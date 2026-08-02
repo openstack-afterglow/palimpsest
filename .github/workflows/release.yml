@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  verify:
+    name: Rebuild and verify release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run python -m pytest tests/unit tests/integration -v
+      - run: uv build
+      - run: python -m zipfile -t dist/*.whl
+      - run: tar -tzf dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  kvm-proof:
+    name: Required KVM clean-host proof
+    if: vars.PALIMPSEST_KVM_ENABLED == 'true'
+    runs-on: [self-hosted, linux, x64, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: test -c /dev/kvm
+      - run: virsh -c qemu:///system net-info default
+      - run: uv sync --frozen --extra dev --extra kvm
+      - run: uv run python -m pytest -m kvm tests/kvm -vv
+
+  publish:
+    name: Publish signed release
+    needs: [verify, kvm-proof]
+    if: needs.kvm-proof.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/palimpsest-local
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+          
+  github-release:
+    name: Create GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

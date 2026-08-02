@@ -1,0 +1,41 @@
+[project]
+name = "palimpsest-local"
+version = "0.1.0.dev0"
+description = "Verified local OCI artifacts and KVM lifecycle for Afterglow Palimpsest"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Afterglow" }]
+dependencies = []
+
+[project.optional-dependencies]
+kvm = ["libvirt-python>=10.0.0"]
+dev = ["pytest>=9.0.3", "ruff>=0.7.0"]
+
+[project.scripts]
+palimpsest = "palimpsest_local.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/palimpsest_local"]
+
+[tool.pytest.ini_options]
+markers = [
+    "kvm: requires a Linux host with KVM, libvirt, and guest fixtures",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv", "build", "dist", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

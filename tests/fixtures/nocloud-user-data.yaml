@@ -1,0 +1,107 @@
+#cloud-config
+users:
+  - name: ubuntu
+    lock_passwd: true
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureClient client@host
+
+ssh_deletekeys: false
+ssh_keys:
+  ed25519_private: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    fixture-private-key
+    -----END OPENSSH PRIVATE KEY-----
+  ed25519_public: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureHost host@guest
+
+write_files:
+  - path: /usr/local/libexec/palimpsest-exec
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env python3
+      """Palimpsest guest exec helper.
+
+      Decodes a URL-safe base64 JSON argv payload passed as the sole command-line
+      argument and execs it directly via os.execvpe, replacing this process. No shell
+      is ever invoked on the guest for `palimpsest exec` traffic; only this fixed
+      path plus an alphabet-constrained payload cross the SSH remote-command
+      boundary, so OpenSSH handing the remote command to the login shell for
+      parsing cannot reintroduce quoting bugs.
+      """
+
+      import base64
+      import json
+      import os
+      import sys
+
+
+      def main() -> int:
+          if len(sys.argv) != 2:
+              sys.stderr.write("usage: palimpsest-exec <payload>\n")
+              return 2
+          payload = sys.argv[1]
+          padded = payload + "=" * (-len(payload) % 4)
+          try:
+              raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+              argv = json.loads(raw.decode("utf-8"))
+          except Exception as exc:
+              sys.stderr.write(f"palimpsest-exec: invalid payload: {exc}\n")
+              return 1
+          if not isinstance(argv, list) or not argv:
+              sys.stderr.write("palimpsest-exec: argv must be a nonempty list\n")
+              return 1
+          if not all(isinstance(item, str) and "\x00" not in item for item in argv):
+              sys.stderr.write("palimpsest-exec: argv items must be NUL-free strings\n")
+              return 1
+          os.execvpe(argv[0], argv, os.environ)
+          return 1  # pragma: no cover -- execvpe never returns on success
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+  - path: /usr/local/libexec/palimpsest-activate
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      exec >>/dev/ttyS0 2>&1
+      set -euo pipefail
+      mkdir -p /opt/layers/upper /opt/layers/work /opt/layers/merged
+      mkdir -p /mnt/palimpsest/lower0
+      DEV=/dev/disk/by-id/virtio-aaaaaaaaaaaaaaaaaaaa
+      for _ in $(seq 1 30); do [ -e "$DEV" ] && break; sleep 1; done
+      [ -e "$DEV" ] || { echo "layer disk missing: $DEV" >&2; exit 1; }
+      mount -t squashfs -o ro "$DEV" /mnt/palimpsest/lower0
+      mkdir -p /mnt/palimpsest/lower1
+      DEV=/dev/disk/by-id/virtio-bbbbbbbbbbbbbbbbbbbb
+      for _ in $(seq 1 30); do [ -e "$DEV" ] && break; sleep 1; done
+      [ -e "$DEV" ] || { echo "layer disk missing: $DEV" >&2; exit 1; }
+      mount -t squashfs -o ro "$DEV" /mnt/palimpsest/lower1
+      mount -t overlay overlay -o lowerdir=/mnt/palimpsest/lower1:/mnt/palimpsest/lower0,upperdir=/opt/layers/upper,workdir=/opt/layers/work /opt/layers/merged
+      echo PALIMPSEST_READY=1
+  - path: /etc/systemd/system/palimpsest-activate.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Palimpsest layer activation
+      After=local-fs.target
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/libexec/palimpsest-activate
+      RemainAfterExit=yes
+      StandardOutput=journal+console
+      StandardError=journal+console
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now palimpsest-activate.service
