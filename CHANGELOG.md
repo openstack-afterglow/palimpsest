@@ -4,6 +4,10 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added a Palimpsest-only Afterglow source contract, drift checker, and scheduled CI verification.
+
 ### Documentation
 
 - Reworked the repository README into a public project guide with installation, Hub configuration, artifact workflows, macOS Apple Silicon usage, Linux KVM requirements, layer builds, and development checks.

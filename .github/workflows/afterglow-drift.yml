@@ -1,0 +1,30 @@
+name: Afterglow Palimpsest Drift
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [afterglow-palimpsest-contract-changed]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: openstack-afterglow/openstack-afterglow
+          ref: main
+          path: afterglow
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tracked extraction contract
+        run: python scripts/check_afterglow_drift.py --upstream-root afterglow

@@ -16,7 +16,9 @@
   - `application/vnd.afterglow.palimpsest.image.qcow2.v1` (Bootable qcow2 cloud image)
   - `application/vnd.afterglow.palimpsest.image.raw.v1` (Bootable raw cloud image)
 
-### Supported Hub Endpoints
+### Local Client Endpoint Contract
+
+The table is the endpoint surface `palimpsest-local` uses, not an assertion that every Afterglow deployment implements every extension. Published Afterglow `main` at `d0250db689631f095dab2ac78ddad89651422c6b` lacks `GET /uploads/{session_id}` and offset-aware `PATCH`; against that baseline, the client safely starts a fresh upload instead of resuming. See `tracking/afterglow-palimpsest.json` for the reviewed contract status.
 
 | Method | Route | Description |
 |---|---|---|

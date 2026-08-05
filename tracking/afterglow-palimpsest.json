@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "scope": "Palimpsest standalone package only; Lumen and Waygate are explicitly out of scope for this repository.",
+  "upstream": {
+    "repository": "https://github.com/openstack-afterglow/openstack-afterglow.git",
+    "ref": "main",
+    "baseline_commit": "d0250db689631f095dab2ac78ddad89651422c6b"
+  },
+  "absence_rules": [
+    {
+      "glob": "services/palimpsest*",
+      "expected_matches": 0,
+      "analysis": "A dedicated Palimpsest service does not exist at the baseline. Creation of one requires an explicit ownership and API review."
+    }
+  ],
+  "contracts": [
+    {
+      "id": "hub-http-v1",
+      "status": "blocked-upstream-protocol",
+      "analysis": "The standalone HubClient supports resumable uploads using Upload-Offset and an additive GET /uploads/{id} query. The Afterglow hub has POST/PATCH/PUT/DELETE upload routes but neither the query route nor offset validation. Do not claim resumable-upload interoperability until the upstream API implements both.",
+      "upstream": [
+        {
+          "path": "backend/app/api/palimpsest/hub.py",
+          "sha256": "51a31d6f5974743c823f825ac8b8fb9cabe4c332be6aabd37e0112b253ec5cc0",
+          "must_contain": [
+            "@router.get(\"/layers\")",
+            "@router.get(\"/images\")",
+            "@router.get(\"/layers/{digest}/blob\")",
+            "@router.post(\"/uploads\")",
+            "@router.patch(\"/uploads/{session_id}\")",
+            "@router.put(\"/uploads/{session_id}\")",
+            "@router.delete(\"/uploads/{session_id}\",",
+            "@router.post(\"/bundles\")"
+          ],
+          "must_not_contain": [
+            "@router.get(\"/uploads/{session_id}\")",
+            "request.headers.get(\"upload-offset\")"
+          ]
+        }
+      ],
+      "counterparts": [
+        {
+          "path": "src/palimpsest_local/hub.py",
+          "sha256": "6549360b4ecdd188d6f0d71bfc786d598fc08918f25445eebc9c7212044620a0",
+          "must_contain": [
+            "HUB_API_PREFIX = \"/api/v1/palimpsest/hub\"",
+            "f\"/uploads/{session_id}\"",
+            "headers={\"Upload-Offset\": str(offset)}",
+            "with self._open(\"GET\", f\"/uploads/{session_id}\")"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "layer-metadata-and-digest-v1",
+      "status": "partial",
+      "analysis": "Afterglow remains authoritative for layer metadata, visibility, persistence, and API routing. The standalone package owns digest normalization, OCI references, and client-side interpretation only.",
+      "upstream": [
+        {
+          "path": "backend/app/api/palimpsest/layers.py",
+          "sha256": "2bb642bd94832df4f06c94bfe2042fa6842fa80a3e64d6b56c418ecde227f0fa"
+        },
+        {
+          "path": "backend/app/models/db.py",
+          "must_contain": [
+            "class PalimpsestHubLayer",
+            "class PalimpsestHubUpload",
+            "class PalimpsestImageExport"
+          ]
+        },
+        {
+          "path": "backend/app/services/palimpsest_digest.py",
+          "sha256": "5765291f50e42d58831afbb71e8017a53d4a11c39056f9b9b77f9b41b3b0a1f7"
+        }
+      ],
+      "counterparts": [
+        {
+          "path": "src/palimpsest_local/digest.py",
+          "sha256": "87908323592e6e6474dc83b3cc85c4941743e6c34ae9b6fe23068a7df8064602",
+          "must_contain": [
+            "def normalize_digest"
+          ]
+        },
+        {
+          "path": "src/palimpsest_local/refs.py",
+          "sha256": "fba9ecd94e3185860ff81f462e0e8190ec7e13c83bba553809d9ed211f5d1b60"
+        },
+        {
+          "path": "src/palimpsest_local/oci_layout.py",
+          "sha256": "b648f1e49842b019f6db8b16327206dc7481a44b1874f6fb1554f4148ac3cb15"
+        }
+      ]
+    },
+    {
+      "id": "oci-bundle-v1",
+      "status": "diverged-stricter-local",
+      "analysis": "Both sides exchange OCI image-layout tar bundles. The standalone importer validates OCI layout and layer data more strictly; preserve that stricter boundary rather than weakening the local package to match an upstream import shortcut.",
+      "upstream": [
+        {
+          "path": "backend/app/api/palimpsest/hub.py",
+          "sha256": "51a31d6f5974743c823f825ac8b8fb9cabe4c332be6aabd37e0112b253ec5cc0",
+          "must_contain": [
+            "@router.post(\"/bundles/import\")",
+            "iter_bundle_tar",
+            "parse_bundle"
+          ]
+        },
+        {
+          "path": "backend/app/services/palimpsest_hub_bundle.py",
+          "sha256": "684ac66a8977a2cd332ba61ad89629b593faec592c207f370c4214475e861573"
+        }
+      ],
+      "counterparts": [
+        {
+          "path": "src/palimpsest_local/oci_layout.py",
+          "sha256": "b648f1e49842b019f6db8b16327206dc7481a44b1874f6fb1554f4148ac3cb15",
+          "must_contain": [
+            "OCI_LAYOUT_VERSION",
+            "def extract_bundle_tar",
+            "def verify_layout_dir"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "local-runtime-cutover",
+      "status": "partial",
+      "analysis": "The standalone package owns local build, runtime, KVM, and CLI mechanics. Afterglow still owns its API registration, configuration, build orchestration, and administration. Changes here need an explicit cutover decision, not a source copy.",
+      "upstream": [
+        {
+          "path": "backend/app/api/palimpsest/builds.py",
+          "sha256": "b29732e1b59621f33c642e0034a584ea6137e73c0a52ebb64e7456c583825462"
+        },
+        {
+          "path": "backend/app/api/palimpsest/admin.py",
+          "sha256": "0e1c631ee017d7573b89c9a677cbbb7f4232f98d77418df8e98c2fbafe5d6445"
+        },
+        {
+          "path": "backend/app/main.py",
+          "must_contain": [
+            "from app.api.palimpsest import",
+            "app.include_router(palimpsest_hub_router, prefix=\"/api/v1/palimpsest/hub\"",
+            "app.include_router(palimpsest_layers_router, prefix=\"/api/v1/palimpsest\"",
+            "app.include_router(palimpsest_builds_router, prefix=\"/api/v1/palimpsest/builds\"",
+            "app.include_router(palimpsest_admin_router, prefix=\"/api/v1/admin/palimpsest\""
+          ]
+        },
+        {
+          "path": "backend/app/config.py",
+          "must_contain": [
+            "palimpsest_hub_local_path",
+            "palimpsest_hub_max_blob_bytes",
+            "palimpsest_hub_upload_ttl_seconds",
+            "palimpsest_kvm_uri",
+            "palimpsest_kvm_layer_root",
+            "palimpsest_kvm_state_dir"
+          ]
+        }
+      ],
+      "counterparts": [
+        {
+          "path": "src/palimpsest_local/cli.py",
+          "sha256": "1d6662d5bc1e9b8fb1284e55091a2eea16b69c0531d8ef15eb0ea5b3571c2053"
+        },
+        {
+          "path": "src/palimpsest_local/runtime.py",
+          "sha256": "bb6ad5b35fafb82b3c5f29abf6f5382467e2920661a00473e56b265bfc6ad64b"
+        },
+        {
+          "path": "src/palimpsest_local/kvm.py",
+          "sha256": "e17f75e5dfd0d731b3198fbf225c77b8bce631ef08f13f0a7569c542c792c4f8"
+        }
+      ]
+    },
+    {
+      "id": "union-layer-operations",
+      "status": "afterglow-owned",
+      "analysis": "Union layer operations coordinate Afterglow administration, NFS, Nova, and Manila. They have no standalone Palimpsest counterpart and must not be copied into this package.",
+      "upstream": [
+        {
+          "path": "backend/app/api/union/layer_ops.py",
+          "sha256": "678cb9b56e28e22166715b385498f3c71d34b55659a24fb18578c0d566ed3c78"
+        }
+      ],
+      "counterparts": []
+    }
+  ]
+}
