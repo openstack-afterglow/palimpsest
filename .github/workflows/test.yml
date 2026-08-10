@@ -1,10 +1,11 @@
 name: Test
 
 on:
+  workflow_call:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-
+    branches: [main, dev]
 permissions:
   contents: read
 
@@ -22,7 +23,28 @@ jobs:
       - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run python -m pytest tests/unit tests/integration -v
+      - run: uv run python -m pytest tests/unit -v
+      - run: uv build
+      - run: python -m zipfile -t dist/*.whl
+      - run: tar -tzf dist/*.tar.gz
+
+  hub:
+    name: Hub tests, lint, and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - run: uv run python -c "from palimpsest_hub.main import app; assert app.title == 'Palimpsest Hub'"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -v
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "palimpsest-hub"
+version = "0.1.0"
+description = "Dedicated Palimpsest Hub API and Glance export worker"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncmy>=0.2.0",
+    "fastapi==0.125.0",
+    "openstacksdk==3.3.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "python-multipart>=0.0.20",
+    "redis[hiredis]>=5.0.0",
+    "slowapi>=0.1.9",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "uvicorn[standard]==0.39.0",
+]
+
+[project.optional-dependencies]
+dev = ["aiosqlite>=0.22.0", "pytest>=9.0.3", "pytest-asyncio>=1.3.0", "ruff>=0.7.0"]
+
+[project.scripts]
+palimpsest-hub = "palimpsest_hub.main:run"
+palimpsest-hub-worker = "palimpsest_hub.worker:run"
+palimpsest-hub-bootstrap = "palimpsest_hub.bootstrap:run"
+palimpsest-hub-migrate-data = "palimpsest_hub.migrate:run"
+[tool.hatch.build.targets.wheel]
+packages = ["src/palimpsest_hub"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "B008", "B904"]
