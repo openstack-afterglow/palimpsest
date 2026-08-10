@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 import openstack
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 
 from palimpsest_hub.config import get_settings
 
@@ -76,7 +76,7 @@ async def require_admin(request: Request) -> dict[str, Any]:
     return context
 
 
-def get_os_conn(token_info: dict[str, Any]) -> openstack.connection.Connection:
+def get_os_conn(token_info: dict[str, Any] = Depends(get_token_info)) -> openstack.connection.Connection:
     settings = get_settings()
     return openstack.connect(
         load_envvars=False,
