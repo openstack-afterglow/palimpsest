@@ -159,7 +159,7 @@ def serialize_export(row: PalimpsestImageExport) -> dict[str, Any]:
         "blob_digest": row.result_blob_digest,
         "size_bytes": row.result_size_bytes,
         "filename": filename,
-        "download_path": f"/api/v1/palimpsest/hub/image-exports/{row.id}/blob" if complete else None,
+        "download_path": f"/v1/image-exports/{row.id}/blob" if complete else None,
         "created_at": row.created_at.isoformat(),
         "started_at": row.started_at.isoformat() if row.started_at else None,
         "completed_at": row.completed_at.isoformat() if row.completed_at else None,

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
@@ -29,7 +29,12 @@ from palimpsest_hub.auth import get_os_conn, get_token_info, require_admin
 from palimpsest_hub.cache import get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import get_session_factory
-from palimpsest_hub.models import PalimpsestHubLayer, PalimpsestHubUpload, PalimpsestImageExport
+from palimpsest_hub.models import (
+    PalimpsestHubLayer,
+    PalimpsestHubLayerAccess,
+    PalimpsestHubUpload,
+    PalimpsestImageExport,
+)
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.digest import (
     compute_config_digest,
@@ -118,10 +123,7 @@ class HubLayerMeta(BaseModel):
     parent_digest: str | None = None
     chain_id: str | None = None
     is_published: bool = False
-    # 이 레이어가 어떤 베이스 cloud image 위에서 만들어졌는지. 번들이 베이스까지 함께
-    # 담을 수 있게 해 준다("이 스택을 돌리는 데 필요한 전부"를 한 번에 받는다).
     base_image_digest: str | None = None
-    # --- kind='cloud-image' 전용 ---
     disk_format: str | None = None  # qcow2 | raw
     arch: str = "x86_64"
     os_variant: str | None = None
@@ -206,8 +208,6 @@ class HubLayerMeta(BaseModel):
 
 class BundleExportRequest(BaseModel):
     refs: list[str] = Field(..., min_length=1, max_length=_MAX_REFS)
-    # 각 leaf 가 선언한 베이스 cloud image 까지 함께 담는다 — 로컬 빌드/실행에 필요한 전부를
-    # 한 번에 받기 위한 옵션. 이미지가 수 GB 라 기본값은 False 다.
     include_base_image: bool = False
 
     @field_validator("refs")
@@ -247,6 +247,68 @@ class HubImageExportResponse(BaseModel):
     completed_at: str | None
 
 
+class HubLayerResponse(BaseModel):
+    blob_digest: str
+    blob_md5: str | None = None
+    size_bytes: int
+    media_type: str
+    disk_format: str | None = None
+    arch: str | None = None
+    os_variant: str | None = None
+    config_digest: str
+    chain_id: str | None = None
+    parent_digest: str | None = None
+    name: str
+    kind: str
+    ubuntu_base: str | None = None
+    python_version: str | None = None
+    config_json: dict[str, Any]
+    project_id: str | None = None
+    is_published: bool
+    created_by: str | None = None
+    created_at: str | None = None
+
+
+class HubUploadStartResponse(BaseModel):
+    session_id: str | None = None
+    completed: bool
+    received_bytes: int = 0
+    blob_digest: str | None = None
+    already_present: bool = False
+    registered: bool = False
+
+
+class HubUploadStatusResponse(BaseModel):
+    session_id: str
+    declared_digest: str | None = None
+    received_bytes: int
+    project_id: str | None = None
+    created_by: str | None = None
+
+
+class HubUploadAppendResponse(BaseModel):
+    session_id: str
+    received_bytes: int
+
+
+class HubUploadFinalizeResponse(BaseModel):
+    blob_digest: str
+    blob_md5: str
+    size_bytes: int
+    already_present: bool
+
+
+class HubImageExportTokenResponse(BaseModel):
+    url: str
+    expires_in: int
+
+
+class HubBundleImportResponse(BaseModel):
+    imported: list[str]
+    imported_count: int
+    skipped: list[dict[str, Any]]
+
+
 # ---------------------------------------------------------------------------
 # 공통
 # ---------------------------------------------------------------------------
@@ -255,7 +317,7 @@ class HubImageExportResponse(BaseModel):
 def _factory_or_503():
     factory = get_session_factory()
     if factory is None:
-        raise HTTPException(status_code=503, detail="DB 연결이 초기화되지 않았습니다")
+        raise HTTPException(status_code=503, detail="데이터베이스 세션 팩토리가 준비되지 않았습니다")
     return factory
 
 
@@ -268,8 +330,8 @@ def _store_or_503():
 
 def _required_project_id(token_info: dict) -> str:
     project_id = _project_id(token_info)
-    if not isinstance(project_id, str) or not project_id:
-        raise HTTPException(status_code=401, detail="프로젝트 범위가 필요합니다")
+    if not project_id:
+        raise HTTPException(status_code=401, detail="프로젝트 스코프의 인증이 필요합니다")
     return project_id
 
 
@@ -277,33 +339,17 @@ def _raise_export_http(exc: ImageExportError) -> NoReturn:
     raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
-def _complete_export_blob(
-    row: PalimpsestImageExport,
-    store: LocalPathBlobStore,
-) -> tuple[str, int, str, str]:
+def _complete_export_blob(row: PalimpsestImageExport, store: LocalPathBlobStore) -> tuple[str, int, str, str]:
     if row.status != STATUS_COMPLETE:
-        raise HTTPException(status_code=409, detail="이미지 내보내기가 아직 완료되지 않았습니다")
-    digest = normalize_digest(row.result_blob_digest)
-    if digest is None:
-        raise HTTPException(status_code=409, detail="완료된 내보내기에 blob 정보가 없습니다")
-    try:
-        if not store.exists(digest):
-            raise HTTPException(status_code=404, detail="내보낸 blob이 저장소에 없습니다")
-        size = store.size(digest)
-    except HTTPException:
-        raise
-    except (HubStoreError, OSError) as exc:
-        raise HTTPException(status_code=404, detail="내보낸 blob이 저장소에 없습니다") from exc
-    if row.result_size_bytes is None or row.result_size_bytes != size:
-        raise HTTPException(status_code=409, detail="내보낸 blob의 크기 정보가 일치하지 않습니다")
-    payload = serialize_export(row)
-    filename = payload["filename"]
-    if not isinstance(filename, str):
-        raise HTTPException(status_code=409, detail="내보낸 blob의 파일 이름을 만들 수 없습니다")
-    format_spec = IMAGE_FORMAT_SPECS.get(row.target_disk_format)
-    if format_spec is None:
-        raise HTTPException(status_code=409, detail="완료된 내보내기 형식이 유효하지 않습니다")
-    media_type = format_spec.media_type
+        raise HTTPException(status_code=409, detail="이미지 내보내기가 완료되지 않았습니다")
+    digest = normalize_digest(row.result_blob_digest or "")
+    if digest is None or not store.exists(digest):
+        raise HTTPException(status_code=404, detail="내보내기 blob 이 허브 스토어에 없습니다")
+    size = store.size(digest)
+    ext = IMAGE_FORMAT_SPECS.get(row.target_disk_format, IMAGE_FORMAT_SPECS["qcow2"]).extension
+    stem = row.source_name if _NAME_RE.fullmatch(row.source_name) else row.id[:8]
+    filename = f"{stem}.{ext}"
+    media_type = DISK_FORMAT_MEDIA_TYPES.get(row.target_disk_format, "application/octet-stream")
     return digest, size, filename, media_type
 
 
@@ -312,13 +358,35 @@ def _project_id(token_info: dict) -> str | None:
 
 
 def _visible_filter(stmt, token_info: dict):
-    """공개(`is_published`) 이거나 사이트 공용(`project_id IS NULL`) 이거나 내 프로젝트 것."""
+    """공개, 사이트 공용, 소유 프로젝트, 또는 검증된 동일 blob 접근 레이어."""
     project_id = _project_id(token_info)
-    return stmt.where(
-        PalimpsestHubLayer.is_published.is_(True)
-        | PalimpsestHubLayer.project_id.is_(None)
-        | (PalimpsestHubLayer.project_id == project_id)
+    shared_access = (
+        select(PalimpsestHubLayerAccess.blob_digest)
+        .where(
+            PalimpsestHubLayerAccess.blob_digest == PalimpsestHubLayer.blob_digest,
+            PalimpsestHubLayerAccess.project_id == project_id,
+        )
+        .exists()
     )
+    return stmt.where(
+        (PalimpsestHubLayer.is_published.is_(True))
+        | (PalimpsestHubLayer.project_id.is_(None))
+        | (PalimpsestHubLayer.project_id == project_id)
+        | shared_access
+    )
+
+
+async def _grant_layer_access(session, digest: str, token_info: dict) -> None:
+    project_id = _required_project_id(token_info)
+    access = await session.get(PalimpsestHubLayerAccess, (digest, project_id))
+    if access is None:
+        session.add(
+            PalimpsestHubLayerAccess(
+                blob_digest=digest,
+                project_id=project_id,
+                created_by=token_info.get("user_id"),
+            )
+        )
 
 
 def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
@@ -337,6 +405,7 @@ def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
         "kind": row.kind,
         "ubuntu_base": row.ubuntu_base,
         "python_version": row.python_version,
+        "config_json": row.config_json,
         "project_id": row.project_id,
         "is_published": row.is_published,
         "created_by": row.created_by,
@@ -347,12 +416,12 @@ def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
 def _hub_blob_filename(row: PalimpsestHubLayer) -> str:
     stem = row.name if row.name and _NAME_RE.fullmatch(row.name) else row.blob_digest[len("sha256:") :][:12]
     if row.kind == KIND_CLOUD_IMAGE and row.disk_format in IMAGE_FORMAT_SPECS:
-        return f"{stem}.{IMAGE_FORMAT_SPECS[row.disk_format].extension}"
+        ext = IMAGE_FORMAT_SPECS[row.disk_format].extension
+        return f"{stem}.{ext}"
     return f"{stem}.sqsh"
 
 
 def _blob_response(
-    *,
     store: LocalPathBlobStore,
     digest: str,
     total: int,
@@ -362,37 +431,37 @@ def _blob_response(
     allow_ranges: bool = True,
 ) -> StreamingResponse:
     start, length, status_code = 0, total, 200
-    headers = {
-        "Cache-Control": "no-store",
+    headers: dict[str, str] = {
+        "Content-Type": media_type,
         "Content-Disposition": f'attachment; filename="{filename}"',
-        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=31536000, immutable",
     }
     if allow_ranges:
         headers["Accept-Ranges"] = "bytes"
-    if allow_ranges and range_header:
-        match = _RANGE_RE.fullmatch(range_header.strip())
-        if not match:
-            raise HTTPException(status_code=416, detail="지원하지 않는 Range 형식입니다")
-        raw_start, raw_end = match.group(1), match.group(2)
-        if raw_start:
-            start = int(raw_start)
-            end = int(raw_end) if raw_end else total - 1
-        else:
-            suffix = int(raw_end or 0)
-            start = max(0, total - suffix)
-            end = total - 1
-        if start >= total or end < start:
-            raise HTTPException(status_code=416, detail="Range 가 blob 범위를 벗어났습니다")
-        end = min(end, total - 1)
-        length = end - start + 1
-        status_code = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+
+    if allow_ranges and range_header and range_header.startswith("bytes="):
+        match = _RANGE_RE.match(range_header.strip())
+        if match:
+            raw_start, raw_end = match.group(1), match.group(2)
+            req_start = int(raw_start) if raw_start else 0
+            req_end = int(raw_end) if raw_end else total - 1
+            if req_start <= req_end and req_start < total:
+                start = req_start
+                end = min(req_end, total - 1)
+                length = end - start + 1
+                status_code = 206
+                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            else:
+                raise HTTPException(
+                    status_code=416,
+                    detail="요청한 Range 가 바이트 범위를 벗어났습니다",
+                    headers={"Content-Range": f"bytes */{total}"},
+                )
 
     headers["Content-Length"] = str(length)
     return StreamingResponse(
         store.iter_blob(digest, start=start, length=length),
         status_code=status_code,
-        media_type=media_type,
         headers=headers,
     )
 
@@ -400,34 +469,35 @@ def _blob_response(
 async def _load_visible(session, digest: str, token_info: dict) -> PalimpsestHubLayer:
     row = (
         await session.execute(
-            _visible_filter(select(PalimpsestHubLayer), token_info).where(PalimpsestHubLayer.blob_digest == digest)
+            _visible_filter(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest), token_info)
         )
     ).scalar_one_or_none()
     if row is None:
-        # 비공개 항목의 존재 여부를 흘리지 않는다 — 403 이 아니라 404
         raise HTTPException(status_code=404, detail="레이어를 찾을 수 없습니다")
     return row
 
 
 async def _ancestor_chain(session, row: PalimpsestHubLayer, token_info: dict) -> list[PalimpsestHubLayer]:
-    """루트 → 자기 자신 순서. 부모가 허브에 없으면 거기서 끊는다(사이클 방어 포함)."""
-    chain: list[PalimpsestHubLayer] = [row]
+    """루트 → 자기 자신 순서. 부모가 허브에 없으면 거기서 끊기며(사이클 방어 포함)."""
+    chain = [row]
     seen = {row.blob_digest}
-    cursor = row.parent_digest
-    while cursor:
-        if cursor in seen:
-            _logger.warning("[palimpsest_hub] 부모 체인 사이클 감지: %s", cursor)
+    current = row
+    while current.parent_digest:
+        if current.parent_digest in seen:
             break
-        seen.add(cursor)
         parent = (
             await session.execute(
-                _visible_filter(select(PalimpsestHubLayer), token_info).where(PalimpsestHubLayer.blob_digest == cursor)
+                _visible_filter(
+                    select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == current.parent_digest),
+                    token_info,
+                )
             )
         ).scalar_one_or_none()
         if parent is None:
             break
+        seen.add(parent.blob_digest)
         chain.append(parent)
-        cursor = parent.parent_digest
+        current = parent
     return list(reversed(chain))
 
 
@@ -436,7 +506,7 @@ async def _ancestor_chain(session, row: PalimpsestHubLayer, token_info: dict) ->
 # ---------------------------------------------------------------------------
 
 
-@router.get("/layers")
+@router.get("/layers", response_model=list[HubLayerResponse], operation_id="search_hub_layers")
 async def search_hub_layers(
     digest: str | None = Query(None),
     digest_prefix: str | None = Query(None),
@@ -448,7 +518,6 @@ async def search_hub_layers(
     limit: int = Query(50, ge=1, le=200),
     token_info: dict = Depends(get_token_info),
 ) -> list[dict[str, Any]]:
-    # 입력 검증이 먼저 — 잘못된 요청은 DB/스토어 상태와 무관하게 422 여야 한다.
     stmt = _visible_filter(select(PalimpsestHubLayer), token_info)
 
     for value, column, label in (
@@ -490,7 +559,7 @@ async def search_hub_layers(
         return [_layer_dict(row) for row in rows]
 
 
-@router.get("/images")
+@router.get("/images", response_model=list[HubLayerResponse], operation_id="list_hub_images")
 async def list_hub_images(
     ubuntu_base: str | None = Query(None, description="예: ubuntu-24.04"),
     arch: str | None = Query(None),
@@ -499,11 +568,6 @@ async def list_hub_images(
     limit: int = Query(50, ge=1, le=200),
     token_info: dict = Depends(get_token_info),
 ) -> list[dict[str, Any]]:
-    """베이스 cloud image 목록.
-
-    로컬 빌드 환경이 여기서 이미지를 골라 받아 VM 을 띄우고 그 위에 레이어를 만든다.
-    `/layers?kind=cloud-image` 와 같은 데이터지만 이미지 전용 필터를 준다.
-    """
     if arch is not None and arch not in {"x86_64", "aarch64"}:
         raise HTTPException(status_code=422, detail="arch 는 x86_64 또는 aarch64 여야 합니다")
     if disk_format is not None and disk_format not in DISK_FORMAT_MEDIA_TYPES:
@@ -529,7 +593,9 @@ async def list_hub_images(
         return [_layer_dict(row) for row in rows]
 
 
-@router.post("/image-exports", status_code=202, response_model=HubImageExportResponse)
+@router.post(
+    "/image-exports", status_code=202, response_model=HubImageExportResponse, operation_id="create_image_export"
+)
 @limiter.limit("6/hour")
 async def create_image_export(
     request: Request,
@@ -545,7 +611,7 @@ async def create_image_export(
     return serialize_export(row)
 
 
-@router.get("/image-exports", response_model=list[HubImageExportResponse])
+@router.get("/image-exports", response_model=list[HubImageExportResponse], operation_id="list_image_exports")
 async def list_image_exports(
     source_image_id: UUID | None = Query(None),
     status: str | None = Query(None),
@@ -566,7 +632,7 @@ async def list_image_exports(
     return [serialize_export(row) for row in rows]
 
 
-@router.get("/image-exports/{export_id}", response_model=HubImageExportResponse)
+@router.get("/image-exports/{export_id}", response_model=HubImageExportResponse, operation_id="get_image_export")
 async def get_image_export(
     export_id: UUID,
     token_info: dict = Depends(get_token_info),
@@ -578,7 +644,7 @@ async def get_image_export(
     return serialize_export(row)
 
 
-@router.get("/image-exports/{export_id}/blob")
+@router.get("/image-exports/{export_id}/blob", operation_id="download_image_export_blob")
 async def download_image_export_blob(
     export_id: UUID,
     request: Request,
@@ -600,7 +666,11 @@ async def download_image_export_blob(
     )
 
 
-@router.post("/image-exports/{export_id}/download-token")
+@router.post(
+    "/image-exports/{export_id}/download-token",
+    response_model=HubImageExportTokenResponse,
+    operation_id="create_image_export_download_token",
+)
 async def create_image_export_download_token(
     export_id: UUID,
     token_info: dict = Depends(get_token_info),
@@ -624,21 +694,25 @@ async def create_image_export_download_token(
         _logger.warning("이미지 내보내기 다운로드 토큰 저장 실패", exc_info=True)
         raise HTTPException(status_code=503, detail="다운로드 토큰을 만들 수 없습니다") from exc
     return {
-        "url": f"/api/v1/palimpsest/hub/image-exports/{row.id}/download?dl_token={token}",
+        "url": f"/v1/image-exports/{row.id}/download?dl_token={token}",
         "expires_in": _EXPORT_TOKEN_TTL_SECONDS,
     }
 
 
-@router.get("/image-exports/{export_id}/download")
+@router.get("/image-exports/{export_id}/download", operation_id="download_image_export_with_token")
 async def download_image_export_with_token(
     export_id: UUID,
+    request: Request,
     dl_token: str = Query(..., min_length=32, max_length=128),
 ) -> StreamingResponse:
+    token_key = f"{_EXPORT_TOKEN_PREFIX}{dl_token}"
     try:
         redis = await get_redis()
-        raw_payload = await redis.getdel(f"{_EXPORT_TOKEN_PREFIX}{dl_token}")
+        raw_payload = await redis.get(token_key)
+        if raw_payload is not None:
+            await redis.expire(token_key, _EXPORT_TOKEN_TTL_SECONDS)
     except Exception as exc:
-        _logger.warning("이미지 내보내기 다운로드 토큰 소비 실패", exc_info=True)
+        _logger.warning("이미지 내보내기 다운로드 토큰 확인 실패", exc_info=True)
         raise HTTPException(status_code=503, detail="다운로드 토큰을 확인할 수 없습니다") from exc
     if raw_payload is None:
         raise HTTPException(status_code=404, detail="다운로드 토큰이 없거나 만료되었습니다")
@@ -666,12 +740,11 @@ async def download_image_export_with_token(
         total=size,
         media_type=media_type,
         filename=filename,
-        range_header=None,
-        allow_ranges=False,
+        range_header=request.headers.get("range"),
     )
 
 
-@router.delete("/image-exports/{export_id}", status_code=204)
+@router.delete("/image-exports/{export_id}", status_code=204, operation_id="delete_image_export")
 async def delete_image_export(
     export_id: UUID,
     token_info: dict = Depends(get_token_info),
@@ -682,7 +755,7 @@ async def delete_image_export(
         _raise_export_http(exc)
 
 
-@router.get("/layers/{digest}")
+@router.get("/layers/{digest}", response_model=HubLayerResponse, operation_id="get_hub_layer")
 async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
     normalized = normalize_digest(digest)
     if normalized is None:
@@ -698,7 +771,7 @@ async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info))
         }
 
 
-@router.get("/layers/{digest}/ancestors")
+@router.get("/layers/{digest}/ancestors", response_model=list[HubLayerResponse], operation_id="get_hub_layer_ancestors")
 async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_token_info)) -> list[dict[str, Any]]:
     """루트 → 자기 자신 순서. 허브에 없는 조상에서 끊기며 `chain_complete` 로 판별한다."""
     normalized = normalize_digest(digest)
@@ -710,7 +783,7 @@ async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_to
         return [_layer_dict(item) for item in await _ancestor_chain(session, row, token_info)]
 
 
-@router.get("/layers/{digest}/blob")
+@router.get("/layers/{digest}/blob", operation_id="download_hub_blob")
 async def download_hub_blob(
     digest: str, request: Request, token_info: dict = Depends(get_token_info)
 ) -> StreamingResponse:
@@ -740,24 +813,29 @@ async def download_hub_blob(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/uploads")
+@router.post("/uploads", response_model=HubUploadStartResponse, operation_id="start_upload")
 async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
 
-    # 이미 있는 콘텐츠면 업로드 자체를 건너뛴다 — content-addressable 의 이점.
     if req.digest and store.exists(req.digest):
         async with factory() as session:
             existing = (
-                await session.execute(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == req.digest))
+                await session.execute(
+                    _visible_filter(
+                        select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == req.digest),
+                        token_info,
+                    )
+                )
             ).scalar_one_or_none()
-        return {
-            "session_id": None,
-            "completed": True,
-            "blob_digest": req.digest,
-            "already_present": True,
-            "registered": existing is not None,
-        }
+        if existing is not None:
+            return {
+                "session_id": None,
+                "completed": True,
+                "blob_digest": req.digest,
+                "already_present": True,
+                "registered": True,
+            }
 
     session_id = uuid.uuid4().hex
     store.start_upload(session_id)
@@ -779,23 +857,51 @@ async def _owned_upload(session, session_id: str, token_info: dict) -> Palimpses
     upload = await session.get(PalimpsestHubUpload, session_id)
     if upload is None:
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
-    # 남의 세션에 바이트를 밀어 넣지 못하게 한다(IDOR)
     if upload.project_id is not None and upload.project_id != _project_id(token_info):
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
     return upload
 
 
-@router.patch("/uploads/{session_id}")
+@router.get("/uploads/{session_id}", response_model=HubUploadStatusResponse, operation_id="get_upload_status")
+async def get_upload_status(session_id: str, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
+    factory = _factory_or_503()
+    async with factory() as session:
+        upload = await _owned_upload(session, session_id, token_info)
+        return {
+            "session_id": upload.id,
+            "declared_digest": upload.declared_digest,
+            "received_bytes": upload.received_bytes,
+            "project_id": upload.project_id,
+            "created_by": upload.created_by,
+        }
+
+
+@router.patch("/uploads/{session_id}", response_model=HubUploadAppendResponse, operation_id="append_upload")
 async def append_upload(
-    session_id: str, request: Request, token_info: dict = Depends(get_token_info)
+    session_id: str, request: Request, response: Response, token_info: dict = Depends(get_token_info)
 ) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
     settings = get_settings()
 
+    offset_hdr = request.headers.get("Upload-Offset")
+    if offset_hdr is None:
+        raise HTTPException(status_code=400, detail="Upload-Offset header is required")
+    try:
+        expected_offset = int(offset_hdr)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Upload-Offset header") from exc
+
     async with factory() as session:
         upload = await _owned_upload(session, session_id, token_info)
         already = upload.received_bytes
+
+    if expected_offset != already:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload-Offset mismatch",
+            headers={"Upload-Offset": str(already)},
+        )
 
     try:
         total = await write_upload_stream(
@@ -818,20 +924,39 @@ async def append_upload(
         if upload is not None:
             upload.received_bytes = total
             await session.commit()
+    response.headers["Upload-Offset"] = str(total)
     return {"session_id": session_id, "received_bytes": total}
 
 
-@router.put("/uploads/{session_id}")
+@router.put("/uploads/{session_id}", response_model=HubUploadFinalizeResponse, operation_id="finalize_upload")
 async def finalize_upload(
-    session_id: str, meta: HubLayerMeta, token_info: dict = Depends(get_token_info)
+    session_id: str, meta: HubLayerMeta, request: Request, token_info: dict = Depends(get_token_info)
 ) -> dict[str, Any]:
     """수신 바이트의 digest 를 재계산해 검증하고 레이어로 등록한다."""
+    if meta.is_published and not token_info.get("is_system_admin"):
+        raise HTTPException(status_code=403, detail="공개 레이어 등록은 시스템 관리자만 허용됩니다")
     factory = _factory_or_503()
     store = _store_or_503()
+
+    offset_hdr = request.headers.get("Upload-Offset")
+    if offset_hdr is None:
+        raise HTTPException(status_code=400, detail="Upload-Offset header is required")
+    try:
+        expected_offset = int(offset_hdr)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid Upload-Offset header") from exc
 
     async with factory() as session:
         upload = await _owned_upload(session, session_id, token_info)
         declared = upload.declared_digest
+        already = upload.received_bytes
+
+    if expected_offset != already:
+        raise HTTPException(
+            status_code=409,
+            detail="Upload-Offset mismatch",
+            headers={"Upload-Offset": str(already)},
+        )
 
     try:
         finalized = store.finalize_upload(session_id, declared)
@@ -888,6 +1013,10 @@ async def finalize_upload(
                     created_by=token_info.get("user_id"),
                 )
             )
+        else:
+            await _grant_layer_access(session, finalized.blob_digest, token_info)
+            if meta.is_published:
+                existing.is_published = True
         upload = await session.get(PalimpsestHubUpload, session_id)
         if upload is not None:
             await session.delete(upload)
@@ -901,7 +1030,7 @@ async def finalize_upload(
     }
 
 
-@router.delete("/uploads/{session_id}", status_code=204)
+@router.delete("/uploads/{session_id}", status_code=204, operation_id="abort_upload")
 async def abort_upload(session_id: str, token_info: dict = Depends(get_token_info)) -> None:
     factory = _factory_or_503()
     store = _store_or_503()
@@ -917,7 +1046,7 @@ async def abort_upload(session_id: str, token_info: dict = Depends(get_token_inf
 # ---------------------------------------------------------------------------
 
 
-@router.post("/bundles")
+@router.post("/bundles", operation_id="export_bundle")
 async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get_token_info)) -> StreamingResponse:
     """요청한 leaf 들의 **부모 체인 전체**를 OCI image-layout tar 로 흘린다."""
     factory = _factory_or_503()
@@ -930,8 +1059,6 @@ async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get
             chain_rows = await _ancestor_chain(session, row, token_info)
 
             if req.include_base_image:
-                # 베이스 cloud image 를 체인 맨 앞에 얹는다. 부모 체인의 루트가 선언한
-                # base_image_digest 를 쓴다 — 스택 전체가 같은 베이스 위에 있기 때문이다.
                 base_digest = normalize_digest((chain_rows[0].config_json or {}).get("base_image_digest") or "")
                 if base_digest is None:
                     raise HTTPException(
@@ -958,8 +1085,6 @@ async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get
                         size_bytes=item.size_bytes,
                         name=item.name,
                         config=dict(item.config_json or {}),
-                        # 베이스 cloud image 는 레이어와 mediaType 이 다르다 — 받는 쪽이
-                        # qcow2 를 squashfs 로 착각하지 않도록 그대로 싣는다.
                         media_type=item.media_type or MEDIA_TYPE_LAYER_SQUASHFS,
                     )
                     for item in chain_rows
@@ -981,7 +1106,7 @@ async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get
     )
 
 
-@router.post("/bundles/import")
+@router.post("/bundles/import", response_model=HubBundleImportResponse, operation_id="import_bundle")
 async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
     """번들을 받아 blob digest 를 **전부 재검증**한 뒤 허브에 등록한다."""
     factory = _factory_or_503()
@@ -1013,7 +1138,6 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_i
                     extract_blob(bundle_path, parsed.blob_members[declared], staged)
                     finalized = store.ingest_file(staged)
                     staged.unlink(missing_ok=True)
-                    # 번들이 선언한 digest 와 실제 바이트가 다르면 받지 않는다(fail-closed).
                     if finalized.blob_digest != declared:
                         store.delete(finalized.blob_digest)
                         skipped.append({"digest": declared, "error": "digest 불일치"})
@@ -1026,12 +1150,11 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_i
                     await session.execute(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == declared))
                 ).scalar_one_or_none()
                 if existing is not None:
-                    skipped.append({"digest": declared, "error": "이미 허브에 있음"})
+                    await _grant_layer_access(session, declared, token_info)
+                    imported.append(declared)
                     continue
 
                 config = dict(entry.get("config") or {})
-                # 부모는 **manifest layers[] 순서**에서 온 값을 쓴다(parse_bundle 이 채운다).
-                # config 는 leaf 것만 실려 오므로 여기서 읽으면 조상이 전부 루트가 된다.
                 parent_digest = normalize_digest(entry.get("parent_digest") or "")
                 name = config.get("name") or entry.get("name") or ""
                 if not _NAME_RE.match(name or ""):
@@ -1072,7 +1195,9 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_i
 # ---------------------------------------------------------------------------
 
 
-@router.delete("/layers/{digest}", status_code=204, dependencies=[Depends(require_admin)])
+@router.delete(
+    "/layers/{digest}", status_code=204, dependencies=[Depends(require_admin)], operation_id="delete_hub_layer"
+)
 async def delete_hub_layer(digest: str) -> None:
     """관리자 전용. 자식이 있으면 거부하고 blob 정리는 지연 GC에 맡긴다."""
     normalized = normalize_digest(digest)

@@ -1,7 +1,7 @@
-"""A synchronous, stdlib-only client for the Bearer-authenticated Palimpsest Hub API.
+"""A synchronous, stdlib-only client for the Keystone-authenticated Palimpsest Hub API.
 
 Every request is prefixed with :data:`HUB_API_PREFIX` and carries
-``Authorization: Bearer <token>``. Downloads (:meth:`HubClient.pull_blob`) verify SHA-256
+``X-Auth-Token: <token>`` (and optional ``X-Project-Id: <project_id>``). Downloads (:meth:`HubClient.pull_blob`) verify SHA-256
 after every transfer and resume interrupted transfers from a ``<destination>.part`` file
 plus an owner-only JSON sidecar. Uploads (:meth:`HubClient.push_blob`) honor the Hub's
 ``completed``/``registered`` existing-blob short-circuit and persist enough state to
@@ -28,7 +28,7 @@ from .digest import digest_file, normalize_digest
 from .errors import DigestMismatchError, HubError
 from .state import delete_transfer, fingerprint, read_transfer, write_transfer
 
-HUB_API_PREFIX = "/api/v1/palimpsest/hub"
+HUB_API_PREFIX = "/v1"
 
 MEDIA_TYPE_LAYER_SQUASHFS = "application/vnd.afterglow.palimpsest.layer.squashfs.v1"
 MEDIA_TYPE_LAYER_CONFIG = "application/vnd.afterglow.palimpsest.layer.config.v1+json"
@@ -93,6 +93,7 @@ class HubClient:
         base_url: str,
         token: str,
         *,
+        project_id: str | None = None,
         timeout_seconds: float = 300.0,
     ) -> None:
         normalized_base = (base_url or "").strip().rstrip("/")
@@ -104,6 +105,7 @@ class HubClient:
             raise HubError("timeout_seconds must be positive")
         self._base_url = normalized_base
         self._token = token.strip()
+        self._project_id = project_id.strip() if project_id and project_id.strip() else None
         self._timeout_seconds = timeout_seconds
         self._opener = urllib.request.build_opener(_NoRedirectHandler)
 
@@ -125,12 +127,19 @@ class HubClient:
         content_type: str | None = None,
         headers: dict[str, str] | None = None,
     ):
-        url = f"{self._base_url}{HUB_API_PREFIX}{path}"
+        prefix = HUB_API_PREFIX.rstrip("/")
+        if not path.startswith(prefix):
+            full_path = f"{prefix}{path}"
+        else:
+            full_path = path
+        url = f"{self._base_url}{full_path}"
         if query:
             filtered = {key: value for key, value in query.items() if value is not None}
             if filtered:
                 url = f"{url}?{urllib.parse.urlencode(filtered)}"
-        request_headers = {"Authorization": f"Bearer {self._token}"}
+        request_headers = {"X-Auth-Token": self._token}
+        if self._project_id:
+            request_headers["X-Project-Id"] = self._project_id
         if content_type is not None:
             request_headers["Content-Type"] = content_type
         if headers:

@@ -16,8 +16,8 @@
   "contracts": [
     {
       "id": "hub-http-v1",
-      "status": "blocked-upstream-protocol",
-      "analysis": "The standalone HubClient supports resumable uploads using Upload-Offset and an additive GET /uploads/{id} query. The Afterglow hub has POST/PATCH/PUT/DELETE upload routes but neither the query route nor offset validation. Do not claim resumable-upload interoperability until the upstream API implements both.",
+      "status": "implemented",
+      "analysis": "The standalone Palimpsest Hub API and HubClient support native /v1 routes, Keystone token authentication, resumable uploads using Upload-Offset validation, and GET /v1/uploads/{session_id} status queries.",
       "upstream": [
         {
           "path": "backend/app/api/palimpsest/hub.py",
@@ -41,9 +41,9 @@
       "counterparts": [
         {
           "path": "src/palimpsest_local/hub.py",
-          "sha256": "6549360b4ecdd188d6f0d71bfc786d598fc08918f25445eebc9c7212044620a0",
+          "sha256": "424dcdd5c8295619db7b5bf995fb2bc7dd2f62944a3ccb4e366adefef44297a1",
           "must_contain": [
-            "HUB_API_PREFIX = \"/api/v1/palimpsest/hub\"",
+            "HUB_API_PREFIX = \"/v1\"",
             "f\"/uploads/{session_id}\"",
             "headers={\"Upload-Offset\": str(offset)}",
             "with self._open(\"GET\", f\"/uploads/{session_id}\")"

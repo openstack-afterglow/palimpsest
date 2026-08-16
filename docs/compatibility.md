@@ -4,12 +4,15 @@
 
 ---
 
-## 1. Afterglow Hub API Contract
+## 1. Standalone Palimpsest Hub API Contract
 
-`palimpsest-local` communicates with Afterglow Hub via a Bearer-authenticated REST API.
+`palimpsest-local` communicates with dedicated Palimpsest Hub instances over a native `/v1` REST API using project-scoped Keystone token authentication.
 
-- **API Base Prefix:** `/api/v1/palimpsest/hub`
-- **Authentication Header:** `Authorization: Bearer <token>`
+- **API Base Prefix:** `/v1`
+- **Authentication Headers:**
+  - `X-Auth-Token: <token>` (Required Keystone auth token)
+  - `X-Project-Id: <project_id>` (Optional project ID scope header)
+- **OpenAPI Security Scheme:** `KeystoneToken` (`apiKey` in header `X-Auth-Token`)
 - **Content Media Types:**
   - `application/vnd.afterglow.palimpsest.layer.squashfs.v1` (SquashFS layer)
   - `application/vnd.afterglow.palimpsest.layer.config.v1+json` (Layer configuration metadata)
@@ -18,22 +21,25 @@
 
 ### Local Client Endpoint Contract
 
-The table is the endpoint surface `palimpsest-local` uses, not an assertion that every Afterglow deployment implements every extension. Published Afterglow `main` at `d0250db689631f095dab2ac78ddad89651422c6b` lacks `GET /uploads/{session_id}` and offset-aware `PATCH`; against that baseline, the client safely starts a fresh upload instead of resuming. See `tracking/afterglow-palimpsest.json` for the reviewed contract status.
+The table below describes the native `/v1` endpoint surface supported by the standalone Palimpsest Hub API and `HubClient`.
 
 | Method | Route | Description |
 |---|---|---|
-| `GET` | `/api/v1/palimpsest/hub/images` | Query boot images (`ubuntu_base`, `arch`, `os_variant`, `disk_format`, `limit`) |
-| `GET` | `/api/v1/palimpsest/hub/layers` | Query layers (`name`, `kind`, `parent_digest`, `limit`) |
-| `GET` | `/api/v1/palimpsest/hub/layers/{digest}` | Retrieve layer metadata record |
-| `GET` | `/api/v1/palimpsest/hub/layers/{digest}/ancestors` | Retrieve ordered parent chain digests |
-| `GET` | `/api/v1/palimpsest/hub/layers/{digest}/blob` | Download image or layer blob (supports HTTP `Range`) |
-| `POST` | `/api/v1/palimpsest/hub/uploads` | Initiate resumable upload session |
-| `GET` | `/api/v1/palimpsest/hub/uploads/{session_id}` | Query current upload offset & session state |
-| `PATCH` | `/api/v1/palimpsest/hub/uploads/{session_id}` | Append payload chunk (accepts optional `Upload-Offset`) |
-| `PUT` | `/api/v1/palimpsest/hub/uploads/{session_id}` | Complete upload session with layer metadata |
-| `DELETE` | `/api/v1/palimpsest/hub/uploads/{session_id}` | Cancel active upload session |
-| `POST` | `/api/v1/palimpsest/hub/bundles` | Generate bundle tarball for stack (`refs`, `include_base_image`) |
-
+| `GET` | `/` | Root version discovery (OpenStack style) |
+| `GET` | `/v1/` | Version discovery document |
+| `GET` | `/v1/health` | Health check endpoint |
+| `GET` | `/v1/images` | Query boot images (`ubuntu_base`, `arch`, `os_variant`, `disk_format`, `limit`) |
+| `GET` | `/v1/layers` | Query layers (`name`, `kind`, `parent_digest`, `limit`) |
+| `GET` | `/v1/layers/{digest}` | Retrieve layer metadata record |
+| `GET` | `/v1/layers/{digest}/ancestors` | Retrieve ordered parent chain digests |
+| `GET` | `/v1/layers/{digest}/blob` | Download image or layer blob (supports HTTP `Range`) |
+| `POST` | `/v1/uploads` | Initiate resumable upload session |
+| `GET` | `/v1/uploads/{session_id}` | Query authoritative upload offset & session status |
+| `PATCH` | `/v1/uploads/{session_id}` | Append payload chunk (requires matching `Upload-Offset`; 409 on mismatch) |
+| `PUT` | `/v1/uploads/{session_id}` | Complete upload session with layer metadata (requires matching `Upload-Offset`) |
+| `DELETE` | `/v1/uploads/{session_id}` | Cancel active upload session |
+| `POST` | `/v1/bundles` | Generate bundle tarball for stack (`refs`, `include_base_image`) |
+| `POST` | `/v1/bundles/import` | Import OCI image-layout bundle with content-addressed digest re-verification |
 ---
 
 ## 2. Resumable Transfer Protocols
@@ -48,7 +54,7 @@ The table is the endpoint surface `palimpsest-local` uses, not an assertion that
 ### Crash-Safe Resumable Uploads (`push_blob`)
 - When pushing a blob, `HubClient` checks Hub upload short-circuit APIs (`already_present` or `registered`). Existing verified blobs bypass payload transfer.
 - For active uploads, transfer progress is recorded in `<state>/transfers/<digest_hex>.json` storing `{session_id, declared_digest, acknowledged_offset, path_fingerprint}`.
-- If interrupted, the client queries `GET /api/v1/palimpsest/hub/uploads/{session_id}` to retrieve server-acknowledged `received_bytes`, seeks to that exact offset, and resumes streaming via `PATCH` with `Upload-Offset: <offset>`.
+- If interrupted, the client queries `GET /v1/uploads/{session_id}` to retrieve server-acknowledged `received_bytes`, seeks to that exact offset, and resumes streaming via `PATCH` with `Upload-Offset: <offset>`.
 - **Hub Fallback:** If the remote Hub returns `HTTP 404` or `HTTP 405` for the upload offset query (indicating an older Hub without offset resumption), `palimpsest-local` deletes the local checkpoint and creates a fresh upload session. It never blindly replays chunks against an unverified offset.
 
 ---
@@ -93,7 +99,7 @@ The table is the endpoint surface `palimpsest-local` uses, not an assertion that
 | Root Overlay / Pivot | **Unsupported** | No rootfs pivot or `overlayroot` modification of `/` or `/usr`. |
 | Remote KVM (`qemu+ssh://`) | **Unsupported** | Local `qemu:///system` daemon connection only. |
 | Multi-Host Scheduling | **Unsupported** | Single-host local KVM execution only. |
-| OCI `/v2` Registry API | **Unsupported** | Integrates via Afterglow Hub REST protocol (`/api/v1/palimpsest/hub`). |
+| OCI `/v2` Registry API | **Unsupported** | Integrates via Palimpsest Hub REST protocol (`/v1`). |
 
 ---
 

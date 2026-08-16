@@ -61,19 +61,19 @@ class MockHubHandler(BaseHTTPRequestHandler):
         pass  # Suppress logging during tests
 
     def do_GET(self):
-        auth = self.headers.get("Authorization")
-        if auth != "Bearer valid-token":
+        auth = self.headers.get("X-Auth-Token")
+        if auth != "valid-token":
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b"Unauthorized")
             return
 
-        if self.path.startswith("/api/v1/palimpsest/hub/images"):
+        if self.path.startswith("/v1/images"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps([{"name": "ubuntu-24.04", "kind": "cloud-image"}]).encode())
-        elif self.path.startswith("/api/v1/palimpsest/hub/layers/sha256:" + "a" * 64 + "/blob"):
+        elif self.path.startswith("/v1/layers/sha256:" + "a" * 64 + "/blob"):
             content = b"fake squashfs layer bytes"
             range_hdr = self.headers.get("Range")
             if range_hdr and range_hdr.startswith("bytes="):
@@ -95,8 +95,8 @@ class MockHubHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        auth = self.headers.get("Authorization")
-        if auth != "Bearer valid-token":
+        auth = self.headers.get("X-Auth-Token")
+        if auth != "valid-token":
             self.send_response(401)
             self.end_headers()
             return
@@ -104,16 +104,14 @@ class MockHubHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length > 0 else {}
 
-        if self.path == "/api/v1/palimpsest/hub/uploads":
+        if self.path == "/v1/uploads":
             digest = body.get("digest")
             if digest == "sha256:" + "0" * 64:
-                # Registered existing blob
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"completed": True, "registered": True}).encode())
             elif digest == "sha256:" + "1" * 64:
-                # Unregistered existing blob
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

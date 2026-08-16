@@ -33,20 +33,29 @@ To use the Linux KVM runtime, install the optional extra:
 pip install '.[kvm]'
 ```
 
-## Hub configuration
+## Hub configuration & Standalone Service
 
-Hub commands use a URL and token from the environment, or a URL passed before the command.
+Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`).
+
+### Entrypoints & Docker Targets
+
+- **API Worker:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`)
+- **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`)
+- **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` or `python -m palimpsest_hub.migrate`
+
+### Client Hub Configuration
+
+Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and Keystone token (`PALIMPSEST_TOKEN` or environment) to call native `/v1` Hub endpoints over `X-Auth-Token`.
 
 ```sh
-export PALIMPSEST_URL="https://hub.example"
-export PALIMPSEST_TOKEN="your-token"
+export PALIMPSEST_URL="http://hub.example:8020"
+export PALIMPSEST_TOKEN="gAAAAAB..."
 
 palimpsest image ls --arch aarch64
-palimpsest --url https://another-hub.example image ls
+palimpsest --url http://another-hub.example:8020 image ls
 ```
 
 `PALIMPSEST_URL` overrides the URL in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/config.toml`; an explicit `--url` takes precedence over both.
-
 ## Artifact workflow
 
 ```sh

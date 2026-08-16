@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import BIGINT, BOOLEAN, CHAR, INT, JSON, TEXT, Index, UniqueConstraint
+from sqlalchemy import BIGINT, BOOLEAN, CHAR, INT, JSON, TEXT, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.dialects.mysql import DATETIME, VARCHAR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -36,6 +36,19 @@ class PalimpsestHubLayer(Base):
     config_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64), nullable=True, index=True)
     is_published: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, server_default="0")
+    created_by: Mapped[str | None] = mapped_column(VARCHAR(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
+class PalimpsestHubLayerAccess(Base):
+    __tablename__ = "palimpsest_hub_layer_access"
+
+    blob_digest: Mapped[str] = mapped_column(
+        VARCHAR(71),
+        ForeignKey("palimpsest_hub_layers.blob_digest", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
     created_by: Mapped[str | None] = mapped_column(VARCHAR(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
 

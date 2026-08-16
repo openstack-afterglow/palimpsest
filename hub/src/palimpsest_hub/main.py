@@ -3,7 +3,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -13,6 +14,30 @@ from palimpsest_hub.cache import close_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, init_db
 from palimpsest_hub.rate_limit import limiter
+
+
+class VersionLink(BaseModel):
+    href: str
+    rel: str = "self"
+
+
+class VersionDocument(BaseModel):
+    id: str = "v1.0"
+    status: str = "CURRENT"
+    updated: str = "2026-08-01T00:00:00Z"
+    links: list[VersionLink]
+
+
+class RootDiscoveryResponse(BaseModel):
+    versions: list[VersionDocument]
+
+
+class VersionDiscoveryResponse(BaseModel):
+    version: VersionDocument
+
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
 
 
 @asynccontextmanager
@@ -40,9 +65,34 @@ app.add_middleware(SlowAPIMiddleware)
 app.include_router(hub_router, prefix="/v1", tags=["hub"])
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+def _version_document(request: Request) -> VersionDocument:
+    base_url = str(request.base_url).rstrip("/")
+    return VersionDocument(
+        id="v1.0",
+        status="CURRENT",
+        updated="2026-08-01T00:00:00Z",
+        links=[VersionLink(href=f"{base_url}/v1/", rel="self")],
+    )
+
+
+@app.get("/", response_model=RootDiscoveryResponse, operation_id="get_root_discovery")
+async def root_discovery(request: Request) -> RootDiscoveryResponse:
+    return RootDiscoveryResponse(versions=[_version_document(request)])
+
+
+@app.get("/v1/", response_model=VersionDiscoveryResponse, operation_id="get_version_discovery")
+async def version_discovery(request: Request) -> VersionDiscoveryResponse:
+    return VersionDiscoveryResponse(version=_version_document(request))
+
+
+@app.get("/v1/health", response_model=HealthResponse, operation_id="get_v1_health")
+async def health_v1() -> HealthResponse:
+    return HealthResponse(status="ok")
+
+
+@app.get("/health", response_model=HealthResponse, include_in_schema=False)
+async def health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
 def run() -> None:

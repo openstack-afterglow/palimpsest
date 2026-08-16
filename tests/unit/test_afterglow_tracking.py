@@ -99,11 +99,9 @@ def test_manifest_records_the_current_hub_protocol_gap():
 
     contracts = {contract["id"]: contract for contract in manifest["contracts"]}
     hub_contract = contracts["hub-http-v1"]
-    assert hub_contract["status"] == "blocked-upstream-protocol"
+    assert hub_contract["status"] == "implemented"
     assert "Upload-Offset" in hub_contract["analysis"]
-    assert '@router.get("/uploads/{session_id}")' in hub_contract["upstream"][0]["must_not_contain"]
-    assert '@router.delete("/uploads/{session_id}",' in hub_contract["upstream"][0]["must_contain"]
-    assert 'f"/uploads/{session_id}"' in hub_contract["counterparts"][0]["must_contain"]
+    assert 'HUB_API_PREFIX = "/v1"' in hub_contract["counterparts"][0]["must_contain"]
 
     union_contract = contracts["union-layer-operations"]
     assert union_contract["status"] == "afterglow-owned"
