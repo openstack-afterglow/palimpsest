@@ -455,6 +455,65 @@ def _close_noerror(file_fd: int) -> None:
         pass
 
 
+def run_entry_present_or_ambiguous(roots: StatePaths, name: str) -> bool:
+    """Return false only when a run entry is securely proven absent.
+
+    The configured state root is the trust anchor.  Its ``runs`` child and the
+    named entry are inspected without following either symlinks or path swaps.
+    Every non-ENOENT outcome is present or ambiguous and must be validated by
+    the durable run dispatcher rather than treated as a free name.
+    """
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    runs_fd: int | None = None
+    runs_missing = False
+    runs_open_failed = False
+    try:
+        runs_fd = os.open(roots.runs, flags)
+    except FileNotFoundError:
+        runs_missing = True
+    except OSError:
+        runs_open_failed = True
+    if runs_missing:
+        return False
+    if runs_open_failed or runs_fd is None:
+        raise StateError("cannot securely inspect run entry")
+
+    try:
+        runs_before = _safe_fstat(runs_fd)
+        entry_missing = False
+        entry_stat_failed = False
+        entry: os.stat_result | None = None
+        try:
+            entry = os.stat(name, dir_fd=runs_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            entry_missing = True
+        except OSError:
+            entry_stat_failed = True
+        runs_after = _safe_fstat(runs_fd)
+        current_runs = _safe_stat(roots.runs)
+        if (
+            runs_before is None
+            or runs_after is None
+            or current_runs is None
+            or entry_stat_failed
+            or (entry is None and not entry_missing)
+            or not stat_module.S_ISDIR(runs_before.st_mode)
+            or not stat_module.S_ISDIR(runs_after.st_mode)
+            or not stat_module.S_ISDIR(current_runs.st_mode)
+            or (runs_after.st_dev, runs_after.st_ino, runs_after.st_ctime_ns)
+            != (runs_before.st_dev, runs_before.st_ino, runs_before.st_ctime_ns)
+            or (current_runs.st_dev, current_runs.st_ino) != (runs_before.st_dev, runs_before.st_ino)
+        ):
+            raise StateError("cannot securely inspect run entry")
+        if entry_missing:
+            return False
+        return True
+    finally:
+        _close_noerror(runs_fd)
+
+
 def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]:
     """Read one bounded regular JSON file relative to an already pinned directory."""
     pre_open = _safe_stat(filename, directory_fd=directory_fd)

@@ -79,6 +79,29 @@ class ExistingRunRecord:
             raise TypeError("existing run record requires a DispatchKey")
 
 
+@dataclass(frozen=True, slots=True)
+class ExpectedRunIdentity:
+    """Durable identity a project expects before mutating an existing run."""
+
+    name: str
+    run_id: str
+    dispatch_key: DispatchKey
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _RUN_NAME_RE.fullmatch(self.name) is None:
+            raise ValueError("expected run identity has an invalid name")
+        if not isinstance(self.run_id, str):
+            raise TypeError("expected run identity requires a string run ID")
+        try:
+            parsed_run_id = uuid.UUID(self.run_id)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("expected run identity has an invalid run ID") from None
+        if str(parsed_run_id) != self.run_id:
+            raise ValueError("expected run identity run ID is not canonical")
+        if not isinstance(self.dispatch_key, DispatchKey):
+            raise TypeError("expected run identity requires a DispatchKey")
+
+
 class RuntimeCapabilityError(PalimpsestError):
     """An exact runtime/backend pair cannot yet perform an operation."""
 
@@ -97,6 +120,7 @@ __all__ = (
     "ALLOWED_RUNTIME_COMBINATIONS",
     "DispatchKey",
     "ExistingRunRecord",
+    "ExpectedRunIdentity",
     "RuntimeBackend",
     "RuntimeCapabilityError",
     "RuntimeKind",

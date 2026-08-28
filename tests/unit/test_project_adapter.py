@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,15 +12,29 @@ import pytest
 
 from palimpsest_local import project_adapter, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
-from palimpsest_local.project import load_project
+from palimpsest_local.project import Project, load_project
 from palimpsest_local.project_runtime import (
     PreparedService,
+    ProjectLifecycleError,
     ProjectPrepareError,
     ServicePlan,
+    down_project,
     project_config_digest,
+    project_logs,
+    service_config_digest,
     service_run_name,
+    stop_project_services,
+    up_project,
 )
 from palimpsest_local.refs import ImageRef, StackRef
+from palimpsest_local.runtime_types import (
+    DispatchKey,
+    ExistingRunRecord,
+    ExpectedRunIdentity,
+    RuntimeBackend,
+    RuntimeCapabilityError,
+    RuntimeKind,
+)
 
 
 def _roots(tmp_path: Path) -> state.StatePaths:
@@ -37,6 +52,70 @@ def _project(tmp_path: Path, body: str, environment: dict[str, str] | None = Non
     path = tmp_path / "palimpsest.yml"
     path.write_text(body, encoding="utf-8")
     return load_project(path, environment or {})
+
+
+def _write_run_ledger(
+    roots: state.StatePaths,
+    name: str,
+    *,
+    backend: str,
+    runtime_kind: str = "cloud-image",
+    status: str = "stopped",
+) -> state.RunPaths:
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, exist_ok=True)
+    run_id = str(uuid.uuid4())
+    state.atomic_write_json(
+        rpaths.owner,
+        {"schema_version": 1, "run_id": run_id, "name": name},
+    )
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": runtime_kind,
+            "backend": backend,
+            "name": name,
+            "run_id": run_id,
+            "status": status,
+        },
+    )
+    return rpaths
+
+
+def _write_project_service_ledger(
+    project: Project,
+    roots: state.StatePaths,
+    *,
+    run_name: str,
+    run_id: str,
+) -> Path:
+    project_name = project.name
+    ppaths = state.project_paths(roots, project_name)
+    ppaths.root.mkdir(parents=True, exist_ok=True)
+    now = state.utc_now_iso()
+    state.atomic_write_json(
+        ppaths.state,
+        {
+            "schema_version": 2,
+            "project": project_name,
+            "config_digest": project_config_digest(project),
+            "services": [
+                {
+                    "service": "api",
+                    "run_name": run_name,
+                    "config_digest": "sha256:" + "b" * 64,
+                    "run_id": run_id,
+                    "backend": "kvm",
+                }
+            ],
+            "order": ["api"],
+            "volumes": [],
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    return ppaths.state
 
 
 def test_desired_digest_binds_resolved_environment_and_runtime_stack(
@@ -241,16 +320,25 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
 """,
     )
     roots = _roots(tmp_path)
+    _write_run_ledger(roots, "demo-api-1", backend="lima-vz")
     monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
-    monkeypatch.setattr(project_adapter.lima, "is_lima_run", lambda _paths: True)
-    calls: list[str] = []
     monkeypatch.setattr(
         project_adapter.lima,
+        "is_lima_run",
+        lambda _paths: pytest.fail("project callback used the legacy Lima heuristic"),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
         "start",
         lambda name, **_kwargs: calls.append(name) or {"status": "running"},
     )
-    monkeypatch.setattr(project_adapter.runtime, "start", lambda *_args, **_kwargs: pytest.fail("wrong backend"))
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        "start",
+        lambda *_args, **_kwargs: pytest.fail("wrong backend"),
+    )
     callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
     service = project.services["api"]
     resolved = callbacks.resolve(project, service, "demo-api-1")
@@ -264,6 +352,643 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
     callbacks.start(prepared)
 
     assert calls == ["demo-api-1"]
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter_name", "expected_backend"),
+    [
+        ("kvm", "cloud_runtime", RuntimeBackend.KVM),
+        ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
+        ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+    ],
+)
+@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove", "logs"])
+def test_existing_project_callbacks_route_from_durable_run_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    adapter_name: str,
+    expected_backend: RuntimeBackend,
+    operation: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    _write_run_ledger(roots, run_name, backend=backend)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    targets = {
+        "inspect": "inspect_run",
+        "start": "start",
+        "stop": "stop",
+        "remove": "rm",
+        "logs": "logs",
+    }
+    target_name = targets[operation]
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def selected(name: str, **kwargs: object) -> object:
+        calls.append((name, kwargs))
+        if operation == "logs":
+            return iter(("project log\n",))
+        return {"name": name, "status": "stopped"}
+
+    selected_adapter = getattr(project_adapter.runtime_dispatch, adapter_name)
+    other_adapter = (
+        project_adapter.runtime_dispatch.lima
+        if adapter_name == "cloud_runtime"
+        else project_adapter.runtime_dispatch.cloud_runtime
+    )
+    monkeypatch.setattr(selected_adapter, target_name, selected)
+    monkeypatch.setattr(
+        other_adapter,
+        target_name,
+        lambda *_args, **_kwargs: pytest.fail("dispatcher selected the wrong project runtime adapter"),
+    )
+    monkeypatch.setattr(
+        project_adapter.lima,
+        "is_lima_run",
+        lambda *_args: pytest.fail("project callback used the legacy Lima heuristic"),
+    )
+
+    if operation == "inspect":
+        result = callbacks.inspect(run_name)
+    elif operation == "start":
+        service = project.services["api"]
+        result = callbacks.start(
+            PreparedService(
+                project,
+                service,
+                ServicePlan("api", run_name, "start", "sha256:" + "b" * 64, "stopped"),
+                None,
+            )
+        )
+    elif operation == "stop":
+        result = callbacks.stop(run_name)
+    elif operation == "remove":
+        result = callbacks.remove(run_name)
+    else:
+        result = list(callbacks.logs(run_name, False))
+
+    assert result == (["project log\n"] if operation == "logs" else {"name": run_name, "status": "stopped"})
+    assert len(calls) == 1
+    called_name, kwargs = calls[0]
+    assert called_name == run_name
+    expected_record = kwargs.pop("_expected_record")
+    assert isinstance(expected_record, ExistingRunRecord)
+    assert expected_record.dispatch_key.backend is expected_backend
+    expected_options: dict[str, object] = {"roots": roots}
+    if operation == "remove":
+        expected_options["volumes"] = True
+    elif operation == "logs":
+        expected_options["follow"] = False
+    assert kwargs == expected_options
+
+
+@pytest.mark.parametrize("operation", ["start", "stop", "remove", "logs"])
+def test_existing_project_callbacks_bind_expected_identity_before_backend_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm")
+    state_payload = state.read_json(rpaths.state)
+    state_payload["opaque"] = "SENSITIVE_REPLACEMENT_VALUE"
+    state.atomic_write_json(rpaths.state, state_payload)
+    expected = ExpectedRunIdentity(
+        run_name,
+        str(uuid.uuid4()),
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    target_name = {"start": "start", "stop": "stop", "remove": "rm", "logs": "logs"}[operation]
+    effects: list[str] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: effects.append("cloud"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: effects.append("lima"),
+    )
+
+    def invoke() -> object:
+        if operation == "start":
+            return callbacks.start(
+                PreparedService(
+                    project,
+                    project.services["api"],
+                    ServicePlan("api", run_name, "start", "sha256:" + "b" * 64, "stopped"),
+                    None,
+                ),
+                expected_identity=expected,
+            )
+        if operation == "stop":
+            return callbacks.stop(run_name, expected_identity=expected)
+        if operation == "remove":
+            return callbacks.remove(run_name, expected_identity=expected)
+        return callbacks.logs(run_name, False, expected_identity=expected)
+
+    with pytest.raises(StateError, match="run identity changed before lifecycle operation") as captured:
+        invoke()
+
+    assert effects == []
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+    assert "SENSITIVE_REPLACEMENT_VALUE" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_project_callbacks_preserve_absent_removed_noop_and_foreign_lima_collision_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch,
+        "rm",
+        lambda *_args, **_kwargs: pytest.fail("absent service removal entered runtime dispatcher"),
+    )
+
+    assert callbacks.remove(run_name) == {"name": run_name, "status": "removed"}
+
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+    monkeypatch.setattr(
+        project_adapter.lima, "inspect_instance_status", lambda name: "running" if name == run_name else None
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch,
+        "inspect_run",
+        lambda *_args, **_kwargs: pytest.fail("foreign name probe entered owned-run dispatcher"),
+    )
+    assert callbacks.inspect(run_name) == {"status": "running"}
+
+
+@pytest.mark.parametrize(
+    ("operation", "status", "swap_on_inspect", "adapter_method"),
+    [
+        ("stop", "running", 1, "stop"),
+        ("remove", "removed", 3, "rm"),
+        ("logs", "running", 1, "logs"),
+    ],
+)
+def test_project_operations_reject_cooperative_name_reuse_after_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    status: str,
+    swap_on_inspect: int,
+    adapter_method: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", status=status)
+    old_run_id = state.read_json(rpaths.owner)["run_id"]
+    assert isinstance(old_run_id, str)
+    project_state = _write_project_service_ledger(project, roots, run_name=run_name, run_id=old_run_id)
+    project_before = project_state.read_bytes()
+    replacement_run_id = str(uuid.uuid4())
+    replacement_owner = {"schema_version": 1, "run_id": replacement_run_id, "name": run_name}
+    replacement_state = {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": run_name,
+        "run_id": replacement_run_id,
+        "status": status,
+        "opaque": "SENSITIVE_REPLACEMENT_VALUE",
+    }
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    inspections = 0
+
+    def racing_inspect(name: str) -> object:
+        nonlocal inspections
+        assert name == run_name
+        inspections += 1
+        if inspections == swap_on_inspect:
+            state.atomic_write_json(rpaths.owner, replacement_owner)
+            state.atomic_write_json(rpaths.state, replacement_state)
+        return {"owner": {"run_id": old_run_id}, "state": {"backend": "kvm", "status": status}}
+
+    callbacks = replace(callbacks, inspect=racing_inspect)
+    effects: list[str] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        adapter_method,
+        lambda *_args, **_kwargs: effects.append("cloud"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        adapter_method,
+        lambda *_args, **_kwargs: effects.append("lima"),
+    )
+
+    def invoke() -> object:
+        if operation == "stop":
+            return stop_project_services(project, callbacks, ["api"], roots=roots)
+        if operation == "remove":
+            return down_project(project, callbacks, roots=roots)
+        return list(project_logs(project, callbacks, ["api"], roots=roots))
+
+    with pytest.raises(StateError, match="run identity changed before lifecycle operation") as captured:
+        invoke()
+
+    assert effects == []
+    assert inspections == swap_on_inspect
+    assert project_state.read_bytes() == project_before
+    assert state.read_run_dispatch_record(roots, run_name).run_id == replacement_run_id
+    assert state.read_json(rpaths.state)["opaque"] == "SENSITIVE_REPLACEMENT_VALUE"
+    assert "SENSITIVE_REPLACEMENT_VALUE" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_project_restart_rejects_cooperative_name_reuse_after_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", status="stopped")
+    old_run_id = state.read_json(rpaths.owner)["run_id"]
+    assert isinstance(old_run_id, str)
+    project_state = _write_project_service_ledger(project, roots, run_name=run_name, run_id=old_run_id)
+    project_payload = state.read_json(project_state)
+    project_payload["services"][0]["config_digest"] = service_config_digest(project, "api")
+    state.atomic_write_json(project_state, project_payload)
+    project_before = project_state.read_bytes()
+    replacement_run_id = str(uuid.uuid4())
+    replacement_state = {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": run_name,
+        "run_id": replacement_run_id,
+        "status": "stopped",
+        "opaque": "SENSITIVE_REPLACEMENT_VALUE",
+    }
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    inspections = 0
+
+    def racing_inspect(name: str) -> object:
+        nonlocal inspections
+        assert name == run_name
+        inspections += 1
+        if inspections == 2:
+            state.atomic_write_json(
+                rpaths.owner,
+                {"schema_version": 1, "run_id": replacement_run_id, "name": run_name},
+            )
+            state.atomic_write_json(rpaths.state, replacement_state)
+        return {"owner": {"run_id": old_run_id}, "state": {"backend": "kvm", "status": "stopped"}}
+
+    callbacks = replace(
+        callbacks,
+        inspect=racing_inspect,
+        resolve=lambda *_args: object(),
+        preflight=lambda _items: None,
+        prepare=lambda _items: (),
+    )
+    effects: list[str] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        "start",
+        lambda *_args, **_kwargs: effects.append("cloud"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        "start",
+        lambda *_args, **_kwargs: effects.append("lima"),
+    )
+
+    with pytest.raises(ProjectLifecycleError, match="run identity changed before lifecycle operation") as captured:
+        # The orchestration layer wraps the stable dispatcher error in its existing
+        # project-up failure type after completing a no-op rollback.
+        up_project(project, callbacks, roots=roots, services=["api"])
+
+    assert effects == []
+    assert inspections == 2
+    assert project_state.read_bytes() == project_before
+    assert state.read_run_dispatch_record(roots, run_name).run_id == replacement_run_id
+    rendered = str(captured.value)
+    assert "SENSITIVE_REPLACEMENT_VALUE" not in rendered
+
+
+@pytest.mark.parametrize("operation", ["inspect", "remove"])
+def test_project_callbacks_treat_dangling_run_symlink_as_ambiguous_and_fail_in_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    (roots.runs / run_name).symlink_to("missing-run", target_is_directory=True)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"side effect reached: {effect}")
+
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: forbidden("foreign-probe"))
+    target_name = "inspect_run" if operation == "inspect" else "rm"
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("cloud-backend"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("lima-backend"),
+    )
+
+    with pytest.raises(StateError, match="cannot securely read run ledger"):
+        callbacks.inspect(run_name) if operation == "inspect" else callbacks.remove(run_name)
+    assert effects == []
+
+
+@pytest.mark.parametrize("operation", ["inspect", "remove"])
+@pytest.mark.parametrize("parent_kind", ["symlink", "non-directory", "swap"])
+def test_project_callbacks_reject_ambiguous_runs_parent_before_dispatch_or_foreign_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    parent_kind: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    if parent_kind == "symlink":
+        roots.runs.rename(roots.state / "real-runs")
+        roots.runs.symlink_to("real-runs", target_is_directory=True)
+    elif parent_kind == "non-directory":
+        roots.runs.rmdir()
+        roots.runs.write_text("not a directory", encoding="utf-8")
+    else:
+        original_fstat = state._safe_fstat
+        calls = 0
+
+        def swapping_fstat(file_fd: int) -> object:
+            nonlocal calls
+            result = original_fstat(file_fd)
+            calls += 1
+            if calls == 1:
+                roots.runs.rename(roots.state / "old-runs")
+                roots.runs.mkdir()
+            return result
+
+        monkeypatch.setattr(state, "_safe_fstat", swapping_fstat)
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"side effect reached: {effect}")
+
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: forbidden("foreign-probe"))
+    dispatcher_name = "inspect_run" if operation == "inspect" else "rm"
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch,
+        dispatcher_name,
+        lambda *_args, **_kwargs: forbidden("dispatcher"),
+    )
+
+    with pytest.raises(StateError, match="cannot securely inspect run entry") as captured:
+        callbacks.inspect(run_name) if operation == "inspect" else callbacks.remove(run_name)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert effects == []
+
+
+@pytest.mark.parametrize("parent_kind", ["symlink", "non-directory", "swap"])
+def test_down_project_rejects_ambiguous_runs_parent_before_dispatch_backend_or_ledger_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_kind: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    project_state = _write_project_service_ledger(project, roots, run_name=run_name, run_id=str(uuid.uuid4()))
+    before = project_state.read_bytes()
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    if parent_kind == "symlink":
+        roots.runs.rename(roots.state / "real-runs")
+        roots.runs.symlink_to("real-runs", target_is_directory=True)
+    elif parent_kind == "non-directory":
+        roots.runs.rmdir()
+        roots.runs.write_text("not a directory", encoding="utf-8")
+    else:
+        original_fstat = state._safe_fstat
+        calls = 0
+
+        def swapping_fstat(file_fd: int) -> object:
+            nonlocal calls
+            result = original_fstat(file_fd)
+            calls += 1
+            if calls == 1:
+                roots.runs.rename(roots.state / "old-runs")
+                roots.runs.mkdir()
+            return result
+
+        monkeypatch.setattr(state, "_safe_fstat", swapping_fstat)
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"side effect reached: {effect}")
+
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: forbidden("foreign-probe"))
+    for dispatcher_name in ("inspect_run", "stop", "rm"):
+        monkeypatch.setattr(
+            project_adapter.runtime_dispatch,
+            dispatcher_name,
+            lambda *_args, _name=dispatcher_name, **_kwargs: forbidden(f"dispatcher-{_name}"),
+        )
+
+    with pytest.raises(StateError, match="cannot securely inspect run entry") as captured:
+        down_project(project, callbacks, roots=roots)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert effects == []
+    assert project_state.read_bytes() == before
+
+
+def test_down_project_dangling_run_symlink_fails_in_dispatcher_before_backend_or_ledger_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    project_state = _write_project_service_ledger(project, roots, run_name=run_name, run_id=str(uuid.uuid4()))
+    before = project_state.read_bytes()
+    (roots.runs / run_name).symlink_to("missing-run", target_is_directory=True)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"side effect reached: {effect}")
+
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: forbidden("foreign-probe"))
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        "inspect_run",
+        lambda *_args, **_kwargs: forbidden("cloud-backend"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        "inspect_run",
+        lambda *_args, **_kwargs: forbidden("lima-backend"),
+    )
+
+    with pytest.raises(StateError, match="cannot securely read run ledger"):
+        down_project(project, callbacks, roots=roots)
+    assert effects == []
+    assert project_state.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove", "logs"])
+def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_backend_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", runtime_kind="oci-root")
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"backend side effect reached: {effect}")
+
+    target_name = {"inspect": "inspect_run", "start": "start", "stop": "stop", "remove": "rm", "logs": "logs"}[
+        operation
+    ]
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("cloud"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("lima"),
+    )
+    monkeypatch.setattr(
+        project_adapter.lima,
+        "is_lima_run",
+        lambda *_args: forbidden("legacy-heuristic"),
+    )
+
+    def invoke() -> object:
+        if operation == "inspect":
+            return callbacks.inspect(run_name)
+        if operation == "start":
+            service = project.services["api"]
+            return callbacks.start(
+                PreparedService(
+                    project,
+                    service,
+                    ServicePlan("api", run_name, "start", "sha256:" + "b" * 64, "stopped"),
+                    None,
+                )
+            )
+        if operation == "stop":
+            return callbacks.stop(run_name)
+        if operation == "remove":
+            return callbacks.remove(run_name)
+        return list(callbacks.logs(run_name, False))
+
+    with pytest.raises(RuntimeCapabilityError):
+        invoke()
+    assert effects == []
+
+    rpaths.state.write_text('{"schema_version":"corrupt"}\n', encoding="utf-8")
+    with pytest.raises(StateError, match="invalid run state schema"):
+        invoke()
+    assert effects == []
+
+    rpaths.owner.unlink()
+    with pytest.raises(StateError, match="cannot securely read run ledger"):
+        invoke()
+    assert effects == []
 
 
 def test_volume_deletion_uses_ledger_backend_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

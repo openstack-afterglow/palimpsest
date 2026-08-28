@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import kvm, lima, platforms, runtime, state
+from . import kvm, lima, platforms, runtime, runtime_dispatch, state
 from .digest import digest_file, require_file_digest
 from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
@@ -40,6 +40,7 @@ from .project_volumes import (
     verify_lima_volume,
 )
 from .refs import PortForward, RunSpec, StackRef, VolumeAttachment
+from .runtime_types import ExpectedRunIdentity
 
 _MIB = 1024 * 1024
 
@@ -108,10 +109,7 @@ def _port_is_available(port: PublishedPort, replacing_run: str | None) -> bool:
 
 
 def _inspect_run(name: str, roots: state.StatePaths) -> object | None:
-    rpaths = state.run_paths(roots, name)
-    root_present = rpaths.root.exists() or rpaths.root.is_symlink()
-    owner_present = rpaths.owner.exists() or rpaths.owner.is_symlink()
-    if not root_present and not owner_present:
+    if not state.run_entry_present_or_ambiguous(roots, name):
         if lima.available():
             foreign_status = lima.inspect_instance_status(name)
             if foreign_status is not None:
@@ -119,10 +117,7 @@ def _inspect_run(name: str, roots: state.StatePaths) -> object | None:
         return None
     # Any partial or malformed local ledger is an ownership ambiguity, never
     # evidence that the run name is free.
-    record = state.read_run_state(rpaths)
-    if record.get("backend") == "lima-vz":
-        return lima.inspect_run(name, roots=roots)
-    return runtime.inspect_run(name, roots=roots)
+    return runtime_dispatch.inspect_run(name, roots=roots)
 
 
 def _volume_use_counts(project: Project) -> Counter[str]:
@@ -794,12 +789,19 @@ def build_project_callbacks(
             result.append(cached)
         return tuple(result)
 
-    def start_service(item: PreparedService) -> object:
+    def start_service(
+        item: PreparedService,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
         if item.plan.action == "start":
-            rpaths = state.run_paths(roots, item.plan.run_name)
-            if lima.is_lima_run(rpaths):
-                return lima.start(item.plan.run_name, roots=roots)
-            return runtime.start(item.plan.run_name, roots=roots)
+            if expected_identity is None:
+                return runtime_dispatch.start(item.plan.run_name, roots=roots)
+            return runtime_dispatch.start(
+                item.plan.run_name,
+                roots=roots,
+                expected_identity=expected_identity,
+            )
         resolved = item.resolved
         if not isinstance(resolved, ResolvedProjectService):
             raise LifecycleError("project resolver returned an invalid service payload")
@@ -831,19 +833,30 @@ def build_project_callbacks(
                 raise
         return runtime.run(spec, roots=roots)
 
-    def stop_service(name: str) -> object:
-        rpaths = state.run_paths(roots, name)
-        if lima.is_lima_run(rpaths):
-            return lima.stop(name, roots=roots)
-        return runtime.stop(name, roots=roots)
+    def stop_service(
+        name: str,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if expected_identity is None:
+            return runtime_dispatch.stop(name, roots=roots)
+        return runtime_dispatch.stop(name, roots=roots, expected_identity=expected_identity)
 
-    def remove_service(name: str) -> object:
-        rpaths = state.run_paths(roots, name)
-        if not rpaths.root.exists() and not rpaths.owner.exists():
+    def remove_service(
+        name: str,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if not state.run_entry_present_or_ambiguous(roots, name):
             return {"name": name, "status": "removed"}
-        if lima.is_lima_run(rpaths):
-            return lima.rm(name, roots=roots, volumes=True)
-        return runtime.rm(name, roots=roots, volumes=True)
+        if expected_identity is None:
+            return runtime_dispatch.rm(name, roots=roots, volumes=True)
+        return runtime_dispatch.rm(
+            name,
+            roots=roots,
+            volumes=True,
+            expected_identity=expected_identity,
+        )
 
     def preflight_down(
         targets: tuple[DownTarget, ...],
@@ -896,11 +909,20 @@ def build_project_callbacks(
             )
         raise StateError(f"managed volume {volume_name!r} has unsupported backend {backend!r}")
 
-    def service_logs(name: str, follow: bool):
-        rpaths = state.run_paths(roots, name)
-        if lima.is_lima_run(rpaths):
-            return lima.logs(name, roots=roots, follow=follow)
-        return runtime.logs(name, roots=roots, follow=follow)
+    def service_logs(
+        name: str,
+        follow: bool,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ):
+        if expected_identity is None:
+            return runtime_dispatch.logs(name, roots=roots, follow=follow)
+        return runtime_dispatch.logs(
+            name,
+            roots=roots,
+            follow=follow,
+            expected_identity=expected_identity,
+        )
 
     return ProjectCallbacks(
         inspect=lambda name: _inspect_run(name, roots),

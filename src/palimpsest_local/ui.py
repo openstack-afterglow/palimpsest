@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from . import inventory, lima, platforms, runtime, state
+from . import inventory, platforms, runtime_dispatch, state
 from .errors import PalimpsestError
 
 WEBUI_DIR = Path(__file__).parent / "webui"
@@ -166,11 +166,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         except ValueError:
                             self._send_json({"error": "invalid tail parameter"}, status=400)
                             return
-                        rpaths = state.run_paths(roots, name)
-                        if state.read_run_state(rpaths).get("backend") == "lima-vz":
-                            lines = list(lima.logs(name, roots=roots, follow=False))
-                        else:
-                            lines = list(runtime.logs(name, roots=roots, follow=False))
+                        lines = list(runtime_dispatch.logs(name, roots=roots, follow=False))
                         tail_lines = lines[-tail:] if tail > 0 else lines
                         self._send_json({"log": "".join(tail_lines)})
                         return
@@ -251,11 +247,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         if not NAME_RE.match(name):
                             self._send_json({"error": "invalid run name"}, status=400)
                             return
-                        rpaths = state.run_paths(roots, name)
-                        if state.read_run_state(rpaths).get("backend") == "lima-vz":
-                            res = lima.stop(name, roots=roots)
-                        else:
-                            res = runtime.stop(name, roots=roots)
+                        res = runtime_dispatch.stop(name, roots=roots)
                         self._send_json(res)
                         return
                     if rest.endswith("/start"):
@@ -263,11 +255,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         if not NAME_RE.match(name):
                             self._send_json({"error": "invalid run name"}, status=400)
                             return
-                        rpaths = state.run_paths(roots, name)
-                        if state.read_run_state(rpaths).get("backend") == "lima-vz":
-                            res = lima.start(name, roots=roots)
-                        else:
-                            res = runtime.start(name, roots=roots)
+                        res = runtime_dispatch.start(name, roots=roots)
                         self._send_json(res)
                         return
 
@@ -341,11 +329,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         self._send_json({"error": "invalid run name"}, status=400)
                         return
                     volumes = qs.get("volumes", ["0"])[0].lower() in ("1", "true")
-                    rpaths = state.run_paths(roots, name)
-                    if state.read_run_state(rpaths).get("backend") == "lima-vz":
-                        res = lima.rm(name, volumes=volumes, roots=roots)
-                    else:
-                        res = runtime.rm(name, volumes=volumes, roots=roots)
+                    res = runtime_dispatch.rm(name, volumes=volumes, roots=roots)
                     self._send_json(res)
                     return
 

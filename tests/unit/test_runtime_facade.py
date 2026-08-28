@@ -31,7 +31,6 @@ _LEGACY_RUNTIME_IMPORTERS = {
     "cli.py",
     "inventory.py",
     "project_adapter.py",
-    "ui.py",
 }
 
 
@@ -114,6 +113,7 @@ def test_only_existing_compatibility_consumers_import_the_legacy_facade() -> Non
 def test_build_and_project_adapter_use_the_split_owners() -> None:
     build_source = (_source_root() / "build.py").read_text(encoding="utf-8")
     adapter_source = (_source_root() / "project_adapter.py").read_text(encoding="utf-8")
+    ui_source = (_source_root() / "ui.py").read_text(encoding="utf-8")
 
     assert "from . import cloud_runtime" in build_source
     assert "cloud_runtime.start_serial_builder(" in build_source
@@ -121,3 +121,9 @@ def test_build_and_project_adapter_use_the_split_owners() -> None:
     assert "cloud_runtime.rm(" in build_source
     assert "kvm.get_domain_run_id(domain)" in adapter_source
     assert "runtime._get_domain_run_id" not in adapter_source
+    for operation in ("inspect_run", "start", "stop", "rm", "logs"):
+        assert f"runtime_dispatch.{operation}(" in adapter_source
+    for operation in ("start", "stop", "rm", "logs"):
+        assert f"runtime_dispatch.{operation}(" in ui_source
+    assert "lima.is_lima_run(" not in adapter_source
+    assert "state.read_run_state(" not in ui_source

@@ -33,6 +33,7 @@ from palimpsest_local.project_runtime import (
     stop_project_services,
     up_project,
 )
+from palimpsest_local.runtime_types import ExpectedRunIdentity
 
 _IMAGE = "sha256:" + "a" * 64
 
@@ -131,8 +132,16 @@ class FakeRuntime:
             raise ProjectPrepareError("prepare rejected", tuple(volumes.values()))
         return tuple(volumes[name] for name in sorted(volumes))
 
-    def start(self, prepared: object) -> None:
+    def start(
+        self,
+        prepared: object,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> None:
         name = prepared.plan.run_name
+        if expected_identity is not None:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("start", prepared.plan.service, prepared.plan.action))
         if prepared.plan.action in {"create", "recreate"} or name not in self.run_ids:
             self.generation += 1
@@ -143,12 +152,18 @@ class FakeRuntime:
             raise RuntimeError("start failed")
         self.statuses[name] = "running"
 
-    def stop(self, name: str) -> None:
+    def stop(self, name: str, *, expected_identity: ExpectedRunIdentity | None = None) -> None:
+        if expected_identity is not None:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("stop", name))
         if name in self.statuses:
             self.statuses[name] = "stopped"
 
-    def remove(self, name: str) -> None:
+    def remove(self, name: str, *, expected_identity: ExpectedRunIdentity | None = None) -> None:
+        if expected_identity is not None and name in self.run_ids:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("remove", name))
         self.statuses.pop(name, None)
         self.run_ids.pop(name, None)
@@ -161,7 +176,16 @@ class FakeRuntime:
     def remove_volume(self, project: str, volume: str, backend: str, size_bytes: int) -> None:
         self.events.append(("remove-volume", project, volume, backend, size_bytes))
 
-    def logs(self, run_name: str, follow: bool):
+    def logs(
+        self,
+        run_name: str,
+        follow: bool,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ):
+        if expected_identity is not None:
+            assert expected_identity.name == run_name
+            assert expected_identity.run_id == self.run_ids[run_name]
         self.events.append(("logs", run_name, follow))
         yield "first\n"
         yield "second\n"
@@ -368,6 +392,41 @@ def test_rollback_touches_only_services_created_by_this_invocation(tmp_path: Pat
     assert ledger is not None
     assert set(ledger.services) == {"db"}
     assert runtime.statuses == {"demo-db-1": "running"}
+
+
+def test_rollback_keeps_successful_created_identity_when_name_is_reused(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    runtime = FakeRuntime()
+    roots = _roots(tmp_path)
+    runtime.fail_start = "worker"
+    callbacks = runtime.callbacks()
+    original_start = callbacks.start
+    replacement_run_id = str(uuid.uuid4())
+
+    def racing_start(
+        prepared: object,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if prepared.plan.service == "worker":
+            runtime.run_ids["demo-api-1"] = replacement_run_id
+        return original_start(prepared, expected_identity=expected_identity)
+
+    callbacks = replace(callbacks, start=racing_start)
+
+    with pytest.raises(ProjectLifecycleError, match="start failed"):
+        up_project(project, callbacks, roots=roots, services=["worker"])
+
+    api_cleanup_events = [
+        event for event in runtime.events if event[0] in {"stop", "remove"} and event[1] == "demo-api-1"
+    ]
+    assert api_cleanup_events == []
+    assert runtime.run_ids["demo-api-1"] == replacement_run_id
+    assert runtime.statuses["demo-api-1"] == "running"
+    ledger = read_project_state(project, roots)
+    assert ledger is not None
+    assert set(ledger.services) == {"api"}
+    assert ledger.services["api"].run_id != replacement_run_id
 
 
 def test_down_is_reverse_order_and_preserves_named_volumes_by_default(tmp_path: Path) -> None:

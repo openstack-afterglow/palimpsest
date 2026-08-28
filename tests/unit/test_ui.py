@@ -4,6 +4,7 @@ import http.client
 import json
 import socket
 import threading
+import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 
 from palimpsest_local import state, ui
+from palimpsest_local.runtime_types import ExistingRunRecord, RuntimeBackend
 from palimpsest_local.state import init_roots
 
 
@@ -20,6 +22,41 @@ def _setup_roots(tmp_path: Path) -> state.StatePaths:
     config_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
     return init_roots({"XDG_CONFIG_HOME": str(config_dir), "XDG_STATE_HOME": str(state_dir)})
+
+
+def _write_ui_run_ledger(
+    roots: state.StatePaths,
+    *,
+    backend: str,
+    runtime_kind: str = "cloud-image",
+) -> state.RunPaths:
+    rpaths = state.run_paths(roots, "ui-vm")
+    rpaths.root.mkdir(parents=True, exist_ok=True)
+    run_id = str(uuid.uuid4())
+    state.atomic_write_json(
+        rpaths.owner,
+        {"schema_version": 1, "run_id": run_id, "name": "ui-vm"},
+    )
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": runtime_kind,
+            "backend": backend,
+            "name": "ui-vm",
+            "run_id": run_id,
+            "status": "stopped",
+        },
+    )
+    return rpaths
+
+
+_UI_LIFECYCLE_REQUESTS = (
+    ("logs", "logs", "GET", "/api/v1/vms/ui-vm/logs?tail=2", {"follow": False}),
+    ("start", "start", "POST", "/api/v1/vms/ui-vm/start", {}),
+    ("stop", "stop", "POST", "/api/v1/vms/ui-vm/stop", {}),
+    ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm?volumes=true", {"volumes": True}),
+)
 
 
 @pytest.fixture
@@ -148,6 +185,143 @@ def test_csrf_origin_semantics(server_env: dict[str, Any]):
         port, "POST", "/api/v1/storage/set", headers=good_headers, body={"destination": "/tmp/test"}
     )
     assert status in (200, 400, 409)
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter_name", "expected_backend"),
+    [
+        ("kvm", "cloud_runtime", RuntimeBackend.KVM),
+        ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
+        ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+    ],
+)
+@pytest.mark.parametrize(("operation", "target_name", "method", "path", "expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    adapter_name: str,
+    expected_backend: RuntimeBackend,
+    operation: str,
+    target_name: str,
+    method: str,
+    path: str,
+    expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    _write_ui_run_ledger(roots, backend=backend)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def selected(name: str, **kwargs: object) -> object:
+        calls.append((name, kwargs))
+        if operation == "logs":
+            return iter(("one\n", "two\n", "three\n"))
+        return {"name": name, "status": "running" if operation == "start" else "stopped"}
+
+    selected_adapter = getattr(ui.runtime_dispatch, adapter_name)
+    other_adapter = ui.runtime_dispatch.lima if adapter_name == "cloud_runtime" else ui.runtime_dispatch.cloud_runtime
+    monkeypatch.setattr(selected_adapter, target_name, selected)
+    monkeypatch.setattr(
+        other_adapter,
+        target_name,
+        lambda *_args, **_kwargs: pytest.fail("UI dispatcher selected the wrong runtime adapter"),
+    )
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, response_headers, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 200
+    assert "application/json" in response_headers["Content-Type"]
+    if operation == "logs":
+        assert payload == {"log": "two\nthree\n"}
+    else:
+        assert payload == {"name": "ui-vm", "status": "running" if operation == "start" else "stopped"}
+    assert len(calls) == 1
+    called_name, kwargs = calls[0]
+    assert called_name == "ui-vm"
+    expected_record = kwargs.pop("_expected_record")
+    assert isinstance(expected_record, ExistingRunRecord)
+    assert expected_record.dispatch_key.backend is expected_backend
+    assert kwargs == {"roots": roots, **expected_kwargs}
+
+
+@pytest.mark.parametrize(("operation", "target_name", "method", "path", "_expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_oci_vm_lifecycle_returns_typed_409_before_backend_side_effects(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    target_name: str,
+    method: str,
+    path: str,
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm", runtime_kind="oci-root")
+    before = (
+        rpaths.owner.read_bytes(),
+        rpaths.state.read_bytes(),
+        tuple(sorted(path.name for path in rpaths.root.iterdir())),
+    )
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"UI backend side effect reached: {effect}")
+
+    monkeypatch.setattr(
+        ui.runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("cloud"),
+    )
+    monkeypatch.setattr(
+        ui.runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("lima"),
+    )
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 409
+    assert payload == {"error": f"runtime operation '{operation}' is unavailable for oci-root/kvm"}
+    assert effects == []
+    assert before == (
+        rpaths.owner.read_bytes(),
+        rpaths.state.read_bytes(),
+        tuple(sorted(path.name for path in rpaths.root.iterdir())),
+    )
+
+
+@pytest.mark.parametrize(("_operation", "_target_name", "method", "path", "_expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_corrupt_vm_ledger_fails_closed_as_409_without_value_reflection(
+    server_env: dict[str, Any],
+    _operation: str,
+    _target_name: str,
+    method: str,
+    path: str,
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm")
+    rpaths.state.write_text('{"schema_version":"sensitive-corrupt-value"}\n', encoding="utf-8")
+    before = rpaths.state.read_bytes()
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 409
+    assert payload == {"error": "invalid run state schema"}
+    assert "sensitive-corrupt-value" not in json.dumps(payload)
+    assert rpaths.state.read_bytes() == before
 
 
 def test_static_asset_routes(server_env: dict[str, Any]):

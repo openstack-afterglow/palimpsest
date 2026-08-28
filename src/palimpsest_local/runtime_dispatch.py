@@ -9,6 +9,7 @@ from . import cloud_runtime, lima, state
 from .errors import StateError
 from .runtime_types import (
     ExistingRunRecord,
+    ExpectedRunIdentity,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
@@ -37,25 +38,57 @@ def _revalidate_bound_record(record: ExistingRunRecord, roots: StatePaths) -> No
         raise StateError("run ledger changed during dispatch")
 
 
-def start(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
+def _require_expected_identity(record: ExistingRunRecord, expected_identity: ExpectedRunIdentity | None) -> None:
+    if expected_identity is None:
+        return
+    if not isinstance(expected_identity, ExpectedRunIdentity):
+        raise StateError("invalid expected run identity")
+    if (
+        record.name != expected_identity.name
+        or record.run_id != expected_identity.run_id
+        or record.dispatch_key != expected_identity.dispatch_key
+    ):
+        raise StateError("run identity changed before lifecycle operation")
+
+
+def start(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> dict[str, Any]:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
     adapter = _adapter_for(record, RuntimeOperation.START)
     _revalidate_bound_record(record, resolved_roots)
     return adapter.start(name, roots=resolved_roots, _expected_record=record)
 
 
-def stop(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
+def stop(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> dict[str, Any]:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
     adapter = _adapter_for(record, RuntimeOperation.STOP)
     _revalidate_bound_record(record, resolved_roots)
     return adapter.stop(name, roots=resolved_roots, _expected_record=record)
 
 
-def rm(name: str, *, volumes: bool = False, roots: StatePaths | None = None) -> dict[str, Any]:
+def rm(
+    name: str,
+    *,
+    volumes: bool = False,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> dict[str, Any]:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
     adapter = _adapter_for(record, RuntimeOperation.RM)
     _revalidate_bound_record(record, resolved_roots)
     return adapter.rm(
@@ -74,9 +107,16 @@ def inspect_run(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]
     return adapter.inspect_run(name, roots=resolved_roots, _expected_record=record)
 
 
-def logs(name: str, *, roots: StatePaths | None = None, follow: bool = False) -> Iterator[str]:
+def logs(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    follow: bool = False,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> Iterator[str]:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
     adapter = _adapter_for(record, RuntimeOperation.LOGS)
 
     def validated_stream() -> Iterator[str]:

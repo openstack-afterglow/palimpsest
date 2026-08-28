@@ -22,6 +22,7 @@ from palimpsest_local.runtime_types import (
     ALLOWED_RUNTIME_COMBINATIONS,
     DispatchKey,
     ExistingRunRecord,
+    ExpectedRunIdentity,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
@@ -182,6 +183,26 @@ def test_existing_run_record_public_constructor_enforces_every_invariant(kwargs:
     }
     with pytest.raises((TypeError, ValueError)):
         ExistingRunRecord(**values)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"name": "Demo"},
+        {"run_id": "not-a-uuid"},
+        {"run_id": "862FFB44-6795-4618-B2D8-C0750439FAC3"},
+        {"dispatch_key": "cloud-image/kvm"},
+    ],
+)
+def test_expected_run_identity_public_constructor_enforces_every_invariant(kwargs: dict[str, Any]) -> None:
+    values: dict[str, Any] = {
+        "name": "demo",
+        "run_id": "862ffb44-6795-4618-b2d8-c0750439fac3",
+        "dispatch_key": DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        **kwargs,
+    }
+    with pytest.raises((TypeError, ValueError)):
+        ExpectedRunIdentity(**values)
 
 
 def test_missing_run_resolution_does_not_create_state_or_config_directories(
@@ -364,6 +385,109 @@ def test_dispatch_reader_rejects_symlinked_ledger_files(tmp_path: Path, filename
     assert str(tmp_path) not in rendered
     assert "Errno" not in rendered
     assert _snapshot_tree(roots.state) == before
+
+
+def test_secure_run_presence_returns_false_only_for_stable_enoent_without_writes(tmp_path: Path) -> None:
+    roots = _roots(tmp_path)
+    before = _snapshot_tree(roots.state)
+
+    assert state.run_entry_present_or_ambiguous(roots, "demo") is False
+    assert _snapshot_tree(roots.state) == before
+
+    roots.runs.rmdir()
+    before_missing_parent = _snapshot_tree(roots.state)
+    assert state.run_entry_present_or_ambiguous(roots, "demo") is False
+    assert _snapshot_tree(roots.state) == before_missing_parent
+
+
+@pytest.mark.parametrize("entry_kind", ["directory", "dangling-symlink", "file"])
+def test_secure_run_presence_treats_every_name_entry_as_present_or_ambiguous(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    roots = _roots(tmp_path)
+    entry = roots.runs / "demo"
+    if entry_kind == "directory":
+        entry.mkdir()
+    elif entry_kind == "dangling-symlink":
+        entry.symlink_to("missing-run", target_is_directory=True)
+    else:
+        entry.write_text("not a directory", encoding="utf-8")
+    before = _snapshot_tree(roots.state)
+
+    assert state.run_entry_present_or_ambiguous(roots, "demo") is True
+    assert _snapshot_tree(roots.state) == before
+
+
+@pytest.mark.parametrize("parent_kind", ["symlink", "non-directory"])
+def test_secure_run_presence_rejects_ambiguous_runs_parent_without_context_or_writes(
+    tmp_path: Path,
+    parent_kind: str,
+) -> None:
+    roots = _roots(tmp_path)
+    if parent_kind == "symlink":
+        real_runs = roots.state / "real-runs"
+        roots.runs.rename(real_runs)
+        roots.runs.symlink_to(real_runs.name, target_is_directory=True)
+    else:
+        roots.runs.rmdir()
+        roots.runs.write_text("not a directory", encoding="utf-8")
+    before = _snapshot_tree(roots.state)
+
+    with pytest.raises(StateError, match="cannot securely inspect run entry") as captured:
+        state.run_entry_present_or_ambiguous(roots, "demo")
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert _snapshot_tree(roots.state) == before
+
+
+def test_secure_run_presence_rejects_permission_error_without_reflecting_os_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    original_open = state.os.open
+
+    def denied_open(path: str | os.PathLike[str], flags: int, *args: Any, **kwargs: Any) -> int:
+        if Path(path) == roots.runs and kwargs.get("dir_fd") is None:
+            raise PermissionError(13, "SENSITIVE_PERMISSION_DETAIL", str(path))
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "open", denied_open)
+    with pytest.raises(StateError, match="cannot securely inspect run entry") as captured:
+        state.run_entry_present_or_ambiguous(roots, "demo")
+
+    rendered = f"{captured.value!s} {captured.value!r}"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "SENSITIVE_" not in rendered
+    assert str(roots.runs) not in rendered
+
+
+def test_secure_run_presence_rejects_runs_parent_swap_while_pinned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    original_fstat = state._safe_fstat
+    calls = 0
+
+    def swapping_fstat(file_fd: int) -> os.stat_result | None:
+        nonlocal calls
+        result = original_fstat(file_fd)
+        calls += 1
+        if calls == 1:
+            roots.runs.rename(roots.state / "old-runs")
+            roots.runs.mkdir()
+        return result
+
+    monkeypatch.setattr(state, "_safe_fstat", swapping_fstat)
+    with pytest.raises(StateError, match="cannot securely inspect run entry") as captured:
+        state.run_entry_present_or_ambiguous(roots, "demo")
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 @pytest.mark.parametrize("filename", ["owner.json", "state.json"])
@@ -612,6 +736,72 @@ _ADAPTER_ENTRY_OPERATIONS: tuple[tuple[RuntimeOperation, Callable[..., Any], dic
     (RuntimeOperation.INSPECT, runtime_dispatch.inspect_run, {}),
     (RuntimeOperation.LOGS, runtime_dispatch.logs, {"follow": False}),
 )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "dispatch", "kwargs"),
+    [
+        ("start", runtime_dispatch.start, {}),
+        ("stop", runtime_dispatch.stop, {}),
+        ("rm", runtime_dispatch.rm, {"volumes": True}),
+        ("logs", runtime_dispatch.logs, {"follow": True}),
+    ],
+)
+@pytest.mark.parametrize("mismatch", ["run-id", "backend", "runtime-kind"])
+def test_expected_project_identity_rejects_static_name_reuse_before_adapter_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    dispatch: Callable[..., Any],
+    kwargs: dict[str, Any],
+    mismatch: str,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, current_run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+            "opaque": "SENSITIVE_REPLACEMENT_VALUE",
+        },
+    )
+    expected_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    if mismatch == "backend":
+        expected_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ)
+    elif mismatch == "runtime-kind":
+        expected_key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+    expected = ExpectedRunIdentity(
+        "demo",
+        str(uuid.uuid4()) if mismatch == "run-id" else current_run_id,
+        expected_key,
+    )
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    effects: list[str] = []
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: effects.append("cloud"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: effects.append("lima"),
+    )
+
+    with pytest.raises(StateError, match="run identity changed before lifecycle operation") as captured:
+        dispatch("demo", roots=roots, expected_identity=expected, **kwargs)
+
+    assert (current_run_id, DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)) != (
+        expected.run_id,
+        expected.dispatch_key,
+    )
+    assert effects == []
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+    assert "SENSITIVE_REPLACEMENT_VALUE" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def _install_adapter_side_effect_spies(
