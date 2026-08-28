@@ -14,7 +14,14 @@ import pytest
 from palimpsest_local import cli, digest, runtime_dispatch, state
 from palimpsest_local.errors import PalimpsestError
 from palimpsest_local.oci_layout import ContentStore
-from palimpsest_local.runtime_types import ExistingRunRecord, RuntimeBackend
+from palimpsest_local.runtime_types import (
+    DispatchKey,
+    ExistingRunRecord,
+    RunAttachmentMode,
+    RunResult,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +59,16 @@ def _write_cli_run_ledger(
         encoding="utf-8",
     )
     return roots, rpaths
+
+
+def _fake_run_result(name: str, backend: RuntimeBackend, guest_ip: str | None = None) -> RunResult:
+    record = ExistingRunRecord(
+        name=name,
+        run_id="862ffb44-6795-4618-b2d8-c0750439fac3",
+        state_schema_version=2,
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+    )
+    return RunResult(record, "running", True, RunAttachmentMode.DETACHED, guest_ip)
 
 
 def _snapshot_cli_state(root: Path) -> dict[str, tuple[int, int, bytes | None]]:
@@ -908,7 +925,11 @@ def test_cli_dispatch_image_push_reaches_hub_and_store(monkeypatch: pytest.Monke
     assert ingested_paths[0] == img
 
 
-def test_cli_dispatch_run_passes_cli_layers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_cli_dispatch_run_passes_cli_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
     import hashlib
 
     base_content = b"base qcow2 content"
@@ -943,13 +964,16 @@ def test_cli_dispatch_run_passes_cli_layers(monkeypatch: pytest.MonkeyPatch, tmp
     )
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setattr("palimpsest_local.cli.platforms.select_backend", lambda arch, requested="auto": "kvm")
-    monkeypatch.setattr("palimpsest_local.cli.platforms.preflight", lambda backend: None)
-    monkeypatch.setattr("palimpsest_local.cli.platforms.resolve_domain_profile", lambda backend, arch: None)
+    monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": "kvm")
+    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", lambda backend: None)
     recorded_specs = []
     monkeypatch.setattr(
-        "palimpsest_local.cli.run",
-        lambda spec, roots=None, profile=None: (recorded_specs.append(spec), {"guest_ip": "10.0.0.5"})[1],
+        cli.runtime_dispatch,
+        "run",
+        lambda request, roots=None: (
+            recorded_specs.append(request.spec),
+            _fake_run_result(request.spec.name, RuntimeBackend.KVM, "10.0.0.5"),
+        )[1],
     )
 
     ret = cli.main(["run", base_digest, "--name", "test-vm", "--layer", layer_digest])
@@ -959,6 +983,7 @@ def test_cli_dispatch_run_passes_cli_layers(monkeypatch: pytest.MonkeyPatch, tmp
     assert spec.name == "test-vm"
     assert len(spec.stack.layers) == 1
     assert spec.stack.layers[0].digest == layer_digest
+    assert capsys.readouterr().out.strip() == "10.0.0.5"
 
 
 def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1094,40 +1119,44 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
     selected = []
     preflighted = []
-    resolved = []
     run_calls = []
 
-    dummy_profile = object()
-
     monkeypatch.setattr(
-        cli.platforms,
+        runtime_dispatch.platforms,
         "select_backend",
         lambda arch, requested="auto": (selected.append((arch, requested)), "libvirt-hvf")[1],
     )
-    monkeypatch.setattr(cli.platforms, "preflight", lambda backend: preflighted.append(backend))
+
+    def preflight(backend: str) -> None:
+        assert capsys.readouterr().err == ""
+        preflighted.append(backend)
+
+    def run(request, roots=None):
+        assert "warning: libvirt-hvf is experimental" in capsys.readouterr().err
+        run_calls.append(request)
+        return _fake_run_result(request.spec.name, RuntimeBackend.LIBVIRT_HVF, None)
+
+    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", preflight)
     monkeypatch.setattr(
-        cli.platforms,
-        "resolve_domain_profile",
-        lambda backend, arch: (resolved.append((backend, arch)), dummy_profile)[1],
-    )
-    monkeypatch.setattr(
-        cli,
+        cli.runtime_dispatch,
         "run",
-        lambda spec, roots=None, profile=None: (run_calls.append((spec, profile)), {"guest_ip": "127.0.0.1"})[1],
+        run,
     )
 
     ret = cli.main(["run", base_digest, "--name", "hvf-vm", "--backend", "libvirt-hvf"])
     assert ret == 0
     assert selected == [("aarch64", "libvirt-hvf")]
     assert preflighted == ["libvirt-hvf"]
-    assert resolved == [("libvirt-hvf", "aarch64")]
     assert len(run_calls) == 1
-    assert run_calls[0][1] is dummy_profile
-    err = capsys.readouterr().err
-    assert "warning: libvirt-hvf is experimental" in err
+    assert run_calls[0].dispatch_key.backend is RuntimeBackend.LIBVIRT_HVF
+    assert capsys.readouterr().out.strip() == "None"
 
 
-def test_cli_run_dispatch_lima_routing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_cli_run_dispatch_lima_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
     import hashlib
 
     content = b"dummy image data lima"
@@ -1142,18 +1171,24 @@ def test_cli_run_dispatch_lima_routing(monkeypatch: pytest.MonkeyPatch, tmp_path
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64", "os_variant": None},
     )
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
-    lima_runs = []
-    runtime_runs = []
+    run_requests = []
 
-    monkeypatch.setattr(cli.platforms, "select_backend", lambda arch, requested="auto": "lima-vz")
-    monkeypatch.setattr(cli.platforms, "preflight", lambda backend: None)
-    monkeypatch.setattr(cli.lima, "run", lambda spec, roots=None: (lima_runs.append(spec), {"backend": "lima-vz"})[1])
-    monkeypatch.setattr(cli, "run", lambda spec, roots=None, profile=None: runtime_runs.append(spec))
+    monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": "lima-vz")
+    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", lambda backend: None)
+    monkeypatch.setattr(
+        cli.runtime_dispatch,
+        "run",
+        lambda request, roots=None: (
+            run_requests.append(request),
+            _fake_run_result(request.spec.name, RuntimeBackend.LIMA_VZ, "192.0.2.10"),
+        )[1],
+    )
 
     ret = cli.main(["run", base_digest, "--name", "lima-vm", "--backend", "lima-vz"])
     assert ret == 0
-    assert len(lima_runs) == 1
-    assert len(runtime_runs) == 0
+    assert len(run_requests) == 1
+    assert run_requests[0].dispatch_key.backend is RuntimeBackend.LIMA_VZ
+    assert capsys.readouterr().out.strip() == "limactl shell lima-vm"
 
 
 def test_cli_ui_port_validation(capsys: pytest.CaptureFixture[str]):

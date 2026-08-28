@@ -1,25 +1,230 @@
-"""Fail-closed routing for lifecycle operations on existing run ledgers."""
+"""Fail-closed typed routing for create and existing-run lifecycle operations."""
 
 from __future__ import annotations
 
+import re
+import uuid
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from . import cloud_runtime, lima, state
+from . import cloud_runtime, lima, platforms, state
 from .errors import StateError
+from .refs import RunSpec
 from .runtime_types import (
+    DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    ResolvedRunRequest,
     RunAggregationError,
     RunAggregationResult,
+    RunAttachmentMode,
+    RunResult,
     RunSummary,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
     RuntimeOperation,
+    RunVolumeIntent,
 )
 from .state import StatePaths
+
+_RECEIPT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _CreationReceipt:
+    """Allowlisted adapter identity fields used only for post-create binding."""
+
+    name: str
+    run_id: str
+    dispatch_key: DispatchKey
+    status: str
+
+
+def _parse_creation_receipt(raw: Any) -> _CreationReceipt:
+    if not isinstance(raw, Mapping):
+        raise StateError("runtime adapter returned an invalid creation receipt")
+    name = raw.get("name")
+    run_id = raw.get("run_id")
+    raw_backend = raw.get("backend")
+    status = raw.get("status")
+    if (
+        not isinstance(name, str)
+        or _RECEIPT_NAME_RE.fullmatch(name) is None
+        or not isinstance(run_id, str)
+        or status != "running"
+    ):
+        raise StateError("runtime adapter returned an invalid creation receipt")
+    parsed_run_id: uuid.UUID | None = None
+    try:
+        parsed_run_id = uuid.UUID(run_id)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if parsed_run_id is None or str(parsed_run_id) != run_id:
+        raise StateError("runtime adapter returned an invalid creation receipt")
+    backend: RuntimeBackend | None = None
+    try:
+        backend = RuntimeBackend(raw_backend)
+    except (TypeError, ValueError):
+        pass
+    if backend is None:
+        raise StateError("runtime adapter returned an invalid creation receipt")
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+    return _CreationReceipt(name, run_id, dispatch_key, status)
+
+
+def resolve_run_request(
+    spec: RunSpec,
+    *,
+    runtime_kind: RuntimeKind = RuntimeKind.CLOUD_IMAGE,
+    requested_backend: str = "auto",
+    require_volume_binding: bool = False,
+    volume_intents: tuple[RunVolumeIntent, ...] | None = None,
+) -> ResolvedRunRequest:
+    """Resolve a typed create request without backend or state side effects."""
+
+    if not isinstance(runtime_kind, RuntimeKind):
+        raise TypeError("run resolver requires a RuntimeKind")
+    if runtime_kind is RuntimeKind.OCI_ROOT:
+        raise RuntimeCapabilityError(
+            RuntimeOperation.RUN,
+            DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+        )
+    if not isinstance(spec, RunSpec):
+        raise TypeError("run resolver requires a RunSpec")
+    if type(require_volume_binding) is not bool:
+        raise TypeError("volume binding requirement must be a boolean")
+    resolved_intents = (
+        tuple(
+            RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
+            for volume in spec.volumes
+        )
+        if volume_intents is None
+        else volume_intents
+    )
+    backend = RuntimeBackend(platforms.select_backend(spec.stack.base.arch, requested=requested_backend))
+    return ResolvedRunRequest(
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+        spec=spec,
+        volume_intents=resolved_intents,
+        attachments_bound=not require_volume_binding,
+    )
+
+
+def preflight_run_request(request: ResolvedRunRequest) -> ResolvedRunRequest:
+    """Run the existing backend-only create preflight and return ``request``.
+
+    This is an explicit compatibility boundary, not a capability token. It does
+    not promise freshness or cryptographically bind the observation to a later
+    adapter call; the operation-profile contract lands in a later slice.
+    """
+
+    if not isinstance(request, ResolvedRunRequest):
+        raise TypeError("run preflight requires a ResolvedRunRequest")
+    platforms.preflight(request.dispatch_key.backend.value)
+    return request
+
+
+def bind_run_request_volumes(
+    request: ResolvedRunRequest,
+    final_spec: RunSpec,
+    *,
+    dispatch_key: DispatchKey,
+) -> ResolvedRunRequest:
+    """Bind prepared physical volumes without changing any logical run input."""
+
+    if not isinstance(request, ResolvedRunRequest) or not isinstance(final_spec, RunSpec):
+        raise TypeError("volume binding requires a resolved request and final RunSpec")
+    if not isinstance(dispatch_key, DispatchKey) or dispatch_key != request.dispatch_key:
+        raise StateError("prepared run request changed its dispatch identity")
+    final_intents = tuple(
+        RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
+        for volume in final_spec.volumes
+    )
+    if final_intents != request.volume_intents:
+        raise StateError("prepared volume attachments changed logical volume intent")
+    backend = request.dispatch_key.backend
+    sources_match = all(
+        (volume.backend_name is not None if backend is RuntimeBackend.LIMA_VZ else volume.host_path is not None)
+        for volume in final_spec.volumes
+    )
+    if not sources_match:
+        raise StateError("prepared volume attachment source does not match resolved backend")
+    logical = request.spec
+    unchanged = (
+        logical.name == final_spec.name
+        and logical.stack == final_spec.stack
+        and logical.memory_mib == final_spec.memory_mib
+        and logical.vcpus == final_spec.vcpus
+        and logical.network == final_spec.network
+        and logical.writable_overlay == final_spec.writable_overlay
+        and logical.seed == final_spec.seed
+        and logical.ports == final_spec.ports
+        and logical.environment == final_spec.environment
+        and logical.cloud_init is final_spec.cloud_init
+    )
+    if not unchanged:
+        raise StateError("prepared volume binding changed immutable run inputs")
+    return ResolvedRunRequest(
+        dispatch_key=request.dispatch_key,
+        spec=final_spec,
+        volume_intents=request.volume_intents,
+        attachments_bound=True,
+    )
+
+
+def run(
+    request: ResolvedRunRequest,
+    *,
+    roots: StatePaths | None = None,
+) -> RunResult:
+    """Create one VM through the exact already-resolved backend adapter.
+
+    First-party callers must invoke :func:`preflight_run_request` before this
+    boundary. That sequencing is intentionally caller-owned until typed,
+    request-bound capability reports are introduced.
+    """
+
+    if not isinstance(request, ResolvedRunRequest):
+        raise TypeError("runtime run requires a ResolvedRunRequest")
+    if not request.attachments_bound:
+        raise StateError("run request volumes have not been prepared")
+    resolved_roots = roots or state.init_roots()
+    if request.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
+        raw_result = lima.run(request.spec, roots=resolved_roots)
+    else:
+        profile = platforms.resolve_domain_profile(
+            request.dispatch_key.backend.value,
+            request.spec.stack.base.arch,
+        )
+        raw_result = cloud_runtime.run(request.spec, roots=resolved_roots, profile=profile)
+
+    receipt = _parse_creation_receipt(raw_result)
+    if receipt.name != request.spec.name or receipt.dispatch_key != request.dispatch_key:
+        raise StateError("runtime adapter creation receipt does not match resolved request")
+    snapshot = state.read_run_ledger_snapshot(resolved_roots, request.spec.name)
+    if (
+        snapshot.record.name != receipt.name
+        or snapshot.record.run_id != receipt.run_id
+        or snapshot.record.dispatch_key != receipt.dispatch_key
+    ):
+        raise StateError("created run ledger identity does not match resolved request")
+    status = snapshot.state.get("status")
+    if status != receipt.status:
+        raise StateError("created run ledger did not reach running status")
+    guest_ip = snapshot.state.get("guest_ip")
+    try:
+        return RunResult(
+            record=snapshot.record,
+            status=status,
+            ready=True,
+            attachment_mode=RunAttachmentMode.DETACHED,
+            guest_ip=guest_ip,
+        )
+    except (TypeError, ValueError):
+        raise StateError("created run ledger has invalid result fields") from None
 
 
 def resolve_existing_run(name: str, *, roots: StatePaths | None = None) -> ExistingRunRecord:
@@ -423,12 +628,16 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
 
 
 __all__ = (
+    "bind_run_request_volumes",
     "inspect_run",
     "logs",
+    "preflight_run_request",
     "ps",
     "reconcile",
     "resolve_existing_run",
+    "resolve_run_request",
     "rm",
+    "run",
     "start",
     "stop",
 )

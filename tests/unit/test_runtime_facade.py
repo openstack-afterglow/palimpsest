@@ -29,7 +29,6 @@ _EXPECTED_PUBLIC_API = (
 )
 _LEGACY_RUNTIME_IMPORTERS = {
     "cli.py",
-    "project_adapter.py",
 }
 
 
@@ -122,10 +121,41 @@ def test_build_and_project_adapter_use_the_split_owners() -> None:
     assert "runtime._get_domain_run_id" not in adapter_source
     for operation in ("inspect_run", "start", "stop", "rm", "logs"):
         assert f"runtime_dispatch.{operation}(" in adapter_source
+    assert "runtime_dispatch.run(" in adapter_source
     for operation in ("start", "stop", "rm", "logs"):
         assert f"runtime_dispatch.{operation}(" in ui_source
     assert "lima.is_lima_run(" not in adapter_source
     assert "state.read_run_state(" not in ui_source
+
+
+def test_first_party_cli_and_project_create_only_through_dispatcher() -> None:
+    source_root = _source_root()
+    for filename in ("cli.py", "project_adapter.py"):
+        tree = ast.parse((source_root / filename).read_text(encoding="utf-8"))
+        forbidden: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if (
+                isinstance(function, ast.Attribute)
+                and function.attr == "run"
+                and isinstance(function.value, ast.Name)
+                and function.value.id in {"cloud_runtime", "lima", "runtime"}
+            ):
+                forbidden.append(f"{function.value.id}.run")
+            elif isinstance(function, ast.Name) and function.id == "run":
+                forbidden.append("run")
+        assert forbidden == [], (filename, forbidden)
+
+    cli_source = (source_root / "cli.py").read_text(encoding="utf-8")
+    adapter_source = (source_root / "project_adapter.py").read_text(encoding="utf-8")
+    assert "runtime_dispatch.resolve_run_request(" in cli_source
+    assert "runtime_dispatch.preflight_run_request(" in cli_source
+    assert "runtime_dispatch.run(" in cli_source
+    assert "runtime_dispatch.resolve_run_request(" in adapter_source
+    assert "runtime_dispatch.preflight_run_request(" in adapter_source
+    assert "runtime_dispatch.bind_run_request_volumes(" in adapter_source
 
 
 def test_first_party_callers_cannot_use_the_legacy_cloud_bulk_reconcile_bypass() -> None:

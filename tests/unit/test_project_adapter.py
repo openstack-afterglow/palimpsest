@@ -31,10 +31,17 @@ from palimpsest_local.runtime_types import (
     DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    ResolvedRunRequest,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
+    RunVolumeIntent,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_backend_only_create_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "preflight", lambda _backend: None)
 
 
 def _roots(tmp_path: Path) -> state.StatePaths:
@@ -121,7 +128,7 @@ def _write_project_service_ledger(
 def test_desired_digest_binds_resolved_environment_and_runtime_stack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     image_digest = "sha256:" + "a" * 64
     project = _project(
         tmp_path,
@@ -229,10 +236,16 @@ def test_kvm_port_forwarding_fails_during_project_preflight(tmp_path: Path, monk
     ports: ["18080:8080"]
 """,
     )
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter, "preflight_kvm_volume_support", lambda: None)
+    backend_preflights: list[str] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "preflight",
+        lambda backend: backend_preflights.append(backend),
+    )
     callbacks = project_adapter.build_project_callbacks(project, _roots(tmp_path), lambda _service: _stack(tmp_path))
     service = project.services["api"]
     resolved = callbacks.resolve(project, service, "demo-api-1")
@@ -245,6 +258,7 @@ def test_kvm_port_forwarding_fails_during_project_preflight(tmp_path: Path, monk
 
     with pytest.raises(ArtifactValidationError, match="per-domain inbound forwarding"):
         callbacks.preflight((prepared,))
+    assert backend_preflights == []
 
 
 def test_new_kvm_service_receives_project_block_volume_and_environment(
@@ -266,27 +280,40 @@ services:
     )
     roots = _roots(tmp_path)
     volume_path = tmp_path / "data.raw"
-    volume_path.write_bytes(b"raw-volume")
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    events: list[str] = []
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "preflight",
+        lambda _backend: events.append("preflight"),
+    )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter.kvm, "validate_domain_name_available", lambda _name: None)
     monkeypatch.setattr(project_adapter, "kvm_volume_path", lambda *_args: volume_path)
-    monkeypatch.setattr(
-        project_adapter,
-        "verify_kvm_volume",
-        lambda *_args, **_kwargs: SimpleNamespace(path=volume_path),
-    )
+    monkeypatch.setattr(project_adapter, "preflight_kvm_volume_support", lambda: None)
+
+    def ensure_volume(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        events.append("prepare")
+        volume_path.write_bytes(b"raw-volume")
+        return SimpleNamespace(path=volume_path)
+
     monkeypatch.setattr(
         project_adapter,
         "ensure_kvm_volume",
-        lambda *_args, **_kwargs: SimpleNamespace(path=volume_path),
+        ensure_volume,
     )
-    received: list[object] = []
+    received: list[ResolvedRunRequest] = []
+
+    def run(request: ResolvedRunRequest, **_kwargs: object) -> dict[str, str]:
+        events.append("run")
+        received.append(request)
+        return {"status": "running"}
+
     monkeypatch.setattr(
-        project_adapter.runtime,
+        project_adapter.runtime_dispatch,
         "run",
-        lambda spec, **_kwargs: received.append(spec) or {"status": "running"},
+        run,
     )
     callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
     service = project.services["api"]
@@ -302,7 +329,11 @@ services:
     callbacks.prepare((prepared,))
     callbacks.start(prepared)
 
-    spec = received[0]
+    request = received[0]
+    assert events == ["preflight", "prepare", "run"]
+    assert request.attachments_bound is True
+    assert request.dispatch_key is resolved.request.dispatch_key
+    spec = request.spec
     assert spec.environment == (("APP_MODE", "development"),)
     assert spec.volumes[0].host_path == volume_path
     assert spec.volumes[0].mount_path == "/var/lib/data"
@@ -321,7 +352,7 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
     )
     roots = _roots(tmp_path)
     _write_run_ledger(roots, "demo-api-1", backend="lima-vz")
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     monkeypatch.setattr(
         project_adapter.lima,
@@ -1022,7 +1053,7 @@ def test_volume_deletion_uses_ledger_backend_binding(tmp_path: Path, monkeypatch
 def test_managed_default_network_rejects_non_nat_driver_before_backend_use(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     project = _project(
         tmp_path,
         f"""networks:
@@ -1043,7 +1074,7 @@ def test_kvm_preflight_rejects_live_name_collision_before_volume_prepare(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     project = _project(
         tmp_path,
         f"""volumes:
@@ -1120,9 +1151,9 @@ services:
     )
     received: list[object] = []
     monkeypatch.setattr(
-        project_adapter.lima,
+        project_adapter.runtime_dispatch,
         "run",
-        lambda spec, **_kwargs: received.append(spec) or {"status": "running"},
+        lambda request, **_kwargs: received.append(request.spec) or {"status": "running"},
     )
     callbacks = project_adapter.build_project_callbacks(
         project,
@@ -1162,7 +1193,7 @@ services:
     assert received[-1].volumes[0].format is False
 
     monkeypatch.setattr(
-        project_adapter.lima,
+        project_adapter.runtime_dispatch,
         "run",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(LifecycleError("ssh handshake failed")),
     )
@@ -1279,7 +1310,7 @@ services:
     roots = _roots(tmp_path)
     volume_path = tmp_path / "data.raw"
     volume_path.write_bytes(b"owned")
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter.kvm, "validate_domain_name_available", lambda _name: None)
@@ -1327,32 +1358,74 @@ def test_invalid_final_run_spec_is_rejected_during_read_only_preflight(
         second
 """,
     )
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     callbacks = project_adapter.build_project_callbacks(project, _roots(tmp_path), lambda _service: _stack(tmp_path))
     service = project.services["api"]
     run_name = service_run_name(project, "api")
-    prepared = PreparedService(
+    with pytest.raises(ArtifactValidationError, match="single NUL-free line"):
+        callbacks.resolve(project, service, run_name)
+
+
+def test_project_resolution_uses_typed_runtime_dispatch_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path, f"services:\n  api:\n    image: sha256:{'a' * 64}\n")
+    selected: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda arch, requested="auto": selected.append((arch, requested)) or "kvm",
+    )
+    callbacks = project_adapter.build_project_callbacks(
         project,
-        service,
-        ServicePlan("api", run_name, "recreate", "sha256:" + "f" * 64, "running"),
-        callbacks.resolve(project, service, run_name),
+        _roots(tmp_path),
+        lambda _service: _stack(tmp_path),
     )
 
-    with pytest.raises(ArtifactValidationError, match="single NUL-free line"):
-        callbacks.preflight((prepared,))
+    resolved = callbacks.resolve(project, project.services["api"], "demo-api-1")
+
+    assert resolved.request.dispatch_key == DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    assert resolved.request.spec.name == "demo-api-1"
+    assert resolved.request.volume_intents == ()
+    assert selected == [("x86_64", "auto"), ("x86_64", "kvm")]
 
 
-def test_backend_for_stack_uses_platforms_select_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    stack = _stack(tmp_path)
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda arch: "lima-vz")
-    assert project_adapter._backend_for_stack(stack) == "lima-vz"
+def test_project_resolution_preserves_ordered_nonreflective_volume_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""volumes:
+  alpha: {{size: 1GiB}}
+  beta: {{size: 1GiB}}
+services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - alpha:/srv/alpha:ro
+      - beta:/srv/beta
+""",
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda _arch, **_kwargs: "kvm",
+    )
+    callbacks = project_adapter.build_project_callbacks(project, _roots(tmp_path), lambda _service: _stack(tmp_path))
 
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda arch: "libvirt-hvf")
-    assert project_adapter._backend_for_stack(stack) == "libvirt-hvf"
+    resolved = callbacks.resolve(project, project.services["api"], "demo-api-1")
 
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda arch: "kvm")
-    assert project_adapter._backend_for_stack(stack) == "kvm"
+    assert resolved.request.attachments_bound is False
+    assert resolved.request.spec.volumes == ()
+    assert resolved.request.volume_intents == (
+        RunVolumeIntent("alpha", "/srv/alpha", "ext4", True),
+        RunVolumeIntent("beta", "/srv/beta", "ext4", False),
+    )
+    assert "/srv/alpha" not in repr(resolved)
+    assert "alpha" not in repr(resolved)
 
 
 def test_libvirt_hvf_backend_routes_like_kvm_for_ports_and_volumes(
@@ -1367,9 +1440,17 @@ def test_libvirt_hvf_backend_routes_like_kvm_for_ports_and_volumes(
     ports: ["18080:8080"]
 """,
     )
-    monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "libvirt-hvf")
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda _arch, **_kw: "libvirt-hvf",
+    )
     monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
-    callbacks = project_adapter.build_project_callbacks(project, _roots(tmp_path), lambda _service: _stack(tmp_path))
+    callbacks = project_adapter.build_project_callbacks(
+        project,
+        _roots(tmp_path),
+        lambda _service: _stack(tmp_path, arch="aarch64"),
+    )
     service = project.services["api"]
     resolved = callbacks.resolve(project, service, "demo-api-1")
     assert resolved.backend == "libvirt-hvf"

@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import kvm, lima, platforms, runtime, runtime_dispatch, state
+from . import kvm, lima, runtime_dispatch, state
 from .digest import digest_file, require_file_digest
 from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
@@ -40,18 +40,34 @@ from .project_volumes import (
     verify_lima_volume,
 )
 from .refs import PortForward, RunSpec, StackRef, VolumeAttachment
-from .runtime_types import ExpectedRunIdentity
+from .runtime_types import ExpectedRunIdentity, ResolvedRunRequest, RunVolumeIntent
 
 _MIB = 1024 * 1024
 
 
 @dataclass(frozen=True)
 class ResolvedProjectService:
-    stack: StackRef
-    backend: str
-    network: str
-    environment: tuple[tuple[str, str], ...] = field(repr=False)
-    cloud_init: object | None = field(repr=False)
+    request: ResolvedRunRequest = field(repr=False)
+
+    @property
+    def stack(self) -> StackRef:
+        return self.request.spec.stack
+
+    @property
+    def backend(self) -> str:
+        return self.request.dispatch_key.backend.value
+
+    @property
+    def network(self) -> str:
+        return self.request.spec.network
+
+    @property
+    def environment(self) -> tuple[tuple[str, str], ...]:
+        return self.request.spec.environment
+
+    @property
+    def cloud_init(self) -> object | None:
+        return self.request.spec.cloud_init
 
 
 @dataclass(frozen=True)
@@ -63,10 +79,6 @@ class _ResolvedExecutionInputs:
 
 
 StackResolver = Callable[[ServiceSpec], StackRef]
-
-
-def _backend_for_stack(stack: StackRef) -> str:
-    return platforms.select_backend(stack.base.arch)
 
 
 def _network_for_service(project: Project, service: ServiceSpec, backend: str) -> str:
@@ -293,6 +305,7 @@ def build_project_callbacks(
     execution_inputs: dict[str, _ResolvedExecutionInputs] = {}
     attachment_cache: dict[tuple[str, str], VolumeAttachment] = {}
     preexisting_volume_keys: set[tuple[str, str]] = set()
+    preflighted_requests: dict[str, ResolvedRunRequest] = {}
     prepare_complete = False
 
     def resolved_inputs(_project: Project, service: ServiceSpec) -> _ResolvedExecutionInputs:
@@ -349,17 +362,49 @@ def build_project_callbacks(
     def desired_digest(_project: Project, service: ServiceSpec) -> str:
         return resolved_inputs(_project, service).digest
 
-    def resolve(_project: Project, service: ServiceSpec, _run_name: str) -> ResolvedProjectService:
+    def resolve(_project: Project, service: ServiceSpec, run_name: str) -> ResolvedProjectService:
         inputs = resolved_inputs(_project, service)
-        backend = _backend_for_stack(inputs.stack)
-        network = _network_for_service(project, service, backend)
-        return ResolvedProjectService(
+        ports = tuple(
+            PortForward(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in service.ports
+        )
+        provisional_spec = RunSpec(
+            name=run_name,
             stack=inputs.stack,
-            backend=backend,
-            network=network,
+            memory_mib=service.memory_mib,
+            vcpus=service.vcpus,
+            ports=ports,
             environment=inputs.environment,
             cloud_init=inputs.cloud_init,
         )
+        provisional = runtime_dispatch.resolve_run_request(provisional_spec)
+        network = _network_for_service(project, service, provisional.dispatch_key.backend.value)
+        logical_spec = RunSpec(
+            name=run_name,
+            stack=inputs.stack,
+            memory_mib=service.memory_mib,
+            vcpus=service.vcpus,
+            network=network,
+            ports=ports,
+            environment=inputs.environment,
+            cloud_init=inputs.cloud_init,
+        )
+        request = runtime_dispatch.resolve_run_request(
+            logical_spec,
+            requested_backend=provisional.dispatch_key.backend.value,
+            require_volume_binding=bool(service.volumes),
+            volume_intents=tuple(
+                RunVolumeIntent(
+                    project.volumes[mount.source].name,
+                    mount.target,
+                    "ext4",
+                    mount.read_only,
+                )
+                for mount in service.volumes
+            ),
+        )
+        if request.dispatch_key != provisional.dispatch_key:
+            raise StateError("project runtime backend changed while the request was resolved")
+        return ResolvedProjectService(request)
 
     def _allowed_lima_instance(item: PreparedService) -> str | None:
         if item.plan.action == "start":
@@ -603,6 +648,7 @@ def build_project_callbacks(
         nonlocal prepare_complete
         attachment_cache.clear()
         preexisting_volume_keys.clear()
+        preflighted_requests.clear()
         prepare_complete = False
         ledger = read_project_state(project, roots)
         ledger_volumes = {} if ledger is None else ledger.volumes
@@ -701,6 +747,21 @@ def build_project_callbacks(
                             read_only=False,
                             format=False,
                         )
+
+        # Preserve existing project error precedence: backend/tool probing is
+        # the final preflight step, after every pure reservation, spec, path,
+        # network, domain, and volume validation, and immediately before the
+        # caller enters volume preparation. These cached requests are not
+        # stale-proof capability tokens; T14 will add that later contract.
+        completed_preflights: dict[str, ResolvedRunRequest] = {}
+        for item in prepared:
+            if item.plan.action not in {"create", "recreate"} or item.plan.preserve_config:
+                continue
+            resolved = item.resolved
+            if not isinstance(resolved, ResolvedProjectService):
+                raise LifecycleError("project resolver returned an invalid service payload")
+            completed_preflights[item.plan.service] = runtime_dispatch.preflight_run_request(resolved.request)
+        preflighted_requests.update(completed_preflights)
 
     def prepare(prepared: tuple[PreparedService, ...]) -> tuple[ManagedVolume, ...]:
         nonlocal prepare_complete
@@ -819,9 +880,17 @@ def build_project_callbacks(
             environment=resolved.environment,
             cloud_init=resolved.cloud_init,
         )
+        logical_request = preflighted_requests.get(item.plan.service)
+        if logical_request is not resolved.request:
+            raise StateError("project run request was not preflighted before volume preparation")
+        request = runtime_dispatch.bind_run_request_volumes(
+            logical_request,
+            spec,
+            dispatch_key=resolved.request.dispatch_key,
+        )
         if resolved.backend == "lima-vz":
             try:
-                return lima.run(spec, roots=roots)
+                return runtime_dispatch.run(request, roots=roots)
             except Exception as exc:
                 if spec.volumes and not any(volume.format for volume in spec.volumes):
                     detail = str(exc).strip() or type(exc).__name__
@@ -831,7 +900,7 @@ def build_project_callbacks(
                         "contents before explicitly deleting any named volume."
                     ) from exc
                 raise
-        return runtime.run(spec, roots=roots)
+        return runtime_dispatch.run(request, roots=roots)
 
     def stop_service(
         name: str,

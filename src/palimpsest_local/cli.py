@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__, completion, inventory, lima, platforms, runtime_dispatch, ui
+from . import __version__, completion, inventory, lima, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
@@ -78,7 +78,6 @@ from .registry import (
 from .runtime import (
     commit,
     exec_command,
-    run,
     shell_command,
 )
 from .state import (
@@ -1652,19 +1651,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
             vcpus=args.vcpus,
             network=args.network,
         )
-        backend = platforms.select_backend(stack.base.arch, requested=args.backend)
-        platforms.preflight(backend)
-        if backend == platforms.BACKEND_HVF:
+        request = runtime_dispatch.resolve_run_request(run_spec, requested_backend=args.backend)
+        runtime_dispatch.preflight_run_request(request)
+        if request.dispatch_key.backend.value == "libvirt-hvf":
             print("warning: libvirt-hvf is experimental", file=sys.stderr)
-        res_dict = (
-            lima.run(run_spec, roots=roots)
-            if backend == platforms.BACKEND_LIMA
-            else run(run_spec, roots=roots, profile=platforms.resolve_domain_profile(backend, stack.base.arch))
-        )
-        if res_dict.get("backend") == "lima-vz":
+        result = runtime_dispatch.run(request, roots=roots)
+        if result.backend.value == "lima-vz":
             print(f"limactl shell {args.name}")
         else:
-            print(res_dict.get("guest_ip", args.name))
+            # Preserve the legacy dict result's ``get("guest_ip", name)``
+            # behavior: cloud/HVF states contain the key with a null value.
+            print(result.guest_ip)
 
     elif op == "ps":
         aggregation = runtime_dispatch.ps(roots=roots)

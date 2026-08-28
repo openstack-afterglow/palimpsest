@@ -7,6 +7,7 @@ import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -14,6 +15,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .errors import PalimpsestError
+from .refs import RunSpec
 
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -30,6 +32,7 @@ class RuntimeBackend(StrEnum):
 
 
 class RuntimeOperation(StrEnum):
+    RUN = "run"
     START = "start"
     STOP = "stop"
     RM = "rm"
@@ -37,6 +40,16 @@ class RuntimeOperation(StrEnum):
     LOGS = "logs"
     PS = "ps"
     RECONCILE = "reconcile"
+
+
+class RunAttachmentMode(StrEnum):
+    """How a successful create result is attached to its caller.
+
+    Foreground process sessions are intentionally a later contract. The typed
+    create boundary currently returns only completed, detached VM launches.
+    """
+
+    DETACHED = "detached"
 
 
 ALLOWED_RUNTIME_COMBINATIONS = frozenset(
@@ -59,6 +72,127 @@ class DispatchKey:
             raise TypeError("dispatch key requires RuntimeKind and RuntimeBackend")
         if (self.runtime_kind, self.backend) not in ALLOWED_RUNTIME_COMBINATIONS:
             raise ValueError(f"unsupported runtime/backend combination: {self.runtime_kind.value}/{self.backend.value}")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RunVolumeIntent:
+    """Ordered logical volume policy, without a host or backend attachment."""
+
+    name: str
+    target: str
+    filesystem: str = "ext4"
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _SUMMARY_LOGICAL_NAME_RE.fullmatch(self.name) is None:
+            raise ValueError("run volume intent has an invalid name")
+        if not _valid_mount_path(self.target):
+            raise ValueError("run volume intent has an invalid target")
+        if self.filesystem != "ext4":
+            raise ValueError("run volume intent has an invalid filesystem")
+        if type(self.read_only) is not bool:
+            raise TypeError("run volume intent read-only policy must be a bool")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRunRequest:
+    """A pure create-time routing decision plus its non-reflective logical spec.
+
+    ``attachments_bound`` is false only while a project is still preparing
+    managed volume artifacts. It is deliberately not a capability token: the
+    current backend-only preflight has no freshness or request-binding contract.
+    """
+
+    dispatch_key: DispatchKey
+    spec: RunSpec = dataclass_field(repr=False)
+    volume_intents: tuple[RunVolumeIntent, ...] = dataclass_field(default=(), repr=False)
+    attachments_bound: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dispatch_key, DispatchKey):
+            raise TypeError("resolved run request requires a DispatchKey")
+        if not isinstance(self.spec, RunSpec):
+            raise TypeError("resolved run request requires a RunSpec")
+        if not isinstance(self.volume_intents, tuple) or not all(
+            isinstance(intent, RunVolumeIntent) for intent in self.volume_intents
+        ):
+            raise TypeError("resolved run request requires immutable volume intents")
+        intent_names = tuple(intent.name for intent in self.volume_intents)
+        intent_targets = tuple(intent.target for intent in self.volume_intents)
+        if len(intent_names) != len(set(intent_names)) or len(intent_targets) != len(set(intent_targets)):
+            raise ValueError("resolved run request has duplicate volume intents")
+        if self.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE:
+            raise ValueError("OCI-root create requests are unavailable before the OCI input contract lands")
+        if type(self.attachments_bound) is not bool:
+            raise TypeError("resolved run request attachment binding must be a boolean")
+        if not self.attachments_bound and self.spec.volumes:
+            raise ValueError("an unbound logical run request cannot contain physical volume attachments")
+        if not self.attachments_bound and not self.volume_intents:
+            raise ValueError("an unbound logical run request requires volume intents")
+        if self.attachments_bound:
+            bound_intents = tuple(
+                RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
+                for volume in self.spec.volumes
+            )
+            if bound_intents != self.volume_intents:
+                raise ValueError("bound run attachments do not match logical volume intents")
+            sources_match = all(
+                (
+                    volume.backend_name is not None
+                    if self.dispatch_key.backend is RuntimeBackend.LIMA_VZ
+                    else volume.host_path is not None
+                )
+                for volume in self.spec.volumes
+            )
+            if not sources_match:
+                raise ValueError("bound volume attachment source does not match resolved backend")
+        if self.dispatch_key.backend in {RuntimeBackend.LIBVIRT_HVF, RuntimeBackend.LIMA_VZ}:
+            if self.spec.stack.base.arch != "aarch64":
+                raise ValueError("selected runtime backend requires an aarch64 cloud image")
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """Safe transport-neutral projection of a completed create operation."""
+
+    record: ExistingRunRecord
+    status: str
+    ready: bool
+    attachment_mode: RunAttachmentMode
+    guest_ip: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("run result requires an ExistingRunRecord")
+        if (
+            not isinstance(self.status, str)
+            or self.status not in ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]
+        ):
+            raise ValueError("run result has an invalid runtime status")
+        if type(self.ready) is not bool:
+            raise TypeError("run result ready flag must be a bool")
+        if self.ready != (self.status == "running"):
+            raise ValueError("run result readiness does not match runtime status")
+        if not isinstance(self.attachment_mode, RunAttachmentMode):
+            raise TypeError("run result requires a RunAttachmentMode")
+        if self.guest_ip is not None and not _valid_ip(self.guest_ip):
+            raise ValueError("run result has an invalid guest IP")
+
+    @property
+    def name(self) -> str:
+        return self.record.name
+
+    @property
+    def run_id(self) -> str:
+        return self.record.run_id
+
+    @property
+    def runtime_kind(self) -> RuntimeKind:
+        return self.record.dispatch_key.runtime_kind
+
+    @property
+    def backend(self) -> RuntimeBackend:
+        return self.record.dispatch_key.backend
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,9 +571,13 @@ __all__ = (
     "DispatchKey",
     "ExistingRunRecord",
     "ExpectedRunIdentity",
+    "ResolvedRunRequest",
+    "RunAttachmentMode",
     "RunAggregationError",
     "RunAggregationResult",
+    "RunResult",
     "RunSummary",
+    "RunVolumeIntent",
     "RuntimeBackend",
     "RuntimeCapabilityError",
     "RuntimeKind",

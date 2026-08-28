@@ -13,6 +13,7 @@ import tempfile
 import uuid
 from collections import UserDict
 from collections.abc import Callable
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -21,18 +22,23 @@ import pytest
 
 from palimpsest_local import runtime_dispatch, state
 from palimpsest_local.errors import StateError
+from palimpsest_local.refs import ImageRef, RunSpec, StackRef, VolumeAttachment
 from palimpsest_local.runtime_types import (
     ALLOWED_RUNTIME_COMBINATIONS,
     DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    ResolvedRunRequest,
     RunAggregationError,
     RunAggregationResult,
+    RunAttachmentMode,
+    RunResult,
     RunSummary,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
     RuntimeOperation,
+    RunVolumeIntent,
 )
 
 
@@ -42,6 +48,31 @@ def _roots(tmp_path: Path) -> state.StatePaths:
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "XDG_STATE_HOME": str(tmp_path / "state"),
         }
+    )
+
+
+def _create_spec(
+    tmp_path: Path,
+    *,
+    arch: str = "x86_64",
+    name: str = "create-demo",
+    volumes: tuple[VolumeAttachment, ...] = (),
+) -> RunSpec:
+    content = f"cloud-{arch}".encode()
+    image = tmp_path / f"{name}-{arch}.qcow2"
+    image.write_bytes(content)
+    base = ImageRef(
+        "sha256:" + hashlib.sha256(content).hexdigest(),
+        "qcow2",
+        arch,  # type: ignore[arg-type]
+        None,
+        image,
+    )
+    return RunSpec(
+        name=name,
+        stack=StackRef(base, ()),
+        environment=(("PRIVATE_VALUE", "do-not-reflect"),),
+        volumes=volumes,
     )
 
 
@@ -165,6 +196,508 @@ def test_runtime_type_contract_has_only_the_phase_one_dispatch_combinations() ->
         DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
     with pytest.raises(TypeError, match="RuntimeKind and RuntimeBackend"):
         DispatchKey("cloud-image", "kvm")  # type: ignore[arg-type]
+
+
+def test_create_resolver_is_pure_and_request_does_not_reflect_its_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _create_spec(tmp_path)
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "select_backend",
+        lambda arch, requested="auto": calls.append((arch, requested)) or "kvm",
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "preflight",
+        lambda *_args, **_kwargs: pytest.fail("resolver entered backend preflight"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("resolver entered cloud adapter"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("resolver entered Lima adapter"),
+    )
+
+    request = runtime_dispatch.resolve_run_request(spec, requested_backend="kvm")
+
+    assert request.dispatch_key == DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    assert request.spec is spec
+    assert request.attachments_bound is True
+    assert calls == [("x86_64", "kvm")]
+    rendered = repr(request)
+    assert "do-not-reflect" not in rendered
+    assert str(spec.stack.base.local_path) not in rendered
+    with pytest.raises(FrozenInstanceError):
+        request.attachments_bound = False  # type: ignore[misc]
+
+
+def test_backend_only_create_preflight_is_explicit_and_not_a_capability_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        _create_spec(tmp_path),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", lambda backend: calls.append(backend))
+
+    returned = runtime_dispatch.preflight_run_request(request)
+
+    assert returned is request
+    assert calls == ["kvm"]
+    assert not hasattr(request, "capability_token")
+
+
+def test_oci_create_resolution_fails_before_host_or_runtime_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _create_spec(tmp_path)
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "select_backend",
+        lambda *_args, **_kwargs: pytest.fail("OCI resolver selected a host backend"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "preflight",
+        lambda *_args, **_kwargs: pytest.fail("OCI resolver entered backend preflight"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.state,
+        "resolve_roots",
+        lambda *_args, **_kwargs: pytest.fail("OCI resolver accessed runtime state"),
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as exc_info:
+        runtime_dispatch.resolve_run_request(
+            spec,
+            runtime_kind=RuntimeKind.OCI_ROOT,
+            requested_backend="lima-vz",
+        )
+
+    assert exc_info.value.operation is RuntimeOperation.RUN
+    assert exc_info.value.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+    assert str(exc_info.value) == "runtime operation 'run' is unavailable for oci-root/kvm"
+
+
+def test_volume_binding_changes_only_prepared_attachments(tmp_path: Path) -> None:
+    logical_spec = _create_spec(tmp_path)
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    intent = RunVolumeIntent("data", "/srv/data", "ext4", False)
+    request = ResolvedRunRequest(key, logical_spec, (intent,), attachments_bound=False)
+    volume_path = tmp_path / "data.raw"
+    volume_path.write_bytes(b"volume")
+    attachment = VolumeAttachment("data", "/srv/data", host_path=volume_path)
+    final_spec = RunSpec(**{**logical_spec.__dict__, "volumes": (attachment,)})
+
+    bound = runtime_dispatch.bind_run_request_volumes(request, final_spec, dispatch_key=key)
+
+    assert bound.dispatch_key == key
+    assert bound.attachments_bound is True
+    assert bound.volume_intents == (intent,)
+    assert bound.spec.volumes == (attachment,)
+    with pytest.raises(StateError, match="immutable run inputs"):
+        runtime_dispatch.bind_run_request_volumes(
+            request,
+            RunSpec(**{**final_spec.__dict__, "memory_mib": final_spec.memory_mib + 1}),
+            dispatch_key=key,
+        )
+    with pytest.raises(StateError, match="dispatch identity"):
+        runtime_dispatch.bind_run_request_volumes(
+            request,
+            final_spec,
+            dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIBVIRT_HVF),
+        )
+
+
+def test_volume_binding_rejects_missing_extra_reordered_or_substituted_intent(tmp_path: Path) -> None:
+    logical_spec = _create_spec(tmp_path)
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    intents = (
+        RunVolumeIntent("alpha", "/srv/alpha", "ext4", False),
+        RunVolumeIntent("beta", "/srv/beta", "ext4", True),
+    )
+    request = ResolvedRunRequest(key, logical_spec, intents, attachments_bound=False)
+    alpha_path = tmp_path / "alpha.raw"
+    beta_path = tmp_path / "beta.raw"
+    gamma_path = tmp_path / "gamma.raw"
+    for path in (alpha_path, beta_path, gamma_path):
+        path.write_bytes(path.name.encode())
+    alpha = VolumeAttachment("alpha", "/srv/alpha", host_path=alpha_path)
+    beta = VolumeAttachment("beta", "/srv/beta", host_path=beta_path, read_only=True)
+    gamma = VolumeAttachment("gamma", "/srv/gamma", host_path=gamma_path)
+
+    invalid_attachments = (
+        (alpha,),
+        (alpha, beta, gamma),
+        (beta, alpha),
+        (alpha, VolumeAttachment("beta", "/srv/substitute", host_path=beta_path, read_only=True)),
+        (alpha, VolumeAttachment("beta", "/srv/beta", host_path=beta_path, read_only=False)),
+    )
+    for attachments in invalid_attachments:
+        with pytest.raises(StateError, match="logical volume intent"):
+            runtime_dispatch.bind_run_request_volumes(
+                request,
+                RunSpec(**{**logical_spec.__dict__, "volumes": attachments}),
+                dispatch_key=key,
+            )
+
+    assert "srv/alpha" not in repr(request)
+    assert "alpha" not in repr(request)
+
+
+def test_bound_request_constructor_rejects_attachment_source_for_other_backend(tmp_path: Path) -> None:
+    intent = RunVolumeIntent("data", "/srv/data")
+    lima_attachment = VolumeAttachment("data", "/srv/data", backend_name="data-disk")
+    kvm_spec = _create_spec(tmp_path, volumes=(lima_attachment,))
+    with pytest.raises(ValueError, match="source does not match resolved backend"):
+        ResolvedRunRequest(
+            DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+            kvm_spec,
+            (intent,),
+        )
+
+    host_path = tmp_path / "data.raw"
+    host_path.write_bytes(b"data")
+    kvm_attachment = VolumeAttachment("data", "/srv/data", host_path=host_path)
+    lima_spec = _create_spec(tmp_path, arch="aarch64", name="lima-source", volumes=(kvm_attachment,))
+    with pytest.raises(ValueError, match="source does not match resolved backend"):
+        ResolvedRunRequest(
+            DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+            lima_spec,
+            (intent,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch", "attachment_kind"),
+    [
+        (RuntimeBackend.KVM, "x86_64", "backend-name"),
+        (RuntimeBackend.LIBVIRT_HVF, "aarch64", "backend-name"),
+        (RuntimeBackend.LIMA_VZ, "aarch64", "host-path"),
+    ],
+)
+def test_volume_binder_rejects_attachment_source_for_other_backend(
+    tmp_path: Path,
+    backend: RuntimeBackend,
+    arch: str,
+    attachment_kind: str,
+) -> None:
+    logical = _create_spec(tmp_path, arch=arch, name=f"bind-{backend.value}")
+    intent = RunVolumeIntent("data", "/srv/data")
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+        logical,
+        (intent,),
+        attachments_bound=False,
+    )
+    if attachment_kind == "backend-name":
+        attachment = VolumeAttachment("data", "/srv/data", backend_name="data-disk")
+    else:
+        host_path = tmp_path / f"{backend.value}.raw"
+        host_path.write_bytes(b"data")
+        attachment = VolumeAttachment("data", "/srv/data", host_path=host_path)
+
+    with pytest.raises(StateError, match="source does not match resolved backend"):
+        runtime_dispatch.bind_run_request_volumes(
+            request,
+            RunSpec(**{**logical.__dict__, "volumes": (attachment,)}),
+            dispatch_key=request.dispatch_key,
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch", "adapter"),
+    [
+        (RuntimeBackend.KVM, "x86_64", "cloud"),
+        (RuntimeBackend.LIBVIRT_HVF, "aarch64", "cloud"),
+        (RuntimeBackend.LIMA_VZ, "aarch64", "lima"),
+    ],
+)
+def test_create_dispatch_uses_only_the_resolved_backend_without_reselection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: RuntimeBackend,
+    arch: str,
+    adapter: str,
+) -> None:
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+        _create_spec(tmp_path, arch=arch, name=f"create-{backend.value}"),
+    )
+    calls: list[tuple[str, object]] = []
+    profile = object()
+    roots = _roots(tmp_path / "roots")
+
+    def write_success(spec: RunSpec, selected_backend: RuntimeBackend) -> dict[str, str]:
+        _rpaths, run_id = _write_ledger(
+            roots,
+            name=spec.name,
+            record={
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": selected_backend.value,
+                "status": "running",
+                "guest_ip": "192.0.2.10",
+                "base": {"local_path": "/private/SENSITIVE_VALUE/base.qcow2"},
+                "volumes": [{"host_path": "/private/SENSITIVE_VALUE/data.raw"}],
+            },
+        )
+        return {
+            "name": spec.name,
+            "run_id": run_id,
+            "backend": selected_backend.value,
+            "status": "running",
+            "guest_ip": "198.51.100.200",
+            "local_path": "/private/SENSITIVE_VALUE/root.raw",
+        }
+
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "select_backend",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher reselected backend"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "preflight",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher repeated caller-owned preflight"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "resolve_domain_profile",
+        lambda selected, selected_arch: calls.append(("profile", (selected, selected_arch))) or profile,
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "run",
+        lambda spec, roots=None, profile=None: (
+            calls.append(("cloud", (spec, roots, profile))) or write_success(spec, backend)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        "run",
+        lambda spec, roots=None: calls.append(("lima", (spec, roots))) or write_success(spec, backend),
+    )
+
+    result = runtime_dispatch.run(request, roots=roots)
+
+    assert isinstance(result, RunResult)
+    assert result.name == request.spec.name
+    assert result.backend is backend
+    assert result.runtime_kind is RuntimeKind.CLOUD_IMAGE
+    assert result.status == "running"
+    assert result.ready is True
+    assert result.attachment_mode is RunAttachmentMode.DETACHED
+    assert result.guest_ip == "192.0.2.10"
+    assert "SENSITIVE_VALUE" not in repr(result)
+    assert "local_path" not in repr(result)
+    assert [name for name, _value in calls if name in {"cloud", "lima"}] == [adapter]
+    if adapter == "cloud":
+        assert calls[0] == ("profile", (backend.value, arch))
+        assert calls[1][1][2] is profile  # type: ignore[index]
+    else:
+        assert all(name != "profile" for name, _value in calls)
+
+
+@pytest.mark.parametrize("field", ["name", "run_id", "backend", "status"])
+def test_malformed_creation_receipt_never_retains_attacker_values_in_exception(field: str) -> None:
+    raw = {
+        "name": "demo",
+        "run_id": "862ffb44-6795-4618-b2d8-c0750439fac3",
+        "backend": "kvm",
+        "status": "running",
+    }
+    raw[field] = "SENSITIVE_VALUE"
+
+    with pytest.raises(StateError) as exc_info:
+        runtime_dispatch._parse_creation_receipt(raw)
+
+    error = exc_info.value
+    assert str(error) == "runtime adapter returned an invalid creation receipt"
+    assert "SENSITIVE_VALUE" not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_create_dispatch_rejects_unbound_project_request_before_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        _create_spec(tmp_path),
+        (RunVolumeIntent("data", "/srv/data"),),
+        attachments_bound=False,
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unbound request entered adapter"),
+    )
+    with pytest.raises(StateError, match="volumes have not been prepared"):
+        runtime_dispatch.run(request, roots=_roots(tmp_path / "roots"))
+
+
+@pytest.mark.parametrize(
+    ("ledger_backend", "ledger_status", "message"),
+    [
+        ("lima-vz", "running", "identity does not match"),
+        ("kvm", "stopped", "did not reach running"),
+    ],
+)
+def test_create_dispatch_rejects_mismatched_or_not_running_post_read_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_backend: str,
+    ledger_status: str,
+    message: str,
+) -> None:
+    roots = _roots(tmp_path)
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        _create_spec(tmp_path),
+    )
+
+    def adapter(spec: RunSpec, **_kwargs: object) -> dict[str, str]:
+        _rpaths, run_id = _write_ledger(
+            roots,
+            name=spec.name,
+            record={
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": ledger_backend,
+                "status": ledger_status,
+            },
+        )
+        return {
+            "name": spec.name,
+            "run_id": run_id,
+            "backend": "kvm",
+            "status": "running",
+            "local_path": "/private/SENSITIVE_VALUE/root.raw",
+        }
+
+    monkeypatch.setattr(runtime_dispatch.platforms, "resolve_domain_profile", lambda *_args: object())
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "run", adapter)
+
+    with pytest.raises(StateError, match=message) as exc_info:
+        runtime_dispatch.run(request, roots=roots)
+    assert "SENSITIVE_VALUE" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("attack", ["replace-after-receipt", "pre-existing-ledger"])
+def test_creation_receipt_rejects_same_name_backend_ledger_identity_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    roots = _roots(tmp_path)
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        _create_spec(tmp_path, name="receipt-attack"),
+    )
+    receipt_run_id = str(uuid.uuid4())
+    rpaths = state.run_paths(roots, request.spec.name)
+    if attack == "pre-existing-ledger":
+        rpaths, _preexisting_run_id = _write_ledger(
+            roots,
+            name=request.spec.name,
+            record={"backend": "kvm", "status": "running"},
+        )
+
+    def adapter(_spec: RunSpec, **_kwargs: object) -> dict[str, str]:
+        nonlocal rpaths
+        if attack == "replace-after-receipt":
+            rpaths, _created_run_id = _write_ledger(
+                roots,
+                name=request.spec.name,
+                owner={"schema_version": 1, "run_id": receipt_run_id, "name": request.spec.name},
+                record={"backend": "kvm", "status": "running"},
+            )
+            replacement_run_id = str(uuid.uuid4())
+            rpaths.owner.write_text(
+                json.dumps({"schema_version": 1, "run_id": replacement_run_id, "name": request.spec.name}) + "\n",
+                encoding="utf-8",
+            )
+            rpaths.state.write_text(
+                json.dumps(
+                    {
+                        "name": request.spec.name,
+                        "run_id": replacement_run_id,
+                        "backend": "kvm",
+                        "status": "running",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return {
+            "name": request.spec.name,
+            "run_id": receipt_run_id,
+            "backend": "kvm",
+            "status": "running",
+        }
+
+    monkeypatch.setattr(runtime_dispatch.platforms, "resolve_domain_profile", lambda *_args: object())
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "run", adapter)
+
+    with pytest.raises(StateError, match="ledger identity does not match"):
+        runtime_dispatch.run(request, roots=roots)
+
+
+def test_create_dispatch_fails_closed_when_adapter_does_not_leave_a_readable_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    request = ResolvedRunRequest(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        _create_spec(tmp_path),
+    )
+    monkeypatch.setattr(runtime_dispatch.platforms, "resolve_domain_profile", lambda *_args: object())
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "run",
+        lambda spec, **_kwargs: {
+            "name": spec.name,
+            "run_id": str(uuid.uuid4()),
+            "backend": "kvm",
+            "status": "running",
+            "guest_ip": "192.0.2.20",
+        },
+    )
+
+    with pytest.raises(StateError, match="securely read run ledger"):
+        runtime_dispatch.run(request, roots=roots)
+
+
+def test_run_result_public_constructor_validates_safe_immutable_fields() -> None:
+    record = ExistingRunRecord(
+        name="demo",
+        run_id="862ffb44-6795-4618-b2d8-c0750439fac3",
+        state_schema_version=2,
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    result = RunResult(record, "running", True, RunAttachmentMode.DETACHED, "192.0.2.10")
+
+    assert result.name == "demo"
+    assert result.run_id == record.run_id
+    with pytest.raises(FrozenInstanceError):
+        result.ready = False  # type: ignore[misc]
+    with pytest.raises(ValueError, match="readiness"):
+        RunResult(record, "running", False, RunAttachmentMode.DETACHED, None)
+    with pytest.raises(ValueError, match="guest IP"):
+        RunResult(record, "running", True, RunAttachmentMode.DETACHED, "/private/SENSITIVE_VALUE")
 
 
 @pytest.mark.parametrize(

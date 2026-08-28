@@ -342,6 +342,9 @@ def test_run_status_transitions_and_completion():
 
             r_owner = state.read_owner_record(rpaths)
             assert r_owner.name == "test-run"
+            assert res["name"] == spec.name
+            assert res["run_id"] == r_owner.run_id
+            assert res["backend"] == "kvm"
 
             # Check ps output
             ps_runs = ps(roots=roots, conn=conn)

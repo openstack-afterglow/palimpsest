@@ -168,6 +168,10 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
     record = lima.run(spec, roots=roots)
 
     assert record["status"] == "running"
+    owner = state.read_owner_record(state.run_paths(roots, spec.name))
+    assert record["name"] == spec.name
+    assert record["run_id"] == owner.run_id
+    assert record["backend"] == "lima-vz"
     assert record["guest_ip"] == "192.168.64.12"
     assert record["ssh_host"] == "127.0.0.1"
     assert record["ssh_local_port"] == 61234
