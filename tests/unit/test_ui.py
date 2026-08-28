@@ -156,6 +156,51 @@ def test_auth_semantics(server_env: dict[str, Any]):
     assert status == 200
 
 
+def test_ui_vm_inventory_uses_safe_aggregation_projection(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm")
+    record = state.read_run_state(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            **record,
+            "base": {
+                "digest": "sha256:" + "a" * 64,
+                "arch": "x86_64",
+                "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+            },
+            "layers": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "target_dev": "vdb",
+                    "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        ui.inventory.runtime_dispatch.cloud_runtime,
+        "reconcile_run",
+        lambda *_a, **_k: {"state": {"guest_ip": "SENSITIVE_VALUE"}},
+    )
+
+    status, _headers, payload = _request(
+        server_env["port"],
+        "GET",
+        "/api/v1/vms",
+        headers={"Authorization": f"Bearer {server_env['token']}"},
+    )
+
+    assert status == 200
+    assert [vm["name"] for vm in payload["vms"]] == ["ui-vm"]
+    assert payload["vms"][0]["base_digest"] == "sha256:" + "a" * 64
+    assert "SENSITIVE_VALUE" not in repr(payload)
+    assert "local_path" not in repr(payload)
+
+
 def test_csrf_origin_semantics(server_env: dict[str, Any]):
     port = server_env["port"]
     token = server_env["token"]

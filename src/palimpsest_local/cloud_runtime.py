@@ -12,7 +12,7 @@ import socket
 import subprocess
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ from .errors import (
 )
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .refs import ImageRef, RunSpec
-from .runtime_types import ExistingRunRecord
+from .runtime_types import ExistingRunRecord, RuntimeBackend, RuntimeKind
 from .state import OwnerRecord, RunPaths, StatePaths, TagRecord
 
 _logger = logging.getLogger(__name__)
@@ -43,12 +43,17 @@ def _get_conn(conn: Any | None, kvm_uri: str) -> Any:
 
 
 _LIBVIRT_BACKENDS = (platforms.BACKEND_KVM, platforms.BACKEND_HVF)
+_RECONCILE_URIS = {
+    RuntimeBackend.KVM: "qemu:///system",
+    RuntimeBackend.LIBVIRT_HVF: "qemu:///session",
+}
 
 
 def _resolve_ledger_profile(ledger: dict[str, Any]) -> platforms.DomainProfile:
     """Rebuild the domain profile an existing run's ledger was created under."""
     backend = ledger.get("backend", platforms.BACKEND_KVM)
-    arch = ledger.get("base", {}).get("arch", "x86_64")
+    default_arch = "aarch64" if backend == platforms.BACKEND_HVF else "x86_64"
+    arch = ledger.get("base", {}).get("arch", default_arch)
     return platforms.resolve_domain_profile(backend, arch)
 
 
@@ -1053,6 +1058,118 @@ def rm(
         return updated
 
 
+def reconcile_run(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    conn: Any | None = None,
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> dict[str, Any]:
+    """Reconcile exactly one bound cloud run without scanning sibling ledgers."""
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.name != name:
+        raise StateError("run dispatch identity does not match requested name")
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or expected.dispatch_key.backend not in {
+        RuntimeBackend.KVM,
+        RuntimeBackend.LIBVIRT_HVF,
+    }:
+        raise StateError("run is not managed by the cloud runtime")
+    rpaths = state.run_paths(roots, name)
+    exact_uri = _RECONCILE_URIS[expected.dispatch_key.backend]
+    if profile is not None and profile.backend != expected.dispatch_key.backend.value:
+        raise StateError("run profile does not match durable backend")
+    if kvm_uri is not None and kvm_uri != exact_uri:
+        raise StateError("run URI does not match durable backend")
+    # Preserve the adapter-entry guard before acquiring the lifecycle lock;
+    # dispatcher-bound callers must not touch even Palimpsest lock state after
+    # a cooperative ledger replacement.
+    state.require_bound_run_dispatch_record(roots, expected)
+
+    def mutable_state(snapshot: state.RunLedgerSnapshot) -> dict[str, Any]:
+        def thaw(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {key: thaw(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return [thaw(item) for item in value]
+            return value
+
+        return thaw(snapshot.state)
+
+    def result_from(snapshot: state.RunLedgerSnapshot, warnings: list[str]) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "owner": {
+                "schema_version": 1,
+                "run_id": snapshot.record.run_id,
+                "name": snapshot.record.name,
+            },
+            "state": mutable_state(snapshot),
+            "warnings": warnings,
+        }
+
+    before_connection = state.read_run_ledger_snapshot(roots, name)
+    if before_connection.record != expected:
+        raise StateError("run ledger changed during cloud reconciliation")
+    before_state = mutable_state(before_connection)
+    if before_state.get("backend", platforms.BACKEND_KVM) != expected.dispatch_key.backend.value:
+        raise StateError("run ledger changed during cloud reconciliation")
+    try:
+        conn_obj = _get_conn(conn, exact_uri)
+    except LifecycleError:
+        if _expected_record is None and conn is None and kvm_uri is None and profile is None:
+            current = state.read_run_ledger_snapshot(roots, name)
+            if current.record != expected:
+                raise StateError("run ledger changed during cloud reconciliation") from None
+            return result_from(current, [])
+        raise
+
+    with state.locked(rpaths):
+        snapshot = state.read_run_ledger_snapshot(roots, name)
+        if snapshot.record != expected:
+            raise StateError("run ledger changed during cloud reconciliation")
+        st_data = mutable_state(snapshot)
+        run_backend = st_data.get("backend", platforms.BACKEND_KVM)
+        if run_backend != expected.dispatch_key.backend.value:
+            raise StateError("run ledger changed during cloud reconciliation")
+
+        status = st_data["status"]
+        warnings: list[str] = []
+        try:
+            domain = conn_obj.lookupByName(name)
+        except Exception as exc:
+            if not _is_missing_domain_error(exc):
+                raise LifecycleError("cannot inspect libvirt domain during reconciliation") from None
+            if status in {"running", "starting"}:
+                status = "stopped"
+                st_data = {**st_data, "status": status, "updated_at": state.utc_now_iso()}
+                warnings.append("libvirt domain is missing")
+                state.require_bound_run_dispatch_record(roots, expected)
+                _write_state(rpaths, status=status, data=st_data)
+        else:
+            domain_run_id = kvm.get_domain_run_id(domain)
+            if domain_run_id != expected.run_id:
+                raise StateError("run is shadowed by a foreign libvirt domain")
+            is_active = domain.isActive() if hasattr(domain, "isActive") else False
+            desired_status = status
+            if is_active and status in {"stopped", "defined"}:
+                desired_status = "running"
+            elif not is_active and status in {"running", "starting"}:
+                desired_status = "stopped"
+            if desired_status != status:
+                status = desired_status
+                st_data = {**st_data, "status": status, "updated_at": state.utc_now_iso()}
+                state.require_bound_run_dispatch_record(roots, expected)
+                _write_state(rpaths, status=status, data=st_data)
+
+        current = state.read_run_ledger_snapshot(roots, name)
+        if current.record != expected:
+            raise StateError("run ledger changed during cloud reconciliation")
+        return result_from(current, warnings)
+
+
 def reconcile(
     *,
     roots: StatePaths | None = None,
@@ -1060,6 +1177,12 @@ def reconcile(
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Legacy cloud-only bulk compatibility API.
+
+    First-party mixed-runtime callers must aggregate through
+    :mod:`palimpsest_local.runtime_dispatch`, which binds every run to its
+    durable record and exact backend.
+    """
     roots = roots or state.init_roots()
     resolved_uri = kvm_uri if kvm_uri is not None else (profile.uri if profile is not None else "qemu:///system")
     warnings: list[str] = []
@@ -1188,25 +1311,14 @@ def inspect_run(
     profile: platforms.DomainProfile | None = None,
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
-    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner_rec, _st_data = _validate_run_ledger(rpaths)
-
-    _, warnings = reconcile(roots=roots, conn=conn, kvm_uri=kvm_uri, profile=profile)
-    run_warnings = [w for w in warnings if f"run '{name}'" in w]
-    # Reconciliation may have observed an external stop/start and durably
-    # updated state.  Return the post-reconcile record, not the stale snapshot
-    # captured above.
-    owner_rec, st_data = _validate_run_ledger(rpaths)
-
-    return {
-        "schema_version": 1,
-        "owner": asdict(owner_rec),
-        "state": st_data,
-        "warnings": run_warnings,
-    }
+    return reconcile_run(
+        name,
+        roots=roots,
+        conn=conn,
+        kvm_uri=kvm_uri,
+        profile=profile,
+        _expected_record=_expected_record,
+    )
 
 
 def logs(

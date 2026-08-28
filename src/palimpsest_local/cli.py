@@ -78,7 +78,6 @@ from .registry import (
 from .runtime import (
     commit,
     exec_command,
-    ps,
     run,
     shell_command,
 )
@@ -1062,7 +1061,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
     if op == "completion":
         print(completion.generate_completion_script(args.shell))
         return 0
-    existing_run_operations = {"start", "stop", "rm", "inspect", "logs"}
+    existing_run_operations = {"start", "stop", "rm", "inspect", "logs", "ps"}
     roots = resolve_roots() if op in existing_run_operations else init_roots()
     store = ContentStore(roots.store)
 
@@ -1668,15 +1667,26 @@ def dispatch_args(args: argparse.Namespace) -> int:
             print(res_dict.get("guest_ip", args.name))
 
     elif op == "ps":
-        runs = ps(roots=roots)
+        aggregation = runtime_dispatch.ps(roots=roots)
+        for error in aggregation.errors:
+            identity = error.name or error.entry_token or "unknown-entry"
+            print(f"warning: {identity}: {error.message}", file=sys.stderr)
         print(f"{'NAME':<20} {'STATUS':<12} {'BASE':<12} {'LAYERS':<8} {'IP':<16} {'CREATED':<24}")
-        for run_record in runs:
-            base_hex = str(run_record["base_digest"]).split(":", 1)[-1][:12]
-            guest_ip = run_record.get("guest_ip") or "-"
-            created_at = run_record.get("created_at") or "-"
+        for summary in aggregation.summaries:
+            if summary.status == "removed":
+                continue
+            details = summary.details
+            base_digest = details.get("base_digest") or "-"
+            base_hex = str(base_digest).split(":", 1)[-1][:12]
+            layers = details.get("layers")
+            layers_count = len(layers) if isinstance(layers, tuple) else 0
+            ssh = details.get("ssh")
+            ssh_host = ssh.get("host") if isinstance(ssh, Mapping) else None
+            guest_ip = details.get("guest_ip") or ssh_host or "-"
+            created_at = details.get("created_at") or "-"
             print(
-                f"{run_record['name']:<20} {run_record['status']:<12} {base_hex:<12} "
-                f"{run_record['layers_count']:<8} {guest_ip:<16} {created_at:<24}"
+                f"{summary.name:<20} {summary.status:<12} {base_hex:<12} "
+                f"{layers_count:<8} {guest_ip:<16} {created_at:<24}"
             )
 
     elif op == "inspect":

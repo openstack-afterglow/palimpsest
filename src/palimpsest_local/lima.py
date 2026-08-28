@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from . import state
 from .digest import require_file_digest
 from .errors import ArtifactValidationError, BuildError, LifecycleError, StateError
 from .refs import BuildSpec, LayerRef, RunSpec, StackRef
-from .runtime_types import ExistingRunRecord
+from .runtime_types import ExistingRunRecord, RuntimeBackend, RuntimeKind
 from .state import RunPaths, StatePaths
 
 _BACKEND = "lima-vz"
@@ -388,45 +388,112 @@ def inspect_instance_status(name: str) -> str | None:
     return None if instance is None else _instance_runtime_status(instance)
 
 
+def _mutable_snapshot_state(snapshot: state.RunLedgerSnapshot) -> dict[str, Any]:
+    def thaw(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: thaw(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return [thaw(item) for item in value]
+        return value
+
+    return thaw(snapshot.state)
+
+
+def _reconcile_result(snapshot: state.RunLedgerSnapshot) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "owner": {
+            "schema_version": 1,
+            "run_id": snapshot.record.run_id,
+            "name": snapshot.record.name,
+        },
+        "state": _mutable_snapshot_state(snapshot),
+        "warnings": [],
+    }
+
+
+def _require_lima_snapshot(
+    snapshot: state.RunLedgerSnapshot,
+    expected: ExistingRunRecord,
+) -> dict[str, Any]:
+    if snapshot.record != expected:
+        raise StateError("run ledger changed during Lima reconciliation")
+    record = _mutable_snapshot_state(snapshot)
+    if record.get("backend") != _BACKEND:
+        raise StateError("run is not a Lima-managed macOS VM")
+    return record
+
+
+def reconcile_run(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> dict[str, Any]:
+    """Reconcile one exact owner-bound Lima run against live ``limactl`` state."""
+
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.name != name:
+        raise StateError("run dispatch identity does not match requested name")
+    if (
+        expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+        or expected.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+    ):
+        raise StateError("run is not managed by the Lima runtime")
+    state.require_bound_run_dispatch_record(roots, expected)
+    rpaths = state.run_paths(roots, name)
+    initial = state.read_run_ledger_snapshot(roots, name)
+    initial_record = _require_lima_snapshot(initial, expected)
+
+    # The first backend query is a preflight before any lifecycle lock or
+    # ledger write. Its failures and foreign markers leave durable state
+    # untouched; the authoritative live observation is repeated under lock.
+    preflight_instance = _instance_info_or_none(name)
+    if preflight_instance is not None:
+        _instance_runtime_status(preflight_instance)
+        _require_owned_instance(preflight_instance, expected.run_id, name)
+        if initial_record.get("status") in {"removed", "failed"}:
+            raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
+    after_query = state.read_run_ledger_snapshot(roots, name)
+    _require_lima_snapshot(after_query, expected)
+
+    with state.locked(rpaths):
+        current = state.read_run_ledger_snapshot(roots, name)
+        record = _require_lima_snapshot(current, expected)
+        # Re-observe under the lifecycle lock. The preflight proves the tool
+        # and marker shape are usable without creating lock state on failure;
+        # only this fresh observation is eligible to update the ledger.
+        instance = _instance_info_or_none(name)
+        if instance is None:
+            reconciled = "removed"
+        else:
+            live = _instance_runtime_status(instance)
+            _require_owned_instance(instance, expected.run_id, name)
+            if record.get("status") in {"removed", "failed"}:
+                raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
+            reconciled = live
+        if reconciled != record.get("status"):
+            state.require_bound_run_dispatch_record(roots, expected)
+            _write_state(
+                rpaths,
+                reconciled,
+                {**record, "updated_at": state.utc_now_iso()},
+            )
+        post = state.read_run_ledger_snapshot(roots, name)
+        _require_lima_snapshot(post, expected)
+        return _reconcile_result(post)
+
+
 def inspect_run(
     name: str,
     *,
     roots: StatePaths | None = None,
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
-    """Reconcile an owner-bound Lima run against live ``limactl`` state."""
+    """Compatibility entry point for exact single-run Lima reconciliation."""
 
-    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner = state.read_owner_record(rpaths)
-    record = state.read_run_state(rpaths)
-    if record.get("backend") != _BACKEND:
-        raise StateError(f"run '{name}' is not a Lima-managed macOS VM")
-    instance = _instance_info_or_none(name)
-    live = None if instance is None else _instance_runtime_status(instance)
-    previous = record.get("status")
-    if live is None:
-        reconciled = "removed"
-    else:
-        assert instance is not None
-        _require_owned_instance(instance, owner.run_id, name)
-        if previous in {"removed", "failed"}:
-            raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
-        reconciled = live
-    if reconciled != previous:
-        record = _write_state(
-            rpaths,
-            reconciled,
-            {**record, "updated_at": state.utc_now_iso()},
-        )
-    return {
-        "schema_version": 1,
-        "owner": asdict(owner),
-        "state": record,
-        "warnings": [],
-    }
+    return reconcile_run(name, roots=roots, _expected_record=_expected_record)
 
 
 def _write_state(rpaths: RunPaths, status: str, data: dict[str, Any]) -> dict[str, Any]:

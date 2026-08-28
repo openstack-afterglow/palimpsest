@@ -11,21 +11,39 @@ import stat as stat_module
 import tempfile
 import tomllib
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from .digest import normalize_digest
 from .errors import StateError
-from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
+from .runtime_types import (
+    ALLOWED_RUNTIME_STATUSES,
+    DispatchKey,
+    ExistingRunRecord,
+    RunAggregationError,
+    RuntimeBackend,
+    RuntimeKind,
+    RuntimeOperation,
+)
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9.+\-]{0,63}$")
 _STATUSES = {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}
 _MAX_RUN_LEDGER_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class RunLedgerSnapshot:
+    """Internal pinned ledger payload; callers must project before exposure."""
+
+    record: ExistingRunRecord
+    state: Mapping[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -598,56 +616,51 @@ def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]
         _close_noerror(file_fd)
 
 
-def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
-    """Read and normalize only the durable identity fields used for dispatch.
-
-    This reader is intentionally side-effect-free.  Legacy mutable state is
-    normalized in memory and is never rewritten by inspection or routing.
-    """
-    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
-        raise StateError("invalid run name")
-    runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
-    if runs_fd is None:
-        raise StateError("cannot securely read run ledger")
-    runs_before = _safe_fstat(runs_fd)
+def _read_pinned_run_payloads(
+    runs_fd: int,
+    name: str,
+    *,
+    expected_directory: os.stat_result | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     directory_fd = _open_readonly_no_follow(name, directory_fd=runs_fd, directory=True)
     if directory_fd is None:
-        _close_noerror(runs_fd)
         raise StateError("cannot securely read run ledger")
     try:
         directory_before = _safe_fstat(directory_fd)
-        if runs_before is None or directory_before is None:
+        if directory_before is None:
             raise StateError("cannot securely read run ledger")
-        if not stat_module.S_ISDIR(runs_before.st_mode) or not stat_module.S_ISDIR(directory_before.st_mode):
+        if not stat_module.S_ISDIR(directory_before.st_mode):
             raise StateError("cannot securely read run ledger")
+        if expected_directory is not None and (directory_before.st_dev, directory_before.st_ino) != (
+            expected_directory.st_dev,
+            expected_directory.st_ino,
+        ):
+            raise StateError("run ledger changed during read")
         raw_owner = _read_pinned_json_object(directory_fd, "owner.json")
         raw_state = _read_pinned_json_object(directory_fd, "state.json")
-        runs_after = _safe_fstat(runs_fd)
         directory_after = _safe_fstat(directory_fd)
-        current_runs = _safe_stat(roots.runs)
         current_directory = _safe_stat(name, directory_fd=runs_fd)
         if (
-            runs_after is None
-            or directory_after is None
-            or current_runs is None
+            directory_after is None
             or current_directory is None
-            or not stat_module.S_ISDIR(runs_after.st_mode)
-            or not stat_module.S_ISDIR(current_runs.st_mode)
             or not stat_module.S_ISDIR(directory_after.st_mode)
             or not stat_module.S_ISDIR(current_directory.st_mode)
-            or (runs_after.st_dev, runs_after.st_ino, runs_after.st_ctime_ns)
-            != (runs_before.st_dev, runs_before.st_ino, runs_before.st_ctime_ns)
-            or (current_runs.st_dev, current_runs.st_ino) != (runs_before.st_dev, runs_before.st_ino)
             or (directory_after.st_dev, directory_after.st_ino, directory_after.st_ctime_ns)
             != (directory_before.st_dev, directory_before.st_ino, directory_before.st_ctime_ns)
             or (current_directory.st_dev, current_directory.st_ino)
             != (directory_before.st_dev, directory_before.st_ino)
         ):
             raise StateError("run ledger changed during read")
+        return raw_owner, raw_state
     finally:
         _close_noerror(directory_fd)
-        _close_noerror(runs_fd)
 
+
+def _normalize_run_dispatch_record(
+    name: str,
+    raw_owner: dict[str, Any],
+    raw_state: dict[str, Any],
+) -> ExistingRunRecord:
     if set(raw_owner) != {"schema_version", "run_id", "name"}:
         raise StateError("invalid owner record")
     if type(raw_owner.get("schema_version")) is not int or raw_owner["schema_version"] != 1:
@@ -721,6 +734,171 @@ def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
     if normalized is None:
         raise StateError("invalid normalized run record")
     return normalized
+
+
+def _verify_pinned_runs_root(roots: StatePaths, runs_fd: int, before: os.stat_result) -> None:
+    after = _safe_fstat(runs_fd)
+    current = _safe_stat(roots.runs)
+    if (
+        after is None
+        or current is None
+        or not stat_module.S_ISDIR(after.st_mode)
+        or not stat_module.S_ISDIR(current.st_mode)
+        or (after.st_dev, after.st_ino, after.st_ctime_ns) != (before.st_dev, before.st_ino, before.st_ctime_ns)
+        or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise StateError("run ledger changed during read")
+
+
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(item) for item in value)
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise StateError("invalid run ledger value")
+
+
+def _snapshot_from_payloads(
+    name: str,
+    raw_owner: dict[str, Any],
+    raw_state: dict[str, Any],
+) -> RunLedgerSnapshot:
+    record = _normalize_run_dispatch_record(name, raw_owner, raw_state)
+    status = raw_state.get("status")
+    if not isinstance(status, str) or status not in ALLOWED_RUNTIME_STATUSES[record.dispatch_key.runtime_kind]:
+        raise StateError("invalid run status")
+    _reject_secrets(raw_state)
+    frozen = _freeze_json_value(deepcopy(raw_state))
+    if not isinstance(frozen, Mapping):
+        raise StateError("invalid run ledger")
+    return RunLedgerSnapshot(record, frozen)
+
+
+def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
+    """Read and normalize only the durable identity fields used for dispatch.
+
+    This reader is intentionally side-effect-free.  Legacy mutable state is
+    normalized in memory and is never rewritten by inspection or routing.
+    """
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+    if runs_fd is None:
+        raise StateError("cannot securely read run ledger")
+    try:
+        runs_before = _safe_fstat(runs_fd)
+        if runs_before is None or not stat_module.S_ISDIR(runs_before.st_mode):
+            raise StateError("cannot securely read run ledger")
+        raw_owner, raw_state = _read_pinned_run_payloads(runs_fd, name)
+        _verify_pinned_runs_root(roots, runs_fd, runs_before)
+    finally:
+        _close_noerror(runs_fd)
+    return _normalize_run_dispatch_record(name, raw_owner, raw_state)
+
+
+def read_run_ledger_snapshot(roots: StatePaths, name: str) -> RunLedgerSnapshot:
+    """Securely read one complete run ledger for internal aggregation use."""
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+    if runs_fd is None:
+        raise StateError("cannot securely read run ledger")
+    try:
+        runs_before = _safe_fstat(runs_fd)
+        if runs_before is None or not stat_module.S_ISDIR(runs_before.st_mode):
+            raise StateError("cannot securely read run ledger")
+        raw_owner, raw_state = _read_pinned_run_payloads(runs_fd, name)
+        snapshot = _snapshot_from_payloads(name, raw_owner, raw_state)
+        _verify_pinned_runs_root(roots, runs_fd, runs_before)
+        return snapshot
+    except (RecursionError, TypeError, ValueError):
+        raise StateError("invalid run ledger") from None
+    finally:
+        _close_noerror(runs_fd)
+
+
+def enumerate_run_snapshots(
+    roots: StatePaths,
+) -> tuple[tuple[RunLedgerSnapshot, ...], tuple[RunAggregationError, ...]]:
+    """Return deterministic pinned ledger payloads for later safe projection."""
+    try:
+        root_stat = os.stat(roots.runs, follow_symlinks=False)
+    except FileNotFoundError:
+        return (), ()
+    except OSError:
+        raise StateError("cannot securely enumerate run ledgers") from None
+    if not stat_module.S_ISDIR(root_stat.st_mode):
+        raise StateError("cannot securely enumerate run ledgers")
+    runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+    if runs_fd is None:
+        raise StateError("cannot securely enumerate run ledgers")
+    snapshots: list[RunLedgerSnapshot] = []
+    errors: list[RunAggregationError] = []
+    try:
+        runs_before = _safe_fstat(runs_fd)
+        if (
+            runs_before is None
+            or not stat_module.S_ISDIR(runs_before.st_mode)
+            or (runs_before.st_dev, runs_before.st_ino) != (root_stat.st_dev, root_stat.st_ino)
+        ):
+            raise StateError("cannot securely enumerate run ledgers")
+        try:
+            names = sorted(os.listdir(runs_fd))
+        except OSError:
+            raise StateError("cannot securely enumerate run ledgers") from None
+        for raw_name in names:
+            if not isinstance(raw_name, str) or _NAME_RE.fullmatch(raw_name) is None:
+                entry_digest = hashlib.sha256(raw_name.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+                errors.append(
+                    RunAggregationError(
+                        None,
+                        f"entry-{entry_digest}",
+                        RuntimeOperation.PS,
+                        None,
+                        "invalid-entry",
+                        "invalid run entry",
+                    )
+                )
+                continue
+            entry_stat = _safe_stat(raw_name, directory_fd=runs_fd)
+            if entry_stat is None or not stat_module.S_ISDIR(entry_stat.st_mode):
+                errors.append(
+                    RunAggregationError(
+                        raw_name,
+                        None,
+                        RuntimeOperation.PS,
+                        None,
+                        "invalid-entry",
+                        "invalid run entry",
+                    )
+                )
+                continue
+            record: ExistingRunRecord | None = None
+            try:
+                raw_owner, raw_state = _read_pinned_run_payloads(
+                    runs_fd,
+                    raw_name,
+                    expected_directory=entry_stat,
+                )
+                record = _normalize_run_dispatch_record(raw_name, raw_owner, raw_state)
+                snapshots.append(_snapshot_from_payloads(raw_name, raw_owner, raw_state))
+            except (RecursionError, StateError, TypeError, ValueError):
+                errors.append(
+                    RunAggregationError(
+                        raw_name,
+                        None,
+                        RuntimeOperation.PS,
+                        None if record is None else record.dispatch_key,
+                        "invalid-ledger",
+                        "invalid run ledger",
+                    )
+                )
+        _verify_pinned_runs_root(roots, runs_fd, runs_before)
+    finally:
+        _close_noerror(runs_fd)
+    return tuple(snapshots), tuple(errors)
 
 
 def require_bound_run_dispatch_record(roots: StatePaths, expected: ExistingRunRecord) -> None:

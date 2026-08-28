@@ -1255,3 +1255,112 @@ def test_reconcile_profile_scoped_connect_failure(tmp_path: Path, monkeypatch: p
     runs, warnings = reconcile(roots=roots)
     assert len(runs) == 1
     assert runs[0]["name"] == "test-run"
+
+
+def test_single_run_reconcile_uses_exact_backend_uri_without_profile_or_firmware_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    for name, backend in (("kvm-exact", "kvm"), ("hvf-exact", "libvirt-hvf")):
+        rpaths = state.run_paths(roots, name)
+        rpaths.root.mkdir()
+        owner = state.write_owner_record(rpaths)
+        state.atomic_write_json(
+            rpaths.state,
+            {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": backend,
+                "name": name,
+                "run_id": owner.run_id,
+                "status": "stopped",
+            },
+        )
+
+    uris: list[str] = []
+    monkeypatch.setattr(
+        platforms,
+        "resolve_domain_profile",
+        lambda *_a, **_k: pytest.fail("single-run reconciliation performed create-time profile discovery"),
+    )
+    monkeypatch.setattr(kvm, "connect", lambda uri: uris.append(uri) or FakeLibvirtConn())
+
+    for name in ("kvm-exact", "hvf-exact"):
+        expected = state.read_run_dispatch_record(roots, name)
+        result = runtime.reconcile_run(name, roots=roots, _expected_record=expected)
+        assert result["state"]["status"] == "stopped"
+
+    assert uris == ["qemu:///system", "qemu:///session"]
+
+
+def test_single_run_connection_failure_does_not_create_lock_or_mutate_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    roots.runs.mkdir(parents=True)
+    rpaths = state.run_paths(roots, "offline-run")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
+    expected = state.read_run_dispatch_record(roots, "offline-run")
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    monkeypatch.setattr(kvm, "connect", lambda _uri: (_ for _ in ()).throw(kvm.KvmError("offline")))
+
+    with pytest.raises(LifecycleError, match="offline"):
+        runtime.reconcile_run("offline-run", roots=roots, _expected_record=expected)
+
+    assert not roots.locks.exists()
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+
+    result = runtime.inspect_run("offline-run", roots=roots)
+    assert result["owner"]["run_id"] == owner.run_id
+    assert result["state"]["status"] == "stopped"
+    assert not roots.locks.exists()
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+
+
+def test_single_run_reconcile_updates_only_the_bound_target_and_preserves_sibling_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    target = state.run_paths(roots, "target-run")
+    target.root.mkdir()
+    target_owner = state.write_owner_record(target)
+    state.write_run_state(target, status="defined", data={"backend": "kvm"})
+    sibling = state.run_paths(roots, "sibling-run")
+    sibling.root.mkdir()
+    state.write_owner_record(sibling)
+    state.write_run_state(sibling, status="running", data={"backend": "libvirt-hvf"})
+    sibling_before = (sibling.owner.read_bytes(), sibling.state.read_bytes(), sibling.state.stat().st_mtime_ns)
+
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{target_owner.run_id}" '
+        f'schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain("target-run", f"<domain><metadata>{marker}</metadata></domain>")
+    domain._active = True
+    conn = FakeLibvirtConn()
+    conn.domains["target-run"] = domain
+    expected = state.read_run_dispatch_record(roots, "target-run")
+
+    result = runtime.reconcile_run("target-run", roots=roots, conn=conn, _expected_record=expected)
+
+    assert result["state"]["status"] == "running"
+    assert state.read_run_state(target)["status"] == "running"
+    assert (sibling.owner.read_bytes(), sibling.state.read_bytes(), sibling.state.stat().st_mtime_ns) == sibling_before
+
+
+def test_single_run_reconcile_does_not_swallow_state_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "write-failure")
+    rpaths.root.mkdir()
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"backend": "kvm"})
+    expected = state.read_run_dispatch_record(roots, "write-failure")
+    monkeypatch.setattr(runtime, "_write_state", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        runtime.reconcile_run("write-failure", roots=roots, conn=FakeLibvirtConn(), _expected_record=expected)

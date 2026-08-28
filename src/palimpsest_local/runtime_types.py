@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
+from types import MappingProxyType
+from typing import Any
 
 from .errors import PalimpsestError
 
@@ -29,6 +35,8 @@ class RuntimeOperation(StrEnum):
     RM = "rm"
     INSPECT = "inspect"
     LOGS = "logs"
+    PS = "ps"
+    RECONCILE = "reconcile"
 
 
 ALLOWED_RUNTIME_COMBINATIONS = frozenset(
@@ -102,6 +110,313 @@ class ExpectedRunIdentity:
             raise TypeError("expected run identity requires a DispatchKey")
 
 
+ALLOWED_RUNTIME_STATUSES = {
+    RuntimeKind.CLOUD_IMAGE: frozenset(
+        {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}
+    ),
+    RuntimeKind.OCI_ROOT: frozenset(
+        {
+            "creating",
+            "defined",
+            "fetching",
+            "converting",
+            "root-mounted",
+            "starting",
+            "running",
+            "stopping",
+            "stopped",
+            "exited",
+            "removing",
+            "removed",
+            "failed",
+        }
+    ),
+}
+
+_SUMMARY_DETAIL_KEYS = frozenset(
+    {
+        "base_digest",
+        "base_arch",
+        "layers",
+        "memory_mib",
+        "vcpus",
+        "network",
+        "ports",
+        "volumes",
+        "ssh",
+        "guest_ip",
+        "created_at",
+        "updated_at",
+    }
+)
+_SUMMARY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SUMMARY_LOGICAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
+_SUMMARY_NETWORK_RE = re.compile(r"^(?:none|default|vzNAT|lima:[a-z0-9][a-z0-9-]{0,62}|[a-z0-9][a-z0-9_.-]{0,62})$")
+_SUMMARY_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$")
+
+
+def _validate_frozen_projection(value: Any) -> None:
+    if value is None or type(value) in {bool, int, float, str}:
+        if isinstance(value, str) and "-----BEGIN" in value and "KEY-----" in value:
+            raise ValueError("run summary contains forbidden key material")
+        return
+    if isinstance(value, tuple):
+        for item in value:
+            _validate_frozen_projection(item)
+        return
+    if isinstance(value, MappingProxyType):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("run summary projection keys must be strings")
+            if any(word in key.lower() for word in ("token", "secret", "password", "private_key")):
+                raise ValueError("run summary contains a forbidden field")
+            _validate_frozen_projection(item)
+        return
+    raise TypeError("run summary projection must be deeply immutable")
+
+
+def _valid_ip(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or _SUMMARY_TIMESTAMP_RE.fullmatch(value) is None:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return parsed.tzinfo == UTC
+
+
+def _valid_mount_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = PurePosixPath(value)
+    return (
+        path.is_absolute()
+        and not any(part in {".", ".."} for part in path.parts)
+        and not value.startswith("//")
+        and str(path) == value
+        and value != "/"
+        and not any(value == prefix or value.startswith(prefix + "/") for prefix in ("/dev", "/proc", "/sys"))
+    )
+
+
+def _validate_summary_details(details: Mapping[str, Any]) -> None:
+    if set(details) != _SUMMARY_DETAIL_KEYS:
+        raise ValueError("run summary requires the exact public detail fields")
+    digest = details["base_digest"]
+    if not isinstance(digest, str) or (digest and _SUMMARY_DIGEST_RE.fullmatch(digest) is None):
+        raise ValueError("run summary has an invalid base digest")
+    if details["base_arch"] not in {"", "x86_64", "aarch64"}:
+        raise ValueError("run summary has an invalid base architecture")
+    for field, minimum, maximum in (("memory_mib", 256, 1_048_576), ("vcpus", 1, 256)):
+        value = details[field]
+        if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+            raise ValueError("run summary has an invalid numeric field")
+    network = details["network"]
+    if network is not None and (not isinstance(network, str) or _SUMMARY_NETWORK_RE.fullmatch(network) is None):
+        raise ValueError("run summary has an invalid network")
+    for field in ("guest_ip",):
+        if details[field] is not None and not _valid_ip(details[field]):
+            raise ValueError("run summary has an invalid IP address")
+    for field in ("created_at", "updated_at"):
+        if details[field] is not None and not _valid_timestamp(details[field]):
+            raise ValueError("run summary has an invalid timestamp")
+
+    layers = details["layers"]
+    if not isinstance(layers, tuple):
+        raise TypeError("run summary layers must be immutable")
+    for layer in layers:
+        if (
+            not isinstance(layer, Mapping)
+            or isinstance(layer, dict)
+            or set(layer)
+            not in (
+                {"digest"},
+                {"digest", "target_dev"},
+            )
+        ):
+            raise ValueError("run summary has an invalid layer")
+        if not isinstance(layer["digest"], str) or _SUMMARY_DIGEST_RE.fullmatch(layer["digest"]) is None:
+            raise ValueError("run summary has an invalid layer digest")
+        if "target_dev" in layer and (
+            not isinstance(layer["target_dev"], str) or re.fullmatch(r"vd[b-z]", layer["target_dev"]) is None
+        ):
+            raise ValueError("run summary has an invalid layer target")
+
+    ports = details["ports"]
+    if not isinstance(ports, tuple):
+        raise TypeError("run summary ports must be immutable")
+    for port in ports:
+        if (
+            not isinstance(port, Mapping)
+            or isinstance(port, dict)
+            or set(port)
+            != {
+                "host_ip",
+                "host_port",
+                "guest_port",
+                "protocol",
+            }
+        ):
+            raise ValueError("run summary has an invalid port")
+        if not _valid_ip(port["host_ip"]):
+            raise ValueError("run summary has an invalid port IP")
+        if any(type(port[field]) is not int or not 1 <= port[field] <= 65_535 for field in ("host_port", "guest_port")):
+            raise ValueError("run summary has an invalid port number")
+        if port["protocol"] not in {"tcp", "udp"}:
+            raise ValueError("run summary has an invalid port protocol")
+
+    volumes = details["volumes"]
+    if not isinstance(volumes, tuple):
+        raise TypeError("run summary volumes must be immutable")
+    allowed_volume_fields = {"name", "mount_path", "filesystem", "read_only", "target_dev"}
+    for volume in volumes:
+        if (
+            not isinstance(volume, Mapping)
+            or isinstance(volume, dict)
+            or "name" not in volume
+            or not set(volume).issubset(allowed_volume_fields)
+            or not isinstance(volume["name"], str)
+            or _SUMMARY_LOGICAL_NAME_RE.fullmatch(volume["name"]) is None
+        ):
+            raise ValueError("run summary has an invalid volume")
+        if "mount_path" in volume and not _valid_mount_path(volume["mount_path"]):
+            raise ValueError("run summary has an invalid volume mount")
+        if "filesystem" in volume and volume["filesystem"] != "ext4":
+            raise ValueError("run summary has an invalid volume filesystem")
+        if "read_only" in volume and type(volume["read_only"]) is not bool:
+            raise ValueError("run summary has an invalid volume policy")
+        if "target_dev" in volume and (
+            not isinstance(volume["target_dev"], str) or re.fullmatch(r"vd[b-z]", volume["target_dev"]) is None
+        ):
+            raise ValueError("run summary has an invalid volume target")
+
+    ssh = details["ssh"]
+    if not isinstance(ssh, Mapping) or isinstance(ssh, dict) or set(ssh) != {"host", "port"}:
+        raise ValueError("run summary has an invalid SSH endpoint")
+    if ssh["host"] is not None and not _valid_ip(ssh["host"]):
+        raise ValueError("run summary has an invalid SSH host")
+    if type(ssh["port"]) is not int or not 1 <= ssh["port"] <= 65_535:
+        raise ValueError("run summary has an invalid SSH port")
+
+
+@dataclass(frozen=True, slots=True)
+class RunSummary:
+    """Allowlisted immutable projection of one durable or live-refreshed run."""
+
+    record: ExistingRunRecord
+    status: str
+    details: Mapping[str, Any]
+    stale: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("run summary requires an ExistingRunRecord")
+        if (
+            not isinstance(self.status, str)
+            or self.status not in ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]
+        ):
+            raise ValueError("run summary has an invalid runtime status")
+        if not isinstance(self.details, MappingProxyType):
+            raise TypeError("run summary requires immutable detail mapping")
+        _validate_summary_details(self.details)
+        _validate_frozen_projection(self.details)
+        if type(self.stale) is not bool:
+            raise TypeError("run summary stale flag must be a bool")
+
+    @property
+    def name(self) -> str:
+        return self.record.name
+
+    @property
+    def run_id(self) -> str:
+        return self.record.run_id
+
+    @property
+    def runtime_kind(self) -> RuntimeKind:
+        return self.record.dispatch_key.runtime_kind
+
+    @property
+    def backend(self) -> RuntimeBackend:
+        return self.record.dispatch_key.backend
+
+
+_AGGREGATION_ERROR_CODES = frozenset(
+    {
+        "invalid-entry",
+        "invalid-ledger",
+        "runtime-capability",
+        "runtime-failure",
+        "runtime-warning",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RunAggregationError:
+    """Stable, non-reflective metadata for one failed aggregation entry."""
+
+    name: str | None
+    entry_token: str | None
+    operation: RuntimeOperation
+    dispatch_key: DispatchKey | None
+    code: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if self.name is not None and (not isinstance(self.name, str) or _RUN_NAME_RE.fullmatch(self.name) is None):
+            raise ValueError("run aggregation error has an invalid name")
+        if self.name is None:
+            if not isinstance(self.entry_token, str) or re.fullmatch(r"entry-[0-9a-f]{12}", self.entry_token) is None:
+                raise ValueError("anonymous run aggregation error requires a stable entry token")
+        elif self.entry_token is not None:
+            raise ValueError("named run aggregation errors cannot have an entry token")
+        if not isinstance(self.operation, RuntimeOperation):
+            raise TypeError("run aggregation error requires a RuntimeOperation")
+        if self.dispatch_key is not None and not isinstance(self.dispatch_key, DispatchKey):
+            raise TypeError("run aggregation error dispatch key must be a DispatchKey")
+        if self.code not in _AGGREGATION_ERROR_CODES:
+            raise ValueError("run aggregation error has an invalid code")
+        if not isinstance(self.message, str) or not self.message:
+            raise ValueError("run aggregation error requires a message")
+
+
+@dataclass(frozen=True, slots=True)
+class RunAggregationResult:
+    """Deterministic valid summaries plus independent per-entry failures."""
+
+    summaries: tuple[RunSummary, ...]
+    errors: tuple[RunAggregationError, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.summaries, tuple) or not all(isinstance(item, RunSummary) for item in self.summaries):
+            raise TypeError("run aggregation result requires RunSummary values")
+        if not isinstance(self.errors, tuple) or not all(isinstance(item, RunAggregationError) for item in self.errors):
+            raise TypeError("run aggregation result requires RunAggregationError values")
+        names = tuple(item.name for item in self.summaries)
+        if names != tuple(sorted(names)) or len(names) != len(set(names)):
+            raise ValueError("run aggregation summaries must have unique sorted names")
+        error_keys = tuple(
+            (
+                item.name or item.entry_token or "",
+                item.code,
+                item.operation.value,
+            )
+            for item in self.errors
+        )
+        if error_keys != tuple(sorted(error_keys)) or len(error_keys) != len(set(error_keys)):
+            raise ValueError("run aggregation errors must be unique and deterministically sorted")
+
+
 class RuntimeCapabilityError(PalimpsestError):
     """An exact runtime/backend pair cannot yet perform an operation."""
 
@@ -118,9 +433,13 @@ class RuntimeCapabilityError(PalimpsestError):
 
 __all__ = (
     "ALLOWED_RUNTIME_COMBINATIONS",
+    "ALLOWED_RUNTIME_STATUSES",
     "DispatchKey",
     "ExistingRunRecord",
     "ExpectedRunIdentity",
+    "RunAggregationError",
+    "RunAggregationResult",
+    "RunSummary",
     "RuntimeBackend",
     "RuntimeCapabilityError",
     "RuntimeKind",

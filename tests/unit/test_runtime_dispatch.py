@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -10,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections import UserDict
 from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -23,6 +26,9 @@ from palimpsest_local.runtime_types import (
     DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    RunAggregationError,
+    RunAggregationResult,
+    RunSummary,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
@@ -1140,3 +1146,584 @@ def test_oci_root_dispatch_returns_typed_capability_error_before_adapter_or_file
     assert error.operation is operation
     assert error.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
     assert _snapshot_tree(roots.state) == before
+
+
+def test_ps_securely_projects_mixed_durable_runs_without_adapters_or_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    common = {
+        "base": {
+            "digest": "sha256:" + "a" * 64,
+            "arch": "x86_64",
+            "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+        },
+        "layers": [
+            {
+                "digest": "sha256:" + "b" * 64,
+                "target_dev": "vdb",
+                "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+            }
+        ],
+        "volumes": [
+            {
+                "name": "data",
+                "mount_path": "/srv/Data",
+                "filesystem": "ext4",
+                "read_only": False,
+                "target_dev": "vdc",
+                "host_path": "/private/SENSITIVE_VALUE/volume.raw",
+                "backend_name": "internal-volume-name",
+            }
+        ],
+        "ports": [{"host_ip": "127.0.0.1", "host_port": 8080, "guest_port": 80, "protocol": "tcp"}],
+        "memory_mib": 2048,
+        "vcpus": 2,
+        "network": "default",
+        "ssh": {"host": "127.0.0.1", "port": 2222},
+        "guest_ip": "192.0.2.10",
+        "created_at": "2026-08-28T00:00:00Z",
+        "updated_at": "2026-08-28T00:01:00Z",
+        "ssh_config_file": "/private/SENSITIVE_VALUE/ssh.config",
+    }
+    for name, backend in (("a-kvm", "kvm"), ("b-hvf", "libvirt-hvf"), ("c-lima", "lima-vz")):
+        _write_ledger(
+            roots,
+            name=name,
+            record={
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": backend,
+                "status": "stopped",
+                **common,
+            },
+        )
+    _write_ledger(
+        roots,
+        name="d-oci",
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "kvm",
+            "status": "root-mounted",
+            "created_at": "2026-08-28T00:00:00Z",
+        },
+    )
+    broken = roots.runs / "broken"
+    broken.mkdir()
+    (broken / "owner.json").write_text("{}\n", encoding="utf-8")
+    (broken / "state.json").write_text("{SENSITIVE_VALUE\n", encoding="utf-8")
+    invalid_name = "BAD NAME"
+    invalid = roots.runs / invalid_name
+    invalid.mkdir()
+    (invalid / "owner.json").write_text("SENSITIVE_VALUE", encoding="utf-8")
+
+    before = _snapshot_tree(roots.state)
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "reconcile_run", lambda *_a, **_k: pytest.fail("adapter"))
+    monkeypatch.setattr(runtime_dispatch.lima, "reconcile_run", lambda *_a, **_k: pytest.fail("adapter"))
+
+    result = runtime_dispatch.ps(roots=roots)
+
+    assert [summary.name for summary in result.summaries] == ["a-kvm", "b-hvf", "c-lima", "d-oci"]
+    assert all(summary.stale is True for summary in result.summaries)
+    assert {summary.status for summary in result.summaries} == {"stopped", "root-mounted"}
+    expected_detail_keys = {
+        "base_digest",
+        "base_arch",
+        "layers",
+        "memory_mib",
+        "vcpus",
+        "network",
+        "ports",
+        "volumes",
+        "ssh",
+        "guest_ip",
+        "created_at",
+        "updated_at",
+    }
+    assert all(set(summary.details) == expected_detail_keys for summary in result.summaries)
+    rendered = repr(result)
+    assert "SENSITIVE_VALUE" not in rendered
+    assert "local_path" not in rendered
+    assert "host_path" not in rendered
+    assert "backend_name" not in rendered
+    expected_token = "entry-" + hashlib.sha256(invalid_name.encode()).hexdigest()[:12]
+    assert [(error.name, error.entry_token, error.code) for error in result.errors] == [
+        ("broken", None, "invalid-ledger"),
+        (None, expected_token, "invalid-entry"),
+    ]
+    assert all(error.operation is RuntimeOperation.PS for error in result.errors)
+    assert _snapshot_tree(roots.state) == before
+
+
+@pytest.mark.parametrize(
+    "malicious_fields",
+    [
+        {"base": {"digest": "SENSITIVE_VALUE", "arch": "x86_64"}},
+        {"base": {"digest": "sha256:" + "a" * 64, "arch": "SENSITIVE_VALUE"}},
+        {"layers": [{"digest": "SENSITIVE_VALUE"}]},
+        {"layers": [{"digest": "sha256:" + "b" * 64, "target_dev": "SENSITIVE_VALUE"}]},
+        {"network": "SENSITIVE_VALUE"},
+        {"ports": [{"host_ip": "SENSITIVE_VALUE", "host_port": 8080, "guest_port": 80, "protocol": "tcp"}]},
+        {"ports": [{"host_ip": "127.0.0.1", "host_port": 8080, "guest_port": 80, "protocol": "SENSITIVE_VALUE"}]},
+        {"volumes": [{"name": "SENSITIVE_VALUE"}]},
+        {"volumes": [{"name": "data", "mount_path": "SENSITIVE_VALUE"}]},
+        {"volumes": [{"name": "data", "filesystem": "SENSITIVE_VALUE"}]},
+        {"ssh": {"host": "SENSITIVE_VALUE", "port": 22}},
+        {"guest_ip": "SENSITIVE_VALUE"},
+        {"created_at": "SENSITIVE_VALUE"},
+        {"updated_at": "SENSITIVE_VALUE"},
+    ],
+)
+def test_ps_never_reflects_unvalidated_public_string_fields(
+    tmp_path: Path,
+    malicious_fields: dict[str, Any],
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+            **malicious_fields,
+        },
+    )
+
+    result = runtime_dispatch.ps(roots=roots)
+
+    assert result.summaries == ()
+    assert len(result.errors) == 1
+    assert result.errors[0].code == "invalid-ledger"
+    assert "SENSITIVE_VALUE" not in repr(result)
+
+
+def test_run_summary_public_constructor_rejects_semantically_untrusted_details() -> None:
+    record = ExistingRunRecord(
+        "demo",
+        "862ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    details = MappingProxyType(
+        {
+            "base_digest": "SENSITIVE_VALUE",
+            "base_arch": "x86_64",
+            "layers": (),
+            "memory_mib": None,
+            "vcpus": None,
+            "network": None,
+            "ports": (),
+            "volumes": (),
+            "ssh": MappingProxyType({"host": None, "port": 22}),
+            "guest_ip": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+    )
+    with pytest.raises(ValueError, match="invalid base digest"):
+        RunSummary(record, "stopped", details, stale=True)
+    with pytest.raises(TypeError, match="immutable detail mapping"):
+        RunSummary(record, "stopped", UserDict(details), stale=True)
+    nested_mutable = dict(details)
+    nested_mutable["base_digest"] = "sha256:" + "a" * 64
+    nested_mutable["ssh"] = UserDict({"host": None, "port": 22})
+    with pytest.raises(TypeError, match="deeply immutable"):
+        RunSummary(record, "stopped", MappingProxyType(nested_mutable), stale=True)
+
+
+def test_reconcile_routes_each_exact_record_and_keeps_oci_durable_summary_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    for name, kind, backend, status in (
+        ("a-kvm", "cloud-image", "kvm", "stopped"),
+        ("b-hvf", "cloud-image", "libvirt-hvf", "stopped"),
+        ("c-lima", "cloud-image", "lima-vz", "stopped"),
+        ("d-oci", "oci-root", "kvm", "fetching"),
+    ):
+        _write_ledger(
+            roots,
+            name=name,
+            record={
+                "schema_version": 2,
+                "runtime_kind": kind,
+                "backend": backend,
+                "status": status,
+                "created_at": "2026-08-28T00:00:00Z",
+            },
+        )
+    calls: list[tuple[str, str]] = []
+
+    def cloud_adapter(name, *, _expected_record, **_kwargs):
+        calls.append((name, _expected_record.dispatch_key.backend.value))
+        return {
+            "state": {"status": "running", "guest_ip": "SENSITIVE_VALUE"},
+            "warnings": ["SENSITIVE_VALUE"] if name == "a-kvm" else [],
+        }
+
+    def lima_adapter(name, *, _expected_record, **_kwargs):
+        calls.append((name, _expected_record.dispatch_key.backend.value))
+        return {"state": {"status": "running", "guest_ip": "SENSITIVE_VALUE"}}
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "reconcile_run", cloud_adapter)
+    monkeypatch.setattr(runtime_dispatch.lima, "reconcile_run", lima_adapter)
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert calls == [("a-kvm", "kvm"), ("b-hvf", "libvirt-hvf"), ("c-lima", "lima-vz")]
+    assert [summary.name for summary in result.summaries] == ["a-kvm", "b-hvf", "c-lima", "d-oci"]
+    assert [summary.stale for summary in result.summaries] == [False, False, False, True]
+    assert [summary.status for summary in result.summaries] == ["stopped", "stopped", "stopped", "fetching"]
+    assert [(error.name, error.code, error.operation) for error in result.errors] == [
+        ("a-kvm", "runtime-warning", RuntimeOperation.RECONCILE),
+        ("d-oci", "runtime-capability", RuntimeOperation.RECONCILE),
+    ]
+    assert "SENSITIVE_VALUE" not in repr(result)
+
+
+def test_reconcile_marks_original_durable_snapshot_stale_when_post_adapter_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, original_run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+        },
+    )
+
+    def replace_after_adapter(*_args, **_kwargs):
+        replacement_run_id = str(uuid.uuid4())
+        rpaths.owner.write_text(
+            json.dumps({"schema_version": 1, "run_id": replacement_run_id, "name": "demo"}) + "\n",
+            encoding="utf-8",
+        )
+        rpaths.state.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "runtime_kind": "cloud-image",
+                    "backend": "kvm",
+                    "name": "demo",
+                    "run_id": replacement_run_id,
+                    "status": "running",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {"state": {"status": "running"}}
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "reconcile_run", replace_after_adapter)
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert len(result.summaries) == 1
+    assert result.summaries[0].run_id == original_run_id
+    assert result.summaries[0].status == "stopped"
+    assert result.summaries[0].stale is True
+    assert [(error.name, error.code) for error in result.errors] == [("demo", "runtime-failure")]
+
+
+def test_reconcile_emits_stable_warning_after_missing_domain_status_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+
+    class MissingDomainConnection:
+        def lookupByName(self, _name: str):
+            raise KeyError("SENSITIVE_VALUE")
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime.kvm, "connect", lambda _uri: MissingDomainConnection())
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert len(result.summaries) == 1
+    assert result.summaries[0].status == "stopped"
+    assert result.summaries[0].stale is False
+    assert [(error.name, error.code, error.message) for error in result.errors] == [
+        ("demo", "runtime-warning", "runtime status changed during reconciliation")
+    ]
+    assert "SENSITIVE_VALUE" not in repr(result)
+
+
+@pytest.mark.parametrize("failure_mode", ["query", "foreign", "write"])
+def test_lima_reconcile_failure_is_typed_stale_and_preserves_ledger_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "status": "stopped",
+        },
+    )
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    backend_calls: list[str] = []
+    writes: list[str] = []
+
+    def query(_name: str) -> dict[str, Any]:
+        backend_calls.append("query")
+        if failure_mode == "query":
+            raise StateError("SENSITIVE_VALUE")
+        marker = "00000000-0000-0000-0000-000000000000" if failure_mode == "foreign" else run_id
+        return {
+            "name": "demo",
+            "status": "Running",
+            "config": {"env": {"PALIMPSEST_RUN_ID": marker}},
+        }
+
+    def write(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        writes.append("write")
+        if failure_mode == "write":
+            raise OSError("SENSITIVE_VALUE")
+        pytest.fail("unexpected Lima ledger write")
+
+    monkeypatch.setattr(runtime_dispatch.lima, "_instance_info_or_none", query)
+    monkeypatch.setattr(runtime_dispatch.lima, "_write_state", write)
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert backend_calls == (["query", "query"] if failure_mode == "write" else ["query"])
+    assert writes == (["write"] if failure_mode == "write" else [])
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+    assert [(summary.name, summary.status, summary.stale) for summary in result.summaries] == [
+        ("demo", "stopped", True)
+    ]
+    assert [(error.name, error.code, error.message) for error in result.errors] == [
+        ("demo", "runtime-failure", "runtime reconciliation failed")
+    ]
+    assert "SENSITIVE_VALUE" not in repr(result)
+
+
+def test_lima_reconcile_detects_cooperative_swap_during_external_query_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, old_run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "status": "stopped",
+        },
+    )
+    replacement_run_id = str(uuid.uuid4())
+    replacement_owner = (
+        json.dumps({"schema_version": 1, "run_id": replacement_run_id, "name": "demo"}, sort_keys=True) + "\n"
+    ).encode()
+    replacement_state = (
+        json.dumps(
+            {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": "lima-vz",
+                "name": "demo",
+                "run_id": replacement_run_id,
+                "status": "running",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    backend_calls: list[str] = []
+
+    def swapping_query(_name: str) -> dict[str, Any]:
+        backend_calls.append("query")
+        rpaths.owner.write_bytes(replacement_owner)
+        rpaths.state.write_bytes(replacement_state)
+        return {
+            "name": "demo",
+            "status": "Running",
+            "config": {"env": {"PALIMPSEST_RUN_ID": old_run_id}},
+        }
+
+    monkeypatch.setattr(runtime_dispatch.lima, "_instance_info_or_none", swapping_query)
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        "_write_state",
+        lambda *_a, **_k: pytest.fail("replacement ledger was overwritten"),
+    )
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert backend_calls == ["query"]
+    assert rpaths.owner.read_bytes() == replacement_owner
+    assert rpaths.state.read_bytes() == replacement_state
+    assert [(summary.run_id, summary.status, summary.stale) for summary in result.summaries] == [
+        (old_run_id, "stopped", True)
+    ]
+    assert [(error.name, error.code) for error in result.errors] == [("demo", "runtime-failure")]
+
+
+def test_lima_reconcile_writes_only_the_fresh_live_status_observed_under_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "status": "stopped",
+        },
+    )
+    statuses = iter(("Stopped", "Running"))
+    backend_calls: list[str] = []
+
+    def changing_query(_name: str) -> dict[str, Any]:
+        backend_calls.append("query")
+        return {
+            "name": "demo",
+            "status": next(statuses),
+            "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+        }
+
+    monkeypatch.setattr(runtime_dispatch.lima, "_instance_info_or_none", changing_query)
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert backend_calls == ["query", "query"]
+    assert [(summary.name, summary.status, summary.stale) for summary in result.summaries] == [
+        ("demo", "running", False)
+    ]
+    assert result.errors == ()
+    assert state.read_run_state(rpaths)["status"] == "running"
+
+
+def test_ps_missing_runs_root_is_empty_and_does_not_create_directories(tmp_path: Path) -> None:
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+
+    result = runtime_dispatch.ps(roots=roots)
+
+    assert result == RunAggregationResult((), ())
+    assert not roots.config.exists()
+    assert not roots.state.exists()
+
+
+def test_ps_rejects_ambiguous_runs_parent_and_reports_child_symlink_without_following(
+    tmp_path: Path,
+) -> None:
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    roots.state.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "owner.json").write_text("SENSITIVE_VALUE", encoding="utf-8")
+    roots.runs.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(StateError, match="cannot securely enumerate run ledgers") as captured:
+        runtime_dispatch.ps(roots=roots)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "SENSITIVE_VALUE" not in str(captured.value)
+
+    roots.runs.unlink()
+    roots.runs.mkdir()
+    (roots.runs / "linked-run").symlink_to(external, target_is_directory=True)
+    result = runtime_dispatch.ps(roots=roots)
+    assert result.summaries == ()
+    assert [(error.name, error.code) for error in result.errors] == [("linked-run", "invalid-entry")]
+    assert "SENSITIVE_VALUE" not in repr(result)
+
+
+def test_ps_detects_runs_parent_swap_while_enumerating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(roots, record={"status": "stopped"})
+    original_reader = state._read_pinned_run_payloads
+    swapped = False
+
+    def swapping_reader(
+        runs_fd: int,
+        name: str,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        nonlocal swapped
+        payloads = original_reader(runs_fd, name, **kwargs)
+        if not swapped:
+            swapped = True
+            roots.runs.rename(roots.state / "old-runs")
+            roots.runs.mkdir()
+        return payloads
+
+    monkeypatch.setattr(state, "_read_pinned_run_payloads", swapping_reader)
+
+    with pytest.raises(StateError, match="run ledger changed during read") as captured:
+        runtime_dispatch.ps(roots=roots)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_ps_detects_runs_parent_swap_between_stat_and_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(roots, record={"status": "stopped"})
+    original_open = state._open_readonly_no_follow
+    swapped = False
+
+    def swapping_open(path, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path) == roots.runs and kwargs.get("directory"):
+            swapped = True
+            roots.runs.rename(roots.state / "old-runs")
+            roots.runs.mkdir()
+        return original_open(path, **kwargs)
+
+    monkeypatch.setattr(state, "_open_readonly_no_follow", swapping_open)
+
+    with pytest.raises(StateError, match="cannot securely enumerate run ledgers"):
+        runtime_dispatch.ps(roots=roots)
+
+
+def test_run_aggregation_result_rejects_unsorted_or_duplicate_errors() -> None:
+    one = RunAggregationError(
+        "z-run",
+        None,
+        RuntimeOperation.PS,
+        None,
+        "invalid-ledger",
+        "invalid run ledger",
+    )
+    two = RunAggregationError(
+        "a-run",
+        None,
+        RuntimeOperation.PS,
+        None,
+        "invalid-ledger",
+        "invalid run ledger",
+    )
+    with pytest.raises(ValueError, match="deterministically sorted"):
+        RunAggregationResult((), (one, two))
+    with pytest.raises(ValueError, match="unique"):
+        RunAggregationResult((), (one, one))

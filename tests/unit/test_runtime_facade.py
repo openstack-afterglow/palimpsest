@@ -29,7 +29,6 @@ _EXPECTED_PUBLIC_API = (
 )
 _LEGACY_RUNTIME_IMPORTERS = {
     "cli.py",
-    "inventory.py",
     "project_adapter.py",
 }
 
@@ -127,3 +126,15 @@ def test_build_and_project_adapter_use_the_split_owners() -> None:
         assert f"runtime_dispatch.{operation}(" in ui_source
     assert "lima.is_lima_run(" not in adapter_source
     assert "state.read_run_state(" not in ui_source
+
+
+def test_first_party_callers_cannot_use_the_legacy_cloud_bulk_reconcile_bypass() -> None:
+    for path in _source_root().rglob("*.py"):
+        if path.name in {"cloud_runtime.py", "runtime.py"}:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "cloud_runtime.reconcile(" not in source, path
+        assert "runtime.reconcile(" not in source, path
+
+    dispatch_source = (_source_root() / "runtime_dispatch.py").read_text(encoding="utf-8")
+    assert "lima.reconcile_run(" in dispatch_source

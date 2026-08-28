@@ -589,25 +589,60 @@ def test_cli_dispatch_image_verify(tmp_path: Path, capsys: pytest.CaptureFixture
 
 
 def test_cli_dispatch_ps(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(
-        "palimpsest_local.cli.ps",
-        lambda roots=None: [
-            {
-                "name": "demo-vm",
-                "status": "running",
-                "base_digest": "sha256:" + "a" * 64,
-                "layers_count": 2,
-                "guest_ip": "192.168.122.50",
-                "created_at": "2026-07-30T00:00:00Z",
-            }
-        ],
+    roots, rpaths = _write_cli_run_ledger(backend="kvm")
+    record = state.read_run_state(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            **record,
+            "status": "running",
+            "base": {"digest": "sha256:" + "a" * 64, "arch": "x86_64"},
+            "layers": [
+                {"digest": "sha256:" + "b" * 64, "target_dev": "vdb"},
+                {"digest": "sha256:" + "c" * 64, "target_dev": "vdc"},
+            ],
+            "guest_ip": "192.168.122.50",
+            "created_at": "2026-07-30T00:00:00Z",
+        },
     )
+    assert roots.runs.exists()
     ret = cli.main(["ps"])
     assert ret == 0
     out = capsys.readouterr().out
     assert "demo-vm" in out
     assert "running" in out
     assert "192.168.122.50" in out
+
+
+def test_cli_ps_missing_state_is_read_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_home = tmp_path / "missing-config"
+    state_home = tmp_path / "missing-state"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    assert cli.main(["ps"]) == 0
+
+    assert "NAME" in capsys.readouterr().out
+    assert not config_home.exists()
+    assert not state_home.exists()
+
+
+def test_cli_ps_reports_corrupt_ledger_without_reflecting_its_contents(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _roots, rpaths = _write_cli_run_ledger(backend="kvm")
+    rpaths.state.write_text('{"status":"SENSITIVE_VALUE"}\n', encoding="utf-8")
+
+    assert cli.main(["ps"]) == 0
+
+    captured = capsys.readouterr()
+    assert "demo-vm" not in captured.out
+    assert "warning: demo-vm: invalid run ledger" in captured.err
+    assert "SENSITIVE_VALUE" not in captured.out + captured.err
 
 
 def test_cli_dispatch_image_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):

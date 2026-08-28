@@ -49,8 +49,28 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "status": "running",
             "memory_mib": 2048,
             "vcpus": 2,
-            "base": {"digest": "sha256:" + "a" * 64, "arch": "x86_64"},
-            "layers": [{"digest": "sha256:" + "b" * 64, "target_dev": "vdb"}],
+            "base": {
+                "digest": "sha256:" + "a" * 64,
+                "arch": "x86_64",
+                "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+            },
+            "layers": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "target_dev": "vdb",
+                    "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "data",
+                    "mount_path": "/srv/Data",
+                    "filesystem": "ext4",
+                    "read_only": False,
+                    "target_dev": "vdc",
+                    "host_path": "/private/SENSITIVE_VALUE/data.raw",
+                }
+            ],
             "ssh": {"host": "127.0.0.1", "port": 2222},
             "created_at": "2026-08-24T00:00:00Z",
             "updated_at": "2026-08-24T00:01:00Z",
@@ -99,42 +119,23 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         },
     )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
-
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        return [
-            {
-                "name": "demo-kvm",
-                "owner": {"run_id": "11111111-1111-1111-1111-111111111111"},
-                "state": {
-                    "name": "demo-kvm",
-                    "run_id": "11111111-1111-1111-1111-111111111111",
-                    "backend": "kvm",
-                    "status": "running",
-                    "memory_mib": 2048,
-                    "vcpus": 2,
-                    "base": {"digest": "sha256:" + "a" * 64, "arch": "x86_64"},
-                    "layers": [{"digest": "sha256:" + "b" * 64, "target_dev": "vdb"}],
-                    "ssh": {"host": "127.0.0.1", "port": 2222},
-                    "created_at": "2026-08-24T00:00:00Z",
-                    "updated_at": "2026-08-24T00:01:00Z",
-                },
-            }
-        ], []
-
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
-    monkeypatch.setattr(inventory, "inspect_instance_status", lambda name: "stopped")
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", lambda *_a, **_k: {})
+    monkeypatch.setattr(inventory.runtime_dispatch.lima, "reconcile_run", lambda *_a, **_k: {})
 
     vms_res = inventory.list_vms(roots)
     vms = vms_res["vms"]
     assert len(vms) == 2
 
     kvm_vm = next(v for v in vms if v["name"] == "demo-kvm")
+    assert kvm_vm["runtime_kind"] == "cloud-image"
     assert kvm_vm["backend"] == "kvm"
     assert kvm_vm["project"] == "myproj"
     assert kvm_vm["base_digest"] == "sha256:" + "a" * 64
     assert kvm_vm["layer_count"] == 1
     assert kvm_vm["ssh"] == {"host": "127.0.0.1", "port": 2222}
+    assert "SENSITIVE_VALUE" not in repr(vms_res)
+    assert "local_path" not in repr(vms_res)
+    assert "host_path" not in repr(vms_res)
 
     vm_detail = inventory.get_vm(roots, "demo-kvm")
     assert vm_detail["name"] == "demo-kvm"
@@ -153,17 +154,32 @@ def test_list_vms_stale_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     )
     state.atomic_write_json(run_dir / "state.json", {"name": "stale-vm", "backend": "kvm", "status": "running"})
 
-    def mock_preflight(backend: str, host=None):
-        if backend == "kvm":
-            raise ArtifactValidationError("/dev/kvm is not accessible")
-
-    monkeypatch.setattr(inventory, "preflight", mock_preflight)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.cloud_runtime,
+        "reconcile_run",
+        lambda *_a, **_k: (_ for _ in ()).throw(ArtifactValidationError("/dev/kvm is not accessible")),
+    )
 
     res = inventory.list_vms(roots)
     assert len(res["vms"]) == 1
     vm = res["vms"][0]
     assert vm["stale"] is True
-    assert any("unavailable on this host" in w for w in res["warnings"])
+    assert any("runtime reconciliation failed" in w for w in res["warnings"])
+
+
+def test_list_vms_uses_non_reflective_token_for_invalid_entry_name(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    invalid = roots.runs / "BAD SENSITIVE_VALUE"
+    invalid.mkdir()
+    (invalid / "owner.json").write_text("SENSITIVE_VALUE", encoding="utf-8")
+
+    result = inventory.list_vms(roots)
+
+    assert result["vms"] == []
+    assert len(result["warnings"]) == 1
+    assert result["warnings"][0].startswith("entry-")
+    assert "invalid run entry" in result["warnings"][0]
+    assert "SENSITIVE_VALUE" not in repr(result)
 
 
 def test_list_artifacts(tmp_path: Path):
@@ -502,78 +518,19 @@ def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch:
         },
     )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
-    orig_resolve = inventory.platforms.resolve_domain_profile
+    captured_backends: list[str] = []
 
-    def mock_resolve(backend: str, arch: str):
-        if backend == "libvirt-hvf":
-            return inventory.platforms.DomainProfile(
-                backend=inventory.platforms.BACKEND_HVF,
-                domain_type="hvf",
-                arch="aarch64",
-                machine="virt",
-                emulator=Path("/usr/bin/qemu-system-aarch64"),
-                uri="qemu:///session",
-                firmware=inventory.platforms.Firmware(
-                    loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
-                    nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
-                ),
-                autoselect_firmware=False,
-                network_mode="user-hostfwd",
-                seed_tool="hdiutil",
-                seed_bus="scsi",
-            )
-        return orig_resolve(backend, arch)
+    def mock_reconcile_run(name, *, _expected_record, **_kwargs):
+        captured_backends.append(_expected_record.dispatch_key.backend.value)
+        return {}
 
-    monkeypatch.setattr(inventory.platforms, "resolve_domain_profile", mock_resolve)
-
-    captured_profiles = []
-
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        captured_profiles.append(profile)
-        if profile is not None and profile.backend == "kvm":
-            return [
-                {
-                    "name": "kvm-vm",
-                    "owner": {"run_id": "11111111-1111-1111-1111-111111111111"},
-                    "state": {
-                        "name": "kvm-vm",
-                        "run_id": "11111111-1111-1111-1111-111111111111",
-                        "backend": "kvm",
-                        "status": "stopped",
-                        "base": {"arch": "x86_64"},
-                    },
-                }
-            ], []
-        elif profile is not None and profile.backend == "libvirt-hvf":
-            return [
-                {
-                    "name": "hvf-vm",
-                    "owner": {"run_id": "22222222-2222-2222-2222-222222222222"},
-                    "state": {
-                        "name": "hvf-vm",
-                        "run_id": "22222222-2222-2222-2222-222222222222",
-                        "backend": "libvirt-hvf",
-                        "status": "running",
-                        "base": {"arch": "aarch64"},
-                    },
-                }
-            ], []
-        return [], []
-
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
     res = inventory.list_vms(roots)
     vms = {v["name"]: v for v in res["vms"]}
 
-    assert len(captured_profiles) == 2
-    kvm_prof = next(p for p in captured_profiles if p.backend == "kvm")
-    hvf_prof = next(p for p in captured_profiles if p.backend == "libvirt-hvf")
-
-    assert kvm_prof.uri == "qemu:///system"
-    assert hvf_prof.uri == "qemu:///session"
-
-    assert vms["kvm-vm"]["status"] == "stopped"
+    assert captured_backends == ["libvirt-hvf", "kvm"]
+    assert vms["kvm-vm"]["status"] == "running"
     assert vms["hvf-vm"]["status"] == "running"
     assert vms["kvm-vm"]["stale"] is False
     assert vms["hvf-vm"]["stale"] is False
@@ -585,67 +542,53 @@ def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkey
     # KVM ledger with no base arch
     kvm_dir = roots.runs / "legacy-kvm"
     kvm_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(kvm_dir / "owner.json", {"schema_version": 1, "run_id": "1111", "name": "legacy-kvm"})
     state.atomic_write_json(
-        kvm_dir / "state.json", {"name": "legacy-kvm", "run_id": "1111", "backend": "kvm", "status": "running"}
+        kvm_dir / "owner.json",
+        {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "legacy-kvm"},
+    )
+    state.atomic_write_json(
+        kvm_dir / "state.json",
+        {
+            "name": "legacy-kvm",
+            "run_id": "11111111-1111-1111-1111-111111111111",
+            "backend": "kvm",
+            "status": "running",
+        },
     )
 
     # HVF ledger with no base arch
     hvf_dir = roots.runs / "legacy-hvf"
     hvf_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(hvf_dir / "owner.json", {"schema_version": 1, "run_id": "2222", "name": "legacy-hvf"})
     state.atomic_write_json(
-        hvf_dir / "state.json", {"name": "legacy-hvf", "run_id": "2222", "backend": "libvirt-hvf", "status": "running"}
+        hvf_dir / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "legacy-hvf"},
+    )
+    state.atomic_write_json(
+        hvf_dir / "state.json",
+        {
+            "name": "legacy-hvf",
+            "run_id": "22222222-2222-2222-2222-222222222222",
+            "backend": "libvirt-hvf",
+            "status": "running",
+        },
     )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
+    captured_backends: list[str] = []
 
-    orig_resolve = inventory.platforms.resolve_domain_profile
-
-    def mock_resolve(backend: str, arch: str):
+    def mock_reconcile_run(name, *, _expected_record, **_kwargs):
+        backend = _expected_record.dispatch_key.backend.value
+        captured_backends.append(backend)
         if backend == "libvirt-hvf":
-            return inventory.platforms.DomainProfile(
-                backend=inventory.platforms.BACKEND_HVF,
-                domain_type="hvf",
-                arch=arch,
-                machine="virt",
-                emulator=Path("/usr/bin/qemu-system-aarch64"),
-                uri="qemu:///session",
-                firmware=inventory.platforms.Firmware(
-                    loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
-                    nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
-                ),
-                autoselect_firmware=False,
-                network_mode="user-hostfwd",
-                seed_tool="hdiutil",
-                seed_bus="scsi",
-            )
-        return orig_resolve(backend, arch)
+            raise RuntimeError("sensitive backend failure")
+        return {}
 
-    monkeypatch.setattr(inventory.platforms, "resolve_domain_profile", mock_resolve)
-
-    captured_profiles = []
-
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        captured_profiles.append(profile)
-        if profile is not None and profile.backend == "libvirt-hvf":
-            raise RuntimeError("conn error")
-        return [], []
-
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
     res = inventory.list_vms(roots)
 
-    assert len(captured_profiles) == 2
-    kvm_prof = next(p for p in captured_profiles if p.backend == "kvm")
-    hvf_prof = next(p for p in captured_profiles if p.backend == "libvirt-hvf")
-
-    expected_kvm_arch = inventory.platforms.detect_host().machine
-    assert kvm_prof.arch == expected_kvm_arch
-    assert hvf_prof.arch == "aarch64"
-
-    assert any("reconcile failed for backend 'libvirt-hvf': conn error" in w for w in res["warnings"])
+    assert captured_backends == ["libvirt-hvf", "kvm"]
+    assert any("runtime reconciliation failed" in w for w in res["warnings"])
+    assert all("sensitive" not in warning for warning in res["warnings"])
     vms = {v["name"]: v for v in res["vms"]}
     assert vms["legacy-hvf"]["stale"] is True
-    assert vms["legacy-kvm"]["stale"] is True
-    assert any("omitted during reconciliation for backend 'kvm'" in w for w in res["warnings"])
+    assert vms["legacy-kvm"]["stale"] is False
