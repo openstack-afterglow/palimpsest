@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -16,7 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from . import cloudinit, guest, kvm, state
+from . import cloudinit, guest, kvm, platforms, state
 from .digest import digest_file, require_file_digest
 from .errors import (
     ArtifactValidationError,
@@ -38,6 +39,53 @@ def _get_conn(conn: Any | None, kvm_uri: str) -> Any:
         return kvm.connect(kvm_uri)
     except kvm.KvmError as exc:
         raise LifecycleError(str(exc)) from exc
+
+_LIBVIRT_BACKENDS = (platforms.BACKEND_KVM, platforms.BACKEND_HVF)
+
+
+def _resolve_ledger_profile(ledger: dict[str, Any]) -> platforms.DomainProfile:
+    """Rebuild the domain profile an existing run's ledger was created under."""
+    backend = ledger.get("backend", platforms.BACKEND_KVM)
+    arch = ledger.get("base", {}).get("arch", "x86_64")
+    return platforms.resolve_domain_profile(backend, arch)
+
+
+def _resolve_new_run_profile(
+    arch: str,
+    *,
+    kvm_uri: str | None,
+    profile: platforms.DomainProfile | None,
+    conn: Any | None,
+) -> tuple[platforms.DomainProfile, str]:
+    """Resolve ``(profile, kvm_uri)`` for defining a brand-new libvirt domain.
+
+    A caller that already supplies ``conn`` or ``kvm_uri`` has taken
+    responsibility for connecting, so the domain shape is derived from
+    ``arch`` alone with no host detection or tool preflight -- this keeps
+    legacy direct and test callers working unchanged. A bare call (no
+    ``conn``, ``kvm_uri``, or ``profile``) goes through full host-capability
+    auto-selection, matching what ``palimpsest run`` does by default.
+    """
+    if profile is not None:
+        return profile, kvm_uri if kvm_uri is not None else profile.uri
+    if kvm_uri is not None or conn is not None:
+        resolved = platforms.resolve_domain_profile(platforms.BACKEND_KVM, arch)
+        return resolved, kvm_uri if kvm_uri is not None else resolved.uri
+    backend = platforms.select_backend(arch)
+    platforms.preflight(backend)
+    resolved = platforms.resolve_domain_profile(backend, arch)
+    return resolved, resolved.uri
+
+
+def _ssh_endpoint(name: str, st: dict[str, Any]) -> tuple[str, int]:
+    """The reachable SSH ``(host, port)`` for a run, tolerating pre-migration ledgers."""
+    ssh = st.get("ssh")
+    if isinstance(ssh, dict) and ssh.get("host"):
+        return ssh["host"], ssh.get("port", 22)
+    guest_ip = st.get("guest_ip")
+    if guest_ip:
+        return guest_ip, 22
+    raise LifecycleError(f"run '{name}' has no reachable SSH endpoint")
 
 
 def _get_domain_run_id(domain: Any) -> str | None:
@@ -67,6 +115,18 @@ def _get_domain_run_id(domain: Any) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _is_missing_domain_error(exc: Exception) -> bool:
+    # In production libvirt reports an explicit error code.  ``KeyError`` is
+    # retained for the small in-memory connection used by contract tests.
+    if isinstance(exc, KeyError):
+        return True
+    try:
+        libvirt = kvm._libvirt()
+        return isinstance(exc, libvirt.libvirtError) and exc.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN
+    except Exception:
+        return False
 
 
 def _destroy_and_undefine_domain(domain: Any) -> None:
@@ -212,21 +272,22 @@ def _generate_ssh_keys(rpaths: RunPaths) -> Path:
     return guest_host_key
 
 
-def _generate_seed_iso(
-    rpaths: RunPaths,
-    run_id: str,
-    spec: RunSpec,
-    layer_disks: list[kvm.LayerDisk],
-    guest_host_key: Path,
-) -> None:
-    activation_script = kvm.build_layer_activation_script(layer_disks)
-    meta_data = cloudinit.build_meta_data(run_id, hostname=spec.name)
-    user_data = cloudinit.build_user_data(
-        client_public_key=rpaths.identity_public,
-        host_private_key=guest_host_key,
-        host_public_key=guest_host_key.with_name(guest_host_key.name + ".pub"),
-        activation_script=activation_script,
-    )
+def _write_seed_iso(rpaths: RunPaths, profile: platforms.DomainProfile, meta_data: str, user_data: str) -> None:
+    """Write NoCloud seed content and build ``rpaths.seed`` with the profile's seed tool."""
+    if profile.seed_tool == "hdiutil":
+        seed_dir = rpaths.root / "seed.d"
+        seed_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        meta_file = seed_dir / "meta-data"
+        user_file = seed_dir / "user-data"
+        meta_file.write_text(meta_data, encoding="utf-8")
+        meta_file.chmod(0o600)
+        user_file.write_text(user_data, encoding="utf-8")
+        user_file.chmod(0o600)
+        try:
+            kvm.run_hdiutil_seed_iso(rpaths.seed, seed_dir)
+        except kvm.KvmError as exc:
+            raise LifecycleError(f"seed ISO creation failed: {exc}") from exc
+        return
 
     meta_file = rpaths.root / "meta-data"
     user_file = rpaths.root / "user-data"
@@ -234,11 +295,69 @@ def _generate_seed_iso(
     meta_file.chmod(0o600)
     user_file.write_text(user_data, encoding="utf-8")
     user_file.chmod(0o600)
-
     try:
         kvm.run_seed_iso(rpaths.seed, user_file, meta_file)
     except kvm.KvmError as exc:
         raise LifecycleError(f"seed ISO creation failed: {exc}") from exc
+
+
+def _generate_seed_iso(
+    rpaths: RunPaths,
+    run_id: str,
+    spec: RunSpec,
+    layer_disks: list[kvm.LayerDisk],
+    guest_host_key: Path,
+    profile: platforms.DomainProfile,
+) -> None:
+    volume_disks = _build_kvm_volume_disks(spec, layer_disks)
+    activation_script = kvm.build_layer_activation_script(layer_disks, volumes=volume_disks)
+    meta_data = cloudinit.build_meta_data(run_id, hostname=spec.name)
+    user_data = cloudinit.build_user_data(
+        client_public_key=rpaths.identity_public,
+        host_private_key=guest_host_key,
+        host_public_key=guest_host_key.with_name(guest_host_key.name + ".pub"),
+        activation_script=activation_script,
+        environment=spec.environment,
+        cloud_init=spec.cloud_init,
+    )
+    _write_seed_iso(rpaths, profile, meta_data, user_data)
+
+
+def _prepare_user_hostfwd(rpaths: RunPaths, profile: platforms.DomainProfile) -> tuple[int, Path]:
+    """Allocate a fresh loopback SSH port and stage this boot's NVRAM copy."""
+    if profile.firmware is None:
+        raise LifecycleError("user-hostfwd networking requires firmware in the domain profile")
+    port = platforms.allocate_local_port()
+    nvram_path = rpaths.root / "nvram.fd"
+    shutil.copyfile(profile.firmware.nvram_template, nvram_path)
+    nvram_path.chmod(0o600)
+    return port, nvram_path
+
+
+def _build_kvm_volume_disks(spec: RunSpec, layer_disks: list[kvm.LayerDisk]) -> list[kvm.VolumeDisk]:
+    if len(layer_disks) + len(spec.volumes) > kvm.MAX_LAYER_DISKS:
+        raise ArtifactValidationError(f"combined layer and volume count exceeds limit {kvm.MAX_LAYER_DISKS}")
+    occupied_serials = {disk.serial for disk in layer_disks}
+    disks: list[kvm.VolumeDisk] = []
+    for index, volume in enumerate(spec.volumes, start=len(layer_disks)):
+        if volume.host_path is None:
+            raise ArtifactValidationError("KVM runs require local block paths for every project volume")
+        serial = hashlib.sha256(f"palimpsest-volume-v1:{volume.name}:{volume.host_path}".encode()).hexdigest()[:20]
+        if serial in occupied_serials:
+            raise ArtifactValidationError(f"volume serial collision for {volume.name}")
+        occupied_serials.add(serial)
+        disks.append(
+            kvm.VolumeDisk(
+                name=volume.name,
+                host_path=volume.host_path,
+                target_dev=f"vd{kvm._DISK_LETTERS[index]}",
+                serial=serial,
+                mount_path=volume.mount_path,
+                filesystem=volume.filesystem,
+                read_only=volume.read_only,
+            )
+        )
+    return disks
 
 
 def _discover_guest_ip(domain: Any, timeout_seconds: float = 300.0) -> str:
@@ -307,11 +426,16 @@ def run(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 300.0,
 ) -> dict[str, Any]:
-    if spec.stack.base.arch != "x86_64":
-        raise ArtifactValidationError("local KVM runtime supports only x86_64 boot images")
+    profile, kvm_uri = _resolve_new_run_profile(spec.stack.base.arch, kvm_uri=kvm_uri, profile=profile, conn=conn)
+    if spec.ports:
+        raise ArtifactValidationError(
+            "KVM project port forwarding is unavailable for libvirt network interfaces; "
+            "use a routed libvirt network or run this project with the Lima backend"
+        )
     roots = roots or state.init_roots()
     rpaths = state.run_paths(roots, spec.name)
 
@@ -334,8 +458,8 @@ def run(
         except Exception as exc:
             raise DigestMismatchError(f"layer image digest mismatch: {exc}") from exc
 
-    if len(spec.stack.layers) > kvm.MAX_LAYER_DISKS:
-        raise ArtifactValidationError(f"layer count exceeds limit {kvm.MAX_LAYER_DISKS}")
+    if len(spec.stack.layers) + len(spec.volumes) > kvm.MAX_LAYER_DISKS:
+        raise ArtifactValidationError(f"combined layer and volume count exceeds limit {kvm.MAX_LAYER_DISKS}")
 
     serials: set[str] = set()
     layer_disks: list[kvm.LayerDisk] = []
@@ -352,6 +476,7 @@ def run(
                 serial=serial,
             )
         )
+    volume_disks = _build_kvm_volume_disks(spec, layer_disks)
 
     rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -364,6 +489,9 @@ def run(
             "run_id": run_id,
             "created_at": state.utc_now_iso(),
             "updated_at": state.utc_now_iso(),
+            "backend": profile.backend,
+            "memory_mib": spec.memory_mib,
+            "vcpus": spec.vcpus,
             "base": {
                 "digest": spec.stack.base.digest,
                 "local_path": str(spec.stack.base.local_path),
@@ -379,8 +507,29 @@ def run(
                 }
                 for layer, disk in zip(spec.stack.layers, layer_disks, strict=True)
             ],
+            "layer_attachment": {
+                "delivery": "direct-block",
+                "device": "virtio-blk",
+                "mount": "squashfs-ro",
+            },
+            "network": spec.network,
+            "volumes": [
+                {
+                    "name": volume.name,
+                    "host_path": str(volume.host_path),
+                    "serial": volume.serial,
+                    "target_dev": volume.target_dev,
+                    "mount_path": volume.mount_path,
+                    "filesystem": volume.filesystem,
+                    "read_only": volume.read_only,
+                }
+                for volume in volume_disks
+            ],
+            "environment_names": [name for name, _value in spec.environment],
+            "cloud_init": spec.cloud_init is not None,
             "domain_uuid": None,
             "guest_ip": None,
+            "ssh": {"host": None, "port": 22},
             "cleanup_flags": {},
         }
 
@@ -402,9 +551,14 @@ def run(
             rpaths.console.touch(mode=0o600)
             create_and_validate_overlay(spec.stack.base, rpaths.overlay)
             guest_host_key = _generate_ssh_keys(rpaths)
-            _generate_seed_iso(rpaths, run_id, spec, layer_disks, guest_host_key)
+            _generate_seed_iso(rpaths, run_id, spec, layer_disks, guest_host_key, profile)
 
             net_name = None if spec.network == "none" else spec.network
+            ssh_host_port: int | None = None
+            nvram_path: Path | None = None
+            if profile.network_mode == "user-hostfwd":
+                ssh_host_port, nvram_path = _prepare_user_hostfwd(rpaths, profile)
+
             domain_spec = kvm.DomainSpec(
                 name=spec.name,
                 memory_mib=spec.memory_mib,
@@ -412,11 +566,14 @@ def run(
                 root_disk=rpaths.overlay,
                 seed_iso=rpaths.seed,
                 layers=layer_disks,
+                volumes=volume_disks,
                 network=net_name,
                 console_log=rpaths.console,
                 run_id=run_id,
+                ssh_host_port=ssh_host_port,
+                nvram=nvram_path,
             )
-            domain_xml = kvm.build_domain_xml(domain_spec)
+            domain_xml = kvm.build_domain_xml(domain_spec, profile)
 
             domain = None
             if hasattr(conn_obj, "defineXML"):
@@ -432,16 +589,24 @@ def run(
             if hasattr(domain, "create"):
                 domain.create()
 
-            require_ip = spec.network != "none"
+            require_ip = spec.network != "none" and profile.network_mode != "user-hostfwd"
             guest_ip = _wait_for_readiness(rpaths, domain, timeout_seconds=timeout_seconds, require_ip=require_ip)
 
-            if guest_ip is not None:
+            if profile.network_mode == "user-hostfwd":
+                ssh_endpoint: dict[str, Any] = {"host": "127.0.0.1", "port": ssh_host_port}
+            else:
+                ssh_endpoint = {"host": guest_ip, "port": 22}
+
+            if ssh_endpoint["host"] is not None:
                 guest_host_pub = guest_host_key.with_name(guest_host_key.name + ".pub")
-                known_hosts_entry = guest.build_known_hosts_entry(guest_ip, guest_host_pub, port=22)
+                known_hosts_entry = guest.build_known_hosts_entry(
+                    ssh_endpoint["host"], guest_host_pub, port=ssh_endpoint["port"]
+                )
                 rpaths.known_hosts.write_text(known_hosts_entry, encoding="utf-8")
                 rpaths.known_hosts.chmod(0o600)
 
             init_data["guest_ip"] = guest_ip
+            init_data["ssh"] = ssh_endpoint
             final_state = _write_state(rpaths, status="running", data={**init_data, "updated_at": state.utc_now_iso()})
             return final_state
 
@@ -468,17 +633,103 @@ def run(
             raise LifecycleError(f"run failed: {exc}") from exc
 
 
+def start(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    conn: Any | None = None,
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
+    timeout_seconds: float = 300.0,
+) -> dict[str, Any]:
+    """Start an owned stopped KVM run without recreating its root or named volumes."""
+
+    roots = roots or state.init_roots()
+    rpaths = state.run_paths(roots, name)
+    owner_rec, current = _validate_run_ledger(rpaths)
+    with state.locked(rpaths):
+        if current.get("status") == "running":
+            return current
+        if current.get("status") != "stopped":
+            raise LifecycleError(f"run '{name}' cannot be started from status {current.get('status')!r}")
+        resolved_profile = profile if profile is not None else _resolve_ledger_profile(current)
+        resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
+        conn_obj = _get_conn(conn, resolved_uri)
+        try:
+            domain = conn_obj.lookupByName(name)
+        except Exception as exc:
+            raise LifecycleError(f"owned libvirt domain '{name}' is missing") from exc
+        if domain is None or _get_domain_run_id(domain) != owner_rec.run_id:
+            raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
+        _write_state(rpaths, status="starting", data={**current, "updated_at": state.utc_now_iso()})
+        try:
+            # A stopped domain reuses its serial log.  Remove the previous boot's
+            # sentinel so readiness can only be satisfied by this boot's
+            # palimpsest-ready.service.
+            rpaths.console.write_text("", encoding="utf-8")
+            rpaths.console.chmod(0o600)
+            if resolved_profile.network_mode == "user-hostfwd":
+                ssh_port = platforms.allocate_local_port()
+                xml_str = domain.XMLDesc()
+                updated_xml, replacements = re.subn(
+                    r"hostfwd=tcp:127\.0\.0\.1:\d+-:22",
+                    f"hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
+                    xml_str,
+                    count=1,
+                )
+                if replacements != 1:
+                    raise LifecycleError(f"domain '{name}' has no Palimpsest SSH host-forward rule")
+                try:
+                    domain = conn_obj.defineXML(updated_xml)
+                except Exception as exc:
+                    raise LifecycleError(f"failed to update SSH host-forward rule for domain '{name}'") from exc
+                if domain is None or _get_domain_run_id(domain) != owner_rec.run_id:
+                    raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
+                ssh_endpoint: dict[str, Any] = {"host": "127.0.0.1", "port": ssh_port}
+            domain.create()
+            require_ip = current.get("network") != "none" and resolved_profile.network_mode != "user-hostfwd"
+            guest_ip = _wait_for_readiness(rpaths, domain, timeout_seconds=timeout_seconds, require_ip=require_ip)
+            if resolved_profile.network_mode != "user-hostfwd":
+                ssh_endpoint = {"host": guest_ip, "port": 22}
+            if ssh_endpoint["host"] is not None:
+                guest_host_pub = rpaths.root / "ssh_host_ed25519_key.pub"
+                known_hosts_entry = guest.build_known_hosts_entry(
+                    ssh_endpoint["host"], guest_host_pub, port=ssh_endpoint["port"]
+                )
+                rpaths.known_hosts.write_text(known_hosts_entry, encoding="utf-8")
+                rpaths.known_hosts.chmod(0o600)
+            return _write_state(
+                rpaths,
+                status="running",
+                data={**current, "guest_ip": guest_ip, "ssh": ssh_endpoint, "updated_at": state.utc_now_iso()},
+            )
+        except Exception as exc:
+            try:
+                if hasattr(domain, "isActive") and domain.isActive() and hasattr(domain, "destroy"):
+                    domain.destroy()
+            except Exception:
+                pass
+            _write_state(
+                rpaths,
+                status="failed",
+                data={**current, "error": str(exc), "updated_at": state.utc_now_iso()},
+            )
+            if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError)):
+                raise
+            raise LifecycleError(f"start failed: {exc}") from exc
+
+
 def start_serial_builder(
     spec: RunSpec,
     *,
     user_data: str,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> dict[str, Any]:
     """Start a credential-free builder whose only host channel is output streaming."""
-    if spec.stack.base.arch != "x86_64":
-        raise ArtifactValidationError("local KVM runtime supports only x86_64 boot images")
+    profile, kvm_uri = _resolve_new_run_profile(spec.stack.base.arch, kvm_uri=kvm_uri, profile=profile, conn=conn)
     if spec.network not in {"none", "default"}:
         raise ArtifactValidationError("serial builder network must be 'none' or 'default'")
     roots = roots or state.init_roots()
@@ -515,6 +766,7 @@ def start_serial_builder(
             "run_id": run_id,
             "created_at": state.utc_now_iso(),
             "updated_at": state.utc_now_iso(),
+            "backend": profile.backend,
             "base": {
                 "digest": spec.stack.base.digest,
                 "local_path": str(spec.stack.base.local_path),
@@ -553,16 +805,13 @@ def start_serial_builder(
                     pass
             rpaths.console.touch(mode=0o600)
             create_and_validate_overlay(spec.stack.base, rpaths.overlay)
-            meta_file = rpaths.root / "meta-data"
-            user_file = rpaths.root / "user-data"
-            meta_file.write_text(cloudinit.build_meta_data(run_id, hostname=spec.name), encoding="utf-8")
-            user_file.write_text(user_data, encoding="utf-8")
-            meta_file.chmod(0o600)
-            user_file.chmod(0o600)
-            try:
-                kvm.run_seed_iso(rpaths.seed, user_file, meta_file)
-            except kvm.KvmError as exc:
-                raise LifecycleError(f"seed ISO creation failed: {exc}") from exc
+            meta_data = cloudinit.build_meta_data(run_id, hostname=spec.name)
+            _write_seed_iso(rpaths, profile, meta_data, user_data)
+
+            ssh_host_port: int | None = None
+            nvram_path: Path | None = None
+            if profile.network_mode == "user-hostfwd":
+                ssh_host_port, nvram_path = _prepare_user_hostfwd(rpaths, profile)
 
             control_socket = rpaths.root / "builder.sock"
             domain_xml = kvm.build_domain_xml(
@@ -578,7 +827,10 @@ def start_serial_builder(
                     run_id=run_id,
                     guest_agent=False,
                     control_socket=control_socket,
-                )
+                    ssh_host_port=ssh_host_port,
+                    nvram=nvram_path,
+                ),
+                profile,
             )
             domain = conn_obj.defineXML(domain_xml) if hasattr(conn_obj, "defineXML") else None
             if domain is None:
@@ -716,7 +968,8 @@ def stop(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     roots = roots or state.init_roots()
@@ -727,7 +980,9 @@ def stop(
         if curr_state.get("status") in ("stopped", "removed"):
             return curr_state
 
-        conn_obj = _get_conn(conn, kvm_uri)
+        resolved_profile = profile if profile is not None else _resolve_ledger_profile(curr_state)
+        resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
+        conn_obj = _get_conn(conn, resolved_uri)
 
         domain = None
         if conn_obj is not None:
@@ -775,14 +1030,17 @@ def rm(
     volumes: bool = False,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> dict[str, Any]:
     roots = roots or state.init_roots()
     rpaths = state.run_paths(roots, name)
     owner_rec, curr_state = _validate_run_ledger(rpaths)
 
     with state.locked(rpaths):
-        conn_obj = _get_conn(conn, kvm_uri)
+        resolved_profile = profile if profile is not None else _resolve_ledger_profile(curr_state)
+        resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
+        conn_obj = _get_conn(conn, resolved_uri)
 
         domain = None
         if conn_obj is not None:
@@ -817,9 +1075,11 @@ def reconcile(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     roots = roots or state.init_roots()
+    resolved_uri = kvm_uri if kvm_uri is not None else (profile.uri if profile is not None else "qemu:///system")
     warnings: list[str] = []
     runs: list[dict[str, Any]] = []
 
@@ -828,9 +1088,12 @@ def reconcile(
 
     conn_obj = None
     try:
-        conn_obj = _get_conn(conn, kvm_uri)
-    except Exception:
-        pass
+        conn_obj = _get_conn(conn, resolved_uri)
+    except Exception as exc:
+        if profile is not None:
+            raise LifecycleError(
+                f"failed to connect to libvirt URI {resolved_uri!r} for backend {profile.backend!r}: {exc}"
+            ) from exc
 
     for run_dir in sorted(roots.runs.iterdir()):
         if not run_dir.is_dir():
@@ -843,41 +1106,47 @@ def reconcile(
         except Exception as exc:
             warnings.append(f"run '{name}': invalid ledger ({exc})")
             continue
+        run_backend = st_data.get("backend") or platforms.BACKEND_KVM
+        if profile is not None and run_backend != profile.backend:
+            continue
 
         status = st_data.get("status", "unknown")
 
-        if st_data.get("backend") != "lima-vz" and conn_obj is not None:
+        if run_backend in _LIBVIRT_BACKENDS and conn_obj is not None:
             try:
                 domain = conn_obj.lookupByName(name)
-                domain_run_id = _get_domain_run_id(domain)
-                if domain_run_id != owner_rec.run_id:
-                    warnings.append(
-                        f"run '{name}': libvirt domain exists but is not owned by run ID '{owner_rec.run_id}'"
-                    )
-                else:
-                    is_active = domain.isActive() if hasattr(domain, "isActive") else False
-                    if is_active and status in ("stopped", "defined"):
-                        status = "running"
-                        st_data["status"] = status
-                        st_data["updated_at"] = state.utc_now_iso()
-                        try:
-                            _write_state(rpaths, status=status, data=st_data)
-                        except Exception:
-                            pass
-                    elif not is_active and status in ("running", "starting"):
-                        status = "stopped"
-                        st_data["status"] = status
-                        st_data["updated_at"] = state.utc_now_iso()
-                        try:
-                            _write_state(rpaths, status=status, data=st_data)
-                        except Exception:
-                            pass
-            except Exception:
+            except Exception as exc:
+                if not _is_missing_domain_error(exc):
+                    raise LifecycleError(f"cannot inspect libvirt domain {name!r} during reconciliation") from exc
                 if status in ("running", "starting"):
                     status = "stopped"
                     st_data["status"] = status
                     st_data["updated_at"] = state.utc_now_iso()
                     warnings.append(f"run '{name}': domain missing from libvirt")
+                    try:
+                        _write_state(rpaths, status=status, data=st_data)
+                    except Exception:
+                        pass
+            else:
+                domain_run_id = _get_domain_run_id(domain)
+                if domain_run_id != owner_rec.run_id:
+                    raise StateError(
+                        f"run '{name}' is shadowed by a foreign libvirt domain "
+                        f"(domain run_id {domain_run_id!r} != owner run_id {owner_rec.run_id!r})"
+                    )
+                is_active = domain.isActive() if hasattr(domain, "isActive") else False
+                if is_active and status in ("stopped", "defined"):
+                    status = "running"
+                    st_data["status"] = status
+                    st_data["updated_at"] = state.utc_now_iso()
+                    try:
+                        _write_state(rpaths, status=status, data=st_data)
+                    except Exception:
+                        pass
+                elif not is_active and status in ("running", "starting"):
+                    status = "stopped"
+                    st_data["status"] = status
+                    st_data["updated_at"] = state.utc_now_iso()
                     try:
                         _write_state(rpaths, status=status, data=st_data)
                     except Exception:
@@ -899,10 +1168,11 @@ def ps(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> list[dict[str, Any]]:
     roots = roots or state.init_roots()
-    runs, _ = reconcile(roots=roots, conn=conn, kvm_uri=kvm_uri)
+    runs, _ = reconcile(roots=roots, conn=conn, kvm_uri=kvm_uri, profile=profile)
     result = []
     for r in runs:
         st = r.get("state", {})
@@ -917,6 +1187,7 @@ def ps(
             {
                 "name": r["name"],
                 "status": status,
+                "backend": st.get("backend", platforms.BACKEND_KVM),
                 "base_digest": short_digest,
                 "layers_count": len(layers),
                 "guest_ip": guest_ip,
@@ -931,14 +1202,19 @@ def inspect_run(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> dict[str, Any]:
     roots = roots or state.init_roots()
     rpaths = state.run_paths(roots, name)
-    owner_rec, st_data = _validate_run_ledger(rpaths)
+    owner_rec, _st_data = _validate_run_ledger(rpaths)
 
-    _, warnings = reconcile(roots=roots, conn=conn, kvm_uri=kvm_uri)
+    _, warnings = reconcile(roots=roots, conn=conn, kvm_uri=kvm_uri, profile=profile)
     run_warnings = [w for w in warnings if f"run '{name}'" in w]
+    # Reconciliation may have observed an external stop/start and durably
+    # updated state.  Return the post-reconcile record, not the stale snapshot
+    # captured above.
+    owner_rec, st_data = _validate_run_ledger(rpaths)
 
     return {
         "schema_version": 1,
@@ -988,7 +1264,8 @@ def shell_command(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> list[str]:
     roots = roots or state.init_roots()
     rpaths = state.run_paths(roots, name)
@@ -996,14 +1273,12 @@ def shell_command(
 
     if st.get("status") != "running":
         raise LifecycleError(f"run '{name}' is not running (status: {st.get('status')})")
-    guest_ip = st.get("guest_ip")
-    if not guest_ip:
-        raise LifecycleError(f"run '{name}' has no assigned guest IP")
+    host, port = _ssh_endpoint(name, st)
     return guest.build_shell_command(
-        guest_ip,
+        host,
         identity=rpaths.identity,
         known_hosts=rpaths.known_hosts,
-        port=22,
+        port=port,
     )
 
 
@@ -1013,7 +1288,8 @@ def exec_command(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
 ) -> list[str]:
     roots = roots or state.init_roots()
     rpaths = state.run_paths(roots, name)
@@ -1021,15 +1297,13 @@ def exec_command(
 
     if st.get("status") != "running":
         raise LifecycleError(f"run '{name}' is not running (status: {st.get('status')})")
-    guest_ip = st.get("guest_ip")
-    if not guest_ip:
-        raise LifecycleError(f"run '{name}' has no assigned guest IP")
+    host, port = _ssh_endpoint(name, st)
     return guest.build_exec_command(
-        guest_ip,
+        host,
         argv,
         identity=rpaths.identity,
         known_hosts=rpaths.known_hosts,
-        port=22,
+        port=port,
     )
 
 
@@ -1039,7 +1313,8 @@ def commit(
     *,
     roots: StatePaths | None = None,
     conn: Any | None = None,
-    kvm_uri: str = "qemu:///system",
+    kvm_uri: str | None = None,
+    profile: platforms.DomainProfile | None = None,
     runner: Callable[[list[str]], Any] | None = None,
 ) -> dict[str, Any]:
     """Commit upper layer changes of a running run into a local content-store tag."""
@@ -1057,7 +1332,9 @@ def commit(
     if st_data.get("status") != "running":
         raise LifecycleError(f"run '{name}' is not running (status: {st_data.get('status')})")
 
-    conn_obj = _get_conn(conn, kvm_uri)
+    resolved_profile = profile if profile is not None else _resolve_ledger_profile(st_data)
+    resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
+    conn_obj = _get_conn(conn, resolved_uri)
     try:
         dom = conn_obj.lookupByName(name)
         dom_run_id = _get_domain_run_id(dom)
@@ -1068,9 +1345,7 @@ def commit(
             raise
         raise LifecycleError(f"domain '{name}' lookup failed: {exc}") from exc
 
-    guest_ip = st_data.get("guest_ip")
-    if not guest_ip:
-        raise LifecycleError(f"run '{name}' has no assigned guest IP")
+    host, port = _ssh_endpoint(name, st_data)
 
     base_info = st_data.get("base")
     if isinstance(base_info, dict) and "local_path" in base_info and "digest" in base_info:
@@ -1098,7 +1373,7 @@ def commit(
     known_hosts = rpaths.known_hosts
 
     def exec_guest(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        ssh_cmd = guest.build_exec_command(guest_ip, argv, identity=identity, known_hosts=known_hosts)
+        ssh_cmd = guest.build_exec_command(host, argv, identity=identity, known_hosts=known_hosts, port=port)
         if runner is not None:
             res = runner(ssh_cmd)
             if isinstance(res, subprocess.CompletedProcess):
@@ -1166,7 +1441,7 @@ def commit(
 
     tmp_host_out = rpaths.root / f"commit-{tag}.squashfs"
     scp_cmd = guest.build_scp_download_command(
-        guest_ip, "/tmp/commit_output.squashfs", tmp_host_out, identity=identity, known_hosts=known_hosts
+        host, "/tmp/commit_output.squashfs", tmp_host_out, identity=identity, known_hosts=known_hosts, port=port
     )
     if runner is not None:
         res_scp = runner(scp_cmd)

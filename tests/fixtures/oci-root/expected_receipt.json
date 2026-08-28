@@ -1,0 +1,179 @@
+{
+  "version": "1.0",
+  "entries": {
+    "dir1": {
+      "type": "dir",
+      "mode": 16877,
+      "uid": 1000,
+      "gid": 1000,
+      "mtime": 1700000000.125,
+      "xattrs": {}
+    },
+    "dir1/file1.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 1000,
+      "gid": 1000,
+      "mtime": 1700000000.125,
+      "sha256": "005f594dcd8525f50cd5f50a81c78f0c1e4fa87842c7568fd938b9dac6611193",
+      "xattrs": {
+        "user.note": "base_val"
+      }
+    },
+    "dir1/subfile.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 1000,
+      "gid": 1000,
+      "mtime": 1700000000.125,
+      "sha256": "f53617a5043bff46ec5fac4874d9cd0fc8bd50b57620488597ed630a41976e58",
+      "xattrs": {}
+    },
+    "dir_opaque": {
+      "type": "dir",
+      "mode": 16877,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "xattrs": {
+        "trusted.overlay.opaque": "y"
+      }
+    },
+    "dir_opaque/new_file.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "3f97a464e9a065c04681c53e68adb3e549f2799ad0e5d3a1e1fd25ce7f32a28f",
+      "xattrs": {}
+    },
+    "file_to_dir": {
+      "type": "dir",
+      "mode": 16877,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "xattrs": {}
+    },
+    "file_to_dir/nested.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "0f7ba7aa1dc0b8ab4d7dba12f4c141817f281f994d897afebeaa4dd679fc7242",
+      "xattrs": {}
+    },
+    "dir_to_file": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "849bf5c92cba1be9a28c2dbb728d444323e1349bf76dd9e7cc4914793deefda6",
+      "xattrs": {}
+    },
+    "hardlink_target.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "615c4b575e0568bac38c57d8ab9a32e813ae385698537c005f42bf74de34a7b1",
+      "inode_group": "hardlink_group_1",
+      "xattrs": {}
+    },
+    "hardlink_source.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "615c4b575e0568bac38c57d8ab9a32e813ae385698537c005f42bf74de34a7b1",
+      "link_target": "hardlink_target.txt",
+      "inode_group": "hardlink_group_1",
+      "xattrs": {}
+    },
+    "forward_link_1.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "65ccef6d077529d73cd665629c913ba3ee8f7c255f69edfda64444606f216587",
+      "link_target": "forward_link_2.txt",
+      "inode_group": "forward_link_group",
+      "xattrs": {}
+    },
+    "forward_link_2.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "65ccef6d077529d73cd665629c913ba3ee8f7c255f69edfda64444606f216587",
+      "inode_group": "forward_link_group",
+      "xattrs": {}
+    },
+    "symlink.txt": {
+      "type": "symlink",
+      "mode": 41471,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "target": "dir1/file1.txt",
+      "xattrs": {}
+    },
+    "fifo_dev": {
+      "type": "fifo",
+      "mode": 4534,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "xattrs": {}
+    },
+    "char_dev": {
+      "type": "chardev",
+      "mode": 8576,
+      "uid": 0,
+      "gid": 0,
+      "rdev_major": 1,
+      "rdev_minor": 3,
+      "mtime": 1700000000.125,
+      "xattrs": {}
+    },
+    "block_dev": {
+      "type": "blkdev",
+      "mode": 24960,
+      "uid": 0,
+      "gid": 0,
+      "rdev_major": 8,
+      "rdev_minor": 0,
+      "mtime": 1700000000.125,
+      "xattrs": {}
+    },
+    "cap_file.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "34856b567796204bcfa93477b231b20be86d8956be62a01205a4683f6c8518aa",
+      "xattrs": {
+        "security.capability": "cap_data"
+      }
+    },
+    "user_xattr_file.txt": {
+      "type": "file",
+      "mode": 33188,
+      "uid": 0,
+      "gid": 0,
+      "mtime": 1700000000.125,
+      "sha256": "99c5d612ca47e8acb3d0f572e8139dfac3cbee59087a683bd4ffd02c2e260c87",
+      "xattrs": {
+        "user.custom": "hello_xattr"
+      }
+    }
+  }
+}

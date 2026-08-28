@@ -25,6 +25,7 @@ packages = ["src/palimpsest_local"]
 [tool.pytest.ini_options]
 markers = [
     "kvm: requires a Linux host with KVM, libvirt, and guest fixtures",
+    "oci_fs: requires Linux root and filesystem tools for privileged OverlayFS testing",
 ]
 
 [tool.ruff]

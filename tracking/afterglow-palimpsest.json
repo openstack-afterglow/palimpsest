@@ -160,15 +160,15 @@
       "counterparts": [
         {
           "path": "src/palimpsest_local/cli.py",
-          "sha256": "1d6662d5bc1e9b8fb1284e55091a2eea16b69c0531d8ef15eb0ea5b3571c2053"
+          "sha256": "213aff569323f4fd43fbb058d1afc3b9266ae22248b33b9617bdca54cfbb35d8"
         },
         {
           "path": "src/palimpsest_local/runtime.py",
-          "sha256": "bb6ad5b35fafb82b3c5f29abf6f5382467e2920661a00473e56b265bfc6ad64b"
+          "sha256": "c7009078ceeb2ba6b6dc4b1355f317e6c177031539ac94fc6727df96c3cc8192"
         },
         {
           "path": "src/palimpsest_local/kvm.py",
-          "sha256": "e17f75e5dfd0d731b3198fbf225c77b8bce631ef08f13f0a7569c542c792c4f8"
+          "sha256": "2569ebb70abfd7ed716a9624a0147c41ef461ca4bbfc7e88b990939e0159babc"
         }
       ]
     },

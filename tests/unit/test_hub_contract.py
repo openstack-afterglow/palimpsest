@@ -16,7 +16,7 @@ import pytest
 
 from palimpsest_local import hub
 from palimpsest_local.errors import HubError
-from palimpsest_local.hub import HubClient
+from palimpsest_local.hub import MEDIA_TYPE_LAYER_SQUASHFS, HubClient
 
 
 def test_hub_module_uses_only_stdlib_and_package():
@@ -54,6 +54,45 @@ def test_hub_client_constructor_validation_and_repr():
 
     with pytest.raises(HubError, match="timeout_seconds"):
         HubClient("http://localhost:8080", "token", timeout_seconds=0)
+
+
+def test_buildkit_cache_contract_constants():
+    assert hub.KIND_BUILDKIT_CACHE == "buildkit-cache"
+    assert hub.MEDIA_TYPE_BUILDKIT_CACHE == "application/vnd.afterglow.palimpsest.buildkit.cache.v1.tar"
+
+
+def test_list_layers_forwards_normalized_chain_id(monkeypatch: pytest.MonkeyPatch):
+    chain_id = "sha256:" + "A" * 64
+    captured: dict[str, object] = {}
+
+    def fake_json_request(method, path, payload=None, *, query=None):
+        captured.update(method=method, path=path, payload=payload, query=query)
+        return []
+
+    client = HubClient("http://hub.invalid", "token")
+    monkeypatch.setattr(client, "_json_request", fake_json_request)
+
+    assert (
+        client.list_layers(
+            name="dockerfile-cache",
+            kind=hub.KIND_BUILDKIT_CACHE,
+            chain_id=chain_id,
+            limit=7,
+        )
+        == []
+    )
+    assert captured == {
+        "method": "GET",
+        "path": "/layers",
+        "payload": None,
+        "query": {
+            "name": "dockerfile-cache",
+            "kind": "buildkit-cache",
+            "chain_id": "sha256:" + "a" * 64,
+            "parent_digest": None,
+            "limit": 7,
+        },
+    }
 
 
 class MockHubHandler(BaseHTTPRequestHandler):
@@ -207,7 +246,19 @@ def test_push_registered_blob_short_circuits_without_chunk_or_final_put(tmp_path
     def fake_open(method, path, **kwargs):
         calls.append((method, path, kwargs.get("headers", {})))
         assert method == "POST"
-        return _Response({"completed": True, "registered": True})
+        return _Response(
+            {
+                "completed": True,
+                "registered": True,
+                "registration": {
+                    "blob_digest": f"sha256:{hashlib.sha256(b'registered').hexdigest()}",
+                    "name": "registered",
+                    "kind": "squashfs",
+                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                    "is_published": False,
+                },
+            }
+        )
 
     client = HubClient("http://hub.invalid", "token")
     monkeypatch.setattr(client, "_open", fake_open)
@@ -218,6 +269,47 @@ def test_push_registered_blob_short_circuits_without_chunk_or_final_put(tmp_path
         "registered": True,
     }
     assert calls == [("POST", "/uploads", {})]
+
+
+def test_push_registered_blob_rejects_incompatible_runtime_descriptor(tmp_path: Path, monkeypatch):
+    source = tmp_path / "runtime.squashfs"
+    source.write_bytes(b"same-bytes")
+    digest = f"sha256:{hashlib.sha256(b'same-bytes').hexdigest()}"
+
+    def fake_open(method, path, **_kwargs):
+        assert (method, path) == ("POST", "/uploads")
+        return _Response(
+            {
+                "completed": True,
+                "registered": True,
+                "registration": {
+                    "blob_digest": digest,
+                    "name": "generic-layer",
+                    "kind": "squashfs",
+                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                    "chain_id": None,
+                    "base_image_digest": None,
+                    "arch": "x86_64",
+                    "is_published": False,
+                },
+            }
+        )
+
+    client = HubClient("http://hub.invalid", "token")
+    monkeypatch.setattr(client, "_open", fake_open)
+    with pytest.raises(HubError, match="incompatible descriptor fields"):
+        client.push_blob(
+            source,
+            {
+                "name": "runtime-pack",
+                "kind": "squashfs",
+                "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                "chain_id": "sha256:" + "c" * 64,
+                "base_image_digest": "sha256:" + "d" * 64,
+                "arch": "x86_64",
+            },
+            resume=False,
+        )
 
 
 def test_push_unregistered_blob_refuses_without_chunk_or_final_put(tmp_path: Path, monkeypatch):

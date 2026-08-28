@@ -6,27 +6,54 @@ import inspect
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from palimpsest_local import platforms
 from palimpsest_local.kvm import (
     MAX_LAYER_DISKS,
     DomainSpec,
     KvmError,
     KvmUnavailable,
+    VolumeDisk,
     build_domain_xml,
+    build_hdiutil_seed_command,
     build_layer_activation_script,
     build_layer_disks,
     build_seed_iso_command,
     connect,
     destroy_and_undefine,
     layer_blob_path,
+    run_hdiutil_seed_iso,
     run_seed_iso,
+    validate_domain_name_available,
+    validate_network,
 )
 
 _ROOT = Path("/var/lib/palimpsest/layers")
 _DIGESTS = [f"sha256:{chr(ord('a') + index) * 64}" for index in range(3)]
+
+
+_X86_PROFILE = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64")
+_AARCH64_KVM_PROFILE = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "aarch64")
+_HVF_PROFILE = platforms.DomainProfile(
+    backend=platforms.BACKEND_HVF,
+    domain_type="hvf",
+    arch="aarch64",
+    machine="virt",
+    emulator=Path("/opt/homebrew/bin/qemu-system-aarch64"),
+    uri="qemu:///session",
+    firmware=platforms.Firmware(
+        loader=Path("/opt/homebrew/share/qemu/edk2-aarch64-code.fd"),
+        nvram_template=Path("/opt/homebrew/share/qemu/edk2-arm-vars.fd"),
+    ),
+    autoselect_firmware=False,
+    network_mode="user-hostfwd",
+    seed_tool="hdiutil",
+    seed_bus="scsi",
+)
 
 
 def _spec(layers=None) -> DomainSpec:
@@ -72,7 +99,7 @@ def test_layer_disks_reject_empty_and_over_limit():
 
 
 def test_domain_xml_marks_every_layer_disk_readonly():
-    xml = ET.fromstring(build_domain_xml(_spec()))
+    xml = ET.fromstring(build_domain_xml(_spec(), _X86_PROFILE))
     layers = [
         disk
         for disk in xml.findall("./devices/disk")
@@ -84,7 +111,7 @@ def test_domain_xml_marks_every_layer_disk_readonly():
 
 
 def test_domain_xml_root_disk_is_writable_qcow2():
-    xml = ET.fromstring(build_domain_xml(_spec()))
+    xml = ET.fromstring(build_domain_xml(_spec(), _X86_PROFILE))
     root = next(disk for disk in xml.findall("./devices/disk") if disk.find("target").get("dev") == "vda")
     assert root.find("readonly") is None
     assert root.find("driver").get("type") == "qcow2"
@@ -92,14 +119,45 @@ def test_domain_xml_root_disk_is_writable_qcow2():
 
 def test_domain_xml_carries_serial_for_stable_guest_lookup():
     disks = build_layer_disks(_ROOT, _DIGESTS)
-    xml = ET.fromstring(build_domain_xml(_spec(disks)))
+    xml = ET.fromstring(build_domain_xml(_spec(disks), _X86_PROFILE))
     assert [disk.findtext("serial") for disk in xml.findall("./devices/disk") if disk.findtext("serial")] == [
         disk.serial for disk in disks
     ]
 
 
+def test_domain_xml_attaches_writable_volume_as_raw_virtio_block():
+    volume = VolumeDisk(
+        name="data",
+        host_path=Path("/var/lib/palimpsest/volumes/demo/data.raw"),
+        target_dev="vde",
+        serial="0123456789abcdefghij",
+        mount_path="/var/lib/data",
+    )
+    xml = ET.fromstring(build_domain_xml(DomainSpec(**{**_spec().__dict__, "volumes": [volume]}), _X86_PROFILE))
+    disk = next(item for item in xml.findall("./devices/disk") if item.findtext("serial") == volume.serial)
+
+    assert disk.find("readonly") is None
+    assert disk.find("driver").get("type") == "raw"
+    assert disk.find("target").attrib == {"dev": "vde", "bus": "virtio"}
+
+
+def test_activation_script_mounts_writable_volume_by_stable_id():
+    volume = VolumeDisk(
+        name="data",
+        host_path=Path("/var/lib/palimpsest/volumes/demo/data.raw"),
+        target_dev="vde",
+        serial="0123456789abcdefghij",
+        mount_path="/var/lib/data",
+    )
+    script = build_layer_activation_script([], volumes=[volume])
+
+    assert "/dev/disk/by-id/virtio-0123456789abcdefghij" in script
+    assert "mount -t ext4 -o rw,noatime" in script
+    assert "/dev/vde" not in script
+
+
 def test_domain_xml_attaches_nocloud_seed_as_cdrom():
-    xml = ET.fromstring(build_domain_xml(_spec()))
+    xml = ET.fromstring(build_domain_xml(_spec(), _X86_PROFILE))
     cdrom = next(disk for disk in xml.findall("./devices/disk") if disk.get("device") == "cdrom")
     assert cdrom.find("source").get("file").endswith("-seed.iso")
     assert cdrom.find("readonly") is not None
@@ -109,7 +167,7 @@ def test_builder_domain_has_only_explicit_serial_channel():
     spec = DomainSpec(
         **{**_spec().__dict__, "guest_agent": False, "control_socket": Path("/run/palimpsest/builder.sock")}
     )
-    xml = ET.fromstring(build_domain_xml(spec))
+    xml = ET.fromstring(build_domain_xml(spec, _X86_PROFILE))
     names = [channel.find("target").get("name") for channel in xml.findall("./devices/channel")]
     assert names == ["org.afterglow.palimpsest.builder.v1"]
     source = xml.find("./devices/channel/source")
@@ -122,7 +180,7 @@ def test_builder_domain_has_only_explicit_serial_channel():
 def test_domain_xml_rejects_invalid_spec(field, value):
     spec = _spec()
     with pytest.raises(KvmError):
-        build_domain_xml(DomainSpec(**{**spec.__dict__, field: value}))
+        build_domain_xml(DomainSpec(**{**spec.__dict__, field: value}), _X86_PROFILE)
 
 
 def test_seed_iso_command_is_argument_list_not_shell():
@@ -153,6 +211,41 @@ def test_run_seed_iso_passes_no_shell():
     assert "shell" not in kwargs or kwargs["shell"] is False
 
 
+def test_hdiutil_seed_command_is_argument_list_not_shell():
+    assert build_hdiutil_seed_command(Path("/s/seed.iso"), Path("/s/seed.d")) == [
+        "hdiutil",
+        "makehybrid",
+        "-iso",
+        "-joliet",
+        "-default-volume-name",
+        "CIDATA",
+        "-o",
+        "/s/seed.iso",
+        "/s/seed.d",
+    ]
+
+
+def test_hdiutil_seed_command_rejects_relative_paths():
+    with pytest.raises(KvmError):
+        build_hdiutil_seed_command(Path("seed.iso"), Path("/s/seed.d"))
+    with pytest.raises(KvmError):
+        build_hdiutil_seed_command(Path("/s/seed.iso"), Path("seed.d"))
+
+
+def test_run_hdiutil_seed_iso_reports_missing_tool_actionably():
+    with patch("palimpsest_local.kvm.subprocess.run", side_effect=FileNotFoundError):
+        with pytest.raises(KvmError, match="hdiutil"):
+            run_hdiutil_seed_iso(Path("/s/seed.iso"), Path("/s/seed.d"))
+
+
+def test_run_hdiutil_seed_iso_passes_no_shell():
+    with patch("palimpsest_local.kvm.subprocess.run") as run:
+        run_hdiutil_seed_iso(Path("/s/seed.iso"), Path("/s/seed.d"))
+    args, kwargs = run.call_args
+    assert isinstance(args[0], list)
+    assert "shell" not in kwargs or kwargs["shell"] is False
+
+
 def test_activation_script_uses_by_id_not_device_names():
     disks = build_layer_disks(_ROOT, _DIGESTS)
     script = build_layer_activation_script(disks)
@@ -175,6 +268,8 @@ def test_activation_script_keeps_upper_and_work_on_local_disk():
 def test_activation_script_mounts_layers_read_only_and_waits_for_udev():
     script = build_layer_activation_script(build_layer_disks(_ROOT, _DIGESTS))
     assert script.count("mount -t squashfs -o ro") == 3
+    assert "mount -t nfs" not in script
+    assert "nfs4" not in script
     assert "seq 1 30" in script
     assert script.startswith("set -euo pipefail")
 
@@ -202,6 +297,69 @@ def test_connect_reports_missing_libvirt_actionably():
             connect("qemu:///system")
 
 
+def test_validate_network_requires_exact_active_network():
+    active = MagicMock()
+    active.isActive.return_value = 1
+    conn = MagicMock()
+    conn.networkLookupByName.return_value = active
+
+    validate_network("default", conn=conn)
+
+    conn.networkLookupByName.assert_called_once_with("default")
+
+
+def test_validate_network_rejects_missing_inactive_and_indeterminate():
+    missing = MagicMock()
+    missing.networkLookupByName.side_effect = RuntimeError("missing")
+    with pytest.raises(KvmError, match="does not exist"):
+        validate_network("missing", conn=missing)
+
+    inactive_network = MagicMock()
+    inactive_network.isActive.return_value = 0
+    inactive = MagicMock()
+    inactive.networkLookupByName.return_value = inactive_network
+    with pytest.raises(KvmError, match="not active"):
+        validate_network("default", conn=inactive)
+
+    unknown_network = MagicMock()
+    unknown_network.isActive.side_effect = RuntimeError("cannot query")
+    unknown = MagicMock()
+    unknown.networkLookupByName.return_value = unknown_network
+    with pytest.raises(KvmError, match="cannot determine"):
+        validate_network("default", conn=unknown)
+
+
+def test_validate_network_skips_all_checks_for_user_hostfwd_profile():
+    conn = MagicMock()
+    validate_network("Not A Valid Name!", conn=conn, profile=_HVF_PROFILE)
+    conn.networkLookupByName.assert_not_called()
+
+
+def test_validate_domain_name_available_rejects_collision_and_ambiguity():
+    class FakeLibvirtError(RuntimeError):
+        def __init__(self, message: str, code: int):
+            super().__init__(message)
+            self.code = code
+
+        def get_error_code(self) -> int:
+            return self.code
+
+    fake_libvirt = SimpleNamespace(libvirtError=FakeLibvirtError, VIR_ERR_NO_DOMAIN=42)
+    missing = MagicMock()
+    missing.lookupByName.side_effect = FakeLibvirtError("missing", 42)
+    collision = MagicMock()
+    collision.lookupByName.return_value = MagicMock()
+    ambiguous = MagicMock()
+    ambiguous.lookupByName.side_effect = FakeLibvirtError("connection failed", 99)
+
+    with patch("palimpsest_local.kvm._libvirt", return_value=fake_libvirt):
+        validate_domain_name_available("palimpsest-demo", conn=missing)
+        with pytest.raises(KvmError, match="already reserved"):
+            validate_domain_name_available("palimpsest-demo", conn=collision)
+        with pytest.raises(KvmError, match="cannot determine"):
+            validate_domain_name_available("palimpsest-demo", conn=ambiguous)
+
+
 def test_destroy_and_undefine_is_best_effort_when_domain_absent():
     fake_libvirt = MagicMock()
     fake_libvirt.libvirtError = RuntimeError
@@ -220,7 +378,7 @@ def test_module_generates_xml_without_parsing_untrusted_input():
 def test_kvm_golden_bytes_are_stable():
     fixture_dir = Path(__file__).parents[1] / "fixtures"
     disks = build_layer_disks(_ROOT, _DIGESTS)
-    assert build_domain_xml(_spec(disks)) == (fixture_dir / "domain.xml").read_text(encoding="utf-8")
+    assert build_domain_xml(_spec(disks), _X86_PROFILE) == (fixture_dir / "domain.xml").read_text(encoding="utf-8")
     assert build_layer_activation_script(disks) == (fixture_dir / "layer-activation.sh").read_text(encoding="utf-8")
     expected_argv = (
         "\0".join(
@@ -235,9 +393,100 @@ def test_kvm_golden_bytes_are_stable():
     assert expected_argv == (fixture_dir / "seed-argv.nul").read_text(encoding="utf-8")
 
 
+def test_kvm_golden_bytes_are_stable_for_aarch64_kvm():
+    fixture_dir = Path(__file__).parents[1] / "fixtures"
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    xml_text = build_domain_xml(_spec(disks), _AARCH64_KVM_PROFILE)
+    assert xml_text == (fixture_dir / "domain-aarch64.xml").read_text(encoding="utf-8")
+    xml = ET.fromstring(xml_text)
+    assert xml.get("type") == "kvm"
+    assert xml.find("./os").get("firmware") == "efi"
+    assert xml.find("./os/loader") is None
+    assert xml.find("./os/nvram") is None
+    assert xml.find("./features/apic") is None
+    assert xml.find("./features/acpi") is not None
+    controller = xml.find("./devices/controller")
+    assert controller is not None and controller.attrib == {"type": "scsi", "index": "0", "model": "virtio-scsi"}
+    cdrom = next(disk for disk in xml.findall("./devices/disk") if disk.get("device") == "cdrom")
+    assert cdrom.find("target").get("bus") == "scsi"
+    assert xml.find("./devices/interface") is not None
+
+
+def test_kvm_golden_bytes_are_stable_for_hvf():
+    fixture_dir = Path(__file__).parents[1] / "fixtures"
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    spec = DomainSpec(
+        **{
+            **_spec(disks).__dict__,
+            "ssh_host_port": 2222,
+            "nvram": Path("/var/lib/palimpsest/domains/demo-nvram.fd"),
+        }
+    )
+    xml_text = build_domain_xml(spec, _HVF_PROFILE)
+    assert xml_text == (fixture_dir / "domain-hvf.xml").read_text(encoding="utf-8")
+    assert 'xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"' in xml_text
+    xml = ET.fromstring(xml_text)
+    assert xml.get("type") == "hvf"
+    assert xml.find("./os").get("firmware") is None
+    assert xml.find("./os/loader").text == "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+    assert xml.find("./os/nvram").text == "/var/lib/palimpsest/domains/demo-nvram.fd"
+    assert xml.find("./features/apic") is None
+    assert xml.find("./features/acpi") is not None
+    controller = xml.find("./devices/controller")
+    assert controller is not None and controller.attrib == {"type": "scsi", "index": "0", "model": "virtio-scsi"}
+    cdrom = next(disk for disk in xml.findall("./devices/disk") if disk.get("device") == "cdrom")
+    assert cdrom.find("target").get("bus") == "scsi"
+    assert xml.find("./devices/interface") is None
+    qemu_ns = "http://libvirt.org/schemas/domain/qemu/1.0"
+    args = [arg.get("value") for arg in xml.findall(f"./{{{qemu_ns}}}commandline/{{{qemu_ns}}}arg")]
+    assert args == [
+        "-netdev",
+        "user,id=palimpsest0,hostfwd=tcp:127.0.0.1:2222-:22",
+        "-device",
+        "virtio-net-pci,netdev=palimpsest0",
+    ]
+
+
+def test_domain_xml_rejects_missing_nvram_for_pflash_firmware():
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    spec = DomainSpec(**{**_spec(disks).__dict__, "ssh_host_port": 2222})
+    with pytest.raises(KvmError, match="nvram"):
+        build_domain_xml(spec, _HVF_PROFILE)
+
+
+def test_domain_xml_rejects_relative_nvram_for_pflash_firmware():
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    spec = DomainSpec(**{**_spec(disks).__dict__, "ssh_host_port": 2222, "nvram": Path("relative-nvram.fd")})
+    with pytest.raises(KvmError, match="nvram"):
+        build_domain_xml(spec, _HVF_PROFILE)
+
+
+def test_domain_xml_rejects_missing_ssh_host_port_for_user_hostfwd():
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    spec = DomainSpec(
+        **{**_spec(disks).__dict__, "nvram": Path("/var/lib/palimpsest/domains/demo-nvram.fd")}
+    )
+    with pytest.raises(KvmError, match="ssh host port"):
+        build_domain_xml(spec, _HVF_PROFILE)
+
+
+@pytest.mark.parametrize("bad_port", [0, 65536, -1])
+def test_domain_xml_rejects_out_of_range_ssh_host_port(bad_port):
+    disks = build_layer_disks(_ROOT, _DIGESTS)
+    spec = DomainSpec(
+        **{
+            **_spec(disks).__dict__,
+            "ssh_host_port": bad_port,
+            "nvram": Path("/var/lib/palimpsest/domains/demo-nvram.fd"),
+        }
+    )
+    with pytest.raises(KvmError, match="ssh host port"):
+        build_domain_xml(spec, _HVF_PROFILE)
+
+
 def test_kvm_marker_uses_stable_namespace_prefix():
     spec = DomainSpec(**{**_spec().__dict__, "run_id": "run-uuid"})
-    assert '<palimpsest:run id="run-uuid" schema="1" version="0.1.0" />' in build_domain_xml(spec)
+    assert '<palimpsest:run id="run-uuid" schema="1" version="0.1.0" />' in build_domain_xml(spec, _X86_PROFILE)
 
 
 def test_pure_tests_never_import_afterglow_app():

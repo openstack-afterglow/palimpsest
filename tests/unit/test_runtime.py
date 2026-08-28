@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import palimpsest_local.kvm as kvm
+import palimpsest_local.platforms as platforms
+import palimpsest_local.runtime as runtime
 import palimpsest_local.state as state
 from palimpsest_local.errors import (
     ArtifactValidationError,
@@ -35,6 +37,7 @@ from palimpsest_local.runtime import (
     rm,
     run,
     shell_command,
+    start,
     start_serial_builder,
     stop,
 )
@@ -100,7 +103,7 @@ class FakeLibvirtConn:
     def lookupByName(self, name: str) -> FakeDomain:
         if name in self.domains and not self.domains[name].undefined:
             return self.domains[name]
-        raise Exception(f"Domain not found: {name}")
+        raise KeyError(f"Domain not found: {name}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -330,6 +333,11 @@ def test_run_status_transitions_and_completion():
 
             assert res["status"] == "running"
             assert res["guest_ip"] == "192.168.122.100"
+            assert res["layer_attachment"] == {
+                "delivery": "direct-block",
+                "device": "virtio-blk",
+                "mount": "squashfs-ro",
+            }
 
             r_owner = state.read_owner_record(rpaths)
             assert r_owner.name == "test-run"
@@ -347,6 +355,17 @@ def test_run_status_transitions_and_completion():
             # Stop again (idempotent)
             idempotent_res = stop("test-run", roots=roots, conn=conn)
             assert idempotent_res["status"] == "stopped"
+
+            def restarted_wait(rpaths_in, domain, timeout_seconds, require_ip=True):
+                assert rpaths_in.console.read_text(encoding="utf-8") == ""
+                rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
+                return "192.168.122.100"
+
+            with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=restarted_wait):
+                restarted_res = start("test-run", roots=roots, conn=conn)
+            assert restarted_res["status"] == "running"
+            assert restarted_res["guest_ip"] == "192.168.122.100"
+            stop("test-run", roots=roots, conn=conn)
 
             # Remove run (plain rm retains volume)
             rm_res = rm("test-run", roots=roots, conn=conn, volumes=False)
@@ -459,8 +478,11 @@ def test_foreign_marker_refusal():
             rm("foreign-run", roots=roots, conn=conn)
         assert domain.isActive()
 
-        runs, warnings = reconcile(roots=roots, conn=conn)
-        assert any("not owned by run ID" in w for w in warnings)
+        with pytest.raises(StateError, match="shadowed by a foreign libvirt domain"):
+            reconcile(roots=roots, conn=conn)
+        with pytest.raises(StateError, match="shadowed by a foreign libvirt domain"):
+            inspect_run("foreign-run", roots=roots, conn=conn)
+        assert domain.isActive()
 
 
 def test_run_refuses_existing_libvirt_domain():
@@ -815,3 +837,416 @@ def test_commit_tag_conflict(tmp_path: Path):
 
     with pytest.raises(LifecycleError, match="conflicting with committed digest"):
         commit("conflict-run", "conflict-commit", roots=roots, conn=conn, runner=fake_runner)
+
+
+def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+
+    base_file = roots.store / "base.qcow2"
+    base_file.parent.mkdir(parents=True, exist_ok=True)
+    base_file.write_bytes(b"base_data")
+    base_digest = _sha256_file(base_file)
+
+    base_ref = ImageRef(base_digest, "qcow2", "x86_64", None, base_file)
+    stack = StackRef(base_ref, ())
+    spec = RunSpec(name="ledger-fields-run", stack=stack, memory_mib=2048, vcpus=4)
+
+    conn = FakeLibvirtConn()
+    rpaths = state.run_paths(roots, "ledger-fields-run")
+
+    def fake_subprocess_run(argv, *args, **kwargs):
+        if argv[0] == "qemu-img":
+            if argv[1] == "create":
+                Path(argv[-1]).write_bytes(b"overlay")
+                return MagicMock(stdout="", stderr="", returncode=0)
+            img_path = Path(argv[-1]).resolve()
+            if "overlay" in img_path.name:
+                info = {
+                    "format": "qcow2",
+                    "backing-filename": str(base_file.resolve()),
+                    "backing-filename-format": "qcow2",
+                }
+            else:
+                info = {"format": "qcow2"}
+            return MagicMock(stdout=json.dumps(info), stderr="", returncode=0)
+        elif argv[0] == "ssh-keygen":
+            key_p = Path(argv[-1])
+            key_p.write_text("private_key")
+            key_p.with_name(key_p.name + ".pub").write_text("ssh-ed25519 AAAAFakePubKey user@host")
+            return MagicMock(stdout="", stderr="", returncode=0)
+        elif argv[0] == "cloud-localds":
+            Path(argv[1]).touch()
+            rpaths.console.write_text("PALIMPSEST_READY=1\n")
+            return MagicMock(stdout="", stderr="", returncode=0)
+        return MagicMock(stdout="", stderr="", returncode=0)
+
+    with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        res = run(spec, roots=roots, conn=conn)
+
+    assert res["backend"] == platforms.BACKEND_KVM
+    assert res["memory_mib"] == 2048
+    assert res["vcpus"] == 4
+    assert res["guest_ip"] == "192.168.122.100"
+    assert res["ssh"] == {"host": "192.168.122.100", "port": 22}
+
+
+def _hvf_test_profile(tmp_path: Path, *, with_firmware: bool = True) -> platforms.DomainProfile:
+    firmware = None
+    if with_firmware:
+        firmware_dir = tmp_path / "firmware"
+        firmware_dir.mkdir(exist_ok=True)
+        loader = firmware_dir / "edk2-aarch64-code.fd"
+        loader.write_bytes(b"loader")
+        nvram_template = firmware_dir / "edk2-arm-vars.fd"
+        nvram_template.write_bytes(b"nvram-template")
+        firmware = platforms.Firmware(loader=loader, nvram_template=nvram_template)
+    return platforms.DomainProfile(
+        backend=platforms.BACKEND_HVF,
+        domain_type="hvf",
+        arch="aarch64",
+        machine="virt",
+        emulator=Path("/opt/homebrew/bin/qemu-system-aarch64"),
+        uri="qemu:///session",
+        firmware=firmware,
+        autoselect_firmware=False,
+        network_mode="user-hostfwd",
+        seed_tool="cloud-localds",
+        seed_bus="scsi",
+    )
+
+
+def test_run_user_hostfwd_allocates_port_and_writes_known_hosts_without_ip_discovery(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+
+    base_file = roots.store / "base.qcow2"
+    base_file.parent.mkdir(parents=True, exist_ok=True)
+    base_file.write_bytes(b"base_data")
+    base_digest = _sha256_file(base_file)
+
+    base_ref = ImageRef(base_digest, "qcow2", "aarch64", None, base_file)
+    stack = StackRef(base_ref, ())
+    spec = RunSpec(name="hvf-run", stack=stack, network="default")
+
+    hvf_profile = _hvf_test_profile(tmp_path)
+    conn = FakeLibvirtConn()
+    rpaths = state.run_paths(roots, "hvf-run")
+
+    def fake_subprocess_run(argv, *args, **kwargs):
+        if argv[0] == "qemu-img":
+            if argv[1] == "create":
+                Path(argv[-1]).write_bytes(b"overlay")
+                return MagicMock(stdout="", stderr="", returncode=0)
+            img_path = Path(argv[-1]).resolve()
+            if "overlay" in img_path.name:
+                info = {
+                    "format": "qcow2",
+                    "backing-filename": str(base_file.resolve()),
+                    "backing-filename-format": "qcow2",
+                }
+            else:
+                info = {"format": "qcow2"}
+            return MagicMock(stdout=json.dumps(info), stderr="", returncode=0)
+        elif argv[0] == "ssh-keygen":
+            key_p = Path(argv[-1])
+            key_p.write_text("private_key")
+            key_p.with_name(key_p.name + ".pub").write_text("ssh-ed25519 AAAAFakePubKey user@host")
+            return MagicMock(stdout="", stderr="", returncode=0)
+        elif argv[0] == "cloud-localds":
+            Path(argv[1]).touch()
+            return MagicMock(stdout="", stderr="", returncode=0)
+        return MagicMock(stdout="", stderr="", returncode=0)
+
+    readiness: list[bool] = []
+
+    def fake_wait(rpaths_in, domain, timeout_seconds, require_ip=True):
+        readiness.append(require_ip)
+        return None
+
+    with (
+        patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run),
+        patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait),
+    ):
+        res = run(spec, roots=roots, conn=conn, profile=hvf_profile)
+
+    assert readiness == [False]
+    assert res["backend"] == platforms.BACKEND_HVF
+    assert res["guest_ip"] is None
+    assert res["ssh"]["host"] == "127.0.0.1"
+    assert 1 <= res["ssh"]["port"] <= 65535
+
+    domain_xml = conn.domains["hvf-run"].xml_content
+    assert "<interface" not in domain_xml
+    assert "qemu:commandline" in domain_xml
+    assert f"hostfwd=tcp:127.0.0.1:{res['ssh']['port']}-:22" in domain_xml
+
+    known_hosts_text = rpaths.known_hosts.read_text(encoding="utf-8")
+    assert f"[127.0.0.1]:{res['ssh']['port']}" in known_hosts_text
+
+    nvram_path = rpaths.root / "nvram.fd"
+    assert nvram_path.read_bytes() == b"nvram-template"
+    assert (nvram_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "hvf-restart")
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rpaths.ssh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (rpaths.root / "ssh_host_ed25519_key.pub").write_text("ssh-ed25519 AAAAFakeHostKey host")
+
+    owner_rec = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="stopped",
+        data={
+            "backend": platforms.BACKEND_HVF,
+            "base": {"arch": "aarch64"},
+            "network": "default",
+            "guest_ip": None,
+            "ssh": {"host": "127.0.0.1", "port": 55123},
+        },
+    )
+
+    conn = FakeLibvirtConn()
+    dom_xml = (
+        f'<domain><name>hvf-restart</name><metadata>'
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner_rec.run_id}" '
+        f'schema="1" version="0.1.0"/></metadata>'
+        f'<qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">'
+        f'<qemu:arg value="-netdev"/><qemu:arg value="user,id=palimpsest0,hostfwd=tcp:127.0.0.1:55123-:22"/>'
+        f'</qemu:commandline></domain>'
+    )
+    conn.defineXML(dom_xml)
+    rpaths.known_hosts.write_text("[127.0.0.1]:55123 ssh-ed25519 AAAAFakeHostKey host\n", encoding="utf-8")
+
+    hvf_profile = _hvf_test_profile(tmp_path, with_firmware=False)
+
+    def fake_wait(rpaths_in, domain, timeout_seconds, require_ip=True):
+        assert require_ip is False
+        rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
+        return None
+
+    with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait):
+        res = start("hvf-restart", roots=roots, conn=conn, profile=hvf_profile)
+
+    new_port = res["ssh"]["port"]
+    assert res["status"] == "running"
+    assert res["guest_ip"] is None
+    assert res["ssh"]["host"] == "127.0.0.1"
+    assert 1 <= new_port <= 65535
+    assert new_port != 55123
+
+    updated_xml = conn.lookupByName("hvf-restart").XMLDesc()
+    assert f"hostfwd=tcp:127.0.0.1:{new_port}-:22" in updated_xml
+    assert "55123" not in updated_xml
+
+    known_hosts_text = rpaths.known_hosts.read_text(encoding="utf-8")
+    assert f"[127.0.0.1]:{new_port}" in known_hosts_text
+    assert "55123" not in known_hosts_text
+
+def test_shell_and_exec_commands_use_recorded_ssh_port(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "port-run")
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths, status="running", data={"guest_ip": None, "ssh": {"host": "127.0.0.1", "port": 54321}}
+    )
+
+    sh_cmd = shell_command("port-run", roots=roots)
+    assert any("127.0.0.1" in arg for arg in sh_cmd)
+    assert sh_cmd[sh_cmd.index("-p") + 1] == "54321"
+
+    ex_cmd = exec_command("port-run", ["ls"], roots=roots)
+    assert any("127.0.0.1" in arg for arg in ex_cmd)
+    assert ex_cmd[ex_cmd.index("-p") + 1] == "54321"
+
+
+def test_ssh_endpoint_falls_back_to_legacy_guest_ip_and_raises_without_either():
+    assert runtime._ssh_endpoint("r", {"guest_ip": "10.0.0.5"}) == ("10.0.0.5", 22)
+    assert runtime._ssh_endpoint("r", {"ssh": {"host": "10.0.0.9", "port": 2222}}) == ("10.0.0.9", 2222)
+    with pytest.raises(LifecycleError, match="no reachable SSH endpoint"):
+        runtime._ssh_endpoint("r", {})
+
+
+def test_shell_command_raises_when_no_ssh_endpoint_recorded(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "no-endpoint-run")
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"guest_ip": None})
+
+    with pytest.raises(LifecycleError, match="no reachable SSH endpoint"):
+        shell_command("no-endpoint-run", roots=roots)
+
+
+def test_reconcile_treats_libvirt_hvf_backend_as_libvirt_backed(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "hvf-reconcile")
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={"backend": platforms.BACKEND_HVF, "guest_ip": None, "ssh": {"host": "127.0.0.1", "port": 12345}},
+    )
+
+    runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
+
+    assert any("domain missing from libvirt" in w for w in warnings)
+    assert state.read_run_state(rpaths)["status"] == "stopped"
+
+
+def test_ps_reports_backend_field_and_defaults_legacy_ledgers_to_kvm(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+
+    hvf_rpaths = state.run_paths(roots, "hvf-ps-run")
+    hvf_rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(hvf_rpaths)
+    state.write_run_state(hvf_rpaths, status="stopped", data={"backend": platforms.BACKEND_HVF, "guest_ip": None})
+
+    legacy_rpaths = state.run_paths(roots, "legacy-ps-run")
+    legacy_rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(legacy_rpaths)
+    state.write_run_state(legacy_rpaths, status="stopped", data={"guest_ip": None})
+
+    result = {r["name"]: r for r in ps(roots=roots, conn=FakeLibvirtConn())}
+    assert result["hvf-ps-run"]["backend"] == platforms.BACKEND_HVF
+    assert result["legacy-ps-run"]["backend"] == platforms.BACKEND_KVM
+
+
+def test_resolve_new_run_profile_preserves_legacy_conn_and_kvm_uri_callers():
+    profile, uri = runtime._resolve_new_run_profile("x86_64", kvm_uri=None, profile=None, conn=object())
+    assert profile.backend == platforms.BACKEND_KVM
+    assert profile.arch == "x86_64"
+    assert uri == profile.uri
+
+    profile2, uri2 = runtime._resolve_new_run_profile("aarch64", kvm_uri="qemu:///system", profile=None, conn=None)
+    assert profile2.backend == platforms.BACKEND_KVM
+    assert profile2.arch == "aarch64"
+    assert uri2 == "qemu:///system"
+
+
+def test_resolve_new_run_profile_bare_call_uses_host_auto_selection_and_preflight(monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+    monkeypatch.setattr(platforms, "select_backend", lambda arch, **_kwargs: calls.append("select") or platforms.BACKEND_KVM)
+    monkeypatch.setattr(platforms, "preflight", lambda backend, **_kwargs: calls.append("preflight"))
+    profile, uri = runtime._resolve_new_run_profile("x86_64", kvm_uri=None, profile=None, conn=None)
+    assert calls == ["select", "preflight"]
+    assert profile.backend == platforms.BACKEND_KVM
+    assert uri == profile.uri
+
+
+def test_resolve_new_run_profile_bare_call_propagates_preflight_failure(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(platforms, "select_backend", lambda arch, **_kwargs: platforms.BACKEND_KVM)
+
+    def boom(backend, **_kwargs):
+        raise LifecycleError("no /dev/kvm")
+
+    monkeypatch.setattr(platforms, "preflight", boom)
+    with pytest.raises(LifecycleError, match="no /dev/kvm"):
+        runtime._resolve_new_run_profile("x86_64", kvm_uri=None, profile=None, conn=None)
+
+
+def test_resolve_ledger_profile_defaults_missing_backend_to_kvm():
+    profile = runtime._resolve_ledger_profile({"base": {"arch": "x86_64"}})
+    assert profile.backend == platforms.BACKEND_KVM
+    assert profile.uri == "qemu:///system"
+    assert profile.arch == "x86_64"
+
+    profile2 = runtime._resolve_ledger_profile({"backend": platforms.BACKEND_KVM, "base": {"arch": "aarch64"}})
+    assert profile2.arch == "aarch64"
+    assert profile2.machine == "virt"
+
+def test_reconcile_scoped_by_profile_ignores_other_backend(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+
+    kvm_rpaths = state.run_paths(roots, "kvm-run")
+    kvm_rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(kvm_rpaths)
+    state.write_run_state(kvm_rpaths, status="running", data={"backend": platforms.BACKEND_KVM, "guest_ip": None})
+
+    hvf_rpaths = state.run_paths(roots, "hvf-run")
+    hvf_rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(hvf_rpaths)
+    state.write_run_state(hvf_rpaths, status="running", data={"backend": platforms.BACKEND_HVF, "guest_ip": None})
+
+    class TrackingConn(FakeLibvirtConn):
+        def __init__(self):
+            super().__init__()
+            self.looked_up = []
+
+        def lookupByName(self, name: str):
+            self.looked_up.append(name)
+            return super().lookupByName(name)
+
+    conn = TrackingConn()
+    hvf_profile = platforms.DomainProfile(
+        backend=platforms.BACKEND_HVF,
+        domain_type="hvf",
+        arch="aarch64",
+        machine="virt",
+        emulator=Path("/usr/bin/qemu-system-aarch64"),
+        uri="qemu:///session",
+        firmware=platforms.Firmware(
+            loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
+            nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
+        ),
+        autoselect_firmware=False,
+        network_mode="user-hostfwd",
+        seed_tool="hdiutil",
+        seed_bus="scsi",
+    )
+    hvf_runs, _ = reconcile(roots=roots, conn=conn, profile=hvf_profile)
+
+    assert conn.looked_up == ["hvf-run"]
+    assert [r["name"] for r in hvf_runs] == ["hvf-run"]
+
+    conn.looked_up.clear()
+    kvm_profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64")
+    kvm_runs, _ = reconcile(roots=roots, conn=conn, profile=kvm_profile)
+
+    assert conn.looked_up == ["kvm-run"]
+    assert [r["name"] for r in kvm_runs] == ["kvm-run"]
+
+
+def test_reconcile_profile_scoped_connect_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    run_rpaths = state.run_paths(roots, "test-run")
+    run_rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.write_owner_record(run_rpaths)
+    state.write_run_state(run_rpaths, status="running", data={"backend": platforms.BACKEND_HVF, "guest_ip": None})
+
+    hvf_profile = platforms.DomainProfile(
+        backend=platforms.BACKEND_HVF,
+        domain_type="hvf",
+        arch="aarch64",
+        machine="virt",
+        emulator=Path("/usr/bin/qemu-system-aarch64"),
+        uri="qemu:///session",
+        firmware=platforms.Firmware(
+            loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
+            nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
+        ),
+        autoselect_firmware=False,
+        network_mode="user-hostfwd",
+        seed_tool="hdiutil",
+        seed_bus="scsi",
+    )
+
+    def failing_connect(uri: str):
+        raise runtime.kvm.KvmError("connection refused")
+
+    monkeypatch.setattr(runtime.kvm, "connect", failing_connect)
+
+    with pytest.raises(LifecycleError) as exc_info:
+        reconcile(roots=roots, profile=hvf_profile)
+
+    err_msg = str(exc_info.value)
+    assert "libvirt-hvf" in err_msg
+    assert "qemu:///session" in err_msg
+
+    # Verify unprofiled call swallows connection error
+    runs, warnings = reconcile(roots=roots)
+    assert len(runs) == 1
+    assert runs[0]["name"] == "test-run"

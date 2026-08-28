@@ -38,6 +38,9 @@ from palimpsest_hub.services.hub_bundle import (
     parse_bundle,
 )
 from palimpsest_hub.services.hub_store import (
+    KIND_BUILDKIT_CACHE,
+    MEDIA_TYPE_BUILDKIT_CACHE,
+    MEDIA_TYPE_IMAGE_QCOW2,
     MEDIA_TYPE_LAYER_SQUASHFS,
     HubDigestMismatch,
     HubStoreError,
@@ -248,9 +251,82 @@ def test_discovery_and_health_endpoints():
 def test_cloud_image_meta_resolves_media_type_by_disk_format():
     assert HubLayerMeta(name="torch", kind="squashfs").resolved_media_type() == MEDIA_TYPE_LAYER_SQUASHFS
     assert (
-        HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format="qcow2").resolved_media_type()
-        == "application/vnd.afterglow.palimpsest.image.qcow2.v1"
+        HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format="qcow2", arch="x86_64").resolved_media_type()
+        == MEDIA_TYPE_IMAGE_QCOW2
     )
+    assert (
+        HubLayerMeta(
+            name="ubuntu",
+            kind="cloud-image",
+            disk_format="qcow2",
+            arch="x86_64",
+            media_type=MEDIA_TYPE_IMAGE_QCOW2,
+        ).resolved_media_type()
+        == MEDIA_TYPE_IMAGE_QCOW2
+    )
+
+
+def test_buildkit_cache_meta_resolves_dedicated_media_type():
+    chain_id = "sha256:" + "d" * 64
+    assert (
+        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id=chain_id).resolved_media_type()
+        == MEDIA_TYPE_BUILDKIT_CACHE
+    )
+    assert (
+        HubLayerMeta(
+            name="dockerfile-cache",
+            kind=KIND_BUILDKIT_CACHE,
+            chain_id=chain_id,
+            media_type=MEDIA_TYPE_BUILDKIT_CACHE,
+        ).resolved_media_type()
+        == MEDIA_TYPE_BUILDKIT_CACHE
+    )
+
+
+def test_buildkit_cache_requires_key_and_rejects_runtime_chain_fields():
+    with pytest.raises(ValueError, match="chain_id"):
+        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE)
+    with pytest.raises(ValueError, match="runtime parent/base"):
+        HubLayerMeta(
+            name="dockerfile-cache",
+            kind=KIND_BUILDKIT_CACHE,
+            chain_id="sha256:" + "d" * 64,
+            base_image_digest="sha256:" + "e" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "name": "dockerfile-cache",
+            "kind": KIND_BUILDKIT_CACHE,
+            "chain_id": "sha256:" + "d" * 64,
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+        },
+        {
+            "name": "runtime-layer",
+            "kind": "squashfs",
+            "media_type": MEDIA_TYPE_BUILDKIT_CACHE,
+        },
+        {
+            "name": "ubuntu",
+            "kind": "cloud-image",
+            "disk_format": "qcow2",
+            "arch": "x86_64",
+            "media_type": MEDIA_TYPE_BUILDKIT_CACHE,
+        },
+        {
+            "name": "dockerfile-cache",
+            "kind": KIND_BUILDKIT_CACHE,
+            "chain_id": "sha256:" + "d" * 64,
+            "media_type": "application/octet-stream",
+        },
+    ],
+)
+def test_layer_meta_rejects_unsupported_or_kind_inconsistent_media_type(kwargs: dict):
+    with pytest.raises(ValueError, match="media_type"):
+        HubLayerMeta(**kwargs)
 
 
 def test_cloud_image_requires_disk_format():
@@ -258,9 +334,106 @@ def test_cloud_image_requires_disk_format():
         HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format=None)
 
 
+def test_cloud_image_requires_arch_but_generic_legacy_layer_keeps_null_arch():
+    with pytest.raises(ValueError, match="arch"):
+        HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format="qcow2")
+    assert HubLayerMeta(name="legacy-layer", kind="squashfs").arch is None
+
+
 def test_layer_cannot_declare_disk_format():
     with pytest.raises(ValueError):
         HubLayerMeta(name="torch", kind="squashfs", disk_format="qcow2")
+
+
+def test_layer_dict_exposes_base_image_digest_from_config_json():
+    base_image_digest = "sha256:" + "b" * 64
+    row = PalimpsestHubLayer(
+        blob_digest="sha256:" + "a" * 64,
+        blob_md5=None,
+        size_bytes=1024,
+        media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+        config_digest="sha256:" + "c" * 64,
+        name="runtime-layer",
+        kind="squashfs",
+        config_json={"base_image_digest": base_image_digest},
+        is_published=False,
+    )
+
+    data = hub_api._layer_dict(row)
+
+    assert data["base_image_digest"] == base_image_digest
+    assert data["config_json"]["base_image_digest"] == base_image_digest
+
+
+def test_buildkit_cache_download_filename_uses_tar_extension():
+    row = PalimpsestHubLayer(
+        blob_digest="sha256:" + "a" * 64,
+        blob_md5=None,
+        size_bytes=1024,
+        media_type=MEDIA_TYPE_BUILDKIT_CACHE,
+        config_digest="sha256:" + "c" * 64,
+        name="dockerfile-cache",
+        kind=KIND_BUILDKIT_CACHE,
+        config_json={},
+        is_published=False,
+    )
+
+    assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
+
+
+@pytest.mark.asyncio
+async def test_finalize_buildkit_cache_stores_dedicated_media_type(
+    store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_session_factory", lambda: factory)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_blob_store", lambda: store)
+
+    payload = b"portable buildkit local cache tar"
+    digest = _sha256(payload)
+    token_info = {
+        "project_id": "project-1",
+        "user_id": "user-1",
+        "is_system_admin": False,
+    }
+    started = await start_upload(HubUploadStartRequest(digest=digest), token_info)
+    session_id = started["session_id"]
+    assert session_id is not None
+
+    store.upload_path(session_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, session_id)
+        assert upload is not None
+        upload.received_bytes = len(payload)
+        await session.commit()
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/v1/uploads/{session_id}",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    chain_id = "sha256:" + "d" * 64
+    await finalize_upload(
+        session_id,
+        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id=chain_id),
+        request,
+        token_info,
+    )
+
+    async with factory() as session:
+        row = (await session.execute(select(PalimpsestHubLayer))).scalar_one()
+        assert row.kind == KIND_BUILDKIT_CACHE
+        assert row.media_type == MEDIA_TYPE_BUILDKIT_CACHE
+        assert row.chain_id == chain_id
+        assert row.config_json["kind"] == KIND_BUILDKIT_CACHE
+        assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -306,7 +479,7 @@ async def test_private_blob_can_be_registered_by_another_project(
         "chain_id": meta.chain_id,
         "blob_digest": digest,
         "disk_format": meta.disk_format,
-        "arch": meta.arch,
+        "arch": None,
         "os_variant": meta.os_variant,
         "base_image_digest": meta.base_image_digest,
     }
@@ -317,6 +490,7 @@ async def test_private_blob_can_be_registered_by_another_project(
                 blob_md5=None,
                 size_bytes=len(payload),
                 media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                arch=None,
                 config_digest=compute_config_digest(config),
                 name=meta.name,
                 kind=meta.kind,
@@ -362,6 +536,42 @@ async def test_private_blob_can_be_registered_by_another_project(
     assert len(layers) == 1
     assert access is not None
     assert access.created_by == "user-b"
+
+    project_c = {
+        "project_id": "project-c",
+        "user_id": "user-c",
+        "is_system_admin": False,
+    }
+    incompatible = HubLayerMeta(
+        name="runtime-pack",
+        kind="squashfs",
+        chain_id="sha256:" + "c" * 64,
+        base_image_digest="sha256:" + "d" * 64,
+        arch="x86_64",
+    )
+    retry = await start_upload(HubUploadStartRequest(digest=digest), project_c)
+    retry_id = retry["session_id"]
+    assert retry_id
+    store.upload_path(retry_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, retry_id)
+        assert upload is not None
+        upload.received_bytes = len(payload)
+        await session.commit()
+    retry_request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/v1/uploads/{retry_id}",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    with pytest.raises(HTTPException) as conflict:
+        await finalize_upload(retry_id, incompatible, retry_request, project_c)
+    assert conflict.value.status_code == 409
+    assert "incompatible descriptor fields" in str(conflict.value.detail)
+    async with factory() as session:
+        assert await session.get(PalimpsestHubLayerAccess, (digest, "project-c")) is None
     await engine.dispose()
 
 
