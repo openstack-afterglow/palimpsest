@@ -284,7 +284,17 @@ def build_hdiutil_seed_command(seed_iso: Path, seed_dir: Path) -> list[str]:
     for label, path in (("seed_iso", seed_iso), ("seed_dir", seed_dir)):
         if not path.is_absolute():
             raise KvmError(f"{label} must be an absolute path: {path!s}")
-    return ["hdiutil", "makehybrid", "-iso", "-joliet", "-default-volume-name", "CIDATA", "-o", str(seed_iso), str(seed_dir)]
+    return [
+        "hdiutil",
+        "makehybrid",
+        "-iso",
+        "-joliet",
+        "-default-volume-name",
+        "CIDATA",
+        "-o",
+        str(seed_iso),
+        str(seed_dir),
+    ]
 
 
 def run_hdiutil_seed_iso(seed_iso: Path, seed_dir: Path) -> None:

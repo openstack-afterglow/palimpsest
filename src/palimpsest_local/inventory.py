@@ -10,12 +10,12 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from . import platforms
 from .digest import digest_file, require_digest
 from .errors import ArtifactValidationError, StateError
 from .hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
 from .lima import inspect_instance_status
 from .oci_layout import ContentStore
-from . import platforms
 from .platforms import preflight
 from .runtime import reconcile
 from .state import (
@@ -29,6 +29,7 @@ from .state import (
 )
 
 BUILD_ID_RE = re.compile(r"^(?:b|bk)-[0-9a-f]{12}$")
+
 
 def _dir_size(path: Path) -> int:
     if not path.exists():
@@ -203,9 +204,9 @@ def list_vms(roots: StatePaths) -> dict[str, Any]:
 
             layers_raw = st_data.get("layers", [])
             layers = [
-                {"digest": l.get("digest", ""), "target_dev": l.get("target_dev", "")}
-                for l in layers_raw
-                if isinstance(l, dict) and "digest" in l
+                {"digest": layer.get("digest", ""), "target_dev": layer.get("target_dev", "")}
+                for layer in layers_raw
+                if isinstance(layer, dict) and "digest" in layer
             ]
             layer_count = len(layers)
 
@@ -222,27 +223,29 @@ def list_vms(roots: StatePaths) -> dict[str, Any]:
             created_at = st_data.get("created_at")
             updated_at = st_data.get("updated_at")
 
-            vms.append({
-                "name": name,
-                "run_id": run_id,
-                "backend": backend,
-                "status": status,
-                "stale": stale,
-                "base_digest": base_digest,
-                "base_arch": base_arch,
-                "layers": layers,
-                "layer_count": layer_count,
-                "memory_mib": memory_mib,
-                "vcpus": vcpus,
-                "network": network,
-                "ports": ports,
-                "volumes": volumes,
-                "ssh": ssh_info,
-                "guest_ip": guest_ip,
-                "project": project_name,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            })
+            vms.append(
+                {
+                    "name": name,
+                    "run_id": run_id,
+                    "backend": backend,
+                    "status": status,
+                    "stale": stale,
+                    "base_digest": base_digest,
+                    "base_arch": base_arch,
+                    "layers": layers,
+                    "layer_count": layer_count,
+                    "memory_mib": memory_mib,
+                    "vcpus": vcpus,
+                    "network": network,
+                    "ports": ports,
+                    "volumes": volumes,
+                    "ssh": ssh_info,
+                    "guest_ip": guest_ip,
+                    "project": project_name,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                }
+            )
 
     vms.sort(key=lambda x: x["name"])
 
@@ -624,7 +627,9 @@ def move_state_root(roots: StatePaths, destination: Path, *, keep_source: bool =
 
     names = sorted(set(runs) | set(projects))
     if names:
-        raise StateError("relocating the state root requires no runs and no projects; remove them first: " + ", ".join(names))
+        raise StateError(
+            "relocating the state root requires no runs and no projects; remove them first: " + ", ".join(names)
+        )
 
     incoming = dest.parent / f"{dest.name}.incoming-{os.getpid()}"
     if incoming.exists():

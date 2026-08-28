@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import json
-
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 import re
 import secrets
 import sys
 import traceback
-
-from typing import Any
 import urllib.parse
 import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 from . import inventory, lima, platforms, runtime, state
 from .errors import PalimpsestError
@@ -141,11 +139,13 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         except PalimpsestError as e:
                             backends_info[b] = {"available": False, "reason": str(e)}
                     storage = inventory.storage_report(roots)
-                    self._send_json({
-                        "host": {"system": host_info.system, "machine": host_info.machine},
-                        "backends": backends_info,
-                        "storage": storage,
-                    })
+                    self._send_json(
+                        {
+                            "host": {"system": host_info.system, "machine": host_info.machine},
+                            "backends": backends_info,
+                            "storage": storage,
+                        }
+                    )
                     return
 
                 if path == "/api/v1/vms":
@@ -154,7 +154,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                     return
 
                 if path.startswith("/api/v1/vms/"):
-                    rest = path[len("/api/v1/vms/"):]
+                    rest = path[len("/api/v1/vms/") :]
                     if rest.endswith("/logs"):
                         name = rest[:-5]
                         if not NAME_RE.match(name):
@@ -200,7 +200,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                     return
 
                 if path.startswith("/api/v1/builds/"):
-                    rest = path[len("/api/v1/builds/"):]
+                    rest = path[len("/api/v1/builds/") :]
                     if rest.endswith("/log"):
                         build_id = rest[:-4]
                         if inventory.BUILD_ID_RE.fullmatch(build_id) is None:
@@ -245,7 +245,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
 
             try:
                 if path.startswith("/api/v1/vms/"):
-                    rest = path[len("/api/v1/vms/"):]
+                    rest = path[len("/api/v1/vms/") :]
                     if rest.endswith("/stop"):
                         name = rest[:-5]
                         if not NAME_RE.match(name):
@@ -336,7 +336,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
 
             try:
                 if path.startswith("/api/v1/vms/"):
-                    name = path[len("/api/v1/vms/"):]
+                    name = path[len("/api/v1/vms/") :]
                     if not NAME_RE.match(name):
                         self._send_json({"error": "invalid run name"}, status=400)
                         return
@@ -350,7 +350,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                     return
 
                 if path.startswith("/api/v1/store/artifacts/"):
-                    digest = path[len("/api/v1/store/artifacts/"):]
+                    digest = path[len("/api/v1/store/artifacts/") :]
                     if not DIGEST_RE.match(digest):
                         self._send_json({"error": "invalid digest"}, status=400)
                         return
@@ -373,7 +373,9 @@ def serve(roots: state.StatePaths, *, host: str = "127.0.0.1", port: int = 0, op
     """Serve the local dashboard on loopback only and open a browser window."""
     token = secrets.token_urlsafe(32)
     # Server binds loopback 127.0.0.1 only regardless of caller host input
-    server = ThreadingHTTPServer(("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}"))
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}")
+    )
     server.daemon_threads = True
     actual_port = server.server_address[1]
 

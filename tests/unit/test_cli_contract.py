@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
-import json
 import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -827,9 +827,12 @@ def test_cli_rejects_commit_for_lima_run(
     assert cli.main(["commit", "mac-vm", "--tag", "layer"]) == 1
     assert "use palimpsest build" in capsys.readouterr().err
 
+
 def test_cli_run_backend_parser_and_network_validation(capsys: pytest.CaptureFixture[str]):
     parser = cli.build_parser()
-    args = parser.parse_args(["run", "sha256:" + "a" * 64, "--name", "vm1", "--backend", "libvirt-hvf", "--network", "routed"])
+    args = parser.parse_args(
+        ["run", "sha256:" + "a" * 64, "--name", "vm1", "--backend", "libvirt-hvf", "--network", "routed"]
+    )
     with pytest.raises(SystemExit) as exc_info:
         cli._validate_args(args, parser)
     assert exc_info.value.code != 0
@@ -889,9 +892,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
     assert "warning: libvirt-hvf is experimental" in err
 
 
-def test_cli_run_dispatch_lima_routing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+def test_cli_run_dispatch_lima_routing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     import hashlib
 
     content = b"dummy image data lima"
@@ -1022,7 +1023,10 @@ def test_cli_dispatch_store_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.C
     out_tbl = capsys.readouterr().out
     assert "sha256:" + "b" * 64 in out_tbl
 
-def test_cli_dispatch_store_ls_ignores_non_dict_and_none_tags(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+
+def test_cli_dispatch_store_ls_ignores_non_dict_and_none_tags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
     monkeypatch.setattr(
         "palimpsest_local.cli.inventory.list_artifacts",
         lambda roots: {
@@ -1043,6 +1047,7 @@ def test_cli_dispatch_store_ls_ignores_non_dict_and_none_tags(monkeypatch: pytes
     assert ret_tbl == 0
     out_tbl = capsys.readouterr().out
     assert "valid-tag" in out_tbl
+
 
 def test_cli_dispatch_store_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     monkeypatch.setattr(

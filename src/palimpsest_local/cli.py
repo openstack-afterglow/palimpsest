@@ -21,8 +21,8 @@ from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
 from .errors import PalimpsestError
-from .inventory import import_cloud_image
 from .hub import DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
+from .inventory import import_cloud_image
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
 from .project import (
     DEFAULT_PROJECT_FILE,
@@ -1749,7 +1749,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 for item in items:
                     raw_tags = item.get("tags")
                     tags_list = raw_tags if isinstance(raw_tags, list) else []
-                    tags_str = ", ".join(t.get("tag", "") for t in tags_list if isinstance(t, dict) and t.get("tag")) or "-"
+                    tags_str = (
+                        ", ".join(t.get("tag", "") for t in tags_list if isinstance(t, dict) and t.get("tag")) or "-"
+                    )
                     print(
                         f"{item['digest']:<20}\t{str(item.get('kind', '-')):<16}\t"
                         f"{str(item.get('size_bytes', 0)):<12}\t{tags_str:<24}"
@@ -1766,6 +1768,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return 0
 
     return 0
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()

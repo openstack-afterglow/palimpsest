@@ -408,6 +408,7 @@ def test_build_layer_selects_lima_vz(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "lima-vz")
     called: list[object] = []
     import palimpsest_local.lima as lima
+
     monkeypatch.setattr(lima, "build_layer", lambda s, roots=None: called.append(s) or {"status": "success"})
 
     result = build_layer(spec, roots=roots)
@@ -445,8 +446,10 @@ def test_build_layer_uses_serial_builder_for_kvm_on_linux_aarch64(tmp_path: Path
 def test_build_layer_propagates_platform_selector_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
     spec = _build_spec(tmp_path)
+
     def selector_boom(arch: str):
         raise ArtifactValidationError("no local runtime can boot a x86_64 image on Darwin/aarch64")
+
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", selector_boom)
 
     with pytest.raises(ArtifactValidationError, match="no local runtime can boot a x86_64 image on Darwin/aarch64"):

@@ -596,8 +596,10 @@ def test_successful_up_refreshes_dependency_order_before_down(tmp_path: Path) ->
     down_project(changed, runtime.callbacks(), roots=roots)
     assert [event[1] for event in runtime.events if event[0] == "remove"] == ["demo-a-1", "demo-b-1"]
 
+
 def test_valid_backend_accepts_known_backends_and_rejects_unknown() -> None:
     from palimpsest_local.project_runtime import _KNOWN_BACKENDS, _valid_backend
+
     assert _KNOWN_BACKENDS == {"kvm", "lima-vz", "libvirt-hvf"}
     assert _valid_backend("kvm", "backend") == "kvm"
     assert _valid_backend("lima-vz", "backend") == "lima-vz"
