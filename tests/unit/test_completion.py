@@ -95,7 +95,7 @@ def test_prefix_filtering():
     assert set(i_candidates) == {"image", "images", "inspect"}
 
     st_candidates = completion.resolve_candidates(parser, ["st"])
-    assert set(st_candidates) == {"stop", "store"}
+    assert set(st_candidates) == {"start", "stop", "store"}
 
 
 def test_aliases_and_short_long_flags():
@@ -328,6 +328,7 @@ def test_exact_top_level_command_set():
         "logs",
         "shell",
         "exec",
+        "start",
         "stop",
         "rm",
         "commit",

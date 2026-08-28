@@ -16,7 +16,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__, completion, inventory, lima, platforms, ui
+from . import __version__, completion, inventory, lima, platforms, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
@@ -78,15 +78,20 @@ from .registry import (
 from .runtime import (
     commit,
     exec_command,
-    inspect_run,
-    logs,
     ps,
-    rm,
     run,
     shell_command,
-    stop,
 )
-from .state import StatePaths, TagRecord, fsync_directory, init_roots, read_tag_record, run_paths, write_tag_record
+from .state import (
+    StatePaths,
+    TagRecord,
+    fsync_directory,
+    init_roots,
+    read_tag_record,
+    resolve_roots,
+    run_paths,
+    write_tag_record,
+)
 
 _DOCKER_IMAGE_ID_RE = re.compile(r"(?:sha256:[0-9a-f]{64}|[0-9a-f]{12,64})")
 
@@ -475,6 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
     execute = commands.add_parser("exec")
     execute.add_argument("name")
     execute.add_argument("command", nargs=argparse.REMAINDER)
+    start = commands.add_parser("start")
+    start.add_argument("name")
     stop = commands.add_parser("stop")
     stop.add_argument("name")
     remove = commands.add_parser("rm")
@@ -1055,7 +1062,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
     if op == "completion":
         print(completion.generate_completion_script(args.shell))
         return 0
-    roots = init_roots()
+    existing_run_operations = {"start", "stop", "rm", "inspect", "logs"}
+    roots = resolve_roots() if op in existing_run_operations else init_roots()
     store = ContentStore(roots.store)
 
     if op == "registry":
@@ -1672,11 +1680,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             )
 
     elif op == "inspect":
-        info = inspect_run(args.name, roots=roots)
+        info = runtime_dispatch.inspect_run(args.name, roots=roots)
         print(json.dumps(info, indent=2))
 
     elif op == "logs":
-        for chunk in logs(args.name, roots=roots, follow=args.follow):
+        for chunk in runtime_dispatch.logs(args.name, roots=roots, follow=args.follow):
             sys.stdout.write(chunk)
             sys.stdout.flush()
 
@@ -1697,18 +1705,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
         )
         proc = subprocess.run(argv, shell=False)
         return proc.returncode
+    elif op == "start":
+        runtime_dispatch.start(args.name, roots=roots)
+        print(f"started {args.name}")
+
     elif op == "stop":
-        if lima.is_lima_run(run_paths(roots, args.name)):
-            lima.stop(args.name, roots=roots)
-        else:
-            stop(args.name, roots=roots)
+        runtime_dispatch.stop(args.name, roots=roots)
         print(f"stopped {args.name}")
 
     elif op == "rm":
-        if lima.is_lima_run(run_paths(roots, args.name)):
-            lima.rm(args.name, roots=roots, volumes=args.volumes)
-        else:
-            rm(args.name, roots=roots, volumes=args.volumes)
+        runtime_dispatch.rm(args.name, roots=roots, volumes=args.volumes)
         print(f"removed {args.name}")
 
     elif op == "commit":

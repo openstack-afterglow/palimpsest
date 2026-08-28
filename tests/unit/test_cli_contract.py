@@ -6,13 +6,15 @@ import ast
 import hashlib
 import inspect
 import json
+import uuid
 from pathlib import Path
 
 import pytest
 
-from palimpsest_local import cli, digest
+from palimpsest_local import cli, digest, runtime_dispatch, state
 from palimpsest_local.errors import PalimpsestError
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.runtime_types import ExistingRunRecord, RuntimeBackend
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +22,58 @@ def _isolated_xdg_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     """Keep CLI state/config writes out of the developer's real XDG roots."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+
+
+def _write_cli_run_ledger(
+    *,
+    backend: str,
+    runtime_kind: str = "cloud-image",
+) -> tuple[state.StatePaths, state.RunPaths]:
+    roots = state.init_roots()
+    rpaths = state.run_paths(roots, "demo-vm")
+    rpaths.root.mkdir()
+    run_id = str(uuid.uuid4())
+    rpaths.owner.write_text(
+        json.dumps({"schema_version": 1, "run_id": run_id, "name": "demo-vm"}) + "\n",
+        encoding="utf-8",
+    )
+    rpaths.state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "runtime_kind": runtime_kind,
+                "backend": backend,
+                "name": "demo-vm",
+                "run_id": run_id,
+                "status": "stopped",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return roots, rpaths
+
+
+def _snapshot_cli_state(root: Path) -> dict[str, tuple[int, int, bytes | None]]:
+    snapshot: dict[str, tuple[int, int, bytes | None]] = {}
+    for path in (root, *root.rglob("*")):
+        metadata = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        snapshot[relative] = (
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            path.read_bytes() if path.is_file() else None,
+        )
+    return snapshot
+
+
+_CLI_EXISTING_RUN_OPERATIONS: tuple[tuple[str, str, list[str], dict[str, object]], ...] = (
+    ("start", "start", ["start", "demo-vm"], {}),
+    ("stop", "stop", ["stop", "demo-vm"], {}),
+    ("rm", "rm", ["rm", "demo-vm", "--volumes"], {"volumes": True}),
+    ("inspect", "inspect_run", ["inspect", "demo-vm"], {}),
+    ("logs", "logs", ["logs", "demo-vm", "--follow"], {"follow": True}),
+)
 
 
 def test_cli_uses_only_stdlib_and_package_imports():
@@ -161,6 +215,7 @@ def test_exact_nested_command_tree_and_defaults():
         "logs",
         "shell",
         "exec",
+        "start",
         "stop",
         "rm",
         "commit",
@@ -482,6 +537,7 @@ def test_palimpsestfile_frontend_rejects_every_buildkit_only_option(
         ["logs", "demo", "--follow"],
         ["shell", "demo"],
         ["exec", "demo", "--", "printf", "%s", "hello"],
+        ["start", "demo"],
         ["stop", "demo"],
         ["rm", "demo", "--volumes"],
         ["commit", "demo", "--tag", "layer"],
@@ -583,9 +639,11 @@ def test_cli_dispatch_layer_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.C
 def test_cli_dispatch_stop_and_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
     stopped = []
     removed = []
-    monkeypatch.setattr("palimpsest_local.cli.stop", lambda name, roots=None: stopped.append(name))
+    monkeypatch.setattr(runtime_dispatch, "stop", lambda name, roots=None: stopped.append(name))
     monkeypatch.setattr(
-        "palimpsest_local.cli.rm", lambda name, roots=None, volumes=False: removed.append((name, volumes))
+        runtime_dispatch,
+        "rm",
+        lambda name, roots=None, volumes=False: removed.append((name, volumes)),
     )
 
     assert cli.main(["stop", "demo-vm"]) == 0
@@ -595,6 +653,148 @@ def test_cli_dispatch_stop_and_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytes
     assert cli.main(["rm", "demo-vm", "--volumes"]) == 0
     assert removed == [("demo-vm", True)]
     assert "removed demo-vm" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter_name", "expected_backend"),
+    [
+        ("kvm", "cloud_runtime", RuntimeBackend.KVM),
+        ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
+        ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+    ],
+)
+@pytest.mark.parametrize(("operation", "target_name", "argv", "expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
+def test_cli_existing_run_operations_route_only_through_durable_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backend: str,
+    adapter_name: str,
+    expected_backend: RuntimeBackend,
+    operation: str,
+    target_name: str,
+    argv: list[str],
+    expected_kwargs: dict[str, object],
+) -> None:
+    roots, _rpaths = _write_cli_run_ledger(backend=backend)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def selected(name: str, **kwargs: object) -> object:
+        calls.append((name, kwargs))
+        if target_name == "logs":
+            return iter(("first\n", "second\n"))
+        if target_name == "inspect_run":
+            return {"owner": {"name": name}, "state": {"status": "stopped"}}
+        return {"status": "running" if target_name == "start" else "stopped"}
+
+    selected_adapter = getattr(runtime_dispatch, adapter_name)
+    other_adapter = runtime_dispatch.lima if adapter_name == "cloud_runtime" else runtime_dispatch.cloud_runtime
+    monkeypatch.setattr(selected_adapter, target_name, selected)
+    monkeypatch.setattr(
+        other_adapter,
+        target_name,
+        lambda *_args, **_kwargs: pytest.fail("dispatcher selected the wrong runtime adapter"),
+    )
+    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: pytest.fail("CLI used the legacy Lima heuristic"))
+
+    assert cli.main(argv) == 0
+
+    assert len(calls) == 1
+    called_name, called_kwargs = calls[0]
+    assert called_name == "demo-vm"
+    record = called_kwargs.pop("_expected_record")
+    assert isinstance(record, ExistingRunRecord)
+    assert record.dispatch_key.backend is expected_backend
+    assert called_kwargs == {"roots": roots, **expected_kwargs}
+    output = capsys.readouterr().out
+    if operation == "inspect":
+        assert json.loads(output) == {"owner": {"name": "demo-vm"}, "state": {"status": "stopped"}}
+    elif operation == "logs":
+        assert output == "first\nsecond\n"
+    else:
+        past_tense = {"start": "started", "stop": "stopped", "rm": "removed"}[operation]
+        assert output == f"{past_tense} demo-vm\n"
+
+
+@pytest.mark.parametrize(("operation", "target_name", "argv", "_expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
+def test_cli_oci_root_existing_operations_fail_typed_before_backend_subprocess_or_file_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+    target_name: str,
+    argv: list[str],
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots, _rpaths = _write_cli_run_ledger(backend="kvm", runtime_kind="oci-root")
+    before = _snapshot_cli_state(roots.state)
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"side effect reached: {effect}")
+
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("cloud-backend"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("lima-backend"),
+    )
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: forbidden("subprocess"))
+    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: forbidden("legacy-heuristic"))
+
+    assert cli.main(argv) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"runtime operation '{operation}' is unavailable for oci-root/kvm\n"
+    assert effects == []
+    assert _snapshot_cli_state(roots.state) == before
+
+
+@pytest.mark.parametrize(("_operation", "_target_name", "argv", "_expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
+def test_cli_missing_existing_run_fails_closed_without_creating_state_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    _operation: str,
+    _target_name: str,
+    argv: list[str],
+    _expected_kwargs: dict[str, object],
+) -> None:
+    missing_argv = ["missing" if item == "demo-vm" else item for item in argv]
+
+    assert cli.main(missing_argv) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "cannot securely read run ledger\n"
+    assert not (tmp_path / "xdg-config").exists()
+    assert not (tmp_path / "xdg-state").exists()
+
+
+@pytest.mark.parametrize(("_operation", "_target_name", "argv", "_expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
+def test_cli_corrupt_existing_run_fails_closed_without_rewrite_or_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _operation: str,
+    _target_name: str,
+    argv: list[str],
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots, rpaths = _write_cli_run_ledger(backend="kvm")
+    rpaths.state.write_text('{"schema_version":"secret-invalid-schema"}\n', encoding="utf-8")
+    before = _snapshot_cli_state(roots.state)
+    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: pytest.fail("CLI used the legacy Lima heuristic"))
+
+    assert cli.main(argv) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "invalid run state schema\n"
+    assert "secret-invalid-schema" not in captured.err
+    assert _snapshot_cli_state(roots.state) == before
 
 
 def test_cli_dispatch_build_routes_verified_spec(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
