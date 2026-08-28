@@ -306,11 +306,11 @@ def test_build_layer_promotes_verified_output_and_cleans_builder(tmp_path: Path,
     spec = _build_spec(tmp_path)
     removed: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.rm",
+        "palimpsest_local.cloud_runtime.rm",
         lambda name, *, volumes, **_kwargs: removed.append((name, volumes)),
     )
 
@@ -343,10 +343,10 @@ def test_build_layer_rejects_conflicting_tag(tmp_path: Path, monkeypatch: pytest
         ),
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     with pytest.raises(BuildError, match="conflicting with built digest"):
         build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
@@ -365,10 +365,10 @@ def test_network_none_build_uses_serial_builder_without_an_interface(tmp_path: P
     )
     started: list[tuple[object, str]] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, *, user_data, **_kwargs: started.append((run_spec, user_data)) or {"status": "running"},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
 
@@ -383,11 +383,11 @@ def test_build_layer_records_serial_run_failure_and_cleans_builder(tmp_path: Pat
     spec = _build_spec(tmp_path, command="false")
     removed: list[str] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.rm",
+        "palimpsest_local.cloud_runtime.rm",
         lambda name, **_kwargs: removed.append(name),
     )
 
@@ -433,10 +433,10 @@ def test_build_layer_uses_serial_builder_for_kvm_on_linux_aarch64(tmp_path: Path
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
     started: list[object] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: started.append(run_spec) or {"status": "running", "name": run_spec.name},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     record = build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
     assert record["status"] == "success"

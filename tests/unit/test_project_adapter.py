@@ -672,13 +672,17 @@ def test_kvm_volume_reference_check_allows_only_exact_owned_teardown_domain(
             self.marker = marker
 
         def metadata(self, *_args: object) -> str:
-            return f'<run id="{self.marker}"/>'
+            return (
+                f'<palimpsest:run xmlns:palimpsest="{project_adapter.kvm.DOMAIN_MARKER_NAMESPACE}" '
+                f'id="{self.marker}" schema="1" version="{project_adapter.kvm.DOMAIN_MARKER_VERSION}" />'
+            )
 
         def XMLDesc(self, *_args: object) -> str:
             return (
                 '<domain xmlns:palimpsest="https://afterglow.dev/palimpsest-local/domain/v1">'
                 "<name>demo-api-1</name><metadata>"
-                f'<palimpsest:run id="{self.marker}"/>'
+                f'<palimpsest:run id="{self.marker}" schema="1" '
+                f'version="{project_adapter.kvm.DOMAIN_MARKER_VERSION}" />'
                 "</metadata><devices><disk>"
                 f'<source file="{path}"/>'
                 "</disk></devices></domain>"

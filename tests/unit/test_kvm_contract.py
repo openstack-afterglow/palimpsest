@@ -13,6 +13,8 @@ import pytest
 
 from palimpsest_local import platforms
 from palimpsest_local.kvm import (
+    DOMAIN_MARKER_NAMESPACE,
+    DOMAIN_MARKER_VERSION,
     MAX_LAYER_DISKS,
     DomainSpec,
     KvmError,
@@ -25,6 +27,7 @@ from palimpsest_local.kvm import (
     build_seed_iso_command,
     connect,
     destroy_and_undefine,
+    get_domain_run_id,
     layer_blob_path,
     run_hdiutil_seed_iso,
     run_seed_iso,
@@ -370,9 +373,142 @@ def test_destroy_and_undefine_is_best_effort_when_domain_absent():
     conn.lookupByName.assert_called_once_with("palimpsest-demo")
 
 
-def test_module_generates_xml_without_parsing_untrusted_input():
-    assert "fromstring" not in inspect.getsource(__import__("palimpsest_local.kvm", fromlist=["*"]))
-    assert "ET.parse" not in inspect.getsource(__import__("palimpsest_local.kvm", fromlist=["*"]))
+def test_get_domain_run_id_prefers_libvirt_metadata_and_falls_back_to_domain_xml():
+    run_id = "862ffb44-6795-4618-b2d8-c0750439fac3"
+    libvirt = SimpleNamespace(VIR_DOMAIN_METADATA_ELEMENT=2)
+    metadata_domain = MagicMock()
+    metadata_domain.metadata.return_value = (
+        f'<palimpsest:run xmlns:palimpsest="{DOMAIN_MARKER_NAMESPACE}" '
+        f'id="{run_id}" schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+    )
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(metadata_domain) == run_id
+
+    fallback_domain = MagicMock()
+    fallback_domain.metadata.side_effect = RuntimeError("metadata API unavailable")
+    fallback_spec = DomainSpec(**{**_spec([]).__dict__, "run_id": run_id})
+    fallback_domain.XMLDesc.return_value = build_domain_xml(fallback_spec, _X86_PROFILE)
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(fallback_domain) == run_id
+
+
+def test_get_domain_run_id_fails_closed_for_missing_or_malformed_metadata():
+    libvirt = SimpleNamespace(VIR_DOMAIN_METADATA_ELEMENT=2)
+    domain = MagicMock()
+    domain.metadata.return_value = "<not-xml"
+    domain.XMLDesc.return_value = "<also-not-xml"
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(domain) is None
+
+
+@pytest.mark.parametrize(
+    "metadata_xml",
+    [
+        f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" schema="1" version="{DOMAIN_MARKER_VERSION}" />',
+        f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="not-a-uuid" schema="1" version="{DOMAIN_MARKER_VERSION}" />',
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862FFB44-6795-4618-B2D8-C0750439FAC3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb4467954618b2d8c0750439fac3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="2" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" schema="1" />'),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            'schema="1" version="9.9.9" />'
+        ),
+        (f'<run id="862ffb44-6795-4618-b2d8-c0750439fac3" schema="1" version="{DOMAIN_MARKER_VERSION}" />'),
+        (
+            '<marker xmlns="https://example.invalid/foreign" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<marker xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+    ],
+)
+def test_get_domain_run_id_rejects_untrusted_marker_shapes(metadata_xml: str):
+    libvirt = SimpleNamespace(VIR_DOMAIN_METADATA_ELEMENT=2)
+    domain = MagicMock()
+    domain.metadata.return_value = metadata_xml
+    domain.XMLDesc.return_value = "<domain><metadata /></domain>"
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(domain) is None
+
+
+@pytest.mark.parametrize(
+    "metadata_xml",
+    [
+        None,
+        "<not-xml",
+        f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" schema="1" version="{DOMAIN_MARKER_VERSION}" />',
+        (
+            '<run xmlns="https://example.invalid/foreign" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862FFB44-6795-4618-B2D8-C0750439FAC3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+    ],
+)
+def test_get_domain_run_id_uses_valid_xmldesc_after_untrusted_metadata(metadata_xml: str | None):
+    run_id = "862ffb44-6795-4618-b2d8-c0750439fac3"
+    libvirt = SimpleNamespace(VIR_DOMAIN_METADATA_ELEMENT=2)
+    domain = MagicMock()
+    domain.metadata.return_value = metadata_xml
+    fallback_spec = DomainSpec(**{**_spec([]).__dict__, "run_id": run_id})
+    domain.XMLDesc.return_value = build_domain_xml(fallback_spec, _X86_PROFILE)
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(domain) == run_id
+
+
+@pytest.mark.parametrize(
+    "marker_xml",
+    [
+        f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" schema="1" version="{DOMAIN_MARKER_VERSION}" />',
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="2" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            'schema="1" version="9.9.9" />'
+        ),
+        (
+            f'<run xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862FFB44-6795-4618-B2D8-C0750439FAC3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+        (
+            f'<marker xmlns="{DOMAIN_MARKER_NAMESPACE}" id="862ffb44-6795-4618-b2d8-c0750439fac3" '
+            f'schema="1" version="{DOMAIN_MARKER_VERSION}" />'
+        ),
+    ],
+)
+def test_get_domain_run_id_rejects_untrusted_xmldesc_fallback_markers(marker_xml: str):
+    libvirt = SimpleNamespace(VIR_DOMAIN_METADATA_ELEMENT=2)
+    domain = MagicMock()
+    domain.metadata.side_effect = RuntimeError("metadata API unavailable")
+    domain.XMLDesc.return_value = f"<domain><metadata>{marker_xml}</metadata></domain>"
+    with patch("palimpsest_local.kvm._libvirt", return_value=libvirt):
+        assert get_domain_run_id(domain) is None
+
+
+def test_domain_xml_builder_does_not_parse_untrusted_input():
+    source = inspect.getsource(build_domain_xml)
+    assert "fromstring" not in source
+    assert "ET.parse" not in source
 
 
 def test_kvm_golden_bytes_are_stable():

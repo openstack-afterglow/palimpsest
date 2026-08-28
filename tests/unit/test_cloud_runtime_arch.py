@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local import platforms
+from palimpsest_local.cloud_runtime import run
 from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.refs import ImageRef, RunSpec, StackRef
-from palimpsest_local.runtime import run
 from palimpsest_local.state import init_roots
 
 

@@ -1,4 +1,4 @@
-"""Unit tests for palimpsest_local.runtime lifecycle, state ledgers, and KVM controls."""
+"""Unit tests for the cloud VM lifecycle, state ledgers, and KVM controls."""
 
 from __future__ import annotations
 
@@ -15,17 +15,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import palimpsest_local.cloud_runtime as runtime
 import palimpsest_local.kvm as kvm
 import palimpsest_local.platforms as platforms
-import palimpsest_local.runtime as runtime
 import palimpsest_local.state as state
-from palimpsest_local.errors import (
-    ArtifactValidationError,
-    LifecycleError,
-    StateError,
-)
-from palimpsest_local.refs import ImageRef, LayerRef, RunSpec, StackRef
-from palimpsest_local.runtime import (
+from palimpsest_local.cloud_runtime import (
     commit,
     create_and_validate_overlay,
     exec_command,
@@ -41,6 +35,12 @@ from palimpsest_local.runtime import (
     start_serial_builder,
     stop,
 )
+from palimpsest_local.errors import (
+    ArtifactValidationError,
+    LifecycleError,
+    StateError,
+)
+from palimpsest_local.refs import ImageRef, LayerRef, RunSpec, StackRef
 
 
 class FakeDomain:
@@ -189,13 +189,14 @@ def test_start_serial_builder_writes_ledger_and_serial_channel(tmp_path: Path, m
     )
     conn = FakeLibvirtConn()
     monkeypatch.setattr(
-        "palimpsest_local.runtime.create_and_validate_overlay", lambda _base, output: output.write_bytes(b"overlay")
+        "palimpsest_local.cloud_runtime.create_and_validate_overlay",
+        lambda _base, output: output.write_bytes(b"overlay"),
     )
     monkeypatch.setattr("palimpsest_local.kvm.run_seed_iso", lambda seed, _user, _meta: seed.touch())
 
     readiness: list[bool] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime._wait_for_readiness",
+        "palimpsest_local.cloud_runtime._wait_for_readiness",
         lambda *_args, require_ip, **_kwargs: readiness.append(require_ip) or None,
     )
     result = start_serial_builder(spec, user_data="#cloud-config\n", roots=roots, conn=conn)
@@ -250,7 +251,7 @@ def test_overlay_creation_and_validation():
                     return MagicMock(stdout=json.dumps(info), stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             create_and_validate_overlay(base_ref, overlay_file)
             assert overlay_file.exists()
 
@@ -328,7 +329,7 @@ def test_run_status_transitions_and_completion():
 
         rpaths = state.run_paths(roots, "test-run")
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             res = run(spec, roots=roots, conn=conn)
 
             assert res["status"] == "running"
@@ -361,7 +362,7 @@ def test_run_status_transitions_and_completion():
                 rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
                 return "192.168.122.100"
 
-            with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=restarted_wait):
+            with patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=restarted_wait):
                 restarted_res = start("test-run", roots=roots, conn=conn)
             assert restarted_res["status"] == "running"
             assert restarted_res["guest_ip"] == "192.168.122.100"
@@ -435,8 +436,8 @@ def test_start_rollback_on_failure():
             raise LifecycleError("readiness failed")
 
         with (
-            patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run),
-            patch("palimpsest_local.runtime._wait_for_readiness", side_effect=failing_wait),
+            patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run),
+            patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=failing_wait),
         ):
             with pytest.raises(LifecycleError, match="readiness failed"):
                 run(spec, roots=roots, conn=conn)
@@ -604,7 +605,7 @@ def test_network_omission():
                 return MagicMock(stdout="", stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             res = run(spec, roots=roots, conn=conn)
             assert res["status"] == "running"
             assert res["guest_ip"] is None
@@ -880,7 +881,7 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
             return MagicMock(stdout="", stderr="", returncode=0)
         return MagicMock(stdout="", stderr="", returncode=0)
 
-    with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+    with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
         res = run(spec, roots=roots, conn=conn)
 
     assert res["backend"] == platforms.BACKEND_KVM
@@ -963,8 +964,8 @@ def test_run_user_hostfwd_allocates_port_and_writes_known_hosts_without_ip_disco
         return None
 
     with (
-        patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run),
-        patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait),
+        patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run),
+        patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=fake_wait),
     ):
         res = run(spec, roots=roots, conn=conn, profile=hvf_profile)
 
@@ -1026,7 +1027,7 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
         rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
         return None
 
-    with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait):
+    with patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=fake_wait):
         res = start("hvf-restart", roots=roots, conn=conn, profile=hvf_profile)
 
     new_port = res["ssh"]["port"]

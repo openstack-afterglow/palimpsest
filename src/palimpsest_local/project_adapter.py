@@ -231,7 +231,7 @@ def _validate_kvm_volume_references(path: Path, allowed_run_ids: Mapping[str, st
                 continue
             name = root.findtext("name")
             expected_run_id = allowed_run_ids.get(name) if isinstance(name, str) else None
-            actual_run_id = runtime._get_domain_run_id(domain)
+            actual_run_id = kvm.get_domain_run_id(domain)
             if expected_run_id is None or actual_run_id != expected_run_id:
                 raise StateError(
                     f"KVM volume {path.name!r} is referenced by foreign or unexpected libvirt domain {name!r}"

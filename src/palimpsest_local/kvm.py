@@ -6,6 +6,7 @@ import logging
 import re
 import shlex
 import subprocess
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -312,6 +313,49 @@ def _libvirt() -> Any:
     except ImportError as exc:
         raise KvmUnavailable("libvirt-python is not installed; install palimpsest-local[kvm]") from exc
     return libvirt
+
+
+def _validated_domain_marker_run_id(element: ET.Element) -> str | None:
+    if (
+        element.tag != f"{{{DOMAIN_MARKER_NAMESPACE}}}run"
+        or element.get("schema") != "1"
+        or element.get("version") != DOMAIN_MARKER_VERSION
+    ):
+        return None
+    run_id = element.get("id")
+    if not isinstance(run_id, str):
+        return None
+    try:
+        parsed = uuid.UUID(run_id)
+    except ValueError:
+        return None
+    return run_id if str(parsed) == run_id else None
+
+
+def get_domain_run_id(domain: Any) -> str | None:
+    """Extract the Palimpsest run ID from a libvirt domain."""
+    try:
+        libvirt = _libvirt()
+        metadata_xml = domain.metadata(
+            libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+            DOMAIN_MARKER_NAMESPACE,
+        )
+        if metadata_xml:
+            root = ET.fromstring(metadata_xml)
+            run_id = _validated_domain_marker_run_id(root)
+            if run_id is not None:
+                return run_id
+    except Exception:
+        pass
+
+    try:
+        root = ET.fromstring(domain.XMLDesc())
+        element = root.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
+        if element is not None:
+            return _validated_domain_marker_run_id(element)
+    except Exception:
+        pass
+    return None
 
 
 def connect(uri: str):
