@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat as stat_module
 import tempfile
 import tomllib
 import uuid
@@ -19,10 +20,12 @@ from typing import Any
 
 from .digest import normalize_digest
 from .errors import StateError
+from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9.+\-]{0,63}$")
 _STATUSES = {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}
+_MAX_RUN_LEDGER_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -232,7 +235,8 @@ def state_root_source(environment: dict[str, str] | None = None) -> str:
     return "default"
 
 
-def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
+def resolve_roots(environment: dict[str, str] | None = None) -> StatePaths:
+    """Resolve configured state paths without creating or changing filesystem objects."""
     env = environment if environment is not None else os.environ
     config = Path(env.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "palimpsest"
 
@@ -265,7 +269,11 @@ def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
         else:
             state = Path(env.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "palimpsest"
 
-    roots = StatePaths(config, state)
+    return StatePaths(config, state)
+
+
+def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
+    roots = resolve_roots(environment)
     for directory in (
         roots.config,
         roots.state,
@@ -406,6 +414,265 @@ def read_owner_record(rpaths: RunPaths) -> OwnerRecord:
         return OwnerRecord(**read_json(rpaths.owner))
     except TypeError as exc:
         raise StateError("invalid owner record") from exc
+
+
+def _open_readonly_no_follow(
+    path: str | Path,
+    *,
+    directory_fd: int | None = None,
+    directory: bool = False,
+    nonblocking: bool = False,
+) -> int | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if directory:
+        flags |= os.O_DIRECTORY
+    if nonblocking:
+        flags |= os.O_NONBLOCK
+    try:
+        return os.open(path, flags, dir_fd=directory_fd)
+    except OSError:
+        return None
+
+
+def _safe_fstat(file_fd: int) -> os.stat_result | None:
+    try:
+        return os.fstat(file_fd)
+    except OSError:
+        return None
+
+
+def _safe_stat(path: str | Path, *, directory_fd: int | None = None) -> os.stat_result | None:
+    try:
+        return os.stat(path, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return None
+
+
+def _close_noerror(file_fd: int) -> None:
+    try:
+        os.close(file_fd)
+    except OSError:
+        pass
+
+
+def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]:
+    """Read one bounded regular JSON file relative to an already pinned directory."""
+    pre_open = _safe_stat(filename, directory_fd=directory_fd)
+    if pre_open is None or not stat_module.S_ISREG(pre_open.st_mode) or pre_open.st_size > _MAX_RUN_LEDGER_BYTES:
+        raise StateError("cannot securely read run ledger")
+    # O_NONBLOCK is immaterial for a regular file but prevents a path swap to a
+    # FIFO or device-like node from hanging this validation boundary.  The
+    # post-open identity/type check rejects any such replacement before reads.
+    file_fd = _open_readonly_no_follow(filename, directory_fd=directory_fd, nonblocking=True)
+    if file_fd is None:
+        raise StateError("cannot securely read run ledger")
+    try:
+        before = _safe_fstat(file_fd)
+        if (
+            before is None
+            or not stat_module.S_ISREG(before.st_mode)
+            or before.st_size > _MAX_RUN_LEDGER_BYTES
+            or (before.st_dev, before.st_ino, stat_module.S_IFMT(before.st_mode))
+            != (pre_open.st_dev, pre_open.st_ino, stat_module.S_IFMT(pre_open.st_mode))
+        ):
+            raise StateError("cannot securely read run ledger")
+        content = bytearray()
+        read_failed = False
+        while True:
+            try:
+                chunk = os.read(file_fd, min(64 * 1024, _MAX_RUN_LEDGER_BYTES + 1 - len(content)))
+            except OSError:
+                read_failed = True
+                break
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > _MAX_RUN_LEDGER_BYTES:
+                raise StateError("cannot securely read run ledger")
+        if read_failed:
+            raise StateError("cannot securely read run ledger")
+        after = _safe_fstat(file_fd)
+        if (
+            after is None
+            or not stat_module.S_ISREG(after.st_mode)
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        ):
+            raise StateError("run ledger changed during read")
+        current = _safe_stat(filename, directory_fd=directory_fd)
+        if (
+            current is None
+            or not stat_module.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino)
+            != (
+                before.st_dev,
+                before.st_ino,
+            )
+        ):
+            raise StateError("run ledger changed during read")
+        decoded: str | None = None
+        try:
+            decoded = bytes(content).decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        if decoded is None:
+            raise StateError("cannot securely read run ledger")
+        parsed = False
+        value: Any = None
+        try:
+            value = json.loads(decoded)
+            parsed = True
+        except (RecursionError, ValueError):
+            pass
+        if not parsed:
+            raise StateError("cannot securely read run ledger")
+        if not isinstance(value, dict):
+            raise StateError("cannot securely read run ledger")
+        return value
+    finally:
+        _close_noerror(file_fd)
+
+
+def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
+    """Read and normalize only the durable identity fields used for dispatch.
+
+    This reader is intentionally side-effect-free.  Legacy mutable state is
+    normalized in memory and is never rewritten by inspection or routing.
+    """
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+    if runs_fd is None:
+        raise StateError("cannot securely read run ledger")
+    runs_before = _safe_fstat(runs_fd)
+    directory_fd = _open_readonly_no_follow(name, directory_fd=runs_fd, directory=True)
+    if directory_fd is None:
+        _close_noerror(runs_fd)
+        raise StateError("cannot securely read run ledger")
+    try:
+        directory_before = _safe_fstat(directory_fd)
+        if runs_before is None or directory_before is None:
+            raise StateError("cannot securely read run ledger")
+        if not stat_module.S_ISDIR(runs_before.st_mode) or not stat_module.S_ISDIR(directory_before.st_mode):
+            raise StateError("cannot securely read run ledger")
+        raw_owner = _read_pinned_json_object(directory_fd, "owner.json")
+        raw_state = _read_pinned_json_object(directory_fd, "state.json")
+        runs_after = _safe_fstat(runs_fd)
+        directory_after = _safe_fstat(directory_fd)
+        current_runs = _safe_stat(roots.runs)
+        current_directory = _safe_stat(name, directory_fd=runs_fd)
+        if (
+            runs_after is None
+            or directory_after is None
+            or current_runs is None
+            or current_directory is None
+            or not stat_module.S_ISDIR(runs_after.st_mode)
+            or not stat_module.S_ISDIR(current_runs.st_mode)
+            or not stat_module.S_ISDIR(directory_after.st_mode)
+            or not stat_module.S_ISDIR(current_directory.st_mode)
+            or (runs_after.st_dev, runs_after.st_ino, runs_after.st_ctime_ns)
+            != (runs_before.st_dev, runs_before.st_ino, runs_before.st_ctime_ns)
+            or (current_runs.st_dev, current_runs.st_ino) != (runs_before.st_dev, runs_before.st_ino)
+            or (directory_after.st_dev, directory_after.st_ino, directory_after.st_ctime_ns)
+            != (directory_before.st_dev, directory_before.st_ino, directory_before.st_ctime_ns)
+            or (current_directory.st_dev, current_directory.st_ino)
+            != (directory_before.st_dev, directory_before.st_ino)
+        ):
+            raise StateError("run ledger changed during read")
+    finally:
+        _close_noerror(directory_fd)
+        _close_noerror(runs_fd)
+
+    if set(raw_owner) != {"schema_version", "run_id", "name"}:
+        raise StateError("invalid owner record")
+    if type(raw_owner.get("schema_version")) is not int or raw_owner["schema_version"] != 1:
+        raise StateError("invalid owner schema")
+    owner_name = raw_owner.get("name")
+    if not isinstance(owner_name, str) or _NAME_RE.fullmatch(owner_name) is None or owner_name != name:
+        raise StateError("invalid owner identity")
+    run_id = raw_owner.get("run_id")
+    if not isinstance(run_id, str):
+        raise StateError("invalid owner identity")
+    parsed_run_id: uuid.UUID | None = None
+    try:
+        parsed_run_id = uuid.UUID(run_id)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if parsed_run_id is None or str(parsed_run_id) != run_id:
+        raise StateError("invalid owner identity")
+
+    raw_schema = raw_state.get("schema_version", 1)
+    if type(raw_schema) is not int or raw_schema not in {1, 2}:
+        raise StateError("invalid run state schema")
+
+    if raw_schema == 1:
+        raw_kind = raw_state.get("runtime_kind", RuntimeKind.CLOUD_IMAGE.value)
+        if raw_kind != RuntimeKind.CLOUD_IMAGE.value:
+            raise StateError("invalid run state runtime kind")
+        raw_backend = raw_state.get("backend", RuntimeBackend.KVM.value)
+    else:
+        if not {"runtime_kind", "backend", "name", "run_id"}.issubset(raw_state):
+            raise StateError("invalid run state schema 2 identity")
+        raw_kind = raw_state["runtime_kind"]
+        raw_backend = raw_state["backend"]
+
+    runtime_kind: RuntimeKind | None = None
+    try:
+        runtime_kind = RuntimeKind(raw_kind)
+    except (TypeError, ValueError):
+        pass
+    if runtime_kind is None:
+        raise StateError("invalid run state runtime kind")
+    backend: RuntimeBackend | None = None
+    try:
+        backend = RuntimeBackend(raw_backend)
+    except (TypeError, ValueError):
+        pass
+    if backend is None:
+        raise StateError("invalid run state runtime backend")
+    dispatch_key: DispatchKey | None = None
+    try:
+        dispatch_key = DispatchKey(runtime_kind, backend)
+    except (TypeError, ValueError):
+        pass
+    if dispatch_key is None:
+        raise StateError("invalid runtime/backend combination")
+
+    if "run_id" in raw_state and (not isinstance(raw_state["run_id"], str) or raw_state["run_id"] != run_id):
+        raise StateError("state run_id mismatch")
+    if "name" in raw_state and (not isinstance(raw_state["name"], str) or raw_state["name"] != owner_name):
+        raise StateError("state name mismatch")
+
+    normalized: ExistingRunRecord | None = None
+    try:
+        normalized = ExistingRunRecord(
+            name=owner_name,
+            run_id=run_id,
+            state_schema_version=raw_schema,
+            dispatch_key=dispatch_key,
+        )
+    except (TypeError, ValueError):
+        pass
+    if normalized is None:
+        raise StateError("invalid normalized run record")
+    return normalized
+
+
+def require_bound_run_dispatch_record(roots: StatePaths, expected: ExistingRunRecord) -> None:
+    """Revalidate a dispatch binding at an adapter's side-effect boundary."""
+    current = read_run_dispatch_record(roots, expected.name)
+    if current != expected:
+        raise StateError("run ledger changed during adapter entry")
+    # This guard binds all cooperative Palimpsest adapter side effects to the
+    # selected record.  The OS cannot freeze files against an arbitrary
+    # same-owner raw writer after this point, so backend ownership checks and
+    # lifecycle locks remain mandatory inside each adapter.
 
 
 @contextmanager

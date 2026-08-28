@@ -20,6 +20,7 @@ from . import state
 from .digest import require_file_digest
 from .errors import ArtifactValidationError, BuildError, LifecycleError, StateError
 from .refs import BuildSpec, LayerRef, RunSpec, StackRef
+from .runtime_types import ExistingRunRecord
 from .state import RunPaths, StatePaths
 
 _BACKEND = "lima-vz"
@@ -387,10 +388,17 @@ def inspect_instance_status(name: str) -> str | None:
     return None if instance is None else _instance_runtime_status(instance)
 
 
-def inspect_run(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
+def inspect_run(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> dict[str, Any]:
     """Reconcile an owner-bound Lima run against live ``limactl`` state."""
 
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner = state.read_owner_record(rpaths)
     record = state.read_run_state(rpaths)
@@ -647,6 +655,7 @@ def logs(
     *,
     roots: StatePaths | None = None,
     follow: bool = False,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> Iterator[str]:
     """Read the owned Lima VM's current-boot system journal.
 
@@ -655,7 +664,9 @@ def logs(
     retained provisioning/attachment console.
     """
 
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     inspected = inspect_run(name, roots=roots)
     record = inspected["state"]
@@ -696,8 +707,15 @@ def logs(
         raise LifecycleError(f"Lima follow guest journal failed: {stderr or f'exit status {return_code}'}")
 
 
-def stop(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
-    roots = roots or state.init_roots()
+def stop(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> dict[str, Any]:
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner = state.read_owner_record(rpaths)
     inspected = inspect_run(name, roots=roots)
@@ -717,10 +735,13 @@ def start(
     *,
     roots: StatePaths | None = None,
     timeout_seconds: float = _TIMEOUT_SECONDS,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     """Start an owned stopped Lima VM and restore its runtime SquashFS mounts."""
 
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner = state.read_owner_record(rpaths)
     inspected = inspect_run(name, roots=roots)
@@ -771,8 +792,16 @@ def start(
         raise LifecycleError(f"Lima start failed: {exc}") from exc
 
 
-def rm(name: str, *, volumes: bool = False, roots: StatePaths | None = None) -> dict[str, Any]:
-    roots = roots or state.init_roots()
+def rm(
+    name: str,
+    *,
+    volumes: bool = False,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> dict[str, Any]:
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner = state.read_owner_record(rpaths)
     record = state.read_run_state(rpaths)

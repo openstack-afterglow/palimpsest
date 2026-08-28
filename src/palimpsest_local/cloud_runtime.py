@@ -27,6 +27,7 @@ from .errors import (
 )
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .refs import ImageRef, RunSpec
+from .runtime_types import ExistingRunRecord
 from .state import OwnerRecord, RunPaths, StatePaths, TagRecord
 
 _logger = logging.getLogger(__name__)
@@ -613,10 +614,13 @@ def start(
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 300.0,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     """Start an owned stopped KVM run without recreating its root or named volumes."""
 
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner_rec, current = _validate_run_ledger(rpaths)
     with state.locked(rpaths):
@@ -943,8 +947,11 @@ def stop(
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 30.0,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner_rec, curr_state = _validate_run_ledger(rpaths)
 
@@ -1004,8 +1011,11 @@ def rm(
     conn: Any | None = None,
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner_rec, curr_state = _validate_run_ledger(rpaths)
 
@@ -1176,8 +1186,11 @@ def inspect_run(
     conn: Any | None = None,
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     owner_rec, _st_data = _validate_run_ledger(rpaths)
 
@@ -1202,8 +1215,11 @@ def logs(
     roots: StatePaths | None = None,
     follow: bool = False,
     poll_interval: float = 0.5,
+    _expected_record: ExistingRunRecord | None = None,
 ) -> Iterator[str]:
-    roots = roots or state.init_roots()
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    if _expected_record is not None:
+        state.require_bound_run_dispatch_record(roots, _expected_record)
     rpaths = state.run_paths(roots, name)
     _validate_run_ledger(rpaths)
 
