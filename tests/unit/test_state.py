@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -459,6 +460,349 @@ def test_new_run_reservation_does_not_fail_after_last_success_boundary(tmp_path:
         reservation.paths.lock.write_bytes(b"replacement")
 
     assert state.read_run_state(state.run_paths(roots, "after-success"))["status"] == "running"
+
+
+def test_existing_run_mutation_promotes_legacy_state_once_with_authoritative_identity(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "legacy-mutation")
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "libvirt-hvf", "guest_ip": None})
+    owner_before = rpaths.owner.read_bytes()
+
+    with state.locked_existing_run(roots, "legacy-mutation") as mutation:
+        assert mutation.is_legacy is True
+        current = mutation.mutable_state()
+        written = mutation.write_state("running", {**current, "guest_ip": "192.0.2.8"})
+        assert mutation.is_legacy is False
+
+    assert rpaths.owner.read_bytes() == owner_before
+    assert state.read_run_state(rpaths) == written
+    assert {key: written[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "libvirt-hvf",
+        "name": "legacy-mutation",
+        "run_id": owner.run_id,
+        "status": "running",
+    }
+
+
+def test_existing_run_mutation_exception_preserves_legacy_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "legacy-failure")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
+    before = rpaths.state.read_bytes()
+
+    with pytest.raises(KeyboardInterrupt):
+        with state.locked_existing_run(roots, "legacy-failure") as mutation:
+            mutation.verify_binding()
+            raise KeyboardInterrupt
+
+    assert rpaths.state.read_bytes() == before
+
+
+def test_existing_run_mutation_rejects_identity_smuggling(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "legacy-smuggle")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
+    before = rpaths.state.read_bytes()
+
+    with state.locked_existing_run(roots, "legacy-smuggle") as mutation:
+        with pytest.raises(StateError, match="durable identity"):
+            mutation.write_state("running", {**mutation.mutable_state(), "backend": "lima-vz"})
+
+    assert rpaths.state.read_bytes() == before
+
+
+def test_existing_run_mutation_rejects_stale_canonical_public_parents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots_a = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg-a"), "XDG_STATE_HOME": str(tmp_path / "st-a")})
+    roots_b = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg-b"), "XDG_STATE_HOME": str(tmp_path / "st-b")})
+    stale_paths = state.run_paths(roots_a, "parent-swap")
+    current_paths = state.run_paths(roots_b, "parent-swap")
+    state.write_owner_record(current_paths)
+    state.write_run_state(current_paths, status="stopped", data={"backend": "kvm", "marker": "b"})
+    monkeypatch.setattr(state, "_new_run_paths", lambda _roots, _name: stale_paths)
+
+    with pytest.raises(StateError, match="changed during lifecycle mutation"):
+        with state.locked_existing_run(roots_b, "parent-swap"):
+            pytest.fail("stale public paths were accepted")
+
+    assert not stale_paths.root.exists()
+    assert state.read_run_state(current_paths)["marker"] == "b"
+
+
+def test_new_run_reservation_rejects_stale_canonical_public_parents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots_a = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg-a"), "XDG_STATE_HOME": str(tmp_path / "st-a")})
+    roots_b = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg-b"), "XDG_STATE_HOME": str(tmp_path / "st-b")})
+    stale_paths = state.run_paths(roots_a, "new-parent-swap")
+    monkeypatch.setattr(state, "_new_run_paths", lambda _roots, _name: stale_paths)
+
+    with pytest.raises(StateError, match="changed during create"):
+        with state.reserve_new_run(roots_b, "new-parent-swap", _cloud_key()):
+            pytest.fail("stale public paths were accepted")
+
+    assert not stale_paths.root.exists()
+
+
+def test_existing_run_delete_rejects_visible_replacement_without_touching_either_tree(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "delete-swap")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+    original_state = rpaths.state.read_bytes()
+    displaced = roots.runs / "delete-swap-original"
+
+    with pytest.raises(StateError, match="changed during lifecycle"):
+        with state.locked_existing_run(roots, "delete-swap") as mutation:
+            os.rename(rpaths.root, displaced)
+            rpaths.root.mkdir()
+            (rpaths.root / "marker").write_bytes(b"replacement")
+            mutation.delete_run_tree()
+
+    assert (rpaths.root / "marker").read_bytes() == b"replacement"
+    assert (displaced / "state.json").read_bytes() == original_state
+
+
+def test_existing_run_delete_removes_only_pinned_run_tree(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "delete-exact")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+    (rpaths.root / "nested").mkdir()
+    (rpaths.root / "nested" / "artifact").write_bytes(b"data")
+
+    with state.locked_existing_run(roots, "delete-exact") as mutation:
+        mutation.delete_run_tree()
+
+    assert not rpaths.root.exists()
+
+
+def test_existing_run_delete_supports_symlink_configured_state_root(tmp_path: Path) -> None:
+    real_state = tmp_path / "real-state"
+    real_state.mkdir()
+    linked_state = tmp_path / "linked-state"
+    linked_state.symlink_to(real_state, target_is_directory=True)
+    roots = state.init_roots(
+        {
+            "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
+            "PALIMPSEST_STATE_HOME": str(linked_state),
+        }
+    )
+    rpaths = state.run_paths(roots, "delete-linked-root")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+
+    with state.locked_existing_run(roots, "delete-linked-root") as mutation:
+        mutation.delete_run_tree()
+
+    assert not rpaths.root.exists()
+    assert list(roots.run_deletions.resolve().iterdir()) == []
+
+
+def test_existing_run_append_rejects_hardlink_without_changing_external_inode(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "append-hardlink")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"backend": "lima-vz"})
+    external = tmp_path / "external.log"
+    external.write_bytes(b"external")
+    external.chmod(0o640)
+    os.link(external, rpaths.console)
+
+    with state.locked_existing_run(roots, "append-hardlink") as mutation:
+        with pytest.raises(StateError, match="securely append"):
+            mutation.append_file("console.log", b"new")
+
+    assert external.read_bytes() == b"external"
+    assert external.stat().st_mode & 0o777 == 0o640
+
+
+def test_existing_run_append_rejects_fifo_without_opening_it(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "append-fifo")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"backend": "lima-vz"})
+    os.mkfifo(rpaths.console, 0o600)
+
+    with state.locked_existing_run(roots, "append-fifo") as mutation:
+        with pytest.raises(StateError, match="securely append"):
+            mutation.append_file("console.log", b"new")
+
+    assert stat.S_ISFIFO(rpaths.console.lstat().st_mode)
+
+
+def test_existing_run_delete_preflights_entire_tree_before_removing_files(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "delete-preflight")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+    ordinary = rpaths.root / "aaa-artifact"
+    ordinary.write_bytes(b"keep")
+    os.mkfifo(rpaths.root / "zzz-fifo", 0o600)
+
+    with state.locked_existing_run(roots, "delete-preflight") as mutation:
+        with pytest.raises(StateError, match="unsupported filesystem entry"):
+            mutation.delete_run_tree()
+
+    assert ordinary.read_bytes() == b"keep"
+    assert rpaths.owner.exists()
+    assert rpaths.state.exists()
+
+
+def test_existing_run_delete_restores_replacement_instead_of_unlinking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "delete-entry-swap")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+    victim = rpaths.root / ".aaa-victim"
+    victim.write_bytes(b"original")
+    displaced = rpaths.root / ".aaa-original"
+    real_rename = state.os.rename
+    swapped = False
+
+    def swap_rename(src, dst, *args, **kwargs):
+        nonlocal swapped
+        if src == ".aaa-victim" and not swapped:
+            swapped = True
+            real_rename(src, ".aaa-original", src_dir_fd=kwargs["src_dir_fd"], dst_dir_fd=kwargs["dst_dir_fd"])
+            replacement_fd = os.open(
+                ".aaa-victim",
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+                dir_fd=kwargs["src_dir_fd"],
+            )
+            try:
+                os.write(replacement_fd, b"replacement")
+            finally:
+                os.close(replacement_fd)
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "rename", swap_rename)
+
+    with state.locked_existing_run(roots, "delete-entry-swap") as mutation:
+        with pytest.raises(StateError, match="changed during deletion"):
+            mutation.delete_run_tree()
+
+    assert not rpaths.root.exists()
+    quarantines = list(roots.run_deletions.glob("delete-entry-swap-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / victim.name).read_bytes() == b"replacement"
+    assert (quarantines[0] / displaced.name).read_bytes() == b"original"
+    assert (quarantines[0] / "owner.json").exists()
+
+
+def test_existing_run_delete_failure_never_leaves_partial_public_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = {"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")}
+    roots = state.init_roots(environment)
+    rpaths = state.run_paths(roots, "delete-unlink-failure")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="removed", data={"backend": "kvm"})
+    (rpaths.root / "artifact-a").write_bytes(b"a")
+    (rpaths.root / "artifact-b").write_bytes(b"b")
+    real_unlink = state.os.unlink
+    unlink_calls = 0
+
+    def fail_second_unlink(path, *args, **kwargs):
+        nonlocal unlink_calls
+        unlink_calls += 1
+        if unlink_calls == 2:
+            raise OSError("injected unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "unlink", fail_second_unlink)
+
+    with state.locked_existing_run(roots, "delete-unlink-failure") as mutation:
+        with pytest.raises(StateError, match="securely delete"):
+            mutation.delete_run_tree()
+
+    assert not rpaths.root.exists()
+    quarantines = list(roots.run_deletions.glob("delete-unlink-failure-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].is_dir()
+
+    state.init_roots(environment)
+
+    assert list(roots.run_deletions.iterdir()) == []
+
+
+def test_init_roots_rejects_run_deletion_symlink_without_chmodding_target(tmp_path: Path) -> None:
+    environment = {"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")}
+    roots = state.init_roots(environment)
+    roots.run_deletions.rmdir()
+    external = tmp_path / "external-deletions"
+    external.mkdir(mode=0o755)
+    roots.run_deletions.symlink_to(external, target_is_directory=True)
+
+    state.init_roots(environment)
+
+    assert roots.run_deletions.is_symlink()
+    assert external.stat().st_mode & 0o777 == 0o755
+
+
+def test_run_deletion_retry_honors_original_name_lock(tmp_path: Path) -> None:
+    environment = {"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")}
+    roots = state.init_roots(environment)
+    quarantine = roots.run_deletions / ("locked-retry-" + "a" * 32)
+    quarantine.mkdir(mode=0o700)
+    (quarantine / "artifact").write_bytes(b"pending")
+    started = threading.Event()
+    finished = threading.Event()
+
+    def retry() -> None:
+        started.set()
+        state.init_roots(environment)
+        finished.set()
+
+    with state._new_run_name_lock(roots, "locked-retry"):
+        worker = threading.Thread(target=retry)
+        worker.start()
+        assert started.wait(timeout=1)
+        worker.join(timeout=0.1)
+        assert worker.is_alive()
+        assert quarantine.exists()
+
+    worker.join(timeout=2)
+    assert finished.is_set()
+    assert not quarantine.exists()
+
+
+def test_existing_run_state_write_restores_legacy_bytes_after_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "state-fsync-failure")
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
+    before = rpaths.state.read_bytes()
+    real_fsync = state.os.fsync
+
+    with state.locked_existing_run(roots, "state-fsync-failure") as mutation:
+
+        def fail_directory_fsync(file_fd: int) -> None:
+            if file_fd == mutation._run_fd:
+                raise OSError("injected directory fsync failure")
+            real_fsync(file_fd)
+
+        monkeypatch.setattr(state.os, "fsync", fail_directory_fsync)
+        with pytest.raises(StateError, match="durably write existing run ledger"):
+            mutation.write_state("running", mutation.mutable_state())
+
+    assert rpaths.state.read_bytes() == before
 
 
 def test_atomic_write_json_syncs_parent_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -567,8 +567,14 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
             refreshed = state.read_run_ledger_snapshot(resolved_roots, record.name)
             if refreshed.record != record:
                 raise StateError("run ledger changed during reconciliation")
+            projected = refreshed
+            if record.state_schema_version == 1:
+                observed_state = adapter_result.get("state") if isinstance(adapter_result, Mapping) else None
+                if not isinstance(observed_state, Mapping):
+                    raise StateError("runtime reconciliation returned no observed state")
+                projected = state.snapshot_from_runtime_observation(record, observed_state)
             summary, error = _project_or_error(
-                refreshed,
+                projected,
                 operation=RuntimeOperation.RECONCILE,
                 stale=False,
             )

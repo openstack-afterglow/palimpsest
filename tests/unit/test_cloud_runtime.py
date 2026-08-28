@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -104,6 +105,32 @@ class FakeLibvirtConn:
         if name in self.domains and not self.domains[name].undefined:
             return self.domains[name]
         raise KeyError(f"Domain not found: {name}")
+
+
+def _legacy_cloud_lifecycle(
+    roots: state.StatePaths,
+    name: str,
+    status: str,
+) -> tuple[state.RunPaths, state.OwnerRecord, FakeLibvirtConn, FakeDomain]:
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rpaths.ssh.mkdir(mode=0o700)
+    rpaths.console.write_text("old boot\n", encoding="utf-8")
+    rpaths.console.chmod(0o600)
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status=status,
+        data={"backend": "kvm", "network": "none", "guest_ip": None, "layers": [], "volumes": []},
+    )
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner.run_id}" '
+        f'schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain(name, f"<domain><name>{name}</name><metadata>{marker}</metadata></domain>")
+    conn = FakeLibvirtConn()
+    conn.domains[name] = domain
+    return rpaths, owner, conn, domain
 
 
 def _sha256_file(path: Path) -> str:
@@ -471,6 +498,138 @@ def test_start_rollback_on_failure():
             assert "rollback-run" not in conn.domains or conn.domains["rollback-run"].undefined
 
 
+def test_legacy_cloud_start_promotes_once_after_backend_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner, conn, domain = _legacy_cloud_lifecycle(roots, "legacy-start", "stopped")
+    before = rpaths.state.read_bytes()
+    monkeypatch.setattr(runtime, "_wait_for_readiness", lambda *_a, **_k: None)
+
+    result = start("legacy-start", roots=roots, conn=conn)
+
+    assert domain.isActive() is True
+    assert rpaths.state.read_bytes() != before
+    assert {key: result[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": "legacy-start",
+        "run_id": owner.run_id,
+        "status": "running",
+    }
+
+
+def test_legacy_cloud_start_backend_failure_preserves_exact_state_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(roots, "legacy-start-failure", "stopped")
+    before = rpaths.state.read_bytes()
+    monkeypatch.setattr(
+        runtime, "_wait_for_readiness", lambda *_a, **_k: (_ for _ in ()).throw(LifecycleError("boot failed"))
+    )
+
+    with pytest.raises(LifecycleError, match="boot failed"):
+        start("legacy-start-failure", roots=roots, conn=conn)
+
+    assert rpaths.state.read_bytes() == before
+
+
+def test_legacy_cloud_stop_success_promotes_but_failure_preserves_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    success_paths, success_owner, success_conn, success_domain = _legacy_cloud_lifecycle(
+        roots, "legacy-stop", "running"
+    )
+    success_domain._active = True
+
+    stopped = stop("legacy-stop", roots=roots, conn=success_conn, timeout_seconds=0)
+
+    assert stopped["schema_version"] == 2
+    assert stopped["run_id"] == success_owner.run_id
+    assert stopped["status"] == "stopped"
+
+    failure_paths, _owner, failure_conn, failure_domain = _legacy_cloud_lifecycle(
+        roots, "legacy-stop-failure", "running"
+    )
+    failure_domain._active = True
+    failure_domain.shutdown = lambda: None  # type: ignore[method-assign]
+    failure_domain.destroy = lambda: (_ for _ in ()).throw(LifecycleError("destroy failed"))  # type: ignore[method-assign]
+    before = failure_paths.state.read_bytes()
+
+    with pytest.raises(LifecycleError, match="destroy failed"):
+        stop("legacy-stop-failure", roots=roots, conn=failure_conn, timeout_seconds=0)
+
+    assert failure_paths.state.read_bytes() == before
+
+
+@pytest.mark.parametrize("domain_present", [True, False])
+def test_legacy_cloud_stop_live_noop_returns_stopped_without_rewriting(
+    tmp_path: Path,
+    domain_present: bool,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    suffix = "present" if domain_present else "missing"
+    rpaths, _owner, conn, domain = _legacy_cloud_lifecycle(roots, f"legacy-stop-noop-{suffix}", "running")
+    domain._active = False
+    if not domain_present:
+        conn.domains.clear()
+    before = rpaths.state.read_bytes()
+
+    stopped = stop(rpaths.name, roots=roots, conn=conn)
+
+    assert stopped["status"] == "stopped"
+    assert stopped.get("schema_version") is None
+    assert rpaths.state.read_bytes() == before
+
+
+def test_legacy_cloud_plain_rm_promotes_removed_and_volumes_rm_rejects_replacement(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    plain_paths, plain_owner, plain_conn, _plain_domain = _legacy_cloud_lifecycle(roots, "legacy-rm", "stopped")
+    plain_conn.domains.clear()
+
+    removed = rm("legacy-rm", roots=roots, conn=plain_conn)
+
+    assert removed["schema_version"] == 2
+    assert removed["run_id"] == plain_owner.run_id
+    assert removed["status"] == "removed"
+    assert plain_paths.root.exists()
+
+    swap_paths, _owner, swap_conn, swap_domain = _legacy_cloud_lifecycle(roots, "legacy-rm-swap", "stopped")
+    displaced = roots.runs / "legacy-rm-swap-original"
+    original_state = swap_paths.state.read_bytes()
+
+    def swap_on_undefine() -> int:
+        os.rename(swap_paths.root, displaced)
+        swap_paths.root.mkdir()
+        (swap_paths.root / "marker").write_bytes(b"replacement")
+        swap_domain.undefined = True
+        return 0
+
+    swap_domain.undefine = swap_on_undefine  # type: ignore[method-assign]
+
+    with pytest.raises(StateError, match="changed during lifecycle"):
+        rm("legacy-rm-swap", roots=roots, conn=swap_conn, volumes=True)
+
+    assert (swap_paths.root / "marker").read_bytes() == b"replacement"
+    assert (displaced / "state.json").read_bytes() == original_state
+
+
+def test_legacy_cloud_plain_rm_noop_preserves_removed_state_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(roots, "legacy-rm-noop", "removed")
+    conn.domains.clear()
+    before = rpaths.state.read_bytes()
+
+    removed = rm("legacy-rm-noop", roots=roots, conn=conn)
+
+    assert removed["status"] == "removed"
+    assert removed.get("schema_version") is None
+    assert rpaths.state.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     ("backend", "arch"),
     [(platforms.BACKEND_KVM, "x86_64"), (platforms.BACKEND_HVF, "aarch64")],
@@ -683,7 +842,64 @@ def test_missing_domain_reconciliation():
         runs, warnings = reconcile(roots=roots, conn=conn)
         assert any("domain missing from libvirt" in w for w in warnings)
         st = state.read_run_state(rpaths)
-        assert st["status"] == "stopped"
+        assert st["status"] == "running"
+        assert runs[0]["status"] == "stopped"
+
+
+def test_bulk_reconcile_persists_v2_drift_through_locked_single_run_path(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "v2-bulk-reconcile")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+        },
+    )
+
+    runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
+
+    assert warnings == ["run 'v2-bulk-reconcile': domain missing from libvirt"]
+    assert runs[0]["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "stopped"
+
+
+def test_bulk_reconcile_preserves_observed_result_when_v2_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "v2-bulk-write-failure")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+        },
+    )
+    monkeypatch.setattr(
+        state.ExistingRunMutation,
+        "write_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
+
+    assert warnings == ["run 'v2-bulk-write-failure': domain missing from libvirt"]
+    assert runs[0]["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "running"
 
 
 def test_lima_run_reconciliation_skips_libvirt_state_changes():
@@ -1254,7 +1470,8 @@ def test_reconcile_treats_libvirt_hvf_backend_as_libvirt_backed(tmp_path: Path):
     runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
 
     assert any("domain missing from libvirt" in w for w in warnings)
-    assert state.read_run_state(rpaths)["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "running"
+    assert runs[0]["status"] == "stopped"
 
 
 def test_ps_reports_backend_field_and_defaults_legacy_ledgers_to_kvm(tmp_path: Path):
@@ -1500,11 +1717,12 @@ def test_single_run_reconcile_updates_only_the_bound_target_and_preserves_siblin
     conn = FakeLibvirtConn()
     conn.domains["target-run"] = domain
     expected = state.read_run_dispatch_record(roots, "target-run")
+    target_before = target.state.read_bytes()
 
     result = runtime.reconcile_run("target-run", roots=roots, conn=conn, _expected_record=expected)
 
     assert result["state"]["status"] == "running"
-    assert state.read_run_state(target)["status"] == "running"
+    assert target.state.read_bytes() == target_before
     assert (sibling.owner.read_bytes(), sibling.state.read_bytes(), sibling.state.stat().st_mtime_ns) == sibling_before
 
 
@@ -1515,10 +1733,24 @@ def test_single_run_reconcile_does_not_swallow_state_write_failure(
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     rpaths = state.run_paths(roots, "write-failure")
     rpaths.root.mkdir()
-    state.write_owner_record(rpaths)
-    state.write_run_state(rpaths, status="running", data={"backend": "kvm"})
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": "write-failure",
+            "run_id": owner.run_id,
+        },
+    )
     expected = state.read_run_dispatch_record(roots, "write-failure")
-    monkeypatch.setattr(runtime, "_write_state", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        state.ExistingRunMutation,
+        "write_state",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
 
     with pytest.raises(OSError, match="disk full"):
         runtime.reconcile_run("write-failure", roots=roots, conn=FakeLibvirtConn(), _expected_record=expected)

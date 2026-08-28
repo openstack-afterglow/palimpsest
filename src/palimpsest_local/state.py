@@ -60,6 +60,11 @@ class StatePaths:
         return self.state / "runs"
 
     @property
+    def run_deletions(self) -> Path:
+        """Quarantined run trees whose committed deletion cleanup did not finish."""
+        return self.state / "run-deletions"
+
+    @property
     def locks(self) -> Path:
         return self.state / "locks"
 
@@ -409,6 +414,7 @@ def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
     ):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
+    _retry_run_deletion_quarantines(roots)
     return roots
 
 
@@ -641,10 +647,10 @@ def _read_exact_private_file(
         or stat_module.S_IMODE(entry_before.st_mode) != expected_mode
         or entry_before.st_size > max_bytes
     ):
-        raise StateError("new run ledger changed during verification")
+        raise StateError("run ledger changed during verification")
     file_fd = _open_readonly_no_follow(filename, directory_fd=directory_fd, nonblocking=True)
     if file_fd is None:
-        raise StateError("new run ledger changed during verification")
+        raise StateError("run ledger changed during verification")
     try:
         opened_before = _safe_fstat(file_fd)
         if (
@@ -656,18 +662,18 @@ def _read_exact_private_file(
             or opened_before.st_size > max_bytes
             or _identity(opened_before) != _identity(entry_before)
         ):
-            raise StateError("new run ledger changed during verification")
+            raise StateError("run ledger changed during verification")
         content = bytearray()
         while True:
             try:
                 chunk = os.read(file_fd, min(64 * 1024, max_bytes + 1 - len(content)))
             except OSError:
-                raise StateError("new run ledger changed during verification") from None
+                raise StateError("run ledger changed during verification") from None
             if not chunk:
                 break
             content.extend(chunk)
             if len(content) > max_bytes:
-                raise StateError("new run ledger changed during verification")
+                raise StateError("run ledger changed during verification")
         opened_after = _safe_fstat(file_fd)
         entry_after = _safe_stat(filename, directory_fd=directory_fd)
         before_metadata = (
@@ -717,7 +723,7 @@ def _read_exact_private_file(
                 entry_after.st_ctime_ns,
             )
         ):
-            raise StateError("new run ledger changed during verification")
+            raise StateError("run ledger changed during verification")
         return bytes(content)
     finally:
         _close_noerror(file_fd)
@@ -923,15 +929,18 @@ def _verify_new_run_binding(reservation: NewRunReservation) -> None:
         raise StateError("invalid new run reservation authority")
     runs_open = _safe_fstat(reservation._runs_fd)
     runs_path = _safe_stat(reservation.roots.runs)
+    public_runs_parent = _safe_stat(reservation.paths.root.parent)
     run_open = _safe_fstat(reservation._run_fd)
     run_entry = _safe_stat(reservation.paths.name, directory_fd=reservation._runs_fd)
     locks_open = _safe_fstat(reservation._locks_fd)
     locks_path = _safe_stat(reservation.roots.locks)
+    public_locks_parent = _safe_stat(reservation.paths.lock.parent)
     lock_open = _safe_fstat(reservation._lock_fd)
     lock_entry = _safe_stat(f"{reservation.paths.name}.lock", directory_fd=reservation._locks_fd)
     if (
         runs_open is None
         or runs_path is None
+        or public_runs_parent is None
         or run_open is None
         or run_entry is None
         or not stat_module.S_ISDIR(runs_open.st_mode)
@@ -940,10 +949,12 @@ def _verify_new_run_binding(reservation: NewRunReservation) -> None:
         or not stat_module.S_ISDIR(run_entry.st_mode)
         or _identity(runs_open) != reservation._runs_identity
         or _identity(runs_path) != reservation._runs_identity
+        or _identity(public_runs_parent) != reservation._runs_identity
         or _identity(run_open) != reservation._run_identity
         or _identity(run_entry) != reservation._run_identity
         or locks_open is None
         or locks_path is None
+        or public_locks_parent is None
         or lock_open is None
         or lock_entry is None
         or not stat_module.S_ISDIR(locks_open.st_mode)
@@ -955,6 +966,7 @@ def _verify_new_run_binding(reservation: NewRunReservation) -> None:
         or stat_module.S_IMODE(lock_open.st_mode) != 0o600
         or _identity(locks_open) != reservation._locks_identity
         or _identity(locks_path) != reservation._locks_identity
+        or _identity(public_locks_parent) != reservation._locks_identity
         or _identity(lock_open) != reservation._lock_identity
         or _identity(lock_entry) != reservation._lock_identity
     ):
@@ -1290,6 +1302,755 @@ def reserve_new_run(
             _close_noerror(runs_fd)
 
 
+class ExistingRunMutation:
+    """Pinned authority for one existing-run lifecycle mutation."""
+
+    __slots__ = (
+        "_roots",
+        "_paths",
+        "_record",
+        "_snapshot",
+        "_owner_bytes",
+        "_state_bytes",
+        "_runs_fd",
+        "_run_fd",
+        "_locks_fd",
+        "_lock_fd",
+        "_runs_identity",
+        "_run_identity",
+        "_locks_identity",
+        "_lock_identity",
+        "_deleted",
+    )
+
+    def __init__(
+        self,
+        roots: StatePaths,
+        paths: RunPaths,
+        snapshot: RunLedgerSnapshot,
+        owner_bytes: bytes,
+        state_bytes: bytes,
+        runs_fd: int,
+        run_fd: int,
+        name_lock: _NewRunNameLock,
+        runs_identity: tuple[int, int],
+        run_identity: tuple[int, int],
+    ) -> None:
+        object.__setattr__(self, "_roots", roots)
+        object.__setattr__(self, "_paths", paths)
+        object.__setattr__(self, "_record", snapshot.record)
+        object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_owner_bytes", owner_bytes)
+        object.__setattr__(self, "_state_bytes", state_bytes)
+        object.__setattr__(self, "_runs_fd", runs_fd)
+        object.__setattr__(self, "_run_fd", run_fd)
+        object.__setattr__(self, "_locks_fd", name_lock.locks_fd)
+        object.__setattr__(self, "_lock_fd", name_lock.lock_fd)
+        object.__setattr__(self, "_runs_identity", runs_identity)
+        object.__setattr__(self, "_run_identity", run_identity)
+        object.__setattr__(self, "_locks_identity", name_lock.locks_identity)
+        object.__setattr__(self, "_lock_identity", name_lock.lock_identity)
+        object.__setattr__(self, "_deleted", False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("existing run mutation authority is immutable")
+
+    @property
+    def paths(self) -> RunPaths:
+        return self._paths
+
+    @property
+    def record(self) -> ExistingRunRecord:
+        return self._record
+
+    @property
+    def snapshot(self) -> RunLedgerSnapshot:
+        return self._snapshot
+
+    @property
+    def is_legacy(self) -> bool:
+        return self._record.state_schema_version == 1
+
+    def mutable_state(self) -> dict[str, Any]:
+        def thaw(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {key: thaw(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return [thaw(item) for item in value]
+            return value
+
+        return thaw(self._snapshot.state)
+
+    def verify_binding(self) -> None:
+        _verify_existing_run_mutation(self)
+
+    def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
+        return _write_existing_run_mutation_state(self, status, data)
+
+    def write_file(self, relative_name: str, content: bytes) -> None:
+        _write_existing_run_file(self, relative_name, content, append=False)
+
+    def append_file(self, relative_name: str, content: bytes) -> None:
+        _write_existing_run_file(self, relative_name, content, append=True)
+
+    def delete_run_tree(self) -> None:
+        _delete_existing_run_tree(self)
+
+
+def _decode_exact_json_object(content: bytes) -> dict[str, Any]:
+    decoded: str | None = None
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    parsed = False
+    value: Any = None
+    if decoded is not None:
+        try:
+            value = json.loads(decoded)
+            parsed = True
+        except (RecursionError, ValueError):
+            pass
+    if not parsed or not isinstance(value, dict):
+        raise StateError("cannot securely read existing run ledger")
+    return value
+
+
+def _verify_existing_run_mutation(
+    mutation: ExistingRunMutation,
+    *,
+    expected_state_bytes: bytes | None = None,
+) -> None:
+    if mutation._deleted:
+        raise StateError("existing run was already deleted")
+    state_bytes = mutation._state_bytes if expected_state_bytes is None else expected_state_bytes
+    runs_open = _safe_fstat(mutation._runs_fd)
+    runs_path = _safe_stat(mutation._roots.runs)
+    public_runs_parent = _safe_stat(mutation._paths.root.parent)
+    run_open = _safe_fstat(mutation._run_fd)
+    run_entry = _safe_stat(mutation._paths.name, directory_fd=mutation._runs_fd)
+    locks_open = _safe_fstat(mutation._locks_fd)
+    locks_path = _safe_stat(mutation._roots.locks)
+    public_locks_parent = _safe_stat(mutation._paths.lock.parent)
+    lock_open = _safe_fstat(mutation._lock_fd)
+    lock_entry = _safe_stat(f"{mutation._paths.name}.lock", directory_fd=mutation._locks_fd)
+    if (
+        runs_open is None
+        or runs_path is None
+        or public_runs_parent is None
+        or run_open is None
+        or run_entry is None
+        or locks_open is None
+        or locks_path is None
+        or public_locks_parent is None
+        or lock_open is None
+        or lock_entry is None
+        or not stat_module.S_ISDIR(runs_open.st_mode)
+        or not stat_module.S_ISDIR(runs_path.st_mode)
+        or not stat_module.S_ISDIR(run_open.st_mode)
+        or not stat_module.S_ISDIR(run_entry.st_mode)
+        or not stat_module.S_ISDIR(locks_open.st_mode)
+        or not stat_module.S_ISDIR(locks_path.st_mode)
+        or not stat_module.S_ISREG(lock_open.st_mode)
+        or not stat_module.S_ISREG(lock_entry.st_mode)
+        or lock_open.st_uid != os.geteuid()
+        or lock_open.st_nlink != 1
+        or stat_module.S_IMODE(lock_open.st_mode) != 0o600
+        or _identity(runs_open) != mutation._runs_identity
+        or _identity(runs_path) != mutation._runs_identity
+        or _identity(public_runs_parent) != mutation._runs_identity
+        or _identity(run_open) != mutation._run_identity
+        or _identity(run_entry) != mutation._run_identity
+        or _identity(locks_open) != mutation._locks_identity
+        or _identity(locks_path) != mutation._locks_identity
+        or _identity(public_locks_parent) != mutation._locks_identity
+        or _identity(lock_open) != mutation._lock_identity
+        or _identity(lock_entry) != mutation._lock_identity
+        or _read_exact_private_file(mutation._run_fd, "owner.json") != mutation._owner_bytes
+        or _read_exact_private_file(mutation._run_fd, "state.json") != state_bytes
+    ):
+        raise StateError("existing run changed during lifecycle mutation")
+
+
+def _validated_existing_state_payload(
+    mutation: ExistingRunMutation,
+    status: str,
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(status, str) or status not in ALLOWED_RUNTIME_STATUSES[mutation.record.dispatch_key.runtime_kind]:
+        raise StateError("invalid status for existing run ledger")
+    if not isinstance(data, Mapping):
+        raise StateError("existing run state data must be a mapping")
+    current = mutation.snapshot.state
+    identity_values = {
+        "runtime_kind": mutation.record.dispatch_key.runtime_kind.value,
+        "backend": mutation.record.dispatch_key.backend.value,
+        "name": mutation.record.name,
+        "run_id": mutation.record.run_id,
+    }
+    for key, expected in identity_values.items():
+        if key in data and data[key] != expected:
+            raise StateError("existing run state cannot override durable identity")
+    if "schema_version" in data and data["schema_version"] != mutation.record.state_schema_version:
+        raise StateError("existing run state cannot override durable schema")
+    if "status" in data and data["status"] != current.get("status"):
+        raise StateError("existing run state is stale")
+    body = {key: deepcopy(value) for key, value in data.items() if key not in _RESERVED_RUN_STATE_FIELDS}
+    return {
+        **body,
+        "schema_version": 2,
+        "runtime_kind": mutation.record.dispatch_key.runtime_kind.value,
+        "backend": mutation.record.dispatch_key.backend.value,
+        "name": mutation.record.name,
+        "run_id": mutation.record.run_id,
+        "status": status,
+    }
+
+
+def _write_existing_run_file(
+    mutation: ExistingRunMutation,
+    relative_name: str,
+    content: bytes,
+    *,
+    append: bool,
+) -> None:
+    if not isinstance(content, bytes):
+        raise StateError("invalid existing run file payload")
+    components = _safe_relative_components(relative_name)
+    mutation.verify_binding()
+    parent_fd = mutation._run_fd
+    opened: list[int] = []
+    file_fd: int | None = None
+    temporary: str | None = None
+    try:
+        for component in components[:-1]:
+            child_fd = _open_readonly_no_follow(component, directory_fd=parent_fd, directory=True)
+            if child_fd is None:
+                raise StateError("cannot securely open existing run file parent")
+            child = _safe_fstat(child_fd)
+            if child is None or not stat_module.S_ISDIR(child.st_mode) or child.st_uid != os.geteuid():
+                _close_noerror(child_fd)
+                raise StateError("cannot securely open existing run file parent")
+            opened.append(child_fd)
+            parent_fd = child_fd
+        if append:
+            prior = _safe_stat(components[-1], directory_fd=parent_fd)
+            created = prior is None
+            if prior is not None and (
+                not stat_module.S_ISREG(prior.st_mode)
+                or prior.st_uid != os.geteuid()
+                or prior.st_nlink != 1
+                or stat_module.S_IMODE(prior.st_mode) != 0o600
+            ):
+                raise StateError("cannot securely append existing run file")
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+            if created:
+                flags |= os.O_CREAT | os.O_EXCL
+            file_fd = os.open(components[-1], flags, 0o600, dir_fd=parent_fd)
+            if created:
+                os.fchmod(file_fd, 0o600)
+            before = _safe_fstat(file_fd)
+            if (
+                before is None
+                or not stat_module.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat_module.S_IMODE(before.st_mode) != 0o600
+                or (prior is not None and _identity(before) != _identity(prior))
+            ):
+                raise StateError("cannot securely append existing run file")
+            _write_all(file_fd, content)
+            os.fsync(file_fd)
+            if created:
+                os.fsync(parent_fd)
+            current = _safe_stat(components[-1], directory_fd=parent_fd)
+            after = _safe_fstat(file_fd)
+            if (
+                current is None
+                or after is None
+                or _identity(current) != _identity(before)
+                or _identity(after) != _identity(before)
+            ):
+                raise StateError("existing run file changed during append")
+        else:
+            temporary = f".artifact-mutation-{uuid.uuid4().hex}"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+            file_fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+            os.fchmod(file_fd, 0o600)
+            _write_all(file_fd, content)
+            os.fsync(file_fd)
+            staged = _safe_fstat(file_fd)
+            if (
+                staged is None
+                or not stat_module.S_ISREG(staged.st_mode)
+                or staged.st_uid != os.geteuid()
+                or staged.st_nlink != 1
+                or stat_module.S_IMODE(staged.st_mode) != 0o600
+            ):
+                raise StateError("cannot securely write existing run file")
+            mutation.verify_binding()
+            os.replace(temporary, components[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            temporary = None
+            os.fsync(parent_fd)
+            published = _safe_stat(components[-1], directory_fd=parent_fd)
+            if (
+                published is None
+                or _identity(published) != _identity(staged)
+                or _read_exact_private_file(parent_fd, components[-1], max_bytes=max(len(content), 1)) != content
+            ):
+                raise StateError("existing run file changed during write")
+        mutation.verify_binding()
+    except OSError:
+        raise StateError("cannot durably write existing run file") from None
+    finally:
+        if file_fd is not None:
+            _close_noerror(file_fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except OSError:
+                pass
+        for opened_fd in reversed(opened):
+            _close_noerror(opened_fd)
+
+
+def _write_existing_run_mutation_state(
+    mutation: ExistingRunMutation,
+    status: str,
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = _validated_existing_state_payload(mutation, status, data)
+    content = _json_bytes(payload)
+    mutation.verify_binding()
+    temporary = f".state-mutation-{uuid.uuid4().hex}"
+    temporary_fd: int | None = None
+    published = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        temporary_fd = os.open(temporary, flags, 0o600, dir_fd=mutation._run_fd)
+        os.fchmod(temporary_fd, 0o600)
+        _write_all(temporary_fd, content)
+        os.fsync(temporary_fd)
+        temporary_stat = _safe_fstat(temporary_fd)
+        if (
+            temporary_stat is None
+            or not stat_module.S_ISREG(temporary_stat.st_mode)
+            or temporary_stat.st_uid != os.geteuid()
+            or temporary_stat.st_nlink != 1
+            or stat_module.S_IMODE(temporary_stat.st_mode) != 0o600
+        ):
+            raise StateError("cannot durably write existing run ledger")
+        mutation.verify_binding()
+        os.replace(
+            temporary,
+            "state.json",
+            src_dir_fd=mutation._run_fd,
+            dst_dir_fd=mutation._run_fd,
+        )
+        temporary = ""
+        published = True
+        os.fsync(mutation._run_fd)
+        published_stat = _safe_stat("state.json", directory_fd=mutation._run_fd)
+        if (
+            published_stat is None
+            or not stat_module.S_ISREG(published_stat.st_mode)
+            or published_stat.st_uid != os.geteuid()
+            or published_stat.st_nlink != 1
+            or stat_module.S_IMODE(published_stat.st_mode) != 0o600
+            or _identity(published_stat) != _identity(temporary_stat)
+            or _read_exact_private_file(mutation._run_fd, "state.json") != content
+        ):
+            raise StateError("existing run state changed during write")
+        _verify_existing_run_mutation(mutation, expected_state_bytes=content)
+        raw_owner = _decode_exact_json_object(mutation._owner_bytes)
+        snapshot = _snapshot_from_payloads(mutation.record.name, raw_owner, payload)
+        object.__setattr__(mutation, "_state_bytes", content)
+        object.__setattr__(mutation, "_snapshot", snapshot)
+        object.__setattr__(mutation, "_record", snapshot.record)
+        return payload
+    except BaseException as exc:
+        if published and not _restore_existing_run_state(mutation, mutation._state_bytes):
+            raise StateError("cannot restore existing run ledger after failed write") from exc
+        if isinstance(exc, OSError):
+            raise StateError("cannot durably write existing run ledger") from None
+        raise
+    finally:
+        if temporary_fd is not None:
+            _close_noerror(temporary_fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=mutation._run_fd)
+            except OSError:
+                pass
+
+
+def _restore_existing_run_state(mutation: ExistingRunMutation, content: bytes) -> bool:
+    """Best-effort visible rollback when a post-publication durability check fails."""
+    temporary = f".state-rollback-{uuid.uuid4().hex}"
+    temporary_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        temporary_fd = os.open(temporary, flags, 0o600, dir_fd=mutation._run_fd)
+        os.fchmod(temporary_fd, 0o600)
+        _write_all(temporary_fd, content)
+        try:
+            os.fsync(temporary_fd)
+        except OSError:
+            pass
+        os.replace(temporary, "state.json", src_dir_fd=mutation._run_fd, dst_dir_fd=mutation._run_fd)
+        temporary = ""
+        try:
+            os.fsync(mutation._run_fd)
+        except OSError:
+            pass
+        return _read_exact_private_file(mutation._run_fd, "state.json") == content
+    except BaseException:
+        return False
+    finally:
+        if temporary_fd is not None:
+            _close_noerror(temporary_fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=mutation._run_fd)
+            except OSError:
+                pass
+
+
+def _validate_pinned_tree_contents(directory_fd: int) -> None:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError:
+        raise StateError("cannot securely delete existing run") from None
+    for name in names:
+        if not isinstance(name, str) or name in {".", ".."} or "/" in name or "\x00" in name:
+            raise StateError("cannot securely delete existing run")
+        entry = _safe_stat(name, directory_fd=directory_fd)
+        if entry is None:
+            raise StateError("existing run changed during deletion")
+        if stat_module.S_ISDIR(entry.st_mode):
+            child_fd = _open_readonly_no_follow(name, directory_fd=directory_fd, directory=True)
+            if child_fd is None:
+                raise StateError("cannot securely delete existing run")
+            try:
+                opened = _safe_fstat(child_fd)
+                if opened is None or _identity(opened) != _identity(entry):
+                    raise StateError("existing run changed during deletion")
+                _validate_pinned_tree_contents(child_fd)
+            finally:
+                _close_noerror(child_fd)
+        elif stat_module.S_ISREG(entry.st_mode) or stat_module.S_ISLNK(entry.st_mode):
+            continue
+        else:
+            raise StateError("existing run contains an unsupported filesystem entry")
+
+
+def _restore_renamed_entry(directory_fd: int, tombstone: str, name: str) -> None:
+    if _safe_stat(name, directory_fd=directory_fd) is not None:
+        return
+    try:
+        os.rename(tombstone, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    except OSError:
+        pass
+
+
+def _open_run_deletions_directory(roots: StatePaths, *, canonical_state: Path | None = None) -> int:
+    state_root = roots.state.resolve() if canonical_state is None else canonical_state
+    state_fd = _open_readonly_no_follow(state_root, directory=True)
+    if state_fd is None:
+        raise StateError("cannot securely open run deletion quarantine")
+    deletions_fd: int | None = None
+    try:
+        state_open = _safe_fstat(state_fd)
+        state_path = _safe_stat(state_root)
+        if (
+            state_open is None
+            or state_path is None
+            or not stat_module.S_ISDIR(state_open.st_mode)
+            or not stat_module.S_ISDIR(state_path.st_mode)
+            or _identity(state_open) != _identity(state_path)
+        ):
+            raise StateError("cannot securely open run deletion quarantine")
+        entry = _safe_stat("run-deletions", directory_fd=state_fd)
+        if entry is None:
+            try:
+                os.mkdir("run-deletions", 0o700, dir_fd=state_fd)
+                os.fsync(state_fd)
+            except OSError:
+                raise StateError("cannot create run deletion quarantine") from None
+            entry = _safe_stat("run-deletions", directory_fd=state_fd)
+        deletions_fd = _open_readonly_no_follow("run-deletions", directory_fd=state_fd, directory=True)
+        opened = None if deletions_fd is None else _safe_fstat(deletions_fd)
+        if (
+            entry is None
+            or deletions_fd is None
+            or opened is None
+            or not stat_module.S_ISDIR(entry.st_mode)
+            or not stat_module.S_ISDIR(opened.st_mode)
+            or entry.st_uid != os.geteuid()
+            or opened.st_uid != os.geteuid()
+            or _identity(entry) != _identity(opened)
+        ):
+            raise StateError("cannot securely open run deletion quarantine")
+        try:
+            os.fchmod(deletions_fd, 0o700)
+        except OSError:
+            raise StateError("cannot secure run deletion quarantine") from None
+        result = deletions_fd
+        deletions_fd = None
+        return result
+    finally:
+        if deletions_fd is not None:
+            _close_noerror(deletions_fd)
+        _close_noerror(state_fd)
+
+
+def _restore_quarantined_run(
+    runs_fd: int,
+    deletions_fd: int,
+    tombstone: str,
+    name: str,
+) -> None:
+    if _safe_stat(name, directory_fd=runs_fd) is not None:
+        return
+    try:
+        os.rename(tombstone, name, src_dir_fd=deletions_fd, dst_dir_fd=runs_fd)
+    except OSError:
+        return
+    for directory_fd in (deletions_fd, runs_fd):
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+
+
+def _retry_run_deletion_quarantines(roots: StatePaths) -> None:
+    """Best-effort cleanup for run trees whose logical deletion already committed."""
+    deletions_fd: int | None = None
+    try:
+        deletions_fd = _open_run_deletions_directory(roots)
+        names = sorted(os.listdir(deletions_fd))
+    except (OSError, StateError):
+        if deletions_fd is not None:
+            _close_noerror(deletions_fd)
+        return
+    try:
+        for name in names:
+            run_name, separator, nonce = name.rpartition("-")
+            if (
+                not separator
+                or _NAME_RE.fullmatch(run_name) is None
+                or len(nonce) != 32
+                or any(character not in "0123456789abcdef" for character in nonce)
+            ):
+                continue
+            try:
+                with _new_run_name_lock(roots, run_name):
+                    entry = _safe_stat(name, directory_fd=deletions_fd)
+                    if entry is None or not stat_module.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+                        continue
+                    run_fd = _open_readonly_no_follow(name, directory_fd=deletions_fd, directory=True)
+                    if run_fd is None:
+                        continue
+                    try:
+                        opened = _safe_fstat(run_fd)
+                        if opened is None or _identity(opened) != _identity(entry):
+                            continue
+                        _validate_pinned_tree_contents(run_fd)
+                        _remove_pinned_tree_contents(run_fd)
+                        os.fsync(run_fd)
+                    except (OSError, StateError):
+                        continue
+                    finally:
+                        _close_noerror(run_fd)
+                    current = _safe_stat(name, directory_fd=deletions_fd)
+                    if current is None or _identity(current) != _identity(entry):
+                        continue
+                    try:
+                        os.rmdir(name, dir_fd=deletions_fd)
+                        os.fsync(deletions_fd)
+                    except OSError:
+                        continue
+            except StateError:
+                continue
+    finally:
+        _close_noerror(deletions_fd)
+
+
+def _remove_pinned_tree_contents(directory_fd: int) -> None:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError:
+        raise StateError("cannot securely delete existing run") from None
+    for name in names:
+        entry = _safe_stat(name, directory_fd=directory_fd)
+        if entry is None:
+            raise StateError("existing run changed during deletion")
+        tombstone = f".deleting-{uuid.uuid4().hex}"
+        try:
+            os.rename(name, tombstone, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        except OSError:
+            raise StateError("cannot securely delete existing run") from None
+        moved = _safe_stat(tombstone, directory_fd=directory_fd)
+        if moved is None or _identity(moved) != _identity(entry):
+            _restore_renamed_entry(directory_fd, tombstone, name)
+            raise StateError("existing run changed during deletion")
+        if stat_module.S_ISDIR(entry.st_mode):
+            child_fd = _open_readonly_no_follow(tombstone, directory_fd=directory_fd, directory=True)
+            if child_fd is None:
+                _restore_renamed_entry(directory_fd, tombstone, name)
+                raise StateError("cannot securely delete existing run")
+            try:
+                opened = _safe_fstat(child_fd)
+                if opened is None or _identity(opened) != _identity(entry):
+                    raise StateError("existing run changed during deletion")
+                _remove_pinned_tree_contents(child_fd)
+                os.fsync(child_fd)
+            finally:
+                _close_noerror(child_fd)
+            try:
+                os.rmdir(tombstone, dir_fd=directory_fd)
+            except OSError:
+                raise StateError("cannot securely delete existing run") from None
+        elif stat_module.S_ISREG(entry.st_mode) or stat_module.S_ISLNK(entry.st_mode):
+            try:
+                os.unlink(tombstone, dir_fd=directory_fd)
+            except OSError:
+                raise StateError("cannot securely delete existing run") from None
+        else:
+            _restore_renamed_entry(directory_fd, tombstone, name)
+            raise StateError("existing run contains an unsupported filesystem entry")
+
+
+def _delete_existing_run_tree(mutation: ExistingRunMutation) -> None:
+    mutation.verify_binding()
+    _validate_pinned_tree_contents(mutation._run_fd)
+    mutation.verify_binding()
+    tombstone = f"{mutation.paths.name}-{uuid.uuid4().hex}"
+    deletions_fd = _open_run_deletions_directory(
+        mutation._roots,
+        canonical_state=mutation.paths.root.parent.parent,
+    )
+    try:
+        try:
+            os.rename(
+                mutation.paths.name,
+                tombstone,
+                src_dir_fd=mutation._runs_fd,
+                dst_dir_fd=deletions_fd,
+            )
+        except OSError:
+            raise StateError("cannot quarantine existing run for deletion") from None
+        quarantined = _safe_stat(tombstone, directory_fd=deletions_fd)
+        pinned = _safe_fstat(mutation._run_fd)
+        if (
+            quarantined is None
+            or pinned is None
+            or _identity(quarantined) != mutation._run_identity
+            or _identity(pinned) != mutation._run_identity
+        ):
+            _restore_quarantined_run(
+                mutation._runs_fd,
+                deletions_fd,
+                tombstone,
+                mutation.paths.name,
+            )
+            raise StateError("existing run changed during deletion")
+        try:
+            os.fsync(deletions_fd)
+            os.fsync(mutation._runs_fd)
+        except OSError:
+            _restore_quarantined_run(
+                mutation._runs_fd,
+                deletions_fd,
+                tombstone,
+                mutation.paths.name,
+            )
+            raise StateError("cannot durably quarantine existing run for deletion") from None
+        _remove_pinned_tree_contents(mutation._run_fd)
+        try:
+            os.fsync(mutation._run_fd)
+        except OSError:
+            raise StateError("cannot durably delete existing run") from None
+        current = _safe_stat(tombstone, directory_fd=deletions_fd)
+        pinned = _safe_fstat(mutation._run_fd)
+        if (
+            current is None
+            or pinned is None
+            or _identity(current) != mutation._run_identity
+            or _identity(pinned) != mutation._run_identity
+        ):
+            raise StateError("existing run changed during deletion")
+        try:
+            os.rmdir(tombstone, dir_fd=deletions_fd)
+            os.fsync(deletions_fd)
+        except OSError:
+            raise StateError("cannot durably delete existing run") from None
+        object.__setattr__(mutation, "_deleted", True)
+    finally:
+        _close_noerror(deletions_fd)
+
+
+@contextmanager
+def locked_existing_run(
+    roots: StatePaths,
+    name: str,
+    *,
+    expected: ExistingRunRecord | None = None,
+) -> Iterator[ExistingRunMutation]:
+    """Lock first, then pin and re-read one existing run mutation authority."""
+    paths = _new_run_paths(roots, name)
+    with _new_run_name_lock(roots, name) as name_lock:
+        runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+        if runs_fd is None:
+            raise StateError("cannot securely open existing runs")
+        run_fd: int | None = None
+        try:
+            runs_open = _safe_fstat(runs_fd)
+            runs_path = _safe_stat(roots.runs)
+            entry = _safe_stat(name, directory_fd=runs_fd)
+            run_fd = _open_readonly_no_follow(name, directory_fd=runs_fd, directory=True)
+            run_open = None if run_fd is None else _safe_fstat(run_fd)
+            if (
+                runs_open is None
+                or runs_path is None
+                or entry is None
+                or run_fd is None
+                or run_open is None
+                or not stat_module.S_ISDIR(runs_open.st_mode)
+                or not stat_module.S_ISDIR(runs_path.st_mode)
+                or not stat_module.S_ISDIR(entry.st_mode)
+                or not stat_module.S_ISDIR(run_open.st_mode)
+                or _identity(runs_open) != _identity(runs_path)
+                or _identity(entry) != _identity(run_open)
+            ):
+                raise StateError("cannot securely open existing run")
+            owner_bytes = _read_exact_private_file(run_fd, "owner.json")
+            state_bytes = _read_exact_private_file(run_fd, "state.json")
+            raw_owner = _decode_exact_json_object(owner_bytes)
+            raw_state = _decode_exact_json_object(state_bytes)
+            snapshot = _snapshot_from_payloads(name, raw_owner, raw_state)
+            if expected is not None and snapshot.record != expected:
+                raise StateError("run ledger changed before lifecycle mutation")
+            mutation = ExistingRunMutation(
+                roots,
+                paths,
+                snapshot,
+                owner_bytes,
+                state_bytes,
+                runs_fd,
+                run_fd,
+                name_lock,
+                _identity(runs_open),
+                _identity(run_open),
+            )
+            mutation.verify_binding()
+            yield mutation
+        finally:
+            if run_fd is not None:
+                _close_noerror(run_fd)
+            _close_noerror(runs_fd)
+
+
 def run_entry_present_or_ambiguous(roots: StatePaths, name: str) -> bool:
     """Return false only when a run entry is securely proven absent.
 
@@ -1591,6 +2352,24 @@ def _snapshot_from_payloads(
     if not isinstance(frozen, Mapping):
         raise StateError("invalid run ledger")
     return RunLedgerSnapshot(record, frozen)
+
+
+def snapshot_from_runtime_observation(
+    expected: ExistingRunRecord,
+    observed_state: Mapping[str, Any],
+) -> RunLedgerSnapshot:
+    """Validate an adapter's in-memory observation against immutable run identity."""
+    if not isinstance(expected, ExistingRunRecord) or not isinstance(observed_state, Mapping):
+        raise StateError("invalid runtime observation")
+    owner = {
+        "schema_version": 1,
+        "run_id": expected.run_id,
+        "name": expected.name,
+    }
+    snapshot = _snapshot_from_payloads(expected.name, owner, deepcopy(dict(observed_state)))
+    if snapshot.record != expected:
+        raise StateError("runtime observation changed durable identity")
+    return snapshot
 
 
 def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:

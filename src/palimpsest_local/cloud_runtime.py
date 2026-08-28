@@ -667,15 +667,24 @@ def start(
     """Start an owned stopped KVM run without recreating its root or named volumes."""
 
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner_rec, current = _validate_run_ledger(rpaths)
-    with state.locked(rpaths):
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend
+            not in {
+                RuntimeBackend.KVM,
+                RuntimeBackend.LIBVIRT_HVF,
+            }
+        ):
+            raise StateError("run is not managed by the cloud runtime")
+        rpaths = mutation.paths
+        current = mutation.mutable_state()
         if current.get("status") == "running":
             return current
         if current.get("status") != "stopped":
             raise LifecycleError(f"run '{name}' cannot be started from status {current.get('status')!r}")
+        if profile is not None and profile.backend != mutation.record.dispatch_key.backend.value:
+            raise StateError("run profile does not match durable backend")
         resolved_profile = profile if profile is not None else _resolve_ledger_profile(current)
         resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
         conn_obj = _get_conn(conn, resolved_uri)
@@ -683,15 +692,16 @@ def start(
             domain = conn_obj.lookupByName(name)
         except Exception as exc:
             raise LifecycleError(f"owned libvirt domain '{name}' is missing") from exc
-        if domain is None or kvm.get_domain_run_id(domain) != owner_rec.run_id:
+        if domain is None or kvm.get_domain_run_id(domain) != mutation.record.run_id:
             raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
-        _write_state(rpaths, status="starting", data={**current, "updated_at": state.utc_now_iso()})
+        legacy = mutation.is_legacy
+        if not legacy:
+            current = mutation.write_state("starting", {**current, "updated_at": state.utc_now_iso()})
         try:
             # A stopped domain reuses its serial log.  Remove the previous boot's
             # sentinel so readiness can only be satisfied by this boot's
             # palimpsest-ready.service.
-            rpaths.console.write_text("", encoding="utf-8")
-            rpaths.console.chmod(0o600)
+            mutation.write_file("console.log", b"")
             if resolved_profile.network_mode == "user-hostfwd":
                 ssh_port = platforms.allocate_local_port()
                 xml_str = domain.XMLDesc()
@@ -704,12 +714,14 @@ def start(
                 if replacements != 1:
                     raise LifecycleError(f"domain '{name}' has no Palimpsest SSH host-forward rule")
                 try:
+                    mutation.verify_binding()
                     domain = conn_obj.defineXML(updated_xml)
                 except Exception as exc:
                     raise LifecycleError(f"failed to update SSH host-forward rule for domain '{name}'") from exc
-                if domain is None or kvm.get_domain_run_id(domain) != owner_rec.run_id:
+                if domain is None or kvm.get_domain_run_id(domain) != mutation.record.run_id:
                     raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
                 ssh_endpoint: dict[str, Any] = {"host": "127.0.0.1", "port": ssh_port}
+            mutation.verify_binding()
             domain.create()
             require_ip = current.get("network") != "none" and resolved_profile.network_mode != "user-hostfwd"
             guest_ip = _wait_for_readiness(rpaths, domain, timeout_seconds=timeout_seconds, require_ip=require_ip)
@@ -720,24 +732,32 @@ def start(
                 known_hosts_entry = guest.build_known_hosts_entry(
                     ssh_endpoint["host"], guest_host_pub, port=ssh_endpoint["port"]
                 )
-                rpaths.known_hosts.write_text(known_hosts_entry, encoding="utf-8")
-                rpaths.known_hosts.chmod(0o600)
-            return _write_state(
-                rpaths,
-                status="running",
-                data={**current, "guest_ip": guest_ip, "ssh": ssh_endpoint, "updated_at": state.utc_now_iso()},
+                mutation.write_file("ssh/known_hosts", known_hosts_entry.encode("utf-8"))
+            mutation.verify_binding()
+            final_domain = conn_obj.lookupByName(name)
+            if final_domain is None or kvm.get_domain_run_id(final_domain) != mutation.record.run_id:
+                raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
+            return mutation.write_state(
+                "running",
+                {**current, "guest_ip": guest_ip, "ssh": ssh_endpoint, "updated_at": state.utc_now_iso()},
             )
-        except Exception as exc:
+        except BaseException as exc:
             try:
                 if hasattr(domain, "isActive") and domain.isActive() and hasattr(domain, "destroy"):
                     domain.destroy()
-            except Exception:
+            except BaseException:
                 pass
-            _write_state(
-                rpaths,
-                status="failed",
-                data={**current, "error": str(exc), "updated_at": state.utc_now_iso()},
-            )
+            if not legacy:
+                try:
+                    current = mutation.mutable_state()
+                    mutation.write_state(
+                        "failed",
+                        {**current, "error": str(exc), "updated_at": state.utc_now_iso()},
+                    )
+                except BaseException:
+                    pass
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError)):
                 raise
             raise LifecycleError(f"start failed: {exc}") from exc
@@ -1004,15 +1024,22 @@ def stop(
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner_rec, curr_state = _validate_run_ledger(rpaths)
-
-    with state.locked(rpaths):
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend
+            not in {
+                RuntimeBackend.KVM,
+                RuntimeBackend.LIBVIRT_HVF,
+            }
+        ):
+            raise StateError("run is not managed by the cloud runtime")
+        curr_state = mutation.mutable_state()
         if curr_state.get("status") in ("stopped", "removed"):
             return curr_state
 
+        if profile is not None and profile.backend != mutation.record.dispatch_key.backend.value:
+            raise StateError("run profile does not match durable backend")
         resolved_profile = profile if profile is not None else _resolve_ledger_profile(curr_state)
         resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
         conn_obj = _get_conn(conn, resolved_uri)
@@ -1021,40 +1048,59 @@ def stop(
         if conn_obj is not None:
             try:
                 domain = conn_obj.lookupByName(name)
-            except Exception:
+            except Exception as exc:
+                if not _is_missing_domain_error(exc):
+                    raise LifecycleError(f"cannot inspect libvirt domain '{name}' before stop") from None
                 domain = None
 
-        if domain is not None:
-            domain_run_id = kvm.get_domain_run_id(domain)
-            if domain_run_id != owner_rec.run_id:
-                raise LifecycleError(
-                    f"domain '{name}' is foreign (domain run_id {domain_run_id!r} != owner run_id {owner_rec.run_id!r})"
-                )
+        if domain is None:
+            if mutation.is_legacy:
+                return {**curr_state, "status": "stopped", "updated_at": state.utc_now_iso()}
+            return mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
 
-            is_active = True
-            if hasattr(domain, "isActive"):
-                is_active = domain.isActive()
+        domain_run_id = kvm.get_domain_run_id(domain)
+        if domain_run_id != mutation.record.run_id:
+            raise LifecycleError(
+                f"domain '{name}' is foreign (domain run_id {domain_run_id!r} != owner run_id {mutation.record.run_id!r})"
+            )
 
-            if is_active:
-                _write_state(rpaths, status="stopping", data={**curr_state, "updated_at": state.utc_now_iso()})
-                if hasattr(domain, "shutdown"):
-                    try:
-                        domain.shutdown()
-                    except Exception:
-                        pass
+        is_active = True
+        if hasattr(domain, "isActive"):
+            is_active = domain.isActive()
+        if not is_active and mutation.is_legacy:
+            return {**curr_state, "status": "stopped", "updated_at": state.utc_now_iso()}
 
-                start_t = time.monotonic()
-                while time.monotonic() - start_t < timeout_seconds:
-                    if hasattr(domain, "isActive") and not domain.isActive():
-                        break
-                    time.sleep(0.5)
+        if is_active:
+            if not mutation.is_legacy:
+                curr_state = mutation.write_state("stopping", {**curr_state, "updated_at": state.utc_now_iso()})
+            mutation.verify_binding()
+            if hasattr(domain, "shutdown"):
+                try:
+                    domain.shutdown()
+                except Exception:
+                    pass
 
-                if hasattr(domain, "isActive") and domain.isActive():
-                    if hasattr(domain, "destroy"):
-                        domain.destroy()
+            start_t = time.monotonic()
+            while time.monotonic() - start_t < timeout_seconds:
+                if hasattr(domain, "isActive") and not domain.isActive():
+                    break
+                time.sleep(0.5)
 
-        updated = _write_state(rpaths, status="stopped", data={**curr_state, "updated_at": state.utc_now_iso()})
-        return updated
+            if hasattr(domain, "isActive") and domain.isActive():
+                if hasattr(domain, "destroy"):
+                    mutation.verify_binding()
+                    domain.destroy()
+            if hasattr(domain, "isActive") and domain.isActive():
+                raise LifecycleError(f"domain '{name}' did not stop")
+
+        mutation.verify_binding()
+        try:
+            final_domain = conn_obj.lookupByName(name)
+        except Exception as exc:
+            raise LifecycleError(f"owned libvirt domain '{name}' disappeared during stop") from exc
+        if final_domain is None or kvm.get_domain_run_id(final_domain) != mutation.record.run_id:
+            raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
+        return mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
 
 
 def rm(
@@ -1068,12 +1114,20 @@ def rm(
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner_rec, curr_state = _validate_run_ledger(rpaths)
-
-    with state.locked(rpaths):
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend
+            not in {
+                RuntimeBackend.KVM,
+                RuntimeBackend.LIBVIRT_HVF,
+            }
+        ):
+            raise StateError("run is not managed by the cloud runtime")
+        curr_state = mutation.mutable_state()
+        original_status = curr_state.get("status")
+        if profile is not None and profile.backend != mutation.record.dispatch_key.backend.value:
+            raise StateError("run profile does not match durable backend")
         resolved_profile = profile if profile is not None else _resolve_ledger_profile(curr_state)
         resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
         conn_obj = _get_conn(conn, resolved_uri)
@@ -1082,28 +1136,35 @@ def rm(
         if conn_obj is not None:
             try:
                 domain = conn_obj.lookupByName(name)
-            except Exception:
+            except Exception as exc:
+                if not _is_missing_domain_error(exc):
+                    raise LifecycleError(f"cannot inspect libvirt domain '{name}' before removal") from None
                 domain = None
 
         if domain is not None:
             domain_run_id = kvm.get_domain_run_id(domain)
-            if domain_run_id != owner_rec.run_id:
+            if domain_run_id != mutation.record.run_id:
                 raise LifecycleError(
-                    f"domain '{name}' is foreign (domain run_id {domain_run_id!r} != owner run_id {owner_rec.run_id!r})"
+                    f"domain '{name}' is foreign (domain run_id {domain_run_id!r} != owner run_id {mutation.record.run_id!r})"
                 )
 
+            mutation.verify_binding()
             _destroy_and_undefine_domain(domain)
+            try:
+                remaining = conn_obj.lookupByName(name)
+            except Exception as exc:
+                if not _is_missing_domain_error(exc):
+                    raise LifecycleError(f"cannot verify removal of libvirt domain '{name}'") from exc
+                remaining = None
+            if remaining is not None:
+                raise LifecycleError(f"domain '{name}' was not removed")
 
         if not volumes:
-            updated = _write_state(rpaths, status="removed", data={**curr_state, "updated_at": state.utc_now_iso()})
-            return updated
+            if domain is None and original_status == "removed":
+                return curr_state
+            return mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
         updated = {**curr_state, "status": "removed", "updated_at": state.utc_now_iso()}
-        if rpaths.root.exists():
-            shutil.rmtree(rpaths.root)
-        if rpaths.root.exists():
-            raise LifecycleError(f"failed to remove run volume directory for '{name}'")
-        if rpaths.lock.exists():
-            rpaths.lock.unlink(missing_ok=True)
+        mutation.delete_run_tree()
         return updated
 
 
@@ -1126,16 +1187,11 @@ def reconcile_run(
         RuntimeBackend.LIBVIRT_HVF,
     }:
         raise StateError("run is not managed by the cloud runtime")
-    rpaths = state.run_paths(roots, name)
     exact_uri = _RECONCILE_URIS[expected.dispatch_key.backend]
     if profile is not None and profile.backend != expected.dispatch_key.backend.value:
         raise StateError("run profile does not match durable backend")
     if kvm_uri is not None and kvm_uri != exact_uri:
         raise StateError("run URI does not match durable backend")
-    # Preserve the adapter-entry guard before acquiring the lifecycle lock;
-    # dispatcher-bound callers must not touch even Palimpsest lock state after
-    # a cooperative ledger replacement.
-    state.require_bound_run_dispatch_record(roots, expected)
 
     def mutable_state(snapshot: state.RunLedgerSnapshot) -> dict[str, Any]:
         def thaw(value: Any) -> Any:
@@ -1159,31 +1215,14 @@ def reconcile_run(
             "warnings": warnings,
         }
 
-    before_connection = state.read_run_ledger_snapshot(roots, name)
-    if before_connection.record != expected:
-        raise StateError("run ledger changed during cloud reconciliation")
-    before_state = mutable_state(before_connection)
-    if before_state.get("backend", platforms.BACKEND_KVM) != expected.dispatch_key.backend.value:
-        raise StateError("run ledger changed during cloud reconciliation")
-    try:
-        conn_obj = _get_conn(conn, exact_uri)
-    except LifecycleError:
-        if _expected_record is None and conn is None and kvm_uri is None and profile is None:
-            current = state.read_run_ledger_snapshot(roots, name)
-            if current.record != expected:
-                raise StateError("run ledger changed during cloud reconciliation") from None
-            return result_from(current, [])
-        raise
+    def result_from_state(
+        snapshot: state.RunLedgerSnapshot, observed: dict[str, Any], warnings: list[str]
+    ) -> dict[str, Any]:
+        result = result_from(snapshot, warnings)
+        result["state"] = observed
+        return result
 
-    with state.locked(rpaths):
-        snapshot = state.read_run_ledger_snapshot(roots, name)
-        if snapshot.record != expected:
-            raise StateError("run ledger changed during cloud reconciliation")
-        st_data = mutable_state(snapshot)
-        run_backend = st_data.get("backend", platforms.BACKEND_KVM)
-        if run_backend != expected.dispatch_key.backend.value:
-            raise StateError("run ledger changed during cloud reconciliation")
-
+    def observe(st_data: dict[str, Any], conn_obj: Any) -> tuple[str, list[str]]:
         status = st_data["status"]
         warnings: list[str] = []
         try:
@@ -1193,10 +1232,7 @@ def reconcile_run(
                 raise LifecycleError("cannot inspect libvirt domain during reconciliation") from None
             if status in {"running", "starting"}:
                 status = "stopped"
-                st_data = {**st_data, "status": status, "updated_at": state.utc_now_iso()}
                 warnings.append("libvirt domain is missing")
-                state.require_bound_run_dispatch_record(roots, expected)
-                _write_state(rpaths, status=status, data=st_data)
         else:
             domain_run_id = kvm.get_domain_run_id(domain)
             if domain_run_id != expected.run_id:
@@ -1209,14 +1245,39 @@ def reconcile_run(
                 desired_status = "stopped"
             if desired_status != status:
                 status = desired_status
-                st_data = {**st_data, "status": status, "updated_at": state.utc_now_iso()}
-                state.require_bound_run_dispatch_record(roots, expected)
-                _write_state(rpaths, status=status, data=st_data)
+        return status, warnings
 
-        current = state.read_run_ledger_snapshot(roots, name)
-        if current.record != expected:
-            raise StateError("run ledger changed during cloud reconciliation")
-        return result_from(current, warnings)
+    initial = state.read_run_ledger_snapshot(roots, name)
+    if initial.record != expected:
+        raise StateError("run ledger changed during cloud reconciliation")
+    initial_state = mutable_state(initial)
+    if initial_state.get("backend", platforms.BACKEND_KVM) != expected.dispatch_key.backend.value:
+        raise StateError("run ledger changed during cloud reconciliation")
+    try:
+        conn_obj = _get_conn(conn, exact_uri)
+    except LifecycleError:
+        if _expected_record is None and conn is None and kvm_uri is None and profile is None:
+            return result_from(initial, [])
+        raise
+    observed_status, warnings = observe(initial_state, conn_obj)
+    after_observe = state.read_run_ledger_snapshot(roots, name)
+    if after_observe.record != expected:
+        raise StateError("run ledger changed during cloud reconciliation")
+    if observed_status == initial_state.get("status"):
+        return result_from(initial, warnings)
+    observed = {**initial_state, "status": observed_status, "updated_at": state.utc_now_iso()}
+    if expected.state_schema_version == 1:
+        return result_from_state(initial, observed, warnings)
+
+    with state.locked_existing_run(roots, name, expected=expected) as mutation:
+        current_state = mutation.mutable_state()
+        current_status, current_warnings = observe(current_state, conn_obj)
+        if current_status != current_state.get("status"):
+            mutation.write_state(
+                current_status,
+                {**current_state, "updated_at": state.utc_now_iso()},
+            )
+        return result_from(mutation.snapshot, current_warnings)
 
 
 def reconcile(
@@ -1265,6 +1326,7 @@ def reconcile(
             continue
 
         status = st_data.get("status", "unknown")
+        durable_status = status
 
         if run_backend in _LIBVIRT_BACKENDS and conn_obj is not None:
             try:
@@ -1277,10 +1339,6 @@ def reconcile(
                     st_data["status"] = status
                     st_data["updated_at"] = state.utc_now_iso()
                     warnings.append(f"run '{name}': domain missing from libvirt")
-                    try:
-                        _write_state(rpaths, status=status, data=st_data)
-                    except Exception:
-                        pass
             else:
                 domain_run_id = kvm.get_domain_run_id(domain)
                 if domain_run_id != owner_rec.run_id:
@@ -1293,18 +1351,30 @@ def reconcile(
                     status = "running"
                     st_data["status"] = status
                     st_data["updated_at"] = state.utc_now_iso()
-                    try:
-                        _write_state(rpaths, status=status, data=st_data)
-                    except Exception:
-                        pass
                 elif not is_active and status in ("running", "starting"):
                     status = "stopped"
                     st_data["status"] = status
                     st_data["updated_at"] = state.utc_now_iso()
-                    try:
-                        _write_state(rpaths, status=status, data=st_data)
-                    except Exception:
-                        pass
+
+        if st_data.get("schema_version", 1) == 2 and status != durable_status and conn_obj is not None:
+            try:
+                expected = state.read_run_dispatch_record(roots, name)
+                if expected.run_id != owner_rec.run_id:
+                    raise StateError("run ledger changed during cloud reconciliation")
+                reconciled = reconcile_run(
+                    name,
+                    roots=roots,
+                    conn=conn_obj,
+                    profile=profile,
+                    _expected_record=expected,
+                )
+                reconciled_state = reconciled.get("state")
+                if not isinstance(reconciled_state, Mapping):
+                    raise StateError("cloud reconciliation returned no state")
+                st_data = dict(reconciled_state)
+                status = st_data["status"]
+            except Exception:
+                pass
 
         runs.append(
             {

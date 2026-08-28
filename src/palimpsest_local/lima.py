@@ -441,29 +441,10 @@ def reconcile_run(
         or expected.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
     ):
         raise StateError("run is not managed by the Lima runtime")
-    state.require_bound_run_dispatch_record(roots, expected)
-    rpaths = state.run_paths(roots, name)
-    initial = state.read_run_ledger_snapshot(roots, name)
-    initial_record = _require_lima_snapshot(initial, expected)
 
-    # The first backend query is a preflight before any lifecycle lock or
-    # ledger write. Its failures and foreign markers leave durable state
-    # untouched; the authoritative live observation is repeated under lock.
-    preflight_instance = _instance_info_or_none(name)
-    if preflight_instance is not None:
-        _instance_runtime_status(preflight_instance)
-        _require_owned_instance(preflight_instance, expected.run_id, name)
-        if initial_record.get("status") in {"removed", "failed"}:
-            raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
-    after_query = state.read_run_ledger_snapshot(roots, name)
-    _require_lima_snapshot(after_query, expected)
-
-    with state.locked(rpaths):
-        current = state.read_run_ledger_snapshot(roots, name)
-        record = _require_lima_snapshot(current, expected)
-        # Re-observe under the lifecycle lock. The preflight proves the tool
-        # and marker shape are usable without creating lock state on failure;
-        # only this fresh observation is eligible to update the ledger.
+    def observe(record: dict[str, Any]) -> str:
+        if record.get("backend") != _BACKEND:
+            raise StateError("run is not a Lima-managed macOS VM")
         instance = _instance_info_or_none(name)
         if instance is None:
             reconciled = "removed"
@@ -473,16 +454,32 @@ def reconcile_run(
             if record.get("status") in {"removed", "failed"}:
                 raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
             reconciled = live
+        return reconciled
+
+    initial = state.read_run_ledger_snapshot(roots, name)
+    if initial.record != expected:
+        raise StateError("run ledger changed during Lima reconciliation")
+    initial_record = _mutable_snapshot_state(initial)
+    reconciled = observe(initial_record)
+    after_observe = state.read_run_ledger_snapshot(roots, name)
+    if after_observe.record != expected:
+        raise StateError("run ledger changed during Lima reconciliation")
+    if reconciled == initial_record.get("status"):
+        return _reconcile_result(initial)
+    if expected.state_schema_version == 1:
+        result = _reconcile_result(initial)
+        result["state"] = {**initial_record, "status": reconciled, "updated_at": state.utc_now_iso()}
+        return result
+
+    with state.locked_existing_run(roots, name, expected=expected) as mutation:
+        record = mutation.mutable_state()
+        reconciled = observe(record)
         if reconciled != record.get("status"):
-            state.require_bound_run_dispatch_record(roots, expected)
-            _write_state(
-                rpaths,
+            mutation.write_state(
                 reconciled,
                 {**record, "updated_at": state.utc_now_iso()},
             )
-        post = state.read_run_ledger_snapshot(roots, name)
-        _require_lima_snapshot(post, expected)
-        return _reconcile_result(post)
+        return _reconcile_result(mutation.snapshot)
 
 
 def inspect_run(
@@ -788,20 +785,39 @@ def stop(
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner = state.read_owner_record(rpaths)
-    inspected = inspect_run(name, roots=roots)
-    record = inspected["state"]
-    if record.get("status") == "stopped":
-        return record
-    instance = _instance_info_or_none(name)
-    if instance is None:
-        raise StateError(f"owned Lima instance is missing: {name}")
-    _require_owned_instance(instance, owner.run_id, name)
-    _require_success(_run_command(["limactl", "stop", "--force", name], timeout_seconds=60), "stop")
-    return _write_state(rpaths, "stopped", {**record, "updated_at": state.utc_now_iso()})
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+        ):
+            raise StateError("run is not managed by the Lima runtime")
+        record = mutation.mutable_state()
+        instance = _instance_info_or_none(name)
+        if instance is None:
+            if not mutation.is_legacy and record.get("status") != "removed":
+                mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+            raise StateError(f"owned Lima instance is missing: {name}")
+        _require_owned_instance(instance, mutation.record.run_id, name)
+        live_status = _instance_runtime_status(instance)
+        if record.get("status") in {"failed", "removed"}:
+            raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
+        if live_status == "stopped":
+            if record.get("status") == "stopped":
+                return record
+            if mutation.is_legacy:
+                return {**record, "status": "stopped", "updated_at": state.utc_now_iso()}
+            return mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
+        if not mutation.is_legacy and live_status != record.get("status"):
+            record = mutation.write_state(live_status, {**record, "updated_at": state.utc_now_iso()})
+        mutation.verify_binding()
+        _require_success(_run_command(["limactl", "stop", "--force", name], timeout_seconds=60), "stop")
+        final_instance = _instance_info_or_none(name)
+        if final_instance is None:
+            raise StateError(f"owned Lima instance is missing after stop: {name}")
+        _require_owned_instance(final_instance, mutation.record.run_id, name)
+        if _instance_runtime_status(final_instance) != "stopped":
+            raise LifecycleError(f"Lima instance '{name}' did not stop")
+        return mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
 
 
 def start(
@@ -814,56 +830,98 @@ def start(
     """Start an owned stopped Lima VM and restore its runtime SquashFS mounts."""
 
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner = state.read_owner_record(rpaths)
-    inspected = inspect_run(name, roots=roots)
-    record = inspected["state"]
-    instance = _instance_info_or_none(name)
-    if instance is None:
-        raise StateError(f"owned Lima instance is missing: {name}")
-    _require_owned_instance(instance, owner.run_id, name)
-    _require_existing_disk_config_safe(instance, record, name)
-    if record.get("status") == "running":
-        return record
-    if record.get("status") != "stopped":
-        raise LifecycleError(f"Lima run '{name}' cannot be started from status {record.get('status')!r}")
-    _write_state(rpaths, "starting", {**record, "updated_at": state.utc_now_iso()})
-    try:
-        result = _run_command(
-            ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", name],
-            timeout_seconds=timeout_seconds + 30,
-        )
-        _require_success(result, "start")
-        instance = _instance_info(name)
-        _require_owned_instance(instance, owner.run_id, name)
-        if instance.get("status") != "Running":
-            raise LifecycleError(f"Lima instance '{name}' did not reach Running state")
-        layers = tuple(
-            LayerRef(
-                digest=item["digest"],
-                media_type="application/vnd.afterglow.palimpsest.layer.squashfs.v1",
-                local_path=Path(item["local_path"]),
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+        ):
+            raise StateError("run is not managed by the Lima runtime")
+        rpaths = mutation.paths
+        record = mutation.mutable_state()
+        instance = _instance_info_or_none(name)
+        if instance is None:
+            if not mutation.is_legacy and record.get("status") != "removed":
+                mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+            raise StateError(f"owned Lima instance is missing: {name}")
+        _require_owned_instance(instance, mutation.record.run_id, name)
+        live_status = _instance_runtime_status(instance)
+        if record.get("status") in {"failed", "removed"}:
+            raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
+        _require_existing_disk_config_safe(instance, record, name)
+        if live_status == "running":
+            if record.get("status") == "running":
+                return record
+            if mutation.is_legacy:
+                return {**record, "status": "running", "updated_at": state.utc_now_iso()}
+            return mutation.write_state("running", {**record, "updated_at": state.utc_now_iso()})
+        if live_status not in {"stopped", "running"}:
+            if not mutation.is_legacy and live_status != record.get("status"):
+                mutation.write_state(live_status, {**record, "updated_at": state.utc_now_iso()})
+            raise LifecycleError(f"Lima run '{name}' cannot be started from status {live_status!r}")
+        if record.get("status") not in {"stopped", "running"}:
+            raise LifecycleError(f"Lima run '{name}' cannot be started from status {record.get('status')!r}")
+        legacy = mutation.is_legacy
+        start_attempted = False
+        if not legacy:
+            record = mutation.write_state("starting", {**record, "updated_at": state.utc_now_iso()})
+        try:
+            mutation.verify_binding()
+            start_attempted = True
+            result = _run_command(
+                ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", name],
+                timeout_seconds=timeout_seconds + 30,
             )
-            for item in record.get("layers", [])
-        )
-        _attach_layers(name, layers, console_log=rpaths.console)
-        guest_ip = _guest_ipv4(name)
-        return _write_state(
-            rpaths,
-            "running",
-            {**record, "guest_ip": guest_ip, "updated_at": state.utc_now_iso()},
-        )
-    except Exception as exc:
-        _write_state(
-            rpaths,
-            "failed",
-            {**record, "error": str(exc), "updated_at": state.utc_now_iso()},
-        )
-        if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError)):
-            raise
-        raise LifecycleError(f"Lima start failed: {exc}") from exc
+            _require_success(result, "start")
+            instance = _instance_info(name)
+            _require_owned_instance(instance, mutation.record.run_id, name)
+            if instance.get("status") != "Running":
+                raise LifecycleError(f"Lima instance '{name}' did not reach Running state")
+            layers = tuple(
+                LayerRef(
+                    digest=item["digest"],
+                    media_type="application/vnd.afterglow.palimpsest.layer.squashfs.v1",
+                    local_path=Path(item["local_path"]),
+                )
+                for item in record.get("layers", [])
+            )
+            _attach_layers(name, layers, console_log=rpaths.console, mutation=mutation)
+            mutation.verify_binding()
+            guest_ip = _guest_ipv4(name)
+            final_instance = _instance_info(name)
+            _require_owned_instance(final_instance, mutation.record.run_id, name)
+            if final_instance.get("status") != "Running":
+                raise LifecycleError(f"Lima instance '{name}' did not remain Running")
+            return mutation.write_state(
+                "running",
+                {**record, "guest_ip": guest_ip, "updated_at": state.utc_now_iso()},
+            )
+        except BaseException as exc:
+            if start_attempted:
+                try:
+                    cleanup_instance = _instance_info_or_none(name)
+                    if cleanup_instance is not None:
+                        _require_owned_instance(cleanup_instance, mutation.record.run_id, name)
+                        if _instance_runtime_status(cleanup_instance) != "stopped":
+                            _require_success(
+                                _run_command(["limactl", "stop", "--force", name], timeout_seconds=60),
+                                "rollback start",
+                            )
+                except BaseException:
+                    pass
+            if not legacy:
+                try:
+                    record = mutation.mutable_state()
+                    mutation.write_state(
+                        "failed",
+                        {**record, "error": str(exc), "updated_at": state.utc_now_iso()},
+                    )
+                except BaseException:
+                    pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError)):
+                raise
+            raise LifecycleError(f"Lima start failed: {exc}") from exc
 
 
 def rm(
@@ -874,29 +932,42 @@ def rm(
     _expected_record: ExistingRunRecord | None = None,
 ) -> dict[str, Any]:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    if _expected_record is not None:
-        state.require_bound_run_dispatch_record(roots, _expected_record)
-    rpaths = state.run_paths(roots, name)
-    owner = state.read_owner_record(rpaths)
-    record = state.read_run_state(rpaths)
-    if record.get("backend") != _BACKEND:
-        raise StateError(f"run '{name}' is not a Lima-managed macOS VM")
-    instance = _instance_info_or_none(name)
-    if instance is not None:
-        _require_owned_instance(instance, owner.run_id, name)
-        _require_success(_run_command(["limactl", "delete", "--force", name], timeout_seconds=60), "delete")
-    if not volumes:
-        return _write_state(rpaths, "removed", {**record, "updated_at": state.utc_now_iso()})
-    shutil.rmtree(rpaths.root)
-    return {**record, "status": "removed"}
+    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+        if (
+            mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+        ):
+            raise StateError("run is not managed by the Lima runtime")
+        record = mutation.mutable_state()
+        instance = _instance_info_or_none(name)
+        if instance is not None:
+            _require_owned_instance(instance, mutation.record.run_id, name)
+            mutation.verify_binding()
+            _require_success(_run_command(["limactl", "delete", "--force", name], timeout_seconds=60), "delete")
+            remaining = _instance_info_or_none(name)
+            if remaining is not None:
+                raise LifecycleError(f"Lima instance '{name}' was not deleted")
+        if not volumes:
+            if instance is None and record.get("status") == "removed":
+                return record
+            return mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+        result = {**record, "status": "removed", "updated_at": state.utc_now_iso()}
+        mutation.delete_run_tree()
+        return result
 
 
-def _append_console(console_log: Path, result: subprocess.CompletedProcess[str]) -> None:
+def _append_console(
+    console_log: Path,
+    result: subprocess.CompletedProcess[str],
+    *,
+    mutation: state.ExistingRunMutation | None = None,
+) -> None:
+    content = (result.stdout or "") + (result.stderr or "")
+    if mutation is not None:
+        mutation.append_file("console.log", content.encode("utf-8"))
+        return
     with console_log.open("a", encoding="utf-8") as output:
-        if result.stdout:
-            output.write(result.stdout)
-        if result.stderr:
-            output.write(result.stderr)
+        output.write(content)
 
 
 def _guest_command(
@@ -906,48 +977,89 @@ def _guest_command(
     console_log: Path,
     action: str,
     timeout_seconds: float = _TIMEOUT_SECONDS,
+    mutation: state.ExistingRunMutation | None = None,
 ) -> None:
+    if mutation is not None:
+        mutation.verify_binding()
     result = _run_command(["limactl", "shell", name, *argv], timeout_seconds=timeout_seconds)
-    _append_console(console_log, result)
+    _append_console(console_log, result, mutation=mutation)
     _require_success(result, action)
 
 
-def _copy_to_guest(name: str, sources: list[Path], target_dir: str, *, console_log: Path) -> None:
+def _copy_to_guest(
+    name: str,
+    sources: list[Path],
+    target_dir: str,
+    *,
+    console_log: Path,
+    mutation: state.ExistingRunMutation | None = None,
+) -> None:
+    if mutation is not None:
+        mutation.verify_binding()
     result = _run_command(
         ["limactl", "copy", "--backend=scp", *(str(source) for source in sources), f"{name}:{target_dir}"],
         timeout_seconds=_TIMEOUT_SECONDS,
     )
-    _append_console(console_log, result)
+    _append_console(console_log, result, mutation=mutation)
     _require_success(result, "copy files to guest")
 
 
-def _copy_from_guest(name: str, source: str, target: Path, *, console_log: Path) -> None:
+def _copy_from_guest(
+    name: str,
+    source: str,
+    target: Path,
+    *,
+    console_log: Path,
+    mutation: state.ExistingRunMutation | None = None,
+) -> None:
+    if mutation is not None:
+        mutation.verify_binding()
     result = _run_command(
         ["limactl", "copy", "--backend=scp", f"{name}:{source}", str(target)],
         timeout_seconds=_TIMEOUT_SECONDS,
     )
-    _append_console(console_log, result)
+    _append_console(console_log, result, mutation=mutation)
     _require_success(result, "retrieve guest file")
 
 
-def _attach_layers(name: str, layers: tuple[LayerRef, ...], *, console_log: Path) -> None:
+def _attach_layers(
+    name: str,
+    layers: tuple[LayerRef, ...],
+    *,
+    console_log: Path,
+    mutation: state.ExistingRunMutation | None = None,
+) -> None:
     _guest_command(
         name,
         ["sudo", "install", "-d", "-m", "0700", "/mnt/palimpsest", "/opt/layers/upper", "/opt/layers/work"],
         console_log=console_log,
         action="prepare layer mounts",
+        mutation=mutation,
     )
     _guest_command(
         name,
         ["sudo", "install", "-d", "-m", "0755", "/opt/layers", "/opt/layers/merged"],
         console_log=console_log,
         action="prepare merged layer mount",
+        mutation=mutation,
     )
     if not layers:
         return
     guest_dir = "/tmp/palimpsest-layers/"
-    _guest_command(name, ["mkdir", "-p", guest_dir], console_log=console_log, action="prepare layer input")
-    _copy_to_guest(name, [layer.local_path for layer in layers], guest_dir, console_log=console_log)
+    _guest_command(
+        name,
+        ["mkdir", "-p", guest_dir],
+        console_log=console_log,
+        action="prepare layer input",
+        mutation=mutation,
+    )
+    _copy_to_guest(
+        name,
+        [layer.local_path for layer in layers],
+        guest_dir,
+        console_log=console_log,
+        mutation=mutation,
+    )
     mounts: list[str] = []
     for index, layer in enumerate(layers):
         mount_path = f"/mnt/palimpsest/lower{index}"
@@ -957,12 +1069,14 @@ def _attach_layers(name: str, layers: tuple[LayerRef, ...], *, console_log: Path
             ["sudo", "install", "-d", "-m", "0700", mount_path],
             console_log=console_log,
             action="prepare layer mount",
+            mutation=mutation,
         )
         _guest_command(
             name,
             ["sudo", "mount", "-t", "squashfs", "-o", "loop,ro", f"{guest_dir}{layer.local_path.name}", mount_path],
             console_log=console_log,
             action="mount layer",
+            mutation=mutation,
         )
     _guest_command(
         name,
@@ -978,6 +1092,7 @@ def _attach_layers(name: str, layers: tuple[LayerRef, ...], *, console_log: Path
         ],
         console_log=console_log,
         action="activate layers",
+        mutation=mutation,
     )
 
     _guest_command(
@@ -985,6 +1100,7 @@ def _attach_layers(name: str, layers: tuple[LayerRef, ...], *, console_log: Path
         ["sudo", "chmod", "0755", "/opt/layers/merged"],
         console_log=console_log,
         action="make merged layers readable",
+        mutation=mutation,
     )
 
 

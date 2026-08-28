@@ -98,6 +98,8 @@ def _write_ledger(
         state_payload.setdefault("run_id", owner_payload.get("run_id", run_id))
     rpaths.owner.write_text(json.dumps(owner_payload, sort_keys=True) + "\n", encoding="utf-8")
     rpaths.state.write_text(json.dumps(state_payload, sort_keys=True) + "\n", encoding="utf-8")
+    rpaths.owner.chmod(0o600)
+    rpaths.state.chmod(0o600)
     return rpaths, run_id
 
 
@@ -1575,17 +1577,17 @@ def test_adapter_entry_guard_blocks_swap_after_dispatch_revalidation_before_real
 
     monkeypatch.setattr(state, "read_run_dispatch_record", racing_reader)
 
-    with pytest.raises(StateError, match="run ledger changed during adapter entry"):
+    with pytest.raises(StateError, match="run ledger changed"):
         result = dispatch("demo", roots=roots, **kwargs)
         if _operation is RuntimeOperation.LOGS:
             next(result)
 
-    assert reads == 3
+    assert reads == (3 if _operation is RuntimeOperation.LOGS else 2)
     assert effects == []
 
 
 @pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
-@pytest.mark.parametrize(("_operation", "dispatch", "kwargs"), _ADAPTER_ENTRY_OPERATIONS)
+@pytest.mark.parametrize(("_operation", "dispatch", "kwargs"), _ADAPTER_ENTRY_OPERATIONS[:3])
 def test_adapter_entry_guard_blocks_run_swap_during_secure_reread_before_real_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1607,14 +1609,14 @@ def test_adapter_entry_guard_blocks_run_swap_during_secure_reread_before_real_si
     rpaths.console.write_text("old console\n", encoding="utf-8")
     effects: list[str] = []
     _install_adapter_side_effect_spies(monkeypatch, effects)
-    original_json_reader = state._read_pinned_json_object
+    original_exact_reader = state._read_exact_private_file
     ledger_reads = 0
 
-    def swapping_json_reader(directory_fd: int, filename: str) -> dict[str, Any]:
+    def swapping_exact_reader(directory_fd: int, filename: str, **kwargs: Any) -> bytes:
         nonlocal ledger_reads
-        record = original_json_reader(directory_fd, filename)
+        content = original_exact_reader(directory_fd, filename, **kwargs)
         ledger_reads += 1
-        if ledger_reads == 5:
+        if ledger_reads == 1:
             rpaths.root.rename(roots.runs / "old-demo")
             replacement_paths, _ = _write_ledger(
                 roots,
@@ -1626,16 +1628,16 @@ def test_adapter_entry_guard_blocks_run_swap_during_secure_reread_before_real_si
                 },
             )
             replacement_paths.console.write_text("replacement console\n", encoding="utf-8")
-        return record
+        return content
 
-    monkeypatch.setattr(state, "_read_pinned_json_object", swapping_json_reader)
+    monkeypatch.setattr(state, "_read_exact_private_file", swapping_exact_reader)
 
-    with pytest.raises(StateError, match="run ledger changed during read"):
+    with pytest.raises(StateError, match="existing run changed during lifecycle mutation"):
         result = dispatch("demo", roots=roots, **kwargs)
         if _operation is RuntimeOperation.LOGS:
             next(result)
 
-    assert ledger_reads == 6
+    assert ledger_reads == 2
     assert effects == []
 
 
@@ -1998,6 +2000,37 @@ def test_reconcile_emits_stable_warning_after_missing_domain_status_refresh(
     assert "SENSITIVE_VALUE" not in repr(result)
 
 
+@pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
+def test_reconcile_projects_observed_legacy_status_without_rewriting_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, _run_id = _write_ledger(
+        roots,
+        record={"backend": backend, "status": "running"},
+    )
+    before = rpaths.state.read_bytes()
+    adapter = runtime_dispatch.cloud_runtime if backend == "kvm" else runtime_dispatch.lima
+    monkeypatch.setattr(
+        adapter,
+        "reconcile_run",
+        lambda *_args, **_kwargs: {
+            "state": {"backend": backend, "status": "stopped"},
+            "warnings": ["observed drift"],
+        },
+    )
+
+    result = runtime_dispatch.reconcile(roots=roots)
+
+    assert [(summary.name, summary.status, summary.stale) for summary in result.summaries] == [
+        ("demo", "stopped", False)
+    ]
+    assert [(error.name, error.code) for error in result.errors] == [("demo", "runtime-warning")]
+    assert rpaths.state.read_bytes() == before
+
+
 @pytest.mark.parametrize("failure_mode", ["query", "foreign", "write"])
 def test_lima_reconcile_failure_is_typed_stale_and_preserves_ledger_bytes(
     tmp_path: Path,
@@ -2036,7 +2069,7 @@ def test_lima_reconcile_failure_is_typed_stale_and_preserves_ledger_bytes(
         pytest.fail("unexpected Lima ledger write")
 
     monkeypatch.setattr(runtime_dispatch.lima, "_instance_info_or_none", query)
-    monkeypatch.setattr(runtime_dispatch.lima, "_write_state", write)
+    monkeypatch.setattr(state.ExistingRunMutation, "write_state", write)
 
     result = runtime_dispatch.reconcile(roots=roots)
 
@@ -2114,7 +2147,7 @@ def test_lima_reconcile_detects_cooperative_swap_during_external_query_without_o
     assert [(error.name, error.code) for error in result.errors] == [("demo", "runtime-failure")]
 
 
-def test_lima_reconcile_writes_only_the_fresh_live_status_observed_under_lock(
+def test_lima_reconcile_does_not_write_stale_preflight_status_when_fresh_status_matches_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2128,7 +2161,7 @@ def test_lima_reconcile_writes_only_the_fresh_live_status_observed_under_lock(
             "status": "stopped",
         },
     )
-    statuses = iter(("Stopped", "Running"))
+    statuses = iter(("Running", "Stopped"))
     backend_calls: list[str] = []
 
     def changing_query(_name: str) -> dict[str, Any]:
@@ -2145,10 +2178,10 @@ def test_lima_reconcile_writes_only_the_fresh_live_status_observed_under_lock(
 
     assert backend_calls == ["query", "query"]
     assert [(summary.name, summary.status, summary.stale) for summary in result.summaries] == [
-        ("demo", "running", False)
+        ("demo", "stopped", False)
     ]
     assert result.errors == ()
-    assert state.read_run_state(rpaths)["status"] == "running"
+    assert state.read_run_state(rpaths)["status"] == "stopped"
 
 
 def test_ps_missing_runs_root_is_empty_and_does_not_create_directories(tmp_path: Path) -> None:

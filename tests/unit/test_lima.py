@@ -29,6 +29,24 @@ def _spec(tmp_path: Path) -> RunSpec:
     return RunSpec(name="mac-prototype", stack=StackRef(ImageRef(digest, "raw", "aarch64", "ubuntu", image), ()))
 
 
+def _legacy_lima_lifecycle(
+    roots: state.StatePaths,
+    name: str,
+    status: str,
+) -> tuple[state.RunPaths, state.OwnerRecord]:
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rpaths.console.write_text("old log\n", encoding="utf-8")
+    rpaths.console.chmod(0o600)
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status=status,
+        data={"backend": "lima-vz", "layers": [], "volumes": [], "guest_ip": None},
+    )
+    return rpaths, owner
+
+
 def test_lima_config_is_native_arm64_with_vznat(tmp_path: Path):
     config = lima._lima_config(_spec(tmp_path))
     assert "vmType: vz" in config
@@ -135,9 +153,10 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
     calls: list[list[str]] = []
     list_calls = 0
     run_id: str | None = None
+    instance_status = "Running"
 
     def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
-        nonlocal list_calls, run_id
+        nonlocal instance_status, list_calls, run_id
         calls.append(argv)
         if argv[:2] == ["limactl", "create"]:
             config = Path(argv[-1]).read_text(encoding="utf-8")
@@ -150,12 +169,16 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
                 return subprocess.CompletedProcess(argv, 0, "[]", "")
             instance = {
                 "name": "mac-prototype",
-                "status": "Running",
+                "status": instance_status,
                 "sshLocalPort": 61234,
                 "sshConfigFile": "/tmp/lima-ssh",
                 "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        if argv[:2] == ["limactl", "stop"]:
+            instance_status = "Stopped"
+        if argv[:2] == ["limactl", "start"]:
+            instance_status = "Running"
         if argv[:3] == ["limactl", "shell", "mac-prototype"]:
             return subprocess.CompletedProcess(
                 argv, 0, "2: eth0    inet 192.168.64.12/24 brd 192.168.64.255 scope global eth0\n", ""
@@ -194,6 +217,394 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
         "uname",
         "-m",
     ]
+
+
+def test_legacy_lima_start_promotes_only_after_backend_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "legacy-lima-start", "stopped")
+    live_status = "Stopped"
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        nonlocal live_status
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instance = {
+                "name": "legacy-lima-start",
+                "status": live_status,
+                "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        if argv[:2] == ["limactl", "start"]:
+            live_status = "Running"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["limactl", "shell", "legacy-lima-start"] and "addr" in argv:
+            return subprocess.CompletedProcess(argv, 0, "2: eth0 inet 192.168.64.9/24 scope global eth0\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    result = lima.start("legacy-lima-start", roots=roots)
+
+    assert {key: result[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "lima-vz",
+        "name": "legacy-lima-start",
+        "run_id": owner.run_id,
+        "status": "running",
+    }
+    assert state.read_run_state(rpaths) == result
+
+
+def test_legacy_lima_start_and_stop_failures_preserve_exact_state_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    start_paths, start_owner = _legacy_lima_lifecycle(roots, "legacy-lima-start-fail", "stopped")
+    stop_paths, stop_owner = _legacy_lima_lifecycle(roots, "legacy-lima-stop-fail", "running")
+    before_start = start_paths.state.read_bytes()
+    before_stop = stop_paths.state.read_bytes()
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            requested = "legacy-lima-start-fail" if "legacy-lima-start-fail" in argv[-1] else None
+            instances = [
+                {
+                    "name": "legacy-lima-start-fail",
+                    "status": "Stopped",
+                    "config": {"env": {"PALIMPSEST_RUN_ID": start_owner.run_id}},
+                },
+                {
+                    "name": "legacy-lima-stop-fail",
+                    "status": "Running",
+                    "config": {"env": {"PALIMPSEST_RUN_ID": stop_owner.run_id}},
+                },
+            ]
+            assert requested is None
+            return subprocess.CompletedProcess(argv, 0, json.dumps(instances), "")
+        if argv[:2] in (["limactl", "start"], ["limactl", "stop"]):
+            return subprocess.CompletedProcess(argv, 1, "", "backend failed")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(LifecycleError, match="backend failed"):
+        lima.start("legacy-lima-start-fail", roots=roots)
+    with pytest.raises(LifecycleError, match="backend failed"):
+        lima.stop("legacy-lima-stop-fail", roots=roots)
+
+    assert start_paths.state.read_bytes() == before_start
+    assert stop_paths.state.read_bytes() == before_stop
+
+
+def test_legacy_lima_stop_success_promotes_and_reconcile_discovery_does_not_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    stop_paths, stop_owner = _legacy_lima_lifecycle(roots, "legacy-lima-stop", "running")
+    discovery_paths, discovery_owner = _legacy_lima_lifecycle(roots, "legacy-lima-discovery", "stopped")
+    discovery_before = discovery_paths.state.read_bytes()
+    statuses = {"legacy-lima-stop": "Running", "legacy-lima-discovery": "Running"}
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instances = [
+                {
+                    "name": name,
+                    "status": live,
+                    "config": {
+                        "env": {
+                            "PALIMPSEST_RUN_ID": stop_owner.run_id
+                            if name == "legacy-lima-stop"
+                            else discovery_owner.run_id
+                        }
+                    },
+                }
+                for name, live in statuses.items()
+            ]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(instances), "")
+        if argv[:2] == ["limactl", "stop"]:
+            statuses[argv[-1]] = "Stopped"
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    stopped = lima.stop("legacy-lima-stop", roots=roots)
+    discovered = lima.reconcile_run("legacy-lima-discovery", roots=roots)
+
+    assert stopped["schema_version"] == 2
+    assert stopped["status"] == "stopped"
+    assert discovered["state"]["status"] == "running"
+    assert discovery_paths.state.read_bytes() == discovery_before
+    assert state.read_run_state(stop_paths)["run_id"] == stop_owner.run_id
+
+
+@pytest.mark.parametrize("ledger_status", ["failed", "removed"])
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_lima_lifecycle_rejects_ambiguous_terminal_ledger_with_live_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_status: str,
+    operation: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    name = f"lima-{operation}-{ledger_status}"
+    rpaths, owner = _legacy_lima_lifecycle(roots, name, ledger_status)
+    before = rpaths.state.read_bytes()
+    backend_calls: list[list[str]] = []
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instance = {
+                "name": name,
+                "status": "Running",
+                "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        backend_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(StateError, match="foreign or ambiguous"):
+        getattr(lima, operation)(name, roots=roots)
+
+    assert backend_calls == []
+    assert rpaths.state.read_bytes() == before
+
+
+def test_legacy_lima_start_rejects_live_intermediate_without_backend_or_state_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "legacy-lima-starting", "stopped")
+    before = rpaths.state.read_bytes()
+    backend_calls: list[list[str]] = []
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instance = {
+                "name": "legacy-lima-starting",
+                "status": "Starting",
+                "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        backend_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(LifecycleError, match="cannot be started from status 'starting'"):
+        lima.start("legacy-lima-starting", roots=roots)
+
+    assert backend_calls == []
+    assert rpaths.state.read_bytes() == before
+
+
+def test_lima_v2_start_records_live_intermediate_before_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "v2-lima-starting", "stopped")
+    state.write_run_state(
+        rpaths,
+        status="stopped",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "layers": [],
+            "volumes": [],
+        },
+    )
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        instance = {
+            "name": rpaths.name,
+            "status": "Starting",
+            "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(LifecycleError, match="cannot be started from status 'starting'"):
+        lima.start(rpaths.name, roots=roots)
+
+    assert state.read_run_state(rpaths)["status"] == "starting"
+
+
+def test_lima_v2_stop_records_live_running_before_backend_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "v2-lima-stop-failure", "stopped")
+    state.write_run_state(
+        rpaths,
+        status="stopped",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "layers": [],
+            "volumes": [],
+        },
+    )
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instance = {
+                "name": rpaths.name,
+                "status": "Running",
+                "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        return subprocess.CompletedProcess(argv, 1, "", "stop failed")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(LifecycleError, match="stop failed"):
+        lima.stop(rpaths.name, roots=roots)
+
+    assert state.read_run_state(rpaths)["status"] == "running"
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_lima_v2_missing_instance_records_removed_before_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, f"v2-lima-missing-{operation}", "stopped")
+    state.write_run_state(
+        rpaths,
+        status="stopped",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "layers": [],
+            "volumes": [],
+        },
+    )
+    monkeypatch.setattr(
+        lima,
+        "_run_command",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "[]", ""),
+    )
+
+    with pytest.raises(StateError, match="owned Lima instance is missing"):
+        getattr(lima, operation)(rpaths.name, roots=roots)
+
+    assert state.read_run_state(rpaths)["status"] == "removed"
+
+
+def test_legacy_lima_start_keyboard_interrupt_stops_owned_backend_and_preserves_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "legacy-lima-interrupt", "stopped")
+    before = rpaths.state.read_bytes()
+    live_status = "Stopped"
+    stop_called = False
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        nonlocal live_status, stop_called
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instance = {
+                "name": rpaths.name,
+                "status": live_status,
+                "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
+        if argv[:2] == ["limactl", "start"]:
+            live_status = "Running"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:2] == ["limactl", "stop"]:
+            stop_called = True
+            live_status = "Stopped"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["limactl", "shell", rpaths.name]:
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(KeyboardInterrupt):
+        lima.start(rpaths.name, roots=roots)
+
+    assert stop_called is True
+    assert live_status == "Stopped"
+    assert rpaths.state.read_bytes() == before
+
+
+def test_legacy_lima_plain_rm_noop_preserves_removed_state_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner = _legacy_lima_lifecycle(roots, "legacy-lima-rm-noop", "removed")
+    before = rpaths.state.read_bytes()
+    monkeypatch.setattr(
+        lima,
+        "_run_command",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "[]", ""),
+    )
+
+    removed = lima.rm("legacy-lima-rm-noop", roots=roots)
+
+    assert removed["status"] == "removed"
+    assert removed.get("schema_version") is None
+    assert rpaths.state.read_bytes() == before
+
+
+def test_lima_rm_volumes_cleans_up_exact_owned_failed_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner = _legacy_lima_lifecycle(roots, "failed-lima-cleanup", "failed")
+    present = True
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        nonlocal present
+        if argv[:3] == ["limactl", "list", "--format"]:
+            instances = []
+            if present:
+                instances.append(
+                    {
+                        "name": rpaths.name,
+                        "status": "Running",
+                        "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+                    }
+                )
+            return subprocess.CompletedProcess(argv, 0, json.dumps(instances), "")
+        if argv[:2] == ["limactl", "delete"]:
+            present = False
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    removed = lima.rm(rpaths.name, roots=roots, volumes=True)
+
+    assert removed["status"] == "removed"
+    assert present is False
+    assert not rpaths.root.exists()
 
 
 def test_lima_create_failure_holds_exact_v2_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

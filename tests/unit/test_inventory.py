@@ -522,7 +522,7 @@ def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch:
 
     def mock_reconcile_run(name, *, _expected_record, **_kwargs):
         captured_backends.append(_expected_record.dispatch_key.backend.value)
-        return {}
+        return {"state": state.read_run_state(state.run_paths(roots, name)), "warnings": []}
 
     monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
@@ -580,7 +580,7 @@ def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkey
         captured_backends.append(backend)
         if backend == "libvirt-hvf":
             raise RuntimeError("sensitive backend failure")
-        return {}
+        return {"state": state.read_run_state(state.run_paths(roots, name)), "warnings": []}
 
     monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
