@@ -40,7 +40,7 @@ from palimpsest_local.errors import (
     LifecycleError,
     StateError,
 )
-from palimpsest_local.refs import ImageRef, LayerRef, RunSpec, StackRef
+from palimpsest_local.refs import ImageRef, LayerRef, PortForward, RunSpec, StackRef
 
 
 class FakeDomain:
@@ -204,7 +204,15 @@ def test_start_serial_builder_writes_ledger_and_serial_channel(tmp_path: Path, m
     assert result["status"] == "running"
     assert readiness == [False]
     rpaths = state.run_paths(roots, spec.name)
-    assert state.read_run_state(rpaths)["status"] == "running"
+    owner = state.read_owner_record(rpaths)
+    assert state.read_run_state(rpaths) == result
+    assert {key: result[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": spec.name,
+        "run_id": owner.run_id,
+    }
     xml = conn.domains[spec.name].xml_content
     assert 'name="org.qemu.guest_agent.0"' not in xml
     assert 'source mode="bind"' in xml
@@ -323,7 +331,7 @@ def test_run_status_transitions_and_completion():
                 return MagicMock(stdout="", stderr="", returncode=0)
             elif argv[0] == "cloud-localds":
                 Path(argv[1]).touch()
-                rpaths.console.write_text("PALIMPSEST_READY=1\n")
+                Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
                 return MagicMock(stdout="", stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
@@ -345,6 +353,8 @@ def test_run_status_transitions_and_completion():
             assert res["name"] == spec.name
             assert res["run_id"] == r_owner.run_id
             assert res["backend"] == "kvm"
+            assert res["schema_version"] == 2
+            assert res["runtime_kind"] == "cloud-image"
 
             # Check ps output
             ps_runs = ps(roots=roots, conn=conn)
@@ -447,8 +457,147 @@ def test_start_rollback_on_failure():
 
             rpaths = state.run_paths(roots, "rollback-run")
             st = state.read_run_state(rpaths)
-            assert st["status"] == "failed"
+            owner = state.read_owner_record(rpaths)
+            assert {
+                key: st[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+            } == {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": "kvm",
+                "name": spec.name,
+                "run_id": owner.run_id,
+                "status": "failed",
+            }
             assert "rollback-run" not in conn.domains or conn.domains["rollback-run"].undefined
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch"),
+    [(platforms.BACKEND_KVM, "x86_64"), (platforms.BACKEND_HVF, "aarch64")],
+)
+def test_new_cloud_backend_failure_holds_exact_v2_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    arch: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / f"base-{backend}.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name=f"failed-{arch.replace('_', '-')}",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", arch, None, base), ()),
+    )
+    profile = (
+        platforms.resolve_domain_profile(platforms.BACKEND_KVM, arch)
+        if backend == platforms.BACKEND_KVM
+        else _hvf_test_profile(tmp_path)
+    )
+    overlay_calls = 0
+
+    def fail_overlay(_base: ImageRef, _output: Path) -> None:
+        nonlocal overlay_calls
+        overlay_calls += 1
+        rpaths = state.run_paths(roots, spec.name)
+        assert _output.parent != rpaths.root
+        assert _output.parent.parent == roots.state
+        owner = state.read_owner_record(rpaths)
+        creating = state.read_run_state(rpaths)
+        assert {
+            key: creating[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+        } == {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "name": spec.name,
+            "run_id": owner.run_id,
+            "status": "creating",
+        }
+        raise LifecycleError("backend exploded")
+
+    monkeypatch.setattr(runtime, "create_and_validate_overlay", fail_overlay)
+
+    with pytest.raises(LifecycleError, match="backend exploded"):
+        run(spec, roots=roots, conn=FakeLibvirtConn(), profile=profile)
+
+    rpaths = state.run_paths(roots, spec.name)
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert {key: failed[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": backend,
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "failed",
+    }
+    with pytest.raises(StateError, match="already exists"):
+        run(spec, roots=roots, conn=FakeLibvirtConn(), profile=profile)
+    assert overlay_calls == 1
+    assert list(roots.state.glob(".run-create-*")) == []
+
+
+def test_serial_builder_failure_holds_exact_v2_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / "serial-base.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name="failed-serial",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", "x86_64", None, base), ()),
+        network="none",
+    )
+
+    def fail_overlay(_base: ImageRef, _output: Path) -> None:
+        rpaths = state.run_paths(roots, spec.name)
+        assert _output.parent != rpaths.root
+        assert _output.parent.parent == roots.state
+        owner = state.read_owner_record(rpaths)
+        creating = state.read_run_state(rpaths)
+        assert {
+            key: creating[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+        } == {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": spec.name,
+            "run_id": owner.run_id,
+            "status": "creating",
+        }
+        raise LifecycleError("serial backend exploded")
+
+    monkeypatch.setattr(runtime, "create_and_validate_overlay", fail_overlay)
+
+    with pytest.raises(LifecycleError, match="serial backend exploded"):
+        start_serial_builder(spec, user_data="#cloud-config\n", roots=roots, conn=FakeLibvirtConn())
+
+    rpaths = state.run_paths(roots, spec.name)
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert {key: failed[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "failed",
+    }
+    assert list(roots.state.glob(".run-create-*")) == []
+
+
+def test_cloud_pre_reservation_failure_creates_no_run_entry(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / "base.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name="invalid-before-reserve",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", "x86_64", None, base), ()),
+        ports=(PortForward("127.0.0.1", 18080, 80),),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="port forwarding is unavailable"):
+        run(spec, roots=roots, conn=FakeLibvirtConn())
+
+    assert not (roots.runs / spec.name).exists()
 
 
 def test_foreign_marker_refusal():
@@ -575,7 +724,6 @@ def test_network_omission():
         spec = RunSpec(name="no-net-run", stack=stack, network="none")
 
         conn = FakeLibvirtConn()
-        rpaths = state.run_paths(roots, "no-net-run")
 
         def fake_subprocess_run(argv, *args, **kwargs):
             if argv[0] == "qemu-img":
@@ -604,7 +752,7 @@ def test_network_omission():
                 return MagicMock(stdout="", stderr="", returncode=0)
             elif argv[0] == "cloud-localds":
                 Path(argv[1]).touch()
-                rpaths.console.write_text("PALIMPSEST_READY=1\n")
+                Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
                 return MagicMock(stdout="", stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
@@ -856,7 +1004,6 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
     spec = RunSpec(name="ledger-fields-run", stack=stack, memory_mib=2048, vcpus=4)
 
     conn = FakeLibvirtConn()
-    rpaths = state.run_paths(roots, "ledger-fields-run")
 
     def fake_subprocess_run(argv, *args, **kwargs):
         if argv[0] == "qemu-img":
@@ -880,7 +1027,7 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
             return MagicMock(stdout="", stderr="", returncode=0)
         elif argv[0] == "cloud-localds":
             Path(argv[1]).touch()
-            rpaths.console.write_text("PALIMPSEST_READY=1\n")
+            Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
             return MagicMock(stdout="", stderr="", returncode=0)
         return MagicMock(stdout="", stderr="", returncode=0)
 
@@ -973,7 +1120,15 @@ def test_run_user_hostfwd_allocates_port_and_writes_known_hosts_without_ip_disco
         res = run(spec, roots=roots, conn=conn, profile=hvf_profile)
 
     assert readiness == [False]
-    assert res["backend"] == platforms.BACKEND_HVF
+    owner = state.read_owner_record(rpaths)
+    assert {key: res[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": platforms.BACKEND_HVF,
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "running",
+    }
     assert res["guest_ip"] is None
     assert res["ssh"]["host"] == "127.0.0.1"
     assert 1 <= res["ssh"]["port"] <= 65535

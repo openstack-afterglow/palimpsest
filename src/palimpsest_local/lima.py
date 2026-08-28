@@ -20,7 +20,7 @@ from . import state
 from .digest import require_file_digest
 from .errors import ArtifactValidationError, BuildError, LifecycleError, StateError
 from .refs import BuildSpec, LayerRef, RunSpec, StackRef
-from .runtime_types import ExistingRunRecord, RuntimeBackend, RuntimeKind
+from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
 from .state import RunPaths, StatePaths
 
 _BACKEND = "lima-vz"
@@ -496,7 +496,15 @@ def inspect_run(
     return reconcile_run(name, roots=roots, _expected_record=_expected_record)
 
 
-def _write_state(rpaths: RunPaths, status: str, data: dict[str, Any]) -> dict[str, Any]:
+def _write_state(
+    rpaths: RunPaths,
+    status: str,
+    data: dict[str, Any],
+    *,
+    reservation: state.NewRunReservation | None = None,
+) -> dict[str, Any]:
+    if reservation is not None:
+        return reservation.write_state(status, data)
     return state.write_run_state(rpaths, status=status, data={**data, "status": status})
 
 
@@ -533,18 +541,6 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
         raise ArtifactValidationError(f"runtime input digest mismatch: {exc}") from exc
 
     roots = roots or state.init_roots()
-    rpaths = state.run_paths(roots, spec.name)
-    if rpaths.owner.exists() or rpaths.root.exists():
-        try:
-            if state.read_run_state(rpaths).get("status") == "removed":
-                raise StateError(
-                    f"run name '{spec.name}' is held by a removed run; free it with: palimpsest rm {spec.name} --volumes"
-                )
-        except StateError:
-            raise
-        except Exception:
-            pass
-        raise StateError(f"run name '{spec.name}' already exists")
     try:
         _instance_info(spec.name)
     except LifecycleError as exc:
@@ -552,21 +548,15 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
             raise
     else:
         raise StateError(f"a Lima instance named '{spec.name}' already exists and is not owned by this run")
-    rpaths.root.mkdir(parents=True, mode=0o700)
-    config_path = rpaths.root / _CONFIG_NAME
-    created_by_this_call = False
-
-    with state.locked(rpaths):
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ)
+    with state.reserve_new_run(roots, spec.name, dispatch_key) as reservation:
+        rpaths = reservation.paths
+        config_path = rpaths.root / _CONFIG_NAME
         try:
-            owner = state.write_owner_record(rpaths)
-            config_path.write_text(_lima_config(spec, run_id=owner.run_id), encoding="utf-8")
-            config_path.chmod(0o600)
+            owner = reservation.record
             record: dict[str, Any] = {
-                "name": spec.name,
-                "run_id": owner.run_id,
                 "created_at": state.utc_now_iso(),
                 "updated_at": state.utc_now_iso(),
-                "backend": _BACKEND,
                 "lima_instance": spec.name,
                 "base": {
                     "digest": spec.stack.base.digest,
@@ -608,14 +598,20 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 "guest_ip": None,
                 "cleanup_flags": {},
             }
-            _write_state(rpaths, "creating", record)
+            _write_state(rpaths, "creating", record, reservation=reservation)
+            reservation.write_file(_CONFIG_NAME, _lima_config(spec, run_id=owner.run_id).encode("utf-8"))
             created = _run_command(
                 ["limactl", "create", "--tty=false", "--name", spec.name, str(config_path)],
                 timeout_seconds=timeout_seconds,
             )
             _require_success(created, "create")
-            created_by_this_call = True
-            _write_state(rpaths, "defined", {**record, "updated_at": state.utc_now_iso()})
+            _write_state(
+                rpaths,
+                "defined",
+                {**record, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
+            reservation.verify_binding()
             started = _run_command(
                 ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", spec.name],
                 timeout_seconds=timeout_seconds + 30,
@@ -636,6 +632,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 # instance configuration could reformat after filesystem-label
                 # drift, so switch every such entry off while the VM is stopped
                 # and require a clean second boot before exposing success.
+                reservation.verify_binding()
                 _require_success(
                     _run_command(["limactl", "stop", "--force", spec.name], timeout_seconds=60),
                     "stop after first-use disk formatting",
@@ -646,6 +643,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                         f"select(.additionalDisks[{index}].name == {json.dumps(volume.backend_name)}) | "
                         f".additionalDisks[{index}].format = false"
                     )
+                    reservation.verify_binding()
                     _require_success(
                         _run_command(
                             ["limactl", "edit", spec.name, "--tty=false", "--set", expression],
@@ -660,8 +658,10 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                     spec,
                     volumes=tuple(replace(volume, format=False) for volume in spec.volumes),
                 )
-                config_path.write_text(_lima_config(safe_spec, run_id=owner.run_id), encoding="utf-8")
-                config_path.chmod(0o600)
+                reservation.write_file(
+                    _CONFIG_NAME,
+                    _lima_config(safe_spec, run_id=owner.run_id).encode("utf-8"),
+                )
                 restarted = _run_command(
                     ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", spec.name],
                     timeout_seconds=timeout_seconds + 30,
@@ -675,8 +675,12 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 config = instance.get("sshConfigFile")
                 if not isinstance(port, int) or not 1 <= port <= 65535 or not isinstance(config, str) or not config:
                     raise LifecycleError("Lima did not report usable SSH connection data after disk-safe restart")
-            rpaths.console.write_text("", encoding="utf-8")
+            reservation.write_file("console.log", b"")
+            # Guest command appenders use the visible path while the
+            # cooperative per-name create lock remains held.
+            reservation.verify_binding()
             _attach_layers(spec.name, spec.stack.layers, console_log=rpaths.console)
+            reservation.verify_binding()
             guest_ip = _guest_ipv4(spec.name)
             return _write_state(
                 rpaths,
@@ -689,17 +693,20 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                     "ssh_config_file": config,
                     "updated_at": state.utc_now_iso(),
                 },
+                reservation=reservation,
             )
-        except Exception as exc:
+        except BaseException as exc:
             try:
-                _write_state(rpaths, "failed", {"name": spec.name, "error": str(exc), "backend": _BACKEND})
-            except Exception:
+                reservation.write_failure({"error": str(exc), "updated_at": state.utc_now_iso()})
+            except BaseException:
                 pass
-            if created_by_this_call:
+            try:
                 cleanup_instance = _instance_info_or_none(spec.name)
                 if cleanup_instance is not None:
                     _require_owned_instance(cleanup_instance, owner.run_id, spec.name)
                     _run_command(["limactl", "delete", "--force", spec.name], timeout_seconds=60)
+            except BaseException:
+                pass
             raise
 
 

@@ -10,9 +10,11 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -27,10 +29,36 @@ from .errors import (
 )
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .refs import ImageRef, RunSpec
-from .runtime_types import ExistingRunRecord, RuntimeBackend, RuntimeKind
+from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
 from .state import OwnerRecord, RunPaths, StatePaths, TagRecord
 
 _logger = logging.getLogger(__name__)
+
+
+def _run_paths_for_root(root: Path, template: RunPaths) -> RunPaths:
+    """Build create-time paths below an isolated staging root."""
+    return RunPaths(
+        root=root,
+        owner=root / "owner.json",
+        state=root / "state.json",
+        overlay=root / "overlay.qcow2",
+        seed=root / "seed.iso",
+        console=root / "console.log",
+        ssh=root / "ssh",
+        identity=root / "ssh" / "id_ed25519",
+        identity_public=root / "ssh" / "id_ed25519.pub",
+        known_hosts=root / "ssh" / "known_hosts",
+        lock=template.lock,
+        name=template.name,
+    )
+
+
+@contextmanager
+def _staged_run_paths(roots: StatePaths, template: RunPaths) -> Iterator[RunPaths]:
+    with tempfile.TemporaryDirectory(prefix=".run-create-", dir=roots.state) as raw_root:
+        root = Path(raw_root)
+        root.chmod(0o700)
+        yield _run_paths_for_root(root, template)
 
 
 def _get_conn(conn: Any | None, kvm_uri: str) -> Any:
@@ -394,7 +422,15 @@ def _wait_for_readiness(rpaths: RunPaths, domain: Any, timeout_seconds: float, r
     return _discover_guest_ip(domain, timeout_seconds=remaining)
 
 
-def _write_state(rpaths: RunPaths, status: str, data: dict[str, Any]) -> dict[str, Any]:
+def _write_state(
+    rpaths: RunPaths,
+    status: str,
+    data: dict[str, Any],
+    *,
+    reservation: state.NewRunReservation | None = None,
+) -> dict[str, Any]:
+    if reservation is not None:
+        return reservation.write_state(status, data)
     payload = {**data, "status": status}
     return state.write_run_state(rpaths, status=status, data=payload)
 
@@ -415,20 +451,6 @@ def run(
             "use a routed libvirt network or run this project with the Lima backend"
         )
     roots = roots or state.init_roots()
-    rpaths = state.run_paths(roots, spec.name)
-
-    if rpaths.owner.exists() or rpaths.root.exists():
-        status = "unknown"
-        try:
-            st = state.read_run_state(rpaths)
-            status = st.get("status", "unknown")
-        except Exception:
-            pass
-        if status == "removed" or rpaths.root.exists():
-            raise StateError(
-                f"run name '{spec.name}' is held by a removed run; free it with: palimpsest rm {spec.name} --volumes"
-            )
-        raise StateError(f"run name '{spec.name}' already exists")
 
     for layer in spec.stack.layers:
         try:
@@ -456,18 +478,15 @@ def run(
         )
     volume_disks = _build_kvm_volume_disks(spec, layer_disks)
 
-    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    with state.locked(rpaths):
-        owner_rec = state.write_owner_record(rpaths)
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend(profile.backend))
+    with state.reserve_new_run(roots, spec.name, dispatch_key) as reservation:
+        rpaths = reservation.paths
+        owner_rec = reservation.record
         run_id = owner_rec.run_id
 
         init_data: dict[str, Any] = {
-            "name": spec.name,
-            "run_id": run_id,
             "created_at": state.utc_now_iso(),
             "updated_at": state.utc_now_iso(),
-            "backend": profile.backend,
             "memory_mib": spec.memory_mib,
             "vcpus": spec.vcpus,
             "base": {
@@ -511,11 +530,12 @@ def run(
             "cleanup_flags": {},
         }
 
-        _write_state(rpaths, status="creating", data=init_data)
         conn_obj = None
 
         try:
+            _write_state(rpaths, status="creating", data=init_data, reservation=reservation)
             # Preflight check: connect to libvirt and check if domain name is already taken
+            reservation.verify_binding()
             conn_obj = _get_conn(conn, kvm_uri)
             if hasattr(conn_obj, "lookupByName"):
                 existing_dom = None
@@ -526,16 +546,19 @@ def run(
                 if existing_dom is not None:
                     raise LifecycleError(f"a domain named '{spec.name}' already exists in libvirt")
 
-            rpaths.console.touch(mode=0o600)
-            create_and_validate_overlay(spec.stack.base, rpaths.overlay)
-            guest_host_key = _generate_ssh_keys(rpaths)
-            _generate_seed_iso(rpaths, run_id, spec, layer_disks, guest_host_key, profile)
-
             net_name = None if spec.network == "none" else spec.network
             ssh_host_port: int | None = None
             nvram_path: Path | None = None
-            if profile.network_mode == "user-hostfwd":
-                ssh_host_port, nvram_path = _prepare_user_hostfwd(rpaths, profile)
+            with _staged_run_paths(roots, rpaths) as staged:
+                staged.console.touch(mode=0o600)
+                create_and_validate_overlay(spec.stack.base, staged.overlay)
+                staged_guest_host_key = _generate_ssh_keys(staged)
+                _generate_seed_iso(staged, run_id, spec, layer_disks, staged_guest_host_key, profile)
+                if profile.network_mode == "user-hostfwd":
+                    ssh_host_port, staged_nvram = _prepare_user_hostfwd(staged, profile)
+                    nvram_path = rpaths.root / staged_nvram.name
+                reservation.publish_staging(staged.root)
+                guest_host_key = rpaths.root / staged_guest_host_key.name
 
             domain_spec = kvm.DomainSpec(
                 name=spec.name,
@@ -555,17 +578,30 @@ def run(
 
             domain = None
             if hasattr(conn_obj, "defineXML"):
+                reservation.verify_binding()
                 domain = conn_obj.defineXML(domain_xml)
             if domain is None:
                 raise LifecycleError("domain definition failed")
 
             domain_uuid = str(domain.UUIDString()) if hasattr(domain, "UUIDString") else str(uuid.uuid4())
             init_data["domain_uuid"] = domain_uuid
-            _write_state(rpaths, status="defined", data={**init_data, "updated_at": state.utc_now_iso()})
+            _write_state(
+                rpaths,
+                status="defined",
+                data={**init_data, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
 
-            _write_state(rpaths, status="starting", data={**init_data, "updated_at": state.utc_now_iso()})
+            _write_state(
+                rpaths,
+                status="starting",
+                data={**init_data, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
             if hasattr(domain, "create"):
+                reservation.verify_binding()
                 domain.create()
+                reservation.verify_binding()
 
             require_ip = spec.network != "none" and profile.network_mode != "user-hostfwd"
             guest_ip = _wait_for_readiness(rpaths, domain, timeout_seconds=timeout_seconds, require_ip=require_ip)
@@ -576,24 +612,29 @@ def run(
                 ssh_endpoint = {"host": guest_ip, "port": 22}
 
             if ssh_endpoint["host"] is not None:
+                reservation.verify_binding()
                 guest_host_pub = guest_host_key.with_name(guest_host_key.name + ".pub")
                 known_hosts_entry = guest.build_known_hosts_entry(
                     ssh_endpoint["host"], guest_host_pub, port=ssh_endpoint["port"]
                 )
-                rpaths.known_hosts.write_text(known_hosts_entry, encoding="utf-8")
-                rpaths.known_hosts.chmod(0o600)
+                reservation.write_file("ssh/known_hosts", known_hosts_entry.encode("utf-8"))
 
             init_data["guest_ip"] = guest_ip
             init_data["ssh"] = ssh_endpoint
-            final_state = _write_state(rpaths, status="running", data={**init_data, "updated_at": state.utc_now_iso()})
+            final_state = _write_state(
+                rpaths,
+                status="running",
+                data={**init_data, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
             return final_state
 
-        except Exception as exc:
+        except BaseException as exc:
             try:
                 init_data["updated_at"] = state.utc_now_iso()
                 init_data["error"] = str(exc)
-                _write_state(rpaths, status="failed", data=init_data)
-            except Exception:
+                reservation.write_failure(init_data)
+            except BaseException:
                 pass
 
             if conn_obj is not None:
@@ -603,9 +644,11 @@ def run(
                         domain_run_id = kvm.get_domain_run_id(libvirt_domain)
                         if domain_run_id == run_id:
                             _destroy_and_undefine_domain(libvirt_domain)
-                except Exception:
+                except BaseException:
                     pass
 
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError, DigestMismatchError)):
                 raise
             raise LifecycleError(f"run failed: {exc}") from exc
@@ -714,9 +757,6 @@ def start_serial_builder(
     if spec.network not in {"none", "default"}:
         raise ArtifactValidationError("serial builder network must be 'none' or 'default'")
     roots = roots or state.init_roots()
-    rpaths = state.run_paths(roots, spec.name)
-    if rpaths.owner.exists() or rpaths.root.exists():
-        raise StateError(f"run name '{spec.name}' already exists")
     for layer in spec.stack.layers:
         try:
             require_file_digest(layer.local_path, layer.digest)
@@ -734,20 +774,14 @@ def start_serial_builder(
         serials.add(serial)
         layer_disks.append(kvm.LayerDisk(layer.digest, layer.local_path, f"vd{kvm._DISK_LETTERS[index]}", serial))
 
-    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with state.locked(rpaths):
-        try:
-            owner_rec = state.write_owner_record(rpaths)
-        except Exception:
-            shutil.rmtree(rpaths.root, ignore_errors=True)
-            raise
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend(profile.backend))
+    with state.reserve_new_run(roots, spec.name, dispatch_key) as reservation:
+        rpaths = reservation.paths
+        owner_rec = reservation.record
         run_id = owner_rec.run_id
         initial: dict[str, Any] = {
-            "name": spec.name,
-            "run_id": run_id,
             "created_at": state.utc_now_iso(),
             "updated_at": state.utc_now_iso(),
-            "backend": profile.backend,
             "base": {
                 "digest": spec.stack.base.digest,
                 "local_path": str(spec.stack.base.local_path),
@@ -768,13 +802,10 @@ def start_serial_builder(
             "cleanup_flags": {},
             "builder_transport": "serial-output-v1",
         }
-        try:
-            _write_state(rpaths, status="creating", data=initial)
-        except Exception:
-            shutil.rmtree(rpaths.root, ignore_errors=True)
-            raise
         conn_obj = None
         try:
+            _write_state(rpaths, status="creating", data=initial, reservation=reservation)
+            reservation.verify_binding()
             conn_obj = _get_conn(conn, kvm_uri)
             if hasattr(conn_obj, "lookupByName"):
                 try:
@@ -784,15 +815,17 @@ def start_serial_builder(
                     raise
                 except Exception:
                     pass
-            rpaths.console.touch(mode=0o600)
-            create_and_validate_overlay(spec.stack.base, rpaths.overlay)
             meta_data = cloudinit.build_meta_data(run_id, hostname=spec.name)
-            _write_seed_iso(rpaths, profile, meta_data, user_data)
-
             ssh_host_port: int | None = None
             nvram_path: Path | None = None
-            if profile.network_mode == "user-hostfwd":
-                ssh_host_port, nvram_path = _prepare_user_hostfwd(rpaths, profile)
+            with _staged_run_paths(roots, rpaths) as staged:
+                staged.console.touch(mode=0o600)
+                create_and_validate_overlay(spec.stack.base, staged.overlay)
+                _write_seed_iso(staged, profile, meta_data, user_data)
+                if profile.network_mode == "user-hostfwd":
+                    ssh_host_port, staged_nvram = _prepare_user_hostfwd(staged, profile)
+                    nvram_path = rpaths.root / staged_nvram.name
+                reservation.publish_staging(staged.root)
 
             control_socket = rpaths.root / "builder.sock"
             domain_xml = kvm.build_domain_xml(
@@ -813,32 +846,48 @@ def start_serial_builder(
                 ),
                 profile,
             )
+            reservation.verify_binding()
             domain = conn_obj.defineXML(domain_xml) if hasattr(conn_obj, "defineXML") else None
             if domain is None:
                 raise LifecycleError("domain definition failed")
             initial["domain_uuid"] = str(domain.UUIDString()) if hasattr(domain, "UUIDString") else str(uuid.uuid4())
-            _write_state(rpaths, status="defined", data={**initial, "updated_at": state.utc_now_iso()})
-            _write_state(rpaths, status="starting", data={**initial, "updated_at": state.utc_now_iso()})
+            _write_state(
+                rpaths,
+                status="defined",
+                data={**initial, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
+            _write_state(
+                rpaths,
+                status="starting",
+                data={**initial, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
             if hasattr(domain, "create"):
+                reservation.verify_binding()
                 domain.create()
+                reservation.verify_binding()
             _wait_for_readiness(rpaths, domain, timeout_seconds=300.0, require_ip=False)
-            return _write_state(rpaths, status="running", data={**initial, "updated_at": state.utc_now_iso()})
-        except Exception as exc:
+            return _write_state(
+                rpaths,
+                status="running",
+                data={**initial, "updated_at": state.utc_now_iso()},
+                reservation=reservation,
+            )
+        except BaseException as exc:
             try:
-                _write_state(
-                    rpaths,
-                    status="failed",
-                    data={**initial, "error": str(exc), "updated_at": state.utc_now_iso()},
-                )
-            except Exception:
+                reservation.write_failure({**initial, "error": str(exc), "updated_at": state.utc_now_iso()})
+            except BaseException:
                 pass
             if conn_obj is not None:
                 try:
                     domain = conn_obj.lookupByName(spec.name)
                     if domain is not None and kvm.get_domain_run_id(domain) == run_id:
                         _destroy_and_undefine_domain(domain)
-                except Exception:
+                except BaseException:
                     pass
+            if not isinstance(exc, Exception):
+                raise
             if isinstance(exc, (LifecycleError, StateError, ArtifactValidationError, DigestMismatchError)):
                 raise
             raise LifecycleError(f"serial builder start failed: {exc}") from exc

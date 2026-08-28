@@ -172,6 +172,8 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
     assert record["name"] == spec.name
     assert record["run_id"] == owner.run_id
     assert record["backend"] == "lima-vz"
+    assert record["schema_version"] == 2
+    assert record["runtime_kind"] == "cloud-image"
     assert record["guest_ip"] == "192.168.64.12"
     assert record["ssh_host"] == "127.0.0.1"
     assert record["ssh_local_port"] == 61234
@@ -192,6 +194,60 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
         "uname",
         "-m",
     ]
+
+
+def test_lima_create_failure_holds_exact_v2_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["limactl", "list", "--format"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:2] == ["limactl", "create"]:
+            rpaths = state.run_paths(roots, spec.name)
+            owner = state.read_owner_record(rpaths)
+            creating = state.read_run_state(rpaths)
+            assert {
+                key: creating[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+            } == {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": "lima-vz",
+                "name": spec.name,
+                "run_id": owner.run_id,
+                "status": "creating",
+            }
+            return subprocess.CompletedProcess(argv, 1, "", "create exploded")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(lima, "available", lambda: True)
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
+    with pytest.raises(LifecycleError, match="create exploded"):
+        lima.run(spec, roots=roots)
+
+    rpaths = state.run_paths(roots, spec.name)
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert {key: failed[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "lima-vz",
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "failed",
+    }
+
+
+def test_lima_pre_reservation_failure_creates_no_run_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+    monkeypatch.setattr(lima, "available", lambda: False)
+
+    with pytest.raises(LifecycleError, match="native Lima VZ runs require"):
+        lima.run(spec, roots=roots)
+
+    assert not (roots.runs / spec.name).exists()
 
 
 def test_lima_first_use_format_is_sealed_false_before_run_succeeds(

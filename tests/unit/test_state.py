@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -10,6 +12,11 @@ import pytest
 
 import palimpsest_local.state as state
 from palimpsest_local.errors import StateError
+from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+
+
+def _cloud_key(backend: RuntimeBackend = RuntimeBackend.KVM) -> DispatchKey:
+    return DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
 
 
 def test_xdg_roots_and_permissions() -> None:
@@ -86,6 +93,372 @@ def test_run_state_and_locks() -> None:
         read_st = state.read_run_state(rpaths)
         assert read_st["status"] == "running"
         assert read_st["guest_ip"] == "192.168.122.10"
+
+
+def test_new_run_reservation_writes_exact_v2_identity_and_rejects_smuggling(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    with state.reserve_new_run(roots, "fresh", _cloud_key(RuntimeBackend.LIBVIRT_HVF)) as reservation:
+        with pytest.raises(AttributeError, match="immutable"):
+            reservation.dispatch_key = _cloud_key()  # type: ignore[misc]
+        with pytest.raises(AttributeError, match="immutable"):
+            reservation._last_status = "failed"  # type: ignore[misc]
+        with pytest.raises(StateError, match="reserved identity"):
+            reservation.write_state("creating", {"backend": "kvm"})
+        with pytest.raises(StateError, match="invalid status"):
+            reservation.write_state("root-mounted", {})
+        written = reservation.write_state("creating", {"guest_ip": None})
+
+    assert state.read_json(state.run_paths(roots, "fresh").owner) == {
+        "schema_version": 1,
+        "run_id": reservation.record.run_id,
+        "name": "fresh",
+    }
+    assert written == state.read_run_state(state.run_paths(roots, "fresh"))
+    assert {key: written[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "libvirt-hvf",
+        "name": "fresh",
+        "run_id": reservation.record.run_id,
+        "status": "creating",
+    }
+    assert state.permission_bits(state.run_paths(roots, "fresh").owner) == 0o600
+    assert state.permission_bits(state.run_paths(roots, "fresh").state) == 0o600
+
+
+def test_new_run_reservation_uses_canonical_public_path_spelling(tmp_path: Path) -> None:
+    real_state = tmp_path / "real-state"
+    real_state.mkdir()
+    linked_state = tmp_path / "linked-state"
+    linked_state.symlink_to(real_state, target_is_directory=True)
+    roots = state.init_roots(
+        {
+            "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
+            "PALIMPSEST_STATE_HOME": str(linked_state),
+        }
+    )
+
+    with state.reserve_new_run(roots, "canonical", _cloud_key()) as reservation:
+        reservation.write_state("failed", {})
+        assert reservation.paths.root == roots.runs.resolve() / "canonical"
+        assert reservation.paths.root == state.run_paths(roots, "canonical").root
+
+
+def test_new_run_owner_postcheck_rejects_same_json_with_different_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    real_read = state._read_exact_private_file
+
+    def rewrite_owner(directory_fd: int, filename: str) -> bytes:
+        original = real_read(directory_fd, filename)
+        if filename == "owner.json":
+            rewritten = json.dumps(json.loads(original), indent=2, sort_keys=True).encode() + b"\n"
+            file_fd = os.open(filename, os.O_WRONLY | os.O_TRUNC, dir_fd=directory_fd)
+            try:
+                os.write(file_fd, rewritten)
+                os.fsync(file_fd)
+            finally:
+                os.close(file_fd)
+        return real_read(directory_fd, filename)
+
+    monkeypatch.setattr(state, "_read_exact_private_file", rewrite_owner)
+
+    with pytest.raises(StateError, match="owner record changed"):
+        with state.reserve_new_run(roots, "owner-bytes", _cloud_key()):
+            pytest.fail("byte-mutated owner was accepted")
+
+    assert not (roots.runs / "owner-bytes").exists()
+
+
+def test_new_run_state_postcheck_rejects_same_json_with_different_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    real_read = state._read_exact_private_file
+    mutated = False
+
+    def rewrite_first_state(directory_fd: int, filename: str) -> bytes:
+        nonlocal mutated
+        original = real_read(directory_fd, filename)
+        if filename == "state.json" and not mutated:
+            mutated = True
+            rewritten = json.dumps(json.loads(original), indent=2, sort_keys=True).encode() + b"\n"
+            file_fd = os.open(filename, os.O_WRONLY | os.O_TRUNC, dir_fd=directory_fd)
+            try:
+                os.write(file_fd, rewritten)
+                os.fsync(file_fd)
+            finally:
+                os.close(file_fd)
+        return real_read(directory_fd, filename)
+
+    monkeypatch.setattr(state, "_read_exact_private_file", rewrite_first_state)
+
+    with pytest.raises(StateError, match="state changed"):
+        with state.reserve_new_run(roots, "state-bytes", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+
+    assert state.read_run_state(state.run_paths(roots, "state-bytes"))["status"] == "failed"
+
+
+def test_new_run_reservation_serializes_same_name_race(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    first_reserved = threading.Event()
+    release_first = threading.Event()
+    outcomes: list[str] = []
+    backend_side_effects: list[str] = []
+
+    def reserve(marker: str, backend: RuntimeBackend) -> None:
+        try:
+            with state.reserve_new_run(roots, "race", _cloud_key(backend)) as reservation:
+                outcomes.append(f"reserved-{marker}")
+                first_reserved.set()
+                assert release_first.wait(5)
+                backend_side_effects.append(backend.value)
+                reservation.write_state("running", {"marker": marker})
+        except StateError:
+            outcomes.append(f"rejected-{marker}")
+
+    first = threading.Thread(target=reserve, args=("a", RuntimeBackend.KVM))
+    second = threading.Thread(target=reserve, args=("b", RuntimeBackend.LIMA_VZ))
+    first.start()
+    assert first_reserved.wait(5)
+    second.start()
+    release_first.set()
+    first.join(5)
+    second.join(5)
+
+    assert len([item for item in outcomes if item.startswith("reserved-")]) == 1
+    assert len([item for item in outcomes if item.startswith("rejected-")]) == 1
+    assert len(backend_side_effects) == 1
+    written = state.read_run_state(state.run_paths(roots, "race"))
+    assert written["status"] == "running"
+    assert written["backend"] == backend_side_effects[0]
+
+
+@pytest.mark.parametrize("entry_kind", ["directory", "file", "symlink"])
+def test_new_run_reservation_preserves_preexisting_entry_bytes(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    entry = roots.runs / "occupied"
+    outside = tmp_path / "outside"
+    if entry_kind == "directory":
+        entry.mkdir()
+        (entry / "marker").write_bytes(b"directory-marker")
+    elif entry_kind == "file":
+        entry.write_bytes(b"file-marker")
+    else:
+        outside.mkdir()
+        (outside / "marker").write_bytes(b"outside-marker")
+        entry.symlink_to(outside, target_is_directory=True)
+    before_entry = entry.lstat()
+    before_marker = (entry / "marker").read_bytes() if entry_kind == "directory" else None
+    before_outside = (outside / "marker").read_bytes() if entry_kind == "symlink" else None
+
+    with pytest.raises(StateError, match="already exists"):
+        with state.reserve_new_run(roots, "occupied", _cloud_key()):
+            pytest.fail("pre-existing entry was reserved")
+
+    after_entry = entry.lstat()
+    assert (after_entry.st_dev, after_entry.st_ino, after_entry.st_size, after_entry.st_mtime_ns) == (
+        before_entry.st_dev,
+        before_entry.st_ino,
+        before_entry.st_size,
+        before_entry.st_mtime_ns,
+    )
+    if before_marker is not None:
+        assert (entry / "marker").read_bytes() == before_marker
+    if before_outside is not None:
+        assert (outside / "marker").read_bytes() == before_outside
+
+
+def test_new_run_reservation_rejects_lock_symlink_without_run_entry(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"do-not-touch")
+    (roots.locks / "locked.lock").symlink_to(outside)
+
+    with pytest.raises(StateError, match="securely lock"):
+        with state.reserve_new_run(roots, "locked", _cloud_key()):
+            pytest.fail("symlink lock was followed")
+
+    assert outside.read_bytes() == b"do-not-touch"
+    assert not (roots.runs / "locked").exists()
+
+
+def test_new_run_reservation_rejects_lock_hardlink_before_chmod(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"do-not-touch")
+    outside.chmod(0o640)
+    os.link(outside, roots.locks / "hardlocked.lock")
+
+    with pytest.raises(StateError, match="securely lock"):
+        with state.reserve_new_run(roots, "hardlocked", _cloud_key()):
+            pytest.fail("hardlinked lock was accepted")
+
+    assert outside.read_bytes() == b"do-not-touch"
+    assert state.permission_bits(outside) == 0o640
+    assert not (roots.runs / "hardlocked").exists()
+
+
+def test_new_run_reservation_detects_entry_swap_and_never_deletes_replacement(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    displaced = roots.runs / "displaced"
+    replacement = roots.runs / "swapped"
+    with pytest.raises(StateError, match="reservation changed"):
+        with state.reserve_new_run(roots, "swapped", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+            os.rename(replacement, displaced)
+            replacement.mkdir()
+            (replacement / "marker").write_bytes(b"replacement")
+            reservation.write_state("running", {})
+
+    assert (replacement / "marker").read_bytes() == b"replacement"
+    assert state.read_run_state(state.run_paths(roots, "displaced"))["status"] == "failed"
+
+
+def test_reserved_run_file_write_never_touches_replacement_directory(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    displaced = roots.runs / "file-displaced"
+    replacement = roots.runs / "file-swap"
+
+    with pytest.raises(StateError, match="reservation changed"):
+        with state.reserve_new_run(roots, "file-swap", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+            os.rename(replacement, displaced)
+            replacement.mkdir()
+            (replacement / "marker").write_bytes(b"replacement")
+            reservation.write_file("lima.yaml", b"vmType: vz\n")
+
+    assert (replacement / "marker").read_bytes() == b"replacement"
+    assert not (replacement / "lima.yaml").exists()
+    assert state.read_run_state(state.run_paths(roots, "file-displaced"))["status"] == "failed"
+
+
+def test_reserved_run_file_preserves_preexisting_large_artifact_support(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    content = b"x" * (2 * 1024 * 1024)
+
+    with state.reserve_new_run(roots, "large-config", _cloud_key(RuntimeBackend.LIMA_VZ)) as reservation:
+        reservation.write_state("creating", {})
+        target = reservation.write_file("lima.yaml", content)
+        reservation.write_state("failed", {})
+
+    assert target.read_bytes() == content
+
+
+def test_staged_artifact_publish_never_touches_replacement_directory(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    (staging / "overlay.qcow2").write_bytes(b"overlay")
+    displaced = roots.runs / "stage-displaced"
+    replacement = roots.runs / "stage-swap"
+
+    with pytest.raises(StateError, match="reservation changed"):
+        with state.reserve_new_run(roots, "stage-swap", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+            os.rename(replacement, displaced)
+            replacement.mkdir()
+            (replacement / "marker").write_bytes(b"replacement")
+            reservation.publish_staging(staging)
+
+    assert (replacement / "marker").read_bytes() == b"replacement"
+    assert not (replacement / "overlay.qcow2").exists()
+    assert (staging / "overlay.qcow2").read_bytes() == b"overlay"
+    assert state.read_run_state(state.run_paths(roots, "stage-displaced"))["status"] == "failed"
+
+
+def test_new_run_state_publish_replaces_symlink_without_following_it(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    outside = tmp_path / "outside-state"
+    outside.write_bytes(b"do-not-touch")
+
+    with state.reserve_new_run(roots, "state-link", _cloud_key()) as reservation:
+        reservation.paths.state.symlink_to(outside)
+        written = reservation.write_state("creating", {})
+
+    assert outside.read_bytes() == b"do-not-touch"
+    assert not reservation.paths.state.is_symlink()
+    assert state.read_run_state(reservation.paths) == written
+
+
+def test_new_run_state_replace_failure_leaves_held_failed_ledger_without_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    real_replace = state.os.replace
+    replace_calls = 0
+
+    def fail_first_replace(*args: object, **kwargs: object) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise OSError("injected replace failure")
+        real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(state.os, "replace", fail_first_replace)
+
+    with pytest.raises(StateError, match="durably write"):
+        with state.reserve_new_run(roots, "replace-failed", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+
+    rpaths = state.run_paths(roots, "replace-failed")
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert failed["schema_version"] == 2
+    assert failed["run_id"] == owner.run_id
+    assert failed["status"] == "failed"
+    assert list(rpaths.root.glob(".state-tmp-*")) == []
+
+
+def test_new_run_reservation_persists_failed_v2_ledger_after_reservation(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    with pytest.raises(RuntimeError, match="backend failed"):
+        with state.reserve_new_run(roots, "failed-create", _cloud_key(RuntimeBackend.LIMA_VZ)) as reservation:
+            reservation.write_state("creating", {})
+            raise RuntimeError("backend failed")
+
+    failed = state.read_run_state(state.run_paths(roots, "failed-create"))
+    assert failed["schema_version"] == 2
+    assert failed["runtime_kind"] == "cloud-image"
+    assert failed["backend"] == "lima-vz"
+    assert failed["name"] == "failed-create"
+    assert failed["run_id"] == reservation.record.run_id
+    assert failed["status"] == "failed"
+
+
+def test_new_run_reservation_persists_failed_v2_on_base_exception(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+
+    with pytest.raises(KeyboardInterrupt):
+        with state.reserve_new_run(roots, "interrupted", _cloud_key()) as reservation:
+            reservation.write_state("creating", {})
+            raise KeyboardInterrupt
+
+    failed = state.read_run_state(state.run_paths(roots, "interrupted"))
+    assert failed["schema_version"] == 2
+    assert failed["runtime_kind"] == "cloud-image"
+    assert failed["backend"] == "kvm"
+    assert failed["status"] == "failed"
+
+
+def test_new_run_reservation_does_not_fail_after_last_success_boundary(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    displaced_lock = roots.locks / "after-success.displaced"
+
+    with state.reserve_new_run(roots, "after-success", _cloud_key()) as reservation:
+        reservation.write_state("running", {})
+        os.rename(reservation.paths.lock, displaced_lock)
+        reservation.paths.lock.write_bytes(b"replacement")
+
+    assert state.read_run_state(state.run_paths(roots, "after-success"))["status"] == "running"
 
 
 def test_atomic_write_json_syncs_parent_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

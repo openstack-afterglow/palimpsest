@@ -132,6 +132,107 @@ class OwnerRecord:
     name: str
 
 
+class NewRunReservation:
+    """Pinned exclusive authority for one newly-created run ledger.
+
+    Palimpsest writers sharing this state root must honor the per-name lock.
+    Descriptor-relative publication protects the reservation from accidental
+    path re-resolution; it is not an OS sandbox against arbitrary same-UID
+    processes that deliberately rewrite owner-controlled storage.
+    """
+
+    __slots__ = (
+        "_roots",
+        "_paths",
+        "_record",
+        "_dispatch_key",
+        "_runs_fd",
+        "_run_fd",
+        "_locks_fd",
+        "_lock_fd",
+        "_runs_identity",
+        "_run_identity",
+        "_locks_identity",
+        "_lock_identity",
+        "_last_status",
+    )
+
+    def __init__(
+        self,
+        roots: StatePaths,
+        paths: RunPaths,
+        record: OwnerRecord,
+        dispatch_key: DispatchKey,
+        runs_fd: int,
+        run_fd: int,
+        locks_fd: int,
+        lock_fd: int,
+        runs_identity: tuple[int, int],
+        run_identity: tuple[int, int],
+        locks_identity: tuple[int, int],
+        lock_identity: tuple[int, int],
+    ) -> None:
+        object.__setattr__(self, "_roots", roots)
+        object.__setattr__(self, "_paths", paths)
+        object.__setattr__(self, "_record", record)
+        object.__setattr__(self, "_dispatch_key", dispatch_key)
+        object.__setattr__(self, "_runs_fd", runs_fd)
+        object.__setattr__(self, "_run_fd", run_fd)
+        object.__setattr__(self, "_locks_fd", locks_fd)
+        object.__setattr__(self, "_lock_fd", lock_fd)
+        object.__setattr__(self, "_runs_identity", runs_identity)
+        object.__setattr__(self, "_run_identity", run_identity)
+        object.__setattr__(self, "_locks_identity", locks_identity)
+        object.__setattr__(self, "_lock_identity", lock_identity)
+        object.__setattr__(self, "_last_status", None)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("new run reservation authority is immutable")
+
+    @property
+    def roots(self) -> StatePaths:
+        return self._roots
+
+    @property
+    def paths(self) -> RunPaths:
+        return self._paths
+
+    @property
+    def record(self) -> OwnerRecord:
+        return self._record
+
+    @property
+    def dispatch_key(self) -> DispatchKey:
+        return self._dispatch_key
+
+    @property
+    def last_status(self) -> str | None:
+        return self._last_status
+
+    def verify_binding(self) -> None:
+        _verify_new_run_binding(self)
+
+    def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
+        payload = _write_reserved_run_state(self, status, data)
+        object.__setattr__(self, "_last_status", status)
+        return payload
+
+    def write_failure(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Publish failure through the pinned directory even after name-path loss."""
+        payload = _write_reserved_run_state(self, "failed", data, require_visible_binding=False)
+        object.__setattr__(self, "_last_status", "failed")
+        return payload
+
+    def write_file(self, relative_name: str, content: bytes, *, mode: int = 0o600) -> Path:
+        """Atomically publish one create-time file relative to the pinned run."""
+        _write_reserved_run_file(self, relative_name, content, mode=mode)
+        return self.paths.root.joinpath(*relative_name.split("/"))
+
+    def publish_staging(self, staging_root: Path) -> None:
+        """Move a fully generated, synced artifact tree into the pinned run."""
+        _publish_reserved_run_staging(self, staging_root)
+
+
 @dataclass(frozen=True)
 class TagRecord:
     schema_version: int
@@ -403,6 +504,29 @@ def run_paths(roots: StatePaths, name: str) -> RunPaths:
     )
 
 
+def _new_run_paths(roots: StatePaths, name: str) -> RunPaths:
+    """Build canonical-parent paths whose safety is enforced by dirfd reservation."""
+    if _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    canonical_runs = roots.runs.resolve()
+    canonical_locks = roots.locks.resolve()
+    root = canonical_runs / name
+    return RunPaths(
+        root,
+        root / "owner.json",
+        root / "state.json",
+        root / "overlay.qcow2",
+        root / "seed.iso",
+        root / "console.log",
+        root / "ssh",
+        root / "ssh" / "id_ed25519",
+        root / "ssh" / "id_ed25519.pub",
+        root / "ssh" / "known_hosts",
+        canonical_locks / f"{name}.lock",
+        name,
+    )
+
+
 def project_paths(roots: StatePaths, name: str) -> ProjectPaths:
     if _NAME_RE.fullmatch(name) is None:
         raise StateError("invalid project name")
@@ -471,6 +595,699 @@ def _close_noerror(file_fd: int) -> None:
         os.close(file_fd)
     except OSError:
         pass
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _write_all(file_fd: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        try:
+            written = os.write(file_fd, content[offset:])
+        except OSError:
+            raise StateError("cannot durably write new run ledger") from None
+        if written <= 0:
+            raise StateError("cannot durably write new run ledger")
+        offset += written
+
+
+def _json_bytes(value: Mapping[str, Any]) -> bytes:
+    _reject_secrets(value)
+    try:
+        content = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+    except (RecursionError, TypeError, ValueError):
+        raise StateError("invalid new run ledger payload") from None
+    if len(content) > _MAX_RUN_LEDGER_BYTES:
+        raise StateError("new run ledger payload is too large")
+    return content
+
+
+def _read_exact_private_file(
+    directory_fd: int,
+    filename: str,
+    *,
+    max_bytes: int = _MAX_RUN_LEDGER_BYTES,
+) -> bytes:
+    """Read one writer-owned file while proving inode and metadata stability."""
+    expected_mode = 0o600
+    entry_before = _safe_stat(filename, directory_fd=directory_fd)
+    if (
+        entry_before is None
+        or not stat_module.S_ISREG(entry_before.st_mode)
+        or entry_before.st_uid != os.geteuid()
+        or entry_before.st_nlink != 1
+        or stat_module.S_IMODE(entry_before.st_mode) != expected_mode
+        or entry_before.st_size > max_bytes
+    ):
+        raise StateError("new run ledger changed during verification")
+    file_fd = _open_readonly_no_follow(filename, directory_fd=directory_fd, nonblocking=True)
+    if file_fd is None:
+        raise StateError("new run ledger changed during verification")
+    try:
+        opened_before = _safe_fstat(file_fd)
+        if (
+            opened_before is None
+            or not stat_module.S_ISREG(opened_before.st_mode)
+            or opened_before.st_uid != os.geteuid()
+            or opened_before.st_nlink != 1
+            or stat_module.S_IMODE(opened_before.st_mode) != expected_mode
+            or opened_before.st_size > max_bytes
+            or _identity(opened_before) != _identity(entry_before)
+        ):
+            raise StateError("new run ledger changed during verification")
+        content = bytearray()
+        while True:
+            try:
+                chunk = os.read(file_fd, min(64 * 1024, max_bytes + 1 - len(content)))
+            except OSError:
+                raise StateError("new run ledger changed during verification") from None
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise StateError("new run ledger changed during verification")
+        opened_after = _safe_fstat(file_fd)
+        entry_after = _safe_stat(filename, directory_fd=directory_fd)
+        before_metadata = (
+            opened_before.st_dev,
+            opened_before.st_ino,
+            opened_before.st_mode,
+            opened_before.st_uid,
+            opened_before.st_nlink,
+            opened_before.st_size,
+            opened_before.st_mtime_ns,
+            opened_before.st_ctime_ns,
+        )
+        if (
+            opened_after is None
+            or entry_after is None
+            or before_metadata
+            != (
+                entry_before.st_dev,
+                entry_before.st_ino,
+                entry_before.st_mode,
+                entry_before.st_uid,
+                entry_before.st_nlink,
+                entry_before.st_size,
+                entry_before.st_mtime_ns,
+                entry_before.st_ctime_ns,
+            )
+            or before_metadata
+            != (
+                opened_after.st_dev,
+                opened_after.st_ino,
+                opened_after.st_mode,
+                opened_after.st_uid,
+                opened_after.st_nlink,
+                opened_after.st_size,
+                opened_after.st_mtime_ns,
+                opened_after.st_ctime_ns,
+            )
+            or before_metadata
+            != (
+                entry_after.st_dev,
+                entry_after.st_ino,
+                entry_after.st_mode,
+                entry_after.st_uid,
+                entry_after.st_nlink,
+                entry_after.st_size,
+                entry_after.st_mtime_ns,
+                entry_after.st_ctime_ns,
+            )
+        ):
+            raise StateError("new run ledger changed during verification")
+        return bytes(content)
+    finally:
+        _close_noerror(file_fd)
+
+
+def _safe_relative_components(relative_name: str) -> tuple[str, ...]:
+    if not isinstance(relative_name, str) or not relative_name or "\x00" in relative_name:
+        raise StateError("invalid reserved run file name")
+    components = tuple(relative_name.split("/"))
+    if any(not component or component in {".", ".."} or "/" in component for component in components):
+        raise StateError("invalid reserved run file name")
+    return components
+
+
+def _verify_pinned_new_run_authority(reservation: NewRunReservation) -> None:
+    """Verify open reservation objects without trusting their visible paths."""
+    runs_open = _safe_fstat(reservation._runs_fd)
+    run_open = _safe_fstat(reservation._run_fd)
+    locks_open = _safe_fstat(reservation._locks_fd)
+    lock_open = _safe_fstat(reservation._lock_fd)
+    if (
+        runs_open is None
+        or run_open is None
+        or locks_open is None
+        or lock_open is None
+        or not stat_module.S_ISDIR(runs_open.st_mode)
+        or not stat_module.S_ISDIR(run_open.st_mode)
+        or not stat_module.S_ISDIR(locks_open.st_mode)
+        or not stat_module.S_ISREG(lock_open.st_mode)
+        or lock_open.st_uid != os.geteuid()
+        or lock_open.st_nlink != 1
+        or stat_module.S_IMODE(lock_open.st_mode) != 0o600
+        or _identity(runs_open) != reservation._runs_identity
+        or _identity(run_open) != reservation._run_identity
+        or _identity(locks_open) != reservation._locks_identity
+        or _identity(lock_open) != reservation._lock_identity
+        or _read_exact_private_file(reservation._run_fd, "owner.json") != _json_bytes(asdict(reservation.record))
+    ):
+        raise StateError("invalid pinned new run reservation authority")
+
+
+def _open_reserved_parent(reservation: NewRunReservation, components: tuple[str, ...]) -> tuple[int, list[int]]:
+    parent_fd = reservation._run_fd
+    opened: list[int] = []
+    for component in components[:-1]:
+        next_fd = _open_readonly_no_follow(component, directory_fd=parent_fd, directory=True)
+        if next_fd is None:
+            for file_fd in reversed(opened):
+                _close_noerror(file_fd)
+            raise StateError("cannot securely open reserved run file parent")
+        metadata = _safe_fstat(next_fd)
+        if metadata is None or not stat_module.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            _close_noerror(next_fd)
+            for file_fd in reversed(opened):
+                _close_noerror(file_fd)
+            raise StateError("cannot securely open reserved run file parent")
+        opened.append(next_fd)
+        parent_fd = next_fd
+    return parent_fd, opened
+
+
+def _write_reserved_run_file(
+    reservation: NewRunReservation,
+    relative_name: str,
+    content: bytes,
+    *,
+    mode: int,
+) -> None:
+    if not isinstance(content, bytes) or mode != 0o600:
+        raise StateError("invalid reserved run file payload")
+    components = _safe_relative_components(relative_name)
+    reservation.verify_binding()
+    parent_fd, opened = _open_reserved_parent(reservation, components)
+    temporary = f".artifact-tmp-{uuid.uuid4().hex}"
+    temporary_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        temporary_fd = os.open(temporary, flags, mode, dir_fd=parent_fd)
+        os.fchmod(temporary_fd, mode)
+        _write_all(temporary_fd, content)
+        os.fsync(temporary_fd)
+        temporary_stat = _safe_fstat(temporary_fd)
+        if (
+            temporary_stat is None
+            or not stat_module.S_ISREG(temporary_stat.st_mode)
+            or temporary_stat.st_uid != os.geteuid()
+            or temporary_stat.st_nlink != 1
+            or stat_module.S_IMODE(temporary_stat.st_mode) != mode
+        ):
+            raise StateError("cannot durably write reserved run file")
+        reservation.verify_binding()
+        os.replace(temporary, components[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = ""
+        os.fsync(parent_fd)
+        published = _safe_stat(components[-1], directory_fd=parent_fd)
+        if (
+            published is None
+            or not stat_module.S_ISREG(published.st_mode)
+            or _identity(published) != _identity(temporary_stat)
+            or _read_exact_private_file(parent_fd, components[-1], max_bytes=len(content)) != content
+        ):
+            raise StateError("reserved run file changed during write")
+        reservation.verify_binding()
+    except OSError:
+        raise StateError("cannot durably write reserved run file") from None
+    finally:
+        if temporary_fd is not None:
+            _close_noerror(temporary_fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except OSError:
+                pass
+        for file_fd in reversed(opened):
+            _close_noerror(file_fd)
+
+
+def _sync_staged_tree(directory_fd: int) -> None:
+    try:
+        names = os.listdir(directory_fd)
+    except OSError:
+        raise StateError("cannot securely inspect staged run artifacts") from None
+    for name in names:
+        if not isinstance(name, str) or name in {".", ".."} or "/" in name or "\x00" in name:
+            raise StateError("invalid staged run artifact")
+        metadata = _safe_stat(name, directory_fd=directory_fd)
+        if metadata is None or metadata.st_uid != os.geteuid():
+            raise StateError("invalid staged run artifact")
+        if stat_module.S_ISDIR(metadata.st_mode):
+            child_fd = _open_readonly_no_follow(name, directory_fd=directory_fd, directory=True)
+            if child_fd is None:
+                raise StateError("invalid staged run artifact")
+            try:
+                os.fchmod(child_fd, 0o700)
+                _sync_staged_tree(child_fd)
+                os.fsync(child_fd)
+            except OSError:
+                raise StateError("cannot durably stage run artifacts") from None
+            finally:
+                _close_noerror(child_fd)
+            continue
+        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise StateError("invalid staged run artifact")
+        file_fd = _open_readonly_no_follow(name, directory_fd=directory_fd, nonblocking=True)
+        if file_fd is None:
+            raise StateError("invalid staged run artifact")
+        try:
+            os.fchmod(file_fd, 0o600)
+            os.fsync(file_fd)
+        except OSError:
+            raise StateError("cannot durably stage run artifacts") from None
+        finally:
+            _close_noerror(file_fd)
+
+
+def _publish_reserved_run_staging(reservation: NewRunReservation, staging_root: Path) -> None:
+    reservation.verify_binding()
+    staging_fd = _open_readonly_no_follow(staging_root, directory=True)
+    if staging_fd is None:
+        raise StateError("cannot securely open staged run artifacts")
+    try:
+        staging_stat = _safe_fstat(staging_fd)
+        if staging_stat is None or not stat_module.S_ISDIR(staging_stat.st_mode) or staging_stat.st_uid != os.geteuid():
+            raise StateError("cannot securely open staged run artifacts")
+        _sync_staged_tree(staging_fd)
+        names = sorted(os.listdir(staging_fd))
+        if not names or {"owner.json", "state.json"}.intersection(names):
+            raise StateError("invalid staged run artifact set")
+        for name in names:
+            if _safe_stat(name, directory_fd=reservation._run_fd) is not None:
+                raise StateError("reserved run artifact already exists")
+            reservation.verify_binding()
+            try:
+                os.rename(name, name, src_dir_fd=staging_fd, dst_dir_fd=reservation._run_fd)
+            except OSError:
+                raise StateError("cannot publish staged run artifacts") from None
+            os.fsync(reservation._run_fd)
+        os.fsync(staging_fd)
+        reservation.verify_binding()
+    except OSError:
+        raise StateError("cannot durably publish staged run artifacts") from None
+    finally:
+        _close_noerror(staging_fd)
+
+
+def _verify_new_run_binding(reservation: NewRunReservation) -> None:
+    if (
+        not isinstance(reservation.roots, StatePaths)
+        or not isinstance(reservation.paths, RunPaths)
+        or not isinstance(reservation.record, OwnerRecord)
+        or reservation.record.schema_version != 1
+        or reservation.record.name != reservation.paths.name
+        or not isinstance(reservation.dispatch_key, DispatchKey)
+        or reservation.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
+    ):
+        raise StateError("invalid new run reservation authority")
+    parsed_run_id: uuid.UUID | None = None
+    try:
+        parsed_run_id = uuid.UUID(reservation.record.run_id)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if parsed_run_id is None or str(parsed_run_id) != reservation.record.run_id:
+        raise StateError("invalid new run reservation authority")
+    runs_open = _safe_fstat(reservation._runs_fd)
+    runs_path = _safe_stat(reservation.roots.runs)
+    run_open = _safe_fstat(reservation._run_fd)
+    run_entry = _safe_stat(reservation.paths.name, directory_fd=reservation._runs_fd)
+    locks_open = _safe_fstat(reservation._locks_fd)
+    locks_path = _safe_stat(reservation.roots.locks)
+    lock_open = _safe_fstat(reservation._lock_fd)
+    lock_entry = _safe_stat(f"{reservation.paths.name}.lock", directory_fd=reservation._locks_fd)
+    if (
+        runs_open is None
+        or runs_path is None
+        or run_open is None
+        or run_entry is None
+        or not stat_module.S_ISDIR(runs_open.st_mode)
+        or not stat_module.S_ISDIR(runs_path.st_mode)
+        or not stat_module.S_ISDIR(run_open.st_mode)
+        or not stat_module.S_ISDIR(run_entry.st_mode)
+        or _identity(runs_open) != reservation._runs_identity
+        or _identity(runs_path) != reservation._runs_identity
+        or _identity(run_open) != reservation._run_identity
+        or _identity(run_entry) != reservation._run_identity
+        or locks_open is None
+        or locks_path is None
+        or lock_open is None
+        or lock_entry is None
+        or not stat_module.S_ISDIR(locks_open.st_mode)
+        or not stat_module.S_ISDIR(locks_path.st_mode)
+        or not stat_module.S_ISREG(lock_open.st_mode)
+        or not stat_module.S_ISREG(lock_entry.st_mode)
+        or lock_open.st_uid != os.geteuid()
+        or lock_open.st_nlink != 1
+        or stat_module.S_IMODE(lock_open.st_mode) != 0o600
+        or _identity(locks_open) != reservation._locks_identity
+        or _identity(locks_path) != reservation._locks_identity
+        or _identity(lock_open) != reservation._lock_identity
+        or _identity(lock_entry) != reservation._lock_identity
+    ):
+        raise StateError("new run reservation changed during create")
+
+
+def _write_exclusive_owner(run_fd: int, record: OwnerRecord) -> None:
+    payload = asdict(record)
+    content = _json_bytes(payload)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        owner_fd = os.open("owner.json", flags, 0o600, dir_fd=run_fd)
+    except OSError:
+        raise StateError("cannot exclusively create owner record") from None
+    try:
+        os.fchmod(owner_fd, 0o600)
+        _write_all(owner_fd, content)
+        os.fsync(owner_fd)
+        owner_open = _safe_fstat(owner_fd)
+        if (
+            owner_open is None
+            or not stat_module.S_ISREG(owner_open.st_mode)
+            or owner_open.st_uid != os.geteuid()
+            or owner_open.st_nlink != 1
+            or stat_module.S_IMODE(owner_open.st_mode) != 0o600
+        ):
+            raise StateError("cannot exclusively create owner record")
+    except OSError:
+        raise StateError("cannot durably create owner record") from None
+    finally:
+        _close_noerror(owner_fd)
+    owner_entry = _safe_stat("owner.json", directory_fd=run_fd)
+    if (
+        owner_entry is None
+        or not stat_module.S_ISREG(owner_entry.st_mode)
+        or owner_entry.st_uid != os.geteuid()
+        or owner_entry.st_nlink != 1
+        or stat_module.S_IMODE(owner_entry.st_mode) != 0o600
+        or _identity(owner_entry) != _identity(owner_open)
+    ):
+        raise StateError("owner record changed during create")
+    try:
+        os.fsync(run_fd)
+    except OSError:
+        raise StateError("cannot durably create owner record") from None
+    if _read_exact_private_file(run_fd, "owner.json") != content:
+        raise StateError("owner record changed during create")
+
+
+_RESERVED_RUN_STATE_FIELDS = frozenset({"schema_version", "runtime_kind", "backend", "name", "run_id", "status"})
+
+
+def _write_reserved_run_state(
+    reservation: NewRunReservation,
+    status: str,
+    data: Mapping[str, Any],
+    *,
+    require_visible_binding: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(status, str) or status not in ALLOWED_RUNTIME_STATUSES[reservation.dispatch_key.runtime_kind]:
+        raise StateError("invalid status for new run ledger")
+    if not isinstance(data, Mapping):
+        raise StateError("new run state data must be a mapping")
+    if _RESERVED_RUN_STATE_FIELDS.intersection(data):
+        raise StateError("new run state cannot override reserved identity fields")
+    payload = {
+        **dict(data),
+        "schema_version": 2,
+        "runtime_kind": reservation.dispatch_key.runtime_kind.value,
+        "backend": reservation.dispatch_key.backend.value,
+        "name": reservation.record.name,
+        "run_id": reservation.record.run_id,
+        "status": status,
+    }
+    content = _json_bytes(payload)
+
+    def verify() -> None:
+        if require_visible_binding:
+            reservation.verify_binding()
+        else:
+            _verify_pinned_new_run_authority(reservation)
+
+    verify()
+    temporary = f".state-tmp-{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(temporary, flags, 0o600, dir_fd=reservation._run_fd)
+        os.fchmod(temporary_fd, 0o600)
+        _write_all(temporary_fd, content)
+        os.fsync(temporary_fd)
+        temporary_open = _safe_fstat(temporary_fd)
+        if (
+            temporary_open is None
+            or not stat_module.S_ISREG(temporary_open.st_mode)
+            or temporary_open.st_uid != os.geteuid()
+            or temporary_open.st_nlink != 1
+            or stat_module.S_IMODE(temporary_open.st_mode) != 0o600
+        ):
+            raise StateError("cannot durably write new run ledger")
+        verify()
+        os.replace(
+            temporary,
+            "state.json",
+            src_dir_fd=reservation._run_fd,
+            dst_dir_fd=reservation._run_fd,
+        )
+        temporary = ""
+        os.fsync(reservation._run_fd)
+        state_entry = _safe_stat("state.json", directory_fd=reservation._run_fd)
+        if (
+            state_entry is None
+            or not stat_module.S_ISREG(state_entry.st_mode)
+            or state_entry.st_uid != os.geteuid()
+            or state_entry.st_nlink != 1
+            or stat_module.S_IMODE(state_entry.st_mode) != 0o600
+            or _identity(state_entry) != _identity(temporary_open)
+        ):
+            raise StateError("new run state changed during write")
+        verify()
+        if _read_exact_private_file(reservation._run_fd, "state.json") != content:
+            raise StateError("new run state changed during write")
+        return payload
+    except OSError:
+        raise StateError("cannot durably write new run ledger") from None
+    finally:
+        if temporary_fd is not None:
+            _close_noerror(temporary_fd)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=reservation._run_fd)
+            except OSError:
+                pass
+
+
+@dataclass(frozen=True, slots=True)
+class _NewRunNameLock:
+    locks_fd: int
+    lock_fd: int
+    locks_identity: tuple[int, int]
+    lock_identity: tuple[int, int]
+
+
+@contextmanager
+def _new_run_name_lock(roots: StatePaths, name: str) -> Iterator[_NewRunNameLock]:
+    locks_fd = _open_readonly_no_follow(roots.locks, directory=True)
+    if locks_fd is None:
+        raise StateError("cannot securely lock new run name")
+    lock_fd: int | None = None
+    filename = f"{name}.lock"
+    try:
+        locks_open = _safe_fstat(locks_fd)
+        locks_path = _safe_stat(roots.locks)
+        if (
+            locks_open is None
+            or locks_path is None
+            or not stat_module.S_ISDIR(locks_open.st_mode)
+            or not stat_module.S_ISDIR(locks_path.st_mode)
+            or _identity(locks_open) != _identity(locks_path)
+        ):
+            raise StateError("cannot securely lock new run name")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+        prior_entry = _safe_stat(filename, directory_fd=locks_fd)
+        try:
+            lock_fd = os.open(filename, flags, 0o600, dir_fd=locks_fd)
+        except OSError:
+            raise StateError("cannot securely lock new run name") from None
+        lock_open = _safe_fstat(lock_fd)
+        if (
+            lock_open is None
+            or not stat_module.S_ISREG(lock_open.st_mode)
+            or lock_open.st_uid != os.geteuid()
+            or lock_open.st_nlink != 1
+        ):
+            raise StateError("cannot securely lock new run name")
+        try:
+            os.fchmod(lock_fd, 0o600)
+            os.fsync(lock_fd)
+            if prior_entry is None:
+                os.fsync(locks_fd)
+        except OSError:
+            raise StateError("cannot securely lock new run name") from None
+        lock_open = _safe_fstat(lock_fd)
+        lock_entry = _safe_stat(filename, directory_fd=locks_fd)
+        if (
+            lock_open is None
+            or lock_entry is None
+            or not stat_module.S_ISREG(lock_open.st_mode)
+            or not stat_module.S_ISREG(lock_entry.st_mode)
+            or lock_open.st_uid != os.geteuid()
+            or lock_open.st_nlink != 1
+            or stat_module.S_IMODE(lock_open.st_mode) != 0o600
+            or _identity(lock_open) != _identity(lock_entry)
+        ):
+            raise StateError("cannot securely lock new run name")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            raise StateError("cannot securely lock new run name") from None
+        current = _safe_stat(filename, directory_fd=locks_fd)
+        current_locks = _safe_stat(roots.locks)
+        if (
+            current is None
+            or current_locks is None
+            or _identity(current) != _identity(lock_open)
+            or _identity(current_locks) != _identity(locks_open)
+        ):
+            raise StateError("new run name lock changed during acquire")
+        yield _NewRunNameLock(
+            locks_fd=locks_fd,
+            lock_fd=lock_fd,
+            locks_identity=_identity(locks_open),
+            lock_identity=_identity(lock_open),
+        )
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            _close_noerror(lock_fd)
+        _close_noerror(locks_fd)
+
+
+@contextmanager
+def reserve_new_run(
+    roots: StatePaths,
+    name: str,
+    dispatch_key: DispatchKey,
+) -> Iterator[NewRunReservation]:
+    """Exclusively reserve and pin one new run directory for its full create."""
+    if not isinstance(dispatch_key, DispatchKey) or dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE:
+        raise StateError("new run reservation requires a cloud-image DispatchKey")
+    rpaths = _new_run_paths(roots, name)
+    with _new_run_name_lock(roots, name) as name_lock:
+        runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+        if runs_fd is None:
+            raise StateError("cannot securely reserve new run")
+        run_fd: int | None = None
+        created_entry = False
+        owner_created = False
+        try:
+            runs_open = _safe_fstat(runs_fd)
+            runs_path = _safe_stat(roots.runs)
+            if (
+                runs_open is None
+                or runs_path is None
+                or not stat_module.S_ISDIR(runs_open.st_mode)
+                or not stat_module.S_ISDIR(runs_path.st_mode)
+                or _identity(runs_open) != _identity(runs_path)
+            ):
+                raise StateError("cannot securely reserve new run")
+            try:
+                os.mkdir(name, 0o700, dir_fd=runs_fd)
+                created_entry = True
+            except FileExistsError:
+                removed = False
+                try:
+                    _raw_owner, raw_state = _read_pinned_run_payloads(runs_fd, name)
+                    removed = raw_state.get("status") == "removed"
+                except (RecursionError, StateError, TypeError, ValueError):
+                    pass
+                if removed:
+                    raise StateError(
+                        f"run name '{name}' is held by a removed run; free it with: palimpsest rm {name} --volumes"
+                    ) from None
+                raise StateError(f"run name '{name}' already exists") from None
+            except OSError:
+                raise StateError("cannot securely reserve new run") from None
+            try:
+                os.fsync(runs_fd)
+            except OSError:
+                raise StateError("cannot durably reserve new run") from None
+            entry = _safe_stat(name, directory_fd=runs_fd)
+            run_fd = _open_readonly_no_follow(name, directory_fd=runs_fd, directory=True)
+            run_open = None if run_fd is None else _safe_fstat(run_fd)
+            if (
+                entry is None
+                or run_fd is None
+                or run_open is None
+                or not stat_module.S_ISDIR(entry.st_mode)
+                or not stat_module.S_ISDIR(run_open.st_mode)
+                or _identity(entry) != _identity(run_open)
+            ):
+                raise StateError("cannot securely reserve new run")
+            record = OwnerRecord(1, str(uuid.uuid4()), name)
+            _write_exclusive_owner(run_fd, record)
+            owner_created = True
+            reservation = NewRunReservation(
+                roots,
+                rpaths,
+                record,
+                dispatch_key,
+                runs_fd,
+                run_fd,
+                name_lock.locks_fd,
+                name_lock.lock_fd,
+                _identity(runs_open),
+                _identity(run_open),
+                name_lock.locks_identity,
+                name_lock.lock_identity,
+            )
+            reservation.verify_binding()
+            try:
+                yield reservation
+            except BaseException:
+                if reservation.last_status != "failed":
+                    try:
+                        reservation.write_failure({"error": "run creation failed"})
+                    except BaseException:
+                        pass
+                raise
+        finally:
+            if created_entry and not owner_created:
+                current_entry = _safe_stat(name, directory_fd=runs_fd)
+                pinned_entry = None if run_fd is None else _safe_fstat(run_fd)
+                if (
+                    current_entry is not None
+                    and pinned_entry is not None
+                    and _identity(current_entry) == _identity(pinned_entry)
+                ):
+                    try:
+                        os.unlink("owner.json", dir_fd=run_fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.rmdir(name, dir_fd=runs_fd)
+                        os.fsync(runs_fd)
+                    except OSError:
+                        pass
+            if run_fd is not None:
+                _close_noerror(run_fd)
+            _close_noerror(runs_fd)
 
 
 def run_entry_present_or_ambiguous(roots: StatePaths, name: str) -> bool:
