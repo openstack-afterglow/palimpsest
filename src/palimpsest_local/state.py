@@ -26,6 +26,8 @@ from .runtime_types import (
     ALLOWED_RUNTIME_STATUSES,
     DispatchKey,
     ExistingRunRecord,
+    LogErrorCategory,
+    LogStreamError,
     RunAggregationError,
     RuntimeBackend,
     RuntimeKind,
@@ -2555,6 +2557,254 @@ def require_bound_run_dispatch_record(roots: StatePaths, expected: ExistingRunRe
     # selected record.  The OS cannot freeze files against an arbitrary
     # same-owner raw writer after this point, so backend ownership checks and
     # lifecycle locks remain mandatory inside each adapter.
+
+
+@dataclass(slots=True)
+class PinnedRunConsole:
+    """Fixed-purpose, descriptor-pinned authority for one retained console."""
+
+    roots: StatePaths
+    record: ExistingRunRecord
+    runs_fd: int
+    run_fd: int
+    owner_fd: int
+    state_fd: int
+    console_fd: int
+    runs_metadata: os.stat_result
+    run_metadata: os.stat_result
+    console_metadata: os.stat_result
+    initial_size: int
+    position: int = 0
+    closed: bool = False
+
+    def _fail(self, category: LogErrorCategory) -> None:
+        raise LogStreamError(category)
+
+    def _opened_console_size(self, *, allow_unlinked: bool = False) -> int:
+        if self.closed:
+            self._fail(LogErrorCategory.READ_FAILED)
+        opened = _safe_fstat(self.console_fd)
+        if (
+            opened is None
+            or not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink not in ({0, 1} if allow_unlinked else {1})
+            or stat_module.S_IMODE(opened.st_mode) != 0o600
+            or _identity(opened) != _identity(self.console_metadata)
+            or opened.st_size < self.initial_size
+            or opened.st_size < self.position
+        ):
+            self._fail(LogErrorCategory.CONSOLE_CHANGED)
+        return opened.st_size
+
+    def _console_size(self, *, allow_unlinked: bool = False) -> int:
+        size = self._opened_console_size(allow_unlinked=allow_unlinked)
+        current = _safe_stat("console.log", directory_fd=self.run_fd)
+        if current is None and allow_unlinked:
+            return size
+        if (
+            current is None
+            or not stat_module.S_ISREG(current.st_mode)
+            or _identity(current) != _identity(self.console_metadata)
+        ):
+            self._fail(LogErrorCategory.CONSOLE_CHANGED)
+        return size
+
+    def read(self, maximum: int, *, snapshot: bool = False) -> bytes:
+        if type(maximum) is not int or not 1 <= maximum <= 64 * 1024:
+            raise ValueError("console reads must be between 1 and 65536 bytes")
+        size = self._console_size(allow_unlinked=not snapshot)
+        boundary = min(size, self.initial_size) if snapshot else size
+        remaining = boundary - self.position
+        if remaining <= 0:
+            return b""
+        try:
+            content = os.pread(self.console_fd, min(maximum, remaining), self.position)
+        except OSError:
+            self._fail(LogErrorCategory.READ_FAILED)
+        if not content:
+            self._fail(LogErrorCategory.CONSOLE_CHANGED)
+        self.position += len(content)
+        return content
+
+    def current_status(self) -> str:
+        """Revalidate the exact run and console binding at a follow EOF."""
+        runs_current = _safe_stat(self.roots.runs)
+        if (
+            runs_current is None
+            or not stat_module.S_ISDIR(runs_current.st_mode)
+            or runs_current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(runs_current.st_mode) != 0o700
+            or _identity(runs_current) != _identity(self.runs_metadata)
+        ):
+            self._fail(LogErrorCategory.RUN_CHANGED)
+        try:
+            run_current = os.stat(self.record.name, dir_fd=self.runs_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            self._opened_console_size(allow_unlinked=True)
+            return "removed"
+        except OSError:
+            self._fail(LogErrorCategory.RUN_CHANGED)
+        if (
+            not stat_module.S_ISDIR(run_current.st_mode)
+            or run_current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(run_current.st_mode) != 0o700
+            or _identity(run_current) != _identity(self.run_metadata)
+        ):
+            self._fail(LogErrorCategory.RUN_CHANGED)
+        self._console_size()
+        try:
+            raw_owner = _read_pinned_json_object(self.run_fd, "owner.json")
+            raw_state = _read_pinned_json_object(self.run_fd, "state.json")
+            current = _normalize_run_dispatch_record(self.record.name, raw_owner, raw_state)
+            status = raw_state.get("status")
+        except (RecursionError, StateError, TypeError, ValueError):
+            self._fail(LogErrorCategory.RUN_CHANGED)
+        if (
+            current != self.record
+            or not isinstance(status, str)
+            or status not in ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]
+        ):
+            self._fail(LogErrorCategory.RUN_CHANGED)
+        return status
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for descriptor in (self.console_fd, self.state_fd, self.owner_fd, self.run_fd, self.runs_fd):
+            _close_noerror(descriptor)
+
+
+def _open_pinned_private_file(directory_fd: int, filename: str) -> tuple[int, bytes]:
+    before = _safe_stat(filename, directory_fd=directory_fd)
+    if (
+        before is None
+        or not stat_module.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat_module.S_IMODE(before.st_mode) != 0o600
+        or before.st_size > _MAX_RUN_LEDGER_BYTES
+    ):
+        raise StateError("cannot securely pin run file")
+    descriptor = _open_readonly_no_follow(filename, directory_fd=directory_fd, nonblocking=True)
+    if descriptor is None:
+        raise StateError("cannot securely pin run file")
+    try:
+        opened = _safe_fstat(descriptor)
+        if opened is None or _identity(opened) != _identity(before):
+            raise StateError("cannot securely pin run file")
+        content = bytearray()
+        while len(content) <= _MAX_RUN_LEDGER_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, _MAX_RUN_LEDGER_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > _MAX_RUN_LEDGER_BYTES:
+            raise StateError("cannot securely pin run file")
+        after = _safe_fstat(descriptor)
+        current = _safe_stat(filename, directory_fd=directory_fd)
+        if (
+            after is None
+            or current is None
+            or _identity(after) != _identity(before)
+            or _identity(current) != _identity(before)
+            or len(content) != before.st_size
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise StateError("cannot securely pin run file")
+        return descriptor, bytes(content)
+    except Exception:
+        _close_noerror(descriptor)
+        raise
+
+
+def open_pinned_run_console(roots: StatePaths, expected: ExistingRunRecord) -> PinnedRunConsole:
+    """Pin one exact owner/state/console chain without following special files."""
+    descriptors: list[int] = []
+    try:
+        runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
+        if runs_fd is None:
+            raise LogStreamError(LogErrorCategory.RUN_CHANGED)
+        descriptors.append(runs_fd)
+        runs_metadata = _safe_fstat(runs_fd)
+        run_fd = _open_readonly_no_follow(expected.name, directory_fd=runs_fd, directory=True)
+        if runs_metadata is None or run_fd is None:
+            raise LogStreamError(LogErrorCategory.RUN_CHANGED)
+        descriptors.append(run_fd)
+        run_metadata = _safe_fstat(run_fd)
+        current_runs = _safe_stat(roots.runs)
+        current_run = _safe_stat(expected.name, directory_fd=runs_fd)
+        if (
+            runs_metadata is None
+            or current_runs is None
+            or current_run is None
+            or not stat_module.S_ISDIR(runs_metadata.st_mode)
+            or not stat_module.S_ISDIR(current_runs.st_mode)
+            or runs_metadata.st_uid != os.geteuid()
+            or stat_module.S_IMODE(runs_metadata.st_mode) != 0o700
+            or _identity(current_runs) != _identity(runs_metadata)
+            or run_metadata is None
+            or not stat_module.S_ISDIR(run_metadata.st_mode)
+            or run_metadata.st_uid != os.geteuid()
+            or stat_module.S_IMODE(run_metadata.st_mode) != 0o700
+            or _identity(current_run) != _identity(run_metadata)
+        ):
+            raise LogStreamError(LogErrorCategory.RUN_CHANGED)
+        owner_fd, owner_bytes = _open_pinned_private_file(run_fd, "owner.json")
+        descriptors.append(owner_fd)
+        state_fd, state_bytes = _open_pinned_private_file(run_fd, "state.json")
+        descriptors.append(state_fd)
+        try:
+            raw_owner = json.loads(owner_bytes)
+            raw_state = json.loads(state_bytes)
+            if not isinstance(raw_owner, dict) or not isinstance(raw_state, dict):
+                raise ValueError("run ledger is not an object")
+            current = _normalize_run_dispatch_record(expected.name, raw_owner, raw_state)
+        except (RecursionError, TypeError, ValueError):
+            raise LogStreamError(LogErrorCategory.RUN_CHANGED) from None
+        if current != expected:
+            raise LogStreamError(LogErrorCategory.RUN_CHANGED)
+
+        console_before = _safe_stat("console.log", directory_fd=run_fd)
+        console_fd = _open_readonly_no_follow("console.log", directory_fd=run_fd, nonblocking=True)
+        if console_before is None or console_fd is None:
+            raise LogStreamError(LogErrorCategory.INVALID_CONSOLE)
+        descriptors.append(console_fd)
+        console_opened = _safe_fstat(console_fd)
+        if (
+            console_opened is None
+            or not stat_module.S_ISREG(console_before.st_mode)
+            or not stat_module.S_ISREG(console_opened.st_mode)
+            or console_opened.st_uid != os.geteuid()
+            or console_opened.st_nlink != 1
+            or stat_module.S_IMODE(console_opened.st_mode) != 0o600
+            or _identity(console_opened) != _identity(console_before)
+        ):
+            raise LogStreamError(LogErrorCategory.INVALID_CONSOLE)
+        return PinnedRunConsole(
+            roots,
+            expected,
+            runs_fd,
+            run_fd,
+            owner_fd,
+            state_fd,
+            console_fd,
+            runs_metadata,
+            run_metadata,
+            console_opened,
+            console_opened.st_size,
+        )
+    except LogStreamError:
+        for descriptor in reversed(descriptors):
+            _close_noerror(descriptor)
+        raise
+    except (OSError, StateError):
+        for descriptor in reversed(descriptors):
+            _close_noerror(descriptor)
+        raise LogStreamError(LogErrorCategory.RUN_CHANGED) from None
 
 
 @contextmanager

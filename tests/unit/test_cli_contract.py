@@ -108,7 +108,6 @@ _CLI_EXISTING_RUN_OPERATIONS: tuple[tuple[str, str, list[str], dict[str, object]
     ("stop", "stop", ["stop", "demo-vm"], {}),
     ("rm", "rm", ["rm", "demo-vm", "--volumes"], {"volumes": True}),
     ("inspect", "inspect_run", ["inspect", "demo-vm"], {}),
-    ("logs", "logs", ["logs", "demo-vm", "--follow"], {"follow": True}),
 )
 
 
@@ -123,6 +122,7 @@ def test_cli_uses_only_stdlib_and_package_imports():
     assert top_level <= {
         "__future__",
         "argparse",
+        "codecs",
         "collections",
         "dataclasses",
         "datetime",

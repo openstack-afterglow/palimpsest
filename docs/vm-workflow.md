@@ -156,12 +156,15 @@ palimpsest logs hello-vm
 includes owner and runtime identity, lifecycle status/revision, public base and
 layer metadata, resource sizing, ports, volumes, and the guest SSH endpoint.
 Host paths, backend-internal identifiers, environment values, cleanup metadata,
-and raw errors are excluded. `logs` reads the retained Palimpsest console log
-for the run; `--follow` tails it while the run is active.
+and raw errors are excluded. `logs` reads the owner-only retained
+`runs/<name>/console.log` for every cloud backend; `--follow` tails that same
+pinned file while the run is active. Log bytes are preserved exactly until the
+CLI or UI rendering boundary, and reading logs never invokes libvirt, Lima, or
+an in-guest journal.
 
-On every host, `ps` and `inspect` read persisted ledger state without querying
-libvirt or Lima. On macOS, use `limactl shell <name> journalctl -b --no-pager`
-for the in-guest journal and `limactl list` for live instance status.
+On every host, `ps`, `inspect`, and `logs` are state-only operations that do not
+require a live hypervisor capability. An operator may still use Lima's own
+tools separately when an explicitly live, in-guest journal is required.
 
 ## 6. Stop and clean up
 

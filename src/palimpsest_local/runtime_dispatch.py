@@ -10,12 +10,12 @@ import secrets
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
-from . import cloud_runtime, lima, platforms, state
+from . import cloud_runtime, lima, log_stream, platforms, state
 from .errors import StateError
 from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
@@ -36,6 +36,8 @@ from .runtime_types import (
     LifecycleCursor,
     LifecycleResult,
     LifecycleWarningCategory,
+    LogMode,
+    LogStream,
     PreflightReport,
     PreflightReportPurpose,
     ProcessSession,
@@ -984,22 +986,13 @@ def logs(
     roots: StatePaths | None = None,
     follow: bool = False,
     expected_identity: ExpectedRunIdentity | None = None,
-) -> Iterator[str]:
+) -> LogStream:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
     platforms.capability_profile(record.dispatch_key, RuntimeOperation.LOGS)
-
-    def validated_stream() -> Iterator[str]:
-        adapter = _preflight_existing_adapter(record, RuntimeOperation.LOGS, resolved_roots)
-        yield from adapter.logs(
-            name,
-            roots=resolved_roots,
-            follow=follow,
-            _expected_record=record,
-        )
-
-    return validated_stream()
+    mode = LogMode.FOLLOW if follow else LogMode.SNAPSHOT
+    return log_stream.open_retained_console_stream(resolved_roots, record, mode)
 
 
 def _optional_string(raw: Any, field: str) -> str | None:

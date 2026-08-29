@@ -90,7 +90,6 @@ _LIMA_LIVE_OPERATIONS = frozenset(
         RuntimeOperation.START,
         RuntimeOperation.STOP,
         RuntimeOperation.RM,
-        RuntimeOperation.LOGS,
         RuntimeOperation.RECONCILE,
     }
 )
@@ -176,7 +175,7 @@ def capability_profile(
     elif backend is RuntimeBackend.LIMA_VZ:
         if operation in _LIMA_LIVE_OPERATIONS:
             identifiers = ("host.lima-vz", "tool.limactl")
-        elif operation in {RuntimeOperation.INSPECT, RuntimeOperation.PS}:
+        elif operation in _READ_ONLY_STATE_OPERATIONS:
             identifiers = ()
         else:  # pragma: no cover - fail closed when RuntimeOperation grows
             raise RuntimeCapabilityError(operation, dispatch_key)

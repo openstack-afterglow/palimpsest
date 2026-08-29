@@ -35,6 +35,8 @@ from palimpsest_local.runtime_types import (
     ExistingRunRecord,
     ExpectedRunIdentity,
     InspectRecord,
+    LogDataEvent,
+    LogStream,
     PreflightReport,
     ResolvedRunRequest,
     RuntimeBackend,
@@ -579,7 +581,7 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
         ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
     ],
 )
-@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove", "logs"])
+@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove"])
 def test_existing_project_callbacks_route_from_durable_run_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -704,7 +706,34 @@ def test_existing_project_callbacks_route_from_durable_run_ledger(
     assert kwargs == expected_options
 
 
-@pytest.mark.parametrize("operation", ["start", "stop", "remove", "logs"])
+@pytest.mark.parametrize("backend", ["kvm", "libvirt-hvf", "lima-vz"])
+def test_project_logs_callback_returns_dispatcher_owned_typed_console_stream(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend=backend)
+    rpaths.root.chmod(0o700)
+    rpaths.console.write_bytes(b"project\x00\xff\n")
+    rpaths.console.chmod(0o600)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+
+    assert callbacks.logs is not None
+    stream = callbacks.logs(run_name, False)
+    assert isinstance(stream, LogStream)
+    events = list(stream.events())
+    assert b"".join(event.data for event in events if isinstance(event, LogDataEvent)) == b"project\x00\xff\n"
+
+
+@pytest.mark.parametrize("operation", ["start", "stop", "remove"])
 def test_existing_project_callbacks_bind_expected_identity_before_backend_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -809,7 +838,6 @@ def test_project_callbacks_preserve_absent_removed_noop_and_foreign_lima_collisi
     [
         ("stop", "running", 1, "stop"),
         ("remove", "removed", 3, "rm"),
-        ("logs", "running", 1, "logs"),
     ],
 )
 def test_project_operations_reject_cooperative_name_reuse_after_inspection(
@@ -1169,7 +1197,7 @@ def test_down_project_dangling_run_symlink_fails_in_dispatcher_before_backend_or
     assert project_state.read_bytes() == before
 
 
-@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove", "logs"])
+@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove"])
 def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_backend_use(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

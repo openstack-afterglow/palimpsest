@@ -39,6 +39,8 @@ from .runtime_types import (
     ExpectedRunIdentity,
     InspectRecord,
     LifecycleResult,
+    LogEvent,
+    LogStream,
     RunResult,
     RuntimeBackend,
     RuntimeKind,
@@ -216,7 +218,7 @@ class ExistingRunLogsCallback(Protocol):
         follow: bool,
         *,
         expected_identity: ExpectedRunIdentity | None = None,
-    ) -> Iterable[str]: ...
+    ) -> LogStream: ...
 
 
 def _expected_mutation_identity(managed: ManagedService) -> ExpectedRunIdentity:
@@ -1269,30 +1271,40 @@ def project_logs(
     *,
     roots: state.StatePaths | None = None,
     follow: bool = False,
-) -> Iterable[tuple[str, str]]:
-    """Yield ``(service, line)`` pairs without exposing backend run-name details."""
+) -> Iterable[tuple[str, LogEvent]]:
+    """Yield typed events after releasing the project ownership lock."""
 
     if callbacks.logs is None:
         raise ProjectLifecycleError("the selected runtime does not provide a logs callback")
     roots = roots or state.init_roots()
     ppaths = state.project_paths(roots, project.name)
-    with state.file_lock(ppaths.lock):
-        ledger = read_project_state(project, roots)
-        if ledger is None:
-            raise ProjectLifecycleError(f"project {project.name!r} has not been started")
-        selected = list(ledger.order) if services is None else list(dict.fromkeys(services))
-        unknown = sorted(set(selected) - set(ledger.services))
-        if unknown:
-            raise ProjectLifecycleError(f"service(s) are not managed by this project: {', '.join(unknown)}")
-        for service_name in selected:
-            managed = ledger.services[service_name]
-            inspected = callbacks.inspect(managed.run_name)
-            if inspected is None:
-                raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
-            _assert_managed_identity(managed, inspected)
-            for line in callbacks.logs(
-                managed.run_name,
-                follow,
-                expected_identity=_expected_mutation_identity(managed),
-            ):
-                yield service_name, line
+    opened: list[tuple[str, LogStream]] = []
+    try:
+        with state.file_lock(ppaths.lock):
+            ledger = read_project_state(project, roots)
+            if ledger is None:
+                raise ProjectLifecycleError(f"project {project.name!r} has not been started")
+            selected = list(ledger.order) if services is None else list(dict.fromkeys(services))
+            unknown = sorted(set(selected) - set(ledger.services))
+            if unknown:
+                raise ProjectLifecycleError(f"service(s) are not managed by this project: {', '.join(unknown)}")
+            for service_name in selected:
+                managed = ledger.services[service_name]
+                inspected = callbacks.inspect(managed.run_name)
+                if inspected is None:
+                    raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
+                _assert_managed_identity(managed, inspected)
+                stream = callbacks.logs(
+                    managed.run_name,
+                    follow,
+                    expected_identity=_expected_mutation_identity(managed),
+                )
+                if not isinstance(stream, LogStream):
+                    raise ProjectLifecycleError("runtime logs callback returned an invalid stream")
+                opened.append((service_name, stream))
+        for service_name, stream in opened:
+            for event in stream.events():
+                yield service_name, event
+    finally:
+        for _, stream in opened:
+            stream.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 from . import __version__, completion, inventory, lima, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
@@ -85,6 +87,10 @@ from .runtime_types import (
     CloudImageInspectDetail,
     ExpectedRunIdentity,
     InspectRecord,
+    LogDataEvent,
+    LogStreamError,
+    LogTerminalCategory,
+    LogTerminalEvent,
     ProcessOutputEvent,
     ProcessSession,
     ProcessSignal,
@@ -164,6 +170,57 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
         },
         "warnings": [warning.value for warning in inspected.warnings],
     }
+
+
+def _render_compose_log_event(
+    service_name: str,
+    event: LogDataEvent | LogTerminalEvent,
+    pending: dict[str, _ComposeLogRenderState],
+    output: TextIO,
+) -> None:
+    """Stream UTF-8 text with bounded decoder state and LF-only framing."""
+    rendering = pending.setdefault(service_name, _ComposeLogRenderState())
+    if isinstance(event, LogDataEvent):
+        remaining = event.data
+        while True:
+            newline = remaining.find(b"\n")
+            if newline < 0:
+                if remaining:
+                    rendering.start_line(service_name, output)
+                    output.write(rendering.decoder.decode(remaining, final=False))
+                break
+            rendering.start_line(service_name, output)
+            output.write(rendering.decoder.decode(remaining[:newline], final=True))
+            output.write("\n")
+            rendering.reset_line()
+            remaining = remaining[newline + 1 :]
+    else:
+        if rendering.line_started:
+            output.write(rendering.decoder.decode(b"", final=True))
+            output.write("\n")
+            rendering.reset_line()
+        if event.outcome.category is LogTerminalCategory.ERROR:
+            assert event.outcome.error_category is not None
+            raise LogStreamError(event.outcome.error_category)
+
+
+class _ComposeLogRenderState:
+    """Keep only one incremental decoder and whether its logical line began."""
+
+    __slots__ = ("decoder", "line_started")
+
+    def __init__(self) -> None:
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.line_started = False
+
+    def start_line(self, service_name: str, output: TextIO) -> None:
+        if not self.line_started:
+            output.write(f"{service_name} | ")
+            self.line_started = True
+
+    def reset_line(self) -> None:
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.line_started = False
 
 
 def _configured_url() -> str | None:
@@ -1229,16 +1286,15 @@ def _dispatch_compose(
         targets = project_log_targets(project, selected, roots=roots)
         if args.follow and len(targets) != 1:
             raise PalimpsestError("compose logs --follow currently requires exactly one service")
-        for service_name, chunk in project_logs(
+        pending: dict[str, _ComposeLogRenderState] = {}
+        for service_name, event in project_logs(
             project,
             callbacks,
             selected,
             roots=roots,
             follow=args.follow,
         ):
-            sys.stdout.write(f"{service_name} | {chunk}")
-            if chunk and not chunk.endswith("\n"):
-                sys.stdout.write("\n")
+            _render_compose_log_event(service_name, event, pending, sys.stdout)
             sys.stdout.flush()
         return 0
     if operation == "exec":
@@ -1937,9 +1993,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(json.dumps(_inspect_json_payload(info), indent=2))
 
     elif op == "logs":
-        for chunk in runtime_dispatch.logs(args.name, roots=roots, follow=args.follow):
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
+        stream = runtime_dispatch.logs(args.name, roots=roots, follow=args.follow)
+        try:
+            for event in stream.events():
+                if isinstance(event, LogDataEvent):
+                    sys.stdout.buffer.write(event.data)
+                    sys.stdout.buffer.flush()
+                elif event.outcome.category is LogTerminalCategory.ERROR:
+                    assert event.outcome.error_category is not None
+                    raise LogStreamError(event.outcome.error_category)
+        finally:
+            stream.close()
 
     elif op == "shell":
         if not sys.stdin.isatty() or not sys.stdout.isatty():

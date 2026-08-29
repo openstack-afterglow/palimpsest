@@ -520,11 +520,11 @@ def test_operation_capability_matrix_is_exact_for_all_28_supported_cloud_operati
         RuntimeOperation.START,
         RuntimeOperation.STOP,
         RuntimeOperation.RM,
-        RuntimeOperation.LOGS,
         RuntimeOperation.RECONCILE,
     ):
         expected[(RuntimeBackend.LIMA_VZ, operation)] = ("host.lima-vz", "tool.limactl")
     expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.INSPECT)] = ()
+    expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.LOGS)] = ()
     expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.PS)] = ()
 
     assert len(expected) == 28

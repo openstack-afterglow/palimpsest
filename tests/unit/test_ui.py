@@ -57,7 +57,6 @@ def _write_ui_run_ledger(
 
 
 _UI_LIFECYCLE_REQUESTS = (
-    ("logs", "logs", "GET", "/api/v1/vms/ui-vm/logs?tail=2", {"follow": False}),
     ("start", "start", "POST", "/api/v1/vms/ui-vm/start", {}),
     ("stop", "stop", "POST", "/api/v1/vms/ui-vm/stop", {}),
     ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm?volumes=true", {"volumes": True}),
@@ -478,6 +477,8 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
         },
     )
     (run_dir / "console.log").write_text("vm console line 1\nvm console line 2\n", encoding="utf-8")
+    run_dir.chmod(0o700)
+    (run_dir / "console.log").chmod(0o600)
 
     # Synthesize build record
     b_id = "b-000000000999"

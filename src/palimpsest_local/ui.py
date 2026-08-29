@@ -9,17 +9,55 @@ import sys
 import traceback
 import urllib.parse
 import webbrowser
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from . import inventory, platforms, runtime_dispatch, state
 from .errors import PalimpsestError
-from .runtime_types import LifecycleResult
+from .runtime_types import (
+    LifecycleResult,
+    LogDataEvent,
+    LogStream,
+    LogStreamError,
+    LogTerminalCategory,
+)
 
 WEBUI_DIR = Path(__file__).parent / "webui"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_UI_LOG_LINES = 10_000
+_MAX_UI_PARTIAL_LINE_BYTES = 64 * 1024
+
+
+def _bounded_log_tail(stream: LogStream, tail: int) -> str:
+    """Render a bounded byte tail, decoding only at the HTTP boundary."""
+    limit = min(max(tail, 0), _MAX_UI_LOG_LINES)
+    lines: deque[bytes] = deque(maxlen=limit or 1)
+    pending = bytearray()
+    try:
+        for event in stream.events():
+            if isinstance(event, LogDataEvent):
+                pending.extend(event.data)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
+                        break
+                    line = bytes(pending[: newline + 1])
+                    del pending[: newline + 1]
+                    if limit:
+                        lines.append(line[-_MAX_UI_PARTIAL_LINE_BYTES:])
+                if len(pending) > _MAX_UI_PARTIAL_LINE_BYTES:
+                    del pending[:-_MAX_UI_PARTIAL_LINE_BYTES]
+            elif event.outcome.category is LogTerminalCategory.ERROR:
+                assert event.outcome.error_category is not None
+                raise LogStreamError(event.outcome.error_category)
+        if pending and limit:
+            lines.append(bytes(pending))
+        return b"".join(lines).decode("utf-8", errors="replace") if limit else ""
+    finally:
+        stream.close()
 
 
 def _lifecycle_projection(result: LifecycleResult) -> dict[str, Any]:
@@ -191,9 +229,11 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         except ValueError:
                             self._send_json({"error": "invalid tail parameter"}, status=400)
                             return
-                        lines = list(runtime_dispatch.logs(name, roots=roots, follow=False))
-                        tail_lines = lines[-tail:] if tail > 0 else lines
-                        self._send_json({"log": "".join(tail_lines)})
+                        if tail < 0 or tail > _MAX_UI_LOG_LINES:
+                            self._send_json({"error": "tail parameter is out of range"}, status=400)
+                            return
+                        stream = runtime_dispatch.logs(name, roots=roots, follow=False)
+                        self._send_json({"log": _bounded_log_tail(stream, tail)})
                         return
                     else:
                         name = rest

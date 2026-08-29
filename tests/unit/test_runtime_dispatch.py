@@ -37,6 +37,9 @@ from palimpsest_local.runtime_types import (
     LifecycleCursor,
     LifecycleResult,
     LifecycleWarningCategory,
+    LogErrorCategory,
+    LogTerminalCategory,
+    LogTerminalEvent,
     PreflightReport,
     ProcessCapabilities,
     ProcessExit,
@@ -2001,7 +2004,6 @@ _OPERATIONS: tuple[tuple[RuntimeOperation, str, Callable[..., Any], dict[str, An
     (RuntimeOperation.STOP, "stop", runtime_dispatch.stop, {}),
     (RuntimeOperation.RM, "rm", runtime_dispatch.rm, {"volumes": True}),
     (RuntimeOperation.INSPECT, "inspect_run", runtime_dispatch.inspect_run, {}),
-    (RuntimeOperation.LOGS, "logs", runtime_dispatch.logs, {"follow": True}),
 )
 
 _ADAPTER_ENTRY_OPERATIONS: tuple[tuple[RuntimeOperation, Callable[..., Any], dict[str, Any]], ...] = (
@@ -2009,7 +2011,6 @@ _ADAPTER_ENTRY_OPERATIONS: tuple[tuple[RuntimeOperation, Callable[..., Any], dic
     (RuntimeOperation.STOP, runtime_dispatch.stop, {}),
     (RuntimeOperation.RM, runtime_dispatch.rm, {"volumes": True}),
     (RuntimeOperation.INSPECT, runtime_dispatch.inspect_run, {}),
-    (RuntimeOperation.LOGS, runtime_dispatch.logs, {"follow": False}),
 )
 
 
@@ -2019,7 +2020,6 @@ _ADAPTER_ENTRY_OPERATIONS: tuple[tuple[RuntimeOperation, Callable[..., Any], dic
         ("start", runtime_dispatch.start, {}),
         ("stop", runtime_dispatch.stop, {}),
         ("rm", runtime_dispatch.rm, {"volumes": True}),
-        ("logs", runtime_dispatch.logs, {"follow": True}),
     ],
 )
 @pytest.mark.parametrize("mismatch", ["run-id", "backend", "runtime-kind"])
@@ -2365,6 +2365,9 @@ def test_log_stream_revalidates_bound_record_before_calling_or_entering_adapter_
             "status": "stopped",
         },
     )
+    rpaths.root.chmod(0o700)
+    rpaths.console.write_bytes(b"owned bytes")
+    rpaths.console.chmod(0o600)
     calls: list[str] = []
 
     def forbidden_logs(*_args: Any, **_kwargs: Any):
@@ -2396,8 +2399,10 @@ def test_log_stream_revalidates_bound_record_before_calling_or_entering_adapter_
         encoding="utf-8",
     )
 
-    with pytest.raises(StateError, match="run ledger changed during dispatch"):
-        next(stream)
+    events = list(stream.events())
+    assert isinstance(events[-1], LogTerminalEvent)
+    assert events[-1].outcome.category is LogTerminalCategory.ERROR
+    assert events[-1].outcome.error_category is LogErrorCategory.RUN_CHANGED
     assert calls == []
 
 

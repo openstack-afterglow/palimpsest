@@ -66,6 +66,39 @@ class InspectWarningCategory(StrEnum):
     RESOURCE_PRESSURE = "resource-pressure"
 
 
+class LogMode(StrEnum):
+    """Stable stream behavior selected when logs are opened."""
+
+    SNAPSHOT = "snapshot"
+    FOLLOW = "follow"
+
+
+class LogSourceStream(StrEnum):
+    """Logical byte source, independent of a backend's implementation."""
+
+    VM_CONSOLE = "vm-console"
+    WORKLOAD_STDOUT = "workload-stdout"
+    WORKLOAD_STDERR = "workload-stderr"
+    WORKLOAD_PTY = "workload-pty"
+
+
+class LogTerminalCategory(StrEnum):
+    SNAPSHOT_COMPLETE = "snapshot-complete"
+    RUN_TERMINAL = "run-terminal"
+    CANCELLED = "cancelled"
+    ERROR = "error"
+
+
+class LogErrorCategory(StrEnum):
+    """Non-reflective failures safe for callers to branch on."""
+
+    INVALID_CONSOLE = "invalid-console"
+    RUN_CHANGED = "run-changed"
+    CONSOLE_CHANGED = "console-changed"
+    READ_FAILED = "read-failed"
+    ALREADY_CONSUMED = "already-consumed"
+
+
 class CapabilityErrorCategory(StrEnum):
     MISSING = "capability-missing"
     UNSUPPORTED = "capability-unsupported"
@@ -624,6 +657,127 @@ class ExistingRunRecord:
             raise ValueError("existing run record has an invalid state schema version")
         if not isinstance(self.dispatch_key, DispatchKey):
             raise TypeError("existing run record requires a DispatchKey")
+
+
+@dataclass(frozen=True, slots=True)
+class LogCursor:
+    """One shared byte/event position bound to an exact stream generation."""
+
+    record: ExistingRunRecord
+    generation: str
+    position: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("log cursor requires an ExistingRunRecord")
+        if not isinstance(self.generation, str):
+            raise TypeError("log cursor requires a string generation")
+        try:
+            parsed = uuid.UUID(self.generation)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("log cursor has an invalid generation") from None
+        if str(parsed) != self.generation:
+            raise ValueError("log cursor generation is not canonical")
+        if type(self.position) is not int or not 1 <= self.position <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("log cursor position must start at one")
+
+
+@dataclass(frozen=True, slots=True)
+class LogDataEvent:
+    cursor: LogCursor
+    source: LogSourceStream
+    stream_sequence: int
+    observed_at: datetime
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cursor, LogCursor):
+            raise TypeError("log data event requires a LogCursor")
+        if not isinstance(self.source, LogSourceStream):
+            raise TypeError("log data event requires a LogSourceStream")
+        if type(self.stream_sequence) is not int or not 1 <= self.stream_sequence <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("log data event sequence must start at one")
+        if (
+            not isinstance(self.observed_at, datetime)
+            or self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() != UTC.utcoffset(self.observed_at)
+        ):
+            raise ValueError("log data event requires a UTC observation time")
+        if type(self.data) is not bytes or not self.data or len(self.data) > 64 * 1024:
+            raise ValueError("log data event requires 1..65536 exact bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class LogTerminalOutcome:
+    category: LogTerminalCategory
+    error_category: LogErrorCategory | None = None
+    run_status: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.category, LogTerminalCategory):
+            raise TypeError("log terminal outcome requires a category")
+        if self.category is LogTerminalCategory.ERROR:
+            if not isinstance(self.error_category, LogErrorCategory) or self.run_status is not None:
+                raise ValueError("log error terminal requires only a stable error category")
+        elif self.category is LogTerminalCategory.RUN_TERMINAL:
+            if self.error_category is not None or self.run_status not in {"stopped", "removed", "failed", "exited"}:
+                raise ValueError("run terminal requires a terminal run status")
+        elif self.error_category is not None or self.run_status is not None:
+            raise ValueError("normal log terminal cannot contain error or run metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class LogTerminalEvent:
+    cursor: LogCursor
+    observed_at: datetime
+    outcome: LogTerminalOutcome
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cursor, LogCursor):
+            raise TypeError("log terminal event requires a LogCursor")
+        if (
+            not isinstance(self.observed_at, datetime)
+            or self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() != UTC.utcoffset(self.observed_at)
+        ):
+            raise ValueError("log terminal event requires a UTC observation time")
+        if not isinstance(self.outcome, LogTerminalOutcome):
+            raise TypeError("log terminal event requires a LogTerminalOutcome")
+        if (
+            self.outcome.category is LogTerminalCategory.RUN_TERMINAL
+            and self.outcome.run_status not in ALLOWED_RUNTIME_STATUSES[self.cursor.record.dispatch_key.runtime_kind]
+        ):
+            raise ValueError("log terminal status does not match the runtime kind")
+
+
+LogEvent = LogDataEvent | LogTerminalEvent
+
+
+class LogStreamError(LifecycleError):
+    """Stable log failure that never reflects paths or backend output."""
+
+    code = "log-stream-failed"
+
+    def __init__(self, category: LogErrorCategory) -> None:
+        if not isinstance(category, LogErrorCategory):
+            raise TypeError("log stream error requires a stable category")
+        self.category = category
+        super().__init__(f"log stream failed: {category.value}")
+
+
+@runtime_checkable
+class LogStream(Protocol):
+    @property
+    def record(self) -> ExistingRunRecord: ...
+
+    @property
+    def mode(self) -> LogMode: ...
+
+    def events(self) -> Iterator[LogEvent]: ...
+
+    def cancel(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1418,6 +1572,17 @@ __all__ = (
     "LifecycleCursor",
     "LifecycleResult",
     "LifecycleWarningCategory",
+    "LogCursor",
+    "LogDataEvent",
+    "LogErrorCategory",
+    "LogEvent",
+    "LogMode",
+    "LogSourceStream",
+    "LogStream",
+    "LogStreamError",
+    "LogTerminalCategory",
+    "LogTerminalEvent",
+    "LogTerminalOutcome",
     "ProcessCapabilities",
     "ProcessCapabilityError",
     "ProcessEvent",

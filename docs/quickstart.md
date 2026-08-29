@@ -242,7 +242,7 @@ palimpsest ps
 # View an allowlisted, machine-readable durable-state snapshot
 palimpsest inspect web-dev
 
-# Stream live serial console logs
+# Stream retained console-file bytes (state-only on every cloud backend)
 palimpsest logs web-dev --follow
 
 # Open an interactive SSH shell into the guest as user 'ubuntu'
@@ -395,7 +395,7 @@ palimpsest rm web-dev --volumes
 
 ## KVM Runtime Requirements Notice
 
-> **Important:** On Linux, operations that create, enter, or mutate a live KVM guest (`run`, `start`, `stop`, `rm`, `shell`, `exec`, `compose`, Palimpsestfile guest `build`, and `commit`) require the relevant KVM tools, `/dev/kvm` access, and `palimpsest-local[kvm]`. `ps` and `inspect` read only the durable run ledger and do not require `/dev/kvm` or libvirt. Retained cloud-runtime logs likewise remain readable without KVM access. On Apple Silicon, supported `run`/`compose` operations use Lima/VZ instead. Dockerfile/Buildx builds do not use libvirt; runtime packing additionally requires `mksquashfs`.
+> **Important:** On Linux, operations that create, enter, or mutate a live KVM guest (`run`, `start`, `stop`, `rm`, `shell`, `exec`, `compose`, Palimpsestfile guest `build`, and `commit`) require the relevant KVM tools, `/dev/kvm` access, and `palimpsest-local[kvm]`. `ps` and `inspect` read only the durable run ledger, while `logs` reads only the retained owner-only console file; none requires `/dev/kvm`, libvirt, Lima, or an in-guest journal. On Apple Silicon, supported `run`/`compose` operations use Lima/VZ instead. Dockerfile/Buildx builds do not use libvirt; runtime packing additionally requires `mksquashfs`.
 >
 > On hosts without KVM or when `libvirt-python` is absent:
 > - Palimpsestfile guest builds and `palimpsest commit` raise operational errors indicating KVM runtime is unavailable; Dockerfile/Buildx builds remain available.
