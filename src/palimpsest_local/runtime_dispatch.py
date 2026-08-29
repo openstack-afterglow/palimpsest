@@ -2,37 +2,59 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import re
+import secrets
+import threading
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
 from . import cloud_runtime, lima, platforms, state
 from .errors import StateError
-from .refs import RunSpec
+from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
+    CapabilityErrorCategory,
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    PreflightReport,
+    PreflightReportPurpose,
     ProcessSession,
     ResolvedRunRequest,
     RunAggregationError,
     RunAggregationResult,
     RunAttachmentMode,
+    RunRequestProvenance,
+    RunRequestProvenanceStage,
     RunResult,
     RunSummary,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
     RuntimeOperation,
+    RuntimePreflightError,
     RunVolumeIntent,
+    existing_record_subject_digest,
+    run_request_subject_digest,
+    snapshot_cloud_init,
 )
 from .state import StatePaths
 
 _RECEIPT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_RUN_REQUEST_AUTHENTICATION_KEY = secrets.token_bytes(32)
+_VOLUME_BINDING_AUTHENTICATION_KEY = secrets.token_bytes(32)
+_PROJECT_VOLUME_BINDING_AUTHORITY = object()
+_VOLUME_BINDING_RECEIPT_TTL_NS = 60 * 1_000_000_000
+_MAX_ISSUED_VOLUME_BINDING_RECEIPTS = 4096
+_ISSUED_VOLUME_BINDING_RECEIPTS: dict[str, tuple[str, int]] = {}
+_VOLUME_BINDING_RECEIPT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +65,188 @@ class _CreationReceipt:
     run_id: str
     dispatch_key: DispatchKey
     status: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _VolumeBindingReceipt:
+    issuer_nonce: str
+    expires_at_monotonic_ns: int
+    authentication_tag: str
+
+
+def _attachment_subject_digest(request: ResolvedRunRequest) -> str:
+    payload = [
+        {
+            "name": volume.name,
+            "mount_path": volume.mount_path,
+            "host_path": str(volume.host_path) if volume.host_path is not None else None,
+            "backend_name": volume.backend_name,
+            "filesystem": volume.filesystem,
+            "read_only": volume.read_only,
+            "format": volume.format,
+        }
+        for volume in request.spec.volumes
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _final_attachment_subject_digest(final_spec: RunSpec) -> str:
+    payload = [
+        {
+            "name": volume.name,
+            "mount_path": volume.mount_path,
+            "host_path": str(volume.host_path) if volume.host_path is not None else None,
+            "backend_name": volume.backend_name,
+            "filesystem": volume.filesystem,
+            "read_only": volume.read_only,
+            "format": volume.format,
+        }
+        for volume in final_spec.volumes
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _volume_binding_authentication_tag(
+    request: ResolvedRunRequest,
+    final_spec: RunSpec,
+    dispatch_key: DispatchKey,
+    issuer_nonce: str,
+    expires_at_monotonic_ns: int,
+) -> str:
+    payload = {
+        "nonce": issuer_nonce,
+        "expires_at_monotonic_ns": expires_at_monotonic_ns,
+        "logical_subject": run_request_subject_digest(request),
+        "logical_provenance_nonce": request.provenance.issuer_nonce if request.provenance is not None else None,
+        "attachment_subject": _final_attachment_subject_digest(final_spec),
+        "dispatch_key": [dispatch_key.runtime_kind.value, dispatch_key.backend.value],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(_VOLUME_BINDING_AUTHENTICATION_KEY, encoded, hashlib.sha256).hexdigest()
+
+
+def _issue_volume_binding_receipt(
+    request: ResolvedRunRequest,
+    final_spec: RunSpec,
+    *,
+    dispatch_key: DispatchKey,
+    _authority: object,
+    now_ns: int | None = None,
+) -> _VolumeBindingReceipt:
+    """Project preparation's private handoff after it verifies managed sources."""
+
+    if _authority is not _PROJECT_VOLUME_BINDING_AUTHORITY:
+        raise StateError("volume binding receipt issuer is unauthorized")
+    if not isinstance(request, ResolvedRunRequest) or not isinstance(final_spec, RunSpec):
+        raise TypeError("volume binding receipt requires a resolved request and final RunSpec")
+    if not isinstance(dispatch_key, DispatchKey) or dispatch_key != request.dispatch_key:
+        raise StateError("volume binding receipt dispatch identity is invalid")
+    _require_run_request_provenance(request)
+    if request.attachments_bound:
+        raise StateError("volume binding receipt requires a logical request")
+    issued = time.monotonic_ns() if now_ns is None else now_ns
+    if type(issued) is not int or issued < 0:
+        raise StateError("volume binding receipt clock is invalid")
+    expires = issued + _VOLUME_BINDING_RECEIPT_TTL_NS
+    nonce = secrets.token_hex(32)
+    tag = _volume_binding_authentication_tag(request, final_spec, dispatch_key, nonce, expires)
+    with _VOLUME_BINDING_RECEIPT_LOCK:
+        _prune_volume_binding_receipts(issued)
+        if len(_ISSUED_VOLUME_BINDING_RECEIPTS) >= _MAX_ISSUED_VOLUME_BINDING_RECEIPTS:
+            raise StateError("volume binding receipt capacity is exhausted")
+        _ISSUED_VOLUME_BINDING_RECEIPTS[nonce] = (tag, expires)
+    return _VolumeBindingReceipt(nonce, expires, tag)
+
+
+def _prune_volume_binding_receipts(now_ns: int, *, preserve_nonce: str | None = None) -> None:
+    for nonce, (_, expires) in tuple(_ISSUED_VOLUME_BINDING_RECEIPTS.items()):
+        if nonce != preserve_nonce and expires <= now_ns:
+            del _ISSUED_VOLUME_BINDING_RECEIPTS[nonce]
+
+
+def _consume_volume_binding_receipt(
+    receipt: _VolumeBindingReceipt | None,
+    request: ResolvedRunRequest,
+    final_spec: RunSpec,
+    dispatch_key: DispatchKey,
+    *,
+    now_ns: int | None = None,
+) -> None:
+    if not isinstance(receipt, _VolumeBindingReceipt):
+        raise StateError("volume binding requires a verifier-issued receipt")
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    if type(now) is not int or now < 0:
+        raise StateError("volume binding receipt clock is invalid")
+    expected = _volume_binding_authentication_tag(
+        request,
+        final_spec,
+        dispatch_key,
+        receipt.issuer_nonce,
+        receipt.expires_at_monotonic_ns,
+    )
+    with _VOLUME_BINDING_RECEIPT_LOCK:
+        _prune_volume_binding_receipts(now, preserve_nonce=receipt.issuer_nonce)
+        registered = _ISSUED_VOLUME_BINDING_RECEIPTS.pop(receipt.issuer_nonce, None)
+    if (
+        registered is None
+        or not hmac.compare_digest(receipt.authentication_tag, expected)
+        or not hmac.compare_digest(registered[0], receipt.authentication_tag)
+    ):
+        raise StateError("volume binding receipt could not be verified")
+    if now >= receipt.expires_at_monotonic_ns:
+        raise StateError("volume binding receipt has expired")
+
+
+def _run_request_authentication_tag(
+    request: ResolvedRunRequest,
+    *,
+    stage: RunRequestProvenanceStage,
+    issuer_nonce: str,
+) -> str:
+    payload = {
+        "stage": stage.value,
+        "nonce": issuer_nonce,
+        "logical_subject": run_request_subject_digest(request),
+        "attachment_subject": _attachment_subject_digest(request),
+        "attachments_bound": request.attachments_bound,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(_RUN_REQUEST_AUTHENTICATION_KEY, encoded, hashlib.sha256).hexdigest()
+
+
+def _issue_run_request_provenance(
+    request: ResolvedRunRequest,
+    stage: RunRequestProvenanceStage,
+) -> ResolvedRunRequest:
+    nonce = secrets.token_hex(32)
+    provenance = RunRequestProvenance(
+        stage,
+        nonce,
+        _run_request_authentication_tag(request, stage=stage, issuer_nonce=nonce),
+    )
+    return replace(request, provenance=provenance)
+
+
+def _require_run_request_provenance(request: ResolvedRunRequest) -> None:
+    provenance = request.provenance
+    expected_stage = RunRequestProvenanceStage.BOUND if request.attachments_bound else RunRequestProvenanceStage.LOGICAL
+    if not isinstance(provenance, RunRequestProvenance) or provenance.stage is not expected_stage:
+        raise RuntimePreflightError(
+            CapabilityErrorCategory.REPORT_PROVENANCE,
+            "resolved run request was not issued by the runtime resolver",
+        )
+    expected_tag = _run_request_authentication_tag(
+        request,
+        stage=provenance.stage,
+        issuer_nonce=provenance.issuer_nonce,
+    )
+    if not hmac.compare_digest(provenance.authentication_tag, expected_tag):
+        raise RuntimePreflightError(
+            CapabilityErrorCategory.REPORT_PROVENANCE,
+            "resolved run request provenance could not be verified",
+        )
 
 
 def _parse_creation_receipt(raw: Any) -> _CreationReceipt:
@@ -96,37 +300,123 @@ def resolve_run_request(
         )
     if not isinstance(spec, RunSpec):
         raise TypeError("run resolver requires a RunSpec")
+    if spec.volumes:
+        raise StateError("physical volume attachments require the private project volume binder")
     if type(require_volume_binding) is not bool:
         raise TypeError("volume binding requirement must be a boolean")
-    resolved_intents = (
-        tuple(
-            RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
-            for volume in spec.volumes
-        )
-        if volume_intents is None
-        else volume_intents
-    )
-    backend = RuntimeBackend(platforms.select_backend(spec.stack.base.arch, requested=requested_backend))
-    return ResolvedRunRequest(
+    frozen_cloud_init = snapshot_cloud_init(spec.cloud_init)
+    resolved_spec = spec if frozen_cloud_init is spec.cloud_init else replace(spec, cloud_init=frozen_cloud_init)
+    resolved_intents = () if volume_intents is None else volume_intents
+    backend = RuntimeBackend(platforms.select_backend(resolved_spec.stack.base.arch, requested=requested_backend))
+    request = ResolvedRunRequest(
         dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
-        spec=spec,
+        spec=resolved_spec,
         volume_intents=resolved_intents,
         attachments_bound=not require_volume_binding,
     )
+    stage = RunRequestProvenanceStage.BOUND if request.attachments_bound else RunRequestProvenanceStage.LOGICAL
+    return _issue_run_request_provenance(request, stage)
 
 
-def preflight_run_request(request: ResolvedRunRequest) -> ResolvedRunRequest:
-    """Run the existing backend-only create preflight and return ``request``.
-
-    This is an explicit compatibility boundary, not a capability token. It does
-    not promise freshness or cryptographically bind the observation to a later
-    adapter call; the operation-profile contract lands in a later slice.
-    """
+def preflight_run_request(
+    request: ResolvedRunRequest,
+    *,
+    host: platforms.HostPlatform | None = None,
+    now_ns: int | None = None,
+) -> PreflightReport:
+    """Return one successful, short-lived report bound to logical create intent."""
 
     if not isinstance(request, ResolvedRunRequest):
         raise TypeError("run preflight requires a ResolvedRunRequest")
-    platforms.preflight(request.dispatch_key.backend.value)
-    return request
+    _require_run_request_provenance(request)
+    profile = platforms.capability_profile(
+        request.dispatch_key,
+        RuntimeOperation.RUN,
+        network=request.spec.network,
+    )
+    report = platforms.evaluate_capability_profile(
+        profile,
+        subject_digest=run_request_subject_digest(request),
+        arch=request.spec.stack.base.arch,
+        host=host,
+        now_ns=now_ns,
+    )
+    if not report.successful:
+        failed = next(item for item in report.checks if not item.passed)
+        raise RuntimePreflightError(
+            failed.error_category or CapabilityErrorCategory.CHECK_FAILED,
+            failed.remediation or "runtime capability preflight failed",
+            report=report,
+            capability_id=failed.capability_id,
+        )
+    return report
+
+
+def preflight_run_capabilities(
+    arch: str,
+    *,
+    requested_backend: str = "auto",
+    network: str | None = None,
+    host: platforms.HostPlatform | None = None,
+) -> DispatchKey:
+    """Read-only early gate used before a remote image pull mutates local storage.
+
+    ``network=None`` intentionally selects the host/tool-only profile for
+    Compose, where the exact service network is resolved later but still
+    before project volume or runtime mutation. Direct run callers pass the
+    exact requested network.
+    """
+
+    resolved_host = host or platforms.detect_host()
+    backend = RuntimeBackend(platforms.select_backend(arch, host=resolved_host, requested=requested_backend))
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+    profile = platforms.capability_profile(key, RuntimeOperation.RUN, network=network)
+    raw_subject = f"early-run:{profile.profile_id}:{arch}:{network}".encode()
+    report = platforms.evaluate_capability_profile(
+        profile,
+        subject_digest="sha256:" + hashlib.sha256(raw_subject).hexdigest(),
+        arch=arch,
+        host=resolved_host,
+        purpose=PreflightReportPurpose.DISCOVERY,
+    )
+    if not report.successful:
+        failed = next(item for item in report.checks if not item.passed)
+        raise RuntimePreflightError(
+            failed.error_category or CapabilityErrorCategory.CHECK_FAILED,
+            failed.remediation or "runtime capability preflight failed",
+            report=report,
+            capability_id=failed.capability_id,
+        )
+    return key
+
+
+def require_run_preflight(
+    request: ResolvedRunRequest,
+    report: PreflightReport | None,
+    *,
+    now_ns: int | None = None,
+) -> None:
+    """Fail before mutation unless ``report`` matches current request/profile/freshness."""
+
+    if not isinstance(request, ResolvedRunRequest):
+        raise TypeError("run preflight validation requires a ResolvedRunRequest")
+    if not isinstance(report, PreflightReport):
+        raise RuntimePreflightError(
+            CapabilityErrorCategory.REPORT_PROVENANCE,
+            "run requires an issuer-authenticated preflight report",
+        )
+    _require_run_request_provenance(request)
+    current_profile = platforms.capability_profile(
+        request.dispatch_key,
+        RuntimeOperation.RUN,
+        network=request.spec.network,
+    )
+    platforms.consume_capability_report(
+        report,
+        expected_profile=current_profile,
+        expected_subject_digest=run_request_subject_digest(request),
+        now_ns=now_ns,
+    )
 
 
 def bind_run_request_volumes(
@@ -134,17 +424,28 @@ def bind_run_request_volumes(
     final_spec: RunSpec,
     *,
     dispatch_key: DispatchKey,
+    receipt: _VolumeBindingReceipt | None = None,
 ) -> ResolvedRunRequest:
     """Bind prepared physical volumes without changing any logical run input."""
 
     if not isinstance(request, ResolvedRunRequest) or not isinstance(final_spec, RunSpec):
         raise TypeError("volume binding requires a resolved request and final RunSpec")
+    _require_run_request_provenance(request)
+    if request.attachments_bound:
+        raise StateError("volume binding requires an unbound logical request")
     if not isinstance(dispatch_key, DispatchKey) or dispatch_key != request.dispatch_key:
         raise StateError("prepared run request changed its dispatch identity")
-    final_intents = tuple(
-        RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
-        for volume in final_spec.volumes
-    )
+    if not isinstance(final_spec.volumes, tuple) or not all(
+        isinstance(volume, VolumeAttachment) for volume in final_spec.volumes
+    ):
+        raise StateError("prepared volume attachments are invalid")
+    try:
+        final_intents = tuple(
+            RunVolumeIntent(volume.name, volume.mount_path, volume.filesystem, volume.read_only)
+            for volume in final_spec.volumes
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise StateError("prepared volume attachments are invalid") from None
     if final_intents != request.volume_intents:
         raise StateError("prepared volume attachments changed logical volume intent")
     backend = request.dispatch_key.backend
@@ -169,31 +470,36 @@ def bind_run_request_volumes(
     )
     if not unchanged:
         raise StateError("prepared volume binding changed immutable run inputs")
-    return ResolvedRunRequest(
+    _consume_volume_binding_receipt(receipt, request, final_spec, dispatch_key)
+    bound = ResolvedRunRequest(
         dispatch_key=request.dispatch_key,
         spec=final_spec,
         volume_intents=request.volume_intents,
         attachments_bound=True,
     )
+    return _issue_run_request_provenance(bound, RunRequestProvenanceStage.BOUND)
 
 
 def run(
     request: ResolvedRunRequest,
     *,
+    preflight: PreflightReport | None = None,
     roots: StatePaths | None = None,
 ) -> RunResult:
     """Create one VM through the exact already-resolved backend adapter.
 
-    First-party callers must invoke :func:`preflight_run_request` before this
-    boundary. That sequencing is intentionally caller-owned until typed,
-    request-bound capability reports are introduced.
+    A successful report is consumed before state-root initialization or adapter
+    entry. Direct cloud compatibility APIs retain their historical behavior.
     """
 
     if not isinstance(request, ResolvedRunRequest):
         raise TypeError("runtime run requires a ResolvedRunRequest")
+    _require_run_request_provenance(request)
     if not request.attachments_bound:
         raise StateError("run request volumes have not been prepared")
-    resolved_roots = roots or state.init_roots()
+    resolved_roots = roots or state.resolve_roots()
+    require_run_preflight(request, preflight)
+    resolved_roots = state.init_resolved_roots(resolved_roots)
     if request.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
         raw_result = lima.run(request.spec, roots=resolved_roots)
     else:
@@ -235,6 +541,61 @@ def resolve_existing_run(name: str, *, roots: StatePaths | None = None) -> Exist
     return state.read_run_dispatch_record(resolved_roots, name)
 
 
+def preflight_existing_record(
+    record: ExistingRunRecord,
+    operation: RuntimeOperation,
+    *,
+    host: platforms.HostPlatform | None = None,
+    now_ns: int | None = None,
+) -> PreflightReport:
+    """Issue one authenticated operation report bound to an exact run record."""
+
+    if not isinstance(record, ExistingRunRecord) or not isinstance(operation, RuntimeOperation):
+        raise TypeError("existing run preflight requires a record and operation")
+    profile = platforms.capability_profile(record.dispatch_key, operation)
+    report = platforms.evaluate_capability_profile(
+        profile,
+        subject_digest=existing_record_subject_digest(record),
+        host=host,
+        now_ns=now_ns,
+    )
+    if not report.successful:
+        failed = next(item for item in report.checks if not item.passed)
+        raise RuntimePreflightError(
+            failed.error_category or CapabilityErrorCategory.CHECK_FAILED,
+            failed.remediation or "runtime capability preflight failed",
+            report=report,
+            capability_id=failed.capability_id,
+        )
+    return report
+
+
+def require_existing_preflight(
+    record: ExistingRunRecord,
+    operation: RuntimeOperation,
+    report: PreflightReport | None,
+    *,
+    host: platforms.HostPlatform | None = None,
+    now_ns: int | None = None,
+) -> None:
+    """Authenticate and consume one report for an exact record operation."""
+
+    if not isinstance(record, ExistingRunRecord) or not isinstance(operation, RuntimeOperation):
+        raise TypeError("existing run preflight validation requires a record and operation")
+    if not isinstance(report, PreflightReport):
+        raise RuntimePreflightError(
+            CapabilityErrorCategory.REPORT_PROVENANCE,
+            "existing run operation requires an issuer-authenticated preflight report",
+        )
+    platforms.consume_capability_report(
+        report,
+        expected_profile=platforms.capability_profile(record.dispatch_key, operation),
+        expected_subject_digest=existing_record_subject_digest(record),
+        host=host,
+        now_ns=now_ns,
+    )
+
+
 def _adapter_for(record: ExistingRunRecord, operation: RuntimeOperation) -> Any:
     if record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
         raise RuntimeCapabilityError(operation, record.dispatch_key)
@@ -247,6 +608,18 @@ def _revalidate_bound_record(record: ExistingRunRecord, roots: StatePaths) -> No
     current = state.read_run_dispatch_record(roots, record.name)
     if current != record:
         raise StateError("run ledger changed during dispatch")
+
+
+def _preflight_existing_adapter(
+    record: ExistingRunRecord,
+    operation: RuntimeOperation,
+    roots: StatePaths,
+) -> Any:
+    report = preflight_existing_record(record, operation)
+    adapter = _adapter_for(record, operation)
+    _revalidate_bound_record(record, roots)
+    require_existing_preflight(record, operation, report)
+    return adapter
 
 
 def _require_expected_identity(record: ExistingRunRecord, expected_identity: ExpectedRunIdentity | None) -> None:
@@ -279,8 +652,7 @@ def exec(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.EXEC)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.EXEC, resolved_roots)
     return _require_process_session(
         adapter.exec_session(
             name,
@@ -300,8 +672,7 @@ def shell(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.SHELL)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.SHELL, resolved_roots)
     return _require_process_session(
         adapter.shell_session(
             name,
@@ -320,8 +691,7 @@ def start(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.START)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.START, resolved_roots)
     return adapter.start(name, roots=resolved_roots, _expected_record=record)
 
 
@@ -334,8 +704,7 @@ def stop(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.STOP)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.STOP, resolved_roots)
     return adapter.stop(name, roots=resolved_roots, _expected_record=record)
 
 
@@ -349,8 +718,7 @@ def rm(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.RM)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.RM, resolved_roots)
     return adapter.rm(
         name,
         roots=resolved_roots,
@@ -362,8 +730,7 @@ def rm(
 def inspect_run(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
-    adapter = _adapter_for(record, RuntimeOperation.INSPECT)
-    _revalidate_bound_record(record, resolved_roots)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.INSPECT, resolved_roots)
     return adapter.inspect_run(name, roots=resolved_roots, _expected_record=record)
 
 
@@ -377,10 +744,10 @@ def logs(
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _adapter_for(record, RuntimeOperation.LOGS)
+    platforms.capability_profile(record.dispatch_key, RuntimeOperation.LOGS)
 
     def validated_stream() -> Iterator[str]:
-        _revalidate_bound_record(record, resolved_roots)
+        adapter = _preflight_existing_adapter(record, RuntimeOperation.LOGS, resolved_roots)
         yield from adapter.logs(
             name,
             roots=resolved_roots,
@@ -601,8 +968,7 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
     for snapshot in snapshots:
         record = snapshot.record
         try:
-            adapter = _adapter_for(record, RuntimeOperation.RECONCILE)
-            _revalidate_bound_record(record, resolved_roots)
+            adapter = _preflight_existing_adapter(record, RuntimeOperation.RECONCILE, resolved_roots)
             if adapter is cloud_runtime:
                 adapter_result = cloud_runtime.reconcile_run(
                     record.name,
@@ -642,7 +1008,7 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
                         message="runtime status changed during reconciliation",
                     )
                 )
-        except RuntimeCapabilityError:
+        except (RuntimeCapabilityError, RuntimePreflightError):
             summary, projection_error = _project_or_error(
                 snapshot,
                 operation=RuntimeOperation.RECONCILE,
@@ -689,9 +1055,13 @@ __all__ = (
     "exec",
     "inspect_run",
     "logs",
+    "preflight_existing_record",
+    "preflight_run_capabilities",
     "preflight_run_request",
     "ps",
     "reconcile",
+    "require_existing_preflight",
+    "require_run_preflight",
     "resolve_existing_run",
     "resolve_run_request",
     "rm",

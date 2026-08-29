@@ -9,7 +9,17 @@ from palimpsest_local import inventory, state
 from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.runtime_types import CapabilityCheck
 from palimpsest_local.state import TagRecord, init_roots, write_tag_record
+
+
+@pytest.fixture(autouse=True)
+def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 def _setup_roots(tmp_path: Path) -> state.StatePaths:

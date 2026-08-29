@@ -10,7 +10,7 @@ import socket
 import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import kvm, lima, runtime_dispatch, state
@@ -40,7 +40,7 @@ from .project_volumes import (
     verify_lima_volume,
 )
 from .refs import PortForward, RunSpec, StackRef, VolumeAttachment
-from .runtime_types import ExpectedRunIdentity, ResolvedRunRequest, RunVolumeIntent
+from .runtime_types import ExpectedRunIdentity, PreflightReport, ResolvedRunRequest, RunVolumeIntent
 
 _MIB = 1024 * 1024
 
@@ -305,7 +305,7 @@ def build_project_callbacks(
     execution_inputs: dict[str, _ResolvedExecutionInputs] = {}
     attachment_cache: dict[tuple[str, str], VolumeAttachment] = {}
     preexisting_volume_keys: set[tuple[str, str]] = set()
-    preflighted_requests: dict[str, ResolvedRunRequest] = {}
+    preflighted_requests: dict[str, tuple[ResolvedRunRequest, PreflightReport]] = {}
     prepare_complete = False
 
     def resolved_inputs(_project: Project, service: ServiceSpec) -> _ResolvedExecutionInputs:
@@ -751,16 +751,19 @@ def build_project_callbacks(
         # Preserve existing project error precedence: backend/tool probing is
         # the final preflight step, after every pure reservation, spec, path,
         # network, domain, and volume validation, and immediately before the
-        # caller enters volume preparation. These cached requests are not
-        # stale-proof capability tokens; T14 will add that later contract.
-        completed_preflights: dict[str, ResolvedRunRequest] = {}
+        # caller enters volume preparation. Reports stay bound to logical
+        # intent while physical volume attachment paths are prepared later.
+        completed_preflights: dict[str, tuple[ResolvedRunRequest, PreflightReport]] = {}
         for item in prepared:
             if item.plan.action not in {"create", "recreate"} or item.plan.preserve_config:
                 continue
             resolved = item.resolved
             if not isinstance(resolved, ResolvedProjectService):
                 raise LifecycleError("project resolver returned an invalid service payload")
-            completed_preflights[item.plan.service] = runtime_dispatch.preflight_run_request(resolved.request)
+            completed_preflights[item.plan.service] = (
+                resolved.request,
+                runtime_dispatch.preflight_run_request(resolved.request),
+            )
         preflighted_requests.update(completed_preflights)
 
     def prepare(prepared: tuple[PreparedService, ...]) -> tuple[ManagedVolume, ...]:
@@ -866,31 +869,30 @@ def build_project_callbacks(
         resolved = item.resolved
         if not isinstance(resolved, ResolvedProjectService):
             raise LifecycleError("project resolver returned an invalid service payload")
-        ports = tuple(
-            PortForward(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in item.service.ports
-        )
-        spec = RunSpec(
-            name=item.plan.run_name,
-            stack=resolved.stack,
-            memory_mib=item.service.memory_mib,
-            vcpus=item.service.vcpus,
-            network=resolved.network,
-            ports=ports,
-            volumes=attachments(item, resolved),
-            environment=resolved.environment,
-            cloud_init=resolved.cloud_init,
-        )
-        logical_request = preflighted_requests.get(item.plan.service)
-        if logical_request is not resolved.request:
+        logical_preflight = preflighted_requests.get(item.plan.service)
+        if logical_preflight is None or logical_preflight[0] is not resolved.request:
             raise StateError("project run request was not preflighted before volume preparation")
-        request = runtime_dispatch.bind_run_request_volumes(
-            logical_request,
-            spec,
-            dispatch_key=resolved.request.dispatch_key,
-        )
+        logical_request, preflight = logical_preflight
+        if item.service.volumes:
+            spec = replace(logical_request.spec, volumes=attachments(item, resolved))
+            binding_receipt = runtime_dispatch._issue_volume_binding_receipt(
+                logical_request,
+                spec,
+                dispatch_key=logical_request.dispatch_key,
+                _authority=runtime_dispatch._PROJECT_VOLUME_BINDING_AUTHORITY,
+            )
+            request = runtime_dispatch.bind_run_request_volumes(
+                logical_request,
+                spec,
+                dispatch_key=logical_request.dispatch_key,
+                receipt=binding_receipt,
+            )
+        else:
+            spec = logical_request.spec
+            request = logical_request
         if resolved.backend == "lima-vz":
             try:
-                return runtime_dispatch.run(request, roots=roots)
+                return runtime_dispatch.run(request, preflight=preflight, roots=roots)
             except Exception as exc:
                 if spec.volumes and not any(volume.format for volume in spec.volumes):
                     detail = str(exc).strip() or type(exc).__name__
@@ -900,7 +902,7 @@ def build_project_callbacks(
                         "contents before explicitly deleting any named volume."
                     ) from exc
                 raise
-        return runtime_dispatch.run(request, roots=roots)
+        return runtime_dispatch.run(request, preflight=preflight, roots=roots)
 
     def stop_service(
         name: str,

@@ -14,7 +14,10 @@ import pytest
 from palimpsest_local import cli, digest, runtime_dispatch, state
 from palimpsest_local.errors import PalimpsestError
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.refs import RunSpec
 from palimpsest_local.runtime_types import (
+    CapabilityCheck,
+    CapabilityErrorCategory,
     DispatchKey,
     ExistingRunRecord,
     ProcessCapabilities,
@@ -28,6 +31,7 @@ from palimpsest_local.runtime_types import (
     RunResult,
     RuntimeBackend,
     RuntimeKind,
+    RuntimePreflightError,
 )
 
 
@@ -36,6 +40,11 @@ def _isolated_xdg_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     """Keep CLI state/config writes out of the developer's real XDG roots."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 def _write_cli_run_ledger(
@@ -146,7 +155,7 @@ def test_digest_file_streams_hash(tmp_path: Path):
     assert "read_bytes()" not in inspect.getsource(digest.digest_file)
 
 
-def test_run_image_resolution_pulls_missing_verified_cloud_image_from_selected_hub(
+def test_non_run_image_resolution_pulls_without_runtime_capability_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
@@ -170,6 +179,11 @@ def test_run_image_resolution_pulls_missing_verified_cloud_image_from_selected_h
 
     monkeypatch.setattr(cli, "HubClient", FakeHub)
     monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        cli.runtime_dispatch,
+        "preflight_run_capabilities",
+        lambda *_args, **_kwargs: pytest.fail("non-run image resolution entered runtime preflight"),
+    )
 
     image = cli._resolve_image_ref(store, digest_value, "https://hub.example.test")
 
@@ -1326,15 +1340,33 @@ def test_cli_dispatch_run_passes_cli_layers(
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": "kvm")
-    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", lambda backend: None)
-    recorded_specs = []
+    preflight = object()
+    pinned_roots = cli.resolve_roots()
+    redirected_state = tmp_path / "redirected-after-preflight"
+
+    def preflight_and_replace_config(_request: object) -> object:
+        pinned_roots.config.mkdir(parents=True, exist_ok=True)
+        (pinned_roots.config / "config.toml").write_text(
+            f'[storage]\nstate_root = "{redirected_state}"\n',
+            encoding="utf-8",
+        )
+        return preflight
+
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", preflight_and_replace_config)
+    recorded_specs: list[RunSpec] = []
+    passed_roots: list[state.StatePaths] = []
     monkeypatch.setattr(
         cli.runtime_dispatch,
         "run",
-        lambda request, roots=None: (
-            recorded_specs.append(request.spec),
-            _fake_run_result(request.spec.name, RuntimeBackend.KVM, "10.0.0.5"),
-        )[1],
+        lambda request, preflight=None, roots=None: (
+            (
+                recorded_specs.append(request.spec),
+                passed_roots.append(roots),
+                _fake_run_result(request.spec.name, RuntimeBackend.KVM, "10.0.0.5"),
+            )[2]
+            if preflight is not None
+            else pytest.fail("CLI omitted preflight report")
+        ),
     )
 
     ret = cli.main(["run", base_digest, "--name", "test-vm", "--layer", layer_digest])
@@ -1344,7 +1376,55 @@ def test_cli_dispatch_run_passes_cli_layers(
     assert spec.name == "test-vm"
     assert len(spec.stack.layers) == 1
     assert spec.stack.layers[0].digest == layer_digest
+    assert passed_roots == [pinned_roots]
+    assert not redirected_state.exists()
     assert capsys.readouterr().out.strip() == "10.0.0.5"
+
+
+def test_remote_run_capability_failure_precedes_pull_or_store_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    digest_value = "sha256:" + "d" * 64
+    store = ContentStore(tmp_path / "not-created-store")
+    pulls: list[Path] = []
+    monkeypatch.setenv("PALIMPSEST_URL", "https://hub.invalid")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        cli.HubClient,
+        "get_layer",
+        lambda _self, _digest: {
+            "kind": "cloud-image",
+            "disk_format": "qcow2",
+            "arch": "x86_64",
+        },
+    )
+    monkeypatch.setattr(
+        cli.HubClient,
+        "pull_blob",
+        lambda _self, _digest, destination: pulls.append(destination) or pytest.fail("pull reached"),
+    )
+    requested: list[tuple[str, str, str]] = []
+
+    def reject(arch: str, *, requested_backend: str, network: str) -> None:
+        requested.append((arch, requested_backend, network))
+        raise RuntimePreflightError(CapabilityErrorCategory.MISSING, "host capability unavailable")
+
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_capabilities", reject)
+
+    with pytest.raises(RuntimePreflightError, match="host capability unavailable"):
+        cli._resolve_image_ref(
+            store,
+            digest_value,
+            None,
+            requested_backend="kvm",
+            preflight_for_run=True,
+            run_network="private",
+        )
+
+    assert requested == [("x86_64", "kvm", "private")]
+    assert pulls == []
+    assert not store.root.exists()
 
 
 def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1423,6 +1503,7 @@ def test_layer_push_preserves_runtime_pack_chain_and_arch(monkeypatch: pytest.Mo
         ),
     )
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
     monkeypatch.setenv("PALIMPSEST_URL", "http://hub.invalid")
     monkeypatch.setenv("PALIMPSEST_TOKEN", "token")
     pushed: list[dict[str, object]] = []
@@ -1478,6 +1559,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64", "os_variant": None},
     )
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
     selected = []
     preflighted = []
     run_calls = []
@@ -1488,16 +1570,20 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
         lambda arch, requested="auto": (selected.append((arch, requested)), "libvirt-hvf")[1],
     )
 
-    def preflight(backend: str) -> None:
-        assert capsys.readouterr().err == ""
-        preflighted.append(backend)
+    token = object()
 
-    def run(request, roots=None):
+    def preflight(request) -> object:
+        assert capsys.readouterr().err == ""
+        preflighted.append(request.dispatch_key.backend.value)
+        return token
+
+    def run(request, *, preflight, roots=None):
         assert "warning: libvirt-hvf is experimental" in capsys.readouterr().err
+        assert preflight is token
         run_calls.append(request)
         return _fake_run_result(request.spec.name, RuntimeBackend.LIBVIRT_HVF, None)
 
-    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", preflight)
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", preflight)
     monkeypatch.setattr(
         cli.runtime_dispatch,
         "run",
@@ -1532,17 +1618,23 @@ def test_cli_run_dispatch_lima_routing(
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64", "os_variant": None},
     )
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
     run_requests = []
 
     monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": "lima-vz")
-    monkeypatch.setattr(runtime_dispatch.platforms, "preflight", lambda backend: None)
+    token = object()
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", lambda _request: token)
     monkeypatch.setattr(
         cli.runtime_dispatch,
         "run",
-        lambda request, roots=None: (
-            run_requests.append(request),
-            _fake_run_result(request.spec.name, RuntimeBackend.LIMA_VZ, "192.0.2.10"),
-        )[1],
+        lambda request, preflight=None, roots=None: (
+            (
+                run_requests.append(request),
+                _fake_run_result(request.spec.name, RuntimeBackend.LIMA_VZ, "192.0.2.10"),
+            )[1]
+            if preflight is token
+            else pytest.fail("CLI omitted preflight report")
+        ),
     )
 
     ret = cli.main(["run", base_digest, "--name", "lima-vm", "--backend", "lima-vz"])

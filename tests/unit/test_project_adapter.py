@@ -28,20 +28,28 @@ from palimpsest_local.project_runtime import (
 )
 from palimpsest_local.refs import ImageRef, StackRef
 from palimpsest_local.runtime_types import (
+    CapabilityCheck,
+    CloudInitSnapshot,
     DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    PreflightReport,
     ResolvedRunRequest,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
     RunVolumeIntent,
+    run_request_subject_digest,
 )
 
 
 @pytest.fixture(autouse=True)
-def _stub_backend_only_create_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "preflight", lambda _backend: None)
+def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 def _roots(tmp_path: Path) -> state.StatePaths:
@@ -242,9 +250,9 @@ def test_kvm_port_forwarding_fails_during_project_preflight(tmp_path: Path, monk
     monkeypatch.setattr(project_adapter, "preflight_kvm_volume_support", lambda: None)
     backend_preflights: list[str] = []
     monkeypatch.setattr(
-        project_adapter.runtime_dispatch.platforms,
-        "preflight",
-        lambda backend: backend_preflights.append(backend),
+        project_adapter.runtime_dispatch,
+        "preflight_run_request",
+        lambda request: backend_preflights.append(request.dispatch_key.backend.value),
     )
     callbacks = project_adapter.build_project_callbacks(project, _roots(tmp_path), lambda _service: _stack(tmp_path))
     service = project.services["api"]
@@ -259,6 +267,161 @@ def test_kvm_port_forwarding_fails_during_project_preflight(tmp_path: Path, monk
     with pytest.raises(ArtifactValidationError, match="per-domain inbound forwarding"):
         callbacks.preflight((prepared,))
     assert backend_preflights == []
+
+
+def test_compose_custom_network_is_bound_into_exact_run_preflight_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""networks:
+  shared:
+    external: true
+    name: custom-net
+services:
+  api:
+    image: sha256:{"a" * 64}
+    networks: [shared]
+""",
+    )
+    roots = _roots(tmp_path)
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
+    manual_network_checks: list[str] = []
+    monkeypatch.setattr(project_adapter.kvm, "validate_network", manual_network_checks.append)
+    monkeypatch.setattr(project_adapter.kvm, "validate_domain_name_available", lambda _name: None)
+    original_preflight = project_adapter.runtime_dispatch.preflight_run_request
+    reports: list[PreflightReport] = []
+
+    def capture_preflight(request: ResolvedRunRequest):
+        report = original_preflight(request)
+        reports.append(report)
+        return report
+
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "preflight_run_request", capture_preflight)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    service = project.services["api"]
+    resolved = callbacks.resolve(project, service, "demo-api-1")
+    prepared = PreparedService(
+        project,
+        service,
+        ServicePlan("api", "demo-api-1", "create", "sha256:" + "b" * 64, None),
+        resolved,
+    )
+
+    callbacks.preflight((prepared,))
+
+    assert resolved.request.spec.network == "custom-net"
+    assert manual_network_checks == ["custom-net"]
+    assert len(reports) == 1
+    report = reports[0]
+    network_requirement = next(item for item in report.profile.requirements if item.capability_id == "network.libvirt")
+    assert network_requirement.selector == "custom-net"
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch"),
+    [("kvm", "x86_64"), ("lima-vz", "aarch64")],
+)
+@pytest.mark.parametrize("with_volume", [False, True])
+def test_project_create_preserves_signed_request_and_cloud_init_snapshot_through_start(
+    backend: str,
+    arch: str,
+    with_volume: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud_init = tmp_path / "cloud-init.yml"
+    cloud_init.write_text("packages: [curl]\n", encoding="utf-8")
+    volume_section = "volumes:\n  data:\n    size: 1GiB\n" if with_volume else ""
+    service_volume = "    volumes: [data:/srv/data]\n" if with_volume else ""
+    project = _project(
+        tmp_path,
+        f"""{volume_section}services:
+  api:
+    image: sha256:{"a" * 64}
+    cloud_init:
+      file: cloud-init.yml
+{service_volume}""",
+    )
+    roots = _roots(tmp_path)
+    service = project.services["api"]
+    run_name = service_run_name(project, "api")
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda *_args, **_kwargs: backend,
+    )
+    if backend == "kvm":
+        monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
+        monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
+        monkeypatch.setattr(project_adapter.kvm, "validate_domain_name_available", lambda _name: None)
+        if with_volume:
+            volume_path = tmp_path / "managed.raw"
+            monkeypatch.setattr(project_adapter, "kvm_volume_path", lambda *_args: volume_path)
+            monkeypatch.setattr(project_adapter, "preflight_kvm_volume_support", lambda: None)
+
+            def ensure_kvm(*_args: object, **_kwargs: object) -> SimpleNamespace:
+                volume_path.write_bytes(b"managed")
+                return SimpleNamespace(path=volume_path)
+
+            monkeypatch.setattr(project_adapter, "ensure_kvm_volume", ensure_kvm)
+    else:
+        monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+        monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
+        monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
+        if with_volume:
+            backend_name = project_adapter.lima_backend_name(project.name, "data")
+            monkeypatch.setattr(project_adapter, "verify_lima_volume", lambda *_args, **_kwargs: None)
+            monkeypatch.setattr(
+                project_adapter,
+                "ensure_lima_volume",
+                lambda *_args, **_kwargs: SimpleNamespace(backend_name=backend_name, created=True),
+            )
+
+    received: list[tuple[ResolvedRunRequest, PreflightReport]] = []
+
+    def consume_at_dispatch(
+        request: ResolvedRunRequest,
+        *,
+        preflight: PreflightReport,
+        **_kwargs: object,
+    ) -> dict[str, str]:
+        assert preflight.subject_digest == run_request_subject_digest(request)
+        project_adapter.runtime_dispatch.require_run_preflight(request, preflight)
+        received.append((request, preflight))
+        return {"status": "running"}
+
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "run", consume_at_dispatch)
+    callbacks = project_adapter.build_project_callbacks(
+        project,
+        roots,
+        lambda _service: _stack(tmp_path, arch=arch),
+    )
+    resolved = callbacks.resolve(project, service, run_name)
+    prepared = PreparedService(
+        project,
+        service,
+        ServicePlan("api", run_name, "create", "sha256:" + "b" * 64, None),
+        resolved,
+    )
+
+    callbacks.preflight((prepared,))
+    callbacks.prepare((prepared,))
+    callbacks.start(prepared)
+
+    request, _report = received[0]
+    assert isinstance(request.spec.cloud_init, CloudInitSnapshot)
+    assert request.spec.cloud_init.packages == ("curl",)
+    assert request.spec.cloud_init is resolved.request.spec.cloud_init
+    if with_volume:
+        assert request is not resolved.request
+        assert request.attachments_bound is True
+        assert len(request.spec.volumes) == 1
+    else:
+        assert request is resolved.request
+        assert request.spec.volumes == ()
 
 
 def test_new_kvm_service_receives_project_block_volume_and_environment(
@@ -281,11 +444,12 @@ services:
     roots = _roots(tmp_path)
     volume_path = tmp_path / "data.raw"
     events: list[str] = []
+    original_preflight = project_adapter.runtime_dispatch.preflight_run_request
     monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
     monkeypatch.setattr(
-        project_adapter.runtime_dispatch.platforms,
-        "preflight",
-        lambda _backend: events.append("preflight"),
+        project_adapter.runtime_dispatch,
+        "preflight_run_request",
+        lambda request: (events.append("preflight"), original_preflight(request))[1],
     )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
     monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)

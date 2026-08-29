@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import re
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import PurePosixPath
+from pathlib import PurePath, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
-from .errors import PalimpsestError
+from .errors import LifecycleError, PalimpsestError
 from .refs import RunSpec
 
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -42,6 +44,170 @@ class RuntimeOperation(StrEnum):
     RECONCILE = "reconcile"
     EXEC = "exec"
     SHELL = "shell"
+
+
+class CapabilityErrorCategory(StrEnum):
+    MISSING = "capability-missing"
+    UNSUPPORTED = "capability-unsupported"
+    CHECK_FAILED = "capability-check-failed"
+    REPORT_MISMATCH = "preflight-report-mismatch"
+    REPORT_STALE = "preflight-report-stale"
+    REPORT_PROVENANCE = "preflight-report-provenance"
+    REPORT_CONSUMED = "preflight-report-consumed"
+    REPORT_CAPACITY = "preflight-report-capacity"
+
+
+class PreflightReportPurpose(StrEnum):
+    OPERATION = "operation"
+    DISCOVERY = "discovery"
+
+
+_CAPABILITY_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$")
+_SUBJECT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_REPORT_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityRequirement:
+    capability_id: str
+    selector: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capability_id, str) or _CAPABILITY_ID_RE.fullmatch(self.capability_id) is None:
+            raise ValueError("capability requirement has an invalid ID")
+        if self.selector is not None and (
+            not isinstance(self.selector, str)
+            or not self.selector
+            or len(self.selector) > 256
+            or "\x00" in self.selector
+        ):
+            raise ValueError("capability requirement has an invalid selector")
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityProfile:
+    schema_version: int
+    dispatch_key: DispatchKey
+    operation: RuntimeOperation
+    requirements: tuple[CapabilityRequirement, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("capability profile has an unsupported schema version")
+        if not isinstance(self.dispatch_key, DispatchKey):
+            raise TypeError("capability profile requires a DispatchKey")
+        if not isinstance(self.operation, RuntimeOperation):
+            raise TypeError("capability profile requires a RuntimeOperation")
+        if not isinstance(self.requirements, tuple) or not all(
+            isinstance(item, CapabilityRequirement) for item in self.requirements
+        ):
+            raise TypeError("capability profile requires immutable requirements")
+        identifiers = tuple(item.capability_id for item in self.requirements)
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("capability profile contains duplicate requirements")
+
+    @property
+    def profile_id(self) -> str:
+        return (
+            f"runtime-capability-v{self.schema_version}:"
+            f"{self.dispatch_key.runtime_kind.value}/{self.dispatch_key.backend.value}/{self.operation.value}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityCheck:
+    capability_id: str
+    observed: str
+    passed: bool
+    error_category: CapabilityErrorCategory | None = None
+    remediation: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capability_id, str) or _CAPABILITY_ID_RE.fullmatch(self.capability_id) is None:
+            raise ValueError("capability check has an invalid ID")
+        if not isinstance(self.observed, str) or not self.observed or len(self.observed) > 128:
+            raise ValueError("capability check has an invalid observation")
+        if type(self.passed) is not bool:
+            raise TypeError("capability check pass state must be a bool")
+        if self.passed:
+            if self.error_category is not None or self.remediation is not None:
+                raise ValueError("successful capability check cannot contain failure metadata")
+        elif not isinstance(self.error_category, CapabilityErrorCategory) or not self.remediation:
+            raise ValueError("failed capability check requires stable failure metadata")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PreflightReport:
+    schema_version: int
+    profile: CapabilityProfile
+    subject_digest: str
+    checks: tuple[CapabilityCheck, ...]
+    issued_at_monotonic_ns: int
+    expires_at_monotonic_ns: int
+    host_digest: str
+    purpose: PreflightReportPurpose
+    issuer_nonce: str
+    authentication_tag: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("preflight report has an unsupported schema version")
+        if not isinstance(self.profile, CapabilityProfile):
+            raise TypeError("preflight report requires a CapabilityProfile")
+        if not isinstance(self.subject_digest, str) or _SUBJECT_DIGEST_RE.fullmatch(self.subject_digest) is None:
+            raise ValueError("preflight report has an invalid subject digest")
+        if not isinstance(self.host_digest, str) or _SUBJECT_DIGEST_RE.fullmatch(self.host_digest) is None:
+            raise ValueError("preflight report has an invalid host digest")
+        if not isinstance(self.purpose, PreflightReportPurpose):
+            raise TypeError("preflight report requires a purpose")
+        if not isinstance(self.issuer_nonce, str) or _REPORT_TOKEN_RE.fullmatch(self.issuer_nonce) is None:
+            raise ValueError("preflight report has an invalid issuer nonce")
+        if not isinstance(self.authentication_tag, str) or _REPORT_TOKEN_RE.fullmatch(self.authentication_tag) is None:
+            raise ValueError("preflight report has an invalid authentication tag")
+        if not isinstance(self.checks, tuple) or not all(isinstance(item, CapabilityCheck) for item in self.checks):
+            raise TypeError("preflight report requires immutable checks")
+        if tuple(item.capability_id for item in self.checks) != tuple(
+            item.capability_id for item in self.profile.requirements
+        ):
+            raise ValueError("preflight report checks do not match its profile")
+        if (
+            type(self.issued_at_monotonic_ns) is not int
+            or type(self.expires_at_monotonic_ns) is not int
+            or self.issued_at_monotonic_ns < 0
+            or self.expires_at_monotonic_ns <= self.issued_at_monotonic_ns
+        ):
+            raise ValueError("preflight report has an invalid freshness window")
+
+    @property
+    def successful(self) -> bool:
+        return all(item.passed for item in self.checks)
+
+
+class RuntimePreflightError(LifecycleError):
+    code = "runtime-preflight-failed"
+
+    def __init__(
+        self,
+        category: CapabilityErrorCategory,
+        message: str,
+        *,
+        report: PreflightReport | None = None,
+        capability_id: str | None = None,
+    ) -> None:
+        if not isinstance(category, CapabilityErrorCategory):
+            raise TypeError("runtime preflight error requires a stable category")
+        if not isinstance(message, str) or not message:
+            raise ValueError("runtime preflight error requires a message")
+        if report is not None and not isinstance(report, PreflightReport):
+            raise TypeError("runtime preflight error report is invalid")
+        if capability_id is not None and (
+            not isinstance(capability_id, str) or _CAPABILITY_ID_RE.fullmatch(capability_id) is None
+        ):
+            raise ValueError("runtime preflight error capability ID is invalid")
+        self.category = category
+        self.report = report
+        self.capability_id = capability_id
+        super().__init__(message)
 
 
 class ProcessStream(StrEnum):
@@ -188,6 +354,85 @@ class RunAttachmentMode(StrEnum):
     DETACHED = "detached"
 
 
+class RunRequestProvenanceStage(StrEnum):
+    LOGICAL = "logical"
+    BOUND = "bound"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RunRequestProvenance:
+    stage: RunRequestProvenanceStage
+    issuer_nonce: str
+    authentication_tag: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, RunRequestProvenanceStage):
+            raise TypeError("run request provenance requires a stage")
+        if not isinstance(self.issuer_nonce, str) or _REPORT_TOKEN_RE.fullmatch(self.issuer_nonce) is None:
+            raise ValueError("run request provenance has an invalid nonce")
+        if not isinstance(self.authentication_tag, str) or _REPORT_TOKEN_RE.fullmatch(self.authentication_tag) is None:
+            raise ValueError("run request provenance has an invalid authentication tag")
+
+
+@dataclass(frozen=True, slots=True)
+class CloudInitWriteFileSnapshot:
+    path: str
+    content: str
+    permissions: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) for value in (self.path, self.content, self.permissions)):
+            raise TypeError("cloud-init write-file snapshot fields must be strings")
+
+
+@dataclass(frozen=True, slots=True)
+class CloudInitSnapshot:
+    packages: tuple[str, ...]
+    write_files: tuple[CloudInitWriteFileSnapshot, ...]
+    runcmd: tuple[tuple[str, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.packages, tuple) or not all(isinstance(value, str) for value in self.packages):
+            raise TypeError("cloud-init package snapshot must contain strings")
+        if not isinstance(self.write_files, tuple) or not all(
+            isinstance(value, CloudInitWriteFileSnapshot) for value in self.write_files
+        ):
+            raise TypeError("cloud-init write-file snapshot is invalid")
+        if not isinstance(self.runcmd, tuple) or not all(
+            isinstance(command, tuple) and all(isinstance(argument, str) for argument in command)
+            for command in self.runcmd
+        ):
+            raise TypeError("cloud-init command snapshot is invalid")
+
+
+def snapshot_cloud_init(value: object | None) -> CloudInitSnapshot | None:
+    """Freeze exactly the cloud-init fields consumed by runtime adapters.
+
+    Ordinary getter/conversion failures are normalized without chaining so
+    secret-bearing exception text cannot escape. Process-control exceptions
+    such as ``KeyboardInterrupt`` and ``SystemExit`` intentionally propagate.
+    """
+
+    if value is None or isinstance(value, CloudInitSnapshot):
+        return value
+    snapshot: CloudInitSnapshot | None = None
+    try:
+        packages = tuple(value.packages)  # type: ignore[attr-defined]
+        write_files = tuple(
+            CloudInitWriteFileSnapshot(item.path, item.content, item.permissions)  # type: ignore[attr-defined]
+            for item in value.write_files  # type: ignore[attr-defined]
+        )
+        commands = tuple(tuple(command) for command in value.runcmd)  # type: ignore[attr-defined]
+        snapshot = CloudInitSnapshot(packages, write_files, commands)
+    except Exception:
+        pass
+    if snapshot is None:
+        # Raise with no active exception so attacker-controlled getter errors
+        # cannot survive in __context__, __cause__, or the rendered traceback.
+        raise TypeError("runtime cloud-init input cannot be converted to an immutable snapshot")
+    return snapshot
+
+
 ALLOWED_RUNTIME_COMBINATIONS = frozenset(
     {
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
@@ -235,14 +480,16 @@ class ResolvedRunRequest:
     """A pure create-time routing decision plus its non-reflective logical spec.
 
     ``attachments_bound`` is false only while a project is still preparing
-    managed volume artifacts. It is deliberately not a capability token: the
-    current backend-only preflight has no freshness or request-binding contract.
+    managed volume artifacts. Resolver and binder provenance authenticate the
+    immutable request shape, while the separate one-use preflight report
+    authorizes a fresh adapter entry.
     """
 
     dispatch_key: DispatchKey
     spec: RunSpec = dataclass_field(repr=False)
     volume_intents: tuple[RunVolumeIntent, ...] = dataclass_field(default=(), repr=False)
     attachments_bound: bool = True
+    provenance: RunRequestProvenance | None = dataclass_field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.dispatch_key, DispatchKey):
@@ -261,6 +508,8 @@ class ResolvedRunRequest:
             raise ValueError("OCI-root create requests are unavailable before the OCI input contract lands")
         if type(self.attachments_bound) is not bool:
             raise TypeError("resolved run request attachment binding must be a boolean")
+        if self.provenance is not None and not isinstance(self.provenance, RunRequestProvenance):
+            raise TypeError("resolved run request provenance is invalid")
         if not self.attachments_bound and self.spec.volumes:
             raise ValueError("an unbound logical run request cannot contain physical volume attachments")
         if not self.attachments_bound and not self.volume_intents:
@@ -355,6 +604,109 @@ class ExistingRunRecord:
             raise ValueError("existing run record has an invalid state schema version")
         if not isinstance(self.dispatch_key, DispatchKey):
             raise TypeError("existing run record requires a DispatchKey")
+
+
+def _binding_projection(value: Any) -> Any:
+    """Return an in-process canonical projection used only behind SHA-256."""
+
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, PurePath):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_binding_projection(item) for item in value]
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("preflight binding mappings require string keys")
+        return {key: _binding_projection(value[key]) for key in sorted(value)}
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _binding_projection(getattr(value, item.name)) for item in fields(value)}
+    raise TypeError(f"preflight binding does not support {type(value).__module__}.{type(value).__qualname__}")
+
+
+def _cloud_init_binding_projection(value: object | None) -> Mapping[str, Any] | None:
+    """Project exactly the mutable cloud-init fields consumed by guest rendering."""
+
+    snapshot = snapshot_cloud_init(value)
+    if snapshot is None:
+        return None
+    return {
+        "packages": snapshot.packages,
+        "write_files": tuple(
+            {
+                "path": item.path,
+                "content": item.content,
+                "permissions": item.permissions,
+            }
+            for item in snapshot.write_files
+        ),
+        "runcmd": snapshot.runcmd,
+    }
+
+
+def _subject_digest(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        _binding_projection(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def run_request_subject_digest(request: ResolvedRunRequest) -> str:
+    """Bind preflight to logical create intent without exposing its secrets."""
+
+    if not isinstance(request, ResolvedRunRequest):
+        raise TypeError("run request subject requires a ResolvedRunRequest")
+    spec = request.spec
+    return _subject_digest(
+        {
+            "schema_version": 1,
+            "dispatch_key": {
+                "runtime_kind": request.dispatch_key.runtime_kind,
+                "backend": request.dispatch_key.backend,
+            },
+            "name": spec.name,
+            "stack": {
+                "base": {
+                    "digest": spec.stack.base.digest,
+                    "disk_format": spec.stack.base.disk_format,
+                    "arch": spec.stack.base.arch,
+                    "os_variant": spec.stack.base.os_variant,
+                },
+                "layers": tuple({"digest": item.digest, "media_type": item.media_type} for item in spec.stack.layers),
+            },
+            "memory_mib": spec.memory_mib,
+            "vcpus": spec.vcpus,
+            "network": spec.network,
+            "writable_overlay": spec.writable_overlay,
+            "seed": spec.seed,
+            "ports": spec.ports,
+            "volume_intents": request.volume_intents,
+            "environment": spec.environment,
+            "cloud_init": _cloud_init_binding_projection(spec.cloud_init),
+        }
+    )
+
+
+def existing_record_subject_digest(record: ExistingRunRecord) -> str:
+    """Bind an operation profile to one exact durable run identity."""
+
+    if not isinstance(record, ExistingRunRecord):
+        raise TypeError("existing run subject requires an ExistingRunRecord")
+    return _subject_digest(
+        {
+            "schema_version": 1,
+            "name": record.name,
+            "run_id": record.run_id,
+            "state_schema_version": record.state_schema_version,
+            "runtime_kind": record.dispatch_key.runtime_kind,
+            "backend": record.dispatch_key.backend,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,6 +1056,12 @@ class RuntimeCapabilityError(PalimpsestError):
 __all__ = (
     "ALLOWED_RUNTIME_COMBINATIONS",
     "ALLOWED_RUNTIME_STATUSES",
+    "CapabilityCheck",
+    "CapabilityErrorCategory",
+    "CapabilityProfile",
+    "CapabilityRequirement",
+    "CloudInitSnapshot",
+    "CloudInitWriteFileSnapshot",
     "DispatchKey",
     "ExecRequest",
     "ExistingRunRecord",
@@ -718,15 +1076,23 @@ __all__ = (
     "ProcessSignal",
     "ProcessStatusEvent",
     "ProcessStream",
+    "PreflightReport",
+    "PreflightReportPurpose",
     "ResolvedRunRequest",
     "RunAttachmentMode",
     "RunAggregationError",
     "RunAggregationResult",
     "RunResult",
+    "RunRequestProvenance",
+    "RunRequestProvenanceStage",
     "RunSummary",
     "RunVolumeIntent",
     "RuntimeBackend",
     "RuntimeCapabilityError",
     "RuntimeKind",
     "RuntimeOperation",
+    "RuntimePreflightError",
+    "existing_record_subject_digest",
+    "run_request_subject_digest",
+    "snapshot_cloud_init",
 )

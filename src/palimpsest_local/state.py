@@ -397,7 +397,14 @@ def resolve_roots(environment: dict[str, str] | None = None) -> StatePaths:
 
 
 def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
-    roots = resolve_roots(environment)
+    return init_resolved_roots(resolve_roots(environment))
+
+
+def init_resolved_roots(roots: StatePaths) -> StatePaths:
+    """Initialize exactly one previously resolved root authority without re-reading config."""
+
+    if not isinstance(roots, StatePaths):
+        raise TypeError("root initialization requires resolved StatePaths")
     for directory in (
         roots.config,
         roots.state,

@@ -134,10 +134,15 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                     backends_info = {}
                     for b in platforms.BACKENDS:
                         try:
-                            platforms.preflight(b, host=host_info)
-                            backends_info[b] = {"available": True, "reason": None}
+                            report = platforms.backend_capability_report(b, host=host_info)
+                            failure = next((item for item in report.checks if not item.passed), None)
+                            backends_info[b] = {
+                                "available": report.successful,
+                                "reason": failure.remediation if failure is not None else None,
+                                "profile": report.profile.profile_id,
+                            }
                         except PalimpsestError as e:
-                            backends_info[b] = {"available": False, "reason": str(e)}
+                            backends_info[b] = {"available": False, "reason": str(e), "profile": None}
                     storage = inventory.storage_report(roots)
                     self._send_json(
                         {

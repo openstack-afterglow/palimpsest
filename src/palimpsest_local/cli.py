@@ -153,7 +153,15 @@ def _image_ref_from_store(store: ContentStore, digest: str) -> ImageRef:
     )
 
 
-def _resolve_image_ref(store: ContentStore, digest: str, explicit_url: str | None) -> ImageRef:
+def _resolve_image_ref(
+    store: ContentStore,
+    digest: str,
+    explicit_url: str | None,
+    *,
+    requested_backend: str = "auto",
+    preflight_for_run: bool = False,
+    run_network: str | None = None,
+) -> ImageRef:
     """Resolve a cloud image from verified local storage or the selected Hub."""
     normalized = require_digest(digest)
     if store.exists(normalized):
@@ -166,6 +174,12 @@ def _resolve_image_ref(store: ContentStore, digest: str, explicit_url: str | Non
     arch = metadata.get("arch")
     if disk_format not in DISK_FORMAT_MEDIA_TYPES or arch not in {"x86_64", "aarch64"}:
         raise PalimpsestError(f"cloud-image metadata is incomplete for {normalized}")
+    if preflight_for_run:
+        runtime_dispatch.preflight_run_capabilities(
+            arch,
+            requested_backend=requested_backend,
+            network=run_network,
+        )
     blob_path = store.blob_path(normalized)
     blob_path.parent.mkdir(parents=True, exist_ok=True)
     client.pull_blob(normalized, blob_path)
@@ -829,6 +843,10 @@ def _resolve_runtime_stack(
     image_or_bundle: str | Path,
     layer_digests: Sequence[str],
     explicit_url: str | None,
+    *,
+    requested_backend: str = "auto",
+    preflight_for_run: bool = False,
+    run_network: str | None = None,
 ) -> StackRef:
     target_path = Path(image_or_bundle)
     if target_path.is_dir():
@@ -876,7 +894,14 @@ def _resolve_runtime_stack(
         )
         return StackRef(base=base_ref, layers=bundle_layers + extra_layers)
     image_digest = os.fspath(image_or_bundle)
-    base_ref = _resolve_image_ref(store, image_digest, explicit_url)
+    base_ref = _resolve_image_ref(
+        store,
+        image_digest,
+        explicit_url,
+        requested_backend=requested_backend,
+        preflight_for_run=preflight_for_run,
+        run_network=run_network,
+    )
     return StackRef(base=base_ref, layers=_layer_refs_from_store(store, layer_digests, base_ref.digest))
 
 
@@ -997,7 +1022,13 @@ def _compose_callbacks(
             target = service.image
         else:  # pragma: no cover - project schema enforces exactly one source
             raise PalimpsestError(f"service {service.name!r} has no boot image or bundle")
-        return _resolve_runtime_stack(store, target, service.layers, explicit_url)
+        return _resolve_runtime_stack(
+            store,
+            target,
+            service.layers,
+            explicit_url,
+            preflight_for_run=True,
+        )
 
     return build_project_callbacks(project, roots, resolve_stack, environment=environment)
 
@@ -1213,8 +1244,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
     if op == "completion":
         print(completion.generate_completion_script(args.shell))
         return 0
-    existing_run_operations = {"start", "stop", "rm", "inspect", "logs", "ps"}
-    roots = resolve_roots() if op in existing_run_operations else init_roots()
+    read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
+    roots = resolve_roots() if op in read_only_root_operations else init_roots()
     store = ContentStore(roots.store)
 
     if op == "registry":
@@ -1796,7 +1827,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return _dispatch_compose(args, roots, store)
 
     elif op == "run":
-        stack = _resolve_runtime_stack(store, args.image_or_bundle, args.layer, args.url)
+        stack = _resolve_runtime_stack(
+            store,
+            args.image_or_bundle,
+            args.layer,
+            args.url,
+            requested_backend=args.backend,
+            preflight_for_run=True,
+            run_network=args.network,
+        )
         run_spec = RunSpec(
             name=args.name,
             stack=stack,
@@ -1805,10 +1844,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
             network=args.network,
         )
         request = runtime_dispatch.resolve_run_request(run_spec, requested_backend=args.backend)
-        runtime_dispatch.preflight_run_request(request)
+        preflight = runtime_dispatch.preflight_run_request(request)
         if request.dispatch_key.backend.value == "libvirt-hvf":
             print("warning: libvirt-hvf is experimental", file=sys.stderr)
-        result = runtime_dispatch.run(request, roots=roots)
+        result = runtime_dispatch.run(request, preflight=preflight, roots=roots)
         if result.backend.value == "lima-vz":
             print(f"limactl shell {args.name}")
         else:

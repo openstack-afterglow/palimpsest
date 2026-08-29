@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from palimpsest_local import state, ui
-from palimpsest_local.runtime_types import ExistingRunRecord, RuntimeBackend
+from palimpsest_local.runtime_types import CapabilityCheck, ExistingRunRecord, RuntimeBackend
 from palimpsest_local.state import init_roots
 
 
@@ -57,6 +57,15 @@ _UI_LIFECYCLE_REQUESTS = (
     ("stop", "stop", "POST", "/api/v1/vms/ui-vm/stop", {}),
     ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm?volumes=true", {"volumes": True}),
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ui.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 @pytest.fixture

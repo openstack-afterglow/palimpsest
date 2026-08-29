@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import socket
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,18 @@ import pytest
 import palimpsest_local.kvm as kvm_module
 import palimpsest_local.platforms as platforms
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError
+from palimpsest_local.runtime_types import (
+    CapabilityCheck,
+    CapabilityErrorCategory,
+    CapabilityRequirement,
+    DispatchKey,
+    PreflightReportPurpose,
+    RuntimeBackend,
+    RuntimeCapabilityError,
+    RuntimeKind,
+    RuntimeOperation,
+    RuntimePreflightError,
+)
 
 
 def test_backend_constants_are_stable_identifiers():
@@ -456,6 +469,491 @@ def test_preflight_lima_succeeds_when_available(monkeypatch: pytest.MonkeyPatch)
 def test_preflight_rejects_unknown_backend():
     with pytest.raises(ArtifactValidationError, match="^unknown backend: bogus$"):
         platforms.preflight("bogus")
+
+
+def test_operation_capability_matrix_is_exact_for_all_28_supported_cloud_operations() -> None:
+    kvm_run = (
+        "host.kvm-device",
+        "tool.qemu-img",
+        "tool.cloud-localds",
+        "tool.ssh",
+        "tool.ssh-keygen",
+        "tool.qemu-system",
+        "python.libvirt",
+        "network.libvirt",
+    )
+    hvf_run = (
+        "host.hypervisor-framework",
+        "tool.qemu-system",
+        "tool.qemu-img",
+        "tool.hdiutil",
+        "tool.ssh",
+        "tool.ssh-keygen",
+        "firmware.uefi",
+        "python.libvirt",
+        "network.user-hostfwd",
+    )
+    expected: dict[tuple[RuntimeBackend, RuntimeOperation], tuple[str, ...]] = {}
+    for backend, run_requirements in (
+        (RuntimeBackend.KVM, kvm_run),
+        (RuntimeBackend.LIBVIRT_HVF, hvf_run),
+    ):
+        expected[(backend, RuntimeOperation.RUN)] = run_requirements
+        for operation in (
+            RuntimeOperation.START,
+            RuntimeOperation.STOP,
+            RuntimeOperation.RM,
+            RuntimeOperation.INSPECT,
+            RuntimeOperation.RECONCILE,
+        ):
+            expected[(backend, operation)] = ("python.libvirt",)
+        expected[(backend, RuntimeOperation.LOGS)] = ()
+        expected[(backend, RuntimeOperation.PS)] = ()
+        expected[(backend, RuntimeOperation.EXEC)] = ("tool.ssh",)
+        expected[(backend, RuntimeOperation.SHELL)] = ("tool.ssh",)
+    expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.RUN)] = (
+        "host.lima-vz",
+        "tool.limactl",
+        "network.lima",
+    )
+    for operation in (
+        RuntimeOperation.START,
+        RuntimeOperation.STOP,
+        RuntimeOperation.RM,
+        RuntimeOperation.INSPECT,
+        RuntimeOperation.LOGS,
+        RuntimeOperation.RECONCILE,
+    ):
+        expected[(RuntimeBackend.LIMA_VZ, operation)] = ("host.lima-vz", "tool.limactl")
+    expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.PS)] = ()
+
+    assert len(expected) == 28
+    for (backend, operation), requirement_ids in expected.items():
+        key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+        profile = platforms.capability_profile(key, operation)
+        assert profile.dispatch_key == key
+        assert profile.operation is operation
+        assert tuple(item.capability_id for item in profile.requirements) == requirement_ids
+        selectors = tuple(item.selector for item in profile.requirements)
+        assert selectors == tuple("default" if item.startswith("network.") else None for item in requirement_ids)
+
+
+@pytest.mark.parametrize("operation", [RuntimeOperation.EXEC, RuntimeOperation.SHELL])
+def test_lima_process_profiles_refuse_before_any_probe(
+    operation: RuntimeOperation,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ)
+    monkeypatch.setattr(platforms, "_check_capability", lambda *_args, **_kwargs: pytest.fail("probe reached"))
+
+    with pytest.raises(RuntimeCapabilityError) as captured:
+        platforms.capability_profile(key, operation)
+
+    assert captured.value.operation is operation
+
+
+def test_oci_root_refusal_precedes_every_cloud_capability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+    monkeypatch.setattr(platforms.shutil, "which", lambda _name: pytest.fail("cloud tool probe reached"))
+    monkeypatch.setattr(Path, "exists", lambda _path: pytest.fail("KVM device probe reached"))
+
+    with pytest.raises(RuntimeCapabilityError) as captured:
+        platforms.capability_profile(key, RuntimeOperation.RUN)
+
+    assert captured.value.code == "runtime-operation-unavailable"
+    assert captured.value.operation is RuntimeOperation.RUN
+    assert platforms.capability_profile(key, RuntimeOperation.PS).requirements == ()
+
+
+def test_oci_root_capability_matrix_refuses_every_operation_except_ps() -> None:
+    key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+
+    for operation in set(RuntimeOperation) - {RuntimeOperation.PS}:
+        with pytest.raises(RuntimeCapabilityError) as captured:
+            platforms.capability_profile(key, operation)
+        assert captured.value.operation is operation
+
+
+def test_operation_report_is_authenticated_and_consumed_exactly_once() -> None:
+    host = platforms.HostPlatform("Linux", "x86_64")
+    profile = platforms.capability_profile(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        RuntimeOperation.LOGS,
+    )
+    subject = "sha256:" + "a" * 64
+    report = platforms.evaluate_capability_profile(profile, subject_digest=subject, host=host, now_ns=100)
+    forged = replace(report, authentication_tag="0" * 64)
+
+    with pytest.raises(RuntimePreflightError) as forged_error:
+        platforms.consume_capability_report(
+            forged,
+            expected_profile=profile,
+            expected_subject_digest=subject,
+            host=host,
+            now_ns=100,
+        )
+    assert forged_error.value.category is CapabilityErrorCategory.REPORT_PROVENANCE
+
+    platforms.consume_capability_report(
+        report,
+        expected_profile=profile,
+        expected_subject_digest=subject,
+        host=host,
+        now_ns=100,
+    )
+    with pytest.raises(RuntimePreflightError) as reused_error:
+        platforms.consume_capability_report(
+            report,
+            expected_profile=profile,
+            expected_subject_digest=subject,
+            host=host,
+            now_ns=100,
+        )
+    assert reused_error.value.category is CapabilityErrorCategory.REPORT_CONSUMED
+
+
+def test_discovery_report_cannot_authorize_an_operation() -> None:
+    host = platforms.HostPlatform("Linux", "x86_64")
+    profile = platforms.capability_profile(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        RuntimeOperation.LOGS,
+    )
+    subject = "sha256:" + "b" * 64
+    report = platforms.evaluate_capability_profile(
+        profile,
+        subject_digest=subject,
+        host=host,
+        now_ns=200,
+        purpose=PreflightReportPurpose.DISCOVERY,
+    )
+
+    with pytest.raises(RuntimePreflightError) as captured:
+        platforms.consume_capability_report(
+            report,
+            expected_profile=profile,
+            expected_subject_digest=subject,
+            host=host,
+            now_ns=200,
+        )
+
+    assert captured.value.category is CapabilityErrorCategory.REPORT_PROVENANCE
+    assert report.issuer_nonce not in platforms._ISSUED_OPERATION_REPORTS
+
+
+def test_operation_report_registries_prune_expired_issued_and_consumed_nonces() -> None:
+    host = platforms.HostPlatform("Linux", "x86_64")
+    profile = platforms.capability_profile(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        RuntimeOperation.LOGS,
+    )
+    subject = "sha256:" + "c" * 64
+    expired_issued = platforms.evaluate_capability_profile(profile, subject_digest=subject, host=host, now_ns=0)
+    current = platforms.evaluate_capability_profile(
+        profile,
+        subject_digest=subject,
+        host=host,
+        now_ns=expired_issued.expires_at_monotonic_ns,
+    )
+
+    assert expired_issued.issuer_nonce not in platforms._ISSUED_OPERATION_REPORTS
+    platforms.consume_capability_report(
+        current,
+        expected_profile=profile,
+        expected_subject_digest=subject,
+        host=host,
+        now_ns=current.issued_at_monotonic_ns,
+    )
+    assert current.issuer_nonce in platforms._CONSUMED_OPERATION_REPORTS
+
+    platforms.evaluate_capability_profile(
+        profile,
+        subject_digest=subject,
+        host=host,
+        now_ns=current.expires_at_monotonic_ns,
+    )
+    assert current.issuer_nonce not in platforms._CONSUMED_OPERATION_REPORTS
+
+
+def test_operation_report_registries_bound_outstanding_and_consumed_tokens_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = platforms.HostPlatform("Linux", "x86_64")
+    profile = platforms.capability_profile(
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        RuntimeOperation.LOGS,
+    )
+    subject = "sha256:" + "e" * 64
+    with platforms._REPORT_REGISTRY_LOCK:
+        saved_issued = dict(platforms._ISSUED_OPERATION_REPORTS)
+        saved_consumed = dict(platforms._CONSUMED_OPERATION_REPORTS)
+        platforms._ISSUED_OPERATION_REPORTS.clear()
+        platforms._CONSUMED_OPERATION_REPORTS.clear()
+    monkeypatch.setattr(platforms, "_MAX_OPERATION_REPORT_REGISTRY_ENTRIES", 3)
+    try:
+        consumed = []
+        for _ in range(10):
+            report = platforms.evaluate_capability_profile(profile, subject_digest=subject, host=host, now_ns=0)
+            platforms.consume_capability_report(
+                report,
+                expected_profile=profile,
+                expected_subject_digest=subject,
+                host=host,
+                now_ns=0,
+            )
+            consumed.append(report)
+        with platforms._REPORT_REGISTRY_LOCK:
+            assert platforms._ISSUED_OPERATION_REPORTS == {}
+            assert len(platforms._CONSUMED_OPERATION_REPORTS) == 3
+        with pytest.raises(RuntimePreflightError) as evicted_replay:
+            platforms.consume_capability_report(
+                consumed[0],
+                expected_profile=profile,
+                expected_subject_digest=subject,
+                host=host,
+                now_ns=0,
+            )
+        assert evicted_replay.value.category is CapabilityErrorCategory.REPORT_PROVENANCE
+
+        issued = [
+            platforms.evaluate_capability_profile(profile, subject_digest=subject, host=host, now_ns=0)
+            for _ in range(3)
+        ]
+        with pytest.raises(RuntimePreflightError) as captured:
+            platforms.evaluate_capability_profile(profile, subject_digest=subject, host=host, now_ns=0)
+        assert captured.value.category is CapabilityErrorCategory.REPORT_CAPACITY
+        with platforms._REPORT_REGISTRY_LOCK:
+            assert len(platforms._ISSUED_OPERATION_REPORTS) == 3
+            assert len(platforms._CONSUMED_OPERATION_REPORTS) == 3
+
+        recovered = platforms.evaluate_capability_profile(
+            profile,
+            subject_digest=subject,
+            host=host,
+            now_ns=issued[0].expires_at_monotonic_ns,
+        )
+        assert recovered.issuer_nonce in platforms._ISSUED_OPERATION_REPORTS
+        with platforms._REPORT_REGISTRY_LOCK:
+            assert len(platforms._ISSUED_OPERATION_REPORTS) == 1
+            assert platforms._CONSUMED_OPERATION_REPORTS == {}
+    finally:
+        with platforms._REPORT_REGISTRY_LOCK:
+            platforms._ISSUED_OPERATION_REPORTS.clear()
+            platforms._ISSUED_OPERATION_REPORTS.update(saved_issued)
+            platforms._CONSUMED_OPERATION_REPORTS.clear()
+            platforms._CONSUMED_OPERATION_REPORTS.update(saved_consumed)
+
+
+def test_run_report_network_selector_is_authenticated_and_must_match_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    host = platforms.HostPlatform("Linux", "x86_64")
+    monkeypatch.setattr(
+        platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "present", True),
+    )
+    issued_profile = platforms.capability_profile(key, RuntimeOperation.RUN, network="default")
+    expected_profile = platforms.capability_profile(key, RuntimeOperation.RUN, network="private")
+    subject = "sha256:" + "f" * 64
+    report = platforms.evaluate_capability_profile(issued_profile, subject_digest=subject, host=host, now_ns=100)
+
+    with pytest.raises(RuntimePreflightError) as captured:
+        platforms.consume_capability_report(
+            report,
+            expected_profile=expected_profile,
+            expected_subject_digest=subject,
+            host=host,
+            now_ns=100,
+        )
+
+    assert captured.value.category is CapabilityErrorCategory.REPORT_MISMATCH
+    assert issued_profile != expected_profile
+
+
+def test_kvm_network_none_profile_omits_external_network_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    profile = platforms.capability_profile(key, RuntimeOperation.RUN, network="none")
+    probed: list[str] = []
+    monkeypatch.setattr(
+        platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: (
+            probed.append(requirement.capability_id) or CapabilityCheck(requirement.capability_id, "present", True)
+        ),
+    )
+
+    platforms.evaluate_capability_profile(
+        profile,
+        subject_digest="sha256:" + "1" * 64,
+        host=platforms.HostPlatform("Linux", "x86_64"),
+        purpose=PreflightReportPurpose.DISCOVERY,
+    )
+
+    assert "network.libvirt" not in probed
+
+
+@pytest.mark.parametrize("selector", ["none", "default", "adapter-ignored-selector"])
+def test_hvf_user_network_selector_matches_adapter_no_lookup_semantics(
+    selector: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        platforms,
+        "resolve_domain_profile",
+        lambda *_args, **_kwargs: pytest.fail("domain/network resolution reached"),
+    )
+    monkeypatch.setattr(kvm_module, "connect", lambda *_args, **_kwargs: pytest.fail("network lookup reached"))
+
+    check = platforms._check_capability(
+        CapabilityRequirement("network.user-hostfwd", selector),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIBVIRT_HVF),
+        host=platforms.HostPlatform("Darwin", "aarch64"),
+        arch="aarch64",
+    )
+
+    assert check.passed is True
+    assert check.observed == "built-in"
+
+
+def test_kvm_device_probe_requires_rw_access_and_kvm_api_v12(monkeypatch: pytest.MonkeyPatch) -> None:
+    requirement = CapabilityRequirement("host.kvm-device")
+    key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM)
+    closed: list[int] = []
+    monkeypatch.setattr(Path, "exists", lambda _path: True)
+    monkeypatch.setattr(platforms.os, "access", lambda *_args: True)
+    monkeypatch.setattr(platforms.os, "open", lambda *_args: 17)
+    monkeypatch.setattr(platforms.os, "close", closed.append)
+    monkeypatch.setattr(platforms.fcntl, "ioctl", lambda descriptor, request: 12)
+
+    check = platforms._check_capability(
+        requirement,
+        dispatch_key=key,
+        host=platforms.HostPlatform("Linux", "x86_64"),
+        arch="x86_64",
+    )
+
+    assert check.passed is True
+    assert check.observed == "api-v12"
+    assert closed == [17]
+
+
+def test_qemu_probe_uses_exact_domain_profile_emulator_not_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emulator = tmp_path / "qemu-system-x86_64"
+    emulator.write_bytes(b"binary")
+    emulator.chmod(0o700)
+    domain = platforms.DomainProfile(
+        backend="kvm",
+        domain_type="kvm",
+        arch="x86_64",
+        machine="q35",
+        emulator=emulator,
+        uri="qemu:///system",
+        firmware=None,
+        autoselect_firmware=False,
+        network_mode="libvirt-network",
+        seed_tool="cloud-localds",
+        seed_bus="sata",
+    )
+    monkeypatch.setattr(platforms, "resolve_domain_profile", lambda *_args, **_kwargs: domain)
+    monkeypatch.setattr(platforms.shutil, "which", lambda _tool: pytest.fail("PATH lookup reached"))
+
+    check = platforms._check_capability(
+        CapabilityRequirement("tool.qemu-system"),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+        host=platforms.HostPlatform("Linux", "x86_64"),
+        arch="x86_64",
+    )
+
+    assert check.passed is True
+    assert check.observed == "configured-executable"
+
+
+@pytest.mark.parametrize("version", ["2.1.0", "2.9.9"])
+def test_lima_tool_probe_accepts_exact_supported_adapter_versions(
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platforms.shutil, "which", lambda _tool: "/opt/bin/limactl")
+    monkeypatch.setattr(
+        platforms.lima,
+        "_run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["limactl", "--version"],
+            0,
+            f"limactl version {version}\n",
+            "",
+        ),
+    )
+
+    check = platforms._check_capability(
+        CapabilityRequirement("tool.limactl"),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        host=platforms.HostPlatform("Darwin", "aarch64"),
+        arch="aarch64",
+    )
+
+    assert check.passed is True
+    assert check.observed == "supported-2.x"
+
+
+@pytest.mark.parametrize("version", ["2.0.9", "3.0.0"])
+def test_lima_tool_probe_rejects_versions_the_adapter_rejects(
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platforms.shutil, "which", lambda _tool: "/opt/bin/limactl")
+    monkeypatch.setattr(
+        platforms.lima,
+        "_run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["limactl", "--version"],
+            0,
+            f"limactl version {version}\n",
+            "",
+        ),
+    )
+
+    check = platforms._check_capability(
+        CapabilityRequirement("tool.limactl"),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        host=platforms.HostPlatform("Darwin", "aarch64"),
+        arch="aarch64",
+    )
+
+    assert check.passed is False
+    assert check.error_category is CapabilityErrorCategory.UNSUPPORTED
+    assert check.observed == "unsupported-version"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        subprocess.CompletedProcess(["limactl", "--version"], 0, "not a version", ""),
+        subprocess.CompletedProcess(["limactl", "--version"], 7, "", "ATTACKER-SECRET"),
+    ],
+)
+def test_lima_tool_probe_normalizes_malformed_or_failed_version_commands(
+    result: subprocess.CompletedProcess[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platforms.shutil, "which", lambda _tool: "/opt/bin/limactl")
+    monkeypatch.setattr(platforms.lima, "_run_command", lambda *_args, **_kwargs: result)
+
+    check = platforms._check_capability(
+        CapabilityRequirement("tool.limactl"),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        host=platforms.HostPlatform("Darwin", "aarch64"),
+        arch="aarch64",
+    )
+
+    assert check.passed is False
+    assert check.error_category is CapabilityErrorCategory.CHECK_FAILED
+    assert check.observed == "version-check-failed"
+    assert "ATTACKER-SECRET" not in (check.remediation or "")
 
 
 # --- allocate_local_port ---------------------------------------------------------------
