@@ -39,6 +39,8 @@ from palimpsest_local.runtime_types import (
     RuntimeCapabilityError,
     RuntimeKind,
     RunVolumeIntent,
+    _issue_lifecycle_adapter_outcome,
+    _LifecycleAdapterOutcome,
     run_request_subject_digest,
 )
 
@@ -524,10 +526,28 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
         lambda _paths: pytest.fail("project callback used the legacy Lima heuristic"),
     )
     calls: list[str] = []
+
+    def start_existing(name: str, **kwargs: object) -> _LifecycleAdapterOutcome:
+        calls.append(name)
+        expected = kwargs["_expected_record"]
+        assert isinstance(expected, ExistingRunRecord)
+        expected_snapshot = kwargs["_expected_snapshot"]
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+        with state.locked_existing_run(roots, name, expected=expected, expected_snapshot=expected_snapshot) as mutation:
+            written = mutation.write_state("running", mutation.mutable_state())
+            initial = mutation.initial_snapshot
+            return _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                "running",
+                state.lifecycle_revision(written),
+            )
+
     monkeypatch.setattr(
         project_adapter.runtime_dispatch.lima,
         "start",
-        lambda name, **_kwargs: calls.append(name) or {"status": "running"},
+        start_existing,
     )
     monkeypatch.setattr(
         project_adapter.runtime_dispatch.cloud_runtime,
@@ -591,6 +611,31 @@ def test_existing_project_callbacks_route_from_durable_run_ledger(
         calls.append((name, kwargs))
         if operation == "logs":
             return iter(("project log\n",))
+        if operation in {"start", "stop", "remove"}:
+            expected = kwargs["_expected_record"]
+            assert isinstance(expected, ExistingRunRecord)
+            expected_snapshot = kwargs["_expected_snapshot"]
+            assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+            with state.locked_existing_run(
+                roots, name, expected=expected, expected_snapshot=expected_snapshot
+            ) as mutation:
+                terminal = "running" if operation == "start" else "removed" if operation == "remove" else "stopped"
+                initial = mutation.initial_snapshot
+                written = (
+                    mutation.mutable_state()
+                    if initial.state["status"] == terminal and operation != "remove"
+                    else mutation.write_state(terminal, mutation.mutable_state())
+                )
+                outcome = _issue_lifecycle_adapter_outcome(
+                    mutation.record,
+                    initial.state["status"],
+                    state.lifecycle_revision(initial),
+                    terminal,
+                    state.lifecycle_revision(written),
+                )
+                if operation == "remove":
+                    mutation.delete_run_tree()
+                return outcome
         return {"name": name, "status": "stopped"}
 
     selected_adapter = getattr(project_adapter.runtime_dispatch, adapter_name)
@@ -630,13 +675,21 @@ def test_existing_project_callbacks_route_from_durable_run_ledger(
     else:
         result = list(callbacks.logs(run_name, False))
 
-    assert result == (["project log\n"] if operation == "logs" else {"name": run_name, "status": "stopped"})
+    if operation == "logs":
+        assert result == ["project log\n"]
+    elif operation == "inspect":
+        assert result == {"name": run_name, "status": "stopped"}
+    else:
+        assert result.record.name == run_name
     assert len(calls) == 1
     called_name, kwargs = calls[0]
     assert called_name == run_name
     expected_record = kwargs.pop("_expected_record")
+    expected_snapshot = kwargs.pop("_expected_snapshot", None)
     assert isinstance(expected_record, ExistingRunRecord)
     assert expected_record.dispatch_key.backend is expected_backend
+    if operation in {"start", "stop", "remove"}:
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     expected_options: dict[str, object] = {"roots": roots}
     if operation == "remove":
         expected_options["volumes"] = True

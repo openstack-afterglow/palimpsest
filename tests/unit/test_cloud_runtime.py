@@ -568,7 +568,7 @@ def test_legacy_cloud_stop_success_promotes_but_failure_preserves_bytes(tmp_path
 
 
 @pytest.mark.parametrize("domain_present", [True, False])
-def test_legacy_cloud_stop_live_noop_returns_stopped_without_rewriting(
+def test_legacy_cloud_stop_live_success_promotes_only_at_terminal_write(
     tmp_path: Path,
     domain_present: bool,
 ) -> None:
@@ -578,13 +578,31 @@ def test_legacy_cloud_stop_live_noop_returns_stopped_without_rewriting(
     domain._active = False
     if not domain_present:
         conn.domains.clear()
-    before = rpaths.state.read_bytes()
-
     stopped = stop(rpaths.name, roots=roots, conn=conn)
 
     assert stopped["status"] == "stopped"
-    assert stopped.get("schema_version") is None
-    assert rpaths.state.read_bytes() == before
+    assert stopped["schema_version"] == 2
+    assert stopped["lifecycle_revision"] == 1
+    assert state.read_run_state(rpaths) == stopped
+
+
+@pytest.mark.parametrize("source_status", ["creating", "failed"])
+def test_cloud_stop_preserves_legacy_source_compatibility(
+    tmp_path: Path,
+    source_status: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(
+        roots,
+        f"legacy-stop-{source_status}",
+        source_status,
+    )
+
+    stopped = stop(rpaths.name, roots=roots, conn=conn, timeout_seconds=0)
+
+    assert stopped["status"] == "stopped"
+    assert stopped["schema_version"] == 2
+    assert stopped["lifecycle_revision"] == 1
 
 
 def test_legacy_cloud_plain_rm_promotes_removed_and_volumes_rm_rejects_replacement(tmp_path: Path) -> None:
@@ -619,16 +637,18 @@ def test_legacy_cloud_plain_rm_promotes_removed_and_volumes_rm_rejects_replaceme
     assert (displaced / "state.json").read_bytes() == original_state
 
 
-def test_legacy_cloud_plain_rm_noop_preserves_removed_state_bytes(tmp_path: Path) -> None:
+def test_legacy_cloud_plain_rm_cleans_owned_domain_without_rewriting_removed_state(tmp_path: Path) -> None:
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
-    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(roots, "legacy-rm-noop", "removed")
-    conn.domains.clear()
+    rpaths, _owner, conn, domain = _legacy_cloud_lifecycle(roots, "legacy-rm-noop", "removed")
+    domain._active = True
     before = rpaths.state.read_bytes()
 
     removed = rm("legacy-rm-noop", roots=roots, conn=conn)
 
     assert removed["status"] == "removed"
     assert removed.get("schema_version") is None
+    assert domain.destroyed is True
+    assert domain.undefined is True
     assert rpaths.state.read_bytes() == before
 
 

@@ -19,11 +19,15 @@ from . import cloud_runtime, lima, platforms, state
 from .errors import StateError
 from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
+    ALLOWED_RUNTIME_STATUSES,
     CapabilityErrorCategory,
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    LifecycleCursor,
+    LifecycleResult,
+    LifecycleWarningCategory,
     PreflightReport,
     PreflightReportPurpose,
     ProcessSession,
@@ -41,6 +45,8 @@ from .runtime_types import (
     RuntimeOperation,
     RuntimePreflightError,
     RunVolumeIntent,
+    _lifecycle_outcome_authentication_tag,
+    _LifecycleAdapterOutcome,
     existing_record_subject_digest,
     run_request_subject_digest,
     snapshot_cloud_init,
@@ -641,6 +647,230 @@ def _require_process_session(candidate: Any) -> ProcessSession:
     return candidate
 
 
+def _same_run_identity(left: ExistingRunRecord, right: ExistingRunRecord) -> bool:
+    return left.name == right.name and left.run_id == right.run_id and left.dispatch_key == right.dispatch_key
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedLifecycleOutcome:
+    record: ExistingRunRecord
+    previous_status: str
+    previous_revision: int
+    status: str
+    revision: int
+    warning_category: Any
+    fallback_used: bool
+
+
+def _normalize_lifecycle_outcome(candidate: object) -> _NormalizedLifecycleOutcome:
+    normalized: _NormalizedLifecycleOutcome | None = None
+    try:
+        if type(candidate) is not _LifecycleAdapterOutcome:
+            raise TypeError
+        raw_record = candidate.record
+        if type(raw_record) is not ExistingRunRecord:
+            raise TypeError
+        raw_key = raw_record.dispatch_key
+        if (
+            type(raw_record.name) is not str
+            or type(raw_record.run_id) is not str
+            or type(raw_record.state_schema_version) is not int
+            or type(raw_key) is not DispatchKey
+            or type(raw_key.runtime_kind) is not RuntimeKind
+            or type(raw_key.backend) is not RuntimeBackend
+        ):
+            raise TypeError
+        clean_record = ExistingRunRecord(
+            raw_record.name,
+            raw_record.run_id,
+            raw_record.state_schema_version,
+            DispatchKey(raw_key.runtime_kind, raw_key.backend),
+        )
+        previous_status = candidate.previous_status
+        previous_revision = candidate.previous_revision
+        current_status = candidate.status
+        revision = candidate.revision
+        warning_category = candidate.warning_category
+        fallback_used = candidate.fallback_used
+        authentication_tag = candidate.authentication_tag
+        if (
+            type(previous_status) is not str
+            or type(previous_revision) is not int
+            or previous_revision < 0
+            or type(current_status) is not str
+            or type(revision) is not int
+            or revision < 0
+            or type(fallback_used) is not bool
+            or type(authentication_tag) is not bytes
+            or len(authentication_tag) != 32
+            or not (
+                warning_category is None
+                or warning_category is LifecycleWarningCategory.FORCED_SHUTDOWN
+                or warning_category is LifecycleWarningCategory.BACKEND_RECONCILED
+            )
+        ):
+            raise TypeError
+        expected_tag = _lifecycle_outcome_authentication_tag(
+            clean_record,
+            previous_status,
+            previous_revision,
+            current_status,
+            revision,
+            warning_category,
+            fallback_used,
+        )
+        if not hmac.compare_digest(authentication_tag, expected_tag):
+            raise ValueError
+        normalized = _NormalizedLifecycleOutcome(
+            clean_record,
+            previous_status,
+            previous_revision,
+            current_status,
+            revision,
+            warning_category,
+            fallback_used,
+        )
+    except Exception:
+        pass
+    if normalized is None:
+        raise StateError("runtime adapter returned an invalid lifecycle receipt")
+    return normalized
+
+
+def _validate_lifecycle_source(operation: RuntimeOperation, status: object) -> None:
+    allowed_sources = {
+        RuntimeOperation.START: ALLOWED_RUNTIME_STATUSES[RuntimeKind.CLOUD_IMAGE],
+        RuntimeOperation.STOP: ALLOWED_RUNTIME_STATUSES[RuntimeKind.CLOUD_IMAGE],
+        RuntimeOperation.RM: ALLOWED_RUNTIME_STATUSES[RuntimeKind.CLOUD_IMAGE],
+    }[operation]
+    if type(status) is not str or status not in allowed_sources:
+        raise StateError("runtime lifecycle operation has an invalid source status")
+
+
+def _dispatch_lifecycle(
+    name: str,
+    operation: RuntimeOperation,
+    *,
+    roots: StatePaths | None,
+    expected_identity: ExpectedRunIdentity | None,
+    volumes: bool = False,
+) -> LifecycleResult:
+    resolved_roots = roots or state.resolve_roots()
+    before = state.read_run_ledger_snapshot(resolved_roots, name)
+    record = before.record
+    _require_expected_identity(record, expected_identity)
+    previous_status = before.state.get("status")
+    previous_revision = state.lifecycle_revision(before)
+    _validate_lifecycle_source(operation, previous_status)
+    # The durable status alone cannot prove a no-op: Lima or libvirt may need
+    # backend reconciliation even when the final status is unchanged.  At the
+    # saturated revision, reject every lifecycle operation before preflight or
+    # adapter entry rather than risk an external effect that cannot be recorded.
+    if previous_revision == 2**63 - 1:
+        raise StateError("lifecycle revision cannot be incremented")
+    adapter = _preflight_existing_adapter(record, operation, resolved_roots)
+    # Rebind after the one-use preflight is consumed, then pin a complete
+    # snapshot. This closes swaps that happen after the adapter selection read
+    # but before the adapter acquires its mutation lock.
+    _revalidate_bound_record(record, resolved_roots)
+    bound = state.read_run_ledger_snapshot(resolved_roots, name)
+    if bound.record != record or bound.state != before.state:
+        raise StateError("run ledger changed during dispatch")
+    if operation is RuntimeOperation.START:
+        raw = adapter.start(
+            name,
+            roots=resolved_roots,
+            _expected_record=record,
+            _expected_snapshot=bound,
+        )
+    elif operation is RuntimeOperation.STOP:
+        raw = adapter.stop(
+            name,
+            roots=resolved_roots,
+            _expected_record=record,
+            _expected_snapshot=bound,
+        )
+    else:
+        raw = adapter.rm(
+            name,
+            roots=resolved_roots,
+            volumes=volumes,
+            _expected_record=record,
+            _expected_snapshot=bound,
+        )
+    raw = _normalize_lifecycle_outcome(raw)
+    if not _same_run_identity(raw.record, record):
+        raise StateError("runtime adapter lifecycle receipt changed run identity")
+    if raw.record.state_schema_version not in {record.state_schema_version, 2}:
+        raise StateError("runtime adapter lifecycle receipt changed state schema")
+    valid_transition = (
+        operation is RuntimeOperation.START
+        and (raw.previous_status, raw.status) in {("stopped", "running"), ("running", "running")}
+        or operation is RuntimeOperation.STOP
+        and (
+            raw.previous_status != "removed"
+            and raw.status == "stopped"
+            or (raw.previous_status, raw.status) in {("stopped", "stopped"), ("removed", "removed")}
+        )
+        or operation is RuntimeOperation.RM
+        and raw.status == "removed"
+    )
+    if not valid_transition:
+        raise StateError("runtime adapter lifecycle receipt has an invalid terminal status")
+    if (raw.previous_status, raw.previous_revision) != (previous_status, previous_revision):
+        raise StateError("runtime adapter lifecycle receipt does not match the bound state")
+    deletion_rewrite = (
+        operation is RuntimeOperation.RM
+        and volumes
+        and previous_status == "removed"
+        and raw.status == "removed"
+        and raw.revision == previous_revision + 1
+    )
+    backend_reconciled = (
+        raw.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED
+        and operation in {RuntimeOperation.START, RuntimeOperation.STOP}
+        and raw.status == previous_status
+        and raw.revision > previous_revision
+    )
+    if raw.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED and not backend_reconciled:
+        raise StateError("runtime adapter lifecycle receipt has invalid recovery metadata")
+    if raw.status == previous_status:
+        revision_valid = raw.revision == previous_revision or deletion_rewrite or backend_reconciled
+    else:
+        revision_valid = (
+            raw.revision > previous_revision and raw.warning_category is not LifecycleWarningCategory.BACKEND_RECONCILED
+        )
+    if not revision_valid:
+        raise StateError("runtime adapter lifecycle receipt has an invalid revision")
+    if raw.fallback_used and operation is not RuntimeOperation.STOP:
+        raise StateError("runtime adapter lifecycle receipt has invalid fallback metadata")
+
+    removed_tree = operation is RuntimeOperation.RM and volumes
+    if removed_tree:
+        if state.run_entry_present_or_ambiguous(resolved_roots, name):
+            raise StateError("removed run ledger is still present")
+    else:
+        after = state.read_run_ledger_snapshot(resolved_roots, name)
+        if (
+            after.record != raw.record
+            or after.state.get("status") != raw.status
+            or state.lifecycle_revision(after) != raw.revision
+        ):
+            raise StateError("runtime adapter lifecycle receipt does not match durable state")
+    try:
+        return LifecycleResult(
+            raw.record,
+            operation,
+            previous_status,
+            raw.status,
+            LifecycleCursor(raw.record, raw.revision),
+            raw.warning_category,
+            raw.fallback_used,
+        )
+    except (TypeError, ValueError):
+        raise StateError("runtime adapter returned an invalid lifecycle receipt") from None
+
+
 def exec(
     name: str,
     argv: Sequence[str],
@@ -687,12 +917,13 @@ def start(
     *,
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
-) -> dict[str, Any]:
-    resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
-    _require_expected_identity(record, expected_identity)
-    adapter = _preflight_existing_adapter(record, RuntimeOperation.START, resolved_roots)
-    return adapter.start(name, roots=resolved_roots, _expected_record=record)
+) -> LifecycleResult:
+    return _dispatch_lifecycle(
+        name,
+        RuntimeOperation.START,
+        roots=roots,
+        expected_identity=expected_identity,
+    )
 
 
 def stop(
@@ -700,12 +931,13 @@ def stop(
     *,
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
-) -> dict[str, Any]:
-    resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
-    _require_expected_identity(record, expected_identity)
-    adapter = _preflight_existing_adapter(record, RuntimeOperation.STOP, resolved_roots)
-    return adapter.stop(name, roots=resolved_roots, _expected_record=record)
+) -> LifecycleResult:
+    return _dispatch_lifecycle(
+        name,
+        RuntimeOperation.STOP,
+        roots=roots,
+        expected_identity=expected_identity,
+    )
 
 
 def rm(
@@ -714,16 +946,13 @@ def rm(
     volumes: bool = False,
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
-) -> dict[str, Any]:
-    resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
-    _require_expected_identity(record, expected_identity)
-    adapter = _preflight_existing_adapter(record, RuntimeOperation.RM, resolved_roots)
-    return adapter.rm(
+) -> LifecycleResult:
+    return _dispatch_lifecycle(
         name,
-        roots=resolved_roots,
+        RuntimeOperation.RM,
+        roots=roots,
+        expected_identity=expected_identity,
         volumes=volumes,
-        _expected_record=record,
     )
 
 

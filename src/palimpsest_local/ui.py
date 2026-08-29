@@ -15,10 +15,30 @@ from typing import Any
 
 from . import inventory, platforms, runtime_dispatch, state
 from .errors import PalimpsestError
+from .runtime_types import LifecycleResult
 
 WEBUI_DIR = Path(__file__).parent / "webui"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _lifecycle_projection(result: LifecycleResult) -> dict[str, Any]:
+    """Project only the stable, public fields of a typed lifecycle receipt."""
+
+    if not isinstance(result, LifecycleResult):
+        raise TypeError("UI lifecycle response requires a LifecycleResult")
+    return {
+        "name": result.record.name,
+        "run_id": result.record.run_id,
+        "runtime_kind": result.record.dispatch_key.runtime_kind.value,
+        "backend": result.record.dispatch_key.backend.value,
+        "operation": result.operation.value,
+        "previous_status": result.previous_status,
+        "status": result.current_status,
+        "lifecycle_revision": result.cursor.revision,
+        "warning_category": (None if result.warning_category is None else result.warning_category.value),
+        "fallback_used": result.fallback_used,
+    }
 
 
 def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[BaseHTTPRequestHandler]:
@@ -253,7 +273,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                             self._send_json({"error": "invalid run name"}, status=400)
                             return
                         res = runtime_dispatch.stop(name, roots=roots)
-                        self._send_json(res)
+                        self._send_json(_lifecycle_projection(res))
                         return
                     if rest.endswith("/start"):
                         name = rest[:-6]
@@ -261,7 +281,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                             self._send_json({"error": "invalid run name"}, status=400)
                             return
                         res = runtime_dispatch.start(name, roots=roots)
-                        self._send_json(res)
+                        self._send_json(_lifecycle_projection(res))
                         return
 
                 if path == "/api/v1/store/import":
@@ -335,7 +355,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                         return
                     volumes = qs.get("volumes", ["0"])[0].lower() in ("1", "true")
                     res = runtime_dispatch.rm(name, volumes=volumes, roots=roots)
-                    self._send_json(res)
+                    self._send_json(_lifecycle_projection(res))
                     return
 
                 if path.startswith("/api/v1/store/artifacts/"):

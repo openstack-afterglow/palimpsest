@@ -108,6 +108,7 @@ def test_new_run_reservation_writes_exact_v2_identity_and_rejects_smuggling(tmp_
         with pytest.raises(StateError, match="invalid status"):
             reservation.write_state("root-mounted", {})
         written = reservation.write_state("creating", {"guest_ip": None})
+        assert written["lifecycle_revision"] == 1
 
     assert state.read_json(state.run_paths(roots, "fresh").owner) == {
         "schema_version": 1,
@@ -474,6 +475,7 @@ def test_existing_run_mutation_promotes_legacy_state_once_with_authoritative_ide
         current = mutation.mutable_state()
         written = mutation.write_state("running", {**current, "guest_ip": "192.0.2.8"})
         assert mutation.is_legacy is False
+        assert written["lifecycle_revision"] == 1
 
     assert rpaths.owner.read_bytes() == owner_before
     assert state.read_run_state(rpaths) == written
@@ -485,6 +487,85 @@ def test_existing_run_mutation_promotes_legacy_state_once_with_authoritative_ide
         "run_id": owner.run_id,
         "status": "running",
     }
+
+
+@pytest.mark.parametrize("revision", [True, False, -1, 2**63, 1.5, "1", None])
+def test_run_ledger_rejects_invalid_lifecycle_revision(tmp_path: Path, revision: object) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "invalid-revision")
+    owner = state.write_owner_record(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "status": "stopped",
+            "lifecycle_revision": revision,
+        },
+    )
+
+    with pytest.raises(StateError, match="invalid lifecycle revision"):
+        state.read_run_dispatch_record(roots, rpaths.name)
+
+
+def test_existing_run_mutation_rejects_revision_overflow_before_write(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "revision-max")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "status": "stopped",
+            "lifecycle_revision": 2**63 - 1,
+        },
+    )
+    before = rpaths.state.read_bytes()
+
+    with state.locked_existing_run(roots, rpaths.name) as mutation:
+        with pytest.raises(StateError, match="cannot be incremented"):
+            mutation.write_state("running", mutation.mutable_state())
+
+    assert rpaths.state.read_bytes() == before
+
+
+def test_existing_run_mutation_binds_exact_expected_snapshot(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    rpaths = state.run_paths(roots, "snapshot-bound")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+            "status": "stopped",
+            "lifecycle_revision": 1,
+        },
+    )
+    expected = state.read_run_ledger_snapshot(roots, rpaths.name)
+    changed = state.read_run_state(rpaths)
+    state.atomic_write_json(rpaths.state, {**changed, "status": "running", "lifecycle_revision": 2})
+
+    with pytest.raises(StateError, match="changed before lifecycle mutation"):
+        with state.locked_existing_run(
+            roots,
+            rpaths.name,
+            expected=expected.record,
+            expected_snapshot=expected,
+        ):
+            pytest.fail("stale snapshot acquired mutation authority")
 
 
 def test_existing_run_mutation_exception_preserves_legacy_bytes(tmp_path: Path) -> None:

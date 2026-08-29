@@ -36,6 +36,7 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9.+\-]{0,63}$")
 _STATUSES = {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}
 _MAX_RUN_LEDGER_BYTES = 1024 * 1024
+_MAX_LIFECYCLE_REVISION = 2**63 - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +161,7 @@ class NewRunReservation:
         "_locks_identity",
         "_lock_identity",
         "_last_status",
+        "_lifecycle_revision",
     )
 
     def __init__(
@@ -190,6 +192,7 @@ class NewRunReservation:
         object.__setattr__(self, "_locks_identity", locks_identity)
         object.__setattr__(self, "_lock_identity", lock_identity)
         object.__setattr__(self, "_last_status", None)
+        object.__setattr__(self, "_lifecycle_revision", 0)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("new run reservation authority is immutable")
@@ -214,18 +217,24 @@ class NewRunReservation:
     def last_status(self) -> str | None:
         return self._last_status
 
+    @property
+    def lifecycle_revision(self) -> int:
+        return self._lifecycle_revision
+
     def verify_binding(self) -> None:
         _verify_new_run_binding(self)
 
     def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
         payload = _write_reserved_run_state(self, status, data)
         object.__setattr__(self, "_last_status", status)
+        object.__setattr__(self, "_lifecycle_revision", payload["lifecycle_revision"])
         return payload
 
     def write_failure(self, data: Mapping[str, Any]) -> dict[str, Any]:
         """Publish failure through the pinned directory even after name-path loss."""
         payload = _write_reserved_run_state(self, "failed", data, require_visible_binding=False)
         object.__setattr__(self, "_last_status", "failed")
+        object.__setattr__(self, "_lifecycle_revision", payload["lifecycle_revision"])
         return payload
 
     def write_file(self, relative_name: str, content: bytes, *, mode: int = 0o600) -> Path:
@@ -1023,7 +1032,9 @@ def _write_exclusive_owner(run_fd: int, record: OwnerRecord) -> None:
         raise StateError("owner record changed during create")
 
 
-_RESERVED_RUN_STATE_FIELDS = frozenset({"schema_version", "runtime_kind", "backend", "name", "run_id", "status"})
+_RESERVED_RUN_STATE_FIELDS = frozenset(
+    {"schema_version", "runtime_kind", "backend", "name", "run_id", "status", "lifecycle_revision"}
+)
 
 
 def _write_reserved_run_state(
@@ -1047,6 +1058,7 @@ def _write_reserved_run_state(
         "name": reservation.record.name,
         "run_id": reservation.record.run_id,
         "status": status,
+        "lifecycle_revision": reservation.lifecycle_revision + 1,
     }
     content = _json_bytes(payload)
 
@@ -1317,6 +1329,7 @@ class ExistingRunMutation:
         "_paths",
         "_record",
         "_snapshot",
+        "_initial_snapshot",
         "_owner_bytes",
         "_state_bytes",
         "_runs_fd",
@@ -1347,6 +1360,7 @@ class ExistingRunMutation:
         object.__setattr__(self, "_paths", paths)
         object.__setattr__(self, "_record", snapshot.record)
         object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_initial_snapshot", snapshot)
         object.__setattr__(self, "_owner_bytes", owner_bytes)
         object.__setattr__(self, "_state_bytes", state_bytes)
         object.__setattr__(self, "_runs_fd", runs_fd)
@@ -1373,6 +1387,10 @@ class ExistingRunMutation:
     @property
     def snapshot(self) -> RunLedgerSnapshot:
         return self._snapshot
+
+    @property
+    def initial_snapshot(self) -> RunLedgerSnapshot:
+        return self._initial_snapshot
 
     @property
     def is_legacy(self) -> bool:
@@ -1502,6 +1520,9 @@ def _validated_existing_state_payload(
         raise StateError("existing run state cannot override durable schema")
     if "status" in data and data["status"] != current.get("status"):
         raise StateError("existing run state is stale")
+    current_revision = lifecycle_revision(current)
+    if current_revision >= _MAX_LIFECYCLE_REVISION:
+        raise StateError("lifecycle revision cannot be incremented")
     body = {key: deepcopy(value) for key, value in data.items() if key not in _RESERVED_RUN_STATE_FIELDS}
     return {
         **body,
@@ -1511,6 +1532,7 @@ def _validated_existing_state_payload(
         "name": mutation.record.name,
         "run_id": mutation.record.run_id,
         "status": status,
+        "lifecycle_revision": current_revision + 1,
     }
 
 
@@ -2003,6 +2025,7 @@ def locked_existing_run(
     name: str,
     *,
     expected: ExistingRunRecord | None = None,
+    expected_snapshot: RunLedgerSnapshot | None = None,
 ) -> Iterator[ExistingRunMutation]:
     """Lock first, then pin and re-read one existing run mutation authority."""
     paths = _new_run_paths(roots, name)
@@ -2037,6 +2060,12 @@ def locked_existing_run(
             raw_state = _decode_exact_json_object(state_bytes)
             snapshot = _snapshot_from_payloads(name, raw_owner, raw_state)
             if expected is not None and snapshot.record != expected:
+                raise StateError("run ledger changed before lifecycle mutation")
+            if expected_snapshot is not None and (
+                not isinstance(expected_snapshot, RunLedgerSnapshot)
+                or snapshot.record != expected_snapshot.record
+                or snapshot.state != expected_snapshot.state
+            ):
                 raise StateError("run ledger changed before lifecycle mutation")
             mutation = ExistingRunMutation(
                 roots,
@@ -2267,6 +2296,7 @@ def _normalize_run_dispatch_record(
     raw_schema = raw_state.get("schema_version", 1)
     if type(raw_schema) is not int or raw_schema not in {1, 2}:
         raise StateError("invalid run state schema")
+    lifecycle_revision(raw_state)
 
     if raw_schema == 1:
         raw_kind = raw_state.get("runtime_kind", RuntimeKind.CLOUD_IMAGE.value)
@@ -2359,6 +2389,18 @@ def _snapshot_from_payloads(
     if not isinstance(frozen, Mapping):
         raise StateError("invalid run ledger")
     return RunLedgerSnapshot(record, frozen)
+
+
+def lifecycle_revision(value: RunLedgerSnapshot | Mapping[str, Any]) -> int:
+    """Return the validated durable revision, defaulting legacy ledgers to zero."""
+
+    state_value = value.state if isinstance(value, RunLedgerSnapshot) else value
+    if not isinstance(state_value, Mapping):
+        raise StateError("invalid lifecycle revision")
+    revision = state_value.get("lifecycle_revision", 0)
+    if type(revision) is not int or revision < 0 or revision > _MAX_LIFECYCLE_REVISION:
+        raise StateError("invalid lifecycle revision")
+    return revision
 
 
 def snapshot_from_runtime_observation(

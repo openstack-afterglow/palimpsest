@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from palimpsest_local import state, ui
-from palimpsest_local.runtime_types import CapabilityCheck, ExistingRunRecord, RuntimeBackend
+from palimpsest_local.runtime_types import (
+    CapabilityCheck,
+    ExistingRunRecord,
+    RuntimeBackend,
+    _issue_lifecycle_adapter_outcome,
+)
 from palimpsest_local.state import init_roots
 
 
@@ -270,7 +275,28 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
         calls.append((name, kwargs))
         if operation == "logs":
             return iter(("one\n", "two\n", "three\n"))
-        return {"name": name, "status": "running" if operation == "start" else "stopped"}
+        expected = kwargs["_expected_record"]
+        assert isinstance(expected, ExistingRunRecord)
+        expected_snapshot = kwargs["_expected_snapshot"]
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+        with state.locked_existing_run(roots, name, expected=expected, expected_snapshot=expected_snapshot) as mutation:
+            terminal = "running" if operation == "start" else "removed" if operation == "rm" else "stopped"
+            initial = mutation.initial_snapshot
+            written = (
+                mutation.mutable_state()
+                if initial.state["status"] == terminal and operation != "rm"
+                else mutation.write_state(terminal, mutation.mutable_state())
+            )
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                terminal,
+                state.lifecycle_revision(written),
+            )
+            if operation == "rm":
+                mutation.delete_run_tree()
+            return outcome
 
     selected_adapter = getattr(ui.runtime_dispatch, adapter_name)
     other_adapter = ui.runtime_dispatch.lima if adapter_name == "cloud_runtime" else ui.runtime_dispatch.cloud_runtime
@@ -292,13 +318,27 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
     if operation == "logs":
         assert payload == {"log": "two\nthree\n"}
     else:
-        assert payload == {"name": "ui-vm", "status": "running" if operation == "start" else "stopped"}
+        assert payload == {
+            "name": "ui-vm",
+            "run_id": payload["run_id"],
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "operation": operation,
+            "previous_status": "stopped",
+            "status": "running" if operation == "start" else "removed" if operation == "rm" else "stopped",
+            "lifecycle_revision": 0 if operation == "stop" else 1,
+            "warning_category": None,
+            "fallback_used": False,
+        }
     assert len(calls) == 1
     called_name, kwargs = calls[0]
     assert called_name == "ui-vm"
     expected_record = kwargs.pop("_expected_record")
+    expected_snapshot = kwargs.pop("_expected_snapshot", None)
     assert isinstance(expected_record, ExistingRunRecord)
     assert expected_record.dispatch_key.backend is expected_backend
+    if operation in {"start", "stop", "rm"}:
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     assert kwargs == {"roots": roots, **expected_kwargs}
 
 

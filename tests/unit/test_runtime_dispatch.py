@@ -33,6 +33,9 @@ from palimpsest_local.runtime_types import (
     ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    LifecycleCursor,
+    LifecycleResult,
+    LifecycleWarningCategory,
     PreflightReport,
     ProcessCapabilities,
     ProcessExit,
@@ -50,6 +53,8 @@ from palimpsest_local.runtime_types import (
     RuntimeOperation,
     RuntimePreflightError,
     RunVolumeIntent,
+    _issue_lifecycle_adapter_outcome,
+    _LifecycleAdapterOutcome,
     existing_record_subject_digest,
     run_request_subject_digest,
 )
@@ -2136,7 +2141,36 @@ def test_existing_operations_route_by_the_durable_dispatch_key(
 
     def selected(name: str, **call_kwargs: Any) -> object:
         calls.append((adapter_name, name, call_kwargs))
-        return iter(("line\n",)) if target_name == "logs" else object()
+        if target_name == "logs":
+            return iter(("line\n",))
+        if target_name == "inspect_run":
+            return object()
+        expected = call_kwargs["_expected_record"]
+        expected_snapshot = call_kwargs["_expected_snapshot"]
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+        with state.locked_existing_run(roots, name, expected=expected, expected_snapshot=expected_snapshot) as mutation:
+            terminal = {
+                "start": "running",
+                "stop": "stopped",
+                "rm": "removed",
+            }[target_name]
+            current = mutation.mutable_state()
+            initial = mutation.initial_snapshot
+            written = (
+                current
+                if initial.state["status"] == terminal and target_name != "rm"
+                else mutation.write_state(terminal, current)
+            )
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                terminal,
+                state.lifecycle_revision(written),
+            )
+            if target_name == "rm" and call_kwargs.get("volumes") is True:
+                mutation.delete_run_tree()
+            return outcome
 
     monkeypatch.setattr(getattr(runtime_dispatch, adapter_name), target_name, selected)
     result = dispatch("demo", roots=roots, **kwargs)
@@ -2149,8 +2183,11 @@ def test_existing_operations_route_by_the_durable_dispatch_key(
     called_adapter, called_name, call_kwargs = calls[0]
     assert (called_adapter, called_name) == (adapter_name, "demo")
     expected_record = call_kwargs.pop("_expected_record")
+    expected_snapshot = call_kwargs.pop("_expected_snapshot", None)
     assert isinstance(expected_record, ExistingRunRecord)
     assert expected_record.dispatch_key == DispatchKey(RuntimeKind(runtime_kind), RuntimeBackend(backend))
+    if target_name in {"start", "stop", "rm"}:
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     assert call_kwargs == {"roots": roots, **kwargs}
 
 
@@ -3163,3 +3200,402 @@ def test_oci_process_operations_remain_typed_unavailable_before_adapter_spawn(
 
     assert captured.value.operation is operation
     assert captured.value.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+
+
+@pytest.mark.parametrize("backend", ["kvm", "libvirt-hvf", "lima-vz"])
+@pytest.mark.parametrize(
+    ("operation", "dispatch", "initial", "terminal", "volumes"),
+    [
+        (RuntimeOperation.START, runtime_dispatch.start, "stopped", "running", False),
+        (RuntimeOperation.STOP, runtime_dispatch.stop, "running", "stopped", False),
+        (RuntimeOperation.RM, runtime_dispatch.rm, "stopped", "removed", True),
+    ],
+)
+def test_lifecycle_dispatch_returns_bound_typed_revision_receipt_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    operation: RuntimeOperation,
+    dispatch: Callable[..., LifecycleResult],
+    initial: str,
+    terminal: str,
+    volumes: bool,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, _ = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "status": initial,
+            "lifecycle_revision": 7,
+        },
+    )
+    adapter = runtime_dispatch.lima if backend == "lima-vz" else runtime_dispatch.cloud_runtime
+
+    def mutate(name: str, **kwargs: Any) -> _LifecycleAdapterOutcome:
+        expected = kwargs["_expected_record"]
+        with state.locked_existing_run(roots, name, expected=expected) as mutation:
+            written = mutation.write_state(terminal, mutation.mutable_state())
+            initial_snapshot = mutation.initial_snapshot
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial_snapshot.state["status"],
+                state.lifecycle_revision(initial_snapshot),
+                terminal,
+                state.lifecycle_revision(written),
+            )
+            if volumes:
+                mutation.delete_run_tree()
+            return outcome
+
+    monkeypatch.setattr(adapter, operation.value, mutate)
+    result = dispatch("demo", roots=roots, **({"volumes": True} if volumes else {}))
+
+    assert result.operation is operation
+    assert (result.previous_status, result.current_status) == (initial, terminal)
+    assert result.cursor.revision == 8
+    assert result.record.dispatch_key.backend.value == backend
+    assert rpaths.root.exists() is (not volumes)
+
+
+def test_lifecycle_public_types_reject_out_of_domain_cursor_and_raw_operation() -> None:
+    record = ExistingRunRecord(
+        "demo",
+        str(uuid.uuid4()),
+        2,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    with pytest.raises(ValueError, match="invalid revision"):
+        LifecycleCursor(record, 2**63)
+    with pytest.raises(ValueError, match="invalid operation"):
+        LifecycleResult(
+            record,
+            "start",  # type: ignore[arg-type]
+            "stopped",
+            "running",
+            LifecycleCursor(record, 1),
+        )
+    with pytest.raises(ValueError, match="forced shutdown"):
+        LifecycleResult(
+            record,
+            RuntimeOperation.START,
+            "stopped",
+            "running",
+            LifecycleCursor(record, 1),
+            LifecycleWarningCategory.FORCED_SHUTDOWN,
+            True,
+        )
+    with pytest.raises(ValueError, match="backend reconciliation"):
+        LifecycleResult(
+            record,
+            RuntimeOperation.RM,
+            "removed",
+            "removed",
+            LifecycleCursor(record, 1),
+            LifecycleWarningCategory.BACKEND_RECONCILED,
+        )
+    with pytest.raises(ValueError, match="backend reconciliation"):
+        LifecycleResult(
+            record,
+            RuntimeOperation.START,
+            "stopped",
+            "running",
+            LifecycleCursor(record, 1),
+            LifecycleWarningCategory.BACKEND_RECONCILED,
+        )
+
+
+def test_lifecycle_noop_keeps_revision_and_malicious_adapter_result_is_non_reflective(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+            "lifecycle_revision": 4,
+        },
+    )
+    record = state.read_run_dispatch_record(roots, "demo")
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "stop",
+        lambda *_args, **_kwargs: _issue_lifecycle_adapter_outcome(record, "stopped", 4, "stopped", 4),
+    )
+    result = runtime_dispatch.stop("demo", roots=roots)
+    assert result.cursor.revision == 4
+
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "stop",
+        lambda *_args, **_kwargs: {"status": "stopped", "secret": "SENSITIVE_VALUE"},
+    )
+    with pytest.raises(StateError) as captured:
+        runtime_dispatch.stop("demo", roots=roots)
+    assert "SENSITIVE_VALUE" not in str(captured.value)
+    assert captured.value.__context__ is None
+
+
+def test_lifecycle_forced_shutdown_warning_is_typed_and_not_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+
+    def force(name: str, **kwargs: Any) -> _LifecycleAdapterOutcome:
+        expected = kwargs["_expected_record"]
+        with state.locked_existing_run(roots, name, expected=expected) as mutation:
+            written = mutation.write_state("stopped", mutation.mutable_state())
+            initial_snapshot = mutation.initial_snapshot
+            return _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial_snapshot.state["status"],
+                state.lifecycle_revision(initial_snapshot),
+                "stopped",
+                state.lifecycle_revision(written),
+                LifecycleWarningCategory.FORCED_SHUTDOWN,
+                True,
+            )
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "stop", force)
+    result = runtime_dispatch.stop("demo", roots=roots)
+    assert result.warning_category is LifecycleWarningCategory.FORCED_SHUTDOWN
+    assert result.fallback_used is True
+    durable = state.read_run_state(state.run_paths(roots, "demo"))
+    assert "warning_category" not in durable
+    assert "fallback_used" not in durable
+
+
+@pytest.mark.parametrize(
+    ("operation", "durable_status", "live_before", "live_after"),
+    [
+        (RuntimeOperation.START, "running", "Stopped", "Running"),
+        (RuntimeOperation.STOP, "stopped", "Running", "Stopped"),
+    ],
+)
+def test_lima_backend_recovery_returns_authenticated_reconciled_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: RuntimeOperation,
+    durable_status: str,
+    live_before: str,
+    live_after: str,
+) -> None:
+    roots = _roots(tmp_path)
+    rpaths, run_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "lima-vz",
+            "status": durable_status,
+            "lifecycle_revision": 3,
+            "layers": [],
+            "volumes": [],
+        },
+    )
+    live_status = live_before
+
+    def instance() -> dict[str, Any]:
+        return {
+            "name": "demo",
+            "status": live_status,
+            "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+        }
+
+    def command(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal live_status
+        assert argv[:2] == ["limactl", operation.value]
+        live_status = live_after
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(runtime_dispatch.lima, "_instance_info_or_none", lambda _name: instance())
+    monkeypatch.setattr(runtime_dispatch.lima, "_instance_info", lambda _name: instance())
+    monkeypatch.setattr(runtime_dispatch.lima, "_run_command", command)
+    monkeypatch.setattr(runtime_dispatch.lima, "_attach_layers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime_dispatch.lima, "_guest_ipv4", lambda _name: "192.0.2.9")
+
+    dispatch = runtime_dispatch.start if operation is RuntimeOperation.START else runtime_dispatch.stop
+    result = dispatch("demo", roots=roots)
+
+    assert (result.previous_status, result.current_status) == (durable_status, durable_status)
+    assert result.cursor.revision == 5
+    assert result.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED
+    assert result.fallback_used is False
+    durable = state.read_run_state(rpaths)
+    assert durable["status"] == durable_status
+    assert durable["lifecycle_revision"] == 5
+    assert "warning_category" not in durable
+    assert "fallback_used" not in durable
+
+
+def test_backend_reconciled_warning_cannot_authorize_status_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+            "lifecycle_revision": 3,
+        },
+    )
+
+    def malicious(name: str, **kwargs: Any) -> _LifecycleAdapterOutcome:
+        expected = kwargs["_expected_record"]
+        snapshot = kwargs["_expected_snapshot"]
+        with state.locked_existing_run(
+            roots,
+            name,
+            expected=expected,
+            expected_snapshot=snapshot,
+        ) as mutation:
+            written = mutation.write_state("running", mutation.mutable_state())
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                "stopped",
+                3,
+                "stopped",
+                state.lifecycle_revision(written),
+                LifecycleWarningCategory.BACKEND_RECONCILED,
+            )
+            object.__setattr__(outcome, "status", "running")
+            object.__setattr__(
+                outcome,
+                "authentication_tag",
+                runtime_dispatch._lifecycle_outcome_authentication_tag(
+                    mutation.record,
+                    "stopped",
+                    3,
+                    "running",
+                    state.lifecycle_revision(written),
+                    LifecycleWarningCategory.BACKEND_RECONCILED,
+                    False,
+                ),
+            )
+            return outcome
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "start", malicious)
+
+    with pytest.raises(StateError, match="invalid recovery metadata"):
+        runtime_dispatch.start("demo", roots=roots)
+
+
+def test_lifecycle_receipt_poison_is_non_reflective_even_after_durable_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "stopped",
+        },
+    )
+
+    class Poison:
+        def __str__(self) -> str:
+            raise RuntimeError("SENSITIVE_VALUE")
+
+        def __repr__(self) -> str:
+            raise RuntimeError("SENSITIVE_VALUE")
+
+        def __eq__(self, _other: object) -> bool:
+            raise RuntimeError("SENSITIVE_VALUE")
+
+        def __hash__(self) -> int:
+            raise RuntimeError("SENSITIVE_VALUE")
+
+    def tamper(name: str, **kwargs: Any) -> _LifecycleAdapterOutcome:
+        expected = kwargs["_expected_record"]
+        expected_snapshot = kwargs["_expected_snapshot"]
+        with state.locked_existing_run(
+            roots,
+            name,
+            expected=expected,
+            expected_snapshot=expected_snapshot,
+        ) as mutation:
+            initial = mutation.initial_snapshot
+            written = mutation.write_state("running", mutation.mutable_state())
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                "running",
+                state.lifecycle_revision(written),
+            )
+            object.__setattr__(outcome, "status", Poison())
+            return outcome
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "start", tamper)
+    with pytest.raises(StateError) as captured:
+        runtime_dispatch.start("demo", roots=roots)
+    assert str(captured.value) == "runtime adapter returned an invalid lifecycle receipt"
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("dispatch", "initial", "kwargs"),
+    [
+        (runtime_dispatch.start, "running", {}),
+        (runtime_dispatch.stop, "stopped", {}),
+        (runtime_dispatch.rm, "removed", {}),
+        (runtime_dispatch.rm, "running", {"volumes": True}),
+    ],
+)
+def test_lifecycle_revision_max_rejects_every_operation_before_preflight_or_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch: Callable[..., LifecycleResult],
+    initial: str,
+    kwargs: dict[str, object],
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": initial,
+            "lifecycle_revision": 2**63 - 1,
+        },
+    )
+    effects: list[str] = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "preflight_existing_record",
+        lambda *_args, **_kwargs: effects.append("preflight") or pytest.fail("preflight reached"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        dispatch.__name__,
+        lambda *_args, **_kwargs: effects.append("adapter") or pytest.fail("adapter reached"),
+    )
+
+    with pytest.raises(StateError, match="cannot be incremented"):
+        dispatch("demo", roots=roots, **kwargs)
+    assert effects == []

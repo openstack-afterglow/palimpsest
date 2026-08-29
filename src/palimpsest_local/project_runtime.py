@@ -34,7 +34,14 @@ from .project import (
     project_config_digest,
     service_start_order,
 )
-from .runtime_types import DispatchKey, ExpectedRunIdentity, RuntimeBackend, RuntimeKind
+from .runtime_types import (
+    DispatchKey,
+    ExpectedRunIdentity,
+    LifecycleResult,
+    RunResult,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 PROJECT_STATE_SCHEMA_VERSION = 2
 _MIB = 1024 * 1024
@@ -362,7 +369,9 @@ def runtime_status(value: object | None) -> str | None:
 
     if value is None:
         return None
-    if isinstance(value, str):
+    if isinstance(value, (RunResult, LifecycleResult)):
+        status = value.status if isinstance(value, RunResult) else value.current_status
+    elif isinstance(value, str):
         status = value
     elif isinstance(value, Mapping):
         candidate = value.get("status")
@@ -383,6 +392,11 @@ def runtime_identity(value: object | None) -> RuntimeIdentity | None:
 
     if value is None:
         return None
+    if isinstance(value, (RunResult, LifecycleResult)):
+        return RuntimeIdentity(
+            run_id=value.record.run_id,
+            backend=value.record.dispatch_key.backend.value,
+        )
     if not isinstance(value, Mapping):
         raise ProjectLifecycleError("runtime identity requires a mapping inspection result")
     nested_state = value.get("state")

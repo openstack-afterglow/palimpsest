@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import json
 import re
+import secrets
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
@@ -20,6 +22,8 @@ from .errors import LifecycleError, PalimpsestError
 from .refs import RunSpec
 
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_LIFECYCLE_ADAPTER_AUTHENTICATION_KEY = secrets.token_bytes(32)
+_MAX_LIFECYCLE_REVISION = 2**63 - 1
 
 
 class RuntimeKind(StrEnum):
@@ -44,6 +48,13 @@ class RuntimeOperation(StrEnum):
     RECONCILE = "reconcile"
     EXEC = "exec"
     SHELL = "shell"
+
+
+class LifecycleWarningCategory(StrEnum):
+    """Stable, non-reflective warnings attached to lifecycle receipts."""
+
+    FORCED_SHUTDOWN = "forced-shutdown"
+    BACKEND_RECONCILED = "backend-reconciled"
 
 
 class CapabilityErrorCategory(StrEnum):
@@ -606,6 +617,165 @@ class ExistingRunRecord:
             raise TypeError("existing run record requires a DispatchKey")
 
 
+@dataclass(frozen=True, slots=True)
+class LifecycleCursor:
+    """A durable lifecycle position bound to one exact run identity."""
+
+    record: ExistingRunRecord
+    revision: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("lifecycle cursor requires an ExistingRunRecord")
+        if type(self.revision) is not int or not 0 <= self.revision <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("lifecycle cursor has an invalid revision")
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleResult:
+    """Safe result of one existing-run lifecycle transition."""
+
+    record: ExistingRunRecord
+    operation: RuntimeOperation
+    previous_status: str
+    current_status: str
+    cursor: LifecycleCursor
+    warning_category: LifecycleWarningCategory | None = None
+    fallback_used: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("lifecycle result requires an ExistingRunRecord")
+        if type(self.operation) is not RuntimeOperation or self.operation not in {
+            RuntimeOperation.START,
+            RuntimeOperation.STOP,
+            RuntimeOperation.RM,
+        }:
+            raise ValueError("lifecycle result has an invalid operation")
+        allowed = ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]
+        if self.previous_status not in allowed or self.current_status not in allowed:
+            raise ValueError("lifecycle result has an invalid runtime status")
+        if not isinstance(self.cursor, LifecycleCursor) or self.cursor.record != self.record:
+            raise ValueError("lifecycle result cursor does not match its record")
+        if self.warning_category is not None and not isinstance(self.warning_category, LifecycleWarningCategory):
+            raise TypeError("lifecycle result has an invalid warning category")
+        if type(self.fallback_used) is not bool:
+            raise TypeError("lifecycle result fallback flag must be a bool")
+        if self.fallback_used != (self.warning_category is LifecycleWarningCategory.FORCED_SHUTDOWN):
+            raise ValueError("lifecycle result fallback metadata is inconsistent")
+        if (
+            self.warning_category is LifecycleWarningCategory.FORCED_SHUTDOWN
+            and self.operation is not RuntimeOperation.STOP
+        ):
+            raise ValueError("forced shutdown warning requires a stop operation")
+        if self.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED and (
+            self.operation not in {RuntimeOperation.START, RuntimeOperation.STOP}
+            or self.previous_status != self.current_status
+        ):
+            raise ValueError("backend reconciliation warning requires a same-status start or stop")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _LifecycleAdapterOutcome:
+    """Internal adapter-to-dispatch receipt; never serialized directly."""
+
+    record: ExistingRunRecord
+    previous_status: str
+    previous_revision: int
+    status: str
+    revision: int
+    warning_category: LifecycleWarningCategory | None = None
+    fallback_used: bool = False
+    authentication_tag: bytes = dataclass_field(default=b"", repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("adapter lifecycle outcome requires an ExistingRunRecord")
+        if self.previous_status not in ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]:
+            raise ValueError("adapter lifecycle outcome has an invalid previous status")
+        if type(self.previous_revision) is not int or not 0 <= self.previous_revision <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("adapter lifecycle outcome has an invalid previous revision")
+        if self.status not in ALLOWED_RUNTIME_STATUSES[self.record.dispatch_key.runtime_kind]:
+            raise ValueError("adapter lifecycle outcome has an invalid status")
+        if type(self.revision) is not int or not 0 <= self.revision <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("adapter lifecycle outcome has an invalid revision")
+        if self.warning_category is not None and not isinstance(self.warning_category, LifecycleWarningCategory):
+            raise TypeError("adapter lifecycle outcome has an invalid warning category")
+        if type(self.fallback_used) is not bool:
+            raise TypeError("adapter lifecycle outcome fallback flag must be a bool")
+        if self.fallback_used != (self.warning_category is LifecycleWarningCategory.FORCED_SHUTDOWN):
+            raise ValueError("adapter lifecycle outcome fallback metadata is inconsistent")
+        if self.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED and (
+            self.previous_status != self.status or self.revision <= self.previous_revision
+        ):
+            raise ValueError("adapter lifecycle outcome reconciliation metadata is inconsistent")
+        if self.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED and (
+            self.previous_status != self.status or self.revision <= self.previous_revision
+        ):
+            raise ValueError("adapter lifecycle outcome recovery metadata is inconsistent")
+        if type(self.authentication_tag) is not bytes or len(self.authentication_tag) != 32:
+            raise ValueError("adapter lifecycle outcome authentication is invalid")
+
+
+def _lifecycle_outcome_authentication_tag(
+    record: ExistingRunRecord,
+    previous_status: str,
+    previous_revision: int,
+    status: str,
+    revision: int,
+    warning_category: LifecycleWarningCategory | None,
+    fallback_used: bool,
+) -> bytes:
+    payload = json.dumps(
+        {
+            "name": record.name,
+            "run_id": record.run_id,
+            "state_schema_version": record.state_schema_version,
+            "runtime_kind": record.dispatch_key.runtime_kind.value,
+            "backend": record.dispatch_key.backend.value,
+            "previous_status": previous_status,
+            "previous_revision": previous_revision,
+            "status": status,
+            "revision": revision,
+            "warning_category": None if warning_category is None else warning_category.value,
+            "fallback_used": fallback_used,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hmac.digest(_LIFECYCLE_ADAPTER_AUTHENTICATION_KEY, payload, "sha256")
+
+
+def _issue_lifecycle_adapter_outcome(
+    record: ExistingRunRecord,
+    previous_status: str,
+    previous_revision: int,
+    status: str,
+    revision: int,
+    warning_category: LifecycleWarningCategory | None = None,
+    fallback_used: bool = False,
+) -> _LifecycleAdapterOutcome:
+    tag = _lifecycle_outcome_authentication_tag(
+        record,
+        previous_status,
+        previous_revision,
+        status,
+        revision,
+        warning_category,
+        fallback_used,
+    )
+    return _LifecycleAdapterOutcome(
+        record,
+        previous_status,
+        previous_revision,
+        status,
+        revision,
+        warning_category,
+        fallback_used,
+        tag,
+    )
+
+
 def _binding_projection(value: Any) -> Any:
     """Return an in-process canonical projection used only behind SHA-256."""
 
@@ -1066,6 +1236,9 @@ __all__ = (
     "ExecRequest",
     "ExistingRunRecord",
     "ExpectedRunIdentity",
+    "LifecycleCursor",
+    "LifecycleResult",
+    "LifecycleWarningCategory",
     "ProcessCapabilities",
     "ProcessCapabilityError",
     "ProcessEvent",

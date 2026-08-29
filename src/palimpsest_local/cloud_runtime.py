@@ -31,10 +31,42 @@ from .errors import (
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .process_session import bind_process_session_context, spawn_process_session
 from .refs import ImageRef, RunSpec
-from .runtime_types import DispatchKey, ExecRequest, ExistingRunRecord, ProcessSession, RuntimeBackend, RuntimeKind
+from .runtime_types import (
+    DispatchKey,
+    ExecRequest,
+    ExistingRunRecord,
+    LifecycleWarningCategory,
+    ProcessSession,
+    RuntimeBackend,
+    RuntimeKind,
+    _issue_lifecycle_adapter_outcome,
+    _LifecycleAdapterOutcome,
+)
 from .state import OwnerRecord, RunPaths, StatePaths, TagRecord
 
 _logger = logging.getLogger(__name__)
+
+
+def _lifecycle_outcome(
+    mutation: state.ExistingRunMutation,
+    payload: dict[str, Any],
+    expected: ExistingRunRecord | None,
+    *,
+    warning_category: LifecycleWarningCategory | None = None,
+    fallback_used: bool = False,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
+    if expected is None:
+        return payload
+    initial = mutation.initial_snapshot
+    return _issue_lifecycle_adapter_outcome(
+        mutation.record,
+        initial.state["status"],
+        state.lifecycle_revision(initial),
+        payload["status"],
+        state.lifecycle_revision(payload),
+        warning_category,
+        fallback_used,
+    )
 
 
 def _run_paths_for_root(root: Path, template: RunPaths) -> RunPaths:
@@ -665,11 +697,14 @@ def start(
     profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 300.0,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     """Start an owned stopped KVM run without recreating its root or named volumes."""
 
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend
@@ -682,7 +717,7 @@ def start(
         rpaths = mutation.paths
         current = mutation.mutable_state()
         if current.get("status") == "running":
-            return current
+            return _lifecycle_outcome(mutation, current, _expected_record)
         if current.get("status") != "stopped":
             raise LifecycleError(f"run '{name}' cannot be started from status {current.get('status')!r}")
         if profile is not None and profile.backend != mutation.record.dispatch_key.backend.value:
@@ -739,10 +774,11 @@ def start(
             final_domain = conn_obj.lookupByName(name)
             if final_domain is None or kvm.get_domain_run_id(final_domain) != mutation.record.run_id:
                 raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
-            return mutation.write_state(
+            result = mutation.write_state(
                 "running",
                 {**current, "guest_ip": guest_ip, "ssh": ssh_endpoint, "updated_at": state.utc_now_iso()},
             )
+            return _lifecycle_outcome(mutation, result, _expected_record)
         except BaseException as exc:
             try:
                 if hasattr(domain, "isActive") and domain.isActive() and hasattr(domain, "destroy"):
@@ -1024,9 +1060,12 @@ def stop(
     profile: platforms.DomainProfile | None = None,
     timeout_seconds: float = 30.0,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend
@@ -1038,7 +1077,7 @@ def stop(
             raise StateError("run is not managed by the cloud runtime")
         curr_state = mutation.mutable_state()
         if curr_state.get("status") in ("stopped", "removed"):
-            return curr_state
+            return _lifecycle_outcome(mutation, curr_state, _expected_record)
 
         if profile is not None and profile.backend != mutation.record.dispatch_key.backend.value:
             raise StateError("run profile does not match durable backend")
@@ -1057,8 +1096,10 @@ def stop(
 
         if domain is None:
             if mutation.is_legacy:
-                return {**curr_state, "status": "stopped", "updated_at": state.utc_now_iso()}
-            return mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+                result = mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+                return _lifecycle_outcome(mutation, result, _expected_record)
+            result = mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
 
         domain_run_id = kvm.get_domain_run_id(domain)
         if domain_run_id != mutation.record.run_id:
@@ -1069,11 +1110,13 @@ def stop(
         is_active = True
         if hasattr(domain, "isActive"):
             is_active = domain.isActive()
-        if not is_active and mutation.is_legacy:
-            return {**curr_state, "status": "stopped", "updated_at": state.utc_now_iso()}
-
+        legacy = mutation.is_legacy
+        if not is_active and legacy:
+            result = mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
+        fallback_used = False
         if is_active:
-            if not mutation.is_legacy:
+            if not legacy:
                 curr_state = mutation.write_state("stopping", {**curr_state, "updated_at": state.utc_now_iso()})
             mutation.verify_binding()
             if hasattr(domain, "shutdown"):
@@ -1092,6 +1135,7 @@ def stop(
                 if hasattr(domain, "destroy"):
                     mutation.verify_binding()
                     domain.destroy()
+                    fallback_used = True
             if hasattr(domain, "isActive") and domain.isActive():
                 raise LifecycleError(f"domain '{name}' did not stop")
 
@@ -1102,7 +1146,15 @@ def stop(
             raise LifecycleError(f"owned libvirt domain '{name}' disappeared during stop") from exc
         if final_domain is None or kvm.get_domain_run_id(final_domain) != mutation.record.run_id:
             raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
-        return mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+        result = mutation.write_state("stopped", {**curr_state, "updated_at": state.utc_now_iso()})
+        warning = LifecycleWarningCategory.FORCED_SHUTDOWN if fallback_used else None
+        return _lifecycle_outcome(
+            mutation,
+            result,
+            _expected_record,
+            warning_category=warning,
+            fallback_used=fallback_used,
+        )
 
 
 def rm(
@@ -1114,9 +1166,12 @@ def rm(
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend
@@ -1162,12 +1217,14 @@ def rm(
                 raise LifecycleError(f"domain '{name}' was not removed")
 
         if not volumes:
-            if domain is None and original_status == "removed":
-                return curr_state
-            return mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
-        updated = {**curr_state, "status": "removed", "updated_at": state.utc_now_iso()}
+            if original_status == "removed":
+                return _lifecycle_outcome(mutation, curr_state, _expected_record)
+            result = mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
+        updated = mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
+        outcome = _lifecycle_outcome(mutation, updated, _expected_record)
         mutation.delete_run_tree()
-        return updated
+        return outcome
 
 
 def reconcile_run(

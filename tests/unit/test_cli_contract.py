@@ -32,6 +32,7 @@ from palimpsest_local.runtime_types import (
     RuntimeBackend,
     RuntimeKind,
     RuntimePreflightError,
+    _issue_lifecycle_adapter_outcome,
 )
 
 
@@ -60,6 +61,7 @@ def _write_cli_run_ledger(
         json.dumps({"schema_version": 1, "run_id": run_id, "name": "demo-vm"}) + "\n",
         encoding="utf-8",
     )
+    rpaths.owner.chmod(0o600)
     rpaths.state.write_text(
         json.dumps(
             {
@@ -74,6 +76,7 @@ def _write_cli_run_ledger(
         + "\n",
         encoding="utf-8",
     )
+    rpaths.state.chmod(0o600)
     return roots, rpaths
 
 
@@ -1109,7 +1112,35 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
             return iter(("first\n", "second\n"))
         if target_name == "inspect_run":
             return {"owner": {"name": name}, "state": {"status": "stopped"}}
-        return {"status": "running" if target_name == "start" else "stopped"}
+        expected = kwargs["_expected_record"]
+        assert isinstance(expected, ExistingRunRecord)
+        operation_roots = kwargs["roots"]
+        assert isinstance(operation_roots, state.StatePaths)
+        expected_snapshot = kwargs["_expected_snapshot"]
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+        with state.locked_existing_run(
+            operation_roots,
+            name,
+            expected=expected,
+            expected_snapshot=expected_snapshot,
+        ) as mutation:
+            terminal = "running" if target_name == "start" else "removed" if target_name == "rm" else "stopped"
+            initial = mutation.initial_snapshot
+            written = (
+                mutation.mutable_state()
+                if initial.state["status"] == terminal and target_name != "rm"
+                else mutation.write_state(terminal, mutation.mutable_state())
+            )
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                terminal,
+                state.lifecycle_revision(written),
+            )
+            if target_name == "rm":
+                mutation.delete_run_tree()
+            return outcome
 
     selected_adapter = getattr(runtime_dispatch, adapter_name)
     other_adapter = runtime_dispatch.lima if adapter_name == "cloud_runtime" else runtime_dispatch.cloud_runtime
@@ -1127,8 +1158,11 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
     called_name, called_kwargs = calls[0]
     assert called_name == "demo-vm"
     record = called_kwargs.pop("_expected_record")
+    expected_snapshot = called_kwargs.pop("_expected_snapshot", None)
     assert isinstance(record, ExistingRunRecord)
     assert record.dispatch_key.backend is expected_backend
+    if operation in {"start", "stop", "rm"}:
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     assert called_kwargs == {"roots": roots, **expected_kwargs}
     output = capsys.readouterr().out
     if operation == "inspect":

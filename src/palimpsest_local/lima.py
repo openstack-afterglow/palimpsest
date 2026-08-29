@@ -24,11 +24,14 @@ from .runtime_types import (
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
+    LifecycleWarningCategory,
     ProcessSession,
     RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
     RuntimeOperation,
+    _issue_lifecycle_adapter_outcome,
+    _LifecycleAdapterOutcome,
 )
 from .state import RunPaths, StatePaths
 
@@ -38,6 +41,26 @@ _TIMEOUT_SECONDS = 600
 _LIMA_NETWORK_RE = re.compile(r"^lima:[a-z0-9][a-z0-9-]{0,62}$")
 _LIMA_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?\b")
 _RUN_ID_ENV = "PALIMPSEST_RUN_ID"
+
+
+def _lifecycle_outcome(
+    mutation: state.ExistingRunMutation,
+    payload: dict[str, Any],
+    expected: ExistingRunRecord | None,
+    *,
+    warning_category: LifecycleWarningCategory | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
+    if expected is None:
+        return payload
+    initial = mutation.initial_snapshot
+    return _issue_lifecycle_adapter_outcome(
+        mutation.record,
+        initial.state["status"],
+        state.lifecycle_revision(initial),
+        payload["status"],
+        state.lifecycle_revision(payload),
+        warning_category,
+    )
 
 
 def available() -> bool:
@@ -827,15 +850,19 @@ def stop(
     *,
     roots: StatePaths | None = None,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
         ):
             raise StateError("run is not managed by the Lima runtime")
         record = mutation.mutable_state()
+        initial_status = record.get("status")
         instance = _instance_info_or_none(name)
         if instance is None:
             if not mutation.is_legacy and record.get("status") != "removed":
@@ -843,15 +870,20 @@ def stop(
             raise StateError(f"owned Lima instance is missing: {name}")
         _require_owned_instance(instance, mutation.record.run_id, name)
         live_status = _instance_runtime_status(instance)
+        backend_reconciled = initial_status == "stopped" and live_status != "stopped"
         if record.get("status") in {"failed", "removed"}:
             raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
         if live_status == "stopped":
             if record.get("status") == "stopped":
-                return record
+                return _lifecycle_outcome(mutation, record, _expected_record)
             if mutation.is_legacy:
-                return {**record, "status": "stopped", "updated_at": state.utc_now_iso()}
-            return mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
-        if not mutation.is_legacy and live_status != record.get("status"):
+                result = mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
+                return _lifecycle_outcome(mutation, result, _expected_record)
+            result = mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
+        if live_status != record.get("status"):
+            if mutation.is_legacy:
+                raise LifecycleError(f"Lima run '{name}' cannot be stopped from status {live_status!r}")
             record = mutation.write_state(live_status, {**record, "updated_at": state.utc_now_iso()})
         mutation.verify_binding()
         _require_success(_run_command(["limactl", "stop", "--force", name], timeout_seconds=60), "stop")
@@ -861,7 +893,14 @@ def stop(
         _require_owned_instance(final_instance, mutation.record.run_id, name)
         if _instance_runtime_status(final_instance) != "stopped":
             raise LifecycleError(f"Lima instance '{name}' did not stop")
-        return mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
+        result = mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
+        warning = LifecycleWarningCategory.BACKEND_RECONCILED if backend_reconciled else None
+        return _lifecycle_outcome(
+            mutation,
+            result,
+            _expected_record,
+            warning_category=warning,
+        )
 
 
 def start(
@@ -870,11 +909,14 @@ def start(
     roots: StatePaths | None = None,
     timeout_seconds: float = _TIMEOUT_SECONDS,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     """Start an owned stopped Lima VM and restore its runtime SquashFS mounts."""
 
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
@@ -882,6 +924,7 @@ def start(
             raise StateError("run is not managed by the Lima runtime")
         rpaths = mutation.paths
         record = mutation.mutable_state()
+        initial_status = record.get("status")
         instance = _instance_info_or_none(name)
         if instance is None:
             if not mutation.is_legacy and record.get("status") != "removed":
@@ -889,23 +932,26 @@ def start(
             raise StateError(f"owned Lima instance is missing: {name}")
         _require_owned_instance(instance, mutation.record.run_id, name)
         live_status = _instance_runtime_status(instance)
+        backend_reconciled = initial_status == "running" and live_status == "stopped"
         if record.get("status") in {"failed", "removed"}:
             raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
         _require_existing_disk_config_safe(instance, record, name)
         if live_status == "running":
             if record.get("status") == "running":
-                return record
+                return _lifecycle_outcome(mutation, record, _expected_record)
             if mutation.is_legacy:
-                return {**record, "status": "running", "updated_at": state.utc_now_iso()}
-            return mutation.write_state("running", {**record, "updated_at": state.utc_now_iso()})
+                result = mutation.write_state("running", {**record, "updated_at": state.utc_now_iso()})
+                return _lifecycle_outcome(mutation, result, _expected_record)
+            result = mutation.write_state("running", {**record, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
         if live_status not in {"stopped", "running"}:
-            if not mutation.is_legacy and live_status != record.get("status"):
+            if live_status != record.get("status") and not mutation.is_legacy:
                 mutation.write_state(live_status, {**record, "updated_at": state.utc_now_iso()})
             raise LifecycleError(f"Lima run '{name}' cannot be started from status {live_status!r}")
         if record.get("status") not in {"stopped", "running"}:
             raise LifecycleError(f"Lima run '{name}' cannot be started from status {record.get('status')!r}")
-        legacy = mutation.is_legacy
         start_attempted = False
+        legacy = mutation.is_legacy
         if not legacy:
             record = mutation.write_state("starting", {**record, "updated_at": state.utc_now_iso()})
         try:
@@ -935,9 +981,16 @@ def start(
             _require_owned_instance(final_instance, mutation.record.run_id, name)
             if final_instance.get("status") != "Running":
                 raise LifecycleError(f"Lima instance '{name}' did not remain Running")
-            return mutation.write_state(
+            result = mutation.write_state(
                 "running",
                 {**record, "guest_ip": guest_ip, "updated_at": state.utc_now_iso()},
+            )
+            warning = LifecycleWarningCategory.BACKEND_RECONCILED if backend_reconciled else None
+            return _lifecycle_outcome(
+                mutation,
+                result,
+                _expected_record,
+                warning_category=warning,
             )
         except BaseException as exc:
             if start_attempted:
@@ -974,9 +1027,12 @@ def rm(
     volumes: bool = False,
     roots: StatePaths | None = None,
     _expected_record: ExistingRunRecord | None = None,
-) -> dict[str, Any]:
+    _expected_snapshot: state.RunLedgerSnapshot | None = None,
+) -> dict[str, Any] | _LifecycleAdapterOutcome:
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
-    with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+    with state.locked_existing_run(
+        roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
+    ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
             or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
@@ -992,12 +1048,14 @@ def rm(
             if remaining is not None:
                 raise LifecycleError(f"Lima instance '{name}' was not deleted")
         if not volumes:
-            if instance is None and record.get("status") == "removed":
-                return record
-            return mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
-        result = {**record, "status": "removed", "updated_at": state.utc_now_iso()}
+            if record.get("status") == "removed":
+                return _lifecycle_outcome(mutation, record, _expected_record)
+            result = mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+            return _lifecycle_outcome(mutation, result, _expected_record)
+        result = mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+        outcome = _lifecycle_outcome(mutation, result, _expected_record)
         mutation.delete_run_tree()
-        return result
+        return outcome
 
 
 def _append_console(
