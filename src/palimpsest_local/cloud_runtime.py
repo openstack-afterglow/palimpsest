@@ -9,12 +9,13 @@ import os
 import re
 import shutil
 import socket
+import stat as stat_module
 import subprocess
 import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -28,8 +29,9 @@ from .errors import (
     StateError,
 )
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
+from .process_session import bind_process_session_context, spawn_process_session
 from .refs import ImageRef, RunSpec
-from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
+from .runtime_types import DispatchKey, ExecRequest, ExistingRunRecord, ProcessSession, RuntimeBackend, RuntimeKind
 from .state import OwnerRecord, RunPaths, StatePaths, TagRecord
 
 _logger = logging.getLogger(__name__)
@@ -1524,6 +1526,129 @@ def exec_command(
         known_hosts=rpaths.known_hosts,
         port=port,
     )
+
+
+def _read_process_ssh_artifact(path: Path) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LifecycleError("run SSH trust artifact is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 64 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError:
+        raise LifecycleError("cannot pin run SSH trust artifacts") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _stage_process_ssh_artifacts(rpaths: RunPaths, directory: Path) -> tuple[Path, Path]:
+    """Copy exact trust bytes into one owner-only session resource directory."""
+
+    staged: list[Path] = []
+    for source, filename in ((rpaths.identity, "identity"), (rpaths.known_hosts, "known_hosts")):
+        target = directory / filename
+        target.write_bytes(_read_process_ssh_artifact(source))
+        target.chmod(0o600)
+        staged.append(target)
+    return staged[0], staged[1]
+
+
+def shell_session(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> ProcessSession:
+    """Open an owned SSH shell without returning host argv to the caller."""
+
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or expected.dispatch_key.backend not in {
+        RuntimeBackend.KVM,
+        RuntimeBackend.LIBVIRT_HVF,
+    }:
+        raise StateError("run is not managed by the cloud runtime")
+    resources = ExitStack()
+    session: ProcessSession | None = None
+    try:
+        staging = Path(
+            resources.enter_context(tempfile.TemporaryDirectory(prefix=".process-session-", dir=roots.state))
+        )
+        with state.locked_existing_run(roots, name, expected=expected) as mutation:
+            record = mutation.mutable_state()
+            if record.get("status") != "running":
+                raise LifecycleError(f"run '{name}' is not running (status: {record.get('status')})")
+            rpaths = mutation.paths
+            host, port = _ssh_endpoint(name, record)
+            identity, known_hosts = _stage_process_ssh_artifacts(rpaths, staging)
+            command = guest.build_shell_command(
+                host,
+                identity=identity,
+                known_hosts=known_hosts,
+                port=port,
+            )
+            mutation.verify_binding()
+            session = spawn_process_session(command, tty=True, stdin=True)
+            mutation.verify_binding()
+        return bind_process_session_context(session, resources)
+    except BaseException:
+        if session is not None:
+            session.close()
+        resources.close()
+        raise
+
+
+def exec_session(
+    name: str,
+    request: ExecRequest,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> ProcessSession:
+    """Open an owned non-interactive SSH exec transport."""
+
+    if not isinstance(request, ExecRequest):
+        raise TypeError("cloud exec requires an ExecRequest")
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or expected.dispatch_key.backend not in {
+        RuntimeBackend.KVM,
+        RuntimeBackend.LIBVIRT_HVF,
+    }:
+        raise StateError("run is not managed by the cloud runtime")
+    resources = ExitStack()
+    session: ProcessSession | None = None
+    try:
+        staging = Path(
+            resources.enter_context(tempfile.TemporaryDirectory(prefix=".process-session-", dir=roots.state))
+        )
+        with state.locked_existing_run(roots, name, expected=expected) as mutation:
+            record = mutation.mutable_state()
+            if record.get("status") != "running":
+                raise LifecycleError(f"run '{name}' is not running (status: {record.get('status')})")
+            rpaths = mutation.paths
+            host, port = _ssh_endpoint(name, record)
+            identity, known_hosts = _stage_process_ssh_artifacts(rpaths, staging)
+            command = guest.build_exec_command(
+                host,
+                request.argv,
+                identity=identity,
+                known_hosts=known_hosts,
+                port=port,
+            )
+            mutation.verify_binding()
+            session = spawn_process_session(command, tty=False, stdin=False)
+            mutation.verify_binding()
+        return bind_process_session_context(session, resources)
+    except BaseException:
+        if session is not None:
+            session.close()
+        resources.close()
+        raise
 
 
 def commit(

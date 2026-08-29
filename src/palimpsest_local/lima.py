@@ -20,7 +20,16 @@ from . import state
 from .digest import require_file_digest
 from .errors import ArtifactValidationError, BuildError, LifecycleError, StateError
 from .refs import BuildSpec, LayerRef, RunSpec, StackRef
-from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
+from .runtime_types import (
+    DispatchKey,
+    ExecRequest,
+    ExistingRunRecord,
+    ProcessSession,
+    RuntimeBackend,
+    RuntimeCapabilityError,
+    RuntimeKind,
+    RuntimeOperation,
+)
 from .state import RunPaths, StatePaths
 
 _BACKEND = "lima-vz"
@@ -719,6 +728,41 @@ def exec_command(name: str, argv: list[str], *, roots: StatePaths | None = None)
     roots = roots or state.init_roots()
     inspect_run(name, roots=roots)
     return ["limactl", "shell", name, *argv]
+
+
+def shell_session(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> ProcessSession:
+    """Open an exact owner-checked Lima shell process."""
+
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.dispatch_key != DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ):
+        raise StateError("run is not managed by the Lima runtime")
+    state.require_bound_run_dispatch_record(roots, expected)
+    raise RuntimeCapabilityError(RuntimeOperation.SHELL, expected.dispatch_key)
+
+
+def exec_session(
+    name: str,
+    request: ExecRequest,
+    *,
+    roots: StatePaths | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+) -> ProcessSession:
+    """Open an exact owner-checked non-interactive Lima exec process."""
+
+    if not isinstance(request, ExecRequest):
+        raise TypeError("Lima exec requires an ExecRequest")
+    roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
+    expected = _expected_record or state.read_run_dispatch_record(roots, name)
+    if expected.dispatch_key != DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ):
+        raise StateError("run is not managed by the Lima runtime")
+    state.require_bound_run_dispatch_record(roots, expected)
+    raise RuntimeCapabilityError(RuntimeOperation.EXEC, expected.dispatch_key)
 
 
 def logs(

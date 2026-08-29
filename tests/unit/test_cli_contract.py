@@ -17,6 +17,13 @@ from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.runtime_types import (
     DispatchKey,
     ExistingRunRecord,
+    ProcessCapabilities,
+    ProcessExit,
+    ProcessExitCategory,
+    ProcessOutputEvent,
+    ProcessSignal,
+    ProcessStatusEvent,
+    ProcessStream,
     RunAttachmentMode,
     RunResult,
     RuntimeBackend,
@@ -111,11 +118,16 @@ def test_cli_uses_only_stdlib_and_package_imports():
         "os",
         "pathlib",
         "re",
+        "select",
         "shutil",
+        "signal",
         "subprocess",
         "sys",
         "tempfile",
+        "termios",
+        "threading",
         "tomllib",
+        "tty",
         "typing",
     }
 
@@ -596,6 +608,353 @@ def test_exec_requires_nonempty_remainder(capsys: pytest.CaptureFixture[str]):
     assert "command" in capsys.readouterr().err
 
 
+def test_top_level_exec_consumes_dispatcher_session_without_spawning_in_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = object()
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_exec(name, argv, *, roots):
+        del roots
+        calls.append((name, argv))
+        return session
+
+    monkeypatch.setattr(cli.runtime_dispatch, "exec", fake_exec)
+    monkeypatch.setattr(
+        cli,
+        "_run_process_session",
+        lambda candidate, *, interactive: 23 if candidate is session and not interactive else pytest.fail(),
+    )
+
+    assert cli.main(["exec", "demo", "--", "printf", "%s", "literal value"]) == 23
+    assert calls == [("demo", ["printf", "%s", "literal value"])]
+
+
+def test_shell_requires_local_terminal_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli.runtime_dispatch, "shell", lambda *_args, **_kwargs: pytest.fail("shell dispatched"))
+
+    assert cli.main(["shell", "demo"]) == 1
+    assert "requires a local terminal" in capsys.readouterr().err
+
+
+def test_cli_process_bridge_preserves_split_bytes_and_exact_status(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = ProcessExit(19, 19, None, ProcessExitCategory.EXITED)
+
+    class Session:
+        capabilities = ProcessCapabilities(False, False, False, True)
+
+        def events(self):
+            yield ProcessOutputEvent(ProcessStream.STDOUT, b"out\n")
+            yield ProcessOutputEvent(ProcessStream.STDERR, b"err\n")
+            yield ProcessStatusEvent(result)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            return None
+
+        def wait(self):
+            return result
+
+        def close(self) -> None:
+            pytest.fail("successful bridge closed its session")
+
+    assert cli._run_process_session(Session(), interactive=False) == 19
+    captured = capsys.readouterr()
+    assert captured.out == "out\n"
+    assert captured.err == "err\n"
+
+
+@pytest.mark.parametrize(
+    ("events", "waited", "message"),
+    [
+        ((), ProcessExit(0, 0, None, ProcessExitCategory.EXITED), "no terminal"),
+        (
+            (
+                ProcessStatusEvent(ProcessExit(0, 0, None, ProcessExitCategory.EXITED)),
+                ProcessStatusEvent(ProcessExit(0, 0, None, ProcessExitCategory.EXITED)),
+            ),
+            ProcessExit(0, 0, None, ProcessExitCategory.EXITED),
+            "duplicate terminal",
+        ),
+        (
+            (
+                ProcessStatusEvent(ProcessExit(0, 0, None, ProcessExitCategory.EXITED)),
+                ProcessOutputEvent(ProcessStream.STDOUT, b"late"),
+            ),
+            ProcessExit(0, 0, None, ProcessExitCategory.EXITED),
+            "output after terminal",
+        ),
+        (
+            (ProcessStatusEvent(ProcessExit(0, 0, None, ProcessExitCategory.EXITED)),),
+            ProcessExit(7, 7, None, ProcessExitCategory.EXITED),
+            "does not match",
+        ),
+    ],
+)
+def test_cli_process_bridge_rejects_invalid_terminal_status_contract(
+    events: tuple[object, ...],
+    waited: ProcessExit,
+    message: str,
+) -> None:
+    closed = False
+
+    class Session:
+        capabilities = ProcessCapabilities(False, False, False, False)
+
+        def events(self):
+            yield from events
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            pytest.fail("signal forwarding was not advertised")
+
+        def wait(self):
+            return waited
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    with pytest.raises(PalimpsestError, match=message):
+        cli._run_process_session(Session(), interactive=False)
+    assert closed
+
+
+def test_cli_process_bridge_installs_no_handlers_without_signal_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+
+    class Session:
+        capabilities = ProcessCapabilities(False, False, False, False)
+
+        def events(self):
+            yield ProcessStatusEvent(result)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            pytest.fail("signal forwarding was not advertised")
+
+        def wait(self):
+            return result
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli.signal_module, "signal", lambda *_args: pytest.fail("handler installed"))
+
+    assert cli._run_process_session(Session(), interactive=False) == 0
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "stream", "message"),
+    [
+        (ProcessCapabilities(True, True, False, False), ProcessStream.STDOUT, "TTY session returned a split"),
+        (ProcessCapabilities(False, False, False, False), ProcessStream.PTY, "non-TTY session returned a PTY"),
+    ],
+)
+def test_cli_process_bridge_rejects_stream_capability_mismatch(
+    capabilities: ProcessCapabilities,
+    stream: ProcessStream,
+    message: str,
+) -> None:
+    result = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+    closed = False
+
+    class Session:
+        def __init__(self) -> None:
+            self.capabilities = capabilities
+
+        def events(self):
+            yield ProcessOutputEvent(stream, b"must-not-render")
+            yield ProcessStatusEvent(result)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            return None
+
+        def wait(self):
+            return result
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    with pytest.raises(PalimpsestError, match=message):
+        cli._run_process_session(Session(), interactive=False)
+    assert closed
+
+
+def test_cli_process_bridge_restores_handlers_when_terminal_restore_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+    signal_calls: list[tuple[int, object]] = []
+
+    class Session:
+        capabilities = ProcessCapabilities(True, True, False, True)
+
+        def events(self):
+            yield ProcessStatusEvent(result)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            return None
+
+        def wait(self):
+            return result
+
+        def close(self) -> None:
+            return None
+
+    class FakeInput:
+        @staticmethod
+        def fileno() -> int:
+            return 81
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            del target, name, daemon
+
+        def start(self) -> None:
+            return None
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.5
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(cli.sys, "stdin", FakeInput())
+    monkeypatch.setattr(cli.termios, "tcgetattr", lambda _fd: ["saved"])
+    monkeypatch.setattr(cli.tty, "setraw", lambda _fd: None)
+    monkeypatch.setattr(
+        cli.termios,
+        "tcsetattr",
+        lambda *_args: (_ for _ in ()).throw(OSError("restore failed")),
+    )
+    monkeypatch.setattr(cli.threading, "Thread", FakeThread)
+    monkeypatch.setattr(cli.signal_module, "getsignal", lambda signum: f"prior-{signum}")
+    monkeypatch.setattr(cli.signal_module, "signal", lambda signum, handler: signal_calls.append((signum, handler)))
+
+    with pytest.raises(PalimpsestError, match="cannot restore local terminal"):
+        cli._run_process_session(Session(), interactive=True)
+
+    assert signal_calls[-2:] == [
+        (cli.signal_module.SIGINT, f"prior-{cli.signal_module.SIGINT}"),
+        (cli.signal_module.SIGTERM, f"prior-{cli.signal_module.SIGTERM}"),
+    ]
+
+
+def test_cli_process_bridge_closes_session_to_terminate_input_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+
+    class Session:
+        capabilities = ProcessCapabilities(True, True, False, False)
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def events(self):
+            yield ProcessStatusEvent(result)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            return None
+
+        def wait(self):
+            return result
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = Session()
+
+    class FakeInput:
+        @staticmethod
+        def fileno() -> int:
+            return 82
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            del target, name, daemon
+            self.joins = 0
+
+        def start(self) -> None:
+            return None
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 0.5
+            self.joins += 1
+
+        def is_alive(self) -> bool:
+            return not session.closed
+
+    monkeypatch.setattr(cli.sys, "stdin", FakeInput())
+    monkeypatch.setattr(cli.termios, "tcgetattr", lambda _fd: ["saved"])
+    monkeypatch.setattr(cli.termios, "tcsetattr", lambda *_args: None)
+    monkeypatch.setattr(cli.tty, "setraw", lambda _fd: None)
+    monkeypatch.setattr(cli.threading, "Thread", FakeThread)
+
+    assert cli._run_process_session(session, interactive=True) == 0
+    assert session.closed
+
+
 def test_cli_dispatch_image_verify(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     img_file = tmp_path / "test.qcow2"
     img_file.write_bytes(b"qcow2 header content")
@@ -875,11 +1234,13 @@ def test_cli_dispatch_build_routes_verified_spec(monkeypatch: pytest.MonkeyPatch
 
 
 def test_cli_dispatch_commit_routes_runtime(monkeypatch: pytest.MonkeyPatch, capsys):
+    roots, _rpaths = _write_cli_run_ledger(backend="kvm")
+    monkeypatch.setattr(cli, "init_roots", lambda: roots)
     monkeypatch.setattr(
         "palimpsest_local.cli.commit",
         lambda name, tag, *, roots: {"name": name, "tag": tag, "digest": "sha256:" + "b" * 64},
     )
-    assert cli.main(["commit", "run-one", "--tag", "delta"]) == 0
+    assert cli.main(["commit", "demo-vm", "--tag", "delta"]) == 0
     assert "sha256:" in capsys.readouterr().out
 
 
@@ -1080,11 +1441,11 @@ def test_layer_push_preserves_runtime_pack_chain_and_arch(monkeypatch: pytest.Mo
 def test_cli_rejects_commit_for_lima_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
-    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    del tmp_path
+    roots, _rpaths = _write_cli_run_ledger(backend="lima-vz")
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda _rpaths: True)
 
-    assert cli.main(["commit", "mac-vm", "--tag", "layer"]) == 1
+    assert cli.main(["commit", "demo-vm", "--tag", "layer"]) == 1
     assert "use palimpsest build" in capsys.readouterr().err
 
 

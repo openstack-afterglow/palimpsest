@@ -1160,7 +1160,7 @@ def project_service_operation(
     project: Project,
     service: str,
     inspect: Callable[[str], object | None],
-    operation: Callable[[str], object],
+    operation: ExistingRunMutationCallback,
     *,
     roots: state.StatePaths | None = None,
 ) -> object:
@@ -1179,7 +1179,10 @@ def project_service_operation(
         if inspected is None:
             raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
         _assert_managed_identity(managed, inspected)
-        return operation(managed.run_name)
+        return operation(
+            managed.run_name,
+            expected_identity=_expected_mutation_identity(managed),
+        )
 
 
 def stop_project_services(

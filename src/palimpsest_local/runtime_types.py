@@ -5,14 +5,14 @@ from __future__ import annotations
 import ipaddress
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from .errors import PalimpsestError
 from .refs import RunSpec
@@ -40,6 +40,142 @@ class RuntimeOperation(StrEnum):
     LOGS = "logs"
     PS = "ps"
     RECONCILE = "reconcile"
+    EXEC = "exec"
+    SHELL = "shell"
+
+
+class ProcessStream(StrEnum):
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    PTY = "pty"
+
+
+class ProcessSignal(StrEnum):
+    INTERRUPT = "interrupt"
+    TERMINATE = "terminate"
+    HANGUP = "hangup"
+
+
+class ProcessExitCategory(StrEnum):
+    EXITED = "exited"
+    SIGNALED = "signaled"
+    CANCELLED = "cancelled"
+    TRANSPORT_ERROR = "transport-error"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecRequest:
+    """Validated literal guest argv for one non-interactive exec operation."""
+
+    argv: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.argv, tuple) or not self.argv:
+            raise ValueError("exec requires a nonempty argv")
+        if any(not isinstance(item, str) or "\x00" in item for item in self.argv):
+            raise ValueError("exec argv must contain only NUL-free strings")
+
+    @classmethod
+    def from_argv(cls, argv: Sequence[str]) -> ExecRequest:
+        if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
+            raise TypeError("exec argv must be a sequence of strings")
+        return cls(tuple(argv))
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessCapabilities:
+    stdin: bool
+    tty: bool
+    resize: bool
+    signal: bool
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not bool for value in (self.stdin, self.tty, self.resize, self.signal)):
+            raise TypeError("process capabilities must be booleans")
+        if self.resize and not self.tty:
+            raise ValueError("process resize capability requires a TTY")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessExit:
+    returncode: int
+    exit_code: int | None
+    signal_number: int | None
+    category: ProcessExitCategory
+
+    def __post_init__(self) -> None:
+        if type(self.returncode) is not int:
+            raise TypeError("process return code must be an integer")
+        if not isinstance(self.category, ProcessExitCategory):
+            raise TypeError("process exit requires a category")
+        if self.returncode >= 0:
+            if self.exit_code != self.returncode or self.signal_number is not None:
+                raise ValueError("exited process result has inconsistent fields")
+            if self.category not in {
+                ProcessExitCategory.EXITED,
+                ProcessExitCategory.CANCELLED,
+                ProcessExitCategory.TRANSPORT_ERROR,
+            }:
+                raise ValueError("exited process result has an invalid category")
+        else:
+            if self.exit_code is not None or self.signal_number != -self.returncode:
+                raise ValueError("signaled process result has inconsistent fields")
+            if self.category not in {ProcessExitCategory.SIGNALED, ProcessExitCategory.CANCELLED}:
+                raise ValueError("signaled process result has an invalid category")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessOutputEvent:
+    stream: ProcessStream
+    data: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stream, ProcessStream):
+            raise TypeError("process output event requires a stream")
+        if not isinstance(self.data, bytes) or not self.data:
+            raise ValueError("process output event requires nonempty bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessStatusEvent:
+    result: ProcessExit
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, ProcessExit):
+            raise TypeError("process status event requires a ProcessExit")
+
+
+ProcessEvent = ProcessOutputEvent | ProcessStatusEvent
+
+
+@runtime_checkable
+class ProcessSession(Protocol):
+    """One adapter-owned process transport with a single event consumer."""
+
+    @property
+    def capabilities(self) -> ProcessCapabilities: ...
+
+    def events(self) -> Iterator[ProcessEvent]: ...
+
+    def write_stdin(self, data: bytes) -> None: ...
+
+    def close_stdin(self) -> None: ...
+
+    def resize(self, rows: int, columns: int) -> None: ...
+
+    def signal(self, requested: ProcessSignal) -> None: ...
+
+    def wait(self) -> ProcessExit: ...
+
+    def close(self) -> None: ...
+
+
+class ProcessCapabilityError(PalimpsestError):
+    code = "process-capability-unavailable"
+
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+        super().__init__(f"process session does not support {capability}")
 
 
 class RunAttachmentMode(StrEnum):
@@ -569,8 +705,19 @@ __all__ = (
     "ALLOWED_RUNTIME_COMBINATIONS",
     "ALLOWED_RUNTIME_STATUSES",
     "DispatchKey",
+    "ExecRequest",
     "ExistingRunRecord",
     "ExpectedRunIdentity",
+    "ProcessCapabilities",
+    "ProcessCapabilityError",
+    "ProcessEvent",
+    "ProcessExit",
+    "ProcessExitCategory",
+    "ProcessOutputEvent",
+    "ProcessSession",
+    "ProcessSignal",
+    "ProcessStatusEvent",
+    "ProcessStream",
     "ResolvedRunRequest",
     "RunAttachmentMode",
     "RunAggregationError",

@@ -26,8 +26,13 @@ from palimpsest_local.refs import ImageRef, RunSpec, StackRef, VolumeAttachment
 from palimpsest_local.runtime_types import (
     ALLOWED_RUNTIME_COMBINATIONS,
     DispatchKey,
+    ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    ProcessCapabilities,
+    ProcessExit,
+    ProcessExitCategory,
+    ProcessSignal,
     ResolvedRunRequest,
     RunAggregationError,
     RunAggregationResult,
@@ -2293,3 +2298,111 @@ def test_run_aggregation_result_rejects_unsorted_or_duplicate_errors() -> None:
         RunAggregationResult((), (one, two))
     with pytest.raises(ValueError, match="unique"):
         RunAggregationResult((), (one, one))
+
+
+class _FakeProcessSession:
+    capabilities = ProcessCapabilities(False, False, False, True)
+
+    def events(self):
+        return iter(())
+
+    def write_stdin(self, _data: bytes) -> None:
+        return None
+
+    def close_stdin(self) -> None:
+        return None
+
+    def resize(self, _rows: int, _columns: int) -> None:
+        return None
+
+    def signal(self, _requested: ProcessSignal) -> None:
+        return None
+
+    def wait(self) -> ProcessExit:
+        return ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+
+    def close(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter_name"),
+    [("kvm", "cloud_runtime"), ("libvirt-hvf", "cloud_runtime"), ("lima-vz", "lima")],
+)
+@pytest.mark.parametrize(("operation", "target"), [("exec", "exec_session"), ("shell", "shell_session")])
+def test_process_operations_route_by_durable_record_without_returning_host_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    adapter_name: str,
+    operation: str,
+    target: str,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "status": "running",
+        },
+    )
+    session = _FakeProcessSession()
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def selected(*args: Any, **kwargs: Any):
+        calls.append((args, kwargs))
+        return session
+
+    monkeypatch.setattr(getattr(runtime_dispatch, adapter_name), target, selected)
+    if operation == "exec":
+        result = runtime_dispatch.exec("demo", ["printf", "%s", "literal value"], roots=roots)
+    else:
+        result = runtime_dispatch.shell("demo", roots=roots)
+
+    assert result is session
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "demo"
+    if operation == "exec":
+        assert isinstance(args[1], ExecRequest)
+        assert args[1].argv == ("printf", "%s", "literal value")
+    assert kwargs["roots"] == roots
+    assert kwargs["_expected_record"].dispatch_key.backend is RuntimeBackend(backend)
+
+
+@pytest.mark.parametrize(
+    ("operation", "dispatch"),
+    [(RuntimeOperation.EXEC, runtime_dispatch.exec), (RuntimeOperation.SHELL, runtime_dispatch.shell)],
+)
+def test_oci_process_operations_remain_typed_unavailable_before_adapter_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: RuntimeOperation,
+    dispatch: Callable[..., Any],
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "exec_session" if operation is RuntimeOperation.EXEC else "shell_session",
+        lambda *_args, **_kwargs: pytest.fail("cloud process adapter reached"),
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as captured:
+        if operation is RuntimeOperation.EXEC:
+            dispatch("demo", ["true"], roots=roots)
+        else:
+            dispatch("demo", roots=roots)
+
+    assert captured.value.operation is operation
+    assert captured.value.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from palimpsest_local.errors import (
     StateError,
 )
 from palimpsest_local.refs import ImageRef, LayerRef, PortForward, RunSpec, StackRef
+from palimpsest_local.runtime_types import ExecRequest
 
 
 class FakeDomain:
@@ -1015,6 +1017,64 @@ def test_logs_and_commands():
         ex_cmd = exec_command("cmd-run", ["ls", "-la"], roots=roots)
         assert any("192.168.122.70" in arg for arg in ex_cmd)
         assert any("palimpsest-exec" in arg or "ls" in arg for arg in ex_cmd)
+
+
+def test_cloud_process_adapters_spawn_sessions_and_never_return_host_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "process-run")
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.70"})
+    rpaths.identity.write_bytes(b"identity-a")
+    rpaths.known_hosts.write_bytes(b"known-host-a")
+
+    class Session:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    sessions = [Session(), Session()]
+    calls: list[tuple[list[str], bool, bool, Path, Path]] = []
+
+    def fake_spawn(argv, *, tty, stdin):
+        identity_index = argv.index("-i") + 1
+        known_hosts_arg = next(item for item in argv if item.startswith("UserKnownHostsFile="))
+        identity = Path(argv[identity_index])
+        known_hosts = Path(known_hosts_arg.split("=", 1)[1])
+        assert identity.read_bytes() == b"identity-a"
+        assert known_hosts.read_bytes() == b"known-host-a"
+        calls.append((argv, tty, stdin, identity, known_hosts))
+        return sessions[len(calls) - 1]
+
+    monkeypatch.setattr(runtime, "spawn_process_session", fake_spawn)
+
+    exec_session = runtime.exec_session("process-run", ExecRequest(("printf", "%s", "literal")), roots=roots)
+    shell_session = runtime.shell_session("process-run", roots=roots)
+    assert calls[0][1:3] == (False, False)
+    assert any("palimpsest-exec" in item for item in calls[0][0])
+    assert calls[1][1:3] == (True, True)
+    assert calls[1][0][0] == "ssh"
+    staged_paths = [path for call in calls for path in call[3:]]
+    assert all(path.is_file() for path in staged_paths)
+
+    shutil.rmtree(rpaths.root)
+    rpaths.root.mkdir(mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.99"})
+    rpaths.identity.write_bytes(b"identity-b")
+    rpaths.known_hosts.write_bytes(b"known-host-b")
+    assert [path.read_bytes() for path in calls[0][3:]] == [b"identity-a", b"known-host-a"]
+
+    exec_session.close()
+    assert all(not path.exists() for path in calls[0][3:])
+    assert all(path.exists() for path in calls[1][3:])
+    shell_session.close()
+    assert all(not path.exists() for path in calls[1][3:])
 
 
 def parse_runner_cmd(cmd: list[str]) -> list[str]:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import cli
+from palimpsest_local.runtime_types import DispatchKey, ExpectedRunIdentity, RuntimeBackend, RuntimeKind
 
 _IMAGE = "sha256:" + "a" * 64
 
@@ -200,28 +201,38 @@ def test_compose_exec_preserves_argv_and_never_uses_a_shell(
     monkeypatch.setattr(
         cli,
         "project_service_operation",
-        lambda _project, _service, _inspect, operation, **_kwargs: operation("demo-api-1"),
+        lambda _project, _service, _inspect, operation, **_kwargs: operation(
+            "demo-api-1",
+            expected_identity=ExpectedRunIdentity(
+                "demo-api-1",
+                "00000000-0000-0000-0000-000000000001",
+                DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+            ),
+        ),
     )
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda _paths: False)
+    session = object()
+    calls: list[tuple[str, list[str], ExpectedRunIdentity | None]] = []
+
+    def fake_exec(name, command, *, roots, expected_identity):
+        del roots
+        calls.append((name, command, expected_identity))
+        return session
+
+    monkeypatch.setattr(cli.runtime_dispatch, "exec", fake_exec)
     monkeypatch.setattr(
         cli,
-        "exec_command",
-        lambda name, command, **_kwargs: ["ssh", name, "--", *command],
+        "_run_process_session",
+        lambda candidate, *, interactive: 17 if candidate is session and not interactive else pytest.fail(),
     )
-    calls: list[tuple[list[str], bool]] = []
-
-    def fake_run(argv, *, shell):
-        calls.append((argv, shell))
-        return SimpleNamespace(returncode=17)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     result = cli.main(
         ["compose", "--project-directory", str(tmp_path), "exec", "api", "--", "printf", "%s", "hello world"]
     )
 
     assert result == 17
-    assert calls == [(["ssh", "demo-api-1", "--", "printf", "%s", "hello world"], False)]
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("demo-api-1", ["printf", "%s", "hello world"])
+    assert isinstance(calls[0][2], ExpectedRunIdentity)
 
 
 def test_compose_port_prints_owner_verified_applied_mapping_instead_of_current_yaml(

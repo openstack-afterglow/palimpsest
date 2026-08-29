@@ -6,11 +6,16 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
+import signal as signal_module
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import tomllib
+import tty
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -75,10 +80,14 @@ from .registry import (
     update_registry_config,
     use_profile,
 )
-from .runtime import (
-    commit,
-    exec_command,
-    shell_command,
+from .runtime import commit
+from .runtime_types import (
+    ExpectedRunIdentity,
+    ProcessOutputEvent,
+    ProcessSession,
+    ProcessSignal,
+    ProcessStatusEvent,
+    ProcessStream,
 )
 from .state import (
     StatePaths,
@@ -219,6 +228,145 @@ def build_mksquashfs_command(source: Path, output: Path) -> list[str]:
 
 def _add_limit(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=50)
+
+
+def _write_process_bytes(target: object, data: bytes) -> None:
+    stream = getattr(target, "buffer", target)
+    try:
+        stream.write(data)
+    except TypeError:
+        # Test and embedded text streams may not expose a byte buffer. The
+        # production CLI always takes the byte path above.
+        target.write(data.decode("utf-8", errors="replace"))
+    stream.flush()
+
+
+def _resize_process_session(session: ProcessSession) -> None:
+    if not session.capabilities.resize:
+        return
+    try:
+        size = os.get_terminal_size(sys.stdin.fileno())
+    except OSError:
+        return
+    session.resize(size.lines, size.columns)
+
+
+def _run_process_session(session: ProcessSession, *, interactive: bool) -> int:
+    """Bridge terminal bytes and signals without learning adapter process argv."""
+
+    if not isinstance(session, ProcessSession):
+        raise PalimpsestError("runtime returned an invalid process session")
+    if interactive and (not session.capabilities.stdin or not session.capabilities.tty):
+        session.close()
+        raise PalimpsestError("runtime shell does not provide an interactive terminal")
+
+    old_terminal: list[object] | None = None
+    input_thread: threading.Thread | None = None
+    input_stop = threading.Event()
+    prior_handlers: dict[int, object] = {}
+    terminal_status = None
+
+    def forward(requested: ProcessSignal):
+        def handler(_signum: int, _frame: object) -> None:
+            session.signal(requested)
+
+        return handler
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            if session.capabilities.signal:
+                for host_signal, requested in (
+                    (signal_module.SIGINT, ProcessSignal.INTERRUPT),
+                    (signal_module.SIGTERM, ProcessSignal.TERMINATE),
+                ):
+                    prior_handlers[host_signal] = signal_module.getsignal(host_signal)
+                    signal_module.signal(host_signal, forward(requested))
+            if session.capabilities.resize:
+                prior_handlers[signal_module.SIGWINCH] = signal_module.getsignal(signal_module.SIGWINCH)
+                signal_module.signal(
+                    signal_module.SIGWINCH,
+                    lambda _signum, _frame: _resize_process_session(session),
+                )
+
+        if interactive:
+            input_fd = sys.stdin.fileno()
+            old_terminal = termios.tcgetattr(input_fd)
+            tty.setraw(input_fd)
+            _resize_process_session(session)
+
+            def pump_input() -> None:
+                while not input_stop.is_set():
+                    try:
+                        readable, _writable, _exceptional = select.select([input_fd], [], [], 0.1)
+                        if not readable:
+                            continue
+                        chunk = os.read(input_fd, 64 * 1024)
+                    except OSError:
+                        return
+                    if not chunk:
+                        session.close_stdin()
+                        return
+                    try:
+                        session.write_stdin(chunk)
+                    except PalimpsestError:
+                        return
+
+            input_thread = threading.Thread(target=pump_input, name="palimpsest-session-stdin", daemon=True)
+            input_thread.start()
+
+        for event in session.events():
+            if isinstance(event, ProcessStatusEvent):
+                if terminal_status is not None:
+                    raise PalimpsestError("runtime returned duplicate terminal process status")
+                terminal_status = event.result
+                continue
+            if not isinstance(event, ProcessOutputEvent):
+                raise PalimpsestError("runtime returned an invalid process event")
+            if terminal_status is not None:
+                raise PalimpsestError("runtime returned output after terminal process status")
+            if session.capabilities.tty and event.stream is not ProcessStream.PTY:
+                raise PalimpsestError("runtime TTY session returned a split output stream")
+            if not session.capabilities.tty and event.stream is ProcessStream.PTY:
+                raise PalimpsestError("runtime non-TTY session returned a PTY output stream")
+            target = sys.stderr if event.stream is ProcessStream.STDERR else sys.stdout
+            _write_process_bytes(target, event.data)
+        if terminal_status is None:
+            raise PalimpsestError("runtime returned no terminal process status")
+        waited = session.wait()
+        if waited != terminal_status:
+            raise PalimpsestError("runtime process status does not match wait result")
+        return waited.returncode
+    except BaseException:
+        session.close()
+        raise
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_error: PalimpsestError | None = None
+        input_stop.set()
+        if input_thread is not None:
+            input_thread.join(timeout=0.5)
+            if input_thread.is_alive():
+                try:
+                    session.close()
+                except BaseException:
+                    cleanup_error = PalimpsestError("cannot stop runtime session input")
+                input_thread.join(timeout=0.5)
+            if input_thread.is_alive() and cleanup_error is None:
+                cleanup_error = PalimpsestError("cannot stop runtime session input")
+        if old_terminal is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_terminal)
+            except BaseException:
+                if cleanup_error is None:
+                    cleanup_error = PalimpsestError("cannot restore local terminal")
+        for host_signal, prior in prior_handlers.items():
+            try:
+                signal_module.signal(host_signal, prior)
+            except BaseException:
+                if cleanup_error is None:
+                    cleanup_error = PalimpsestError("cannot restore local signal handlers")
+        if cleanup_error is not None and not active_exception:
+            raise cleanup_error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1010,13 +1158,18 @@ def _dispatch_compose(
         return 0
     if operation == "exec":
 
-        def execute_managed(run_name: str) -> object:
-            argv = (
-                lima.exec_command(run_name, args.command, roots=roots)
-                if lima.is_lima_run(run_paths(roots, run_name))
-                else exec_command(run_name, args.command, roots=roots)
+        def execute_managed(
+            run_name: str,
+            *,
+            expected_identity: ExpectedRunIdentity | None = None,
+        ) -> object:
+            session = runtime_dispatch.exec(
+                run_name,
+                args.command,
+                roots=roots,
+                expected_identity=expected_identity,
             )
-            return subprocess.run(argv, shell=False).returncode
+            return _run_process_session(session, interactive=False)
 
         return int(
             project_service_operation(
@@ -1696,22 +1849,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
             sys.stdout.flush()
 
     elif op == "shell":
-        argv = (
-            lima.shell_command(args.name, roots=roots)
-            if lima.is_lima_run(run_paths(roots, args.name))
-            else shell_command(args.name, roots=roots)
-        )
-        proc = subprocess.run(argv, shell=False)
-        return proc.returncode
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise PalimpsestError("shell requires a local terminal")
+        return _run_process_session(runtime_dispatch.shell(args.name, roots=roots), interactive=True)
 
     elif op == "exec":
-        argv = (
-            lima.exec_command(args.name, args.command, roots=roots)
-            if lima.is_lima_run(run_paths(roots, args.name))
-            else exec_command(args.name, args.command, roots=roots)
+        return _run_process_session(
+            runtime_dispatch.exec(args.name, args.command, roots=roots),
+            interactive=False,
         )
-        proc = subprocess.run(argv, shell=False)
-        return proc.returncode
     elif op == "start":
         runtime_dispatch.start(args.name, roots=roots)
         print(f"started {args.name}")

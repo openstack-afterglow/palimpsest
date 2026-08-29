@@ -20,6 +20,7 @@ from palimpsest_local.refs import (
     StackRef,
     VolumeAttachment,
 )
+from palimpsest_local.runtime_types import ExecRequest, RuntimeCapabilityError, RuntimeOperation
 
 
 def _spec(tmp_path: Path) -> RunSpec:
@@ -217,6 +218,26 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
         "uname",
         "-m",
     ]
+
+
+def test_lima_process_adapters_are_typed_unavailable_without_backend_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _legacy_lima_lifecycle(roots, "owned-process", "running")
+    monkeypatch.setattr(lima, "_run_command", lambda *_args, **_kwargs: pytest.fail("backend probe reached"))
+    monkeypatch.setattr(
+        lima, "spawn_process_session", lambda *_args, **_kwargs: pytest.fail("spawn reached"), raising=False
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as exec_error:
+        lima.exec_session("owned-process", ExecRequest(("uname", "-m")), roots=roots)
+    with pytest.raises(RuntimeCapabilityError) as shell_error:
+        lima.shell_session("owned-process", roots=roots)
+
+    assert exec_error.value.operation is RuntimeOperation.EXEC
+    assert shell_error.value.operation is RuntimeOperation.SHELL
 
 
 def test_legacy_lima_start_promotes_only_after_backend_success(

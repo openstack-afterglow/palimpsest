@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -14,8 +14,10 @@ from .errors import StateError
 from .refs import RunSpec
 from .runtime_types import (
     DispatchKey,
+    ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    ProcessSession,
     ResolvedRunRequest,
     RunAggregationError,
     RunAggregationResult,
@@ -258,6 +260,55 @@ def _require_expected_identity(record: ExistingRunRecord, expected_identity: Exp
         or record.dispatch_key != expected_identity.dispatch_key
     ):
         raise StateError("run identity changed before lifecycle operation")
+
+
+def _require_process_session(candidate: Any) -> ProcessSession:
+    if not isinstance(candidate, ProcessSession):
+        raise StateError("runtime adapter returned an invalid process session")
+    return candidate
+
+
+def exec(
+    name: str,
+    argv: Sequence[str],
+    *,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> ProcessSession:
+    request = ExecRequest.from_argv(argv)
+    resolved_roots = roots or state.resolve_roots()
+    record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
+    adapter = _adapter_for(record, RuntimeOperation.EXEC)
+    _revalidate_bound_record(record, resolved_roots)
+    return _require_process_session(
+        adapter.exec_session(
+            name,
+            request,
+            roots=resolved_roots,
+            _expected_record=record,
+        )
+    )
+
+
+def shell(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> ProcessSession:
+    resolved_roots = roots or state.resolve_roots()
+    record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
+    adapter = _adapter_for(record, RuntimeOperation.SHELL)
+    _revalidate_bound_record(record, resolved_roots)
+    return _require_process_session(
+        adapter.shell_session(
+            name,
+            roots=resolved_roots,
+            _expected_record=record,
+        )
+    )
 
 
 def start(
@@ -635,6 +686,7 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
 
 __all__ = (
     "bind_run_request_volumes",
+    "exec",
     "inspect_run",
     "logs",
     "preflight_run_request",
@@ -644,6 +696,7 @@ __all__ = (
     "resolve_run_request",
     "rm",
     "run",
+    "shell",
     "start",
     "stop",
 )

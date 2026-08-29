@@ -616,14 +616,22 @@ def test_locked_project_service_operation_and_stop_revalidate_identity(tmp_path:
     roots = _roots(tmp_path)
     up_project(project, runtime.callbacks(), roots=roots, services=["api"])
 
+    received_identity: list[ExpectedRunIdentity | None] = []
+
+    def execute(run_name: str, *, expected_identity: ExpectedRunIdentity | None = None):
+        received_identity.append(expected_identity)
+        return "executed", run_name
+
     observed = project_service_operation(
         project,
         "api",
         runtime.inspect,
-        lambda run_name: ("executed", run_name),
+        execute,
         roots=roots,
     )
     assert observed == ("executed", "demo-api-1")
+    assert len(received_identity) == 1
+    assert isinstance(received_identity[0], ExpectedRunIdentity)
 
     stopped = stop_project_services(project, runtime.callbacks(), ["db", "api"], roots=roots)
     assert stopped == ("api", "db")

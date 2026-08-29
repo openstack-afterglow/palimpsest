@@ -158,6 +158,21 @@ def test_first_party_cli_and_project_create_only_through_dispatcher() -> None:
     assert "runtime_dispatch.bind_run_request_volumes(" in adapter_source
 
 
+def test_first_party_process_operations_use_dispatcher_sessions() -> None:
+    source_root = _source_root()
+    cli_source = (source_root / "cli.py").read_text(encoding="utf-8")
+    assert "runtime_dispatch.exec(" in cli_source
+    assert "runtime_dispatch.shell(" in cli_source
+    assert "lima.exec_command(" not in cli_source
+    assert "lima.shell_command(" not in cli_source
+    assert "from .runtime import exec_command" not in cli_source
+    assert "from .runtime import shell_command" not in cli_source
+
+    dispatch_source = (source_root / "runtime_dispatch.py").read_text(encoding="utf-8")
+    assert "adapter.exec_session(" in dispatch_source
+    assert "adapter.shell_session(" in dispatch_source
+
+
 def test_first_party_callers_cannot_use_the_legacy_cloud_bulk_reconcile_bypass() -> None:
     for path in _source_root().rglob("*.py"):
         if path.name in {"cloud_runtime.py", "runtime.py"}:
