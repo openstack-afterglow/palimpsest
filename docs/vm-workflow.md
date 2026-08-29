@@ -152,15 +152,16 @@ palimpsest inspect hello-vm
 palimpsest logs hello-vm
 ```
 
-`inspect` prints the run ledger: backend, base and layer digests, network,
-`layer_attachment`, guest IP or SSH endpoint, and status. `logs` reads the
-retained Palimpsest console log for the run; `--follow` tails it while the run
-is active.
+`inspect` prints a versioned, allowlisted JSON snapshot of durable state. It
+includes owner and runtime identity, lifecycle status/revision, public base and
+layer metadata, resource sizing, ports, volumes, and the guest SSH endpoint.
+Host paths, backend-internal identifiers, environment values, cleanup metadata,
+and raw errors are excluded. `logs` reads the retained Palimpsest console log
+for the run; `--follow` tails it while the run is active.
 
-On macOS, `ps`, `inspect`, and `logs` report persisted ledger state and the
-retained console log rather than querying the live Lima guest. Use
-`limactl shell <name> journalctl -b --no-pager` for the in-guest journal and
-`limactl list` for live instance status.
+On every host, `ps` and `inspect` read persisted ledger state without querying
+libvirt or Lima. On macOS, use `limactl shell <name> journalctl -b --no-pager`
+for the in-guest journal and `limactl list` for live instance status.
 
 ## 6. Stop and clean up
 

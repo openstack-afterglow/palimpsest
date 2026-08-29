@@ -57,6 +57,15 @@ class LifecycleWarningCategory(StrEnum):
     BACKEND_RECONCILED = "backend-reconciled"
 
 
+class InspectWarningCategory(StrEnum):
+    """Stable warnings reserved for future state-only inspect projections."""
+
+    BACKEND_OBJECT_MISSING = "backend-object-missing"
+    BACKEND_STATUS_DRIFT = "backend-status-drift"
+    CONTROL_DEGRADED = "control-degraded"
+    RESOURCE_PRESSURE = "resource-pressure"
+
+
 class CapabilityErrorCategory(StrEnum):
     MISSING = "capability-missing"
     UNSUPPORTED = "capability-unsupported"
@@ -1102,6 +1111,167 @@ def _validate_summary_details(details: Mapping[str, Any]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class InspectLifecycle:
+    """Allowlisted durable lifecycle position captured by one ledger read."""
+
+    status: str
+    lifecycle_revision: int
+    created_at: str | None
+    updated_at: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, str) or self.status not in ALLOWED_RUNTIME_STATUSES[RuntimeKind.CLOUD_IMAGE]:
+            raise ValueError("inspect lifecycle has an invalid status")
+        if type(self.lifecycle_revision) is not int or not 0 <= self.lifecycle_revision <= _MAX_LIFECYCLE_REVISION:
+            raise ValueError("inspect lifecycle has an invalid revision")
+        if self.created_at is not None and not _valid_timestamp(self.created_at):
+            raise ValueError("inspect lifecycle has an invalid creation timestamp")
+        if self.updated_at is not None and not _valid_timestamp(self.updated_at):
+            raise ValueError("inspect lifecycle has an invalid update timestamp")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectBase:
+    digest: str | None
+    arch: str | None
+    disk_format: str | None
+
+    def __post_init__(self) -> None:
+        if self.digest is not None and _SUMMARY_DIGEST_RE.fullmatch(self.digest) is None:
+            raise ValueError("inspect base has an invalid digest")
+        if self.arch is not None and self.arch not in {"x86_64", "aarch64"}:
+            raise ValueError("inspect base has an invalid architecture")
+        if self.disk_format is not None and self.disk_format not in {"qcow2", "raw"}:
+            raise ValueError("inspect base has an invalid disk format")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectLayer:
+    digest: str
+    target_dev: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.digest, str) or _SUMMARY_DIGEST_RE.fullmatch(self.digest) is None:
+            raise ValueError("inspect layer has an invalid digest")
+        if self.target_dev is not None and re.fullmatch(r"vd[b-z]", self.target_dev) is None:
+            raise ValueError("inspect layer has an invalid target")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectPort:
+    host_ip: str
+    host_port: int
+    guest_port: int
+    protocol: str
+
+    def __post_init__(self) -> None:
+        if not _valid_ip(self.host_ip):
+            raise ValueError("inspect port has an invalid host IP")
+        if any(type(value) is not int or not 1 <= value <= 65_535 for value in (self.host_port, self.guest_port)):
+            raise ValueError("inspect port has an invalid port number")
+        if self.protocol not in {"tcp", "udp"}:
+            raise ValueError("inspect port has an invalid protocol")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectVolume:
+    name: str
+    mount_path: str | None = None
+    filesystem: str | None = None
+    read_only: bool | None = None
+    target_dev: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _SUMMARY_LOGICAL_NAME_RE.fullmatch(self.name) is None:
+            raise ValueError("inspect volume has an invalid name")
+        if self.mount_path is not None and not _valid_mount_path(self.mount_path):
+            raise ValueError("inspect volume has an invalid mount path")
+        if self.filesystem is not None and self.filesystem != "ext4":
+            raise ValueError("inspect volume has an invalid filesystem")
+        if self.read_only is not None and type(self.read_only) is not bool:
+            raise TypeError("inspect volume has an invalid read-only policy")
+        if self.target_dev is not None and re.fullmatch(r"vd[b-z]", self.target_dev) is None:
+            raise ValueError("inspect volume has an invalid target")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectSshEndpoint:
+    host: str | None
+    port: int
+
+    def __post_init__(self) -> None:
+        if self.host is not None and not _valid_ip(self.host):
+            raise ValueError("inspect SSH endpoint has an invalid host")
+        if type(self.port) is not int or not 1 <= self.port <= 65_535:
+            raise ValueError("inspect SSH endpoint has an invalid port")
+
+
+@dataclass(frozen=True, slots=True)
+class CloudImageInspectDetail:
+    """Public cloud-image detail without host paths or backend identifiers."""
+
+    base: InspectBase
+    layers: tuple[InspectLayer, ...]
+    memory_mib: int | None
+    vcpus: int | None
+    network: str | None
+    ports: tuple[InspectPort, ...]
+    volumes: tuple[InspectVolume, ...]
+    ssh: InspectSshEndpoint
+    guest_ip: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, InspectBase):
+            raise TypeError("cloud-image inspect detail requires a base")
+        if not isinstance(self.layers, tuple) or not all(isinstance(item, InspectLayer) for item in self.layers):
+            raise TypeError("cloud-image inspect detail requires immutable layers")
+        if not isinstance(self.ports, tuple) or not all(isinstance(item, InspectPort) for item in self.ports):
+            raise TypeError("cloud-image inspect detail requires immutable ports")
+        if not isinstance(self.volumes, tuple) or not all(isinstance(item, InspectVolume) for item in self.volumes):
+            raise TypeError("cloud-image inspect detail requires immutable volumes")
+        for value, minimum, maximum in ((self.memory_mib, 256, 1_048_576), (self.vcpus, 1, 256)):
+            if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+                raise ValueError("cloud-image inspect detail has an invalid numeric field")
+        if self.network is not None and (
+            not isinstance(self.network, str) or _SUMMARY_NETWORK_RE.fullmatch(self.network) is None
+        ):
+            raise ValueError("cloud-image inspect detail has an invalid network")
+        if not isinstance(self.ssh, InspectSshEndpoint):
+            raise TypeError("cloud-image inspect detail requires an SSH endpoint")
+        if self.guest_ip is not None and not _valid_ip(self.guest_ip):
+            raise ValueError("cloud-image inspect detail has an invalid guest IP")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectRecord:
+    """Versioned, deeply immutable public projection of one pinned run ledger."""
+
+    schema_version: int
+    record: ExistingRunRecord
+    lifecycle: InspectLifecycle
+    detail: CloudImageInspectDetail
+    warnings: tuple[InspectWarningCategory, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("inspect record has an unsupported response schema version")
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("inspect record requires an ExistingRunRecord")
+        if self.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE:
+            raise ValueError("inspect record requires a cloud-image run")
+        if not isinstance(self.lifecycle, InspectLifecycle):
+            raise TypeError("inspect record requires an InspectLifecycle")
+        if not isinstance(self.detail, CloudImageInspectDetail):
+            raise TypeError("inspect record requires a cloud-image detail")
+        if not isinstance(self.warnings, tuple) or not all(
+            isinstance(item, InspectWarningCategory) for item in self.warnings
+        ):
+            raise TypeError("inspect record requires immutable warnings")
+        if len(self.warnings) != len(set(self.warnings)):
+            raise ValueError("inspect record contains duplicate warnings")
+
+
+@dataclass(frozen=True, slots=True)
 class RunSummary:
     """Allowlisted immutable projection of one durable or live-refreshed run."""
 
@@ -1230,12 +1400,21 @@ __all__ = (
     "CapabilityErrorCategory",
     "CapabilityProfile",
     "CapabilityRequirement",
+    "CloudImageInspectDetail",
     "CloudInitSnapshot",
     "CloudInitWriteFileSnapshot",
     "DispatchKey",
     "ExecRequest",
     "ExistingRunRecord",
     "ExpectedRunIdentity",
+    "InspectBase",
+    "InspectLayer",
+    "InspectLifecycle",
+    "InspectPort",
+    "InspectRecord",
+    "InspectSshEndpoint",
+    "InspectVolume",
+    "InspectWarningCategory",
     "LifecycleCursor",
     "LifecycleResult",
     "LifecycleWarningCategory",

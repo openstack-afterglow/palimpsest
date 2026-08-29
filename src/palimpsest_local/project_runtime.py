@@ -37,6 +37,7 @@ from .project import (
 from .runtime_types import (
     DispatchKey,
     ExpectedRunIdentity,
+    InspectRecord,
     LifecycleResult,
     RunResult,
     RuntimeBackend,
@@ -177,6 +178,17 @@ class RuntimeIdentity:
 
     run_id: str
     backend: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRunStatus:
+    """A non-owned Lima name collision; never confused with an owned inspect record."""
+
+    status: str
+
+    def __post_init__(self) -> None:
+        if self.status not in _KNOWN_RUNTIME_STATUSES:
+            raise ValueError("external runtime has an invalid status")
 
 
 class StartServiceCallback(Protocol):
@@ -369,7 +381,11 @@ def runtime_status(value: object | None) -> str | None:
 
     if value is None:
         return None
-    if isinstance(value, (RunResult, LifecycleResult)):
+    if isinstance(value, InspectRecord):
+        status = value.lifecycle.status
+    elif isinstance(value, ExternalRunStatus):
+        status = value.status
+    elif isinstance(value, (RunResult, LifecycleResult)):
         status = value.status if isinstance(value, RunResult) else value.current_status
     elif isinstance(value, str):
         status = value
@@ -392,6 +408,13 @@ def runtime_identity(value: object | None) -> RuntimeIdentity | None:
 
     if value is None:
         return None
+    if isinstance(value, InspectRecord):
+        return RuntimeIdentity(
+            run_id=value.record.run_id,
+            backend=value.record.dispatch_key.backend.value,
+        )
+    if isinstance(value, ExternalRunStatus):
+        raise ProjectLifecycleError("external runtime status has no owned runtime identity")
     if isinstance(value, (RunResult, LifecycleResult)):
         return RuntimeIdentity(
             run_id=value.record.run_id,

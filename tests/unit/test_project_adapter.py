@@ -14,6 +14,7 @@ from palimpsest_local import project_adapter, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
 from palimpsest_local.project import Project, load_project
 from palimpsest_local.project_runtime import (
+    ExternalRunStatus,
     PreparedService,
     ProjectLifecycleError,
     ProjectPrepareError,
@@ -33,6 +34,7 @@ from palimpsest_local.runtime_types import (
     DispatchKey,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    InspectRecord,
     PreflightReport,
     ResolvedRunRequest,
     RuntimeBackend,
@@ -678,7 +680,11 @@ def test_existing_project_callbacks_route_from_durable_run_ledger(
     if operation == "logs":
         assert result == ["project log\n"]
     elif operation == "inspect":
-        assert result == {"name": run_name, "status": "stopped"}
+        assert isinstance(result, InspectRecord)
+        assert result.record.name == run_name
+        assert result.lifecycle.status == "stopped"
+        assert calls == []
+        return
     else:
         assert result.record.name == run_name
     assert len(calls) == 1
@@ -795,7 +801,7 @@ def test_project_callbacks_preserve_absent_removed_noop_and_foreign_lima_collisi
         "inspect_run",
         lambda *_args, **_kwargs: pytest.fail("foreign name probe entered owned-run dispatcher"),
     )
-    assert callbacks.inspect(run_name) == {"status": "running"}
+    assert callbacks.inspect(run_name) == ExternalRunStatus("running")
 
 
 @pytest.mark.parametrize(

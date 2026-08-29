@@ -1103,7 +1103,7 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
     argv: list[str],
     expected_kwargs: dict[str, object],
 ) -> None:
-    roots, _rpaths = _write_cli_run_ledger(backend=backend)
+    roots, rpaths = _write_cli_run_ledger(backend=backend)
     calls: list[tuple[str, dict[str, object]]] = []
 
     def selected(name: str, **kwargs: object) -> object:
@@ -1154,6 +1154,36 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
 
     assert cli.main(argv) == 0
 
+    output = capsys.readouterr().out
+    if operation == "inspect":
+        assert calls == []
+        run_id = json.loads(rpaths.owner.read_text(encoding="utf-8"))["run_id"]
+        assert json.loads(output) == {
+            "schema_version": 1,
+            "state_schema_version": 2,
+            "owner": {"schema_version": 1, "name": "demo-vm", "run_id": run_id},
+            "identity": {"runtime_kind": "cloud-image", "backend": backend},
+            "lifecycle": {
+                "status": "stopped",
+                "lifecycle_revision": 0,
+                "created_at": None,
+                "updated_at": None,
+            },
+            "detail": {
+                "type": "cloud-image",
+                "base": {"digest": None, "arch": None, "disk_format": None},
+                "layers": [],
+                "memory_mib": None,
+                "vcpus": None,
+                "network": None,
+                "ports": [],
+                "volumes": [],
+                "ssh": {"host": None, "port": 22},
+                "guest_ip": None,
+            },
+            "warnings": [],
+        }
+        return
     assert len(calls) == 1
     called_name, called_kwargs = calls[0]
     assert called_name == "demo-vm"
@@ -1164,14 +1194,45 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
     if operation in {"start", "stop", "rm"}:
         assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     assert called_kwargs == {"roots": roots, **expected_kwargs}
-    output = capsys.readouterr().out
-    if operation == "inspect":
-        assert json.loads(output) == {"owner": {"name": "demo-vm"}, "state": {"status": "stopped"}}
-    elif operation == "logs":
+    if operation == "logs":
         assert output == "first\nsecond\n"
     else:
         past_tense = {"start": "started", "stop": "stopped", "rm": "removed"}[operation]
         assert output == f"{past_tense} demo-vm\n"
+
+
+def test_cli_inspect_json_does_not_serialize_internal_ledger_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _roots, rpaths = _write_cli_run_ledger(backend="kvm")
+    payload = json.loads(rpaths.state.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "base": {
+                "digest": "sha256:" + "a" * 64,
+                "arch": "x86_64",
+                "disk_format": "qcow2",
+                "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+            },
+            "domain_uuid": "SENSITIVE_VALUE",
+            "environment": {"API_KEY": "SENSITIVE_VALUE"},
+            "cleanup_flags": {"internal": "SENSITIVE_VALUE"},
+            "error": "SENSITIVE_VALUE",
+            "ssh_config_file": "/private/SENSITIVE_VALUE/ssh.config",
+        }
+    )
+    rpaths.state.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    assert cli.main(["inspect", "demo-vm"]) == 0
+
+    rendered = capsys.readouterr().out
+    assert "SENSITIVE_VALUE" not in rendered
+    assert "local_path" not in rendered
+    assert "domain_uuid" not in rendered
+    assert "environment" not in rendered
+    assert "cleanup_flags" not in rendered
+    assert "error" not in rendered
+    assert "ssh_config_file" not in rendered
 
 
 @pytest.mark.parametrize(("operation", "target_name", "argv", "_expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)

@@ -8,9 +8,45 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import cli
-from palimpsest_local.runtime_types import DispatchKey, ExpectedRunIdentity, RuntimeBackend, RuntimeKind
+from palimpsest_local.runtime_types import (
+    CloudImageInspectDetail,
+    DispatchKey,
+    ExistingRunRecord,
+    ExpectedRunIdentity,
+    InspectBase,
+    InspectLifecycle,
+    InspectPort,
+    InspectRecord,
+    InspectSshEndpoint,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 _IMAGE = "sha256:" + "a" * 64
+
+
+def _typed_inspect(status: str, ports: tuple[InspectPort, ...] = ()) -> InspectRecord:
+    return InspectRecord(
+        schema_version=1,
+        record=ExistingRunRecord(
+            "demo-api-1",
+            "00000000-0000-0000-0000-000000000001",
+            2,
+            DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        ),
+        lifecycle=InspectLifecycle(status, 0, None, None),
+        detail=CloudImageInspectDetail(
+            InspectBase(None, None, None),
+            (),
+            None,
+            None,
+            None,
+            ports,
+            (),
+            InspectSshEndpoint(None, 22),
+            None,
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -241,21 +277,7 @@ def test_compose_port_prints_owner_verified_applied_mapping_instead_of_current_y
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_project(tmp_path)
-    inspected = {
-        "owner": {"run_id": "00000000-0000-0000-0000-000000000001"},
-        "state": {
-            "status": "running",
-            "backend": "lima-vz",
-            "ports": [
-                {
-                    "host_ip": "127.0.0.1",
-                    "host_port": 19090,
-                    "guest_port": 8080,
-                    "protocol": "tcp",
-                }
-            ],
-        },
-    }
+    inspected = _typed_inspect("running", (InspectPort("127.0.0.1", 19090, 8080, "tcp"),))
     callbacks = SimpleNamespace(inspect=lambda _name: inspected)
     monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
 
@@ -286,7 +308,7 @@ def test_compose_port_rejects_malformed_applied_runtime_state(
     monkeypatch.setattr(cli, "managed_run_name", fake_managed_run_name)
 
     assert cli.main(["compose", "--project-directory", str(tmp_path), "port", "api", "8080"]) == 1
-    assert "malformed applied port state" in capsys.readouterr().err
+    assert "typed inspect record" in capsys.readouterr().err
 
 
 def test_compose_port_rejects_removed_runtime_instead_of_falling_back_to_yaml(
@@ -296,19 +318,7 @@ def test_compose_port_rejects_removed_runtime_instead_of_falling_back_to_yaml(
 ) -> None:
     _write_project(tmp_path)
     callbacks = SimpleNamespace(
-        inspect=lambda _name: {
-            "state": {
-                "status": "removed",
-                "ports": [
-                    {
-                        "host_ip": "127.0.0.1",
-                        "host_port": 18080,
-                        "guest_port": 8080,
-                        "protocol": "tcp",
-                    }
-                ],
-            }
-        }
+        inspect=lambda _name: _typed_inspect("removed", (InspectPort("127.0.0.1", 18080, 8080, "tcp"),))
     )
     monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
 

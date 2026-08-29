@@ -21,10 +21,18 @@ from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
     ALLOWED_RUNTIME_STATUSES,
     CapabilityErrorCategory,
+    CloudImageInspectDetail,
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    InspectBase,
+    InspectLayer,
+    InspectLifecycle,
+    InspectPort,
+    InspectRecord,
+    InspectSshEndpoint,
+    InspectVolume,
     LifecycleCursor,
     LifecycleResult,
     LifecycleWarningCategory,
@@ -956,11 +964,18 @@ def rm(
     )
 
 
-def inspect_run(name: str, *, roots: StatePaths | None = None) -> dict[str, Any]:
+def inspect_run(name: str, *, roots: StatePaths | None = None) -> InspectRecord:
+    """Return one state-only, allowlisted projection of a pinned ledger snapshot."""
+
     resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
-    adapter = _preflight_existing_adapter(record, RuntimeOperation.INSPECT, resolved_roots)
-    return adapter.inspect_run(name, roots=resolved_roots, _expected_record=record)
+    snapshot = state.read_run_ledger_snapshot(resolved_roots, name)
+    # This declarative lookup both records the state-only operation contract and
+    # keeps unsupported runtime kinds fail-closed without probing the host.
+    platforms.capability_profile(snapshot.record.dispatch_key, RuntimeOperation.INSPECT)
+    try:
+        return _project_inspect(snapshot)
+    except (RecursionError, TypeError, ValueError):
+        raise StateError("invalid run ledger") from None
 
 
 def logs(
@@ -1110,6 +1125,101 @@ def _project_summary(snapshot: state.RunLedgerSnapshot, *, stale: bool) -> RunSu
     if not isinstance(status, str):
         raise StateError("run ledger contains an invalid status")
     return RunSummary(snapshot.record, status, details, stale=stale)
+
+
+def _project_inspect(snapshot: state.RunLedgerSnapshot) -> InspectRecord:
+    """Build typed inspect data from exact public fields of one snapshot."""
+
+    raw = snapshot.state
+    base = raw.get("base")
+    if base is not None and not isinstance(base, Mapping):
+        raise StateError("run ledger contains an invalid public base")
+    base_digest = _optional_string(raw, "base_digest")
+    base_arch = _optional_string(raw, "base_arch")
+    base_format = _optional_string(raw, "disk_format")
+    if base is not None:
+        if base_digest is None:
+            base_digest = _optional_string(base, "digest")
+        if base_arch is None:
+            base_arch = _optional_string(base, "arch")
+        if base_format is None:
+            base_format = _optional_string(base, "disk_format")
+
+    layers = tuple(
+        InspectLayer(item["digest"], item.get("target_dev"))
+        for item in _project_mapping_items(
+            raw.get("layers", ()),
+            fields={"digest": str, "target_dev": str},
+            required=frozenset({"digest"}),
+        )
+    )
+    ports = tuple(
+        InspectPort(item["host_ip"], item["host_port"], item["guest_port"], item["protocol"])
+        for item in _project_mapping_items(
+            raw.get("ports", ()),
+            fields={"host_ip": str, "host_port": int, "guest_port": int, "protocol": str},
+            required=frozenset({"host_ip", "host_port", "guest_port", "protocol"}),
+        )
+    )
+    volumes = tuple(
+        InspectVolume(
+            name=item["name"],
+            mount_path=item.get("mount_path"),
+            filesystem=item.get("filesystem"),
+            read_only=item.get("read_only"),
+            target_dev=item.get("target_dev"),
+        )
+        for item in _project_mapping_items(
+            raw.get("volumes", ()),
+            fields={
+                "name": str,
+                "mount_path": str,
+                "filesystem": str,
+                "read_only": bool,
+                "target_dev": str,
+            },
+            required=frozenset({"name"}),
+        )
+    )
+
+    guest_ip = _optional_string(raw, "guest_ip")
+    raw_ssh = raw.get("ssh")
+    if raw_ssh is not None:
+        if not isinstance(raw_ssh, Mapping):
+            raise StateError("run ledger contains an invalid public SSH endpoint")
+        ssh_host = _optional_string(raw_ssh, "host")
+        ssh_port = _optional_integer(raw_ssh, "port")
+    else:
+        ssh_host = _optional_string(raw, "ssh_host")
+        ssh_port = _optional_integer(raw, "ssh_local_port")
+    if ssh_host is None:
+        ssh_host = guest_ip
+
+    status = raw.get("status")
+    if not isinstance(status, str):
+        raise StateError("run ledger contains an invalid status")
+    revision = _optional_integer(raw, "lifecycle_revision")
+    return InspectRecord(
+        schema_version=1,
+        record=snapshot.record,
+        lifecycle=InspectLifecycle(
+            status=status,
+            lifecycle_revision=0 if revision is None else revision,
+            created_at=_optional_string(raw, "created_at"),
+            updated_at=_optional_string(raw, "updated_at"),
+        ),
+        detail=CloudImageInspectDetail(
+            base=InspectBase(base_digest, base_arch, base_format),
+            layers=layers,
+            memory_mib=_optional_integer(raw, "memory_mib"),
+            vcpus=_optional_integer(raw, "vcpus"),
+            network=_optional_string(raw, "network"),
+            ports=ports,
+            volumes=volumes,
+            ssh=InspectSshEndpoint(ssh_host, 22 if ssh_port is None else ssh_port),
+            guest_ip=guest_ip,
+        ),
+    )
 
 
 def _aggregation_error(

@@ -82,7 +82,9 @@ from .registry import (
 )
 from .runtime import commit
 from .runtime_types import (
+    CloudImageInspectDetail,
     ExpectedRunIdentity,
+    InspectRecord,
     ProcessOutputEvent,
     ProcessSession,
     ProcessSignal,
@@ -101,6 +103,67 @@ from .state import (
 )
 
 _DOCKER_IMAGE_ID_RE = re.compile(r"(?:sha256:[0-9a-f]{64}|[0-9a-f]{12,64})")
+
+
+def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
+    """Manually serialize the stable public inspect schema without reflective fields."""
+
+    detail = inspected.detail
+    if not isinstance(detail, CloudImageInspectDetail):  # pragma: no cover - closed typed contract
+        raise PalimpsestError("unsupported runtime inspect detail")
+    return {
+        "schema_version": inspected.schema_version,
+        "state_schema_version": inspected.record.state_schema_version,
+        "owner": {
+            "schema_version": 1,
+            "name": inspected.record.name,
+            "run_id": inspected.record.run_id,
+        },
+        "identity": {
+            "runtime_kind": inspected.record.dispatch_key.runtime_kind.value,
+            "backend": inspected.record.dispatch_key.backend.value,
+        },
+        "lifecycle": {
+            "status": inspected.lifecycle.status,
+            "lifecycle_revision": inspected.lifecycle.lifecycle_revision,
+            "created_at": inspected.lifecycle.created_at,
+            "updated_at": inspected.lifecycle.updated_at,
+        },
+        "detail": {
+            "type": "cloud-image",
+            "base": {
+                "digest": detail.base.digest,
+                "arch": detail.base.arch,
+                "disk_format": detail.base.disk_format,
+            },
+            "layers": [{"digest": layer.digest, "target_dev": layer.target_dev} for layer in detail.layers],
+            "memory_mib": detail.memory_mib,
+            "vcpus": detail.vcpus,
+            "network": detail.network,
+            "ports": [
+                {
+                    "host_ip": port.host_ip,
+                    "host_port": port.host_port,
+                    "guest_port": port.guest_port,
+                    "protocol": port.protocol,
+                }
+                for port in detail.ports
+            ],
+            "volumes": [
+                {
+                    "name": volume.name,
+                    "mount_path": volume.mount_path,
+                    "filesystem": volume.filesystem,
+                    "read_only": volume.read_only,
+                    "target_dev": volume.target_dev,
+                }
+                for volume in detail.volumes
+            ],
+            "ssh": {"host": detail.ssh.host, "port": detail.ssh.port},
+            "guest_ip": detail.guest_ip,
+        },
+        "warnings": [warning.value for warning in inspected.warnings],
+    }
 
 
 def _configured_url() -> str | None:
@@ -1038,7 +1101,7 @@ def _managed_compose_runtime_state(
     service: str,
     callbacks: object,
     roots: StatePaths,
-) -> tuple[str, Mapping[str, object]]:
+) -> tuple[str, InspectRecord]:
     """Capture one live inspection while the project ledger verifies its owner."""
 
     inspect_callback = getattr(callbacks, "inspect", None)
@@ -1053,17 +1116,14 @@ def _managed_compose_runtime_state(
 
     run_name = managed_run_name(project, service, roots=roots, inspect=capture)
     inspected = captured.get(run_name)
-    if not isinstance(inspected, Mapping):
-        raise PalimpsestError(f"managed run {run_name!r} did not return an inspectable runtime state")
-    runtime_state = inspected.get("state")
-    if not isinstance(runtime_state, Mapping):
-        raise PalimpsestError(f"managed run {run_name!r} inspection is missing runtime state")
-    status = runtime_state.get("status")
+    if not isinstance(inspected, InspectRecord):
+        raise PalimpsestError(f"managed run {run_name!r} did not return a typed inspect record")
+    status = inspected.lifecycle.status
     if status not in {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}:
         raise PalimpsestError(f"managed run {run_name!r} inspection is missing runtime status")
     if status == "removed":
         raise PalimpsestError(f"managed run {run_name!r} has been removed")
-    return run_name, runtime_state
+    return run_name, inspected
 
 
 def _applied_compose_ports(
@@ -1074,21 +1134,15 @@ def _applied_compose_ports(
 ) -> tuple[tuple[str, int, int, str], ...]:
     """Return validated port bindings recorded on the owner-verified runtime."""
 
-    run_name, runtime_state = _managed_compose_runtime_state(project, service, callbacks, roots)
-    raw_ports = runtime_state.get("ports")
-    if not isinstance(raw_ports, list):
-        raise PalimpsestError(f"managed run {run_name!r} has malformed applied port state")
+    run_name, inspected = _managed_compose_runtime_state(project, service, callbacks, roots)
+    raw_ports = inspected.detail.ports
     result: list[tuple[str, int, int, str]] = []
     seen: set[tuple[str, int, int, str]] = set()
     for index, raw_port in enumerate(raw_ports):
-        if not isinstance(raw_port, Mapping):
-            raise PalimpsestError(f"managed run {run_name!r} applied port [{index}] is not a mapping")
-        raw_host_ip = raw_port.get("host_ip")
-        host_port = raw_port.get("host_port")
-        guest_port = raw_port.get("guest_port")
-        protocol = raw_port.get("protocol")
-        if not isinstance(raw_host_ip, str):
-            raise PalimpsestError(f"managed run {run_name!r} applied port [{index}] has an invalid host_ip")
+        raw_host_ip = raw_port.host_ip
+        host_port = raw_port.host_port
+        guest_port = raw_port.guest_port
+        protocol = raw_port.protocol
         host_ip = normalize_host_ip(
             raw_host_ip,
             f"managed run {run_name!r} applied port [{index}].host_ip",
@@ -1880,7 +1934,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
 
     elif op == "inspect":
         info = runtime_dispatch.inspect_run(args.name, roots=roots)
-        print(json.dumps(info, indent=2))
+        print(json.dumps(_inspect_json_payload(info), indent=2))
 
     elif op == "logs":
         for chunk in runtime_dispatch.logs(args.name, roots=roots, follow=args.follow):

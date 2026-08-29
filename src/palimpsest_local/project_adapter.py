@@ -19,6 +19,7 @@ from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
 from .project_runtime import (
     DownTarget,
+    ExternalRunStatus,
     ManagedVolume,
     PreparedService,
     ProjectCallbacks,
@@ -125,7 +126,7 @@ def _inspect_run(name: str, roots: state.StatePaths) -> object | None:
         if lima.available():
             foreign_status = lima.inspect_instance_status(name)
             if foreign_status is not None:
-                return {"status": foreign_status}
+                return ExternalRunStatus(foreign_status)
         return None
     # Any partial or malformed local ledger is an ownership ambiguity, never
     # evidence that the run name is free.

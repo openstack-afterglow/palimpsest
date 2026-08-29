@@ -33,6 +33,7 @@ from palimpsest_local.runtime_types import (
     ExecRequest,
     ExistingRunRecord,
     ExpectedRunIdentity,
+    InspectRecord,
     LifecycleCursor,
     LifecycleResult,
     LifecycleWarningCategory,
@@ -2176,6 +2177,10 @@ def test_existing_operations_route_by_the_durable_dispatch_key(
     result = dispatch("demo", roots=roots, **kwargs)
 
     assert result is not None
+    if target_name == "inspect_run":
+        assert isinstance(result, InspectRecord)
+        assert calls == []
+        return
     if target_name == "logs":
         assert calls == []
         assert list(result) == ["line\n"]
@@ -2191,10 +2196,100 @@ def test_existing_operations_route_by_the_durable_dispatch_key(
     assert call_kwargs == {"roots": roots, **kwargs}
 
 
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_inspect_is_one_snapshot_typed_immutable_allowlisted_and_state_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int,
+) -> None:
+    roots = _roots(tmp_path)
+    payload: dict[str, Any] = {
+        "schema_version": schema_version,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "status": "running",
+        "lifecycle_revision": 7,
+        "created_at": "2026-08-28T00:00:00Z",
+        "updated_at": "2026-08-28T00:01:00Z",
+        "base": {
+            "digest": "sha256:" + "a" * 64,
+            "arch": "x86_64",
+            "disk_format": "qcow2",
+            "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+        },
+        "layers": [
+            {
+                "digest": "sha256:" + "b" * 64,
+                "target_dev": "vdb",
+                "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+                "serial": "internal-layer-id",
+            }
+        ],
+        "memory_mib": 2048,
+        "vcpus": 2,
+        "network": "default",
+        "ports": [{"host_ip": "127.0.0.1", "host_port": 8080, "guest_port": 80, "protocol": "tcp"}],
+        "volumes": [
+            {
+                "name": "data",
+                "mount_path": "/srv/data",
+                "filesystem": "ext4",
+                "read_only": False,
+                "target_dev": "vdc",
+                "host_path": "/private/SENSITIVE_VALUE/data.raw",
+                "backend_name": "internal-volume-id",
+            }
+        ],
+        "ssh": {"host": "127.0.0.1", "port": 2222, "config": "/private/SENSITIVE_VALUE/ssh"},
+        "guest_ip": "192.0.2.10",
+        "domain_uuid": "SENSITIVE_VALUE",
+        "environment": {"API_KEY": "SENSITIVE_VALUE"},
+        "cleanup_flags": {"SENSITIVE_VALUE": True},
+        "error": "SENSITIVE_VALUE",
+    }
+    _write_ledger(roots, record=payload)
+    before = _snapshot_tree(roots.state)
+    original_reader = state.read_run_ledger_snapshot
+    reads = 0
+
+    def counted_reader(read_roots: state.StatePaths, name: str) -> state.RunLedgerSnapshot:
+        nonlocal reads
+        reads += 1
+        return original_reader(read_roots, name)
+
+    monkeypatch.setattr(state, "read_run_ledger_snapshot", counted_reader)
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "inspect_run", lambda *_a, **_k: pytest.fail("adapter"))
+    monkeypatch.setattr(runtime_dispatch.lima, "inspect_run", lambda *_a, **_k: pytest.fail("adapter"))
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "reconcile_run", lambda *_a, **_k: pytest.fail("reconcile"))
+    monkeypatch.setattr(runtime_dispatch.lima, "reconcile_run", lambda *_a, **_k: pytest.fail("reconcile"))
+    monkeypatch.setattr(state, "locked_existing_run", lambda *_a, **_k: pytest.fail("lock"))
+
+    inspected = runtime_dispatch.inspect_run("demo", roots=roots)
+
+    assert isinstance(inspected, InspectRecord)
+    assert inspected.schema_version == 1
+    assert inspected.record.state_schema_version == schema_version
+    assert inspected.lifecycle.status == "running"
+    assert inspected.lifecycle.lifecycle_revision == 7
+    assert inspected.detail.base.disk_format == "qcow2"
+    assert inspected.detail.layers[0].target_dev == "vdb"
+    assert inspected.detail.ports[0].host_port == 8080
+    assert inspected.detail.volumes[0].mount_path == "/srv/data"
+    assert reads == 1
+    assert _snapshot_tree(roots.state) == before
+    rendered = repr(inspected)
+    assert "SENSITIVE_VALUE" not in rendered
+    assert "local_path" not in rendered
+    assert "host_path" not in rendered
+    assert "backend_name" not in rendered
+    with pytest.raises(FrozenInstanceError):
+        inspected.lifecycle.status = "stopped"  # type: ignore[misc]
+
+
 @pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
 @pytest.mark.parametrize(
     ("_operation", "target_name", "dispatch", "kwargs"),
-    [entry for entry in _OPERATIONS if entry[0] is not RuntimeOperation.LOGS],
+    [entry for entry in _OPERATIONS if entry[0] not in {RuntimeOperation.INSPECT, RuntimeOperation.LOGS}],
 )
 def test_eager_dispatch_rejects_identity_and_kind_swap_between_selection_and_adapter_call(
     tmp_path: Path,
@@ -2307,7 +2402,10 @@ def test_log_stream_revalidates_bound_record_before_calling_or_entering_adapter_
 
 
 @pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
-@pytest.mark.parametrize(("_operation", "dispatch", "kwargs"), _ADAPTER_ENTRY_OPERATIONS)
+@pytest.mark.parametrize(
+    ("_operation", "dispatch", "kwargs"),
+    [entry for entry in _ADAPTER_ENTRY_OPERATIONS if entry[0] is not RuntimeOperation.INSPECT],
+)
 def test_adapter_entry_guard_blocks_swap_after_dispatch_revalidation_before_real_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -79,19 +79,17 @@ _LIBVIRT_LIVE_OPERATIONS = frozenset(
         RuntimeOperation.START,
         RuntimeOperation.STOP,
         RuntimeOperation.RM,
-        RuntimeOperation.INSPECT,
         RuntimeOperation.RECONCILE,
     }
 )
 _PROCESS_OPERATIONS = frozenset({RuntimeOperation.EXEC, RuntimeOperation.SHELL})
-_READ_ONLY_STATE_OPERATIONS = frozenset({RuntimeOperation.LOGS, RuntimeOperation.PS})
+_READ_ONLY_STATE_OPERATIONS = frozenset({RuntimeOperation.INSPECT, RuntimeOperation.LOGS, RuntimeOperation.PS})
 _LIMA_LIVE_OPERATIONS = frozenset(
     {
         RuntimeOperation.RUN,
         RuntimeOperation.START,
         RuntimeOperation.STOP,
         RuntimeOperation.RM,
-        RuntimeOperation.INSPECT,
         RuntimeOperation.LOGS,
         RuntimeOperation.RECONCILE,
     }
@@ -178,7 +176,7 @@ def capability_profile(
     elif backend is RuntimeBackend.LIMA_VZ:
         if operation in _LIMA_LIVE_OPERATIONS:
             identifiers = ("host.lima-vz", "tool.limactl")
-        elif operation is RuntimeOperation.PS:
+        elif operation in {RuntimeOperation.INSPECT, RuntimeOperation.PS}:
             identifiers = ()
         else:  # pragma: no cover - fail closed when RuntimeOperation grows
             raise RuntimeCapabilityError(operation, dispatch_key)
