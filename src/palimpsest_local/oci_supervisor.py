@@ -4,9 +4,10 @@ This module deliberately defines no guest wire format, listener, adoption, or
 runtime integration.  A future decoder may feed semantic events into
 ``SupervisorCore`` after authenticating its own transport.
 
-The inactive journal favors bounded-memory full integrity rescans.  Its
-deliberate O(n) pull cost must be replaced by a verified incremental index
-before this module is activated for unbounded production journals.
+The journal performs one streaming verification when opened, then keeps only
+fixed tail/readiness anchors and one fixed position per session.  Steady-state
+append and pull work is proportional to new or requested frames; any unexpected
+content stamp change fails closed instead of triggering a rescan or rebase.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ _MAX_OUTPUT_BYTES = 64 * 1024
 _MAX_FRAME_BYTES = 128 * 1024
 _SESSION_PULL_RECORD_LIMIT = 1
 MAX_ACTIVE_SESSIONS = 32
+_JOURNAL_SEAL_SEED = hashlib.sha256(_JOURNAL_HEADER).digest()
 
 
 class SupervisorErrorCategory(StrEnum):
@@ -197,6 +199,13 @@ class SupervisorSnapshot:
     error_category: SupervisorErrorCategory | None = None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _JournalPosition:
+    cursor: int
+    end_offset: int
+    chain_checksum: bytes = field(repr=False)
+
+
 def _write_all(descriptor: int, content: bytes) -> None:
     offset = 0
     while offset < len(content):
@@ -213,6 +222,10 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
+def _content_state(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+
+
 class SupervisorJournal:
     """Descriptor-pinned, owner-only host semantic journal version 1."""
 
@@ -221,13 +234,15 @@ class SupervisorJournal:
             raise SupervisorError(SupervisorErrorCategory.INVALID_JOURNAL)
         self._lock = threading.RLock()
         self._closed = False
-        self._failed = False
+        self._failure_category: SupervisorErrorCategory | None = None
         self._identity = identity
         self._directory_fd = -1
         self._file_fd = -1
         self._directory_identity: tuple[int, int] | None = None
         self._file_identity: tuple[int, int] | None = None
-        self._offsets: list[int] = []
+        self._tail_position = _JournalPosition(0, len(_JOURNAL_HEADER), _JOURNAL_SEAL_SEED)
+        self._ready_position_value: _JournalPosition | None = None
+        self._verified_content_state: tuple[int, int, int] | None = None
         self._phase = SupervisorPhase.STARTING
         self._ready_cursor: int | None = None
         self._exit: ProcessExit | None = None
@@ -243,7 +258,7 @@ class SupervisorJournal:
                 raise SupervisorError(SupervisorErrorCategory.INVALID_JOURNAL)
             self._directory_identity = _metadata_identity(directory_metadata)
             self._open_file()
-            self._reload()
+            self._verify_full()
         except SupervisorError:
             self.close()
             raise
@@ -259,17 +274,17 @@ class SupervisorJournal:
     def cursor(self) -> int:
         with self._lock:
             self._require_open()
-            self._reload()
-            return len(self._offsets)
+            self._verify_stamp()
+            return self._tail_position.cursor
 
     @property
     def snapshot(self) -> SupervisorSnapshot:
         with self._lock:
             self._require_open()
-            self._reload()
+            self._verify_stamp()
             return SupervisorSnapshot(
                 self._phase,
-                len(self._offsets),
+                self._tail_position.cursor,
                 self._ready_cursor,
                 self._exit,
                 self._error_category,
@@ -316,8 +331,12 @@ class SupervisorJournal:
     def _require_open(self) -> None:
         if self._closed:
             raise SupervisorError(SupervisorErrorCategory.CLOSED)
-        if self._failed:
-            raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO)
+        if self._failure_category is not None:
+            raise SupervisorError(self._failure_category)
+
+    def _latch_failure(self, category: SupervisorErrorCategory) -> None:
+        if self._failure_category is None:
+            self._failure_category = category
 
     def _validate_binding(self) -> None:
         try:
@@ -472,7 +491,7 @@ class SupervisorJournal:
         expected_cursor: int,
         *,
         file_size: int,
-    ) -> tuple[SupervisorJournalRecord, int]:
+    ) -> tuple[SupervisorJournalRecord, int, bytes]:
         if file_size - offset < _FRAME_LENGTH.size:
             raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
         payload_length = _FRAME_LENGTH.unpack(self._read_exact(offset, _FRAME_LENGTH.size))[0]
@@ -486,28 +505,66 @@ class SupervisorJournal:
         checksum = self._read_exact(payload_offset + payload_length, _CHECKSUM_BYTES)
         if checksum != hashlib.sha256(payload).digest():
             raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
-        return self._decode_payload(payload, expected_cursor), frame_length
+        frame = _FRAME_LENGTH.pack(payload_length) + payload + checksum
+        return self._decode_payload(payload, expected_cursor), frame_length, frame
 
-    def _reload(self) -> None:
+    def _verify_full(self) -> None:
         self._validate_binding()
         try:
-            size = os.fstat(self._file_fd).st_size
+            before = os.fstat(self._file_fd)
         except OSError:
             raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO) from None
+        size = before.st_size
         if size < len(_JOURNAL_HEADER) or self._read_exact(0, len(_JOURNAL_HEADER)) != _JOURNAL_HEADER:
             raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
-        offsets: list[int] = []
+        candidate_cursor = 0
+        candidate_ready_position: _JournalPosition | None = None
+        candidate_seal = _JOURNAL_SEAL_SEED
         self._phase = SupervisorPhase.STARTING
         self._ready_cursor = None
         self._exit = None
         self._error_category = None
         offset = len(_JOURNAL_HEADER)
-        while offset < size:
-            record, frame_length = self._read_record_at(offset, len(offsets) + 1, file_size=size)
-            offsets.append(offset)
-            self._apply_semantics(record)
-            offset += frame_length
-        self._offsets = offsets
+        try:
+            while offset < size:
+                record, frame_length, frame = self._read_record_at(
+                    offset,
+                    candidate_cursor + 1,
+                    file_size=size,
+                )
+                candidate_cursor += 1
+                self._apply_semantics(record)
+                offset += frame_length
+                candidate_seal = hashlib.sha256(candidate_seal + frame).digest()
+                if record.kind is SupervisorRecordKind.READY:
+                    candidate_ready_position = _JournalPosition(candidate_cursor, offset, candidate_seal)
+            try:
+                after = os.fstat(self._file_fd)
+            except OSError:
+                raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO) from None
+            if _content_state(after) != _content_state(before):
+                raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+        except SupervisorError:
+            raise
+        self._tail_position = _JournalPosition(candidate_cursor, offset, candidate_seal)
+        self._ready_position_value = candidate_ready_position
+        self._verified_content_state = _content_state(after)
+
+    def _verify_stamp(self) -> None:
+        try:
+            self._validate_binding()
+            metadata = os.fstat(self._file_fd)
+            current = _content_state(metadata)
+            if self._verified_content_state is None:
+                raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+            elif current != self._verified_content_state:
+                raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+        except OSError:
+            self._latch_failure(SupervisorErrorCategory.JOURNAL_IO)
+            raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO) from None
+        except SupervisorError as error:
+            self._latch_failure(error.category)
+            raise
 
     def _payload_for(
         self,
@@ -546,8 +603,8 @@ class SupervisorJournal:
     ) -> SupervisorJournalRecord:
         with self._lock:
             self._require_open()
-            self._reload()
-            cursor = len(self._offsets) + 1
+            self._verify_stamp()
+            cursor = self._tail_position.cursor + 1
             payload = self._payload_for(
                 cursor,
                 kind,
@@ -566,48 +623,87 @@ class SupervisorJournal:
                 self._phase, self._ready_cursor, self._exit, self._error_category = prior
                 raise SupervisorError(SupervisorErrorCategory.INVALID_TRANSITION) from None
             self._phase, self._ready_cursor, self._exit, self._error_category = prior
-            frame = _FRAME_LENGTH.pack(len(payload)) + payload + hashlib.sha256(payload).digest()
+            checksum = hashlib.sha256(payload).digest()
+            frame = _FRAME_LENGTH.pack(len(payload)) + payload + checksum
+            assert self._verified_content_state is not None
+            offset = self._tail_position.end_offset
             try:
                 self._validate_binding()
-                offset = os.fstat(self._file_fd).st_size
                 _write_all(self._file_fd, frame)
                 os.fsync(self._file_fd)
                 self._validate_binding()
-            except (OSError, SupervisorError):
-                self._failed = True
+                metadata = os.fstat(self._file_fd)
+                if metadata.st_size != offset + len(frame):
+                    raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+            except OSError:
+                self._latch_failure(SupervisorErrorCategory.JOURNAL_IO)
                 raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO) from None
-            self._offsets.append(offset)
+            except SupervisorError as error:
+                self._latch_failure(error.category)
+                raise
+            next_position = _JournalPosition(
+                cursor,
+                offset + len(frame),
+                hashlib.sha256(self._tail_position.chain_checksum + frame).digest(),
+            )
+            self._tail_position = next_position
+            if candidate.kind is SupervisorRecordKind.READY:
+                self._ready_position_value = next_position
+            self._verified_content_state = _content_state(metadata)
             self._apply_semantics(candidate)
             return candidate
 
-    def records_after(
-        self,
-        cursor: int,
-        *,
-        limit: int | None = None,
-    ) -> tuple[SupervisorJournalRecord, ...]:
+    def _ready_position(self) -> _JournalPosition:
         with self._lock:
             self._require_open()
-            self._reload()
-            if type(cursor) is not int or cursor < 0 or cursor > len(self._offsets):
+            self._verify_stamp()
+            if self._ready_cursor is None or self._ready_position_value is None:
+                raise SupervisorError(SupervisorErrorCategory.NOT_READY)
+            return self._ready_position_value
+
+    def _pull_from_position(
+        self,
+        position: _JournalPosition,
+        *,
+        limit: int,
+    ) -> tuple[tuple[SupervisorJournalRecord, ...], _JournalPosition]:
+        with self._lock:
+            self._require_open()
+            self._verify_stamp()
+            if (
+                not isinstance(position, _JournalPosition)
+                or position.cursor < 0
+                or position.cursor > self._tail_position.cursor
+                or position.end_offset < len(_JOURNAL_HEADER)
+                or position.end_offset > self._tail_position.end_offset
+                or len(position.chain_checksum) != _CHECKSUM_BYTES
+                or type(limit) is not int
+                or limit != _SESSION_PULL_RECORD_LIMIT
+                or (position.cursor == self._tail_position.cursor and position != self._tail_position)
+            ):
                 raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
-            if limit is not None and (type(limit) is not int or limit <= 0):
-                raise ValueError("journal record limit must be positive")
-            stop = None if limit is None else cursor + limit
-            selected_offsets = self._offsets[cursor:stop]
-            try:
-                file_size = os.fstat(self._file_fd).st_size
-            except OSError:
-                raise SupervisorError(SupervisorErrorCategory.JOURNAL_IO) from None
             result: list[SupervisorJournalRecord] = []
-            for expected_cursor, offset in enumerate(selected_offsets, start=cursor + 1):
-                record, _frame_length = self._read_record_at(
-                    offset,
-                    expected_cursor,
-                    file_size=file_size,
-                )
-                result.append(record)
-            return tuple(result)
+            current = position
+            try:
+                while current.cursor < self._tail_position.cursor and len(result) < limit:
+                    record, frame_length, frame = self._read_record_at(
+                        current.end_offset,
+                        current.cursor + 1,
+                        file_size=self._tail_position.end_offset,
+                    )
+                    result.append(record)
+                    current = _JournalPosition(
+                        current.cursor + 1,
+                        current.end_offset + frame_length,
+                        hashlib.sha256(current.chain_checksum + frame).digest(),
+                    )
+                if current.cursor == self._tail_position.cursor and current != self._tail_position:
+                    raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+                self._verify_stamp()
+            except SupervisorError as error:
+                self._latch_failure(error.category)
+                raise
+            return tuple(result), current
 
     def close(self) -> None:
         with self._lock:
@@ -649,6 +745,7 @@ class SupervisorCore:
         self._identity = identity
         self._journal = journal
         self._control_port = control_port
+        self._commit_lock = threading.RLock()
         self._condition = threading.Condition(threading.RLock())
         self._phase = snapshot.phase
         self._ready_cursor = snapshot.ready_cursor
@@ -714,36 +811,40 @@ class SupervisorCore:
         exit_result: ProcessExit | None = None,
         error_category: SupervisorErrorCategory | None = None,
     ) -> SupervisorJournalRecord:
-        self._require_open()
-        try:
-            record = self._journal.append(
-                kind,
-                stream=stream,
-                data=data,
-                exit_result=exit_result,
-                error_category=error_category,
-            )
-            snapshot = self._journal.snapshot
-        except SupervisorError as error:
-            if error.category in {
-                SupervisorErrorCategory.INVALID_JOURNAL,
-                SupervisorErrorCategory.JOURNAL_CORRUPT,
-                SupervisorErrorCategory.JOURNAL_IO,
-                SupervisorErrorCategory.CLOSED,
-            }:
-                self._phase = (
-                    SupervisorPhase.READINESS_FAILED if self._ready_cursor is None else SupervisorPhase.DEGRADED
+        with self._commit_lock:
+            with self._condition:
+                self._require_open()
+            try:
+                record = self._journal.append(
+                    kind,
+                    stream=stream,
+                    data=data,
+                    exit_result=exit_result,
+                    error_category=error_category,
                 )
-                self._error_category = error.category
+                snapshot = self._journal.snapshot
+            except SupervisorError as error:
+                with self._condition:
+                    if error.category in {
+                        SupervisorErrorCategory.INVALID_JOURNAL,
+                        SupervisorErrorCategory.JOURNAL_CORRUPT,
+                        SupervisorErrorCategory.JOURNAL_IO,
+                        SupervisorErrorCategory.CLOSED,
+                    }:
+                        self._phase = (
+                            SupervisorPhase.READINESS_FAILED if self._ready_cursor is None else SupervisorPhase.DEGRADED
+                        )
+                        self._error_category = error.category
+                        self._condition.notify_all()
+                raise
+            with self._condition:
+                self._phase = snapshot.phase
+                self._ready_cursor = snapshot.ready_cursor
+                self._exit = snapshot.exit
+                self._error_category = snapshot.error_category
+                self._journal_cursor = record.cursor
                 self._condition.notify_all()
-            raise
-        self._phase = snapshot.phase
-        self._ready_cursor = snapshot.ready_cursor
-        self._exit = snapshot.exit
-        self._error_category = snapshot.error_category
-        self._journal_cursor = record.cursor
-        self._condition.notify_all()
-        return record
+            return record
 
     def wait_ready(self, timeout: float | None = None) -> int:
         if timeout is not None and (isinstance(timeout, bool) or timeout < 0):
@@ -771,16 +872,14 @@ class SupervisorCore:
             return self._ready_cursor
 
     def mark_ready(self) -> int:
-        with self._condition:
-            return self._commit(SupervisorRecordKind.READY).cursor
+        return self._commit(SupervisorRecordKind.READY).cursor
 
     def append_output(self, stream: ProcessStream, data: bytes) -> int:
         if stream not in {ProcessStream.STDOUT, ProcessStream.STDERR}:
             raise SupervisorError(SupervisorErrorCategory.INVALID_TRANSITION)
         if not isinstance(data, bytes) or not data or len(data) > _MAX_OUTPUT_BYTES:
             raise SupervisorError(SupervisorErrorCategory.INVALID_TRANSITION)
-        with self._condition:
-            return self._commit(SupervisorRecordKind.OUTPUT, stream=stream, data=data).cursor
+        return self._commit(SupervisorRecordKind.OUTPUT, stream=stream, data=data).cursor
 
     def mark_exit(self, result: ProcessExit) -> int:
         if not isinstance(result, ProcessExit) or result.category not in {
@@ -788,22 +887,19 @@ class SupervisorCore:
             ProcessExitCategory.SIGNALED,
         }:
             raise SupervisorError(SupervisorErrorCategory.INVALID_TRANSITION)
-        with self._condition:
-            return self._commit(SupervisorRecordKind.EXIT, exit_result=result).cursor
+        return self._commit(SupervisorRecordKind.EXIT, exit_result=result).cursor
 
     def fail_readiness(self) -> int:
-        with self._condition:
-            return self._commit(
-                SupervisorRecordKind.READINESS_FAILED,
-                error_category=SupervisorErrorCategory.READINESS_FAILED,
-            ).cursor
+        return self._commit(
+            SupervisorRecordKind.READINESS_FAILED,
+            error_category=SupervisorErrorCategory.READINESS_FAILED,
+        ).cursor
 
     def mark_control_lost(self) -> int:
-        with self._condition:
-            return self._commit(
-                SupervisorRecordKind.DEGRADED,
-                error_category=SupervisorErrorCategory.CONTROL_LOST,
-            ).cursor
+        return self._commit(
+            SupervisorRecordKind.DEGRADED,
+            error_category=SupervisorErrorCategory.CONTROL_LOST,
+        ).cursor
 
     def _require_control_available(self) -> None:
         self._require_open()
@@ -815,8 +911,9 @@ class SupervisorCore:
             raise SupervisorError(SupervisorErrorCategory.INVALID_TRANSITION)
 
     def request_stop(self) -> None:
-        with self._condition:
-            self._require_control_available()
+        with self._commit_lock:
+            with self._condition:
+                self._require_control_available()
             self._control_port.request_stop()
 
     def detached_result(self) -> RunResult:
@@ -833,87 +930,124 @@ class SupervisorCore:
 
     def attached_result(self) -> RunResult:
         self.wait_ready()
-        with self._condition:
-            self._require_ready()
-            if len(self._active_clients) >= MAX_ACTIVE_SESSIONS:
-                raise SupervisorError(SupervisorErrorCategory.SESSION_CAPACITY)
-            token = self._next_client
-            self._next_client += 1
-            self._active_clients.add(token)
-            assert self._ready_cursor is not None
-            session = SupervisorProcessSession(self, token, self._ready_cursor)
-            status = "exited" if self._phase is SupervisorPhase.EXITED else "running"
-            return RunResult(
-                self._identity.record,
-                status,
-                True,
-                RunAttachmentMode.ATTACHED,
-                session=session,
-            )
+        with self._commit_lock:
+            try:
+                ready_position = self._journal._ready_position()
+            except SupervisorError as error:
+                with self._condition:
+                    self._phase = SupervisorPhase.DEGRADED
+                    self._error_category = error.category
+                    self._condition.notify_all()
+                raise
+            with self._condition:
+                self._require_ready()
+                if len(self._active_clients) >= MAX_ACTIVE_SESSIONS:
+                    raise SupervisorError(SupervisorErrorCategory.SESSION_CAPACITY)
+                token = self._next_client
+                self._next_client += 1
+                assert self._ready_cursor is not None
+                if ready_position.cursor != self._ready_cursor:
+                    raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
+                self._active_clients.add(token)
+                session = SupervisorProcessSession(self, token, ready_position)
+                status = "exited" if self._phase is SupervisorPhase.EXITED else "running"
+                return RunResult(
+                    self._identity.record,
+                    status,
+                    True,
+                    RunAttachmentMode.ATTACHED,
+                    session=session,
+                )
 
     def _release_client(self, token: int) -> None:
         with self._condition:
             self._active_clients.discard(token)
             self._condition.notify_all()
 
-    def _records_or_wait(self, cursor: int, token: int) -> tuple[SupervisorJournalRecord, ...] | None:
-        with self._condition:
-            while token in self._active_clients:
-                records = self._journal.records_after(cursor, limit=_SESSION_PULL_RECORD_LIMIT)
-                if records:
-                    return records
+    def _records_or_wait(
+        self,
+        position: _JournalPosition,
+        token: int,
+    ) -> tuple[tuple[SupervisorJournalRecord, ...], _JournalPosition] | None:
+        while True:
+            with self._condition:
+                if token not in self._active_clients:
+                    return None
                 if self._closed:
                     raise SupervisorError(SupervisorErrorCategory.CLOSED)
-                self._condition.wait()
-            return None
+                if position.cursor >= self._journal_cursor:
+                    if self._error_category in {
+                        SupervisorErrorCategory.INVALID_JOURNAL,
+                        SupervisorErrorCategory.JOURNAL_CORRUPT,
+                        SupervisorErrorCategory.JOURNAL_IO,
+                        SupervisorErrorCategory.CLOSED,
+                    }:
+                        raise SupervisorError(self._error_category)
+                    self._condition.wait()
+                    continue
+            try:
+                batch = self._journal._pull_from_position(
+                    position,
+                    limit=_SESSION_PULL_RECORD_LIMIT,
+                )
+            except SupervisorError as error:
+                with self._condition:
+                    self._phase = SupervisorPhase.DEGRADED
+                    self._error_category = error.category
+                    self._condition.notify_all()
+                raise
+            with self._condition:
+                if token not in self._active_clients:
+                    return None
+            return batch
 
-    def _wait_terminal(self, cursor: int, token: int) -> ProcessExit:
-        current = cursor
+    def _wait_terminal(self, position: _JournalPosition, token: int) -> ProcessExit:
+        current = position
         try:
             while True:
-                records = self._records_or_wait(current, token)
-                if records is None:
+                batch = self._records_or_wait(current, token)
+                if batch is None:
                     raise SupervisorError(SupervisorErrorCategory.CLOSED)
+                records, current = batch
                 for record in records:
-                    current = record.cursor
                     if record.kind is SupervisorRecordKind.EXIT:
                         assert record.exit is not None
-                        self._release_client(token)
                         return record.exit
                     if record.kind is SupervisorRecordKind.DEGRADED:
                         raise SupervisorError(SupervisorErrorCategory.CONTROL_LOST)
-        except SupervisorError:
+        finally:
             self._release_client(token)
-            raise
 
     def _signal(self, token: int, requested: ProcessSignal) -> None:
         if not isinstance(requested, ProcessSignal):
             raise TypeError("process signal must be a ProcessSignal")
-        with self._condition:
-            if token not in self._active_clients:
-                raise SupervisorError(SupervisorErrorCategory.CLOSED)
-            self._require_control_available()
+        with self._commit_lock:
+            with self._condition:
+                if token not in self._active_clients:
+                    raise SupervisorError(SupervisorErrorCategory.CLOSED)
+                self._require_control_available()
             self._control_port.signal(requested)
 
     def close(self) -> None:
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            self._condition.notify_all()
-        try:
-            self._control_port.close()
-        finally:
-            self._journal.close()
+        with self._commit_lock:
+            with self._condition:
+                if self._closed:
+                    return
+                self._closed = True
+                self._condition.notify_all()
+            try:
+                self._control_port.close()
+            finally:
+                self._journal.close()
 
 
 class SupervisorProcessSession:
     capabilities = ProcessCapabilities(stdin=False, tty=False, resize=False, signal=True)
 
-    def __init__(self, core: SupervisorCore, token: int, ready_cursor: int) -> None:
+    def __init__(self, core: SupervisorCore, token: int, ready_position: _JournalPosition) -> None:
         self._core = core
         self._token = token
-        self._cursor = ready_cursor
+        self._position = ready_position
         self._consumed = False
         self._closed = False
         self._terminal: ProcessExit | None = None
@@ -922,7 +1056,7 @@ class SupervisorProcessSession:
 
     @property
     def replay_cursor(self) -> int:
-        return self._cursor
+        return self._position.cursor
 
     def events(self) -> Iterator[ProcessEvent]:
         with self._lock:
@@ -934,18 +1068,17 @@ class SupervisorProcessSession:
     def _iterate_events(self) -> Iterator[ProcessEvent]:
         try:
             while True:
-                records = self._core._records_or_wait(self._cursor, self._token)
-                if records is None:
+                batch = self._core._records_or_wait(self._position, self._token)
+                if batch is None:
                     return
+                records, self._position = batch
                 for record in records:
-                    self._cursor = record.cursor
                     if record.kind is SupervisorRecordKind.OUTPUT:
                         assert record.stream is not None and record.data is not None
                         yield ProcessOutputEvent(record.stream, record.data)
                     elif record.kind is SupervisorRecordKind.EXIT:
                         assert record.exit is not None
                         self._terminal = record.exit
-                        self._core._release_client(self._token)
                         yield ProcessStatusEvent(record.exit)
                         return
                     elif record.kind is SupervisorRecordKind.DEGRADED:
@@ -982,7 +1115,7 @@ class SupervisorProcessSession:
                 raise SupervisorError(SupervisorErrorCategory.ALREADY_CONSUMED)
             self._consumed = True
         try:
-            terminal = self._core._wait_terminal(self._cursor, self._token)
+            terminal = self._core._wait_terminal(self._position, self._token)
         except SupervisorError as error:
             with self._lock:
                 self._terminal_error = error.category

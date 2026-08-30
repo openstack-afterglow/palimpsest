@@ -593,37 +593,258 @@ def test_journal_rejects_duplicate_semantic_transition_and_oversized_output(tmp_
     journal.close()
 
 
-def test_journal_pull_is_bounded_and_rechecks_checksum_after_reload(
+def test_journal_position_pull_is_bounded_and_rechecks_checksum_after_refresh(tmp_path: Path) -> None:
+    directory = tmp_path / "journal"
+    journal = _journal(directory)
+    journal.append(SupervisorRecordKind.READY)
+    first = journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"x")
+    second = journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDERR, data=b"y")
+    position = journal._ready_position()
+    records, position = journal._pull_from_position(position, limit=1)
+    assert records == (first,)
+    records, position = journal._pull_from_position(position, limit=1)
+    assert records == (second,)
+
+    path = directory / supervisor._JOURNAL_NAME
+    content = path.read_bytes()
+    changed = content.replace(b"eA==", b"eQ==", 1)
+    assert changed != content
+    path.write_bytes(changed)
+    path.chmod(0o600)
+    with pytest.raises(SupervisorError) as checksum:
+        journal._pull_from_position(position, limit=1)
+    assert checksum.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+
+
+@pytest.mark.parametrize("attack", ["touch", "append", "truncate", "prefix-rewrite"])
+def test_live_journal_stamp_changes_latch_corruption(tmp_path: Path, attack: str) -> None:
+    directory = tmp_path / attack
+    journal = _journal(directory)
+    journal.append(SupervisorRecordKind.READY)
+    journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"x")
+    path = directory / supervisor._JOURNAL_NAME
+    original = path.read_bytes()
+    inode = path.stat().st_ino
+    if attack == "touch":
+        metadata = path.stat()
+        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000))
+    elif attack == "append":
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b"foreign-tail")
+        finally:
+            os.close(descriptor)
+    elif attack == "truncate":
+        os.truncate(path, len(original) - 1)
+    else:
+        header_length = len(supervisor._JOURNAL_HEADER)
+        ready_payload_length = supervisor._FRAME_LENGTH.unpack(
+            original[header_length : header_length + supervisor._FRAME_LENGTH.size]
+        )[0]
+        ready_frame_length = supervisor._FRAME_LENGTH.size + ready_payload_length + supervisor._CHECKSUM_BYTES
+        output_offset = header_length + ready_frame_length
+        output_payload_length = supervisor._FRAME_LENGTH.unpack(
+            original[output_offset : output_offset + supervisor._FRAME_LENGTH.size]
+        )[0]
+        payload_offset = output_offset + supervisor._FRAME_LENGTH.size
+        payload = original[payload_offset : payload_offset + output_payload_length]
+        changed_payload = payload.replace(b"eA==", b"eQ==", 1)
+        assert changed_payload != payload
+        changed = bytearray(original)
+        changed[payload_offset : payload_offset + output_payload_length] = changed_payload
+        checksum_offset = payload_offset + output_payload_length
+        changed[checksum_offset : checksum_offset + supervisor._CHECKSUM_BYTES] = supervisor.hashlib.sha256(
+            changed_payload
+        ).digest()
+        path.write_bytes(changed)
+        path.chmod(0o600)
+    assert path.stat().st_ino == inode
+    with pytest.raises(SupervisorError) as corrupted:
+        _ = journal.cursor
+    assert corrupted.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+    path.write_bytes(original)
+    path.chmod(0o600)
+    with pytest.raises(SupervisorError) as latched:
+        _ = journal.cursor
+    assert latched.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+
+
+def test_incremental_append_and_session_pull_never_reread_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core, journal, _port = _core(tmp_path / "journal")
+    core.mark_ready()
+    session = core.attached_result().session
+    assert session is not None
+    counts = {"pread": 0, "hash": 0, "decode": 0}
+    original_pread = supervisor.os.pread
+    original_sha256 = supervisor.hashlib.sha256
+    original_decode = SupervisorJournal._decode_payload
+
+    def counted_pread(descriptor: int, length: int, offset: int) -> bytes:
+        counts["pread"] += 1
+        return original_pread(descriptor, length, offset)
+
+    def counted_sha256(content: bytes = b""):
+        counts["hash"] += 1
+        return original_sha256(content)
+
+    def counted_decode(self, payload: bytes, expected_cursor: int):
+        counts["decode"] += 1
+        return original_decode(self, payload, expected_cursor)
+
+    monkeypatch.setattr(supervisor.os, "pread", counted_pread)
+    monkeypatch.setattr(supervisor.hashlib, "sha256", counted_sha256)
+    monkeypatch.setattr(SupervisorJournal, "_decode_payload", counted_decode)
+    output_count = 256
+    for index in range(output_count):
+        core.append_output(ProcessStream.STDOUT, bytes([index % 251 + 1]))
+    terminal = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
+    core.mark_exit(terminal)
+    new_frame_count = output_count + 1
+    assert counts == {"pread": 0, "hash": new_frame_count * 2, "decode": new_frame_count}
+    assert not any(isinstance(value, (list, dict)) for value in vars(journal).values())
+    assert not any(isinstance(value, (list, dict)) for value in vars(session).values())
+
+    counts.update(pread=0, hash=0, decode=0)
+    events = tuple(session.events())
+    assert len(events) == new_frame_count
+    assert events[-1] == ProcessStatusEvent(terminal)
+    assert counts == {
+        "pread": new_frame_count * 3,
+        "hash": new_frame_count * 2,
+        "decode": new_frame_count,
+    }
+
+
+def test_existing_journal_is_stream_verified_once_at_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     directory = tmp_path / "journal"
-    journal = _journal(directory)
-    ready = journal.append(SupervisorRecordKind.READY)
-    first = journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"x")
-    second = journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDERR, data=b"y")
-    assert journal.records_after(ready.cursor, limit=1) == (first,)
-    assert journal.records_after(first.cursor, limit=1) == (second,)
+    first = _journal(directory)
+    identity = first.identity
+    first.append(SupervisorRecordKind.READY)
+    output_count = 128
+    for _ in range(output_count):
+        first.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"x")
+    first.close()
 
-    original_reload = SupervisorJournal._reload
-    tampered = False
+    counts = {"pread": 0, "hash": 0, "decode": 0}
+    original_pread = supervisor.os.pread
+    original_sha256 = supervisor.hashlib.sha256
+    original_decode = SupervisorJournal._decode_payload
 
-    def reload_then_tamper(self) -> None:
-        nonlocal tampered
-        original_reload(self)
-        if not tampered:
-            path = directory / supervisor._JOURNAL_NAME
-            content = path.read_bytes()
-            changed = content.replace(b"eA==", b"eQ==", 1)
-            assert changed != content
-            path.write_bytes(changed)
-            path.chmod(0o600)
-            tampered = True
+    def counted_pread(descriptor: int, length: int, offset: int) -> bytes:
+        counts["pread"] += 1
+        return original_pread(descriptor, length, offset)
 
-    monkeypatch.setattr(SupervisorJournal, "_reload", reload_then_tamper)
-    with pytest.raises(SupervisorError) as checksum:
-        journal.records_after(ready.cursor, limit=1)
-    assert checksum.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+    def counted_sha256(content: bytes = b""):
+        counts["hash"] += 1
+        return original_sha256(content)
+
+    def counted_decode(self, payload: bytes, expected_cursor: int):
+        counts["decode"] += 1
+        return original_decode(self, payload, expected_cursor)
+
+    monkeypatch.setattr(supervisor.os, "pread", counted_pread)
+    monkeypatch.setattr(supervisor.hashlib, "sha256", counted_sha256)
+    monkeypatch.setattr(SupervisorJournal, "_decode_payload", counted_decode)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        reopened = SupervisorJournal(directory_fd, identity)
+    finally:
+        os.close(directory_fd)
+    frame_count = output_count + 1
+    assert counts == {"pread": frame_count * 3 + 1, "hash": frame_count * 2, "decode": frame_count}
+    counts.update(pread=0, hash=0, decode=0)
+    assert reopened.cursor == frame_count
+    assert reopened.snapshot.journal_cursor == frame_count
+    assert counts == {"pread": 0, "hash": 0, "decode": 0}
+    reopened.close()
+
+
+def test_journal_position_pull_rejects_multi_frame_requests(tmp_path: Path) -> None:
+    journal = _journal(tmp_path / "journal")
+    journal.append(SupervisorRecordKind.READY)
+    position = journal._ready_position()
+    with pytest.raises(SupervisorError) as unbounded:
+        journal._pull_from_position(position, limit=2)
+    assert unbounded.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+
+
+def test_module_has_no_arbitrary_cursor_seek() -> None:
+    source_path = Path(supervisor.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "records_after"
+        for node in ast.walk(tree)
+    )
+
+
+def test_core_never_performs_journal_io_while_holding_its_condition() -> None:
+    source_path = Path(supervisor.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    core = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SupervisorCore")
+
+    def is_condition(expression: ast.expr) -> bool:
+        return (
+            isinstance(expression, ast.Attribute)
+            and expression.attr == "_condition"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "self"
+        )
+
+    def is_journal_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_journal"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "self"
+        )
+
+    condition_blocks = [
+        node
+        for node in ast.walk(core)
+        if isinstance(node, ast.With) and any(is_condition(item.context_expr) for item in node.items)
+    ]
+    assert condition_blocks
+    assert not any(is_journal_call(child) for block in condition_blocks for child in ast.walk(block))
+
+
+def test_inactive_supervisor_has_no_reverse_import_or_reexport() -> None:
+    def imports_supervisor(tree: ast.AST) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name == "oci_supervisor" or alias.name.endswith(".oci_supervisor") for alias in node.names
+            ):
+                return True
+            if isinstance(node, ast.ImportFrom) and (
+                (node.module is not None and node.module.endswith("oci_supervisor"))
+                or any(alias.name == "oci_supervisor" for alias in node.names)
+            ):
+                return True
+        return False
+
+    package = Path(supervisor.__file__).parent
+    importers: list[str] = []
+    for source_path in package.glob("*.py"):
+        if source_path.name == "oci_supervisor.py":
+            continue
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        if imports_supervisor(tree):
+            importers.append(source_path.name)
+    assert importers == []
+    for source in (
+        "from . import oci_supervisor",
+        "from palimpsest_local import oci_supervisor",
+        "from .oci_supervisor import SupervisorCore",
+        "import palimpsest_local.oci_supervisor as supervisor_core",
+    ):
+        assert imports_supervisor(ast.parse(source))
 
 
 @pytest.mark.parametrize(
