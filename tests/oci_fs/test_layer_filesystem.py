@@ -5,22 +5,24 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
-import sys
 import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from palimpsest_local.errors import UnsupportedPlatformError
+from palimpsest_local.errors import ArtifactValidationError, UnsupportedPlatformError
 from palimpsest_local.oci_convert import (
+    SELECTED_OCI_LAYER_FILESYSTEM,
+    FilesystemCandidate,
+    _probe_fixture_digest,
     _verify_merged_tree,
     build_layer_filesystem,
     check_lowerdir_page_budget,
     check_platform_support,
     get_oci_layer_filesystem,
-    probe_oci_filesystem_semantics,
+    preflight_oci_filesystem_probe,
+    probe_oci_filesystem_candidate,
     to_base36,
     translate_oci_tar_to_overlay_tar,
 )
@@ -36,19 +38,12 @@ def test_non_linux_rejection_before_subprocess():
                 check_platform_support()
 
             with pytest.raises(UnsupportedPlatformError, match="unsupported"):
-                build_layer_filesystem(b"dummy")
+                build_layer_filesystem(b"dummy", target_fs=FilesystemCandidate.SQUASHFS)
 
             with pytest.raises(UnsupportedPlatformError, match="unsupported"):
-                probe_oci_filesystem_semantics(b"base", b"leaf", {})
+                preflight_oci_filesystem_probe(FilesystemCandidate.SQUASHFS)
 
             mock_run.assert_not_called()
-
-
-def test_unestablished_layer_filesystem_selection_raises():
-    """Verify get_oci_layer_filesystem raises if not established by Linux probe."""
-    with patch("palimpsest_local.oci_convert.OCI_LAYER_FILESYSTEM", None):
-        with pytest.raises(UnsupportedPlatformError, match="not been established"):
-            get_oci_layer_filesystem()
 
 
 def test_base36_conversion():
@@ -197,8 +192,7 @@ def test_tar_translation_forward_hardlink_emitted_after_target():
 def test_tar_translation_leaf_fixture_structure():
     """Verify translated leaf_layer.tar fixture includes correct dir_to_file, synthesized file_to_dir, and ordered hardlinks."""
     leaf_tar_path = FIXTURES_DIR / "leaf_layer.tar"
-    if not leaf_tar_path.exists():
-        return
+    assert leaf_tar_path.is_file()
 
     leaf_tar = leaf_tar_path.read_bytes()
     translated_bytes = translate_oci_tar_to_overlay_tar(leaf_tar)
@@ -223,18 +217,16 @@ def test_tar_translation_leaf_fixture_structure():
 
 @pytest.mark.oci_fs
 def test_layer_filesystem_semantics():
-    """Linux privileged test for 2-layer OCI changeset OverlayFS semantics."""
-    if sys.platform != "linux":
-        pytest.skip("OCI layer filesystem semantics test requires a Linux host")
-
-    if os.geteuid() != 0:
-        pytest.skip("OCI layer filesystem semantics test requires root privileges for OverlayFS mount")
-
-    if not shutil.which("mksquashfs") and not shutil.which("mkfs.erofs"):
-        pytest.skip("OCI layer filesystem semantics test requires mksquashfs or mkfs.erofs installed")
-
-    if not shutil.which("mount") or not shutil.which("umount"):
-        pytest.skip("OCI layer filesystem semantics test requires mount/umount tools installed")
+    """Prove the selected candidate on privileged Linux without fallback."""
+    candidate = SELECTED_OCI_LAYER_FILESYSTEM
+    required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
+    try:
+        preflight_oci_filesystem_probe(candidate)
+    except UnsupportedPlatformError as exc:
+        reason = f"{candidate.value} OCI filesystem proof unavailable: {exc}"
+        if required:
+            pytest.fail(reason)
+        pytest.skip(reason)
 
     base_tar_path = FIXTURES_DIR / "base_layer.tar"
     leaf_tar_path = FIXTURES_DIR / "leaf_layer.tar"
@@ -247,13 +239,61 @@ def test_layer_filesystem_semantics():
     leaf_tar = leaf_tar_path.read_bytes()
     receipt = json.loads(receipt_path.read_text())
 
-    selected_fs = probe_oci_filesystem_semantics(base_tar, leaf_tar, receipt)
+    evidence = probe_oci_filesystem_candidate(candidate, base_tar, leaf_tar, receipt)
+    assert evidence.candidate == candidate.value
+    assert get_oci_layer_filesystem() is FilesystemCandidate.SQUASHFS
+    assert evidence.fixture_digest.startswith("sha256:")
+    assert len(evidence.base_image_sha256) == 64
+    assert len(evidence.leaf_image_sha256) == 64
+    evidence_dir = os.environ.get("PALIMPSEST_OCI_FS_EVIDENCE_DIR")
+    if evidence_dir:
+        output_dir = Path(evidence_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / f"{candidate.value}.json").write_text(evidence.to_json(), encoding="utf-8")
 
-    assert selected_fs in ("squashfs", "erofs")
-    assert get_oci_layer_filesystem() == selected_fs
+
+@pytest.mark.oci_fs
+def test_erofs_reference_retains_timestamp_failure():
+    """Retain why EROFS 1.7.1 is not the selected Phase 1 backend."""
+    candidate = FilesystemCandidate.EROFS
+    required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
+    try:
+        prerequisites = preflight_oci_filesystem_probe(candidate)
+    except UnsupportedPlatformError as exc:
+        reason = f"erofs comparison unavailable: {exc}"
+        if required:
+            pytest.fail(reason)
+        pytest.skip(reason)
+
+    base_tar = (FIXTURES_DIR / "base_layer.tar").read_bytes()
+    leaf_tar = (FIXTURES_DIR / "leaf_layer.tar").read_bytes()
+    receipt = json.loads((FIXTURES_DIR / "expected_receipt.json").read_text())
+    with pytest.raises(ArtifactValidationError, match="mtime mismatch"):
+        probe_oci_filesystem_candidate(candidate, base_tar, leaf_tar, receipt)
+    evidence_dir = os.environ.get("PALIMPSEST_OCI_FS_EVIDENCE_DIR")
+    if evidence_dir:
+        output_dir = Path(evidence_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failure_evidence = {
+            "architecture": prerequisites.architecture,
+            "candidate": candidate.value,
+            "failure_category": "timestamp-semantics",
+            "fixture_digest": _probe_fixture_digest(base_tar, leaf_tar, receipt),
+            "kernel_release": prerequisites.kernel_release,
+            "packer_sha256": prerequisites.packer_sha256,
+            "packer_version": prerequisites.packer_version,
+            "schema_version": 1,
+            "status": "failed",
+        }
+        (output_dir / "erofs.json").write_text(
+            json.dumps(failure_evidence, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
 
 
 def test_verify_merged_tree_pure_unit_tests(tmp_path):
+    if not hasattr(os, "listxattr"):
+        pytest.skip("exact merged-tree xattr verification requires os.listxattr")
     import hashlib
 
     def build_mock_tree(root_dir: Path) -> dict:
@@ -273,47 +313,61 @@ def test_verify_merged_tree_pure_unit_tests(tmp_path):
         st_f1 = f1.lstat()
         st_d1 = d1.lstat()
         st_sym = sym.lstat()
+        st_root = root_dir.lstat()
 
         return {
+            ".": {
+                "type": "dir",
+                "mode": st_root.st_mode,
+                "uid": st_root.st_uid,
+                "gid": st_root.st_gid,
+                "mtime_ns": st_root.st_mtime_ns,
+                "xattrs_b64": {},
+            },
             "dir1": {
                 "type": "dir",
                 "mode": st_d1.st_mode,
                 "uid": st_d1.st_uid,
                 "gid": st_d1.st_gid,
-                "mtime": st_d1.st_mtime,
+                "mtime_ns": st_d1.st_mtime_ns,
+                "xattrs_b64": {},
             },
             "dir1/file1.txt": {
                 "type": "file",
                 "mode": st_f1.st_mode,
                 "uid": st_f1.st_uid,
                 "gid": st_f1.st_gid,
-                "mtime": st_f1.st_mtime,
+                "mtime_ns": st_f1.st_mtime_ns,
                 "sha256": hashlib.sha256(b"hello world").hexdigest(),
+                "xattrs_b64": {},
             },
             "symlink.txt": {
                 "type": "symlink",
                 "mode": st_sym.st_mode,
                 "uid": st_sym.st_uid,
                 "gid": st_sym.st_gid,
-                "mtime": st_sym.st_mtime,
+                "mtime_ns": st_sym.st_mtime_ns,
                 "target": "dir1/file1.txt",
+                "xattrs_b64": {},
             },
             "hardlink1.txt": {
                 "type": "file",
                 "mode": h1.lstat().st_mode,
                 "uid": h1.lstat().st_uid,
                 "gid": h1.lstat().st_gid,
-                "mtime": h1.lstat().st_mtime,
+                "mtime_ns": h1.lstat().st_mtime_ns,
                 "sha256": hashlib.sha256(b"hardlink data").hexdigest(),
+                "xattrs_b64": {},
             },
             "hardlink2.txt": {
                 "type": "file",
                 "mode": h2.lstat().st_mode,
                 "uid": h2.lstat().st_uid,
                 "gid": h2.lstat().st_gid,
-                "mtime": h2.lstat().st_mtime,
+                "mtime_ns": h2.lstat().st_mtime_ns,
                 "sha256": hashlib.sha256(b"hardlink data").hexdigest(),
                 "link_target": "hardlink1.txt",
+                "xattrs_b64": {},
             },
         }
 
@@ -336,7 +390,15 @@ def test_verify_merged_tree_pure_unit_tests(tmp_path):
     dir3 = tmp_path / "missing_tree"
     receipt3 = build_mock_tree(dir3)
     bad_receipt = dict(receipt3)
-    bad_receipt["missing.txt"] = {"type": "file"}
+    bad_receipt["missing.txt"] = {
+        "type": "file",
+        "mode": 0o644,
+        "uid": 0,
+        "gid": 0,
+        "mtime_ns": 0,
+        "sha256": "0" * 64,
+        "xattrs_b64": {},
+    }
     ok, msg = _verify_merged_tree(dir3, bad_receipt)
     assert ok is False
     assert "Missing expected entries" in msg
@@ -367,11 +429,32 @@ def test_verify_merged_tree_pure_unit_tests(tmp_path):
     sep1.write_bytes(b"same content")
     sep2.write_bytes(b"same content")
     sep_receipt = {
-        "sep1.txt": {"type": "file", "sha256": hashlib.sha256(b"same content").hexdigest()},
+        ".": {
+            "type": "dir",
+            "mode": dir6.stat().st_mode,
+            "uid": dir6.stat().st_uid,
+            "gid": dir6.stat().st_gid,
+            "mtime_ns": dir6.stat().st_mtime_ns,
+            "xattrs_b64": {},
+        },
+        "sep1.txt": {
+            "type": "file",
+            "mode": sep1.stat().st_mode,
+            "uid": sep1.stat().st_uid,
+            "gid": sep1.stat().st_gid,
+            "mtime_ns": sep1.stat().st_mtime_ns,
+            "sha256": hashlib.sha256(b"same content").hexdigest(),
+            "xattrs_b64": {},
+        },
         "sep2.txt": {
             "type": "file",
+            "mode": sep2.stat().st_mode,
+            "uid": sep2.stat().st_uid,
+            "gid": sep2.stat().st_gid,
+            "mtime_ns": sep2.stat().st_mtime_ns,
             "sha256": hashlib.sha256(b"same content").hexdigest(),
             "link_target": "sep1.txt",
+            "xattrs_b64": {},
         },
     }
     ok, msg = _verify_merged_tree(dir6, sep_receipt)
@@ -386,20 +469,41 @@ def test_verify_merged_tree_pure_unit_tests(tmp_path):
         xattr_file.write_bytes(b"xattr test")
         try:
             os.setxattr(xattr_file, "user.testnote", b"hello_xattr")
+            xattr_stat = xattr_file.stat()
+            root_stat = dir7.stat()
             xattr_receipt = {
+                ".": {
+                    "type": "dir",
+                    "mode": root_stat.st_mode,
+                    "uid": root_stat.st_uid,
+                    "gid": root_stat.st_gid,
+                    "mtime_ns": root_stat.st_mtime_ns,
+                    "xattrs_b64": {},
+                },
                 "xattr_file.txt": {
                     "type": "file",
-                    "xattrs": {"user.testnote": "hello_xattr"},
-                }
+                    "mode": xattr_stat.st_mode,
+                    "uid": xattr_stat.st_uid,
+                    "gid": xattr_stat.st_gid,
+                    "mtime_ns": xattr_stat.st_mtime_ns,
+                    "sha256": hashlib.sha256(b"xattr test").hexdigest(),
+                    "xattrs_b64": {"user.testnote": "aGVsbG9feGF0dHI="},
+                },
             }
             ok, msg = _verify_merged_tree(dir7, xattr_receipt)
             assert ok is True, f"Expected xattr verification to succeed, got: {msg}"
 
             bad_xattr_receipt = {
+                ".": xattr_receipt["."],
                 "xattr_file.txt": {
                     "type": "file",
-                    "xattrs": {"user.testnote": "wrong_value"},
-                }
+                    "mode": xattr_stat.st_mode,
+                    "uid": xattr_stat.st_uid,
+                    "gid": xattr_stat.st_gid,
+                    "mtime_ns": xattr_stat.st_mtime_ns,
+                    "sha256": hashlib.sha256(b"xattr test").hexdigest(),
+                    "xattrs_b64": {"user.testnote": "d3JvbmdfdmFsdWU="},
+                },
             }
             ok, msg = _verify_merged_tree(dir7, bad_xattr_receipt)
             assert ok is False
@@ -413,12 +517,66 @@ def test_build_layer_filesystem_cleanup_on_failure(tmp_path):
     with tarfile.open(fileobj=buf, mode="w"):
         pass
     valid_tar = buf.getvalue()
+    private_parent = tmp_path / "generated-parent"
+    private_parent.mkdir(mode=0o700)
 
     with patch("sys.platform", "linux"):
         with patch("shutil.which", return_value="/usr/bin/mksquashfs"):
             mock_proc = MagicMock(returncode=1, stderr=b"mksquashfs error")
-            with patch("subprocess.run", return_value=mock_proc):
+            with (
+                patch("subprocess.run", return_value=mock_proc),
+                patch("tempfile.mkdtemp", return_value=str(private_parent)),
+            ):
                 from palimpsest_local.errors import ArtifactValidationError
 
                 with pytest.raises(ArtifactValidationError, match="mksquashfs failed"):
                     build_layer_filesystem(valid_tar, target_fs="squashfs")
+    assert not private_parent.exists()
+
+
+def test_build_layer_filesystem_atomically_publishes_from_private_staging(tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w"):
+        pass
+    output = tmp_path / "layer.squashfs"
+
+    def fake_pack(command, **_kwargs):
+        Path(command[2]).write_bytes(b"hsqs\0")
+        return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+    with (
+        patch("sys.platform", "linux"),
+        patch("shutil.which", return_value="/usr/bin/mksquashfs"),
+        patch("palimpsest_local.oci_convert._run_checked", side_effect=fake_pack),
+    ):
+        result = build_layer_filesystem(buf.getvalue(), target_fs="squashfs", out_path=output)
+
+    assert result == output
+    assert output.read_bytes() == b"hsqs\0"
+    assert list(tmp_path.glob(".layer.squashfs.*")) == []
+
+
+def test_build_layer_filesystem_refuses_output_symlink_inserted_during_pack(tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w"):
+        pass
+    output = tmp_path / "layer.squashfs"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+
+    def fake_pack(command, **_kwargs):
+        Path(command[2]).write_bytes(b"hsqs\0")
+        output.symlink_to(victim)
+        return MagicMock(returncode=0, stdout=b"", stderr=b"")
+
+    with (
+        patch("sys.platform", "linux"),
+        patch("shutil.which", return_value="/usr/bin/mksquashfs"),
+        patch("palimpsest_local.oci_convert._run_checked", side_effect=fake_pack),
+        pytest.raises(ArtifactValidationError, match="appeared before atomic publish"),
+    ):
+        build_layer_filesystem(buf.getvalue(), target_fs="squashfs", out_path=output)
+
+    assert output.is_symlink()
+    assert victim.read_bytes() == b"untouched"
+    assert list(tmp_path.glob(".layer.squashfs.*")) == []

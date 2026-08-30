@@ -21,12 +21,51 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --extra dev
       - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
+      - run: uv run python tests/fixtures/oci-root/generate_fixtures.py --check
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python -m pytest tests/unit -v
+      - run: uv run python -m pytest tests/oci_fs -m "not oci_fs" -v
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz
+
+  oci-fs-proof:
+    name: OCI filesystem proof (privileged Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes erofs-utils squashfs-tools
+      - run: uv sync --frozen --extra dev
+      - run: mkdir -m 0700 "$RUNNER_TEMP/oci-fs-evidence"
+      - run: mkdir -m 0700 "$RUNNER_TEMP/oci-fs-replay"
+      - name: Prove selected SquashFS and retain EROFS comparison failure
+        env:
+          PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-evidence
+          PALIMPSEST_REQUIRE_OCI_FS: "1"
+        run: sudo --preserve-env=PATH,PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS uv run python -m pytest -m oci_fs tests/oci_fs -vv
+      - name: Rebuild selected SquashFS in a separate process
+        env:
+          PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-replay
+          PALIMPSEST_REQUIRE_OCI_FS: "1"
+        run: sudo --preserve-env=PATH,PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS uv run python -m pytest -m oci_fs -k layer_filesystem_semantics tests/oci_fs -vv
+      - name: Require cross-process deterministic evidence
+        run: |
+          cmp "$RUNNER_TEMP/oci-fs-evidence/squashfs.json" "$RUNNER_TEMP/oci-fs-replay/squashfs.json"
+          cp "$RUNNER_TEMP/oci-fs-replay/squashfs.json" "$RUNNER_TEMP/oci-fs-evidence/squashfs-replay.json"
+      - name: Require both retained candidate results
+        run: test -s "$RUNNER_TEMP/oci-fs-evidence/squashfs.json" && test -s "$RUNNER_TEMP/oci-fs-evidence/squashfs-replay.json" && test -s "$RUNNER_TEMP/oci-fs-evidence/erofs.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oci-filesystem-proof
+          path: ${{ runner.temp }}/oci-fs-evidence
+          if-no-files-found: error
 
 
   unit-macos:

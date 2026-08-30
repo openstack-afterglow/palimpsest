@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "generator_contract": "palimpsest-oci-root-fixtures-v1",
+  "files": {
+    "base_layer.tar": {
+      "sha256": "f2ba2f2e0df68d473c8e5de51dcaa84ba76017bc4df9dc35d2ce73b93db1d83a",
+      "size": 20480
+    },
+    "leaf_layer.tar": {
+      "sha256": "1971ab70fed13aa8042b186a177d3883484839ff7142ab4bf749c9250d0aaeaa",
+      "size": 20480
+    },
+    "expected_receipt.json": {
+      "sha256": "495d2e9e85dae63923ff36b79ebedeaf8afcd079cbaa1993783d4c96b264a7c5",
+      "size": 4758
+    }
+  }
+}
