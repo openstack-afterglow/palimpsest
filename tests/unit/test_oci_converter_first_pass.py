@@ -8,7 +8,11 @@ import io
 import json
 import os
 import pickle
+import shutil
+import struct
+import sys
 import tarfile
+import tempfile
 import threading
 from copy import copy, deepcopy
 from dataclasses import replace
@@ -17,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import palimpsest_local.oci_converter as oci_converter
+import palimpsest_local.oci_packer as oci_packer
 from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_changeset import EntryKind
 from palimpsest_local.oci_converter import (
@@ -27,6 +32,13 @@ from palimpsest_local.oci_converter import (
     stage_layer,
 )
 from palimpsest_local.oci_image import OCIImageRef
+from palimpsest_local.oci_packer import (
+    SQUASHFS_PACK_POLICY_ID,
+    SQUASHFS_STRUCTURAL_VERIFIER_ID,
+    SquashFSPackError,
+    SquashFSPackPolicy,
+    pack_staged_squashfs,
+)
 from palimpsest_local.oci_provenance import (
     DOCKER_IMAGE_CONFIG_MEDIA_TYPE,
     DOCKER_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -139,6 +151,53 @@ def _snapshot(
     )
     image = LocalLayoutSource.parse(f"oci-layout://{root}@{manifest.digest}").snapshot(reference, cas)
     return cas, image, compressed
+
+
+def _fake_mksquashfs(tmp_path: Path, *, behavior: str = "ok") -> tuple[Path, str]:
+    packer = tmp_path / f"fake-mksquashfs-{behavior}"
+    packer.write_text(
+        f"""#!{sys.executable}
+import hashlib
+import pathlib
+import struct
+import sys
+import time
+
+BEHAVIOR = {behavior!r}
+if sys.argv[1:] == ["-version"]:
+    print("mksquashfs version 4.7.5 (fixture)")
+    raise SystemExit(0)
+if BEHAVIOR == "exit":
+    raise SystemExit(23)
+if BEHAVIOR == "sleep":
+    time.sleep(30)
+if BEHAVIOR == "missing":
+    raise SystemExit(0)
+payload = sys.stdin.buffer.read()
+expected = [
+    "-", "layer.squashfs", "-tar", "-noappend", "-xattrs", "-mkfs-time", "0", "-processors", "1", "-no-progress",
+    "-root-mode", "755", "-root-uid", "0", "-root-gid", "0", "-root-time", "0",
+]
+if sys.argv[1:] != expected:
+    raise SystemExit(24)
+if BEHAVIOR == "bad":
+    pathlib.Path("layer.squashfs").write_bytes(b"not-squashfs")
+    raise SystemExit(0)
+tail = hashlib.sha256(payload).digest() + hashlib.sha256("\\0".join(sys.argv[3:]).encode()).digest()
+image_size = 96 + len(tail)
+superblock = struct.pack(
+    "<5I6H8Q",
+    0x73717368, 1, 0, 131072, 0,
+    1, 17, 0, 1, 4, 0,
+    0, image_size,
+    144, 2**64 - 1, 96, 112, 2**64 - 1, 2**64 - 1,
+)
+pathlib.Path("layer.squashfs").write_bytes(superblock + tail)
+""",
+        encoding="utf-8",
+    )
+    packer.chmod(0o700)
+    return packer, hashlib.sha256(packer.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -344,6 +403,343 @@ def test_pr2_base_fixture_binary_capability_stages_through_the_production_parser
         reference = staged.changeset.by_path()["cap_file.txt"].payload
         with staged.lease_regular_payload(reference) as payload_lease:
             assert b"".join(payload_lease.chunks()) == b"file with capability"
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_digest"),
+    [
+        ("base_layer.tar", "sha256:4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6"),
+        ("leaf_layer.tar", "sha256:85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79"),
+    ],
+)
+def test_staged_emitter_matches_the_exact_pr2_normalized_tar(
+    tmp_path: Path,
+    fixture_name: str,
+    expected_digest: str,
+) -> None:
+    uncompressed = (Path(__file__).parent.parent / "fixtures" / "oci-root" / fixture_name).read_bytes()
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    output = io.BytesIO()
+
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
+        receipt = staged.emit_overlay_tar(output)
+
+    assert receipt.digest == expected_digest
+    assert receipt.size == len(output.getvalue())
+    assert receipt.entries > 0
+
+
+def test_payload_lease_supports_bounded_file_reads_without_mixing_consumers(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        reference = staged.changeset.by_path()["value"].payload
+        with staged.lease_regular_payload(reference) as payload_lease:
+            assert payload_lease.read(0) == b""
+            assert payload_lease.read(3) == b"pay"
+            with pytest.raises(LayerIntakeError, match="single-use"):
+                next(payload_lease.chunks())
+            assert payload_lease.read(1024) == b"load"
+            assert payload_lease.read(1) == b""
+
+
+def test_staged_emitter_enforces_its_output_limit_before_writing_past_it(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    output = io.BytesIO()
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pytest.raises(ArtifactValidationError, match="exceeds its byte limit"):
+            staged.emit_overlay_tar(output, max_bytes=1024)
+    assert len(output.getvalue()) <= 1024
+
+
+def test_staged_emitter_preserves_high_bit_capability_bytes(tmp_path: Path) -> None:
+    capability = b"\x01\0\0\x02\xff" + b"\0" * 15
+    member, payload = _file("capability", b"payload")
+    member.pax_headers = {"SCHILY.xattr.security.capability": capability.decode("utf-8", errors="surrogateescape")}
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    output = io.BytesIO()
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        assert (
+            dict(staged.changeset.by_path()["capability"].xattrs)["security.capability"].encode("latin-1") == capability
+        )
+        staged.emit_overlay_tar(output)
+
+    assert capability in output.getvalue()
+    assert b"\x01\0\0\x02\xc3\xbf" not in output.getvalue()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
+def test_staged_squashfs_packer_returns_a_path_free_verified_lease(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer, packer_digest = _fake_mksquashfs(tmp_path)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pack_staged_squashfs(
+            staged,
+            packer_path=packer,
+            expected_packer_sha256=packer_digest,
+        ) as packed:
+            rendered = repr(packed) + repr(packed.receipt)
+            assert os.fspath(tmp_path) not in rendered
+            assert not hasattr(packed, "path")
+            with pytest.raises(AttributeError):
+                packed.receipt = packed.receipt  # type: ignore[misc]
+            with pytest.raises(SquashFSPackError, match="cannot be copied"):
+                copy(packed)
+            with pytest.raises(SquashFSPackError, match="cannot be copied"):
+                deepcopy(packed)
+            with pytest.raises(TypeError, match="cannot be serialized"):
+                pickle.dumps(packed)
+            payload_bytes = b"".join(packed.chunks(17))
+            receipt = packed.receipt
+
+    assert receipt.policy_id == SQUASHFS_PACK_POLICY_ID
+    assert receipt.structural_verifier == SQUASHFS_STRUCTURAL_VERIFIER_ID
+    assert receipt.packer_version == "4.7.5"
+    assert receipt.packer_sha256 == packer_digest
+    assert receipt.image_digest == f"sha256:{hashlib.sha256(payload_bytes).hexdigest()}"
+    assert receipt.image_size == len(payload_bytes)
+    assert payload_bytes[96:128].hex() == receipt.normalized_tar_digest.removeprefix("sha256:")
+    expected_arguments = [
+        "-tar",
+        "-noappend",
+        "-xattrs",
+        "-mkfs-time",
+        "0",
+        "-processors",
+        "1",
+        "-no-progress",
+        "-root-mode",
+        "755",
+        "-root-uid",
+        "0",
+        "-root-gid",
+        "0",
+        "-root-time",
+        "0",
+    ]
+    assert payload_bytes[128:160] == hashlib.sha256("\0".join(expected_arguments).encode()).digest()
+
+
+def test_staged_root_arguments_preserve_nondefault_metadata_and_xattr_bytes(tmp_path: Path) -> None:
+    capability = b"\x01\0\0\x02\xff" + b"\0" * 15
+    root = tarfile.TarInfo(".")
+    root.type = tarfile.DIRTYPE
+    root.mode = 0o750
+    root.uid = 123
+    root.gid = 456
+    root.mtime = 7
+    root.pax_headers = {
+        "SCHILY.xattr.security.capability": capability.decode("utf-8", errors="surrogateescape"),
+        "SCHILY.xattr.user.note": "한글",
+    }
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(root, member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        assert oci_packer._root_arguments(staged) == [
+            "-root-mode",
+            "750",
+            "-root-uid",
+            "123",
+            "-root-gid",
+            "456",
+            "-root-time",
+            "7",
+            "-p",
+            "/ x security.capability=0sAQAAAv8AAAAAAAAAAAAAAAAAAAA=",
+            "-p",
+            "/ x user.note=0s7ZWc6riA",
+        ]
+        with pytest.raises(SquashFSPackError, match="root xattrs exceed"):
+            oci_packer._root_arguments(staged, SquashFSPackPolicy(max_root_xattr_bytes=1))
+
+
+def test_packed_lease_reports_close_failures() -> None:
+    class CloseFault:
+        def close(self) -> None:
+            raise OSError("injected close fault")
+
+    receipt = oci_packer.PackedSquashFSReceipt(
+        policy_id=SQUASHFS_PACK_POLICY_ID,
+        policy_fingerprint="sha256:" + "0" * 64,
+        source_ordinal=0,
+        source_diff_id="sha256:" + "1" * 64,
+        normalized_tar_digest="sha256:" + "2" * 64,
+        normalized_tar_size=10240,
+        entries=1,
+        packer_version="4.7.5",
+        packer_sha256="3" * 64,
+        image_digest="sha256:" + "4" * 64,
+        image_size=4096,
+        structural_verifier=SQUASHFS_STRUCTURAL_VERIFIER_ID,
+    )
+    lease = oci_packer.LeasedSquashFS(CloseFault(), receipt)  # type: ignore[arg-type]
+
+    failure = lease._close()
+
+    assert isinstance(failure, SquashFSPackError)
+    assert "oci-packed-cleanup" in str(failure)
+    assert "injected" not in str(failure)
+
+
+@pytest.mark.parametrize(
+    ("behavior", "failure"),
+    [
+        ("exit", "oci-packer-exit"),
+        ("missing", "oci-pack-output-open"),
+        ("bad", "oci-pack-output-size|oci-pack-superblock"),
+    ],
+)
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
+def test_staged_squashfs_packer_fails_closed_on_worker_output_faults(
+    tmp_path: Path,
+    behavior: str,
+    failure: str,
+) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer, packer_digest = _fake_mksquashfs(tmp_path, behavior=behavior)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pytest.raises(SquashFSPackError, match=failure):
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+            ):
+                pass
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
+def test_staged_squashfs_packer_kills_and_reaps_a_timed_out_worker(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer, packer_digest = _fake_mksquashfs(tmp_path, behavior="sleep")
+    policy = SquashFSPackPolicy(packer_timeout_seconds=0.05, terminate_grace_seconds=0.05)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pytest.raises(SquashFSPackError, match="oci-packer-timeout"):
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+                policy=policy,
+            ):
+                pass
+
+
+def test_packer_interruption_terminates_and_reaps_the_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptedProcess:
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            return 0
+
+    process = InterruptedProcess()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(oci_packer.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    with pytest.raises(KeyboardInterrupt):
+        oci_packer._run_pinned(
+            1,
+            ["-version"],
+            cwd_fd=2,
+            stdin=oci_packer.subprocess.DEVNULL,
+            timeout_seconds=1,
+            grace_seconds=1,
+        )
+
+    assert process.waits == 2
+    assert signals == [(process.pid, oci_packer.signal.SIGTERM)]
+
+
+def test_structural_verifier_rejects_missing_required_tables() -> None:
+    impossible = struct.pack(
+        "<5I6H8Q",
+        0x73717368,
+        1,
+        0,
+        131072,
+        0,
+        1,
+        17,
+        0,
+        1,
+        4,
+        0,
+        0,
+        96,
+        *([2**64 - 1] * 6),
+    )
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(impossible)
+        image.flush()
+        with pytest.raises(SquashFSPackError, match="required tables"):
+            oci_packer._verify_superblock(image.fileno(), len(impossible), len(impossible))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
+def test_staged_squashfs_lease_requires_verified_eof(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer, packer_digest = _fake_mksquashfs(tmp_path)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pytest.raises(SquashFSPackError, match="oci-packed-incomplete"):
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+            ) as packed:
+                next(packed.chunks(1))
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("mksquashfs") is None,
+    reason="Linux mksquashfs is not installed",
+)
+def test_real_staged_squashfs_build_is_byte_deterministic(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer = Path(shutil.which("mksquashfs") or "")
+    packer_digest = hashlib.sha256(packer.read_bytes()).hexdigest()
+    built: list[tuple[bytes, object]] = []
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        for _ in range(2):
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+            ) as packed:
+                built.append((b"".join(packed.chunks()), packed.receipt))
+
+    assert built[0] == built[1]
 
 
 def test_large_pax_integer_is_range_checked_before_python_int_conversion(tmp_path: Path) -> None:

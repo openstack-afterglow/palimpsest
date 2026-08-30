@@ -27,6 +27,16 @@ from palimpsest_local.oci_convert import (
     to_base36,
     translate_oci_tar_to_overlay_tar,
 )
+from palimpsest_local.oci_converter import stage_layer
+from palimpsest_local.oci_image import OCIImageRef
+from palimpsest_local.oci_packer import PackedSquashFSReceipt, pack_staged_squashfs
+from palimpsest_local.oci_provenance import (
+    OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OCI_LAYER_MEDIA_TYPE,
+    Descriptor,
+)
+from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "oci-root"
 
@@ -34,6 +44,76 @@ _TRANSLATED_FIXTURE_SHA256 = {
     "base_layer.tar": "4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6",
     "leaf_layer.tar": "85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79",
 }
+
+
+def _descriptor(payload: bytes, media_type: str) -> Descriptor:
+    return Descriptor(
+        media_type=media_type,
+        digest=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        size=len(payload),
+    )
+
+
+def _pack_staged_fixture(
+    root: Path,
+    payload: bytes,
+    *,
+    packer: Path,
+    packer_sha256: str,
+) -> tuple[str, PackedSquashFSReceipt]:
+    layout = root / "layout"
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}', encoding="utf-8")
+    layer = _descriptor(payload, OCI_LAYER_MEDIA_TYPE)
+    (blobs / layer.digest.removeprefix("sha256:")).write_bytes(payload)
+
+    def add_json(value: object, media_type: str) -> Descriptor:
+        encoded = json.dumps(value, separators=(",", ":")).encode()
+        descriptor = _descriptor(encoded, media_type)
+        (blobs / descriptor.digest.removeprefix("sha256:")).write_bytes(encoded)
+        return descriptor
+
+    diff_id = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    config = add_json(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+        },
+        OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    )
+    manifest = add_json(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": config.to_dict(),
+            "layers": [layer.to_dict()],
+        },
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    )
+    (layout / "index.json").write_text(
+        json.dumps({"schemaVersion": 2, "manifests": [manifest.to_dict()]}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    cas = SourceCAS(root / "cas")
+    reference = OCIImageRef(
+        registry="registry.example.com",
+        repository="fixture/oci-root",
+        requested_reference="registry.example.com/fixture/oci-root:latest",
+    )
+    image = LocalLayoutSource.parse(f"oci-layout://{layout}@{manifest.digest}").snapshot(reference, cas)
+    image_digest = hashlib.sha256()
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pack_staged_squashfs(
+            staged,
+            packer_path=packer,
+            expected_packer_sha256=packer_sha256,
+        ) as packed:
+            receipt = packed.receipt
+            for chunk in packed.chunks():
+                image_digest.update(chunk)
+    return image_digest.hexdigest(), receipt
 
 
 def test_non_linux_rejection_before_subprocess():
@@ -229,12 +309,12 @@ def test_translated_fixture_bytes_remain_exact(fixture_name: str):
 
 
 @pytest.mark.oci_fs
-def test_layer_filesystem_semantics():
+def test_layer_filesystem_semantics(tmp_path: Path):
     """Prove the selected candidate on privileged Linux without fallback."""
     candidate = SELECTED_OCI_LAYER_FILESYSTEM
     required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
     try:
-        preflight_oci_filesystem_probe(candidate)
+        prerequisites = preflight_oci_filesystem_probe(candidate)
     except UnsupportedPlatformError as exc:
         reason = f"{candidate.value} OCI filesystem proof unavailable: {exc}"
         if required:
@@ -258,6 +338,22 @@ def test_layer_filesystem_semantics():
     assert evidence.fixture_digest.startswith("sha256:")
     assert len(evidence.base_image_sha256) == 64
     assert len(evidence.leaf_image_sha256) == 64
+    staged_base_digest, staged_base = _pack_staged_fixture(
+        tmp_path / "staged-base",
+        base_tar,
+        packer=Path(prerequisites.packer),
+        packer_sha256=prerequisites.packer_sha256,
+    )
+    staged_leaf_digest, staged_leaf = _pack_staged_fixture(
+        tmp_path / "staged-leaf",
+        leaf_tar,
+        packer=Path(prerequisites.packer),
+        packer_sha256=prerequisites.packer_sha256,
+    )
+    assert staged_base.normalized_tar_digest == f"sha256:{_TRANSLATED_FIXTURE_SHA256['base_layer.tar']}"
+    assert staged_leaf.normalized_tar_digest == f"sha256:{_TRANSLATED_FIXTURE_SHA256['leaf_layer.tar']}"
+    assert staged_base_digest == evidence.base_image_sha256
+    assert staged_leaf_digest == evidence.leaf_image_sha256
     evidence_dir = os.environ.get("PALIMPSEST_OCI_FS_EVIDENCE_DIR")
     if evidence_dir:
         output_dir = Path(evidence_dir)

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any
 
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_changeset import ChangesetMember, EntryKind, normalize_changeset
+from .oci_tar_emitter import emit_normalized_overlay_tar
 
 _PACK_TIMEOUT_SECONDS = 120
 _MOUNT_TIMEOUT_SECONDS = 30
@@ -448,44 +450,12 @@ def translate_oci_tar_to_overlay_tar(
 
     normalized = normalize_changeset(tuple(physical_members))
 
-    # Emit output tar
     out_buf = io.BytesIO()
-    with tarfile.open(fileobj=out_buf, mode="w", format=tarfile.PAX_FORMAT) as out_tar:
-        tar_types = {
-            EntryKind.FILE: tarfile.REGTYPE,
-            EntryKind.DIRECTORY: tarfile.DIRTYPE,
-            EntryKind.HARDLINK: tarfile.LNKTYPE,
-            EntryKind.SYMLINK: tarfile.SYMTYPE,
-            EntryKind.CHAR: tarfile.CHRTYPE,
-            EntryKind.BLOCK: tarfile.BLKTYPE,
-            EntryKind.FIFO: tarfile.FIFOTYPE,
-            EntryKind.WHITEOUT: tarfile.CHRTYPE,
-        }
-        for entry in normalized.entries:
-            new_info = tarfile.TarInfo(name=entry.path)
-            new_info.type = tar_types[entry.kind]
-            new_info.mode = entry.mode
-            new_info.uid = entry.uid
-            new_info.gid = entry.gid
-            new_info.size = entry.size
-            new_info.mtime = entry.mtime
-            new_info.linkname = entry.link_target
-            new_info.devmajor = entry.device_major
-            new_info.devminor = entry.device_minor
-            if entry.kind is EntryKind.WHITEOUT:
-                out_tar.addfile(new_info)
-                continue
-            new_info.uname = str(entry.uid)
-            new_info.gname = str(entry.gid)
-            pax_headers = {f"SCHILY.xattr.{key}": value for key, value in entry.xattrs}
-            pax_headers.setdefault("uid", str(entry.uid))
-            pax_headers.setdefault("gid", str(entry.gid))
-            new_info.pax_headers = pax_headers
-
-            if entry.kind is EntryKind.FILE and entry.payload is not None:
-                out_tar.addfile(new_info, io.BytesIO(entry.payload))
-            else:
-                out_tar.addfile(new_info)
+    emit_normalized_overlay_tar(
+        normalized,
+        out_buf,
+        lambda payload: nullcontext(io.BytesIO(payload)),
+    )
 
     return out_buf.getvalue()
 
@@ -519,9 +489,9 @@ def _squashfs_root_arguments(translated_tar: bytes) -> list[str]:
             continue
         name = key.removeprefix("SCHILY.xattr.")
         try:
-            raw_value = value.encode("latin-1")
+            raw_value = value.encode("utf-8", errors="surrogateescape")
         except UnicodeEncodeError as exc:
-            raise ArtifactValidationError("OCI root xattr is not byte-preserving Latin-1 metadata") from exc
+            raise ArtifactValidationError("OCI root xattr is not byte-preserving metadata") from exc
         encoded = base64.b64encode(raw_value).decode("ascii")
         arguments.extend(("-p", f"/ x {name}=0s{encoded}"))
     return arguments

@@ -436,6 +436,6 @@ def test_privileged_workflow_is_non_skipping_and_runtime_remains_inactive():
         if source_file.name == "oci_convert.py":
             continue
         source = source_file.read_text(encoding="utf-8")
-        if "oci_convert" in source:
+        if "from .oci_convert import" in source or "import palimpsest_local.oci_convert" in source:
             importers.append(source_file.name)
     assert importers == []

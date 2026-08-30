@@ -37,6 +37,7 @@ from .oci_provenance import (
     OCI_LAYER_MEDIA_TYPE,
 )
 from .oci_source import LeasedSourceLayer
+from .oci_tar_emitter import TarEmissionReceipt, emit_normalized_overlay_tar
 
 _BLOCK = 512
 _ZERO_BLOCK = b"\0" * _BLOCK
@@ -614,6 +615,7 @@ class StagedPayloadLease:
         "_owner_thread",
         "_parent",
         "_position",
+        "_reader",
         "_started",
         "_token",
     )
@@ -633,9 +635,11 @@ class StagedPayloadLease:
         self._owner_thread = threading.get_ident()
         self._hasher = hashlib.sha256()
         self._position = 0
+        self._reader: str | None = None
         self._started = False
         self._complete = False
         self._closed = False
+        self._finish_if_complete()
 
     @property
     def size(self) -> int:
@@ -662,6 +666,7 @@ class StagedPayloadLease:
         if self._started:
             raise LayerIntakeError("oci-payload-consumed", "payload lease stream is single-use")
         self._started = True
+        self._reader = "chunks"
         while self._position < self._binding.size:
             payload = self._parent._read_payload(
                 self._binding,
@@ -672,7 +677,39 @@ class StagedPayloadLease:
             )
             self._position += len(payload)
             self._hasher.update(payload)
+            self._finish_if_complete()
             yield payload
+        self._finish_if_complete()
+
+    def read(self, size: int = -1) -> bytes:
+        """Read one bounded chunk for streaming tarfile consumers."""
+        self._assert_owner()
+        if type(size) is not int or not 0 <= size <= _IO_CHUNK:
+            raise LayerIntakeError("oci-payload-read", "payload read size is out of range")
+        if self._reader == "chunks":
+            raise LayerIntakeError("oci-payload-consumed", "payload lease stream is single-use")
+        if self._reader is None:
+            self._reader = "read"
+            self._started = True
+        if size == 0 or self._position == self._binding.size:
+            self._finish_if_complete()
+            return b""
+        requested = min(size, self._binding.size - self._position)
+        payload = self._parent._read_payload(
+            self._binding,
+            self._position,
+            requested,
+            self._generation,
+            self._token,
+        )
+        self._position += len(payload)
+        self._hasher.update(payload)
+        self._finish_if_complete()
+        return payload
+
+    def _finish_if_complete(self) -> None:
+        if self._complete or self._position != self._binding.size:
+            return
         actual_digest = f"sha256:{self._hasher.hexdigest()}"
         if actual_digest != self._binding.digest:
             raise LayerIntakeError("oci-payload-digest", "regular payload digest changed after staging")
@@ -765,6 +802,16 @@ class StagedLayer:
     @property
     def changeset(self) -> NormalizedChangeset[RegularPayloadRef]:
         return self._normalized
+
+    def emit_overlay_tar(self, sink: BinaryIO, *, max_bytes: int | None = None) -> TarEmissionReceipt:
+        """Stream the normalized OverlayFS tar through occurrence-bound leases."""
+        self._assert_owner()
+        return emit_normalized_overlay_tar(
+            self._normalized,
+            sink,
+            self.lease_regular_payload,
+            max_bytes=max_bytes,
+        )
 
     def _assert_owner(self) -> None:
         if os.getpid() != self._owner_pid:
