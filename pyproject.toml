@@ -24,6 +24,7 @@ packages = ["src/palimpsest_local"]
 
 [tool.pytest.ini_options]
 markers = [
+    "buildkit_e2e: requires Docker Buildx and a running docker-container builder",
     "kvm: requires a Linux host with KVM, libvirt, and guest fixtures",
     "oci_fs: requires Linux root and filesystem tools for privileged OverlayFS testing",
 ]

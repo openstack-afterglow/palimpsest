@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import threading
@@ -31,7 +32,7 @@ from palimpsest_local.buildkit import (
     validate_online_dockerfile,
 )
 from palimpsest_local.digest import digest_file
-from palimpsest_local.errors import HubError, PalimpsestError, StateError
+from palimpsest_local.errors import DigestMismatchError, HubError, PalimpsestError, StateError
 from palimpsest_local.hub import KIND_BUILDKIT_CACHE, MEDIA_TYPE_BUILDKIT_CACHE
 from palimpsest_local.oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from palimpsest_local.state import StatePaths, init_roots, read_tag_record
@@ -117,6 +118,31 @@ def _add_oci_descriptor(layout: Path, payload: bytes, *, config: bytes = b"{}") 
     return _add_oci_blob(layout, manifest)
 
 
+def _oci_descriptor(layout: Path, digest: str, media_type: str, **extensions: object) -> dict[str, object]:
+    descriptor: dict[str, object] = {
+        "mediaType": media_type,
+        "digest": digest,
+        "size": (layout / "blobs" / "sha256" / digest.split(":", 1)[1]).stat().st_size,
+    }
+    descriptor.update(extensions)
+    return descriptor
+
+
+def _add_oci_index(layout: Path, manifests: list[dict[str, object]]) -> str:
+    return _add_oci_blob(
+        layout,
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": manifests,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+    )
+
+
 def _spec(
     tmp_path: Path,
     dockerfile_text: str = "FROM scratch\nCOPY app.txt /app.txt\n",
@@ -170,6 +196,256 @@ def test_build_key_includes_pinned_named_oci_context_digest(tmp_path: Path):
     spec = _spec(tmp_path, "FROM base\n", local_images=(first,), offline=True, network="none")
 
     assert compute_build_key(spec) != compute_build_key(replace(spec, local_images=(second,)))
+
+
+def test_named_oci_context_accepts_direct_and_index_pins_after_shared_verifier_extraction(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"opaque layer bytes")
+    direct = NamedOCIContext.parse(f"direct={layout}@{manifest_digest}")
+    index_digest = _add_oci_index(
+        layout,
+        [
+            _oci_descriptor(
+                layout,
+                manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                annotations={"example.invalid/retained": "yes"},
+                platform={"os": "linux", "architecture": "amd64"},
+                urls=["https://example.invalid/unused"],
+            )
+        ],
+    )
+    indexed = NamedOCIContext.parse(f"indexed={layout}@{index_digest}")
+
+    assert direct.manifest_digest == manifest_digest
+    assert indexed.manifest_digest == index_digest
+    assert direct.buildx_value == f"oci-layout://{layout}@{manifest_digest}"
+    assert indexed.buildx_value == f"oci-layout://{layout}@{index_digest}"
+
+
+def test_named_oci_context_remains_platform_agnostic_for_buildkit(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "arm-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"arm64 opaque layer")
+    index_digest = _add_oci_index(
+        layout,
+        [
+            _oci_descriptor(
+                layout,
+                manifest_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                platform={"os": "linux", "architecture": "arm64", "variant": "v8"},
+            )
+        ],
+    )
+    local = NamedOCIContext.parse(f"base={layout}@{index_digest}")
+    spec = _spec(
+        tmp_path,
+        "FROM base\n",
+        local_images=(local,),
+        platform="linux/arm64/v8",
+        offline=True,
+        network="none",
+    )
+    argv = build_buildx_command(
+        spec,
+        cache_from=tmp_path / "cache-in",
+        cache_to=tmp_path / "cache-out",
+        metadata_file=tmp_path / "metadata.json",
+    )
+
+    assert argv[argv.index("--platform") + 1] == "linux/arm64/v8"
+    assert argv[argv.index("--build-context") + 1] == f"base={local.buildx_value}"
+
+
+def test_named_oci_context_verifies_every_reachable_index_branch_before_solve(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "multi-platform-layout")
+    selected_digest = _add_oci_descriptor(layout, b"selected layer")
+    unsafe_config = json.dumps({"config": {"OnBuild": ["RUN false"]}}).encode()
+    unsafe_digest = _add_oci_descriptor(layout, b"nonselected layer", config=unsafe_config)
+    index_digest = _add_oci_index(
+        layout,
+        [
+            _oci_descriptor(
+                layout,
+                selected_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                platform={"os": "linux", "architecture": "amd64"},
+            ),
+            _oci_descriptor(
+                layout,
+                unsafe_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                platform={"os": "linux", "architecture": "arm64"},
+            ),
+        ],
+    )
+
+    with pytest.raises(PalimpsestError, match="OnBuild triggers"):
+        NamedOCIContext.parse(f"base={layout}@{index_digest}")
+
+
+def test_named_oci_context_recurses_nested_indexes_and_rejects_deep_onbuild(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "nested-layout")
+    config = json.dumps({"config": {"OnBuild": ["RUN false"]}}).encode()
+    manifest_digest = _add_oci_descriptor(layout, b"deep layer", config=config)
+    nested_digest = _add_oci_index(
+        layout,
+        [_oci_descriptor(layout, manifest_digest, "application/vnd.oci.image.manifest.v1+json")],
+    )
+    root_digest = _add_oci_index(
+        layout,
+        [_oci_descriptor(layout, nested_digest, "application/vnd.oci.image.index.v1+json")],
+    )
+
+    with pytest.raises(PalimpsestError, match="OnBuild triggers"):
+        NamedOCIContext.parse(f"base={layout}@{root_digest}")
+
+
+@pytest.mark.parametrize("onbuild", ["RUN false", {"command": "RUN false"}, 1, True])
+def test_named_oci_context_rejects_malformed_onbuild(tmp_path: Path, onbuild: object):
+    layout = _write_minimal_oci_layout(tmp_path / "malformed-onbuild")
+    config = json.dumps({"config": {"OnBuild": onbuild}}).encode()
+    manifest_digest = _add_oci_descriptor(layout, b"layer", config=config)
+
+    with pytest.raises(PalimpsestError, match="malformed OnBuild"):
+        NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+
+
+def test_named_oci_context_keeps_empty_layer_and_docker_v2_buildkit_contract(tmp_path: Path):
+    empty_layout = _write_minimal_oci_layout(tmp_path / "empty-layout")
+    empty_config = b"{}"
+    empty_config_digest = _add_oci_blob(empty_layout, empty_config)
+    empty_manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "config": {"digest": empty_config_digest, "size": len(empty_config)},
+            "layers": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    empty_manifest_digest = _add_oci_blob(empty_layout, empty_manifest)
+    NamedOCIContext.parse(f"empty={empty_layout}@{empty_manifest_digest}")
+
+    docker_layout = _write_minimal_oci_layout(tmp_path / "docker-layout")
+    docker_manifest_digest = _add_oci_descriptor(docker_layout, b"docker layer")
+    docker_manifest_path = docker_layout / "blobs" / "sha256" / docker_manifest_digest.split(":", 1)[1]
+    docker_manifest = json.loads(docker_manifest_path.read_text(encoding="utf-8"))
+    docker_manifest["mediaType"] = "application/vnd.docker.distribution.manifest.v2+json"
+    docker_manifest["config"]["mediaType"] = "application/vnd.docker.container.image.v1+json"
+    docker_manifest["layers"][0]["mediaType"] = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+    docker_manifest_digest = _add_oci_blob(
+        docker_layout,
+        json.dumps(docker_manifest, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    NamedOCIContext.parse(f"docker={docker_layout}@{docker_manifest_digest}")
+
+
+def test_named_oci_context_rejects_same_size_digest_corruption_before_solve(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"layer payload")
+    manifest_path = layout / "blobs" / "sha256" / manifest_digest.split(":", 1)[1]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layer_digest = manifest["layers"][0]["digest"]
+    layer_path = layout / "blobs" / "sha256" / layer_digest.split(":", 1)[1]
+    layer_path.write_bytes(b"other payload")
+    assert layer_path.stat().st_size == manifest["layers"][0]["size"]
+
+    with pytest.raises(DigestMismatchError, match="digest mismatch"):
+        NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+
+
+def test_named_oci_context_rejects_missing_transitive_blob_before_solve(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"layer payload")
+    manifest_path = layout / "blobs" / "sha256" / manifest_digest.split(":", 1)[1]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layer_digest = manifest["layers"][0]["digest"]
+    (layout / "blobs" / "sha256" / layer_digest.split(":", 1)[1]).unlink()
+
+    with pytest.raises(PalimpsestError, match="missing referenced blob"):
+        NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+
+
+def test_named_oci_context_rejects_bool_descriptor_size(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    config = b"{}"
+    config_digest = _add_oci_blob(layout, config)
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "config": {"digest": config_digest, "size": True},
+            "layers": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    manifest_digest = _add_oci_blob(layout, manifest)
+
+    with pytest.raises(PalimpsestError, match="digest and nonnegative size"):
+        NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+
+
+def test_named_oci_context_hashes_each_repeated_blob_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    layer = b"repeated layer"
+    layer_digest = _add_oci_blob(layout, layer)
+    config = b"{}"
+    config_digest = _add_oci_blob(layout, config)
+    layer_descriptor = {
+        "digest": layer_digest,
+        "size": len(layer),
+        "mediaType": "application/vnd.oci.image.layer.v1.tar",
+    }
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "config": {"digest": config_digest, "size": len(config)},
+            "layers": [layer_descriptor, layer_descriptor],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    manifest_digest = _add_oci_blob(layout, manifest)
+    original = buildkit.verify_blob_chunks
+    calls: list[str] = []
+
+    def counting_verifier(*, expected_digest: str, expected_size: int, chunks) -> None:
+        calls.append(expected_digest)
+        original(expected_digest=expected_digest, expected_size=expected_size, chunks=chunks)
+
+    monkeypatch.setattr(buildkit, "verify_blob_chunks", counting_verifier)
+    NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+
+    assert calls.count(layer_digest) == 1
+
+
+def test_named_oci_context_path_is_transport_only_and_alias_order_is_deterministic(tmp_path: Path):
+    layout = _write_minimal_oci_layout(tmp_path / "first-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"layer")
+    relocated_layout = tmp_path / "relocated-layout"
+    shutil.copytree(layout, relocated_layout)
+    first = NamedOCIContext.parse(f"zbase={layout}@{manifest_digest}")
+    second = NamedOCIContext.parse(f"abase={layout}@{manifest_digest}")
+    relocated = NamedOCIContext.parse(f"zbase={relocated_layout}@{manifest_digest}")
+    spec = _spec(
+        tmp_path,
+        "FROM scratch\n",
+        local_images=(first, second),
+        offline=True,
+        network="none",
+    )
+
+    assert compute_build_key(spec) == compute_build_key(replace(spec, local_images=(second, first)))
+    assert compute_build_key(spec) == compute_build_key(replace(spec, local_images=(relocated, second)))
+    argv = build_buildx_command(
+        spec,
+        cache_from=tmp_path / "cache-in",
+        cache_to=tmp_path / "cache-out",
+        metadata_file=tmp_path / "metadata.json",
+    )
+    contexts = [argv[index + 1] for index, item in enumerate(argv) if item == "--build-context"]
+    assert contexts == [f"abase={second.buildx_value}", f"zbase={first.buildx_value}"]
 
 
 def test_destination_registry_and_export_controls_do_not_change_solve_key(tmp_path: Path):

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,17 +89,40 @@ def strict_json_object(payload: bytes, field_name: str) -> dict[str, Any]:
     return _strict_json(payload, field_name)
 
 
+def verify_blob_chunks(*, expected_digest: str, expected_size: int, chunks: Iterable[bytes]) -> None:
+    """Stream-verify one canonical OCI digest/size pair without retaining bytes."""
+    digest = _canonical_digest(expected_digest, "blob expected_digest")
+    if type(expected_size) is not int or not 0 <= expected_size <= 2**63 - 1:
+        raise ArtifactValidationError("blob expected_size must be an exact integer between 0 and 2**63-1")
+
+    hasher = hashlib.sha256()
+    total = 0
+    for chunk in chunks:
+        if not isinstance(chunk, bytes):
+            raise ArtifactValidationError("blob chunks must contain immutable bytes")
+        if not chunk:
+            raise ArtifactValidationError("blob chunks must be nonempty")
+        total += len(chunk)
+        if total > expected_size:
+            raise ArtifactValidationError(f"OCI descriptor size mismatch for {digest}")
+        hasher.update(chunk)
+    if total != expected_size:
+        raise ArtifactValidationError(f"OCI descriptor size mismatch for {digest}")
+    if f"sha256:{hasher.hexdigest()}" != digest:
+        raise ArtifactValidationError(f"OCI descriptor digest mismatch for {digest}")
+
+
 def verify_descriptor_bytes(descriptor: Descriptor, payload: bytes) -> bytes:
     """Verify that *payload* is exactly the content named by *descriptor*."""
     if not isinstance(descriptor, Descriptor):
         raise ArtifactValidationError("blob descriptor must be a Descriptor")
     if not isinstance(payload, bytes):
         raise ArtifactValidationError("blob reader must return immutable bytes")
-    if len(payload) != descriptor.size:
-        raise ArtifactValidationError(f"OCI descriptor size mismatch for {descriptor.digest}")
-    actual = f"sha256:{hashlib.sha256(payload).hexdigest()}"
-    if actual != descriptor.digest:
-        raise ArtifactValidationError(f"OCI descriptor digest mismatch for {descriptor.digest}")
+    verify_blob_chunks(
+        expected_digest=descriptor.digest,
+        expected_size=descriptor.size,
+        chunks=(payload,) if payload else (),
+    )
     return payload
 
 

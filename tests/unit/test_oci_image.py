@@ -15,6 +15,8 @@ from palimpsest_local.oci_image import (
     RESERVED_PATH_POLICY_ID,
     OCIImageRef,
     resolve_image,
+    verify_blob_chunks,
+    verify_descriptor_bytes,
 )
 from palimpsest_local.oci_provenance import (
     DOCKER_IMAGE_CONFIG_MEDIA_TYPE,
@@ -55,6 +57,58 @@ def ref() -> OCIImageRef:
         repository="team/app",
         requested_reference="registry.example.com/team/app:stable",
     )
+
+
+def test_streaming_blob_verifier_accepts_empty_and_multi_chunk_payloads() -> None:
+    verify_blob_chunks(
+        expected_digest="sha256:" + hashlib.sha256(b"").hexdigest(),
+        expected_size=0,
+        chunks=(),
+    )
+    payload = b"first-second-third"
+    verify_blob_chunks(
+        expected_digest="sha256:" + hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        chunks=(b"first-", b"second-", b"third"),
+    )
+    empty_descriptor = Descriptor(
+        media_type="application/octet-stream",
+        digest="sha256:" + hashlib.sha256(b"").hexdigest(),
+        size=0,
+    )
+    assert verify_descriptor_bytes(empty_descriptor, b"") == b""
+
+
+@pytest.mark.parametrize(
+    ("size", "chunks", "message"),
+    [
+        (3, (b"ab",), "size mismatch"),
+        (1, (b"ab",), "size mismatch"),
+        (True, (b"x",), "expected_size"),
+        (-1, (), "expected_size"),
+        (2**63, (), "expected_size"),
+        (1, (bytearray(b"x"),), "immutable bytes"),
+        (0, (b"",), "nonempty"),
+    ],
+)
+def test_streaming_blob_verifier_rejects_invalid_size_and_chunks(
+    size: object,
+    chunks: tuple[object, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ArtifactValidationError, match=message):
+        verify_blob_chunks(
+            expected_digest="sha256:" + hashlib.sha256(b"x").hexdigest(),
+            expected_size=size,  # type: ignore[arg-type]
+            chunks=chunks,  # type: ignore[arg-type]
+        )
+
+
+def test_streaming_blob_verifier_rejects_same_size_digest_mismatch_and_noncanonical_digest() -> None:
+    with pytest.raises(ArtifactValidationError, match="digest mismatch"):
+        verify_blob_chunks(expected_digest="sha256:" + "0" * 64, expected_size=4, chunks=(b"data",))
+    with pytest.raises(ArtifactValidationError, match="canonical"):
+        verify_blob_chunks(expected_digest="SHA256:" + "0" * 64, expected_size=0, chunks=())
 
 
 def image_graph(
