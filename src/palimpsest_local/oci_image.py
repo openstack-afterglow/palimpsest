@@ -84,6 +84,11 @@ def _strict_json(payload: bytes, field_name: str) -> dict[str, Any]:
     return value
 
 
+def strict_json_object(payload: bytes, field_name: str) -> dict[str, Any]:
+    """Parse one bounded caller-supplied object with the OCI JSON rules."""
+    return _strict_json(payload, field_name)
+
+
 def verify_descriptor_bytes(descriptor: Descriptor, payload: bytes) -> bytes:
     """Verify that *payload* is exactly the content named by *descriptor*."""
     if not isinstance(descriptor, Descriptor):
