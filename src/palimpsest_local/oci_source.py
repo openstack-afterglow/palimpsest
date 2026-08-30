@@ -16,6 +16,7 @@ import hashlib
 import os
 import stat
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -434,6 +435,170 @@ class _CASAuthority:
     signature: tuple[tuple[int, int, int, int], ...]
 
 
+class SourceLeaseError(ArtifactValidationError):
+    """A descriptor-pinned source-layer lease could not be verified."""
+
+
+class LeasedSourceLayer:
+    """One occurrence-bound, single-use stream from the private source CAS.
+
+    The capability intentionally exposes neither a path nor a raw file
+    descriptor.  Successful context exit requires that ``chunks()`` reached
+    EOF and verified the exact descriptor bytes from the pinned open file.
+    """
+
+    __slots__ = (
+        "_authority",
+        "_closed",
+        "_descriptor",
+        "_diff_id",
+        "_entry_name",
+        "_file_fd",
+        "_initial_metadata",
+        "_media_type",
+        "_ordinal",
+        "_owner_pid",
+        "_owner_thread",
+        "_started",
+        "_verified",
+    )
+
+    def __init__(
+        self,
+        *,
+        authority: _CASAuthority,
+        descriptor: Descriptor,
+        diff_id: str,
+        ordinal: int,
+        entry_name: str,
+        file_fd: int,
+        initial_metadata: os.stat_result,
+    ) -> None:
+        self._authority = authority
+        self._descriptor = descriptor
+        self._entry_name = entry_name
+        self._file_fd = file_fd
+        self._initial_metadata = initial_metadata
+        self._owner_pid = os.getpid()
+        self._owner_thread = threading.get_ident()
+        self._started = False
+        self._verified = False
+        self._closed = False
+        self._ordinal = ordinal
+        self._media_type = descriptor.media_type
+        self._diff_id = diff_id
+
+    @property
+    def ordinal(self) -> int:
+        return self._ordinal
+
+    @property
+    def media_type(self) -> str:
+        return self._media_type
+
+    @property
+    def diff_id(self) -> str:
+        return self._diff_id
+
+    @property
+    def compressed_digest(self) -> str:
+        return self._descriptor.digest
+
+    @property
+    def compressed_size(self) -> int:
+        return self._descriptor.size
+
+    def _check_owner(self) -> None:
+        if os.getpid() != self._owner_pid:
+            if not self._closed:
+                self._closed = True
+                _close_noerror(self._file_fd)
+                self._file_fd = -1
+            raise SourceLeaseError("source layer lease cannot cross a process boundary")
+        if threading.get_ident() != self._owner_thread:
+            raise SourceLeaseError("source layer lease cannot cross a process or thread boundary")
+
+    def _check_readable(self) -> None:
+        self._check_owner()
+        if self._closed:
+            raise SourceLeaseError("source layer lease is closed")
+
+    def chunks(self, chunk_size: int = _READ_CHUNK) -> Iterator[bytes]:
+        """Yield descriptor bytes once and verify the pinned target at EOF."""
+        self._check_readable()
+        if type(chunk_size) is not int or not 1 <= chunk_size <= _READ_CHUNK:
+            raise SourceLeaseError("source layer lease chunk size is out of range")
+        if self._started:
+            raise SourceLeaseError("source layer lease stream is single-use")
+        self._started = True
+        hasher = hashlib.sha256()
+        total = 0
+        while True:
+            self._check_readable()
+            try:
+                chunk = os.read(self._file_fd, chunk_size)
+            except OSError:
+                raise SourceLeaseError("cannot read source layer lease") from None
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > self._descriptor.size:
+                raise SourceLeaseError("source layer lease exceeds its descriptor size")
+            hasher.update(chunk)
+            yield chunk
+        self._check_readable()
+        try:
+            opened_after = os.fstat(self._file_fd)
+            entry_after = os.stat(
+                self._entry_name,
+                dir_fd=self._authority.blobs_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise SourceLeaseError("source layer lease target changed") from None
+        if (
+            total != self._descriptor.size
+            or f"sha256:{hasher.hexdigest()}" != self._descriptor.digest
+            or _stable_metadata(self._initial_metadata) != _stable_metadata(opened_after)
+            or _stable_metadata(self._initial_metadata) != _stable_metadata(entry_after)
+        ):
+            raise SourceLeaseError("source layer lease failed descriptor verification")
+        self._verified = True
+
+    def close(self) -> None:
+        """Cooperatively revoke the capability; safe to call more than once."""
+        self._check_owner()
+        if not self._closed:
+            self._closed = True
+            _close_noerror(self._file_fd)
+            self._file_fd = -1
+
+    def _abort(self) -> None:
+        if not self._closed:
+            self._closed = True
+            _close_noerror(self._file_fd)
+            self._file_fd = -1
+
+    def __copy__(self) -> LeasedSourceLayer:
+        raise SourceLeaseError("source layer lease cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> LeasedSourceLayer:
+        raise SourceLeaseError("source layer lease cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("source layer lease cannot be serialized")
+
+    def __repr__(self) -> str:
+        state = "verified" if self._verified else "open"
+        if self._closed:
+            state = "closed"
+        return (
+            "LeasedSourceLayer("
+            f"ordinal={self.ordinal}, media_type={self.media_type!r}, "
+            f"compressed_digest={self.compressed_digest!r}, state={state!r})"
+        )
+
+
 class SourceCAS:
     """Owner-only CAS authority used to reopen verified source snapshots."""
 
@@ -802,6 +967,75 @@ class SourceCAS:
             if payload is None:
                 raise ArtifactValidationError(f"source-CAS blob is missing or corrupt: {snapshot.descriptor.digest}")
             return payload
+
+    @contextmanager
+    def lease_layer(
+        self,
+        image: SnapshottedOCIImage,
+        ordinal: int,
+    ) -> Iterator[LeasedSourceLayer]:
+        """Lease one exact image-layer occurrence from its pinned source blob.
+
+        A clean context exit is successful only after the consumer has drained
+        ``chunks()`` to EOF.  Body exceptions abort the lease without masking
+        the original exception.
+        """
+        if not isinstance(image, SnapshottedOCIImage) or image.cas_id != self._cas_id:
+            raise SourceLeaseError("snapshotted image belongs to a different source CAS")
+        if type(ordinal) is not int or not 0 <= ordinal < len(image.layers):
+            raise SourceLeaseError("source layer ordinal is out of range")
+        occurrence = image.image.layers[ordinal]
+        snapshot = image.layers[ordinal]
+        if occurrence.ordinal != ordinal or occurrence.compressed != snapshot.descriptor:
+            raise SourceLeaseError("source layer occurrence binding is inconsistent")
+
+        file_fd: int | None = None
+        lease: LeasedSourceLayer | None = None
+        with self._authority() as authority:
+            if authority.cas_id != snapshot.cas_id:
+                raise SourceLeaseError("source CAS authority changed")
+            entry_name = snapshot.descriptor.digest.split(":", 1)[1]
+            try:
+                entry = os.stat(entry_name, dir_fd=authority.blobs_fd, follow_symlinks=False)
+                file_fd = os.open(entry_name, _READ_FLAGS, dir_fd=authority.blobs_fd)
+                opened = os.fstat(file_fd)
+            except OSError:
+                _close_noerror(file_fd)
+                file_fd = None
+                raise SourceLeaseError("source layer lease target is missing or inaccessible") from None
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != _PRIVATE_BLOB_MODE
+                or opened.st_size != snapshot.descriptor.size
+                or _identity(entry) != _identity(opened)
+            ):
+                _close_noerror(file_fd)
+                file_fd = None
+                raise SourceLeaseError("source layer lease target is unsafe")
+            lease = LeasedSourceLayer(
+                authority=authority,
+                descriptor=snapshot.descriptor,
+                diff_id=occurrence.diff_id,
+                ordinal=ordinal,
+                entry_name=entry_name,
+                file_fd=file_fd,
+                initial_metadata=opened,
+            )
+            file_fd = None
+            try:
+                yield lease
+            except BaseException:
+                lease._abort()
+                raise
+            else:
+                if not lease._verified:
+                    raise SourceLeaseError("source layer lease was not consumed to verified EOF")
+            finally:
+                lease._abort()
+                _close_noerror(file_fd)
 
     def verify_image(self, snapshot: SnapshottedOCIImage) -> None:
         if not isinstance(snapshot, SnapshottedOCIImage) or snapshot.cas_id != self._cas_id:
