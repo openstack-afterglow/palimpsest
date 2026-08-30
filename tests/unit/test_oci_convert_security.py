@@ -51,6 +51,33 @@ def test_root_opaque_whiteout_is_explicitly_translated():
         assert root.pax_headers["SCHILY.xattr.trusted.overlay.opaque"] == "y"
 
 
+def test_later_whiteout_wins_over_an_earlier_opaque_directory_marker():
+    opaque = tarfile.TarInfo("d/.wh..wh..opq")
+    whiteout = tarfile.TarInfo(".wh.d")
+
+    translated = translate_oci_tar_to_overlay_tar(_tar(opaque, whiteout))
+
+    with tarfile.open(fileobj=io.BytesIO(translated), mode="r:*") as archive:
+        actual = archive.getmember("d")
+        assert actual.ischr()
+        assert "SCHILY.xattr.trusted.overlay.opaque" not in actual.pax_headers
+
+
+def test_later_directory_metadata_preserves_an_earlier_opaque_marker():
+    opaque = tarfile.TarInfo("d/.wh..wh..opq")
+    directory = tarfile.TarInfo("d")
+    directory.type = tarfile.DIRTYPE
+    directory.mode = 0o700
+
+    translated = translate_oci_tar_to_overlay_tar(_tar(opaque, directory))
+
+    with tarfile.open(fileobj=io.BytesIO(translated), mode="r:*") as archive:
+        actual = archive.getmember("d")
+        assert actual.isdir()
+        assert actual.mode == 0o700
+        assert actual.pax_headers["SCHILY.xattr.trusted.overlay.opaque"] == "y"
+
+
 def test_source_cannot_inject_overlay_control_xattr():
     member = tarfile.TarInfo("owned")
     member.type = tarfile.DIRTYPE

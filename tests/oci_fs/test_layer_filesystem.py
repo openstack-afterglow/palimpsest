@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,11 @@ from palimpsest_local.oci_convert import (
 )
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "oci-root"
+
+_TRANSLATED_FIXTURE_SHA256 = {
+    "base_layer.tar": "4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6",
+    "leaf_layer.tar": "85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79",
+}
 
 
 def test_non_linux_rejection_before_subprocess():
@@ -213,6 +219,13 @@ def test_tar_translation_leaf_fixture_structure():
         idx_target = names.index("forward_link_2.txt")
         idx_link = names.index("forward_link_1.txt")
         assert idx_target < idx_link, "forward_link_2.txt target must be emitted before forward_link_1.txt hardlink"
+
+
+@pytest.mark.parametrize("fixture_name", sorted(_TRANSLATED_FIXTURE_SHA256))
+def test_translated_fixture_bytes_remain_exact(fixture_name: str):
+    translated = translate_oci_tar_to_overlay_tar((FIXTURES_DIR / fixture_name).read_bytes())
+
+    assert hashlib.sha256(translated).hexdigest() == _TRANSLATED_FIXTURE_SHA256[fixture_name]
 
 
 @pytest.mark.oci_fs

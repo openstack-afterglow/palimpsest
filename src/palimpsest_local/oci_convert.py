@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ArtifactValidationError, UnsupportedPlatformError
+from .oci_changeset import ChangesetMember, EntryKind, normalize_changeset
 
 _PACK_TIMEOUT_SECONDS = 120
 _MOUNT_TIMEOUT_SECONDS = 30
@@ -261,55 +262,6 @@ def _validate_member_numeric_metadata(member: tarfile.TarInfo) -> None:
         raise ArtifactValidationError("OCI layer mtime metadata is not an exactly representable SquashFS timestamp")
 
 
-def _table_parent(path: str) -> str | None:
-    if path == ".":
-        return None
-    parent = os.path.dirname(path)
-    return parent or "."
-
-
-def _register_table_path(children: dict[str, set[str]], path: str) -> None:
-    parent = _table_parent(path)
-    if parent is not None:
-        children.setdefault(parent, set()).add(path)
-
-
-def _remove_table_subtree(
-    table: dict[str, dict],
-    children: dict[str, set[str]],
-    path: str,
-    *,
-    include_root: bool,
-) -> None:
-    """Remove a path subtree in time proportional to removed descendants."""
-    pending = list(children.get(path, ()))
-    while pending:
-        descendant = pending.pop()
-        pending.extend(children.pop(descendant, ()))
-        table.pop(descendant, None)
-        parent = _table_parent(descendant)
-        if parent is not None:
-            children.get(parent, set()).discard(descendant)
-    children.pop(path, None)
-    if include_root:
-        table.pop(path, None)
-        parent = _table_parent(path)
-        if parent is not None:
-            children.get(parent, set()).discard(path)
-
-
-def _validate_hardlink_graph(table: dict[str, dict]) -> None:
-    for path, item in table.items():
-        if item["is_whiteout"] or not item["member"].islnk():
-            continue
-        target = item["canonical_linkname"]
-        target_item = table.get(target)
-        if target_item is None or target_item["is_whiteout"] or not target_item["member"].isreg():
-            raise ArtifactValidationError("OCI hardlink target must be a same-layer regular file")
-        if target == path:
-            raise ArtifactValidationError("OCI hardlink cannot target itself")
-
-
 def _validate_uncompressed_tar_framing(payload: bytes) -> None:
     """Reject truncated, corrupt, compressed, or nonzero-trailed tar streams."""
     if payload.startswith((b"\x1f\x8b", b"\x28\xb5\x2f\xfd")):
@@ -367,9 +319,7 @@ def translate_oci_tar_to_overlay_tar(
         raise ArtifactValidationError("OCI layer exceeds the input-byte limit")
     _validate_uncompressed_tar_framing(in_tar_bytes)
     in_buf = io.BytesIO(in_tar_bytes)
-    opaque_dirs: set[str] = set()
-    table: dict[str, dict] = {}
-    children: dict[str, set[str]] = {}
+    physical_members: list[ChangesetMember[bytes]] = []
     member_count = 0
     total_regular_bytes = 0
 
@@ -398,7 +348,6 @@ def translate_oci_tar_to_overlay_tar(
             if not norm_name:
                 continue
             basename = os.path.basename(norm_name)
-            parent_dir = os.path.dirname(norm_name)
             _validate_member_numeric_metadata(member)
             if basename == ".wh..wh..opq" or basename.startswith(".wh."):
                 _validate_whiteout_marker(member)
@@ -446,196 +395,97 @@ def translate_oci_tar_to_overlay_tar(
                 raise ArtifactValidationError("OCI layer PAX metadata is not valid UTF-8") from exc
             if pax_size > limits.max_pax_bytes_per_member:
                 raise ArtifactValidationError("OCI layer PAX metadata exceeds the per-member limit")
-            if norm_name == ".":
-                if not member.isdir():
-                    raise ArtifactValidationError("OCI root archive member must be a directory")
-                root_pax_headers = dict(member.pax_headers or {})
-                _validate_pax_xattr_policy(root_pax_headers)
-                root_pax_headers = _canonical_output_pax_headers(root_pax_headers)
-                table["."] = {
-                    "is_whiteout": False,
-                    "name": ".",
-                    "member": member,
-                    "content": None,
-                    "pax_headers": root_pax_headers,
-                    "canonical_linkname": "",
-                }
-                _register_table_path(children, ".")
-                continue
-            if basename == ".wh..wh..opq":
-                opaque_dirs.add(parent_dir or ".")
-                continue
+            if norm_name == "." and not member.isdir():
+                raise ArtifactValidationError("OCI root archive member must be a directory")
 
-            if basename.startswith(".wh."):
-                target_name = basename[4:]
-                if not target_name or target_name in {".", ".."} or target_name.startswith(".wh."):
-                    raise ArtifactValidationError("Invalid OCI whiteout target")
-                target_path = _validate_tar_path(os.path.join(parent_dir, target_name) if parent_dir else target_name)
-
-                _remove_table_subtree(table, children, target_path, include_root=True)
-
-                table[target_path] = {
-                    "is_whiteout": True,
-                    "name": target_path,
-                    "mtime": member.mtime,
-                }
-                _register_table_path(children, target_path)
+            pax_headers = dict(member.pax_headers or {})
+            _validate_pax_xattr_policy(pax_headers)
+            canonical_pax = _canonical_output_pax_headers(pax_headers)
+            xattrs = tuple(sorted((key.removeprefix("SCHILY.xattr."), value) for key, value in canonical_pax.items()))
+            if member.isreg():
+                extracted = in_tar.extractfile(member)
+                if extracted is None:
+                    raise ArtifactValidationError("OCI regular file payload is unavailable")
+                try:
+                    content = extracted.read(member.size + 1)
+                except (tarfile.TarError, OSError) as exc:
+                    raise ArtifactValidationError("OCI regular file payload could not be read") from exc
+                if len(content) != member.size:
+                    raise ArtifactValidationError("OCI regular file payload size does not match metadata")
             else:
-                # If non-directory member replaces a directory, purge pending descendants
-                if not member.isdir():
-                    _remove_table_subtree(table, children, norm_name, include_root=False)
+                content = None
 
-                pax_headers = dict(member.pax_headers or {})
-                _validate_pax_xattr_policy(pax_headers)
-                pax_headers = _canonical_output_pax_headers(pax_headers)
-                if member.isreg():
-                    extracted = in_tar.extractfile(member)
-                    if extracted is None:
-                        raise ArtifactValidationError("OCI regular file payload is unavailable")
-                    try:
-                        content = extracted.read(member.size + 1)
-                    except (tarfile.TarError, OSError) as exc:
-                        raise ArtifactValidationError("OCI regular file payload could not be read") from exc
-                    if len(content) != member.size:
-                        raise ArtifactValidationError("OCI regular file payload size does not match metadata")
-                else:
-                    content = None
+            kind = next(
+                entry_kind
+                for predicate, entry_kind in (
+                    (member.isreg, EntryKind.FILE),
+                    (member.isdir, EntryKind.DIRECTORY),
+                    (member.islnk, EntryKind.HARDLINK),
+                    (member.issym, EntryKind.SYMLINK),
+                    (member.ischr, EntryKind.CHAR),
+                    (member.isblk, EntryKind.BLOCK),
+                    (member.isfifo, EntryKind.FIFO),
+                )
+                if predicate()
+            )
+            physical_members.append(
+                ChangesetMember(
+                    ordinal=len(physical_members),
+                    path=norm_name,
+                    kind=kind,
+                    size=member.size,
+                    mode=member.mode,
+                    uid=member.uid,
+                    gid=member.gid,
+                    mtime=int(member.mtime),
+                    link_target=_validate_tar_path(member.linkname) if member.islnk() else member.linkname,
+                    device_major=member.devmajor,
+                    device_minor=member.devminor,
+                    xattrs=xattrs,
+                    payload=content,
+                )
+            )
 
-                table[norm_name] = {
-                    "is_whiteout": False,
-                    "name": norm_name,
-                    "member": member,
-                    "content": content,
-                    "pax_headers": pax_headers,
-                    "canonical_linkname": _validate_tar_path(member.linkname) if member.islnk() else member.linkname,
-                }
-                _register_table_path(children, norm_name)
-
-                # Synthesize missing parent directories for file-to-directory transitions
-                curr = parent_dir
-                while curr and curr != ".":
-                    if curr not in table or table[curr].get("is_whiteout") or not table[curr]["member"].isdir():
-                        synth_info = tarfile.TarInfo(name=curr)
-                        synth_info.type = tarfile.DIRTYPE
-                        synth_info.mode = 0o755 | stat.S_IFDIR
-                        synth_info.uid = 0
-                        synth_info.gid = 0
-                        synth_info.mtime = member.mtime
-                        table[curr] = {
-                            "is_whiteout": False,
-                            "name": curr,
-                            "member": synth_info,
-                            "content": None,
-                            "pax_headers": {},
-                            "canonical_linkname": "",
-                        }
-                        _register_table_path(children, curr)
-                    curr = os.path.dirname(curr)
-
-    _validate_hardlink_graph(table)
-
-    if "." not in table:
-        root_info = tarfile.TarInfo(name=".")
-        root_info.type = tarfile.DIRTYPE
-        root_info.mode = 0o755 | stat.S_IFDIR
-        root_info.uid = 0
-        root_info.gid = 0
-        root_info.mtime = 0
-        table["."] = {
-            "is_whiteout": False,
-            "name": ".",
-            "member": root_info,
-            "content": None,
-            "pax_headers": {},
-            "canonical_linkname": "",
-        }
-        _register_table_path(children, ".")
-
-    # Ensure opaque dirs have directory entries in table with opaque PAX header
-    for opq_dir in opaque_dirs:
-        if opq_dir not in table or table[opq_dir].get("is_whiteout") or not table[opq_dir]["member"].isdir():
-            dir_info = tarfile.TarInfo(name=opq_dir)
-            dir_info.type = tarfile.DIRTYPE
-            dir_info.mode = 0o755 | stat.S_IFDIR
-            dir_info.uid = 0
-            dir_info.gid = 0
-            dir_info.mtime = 0
-            table[opq_dir] = {
-                "is_whiteout": False,
-                "name": opq_dir,
-                "member": dir_info,
-                "content": None,
-                "pax_headers": {"SCHILY.xattr.trusted.overlay.opaque": "y"},
-                "canonical_linkname": "",
-            }
-            _register_table_path(children, opq_dir)
-        else:
-            table[opq_dir]["pax_headers"]["SCHILY.xattr.trusted.overlay.opaque"] = "y"
-
-    # Order paths for emission: topological sort for hardlinks
-    sorted_paths = sorted(table.keys())
-    emitted_set: set[str] = set()
-    ordered_paths: list[str] = []
-
-    remaining = list(sorted_paths)
-    while remaining:
-        progress = False
-        next_remaining = []
-        for p in remaining:
-            item = table[p]
-            if not item["is_whiteout"] and item["member"].islnk():
-                target = _validate_tar_path(item["member"].linkname)
-                if target in table and target not in emitted_set:
-                    next_remaining.append(p)
-                    continue
-            ordered_paths.append(p)
-            emitted_set.add(p)
-            progress = True
-        if not progress:
-            ordered_paths.extend(next_remaining)
-            break
-        remaining = next_remaining
+    normalized = normalize_changeset(tuple(physical_members))
 
     # Emit output tar
     out_buf = io.BytesIO()
     with tarfile.open(fileobj=out_buf, mode="w", format=tarfile.PAX_FORMAT) as out_tar:
-        for p in ordered_paths:
-            item = table[p]
-            if item["is_whiteout"]:
-                wh_info = tarfile.TarInfo(name=p)
-                wh_info.type = tarfile.CHRTYPE
-                wh_info.mode = 0o600 | stat.S_IFCHR
-                wh_info.uid = 0
-                wh_info.gid = 0
-                wh_info.size = 0
-                wh_info.mtime = item["mtime"]
-                wh_info.devmajor = 0
-                wh_info.devminor = 0
-                out_tar.addfile(wh_info)
-            else:
-                orig_member = item["member"]
-                new_info = tarfile.TarInfo(name=p)
-                new_info.type = orig_member.type
-                new_info.mode = orig_member.mode
-                new_info.uid = orig_member.uid
-                new_info.gid = orig_member.gid
-                new_info.uname = str(orig_member.uid)
-                new_info.gname = str(orig_member.gid)
-                new_info.size = orig_member.size
-                new_info.mtime = orig_member.mtime
-                new_info.linkname = item["canonical_linkname"]
-                new_info.devmajor = orig_member.devmajor
-                new_info.devminor = orig_member.devminor
-                pax_headers = dict(item["pax_headers"])
-                pax_headers.setdefault("uid", str(orig_member.uid))
-                pax_headers.setdefault("gid", str(orig_member.gid))
-                if pax_headers:
-                    new_info.pax_headers = pax_headers
+        tar_types = {
+            EntryKind.FILE: tarfile.REGTYPE,
+            EntryKind.DIRECTORY: tarfile.DIRTYPE,
+            EntryKind.HARDLINK: tarfile.LNKTYPE,
+            EntryKind.SYMLINK: tarfile.SYMTYPE,
+            EntryKind.CHAR: tarfile.CHRTYPE,
+            EntryKind.BLOCK: tarfile.BLKTYPE,
+            EntryKind.FIFO: tarfile.FIFOTYPE,
+            EntryKind.WHITEOUT: tarfile.CHRTYPE,
+        }
+        for entry in normalized.entries:
+            new_info = tarfile.TarInfo(name=entry.path)
+            new_info.type = tar_types[entry.kind]
+            new_info.mode = entry.mode
+            new_info.uid = entry.uid
+            new_info.gid = entry.gid
+            new_info.size = entry.size
+            new_info.mtime = entry.mtime
+            new_info.linkname = entry.link_target
+            new_info.devmajor = entry.device_major
+            new_info.devminor = entry.device_minor
+            if entry.kind is EntryKind.WHITEOUT:
+                out_tar.addfile(new_info)
+                continue
+            new_info.uname = str(entry.uid)
+            new_info.gname = str(entry.gid)
+            pax_headers = {f"SCHILY.xattr.{key}": value for key, value in entry.xattrs}
+            pax_headers.setdefault("uid", str(entry.uid))
+            pax_headers.setdefault("gid", str(entry.gid))
+            new_info.pax_headers = pax_headers
 
-                if orig_member.isreg() and item["content"] is not None:
-                    out_tar.addfile(new_info, io.BytesIO(item["content"]))
-                else:
-                    out_tar.addfile(new_info)
+            if entry.kind is EntryKind.FILE and entry.payload is not None:
+                out_tar.addfile(new_info, io.BytesIO(entry.payload))
+            else:
+                out_tar.addfile(new_info)
 
     return out_buf.getvalue()
 

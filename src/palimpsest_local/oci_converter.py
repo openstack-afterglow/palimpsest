@@ -19,11 +19,18 @@ import time
 import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import BinaryIO
 
 from .errors import ArtifactValidationError
+from .oci_changeset import (
+    ChangesetMember,
+    ChangesetValidationError,
+    EntryKind,
+    NormalizedChangeset,
+    normalize_changeset,
+)
 from .oci_provenance import (
     DOCKER_LAYER_GZIP_MEDIA_TYPE,
     OCI_LAYER_GZIP_MEDIA_TYPE,
@@ -124,8 +131,9 @@ DEFAULT_LAYER_CONVERSION_LIMITS = LayerConversionLimits()
 
 @dataclass(frozen=True, slots=True)
 class PhysicalLayerMember:
-    """One validated physical member; archive normalization happens next slice."""
+    """One validated physical member in exact archive order."""
 
+    ordinal: int
     path: str
     kind: str
     size: int
@@ -137,6 +145,32 @@ class PhysicalLayerMember:
     device_major: int
     device_minor: int
     xattrs: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RegularPayloadBinding:
+    member_index: int
+    offset: int
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class RegularPayloadRef:
+    """Opaque identity for one normalized regular payload in the private spool."""
+
+    member_index: int
+    size: int
+    digest: str
+
+    def __copy__(self) -> RegularPayloadRef:
+        raise LayerIntakeError("oci-payload-copy", "regular payload reference cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> RegularPayloadRef:
+        raise LayerIntakeError("oci-payload-copy", "regular payload reference cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("regular payload reference cannot be serialized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +211,17 @@ def _read_exact_at(spool: BinaryIO, offset: int, size: int) -> bytes:
     if len(value) != size:
         raise LayerIntakeError("oci-tar-framing", "tar member is truncated")
     return value
+
+
+def _hash_payload_at(spool: BinaryIO, offset: int, size: int, deadline: _Deadline) -> str:
+    hasher = hashlib.sha256()
+    position = 0
+    while position < size:
+        deadline.check()
+        payload = _read_exact_at(spool, offset + position, min(_IO_CHUNK, size - position))
+        hasher.update(payload)
+        position += len(payload)
+    return f"sha256:{hasher.hexdigest()}"
 
 
 def _tar_number(field: bytes, label: str) -> int:
@@ -262,13 +307,21 @@ def _parse_pax(payload: bytes) -> dict[str, str]:
             raise LayerIntakeError("oci-pax-metadata", "PAX record framing is malformed")
         record = payload[space + 1 : end - 1]
         key_raw, separator, value_raw = record.partition(b"=")
-        if not separator or not key_raw or b"\0" in record:
+        if not separator or not key_raw or b"\0" in key_raw:
             raise LayerIntakeError("oci-pax-metadata", "PAX record is malformed")
         try:
             key = key_raw.decode("utf-8")
-            value = value_raw.decode("utf-8")
         except UnicodeDecodeError:
             raise LayerIntakeError("oci-tar-utf8", "PAX metadata is not valid UTF-8") from None
+        if key == "SCHILY.xattr.security.capability":
+            value = value_raw.decode("latin-1")
+        else:
+            if b"\0" in value_raw:
+                raise LayerIntakeError("oci-pax-metadata", "PAX record is malformed")
+            try:
+                value = value_raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise LayerIntakeError("oci-tar-utf8", "PAX metadata is not valid UTF-8") from None
         records[key] = value
         offset = end
     return records
@@ -300,7 +353,8 @@ def _xattrs(pax: dict[str, str], limits: LayerConversionLimits) -> tuple[tuple[t
             expected = {0x01000000: 12, 0x02000000: 20, 0x03000000: 24}.get(magic & 0xFF000000)
             if expected != len(raw_capability) or magic & 0x00FFFFFE:
                 raise LayerIntakeError("oci-xattr-policy", "capability metadata is invalid")
-        encoded_size = len(key.encode("utf-8")) + len(value.encode("utf-8"))
+        encoded_value = value.encode("latin-1") if name == "security.capability" else value.encode("utf-8")
+        encoded_size = len(key.encode("utf-8")) + len(encoded_value)
         total += encoded_size
         values.append((name, value))
     if total > limits.max_xattr_bytes_per_member:
@@ -313,7 +367,15 @@ def _scan_tar(
     size: int,
     limits: LayerConversionLimits,
     deadline: _Deadline,
-) -> tuple[tuple[PhysicalLayerMember, ...], int, int, int, int]:
+) -> tuple[
+    tuple[PhysicalLayerMember, ...],
+    tuple[_RegularPayloadBinding, ...],
+    NormalizedChangeset[int],
+    int,
+    int,
+    int,
+    int,
+]:
     if size < 2 * _BLOCK or size % _BLOCK:
         raise LayerIntakeError("oci-tar-framing", "tar size is not block aligned")
     offset = 0
@@ -322,6 +384,7 @@ def _scan_tar(
     regular_bytes = 0
     total_xattr_bytes = 0
     members: list[PhysicalLayerMember] = []
+    payload_bindings: list[_RegularPayloadBinding] = []
     global_pax: dict[str, str] = {}
     pending_pax: dict[str, str] | None = None
     pending_long_name: str | None = None
@@ -342,7 +405,37 @@ def _scan_tar(
                 trailing += len(chunk)
             if pending_pax is not None or pending_long_name is not None or pending_long_link is not None:
                 raise LayerIntakeError("oci-tar-metadata", "tar ends with unattached extension metadata")
-            return tuple(members), physical_headers, regular_bytes, total_xattr_bytes, metadata_bytes
+            common_members = tuple(
+                ChangesetMember(
+                    ordinal=member.ordinal,
+                    path=member.path,
+                    kind=EntryKind(member.kind),
+                    size=member.size,
+                    mode=member.mode,
+                    uid=member.uid,
+                    gid=member.gid,
+                    mtime=member.mtime,
+                    link_target=member.link_target,
+                    device_major=member.device_major,
+                    device_minor=member.device_minor,
+                    xattrs=member.xattrs,
+                    payload=member.ordinal if member.kind == EntryKind.FILE else None,
+                )
+                for member in members
+            )
+            try:
+                normalized = normalize_changeset(common_members)
+            except ChangesetValidationError as exc:
+                raise LayerIntakeError(exc.code, str(exc).partition(": ")[2]) from None
+            return (
+                tuple(members),
+                tuple(payload_bindings),
+                normalized,
+                physical_headers,
+                regular_bytes,
+                total_xattr_bytes,
+                metadata_bytes,
+            )
 
         physical_headers += 1
         if physical_headers > limits.max_physical_headers:
@@ -420,7 +513,7 @@ def _scan_tar(
         parent = os.path.dirname(normalized)
         if basename.startswith(".wh.") and basename != ".wh..wh..opq":
             target_name = basename.removeprefix(".wh.")
-            if target_name in {"", ".", ".."}:
+            if target_name in {"", ".", ".."} or target_name.startswith(".wh."):
                 raise LayerIntakeError("oci-whiteout", "whiteout target name is invalid")
             target = os.path.join(parent, target_name) if parent else target_name
             _validate_path(target, limits.max_path_bytes)
@@ -481,6 +574,7 @@ def _scan_tar(
             raise LayerIntakeError("oci-xattr-limit", "layer xattrs exceed the byte limit")
         members.append(
             PhysicalLayerMember(
+                ordinal=len(members),
                 path=normalized,
                 kind=kind,
                 size=member_size,
@@ -494,8 +588,113 @@ def _scan_tar(
                 xattrs=member_xattrs,
             )
         )
+        if kind == "file":
+            payload_bindings.append(
+                _RegularPayloadBinding(
+                    member_index=len(members) - 1,
+                    offset=data_offset,
+                    size=member_size,
+                    digest=_hash_payload_at(spool, data_offset, member_size, deadline),
+                )
+            )
         offset = next_offset
     raise LayerIntakeError("oci-tar-trailer", "tar end marker is missing")
+
+
+class StagedPayloadLease:
+    """Single-use bounded reader for one occurrence-bound regular payload."""
+
+    __slots__ = (
+        "_binding",
+        "_closed",
+        "_complete",
+        "_generation",
+        "_hasher",
+        "_owner_pid",
+        "_owner_thread",
+        "_parent",
+        "_position",
+        "_started",
+        "_token",
+    )
+
+    def __init__(
+        self,
+        parent: StagedLayer,
+        binding: _RegularPayloadBinding,
+        generation: int,
+        token: int,
+    ) -> None:
+        self._parent = parent
+        self._binding = binding
+        self._generation = generation
+        self._token = token
+        self._owner_pid = os.getpid()
+        self._owner_thread = threading.get_ident()
+        self._hasher = hashlib.sha256()
+        self._position = 0
+        self._started = False
+        self._complete = False
+        self._closed = False
+
+    @property
+    def size(self) -> int:
+        return self._binding.size
+
+    @property
+    def digest(self) -> str:
+        return self._binding.digest
+
+    def _assert_owner(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._closed = True
+            self._parent._close_inherited_process()
+            raise LayerIntakeError("oci-payload-owner", "payload lease cannot cross a process boundary")
+        if threading.get_ident() != self._owner_thread:
+            raise LayerIntakeError("oci-payload-owner", "payload lease cannot cross a process or thread boundary")
+        if self._closed:
+            raise LayerIntakeError("oci-payload-closed", "payload lease is closed")
+
+    def chunks(self, chunk_size: int = _IO_CHUNK) -> Iterator[bytes]:
+        self._assert_owner()
+        if type(chunk_size) is not int or not 1 <= chunk_size <= _IO_CHUNK:
+            raise LayerIntakeError("oci-payload-chunk", "payload chunk size is out of range")
+        if self._started:
+            raise LayerIntakeError("oci-payload-consumed", "payload lease stream is single-use")
+        self._started = True
+        while self._position < self._binding.size:
+            payload = self._parent._read_payload(
+                self._binding,
+                self._position,
+                min(chunk_size, self._binding.size - self._position),
+                self._generation,
+                self._token,
+            )
+            self._position += len(payload)
+            self._hasher.update(payload)
+            yield payload
+        actual_digest = f"sha256:{self._hasher.hexdigest()}"
+        if actual_digest != self._binding.digest:
+            raise LayerIntakeError("oci-payload-digest", "regular payload digest changed after staging")
+        self._complete = True
+
+    def _close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._parent._release_payload(self._token)
+
+    def __copy__(self) -> StagedPayloadLease:
+        raise LayerIntakeError("oci-payload-copy", "payload lease cannot be copied")
+
+    def __deepcopy__(self, _memo: object) -> StagedPayloadLease:
+        raise LayerIntakeError("oci-payload-copy", "payload lease cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("payload lease cannot be serialized")
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else "open"
+        return f"StagedPayloadLease(size={self.size}, digest={self.digest!r}, state={state!r})"
 
 
 class StagedLayer:
@@ -503,12 +702,19 @@ class StagedLayer:
 
     __slots__ = (
         "_closed",
+        "_generation",
+        "_lock",
         "_members",
+        "_next_payload_token",
+        "_normalized",
         "_owner_pid",
         "_owner_thread",
+        "_payload_bindings",
+        "_payload_refs",
         "_receipt",
         "_spool",
         "_started",
+        "_tokens",
     )
 
     def __init__(
@@ -516,6 +722,8 @@ class StagedLayer:
         spool: BinaryIO,
         receipt: LayerIntakeReceipt,
         members: tuple[PhysicalLayerMember, ...],
+        payload_bindings: tuple[_RegularPayloadBinding, ...],
+        normalized: NormalizedChangeset[int],
     ) -> None:
         self._spool = spool
         self._closed = False
@@ -524,6 +732,27 @@ class StagedLayer:
         self._owner_thread = threading.get_ident()
         self._receipt = receipt
         self._members = members
+        self._lock = threading.RLock()
+        self._generation = 0
+        self._next_payload_token = 0
+        self._tokens: dict[int, _RegularPayloadBinding] = {}
+        self._payload_bindings = {binding.member_index: binding for binding in payload_bindings}
+        self._payload_refs = {
+            binding.member_index: RegularPayloadRef(
+                member_index=binding.member_index,
+                size=binding.size,
+                digest=binding.digest,
+            )
+            for binding in payload_bindings
+        }
+        self._normalized = NormalizedChangeset(
+            entries=tuple(
+                replace(entry, payload=self._payload_refs[entry.payload])
+                if entry.kind is EntryKind.FILE and entry.payload is not None
+                else replace(entry, payload=None)
+                for entry in normalized.entries
+            )
+        )
 
     @property
     def receipt(self) -> LayerIntakeReceipt:
@@ -533,11 +762,21 @@ class StagedLayer:
     def members(self) -> tuple[PhysicalLayerMember, ...]:
         return self._members
 
-    def chunks(self, chunk_size: int = _IO_CHUNK) -> Iterator[bytes]:
-        if os.getpid() != self._owner_pid or threading.get_ident() != self._owner_thread:
+    @property
+    def changeset(self) -> NormalizedChangeset[RegularPayloadRef]:
+        return self._normalized
+
+    def _assert_owner(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._close_inherited_process()
+            raise LayerIntakeError("oci-stage-owner", "staged layer cannot cross a process boundary")
+        if threading.get_ident() != self._owner_thread:
             raise LayerIntakeError("oci-stage-owner", "staged layer cannot cross a process or thread boundary")
         if self._closed:
             raise LayerIntakeError("oci-stage-closed", "staged layer is closed")
+
+    def chunks(self, chunk_size: int = _IO_CHUNK) -> Iterator[bytes]:
+        self._assert_owner()
         if type(chunk_size) is not int or not 1 <= chunk_size <= _IO_CHUNK:
             raise LayerIntakeError("oci-stage-chunk", "staged layer chunk size is out of range")
         if self._started:
@@ -556,13 +795,75 @@ class StagedLayer:
                 return
             yield payload
 
-    def _close(self) -> None:
-        if not self._closed:
-            self._closed = True
+    @contextmanager
+    def lease_regular_payload(self, reference: RegularPayloadRef) -> Iterator[StagedPayloadLease]:
+        self._assert_owner()
+        if not isinstance(reference, RegularPayloadRef):
+            raise LayerIntakeError("oci-payload-ref", "regular payload reference is invalid")
+        expected = self._payload_refs.get(reference.member_index)
+        if expected is not reference:
+            raise LayerIntakeError("oci-payload-ref", "regular payload reference does not belong to this stage")
+        binding = self._payload_bindings[reference.member_index]
+        with self._lock:
+            self._assert_owner()
+            token = self._next_payload_token
+            self._next_payload_token += 1
+            self._tokens[token] = binding
+            lease = StagedPayloadLease(self, binding, self._generation, token)
+        try:
+            yield lease
+            if not lease._complete:
+                raise LayerIntakeError("oci-payload-incomplete", "payload lease exited before verified EOF")
+        finally:
+            lease._close()
+
+    def _read_payload(
+        self,
+        binding: _RegularPayloadBinding,
+        position: int,
+        size: int,
+        generation: int,
+        token: int,
+    ) -> bytes:
+        with self._lock:
+            self._assert_owner()
+            if generation != self._generation or self._tokens.get(token) is not binding:
+                raise LayerIntakeError("oci-payload-revoked", "payload lease has been revoked")
             try:
-                self._spool.close()
+                payload = os.pread(self._spool.fileno(), size, binding.offset + position)
             except OSError:
-                pass
+                raise LayerIntakeError("oci-payload-io", "cannot read private regular payload") from None
+            if len(payload) != size:
+                raise LayerIntakeError("oci-payload-short-read", "regular payload ended before its bound size")
+            return payload
+
+    def _release_payload(self, token: int) -> None:
+        with self._lock:
+            self._tokens.pop(token, None)
+
+    def _close_inherited_process(self) -> None:
+        """Revoke the child-process copy without touching a possibly inherited lock."""
+        self._closed = True
+        self._generation += 1
+        self._tokens.clear()
+        try:
+            self._spool.close()
+        except OSError:
+            pass
+
+    def _close(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._close_inherited_process()
+            return
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._generation += 1
+                self._tokens.clear()
+                try:
+                    self._spool.close()
+                except OSError:
+                    pass
 
     def __copy__(self) -> StagedLayer:
         raise LayerIntakeError("oci-stage-copy", "staged layer cannot be copied")
@@ -703,9 +1004,15 @@ def stage_layer(
         except OSError:
             raise LayerIntakeError("oci-spool-io", "cannot durably stage private layer spool") from None
 
-        members, physical_headers, regular_bytes, xattr_bytes, _metadata_bytes = _scan_tar(
-            spool, uncompressed_seen, limits, deadline
-        )
+        (
+            members,
+            payload_bindings,
+            normalized,
+            physical_headers,
+            regular_bytes,
+            xattr_bytes,
+            _metadata_bytes,
+        ) = _scan_tar(spool, uncompressed_seen, limits, deadline)
         receipt = LayerIntakeReceipt(
             policy_id=LAYER_INTAKE_POLICY_ID,
             policy_fingerprint=limits.fingerprint,
@@ -720,7 +1027,7 @@ def stage_layer(
             regular_bytes=regular_bytes,
             xattr_bytes=xattr_bytes,
         )
-        staged = StagedLayer(spool, receipt, members)
+        staged = StagedLayer(spool, receipt, members, payload_bindings, normalized)
         yield staged
     finally:
         if staged is not None:
@@ -739,6 +1046,7 @@ __all__ = [
     "LayerIntakeError",
     "LayerIntakeReceipt",
     "PhysicalLayerMember",
+    "RegularPayloadRef",
     "StagedLayer",
     "stage_layer",
 ]

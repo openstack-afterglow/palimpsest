@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import pickle
 import tarfile
 import threading
 from copy import copy, deepcopy
@@ -17,10 +18,12 @@ import pytest
 
 import palimpsest_local.oci_converter as oci_converter
 from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.oci_changeset import EntryKind
 from palimpsest_local.oci_converter import (
     DEFAULT_LAYER_CONVERSION_LIMITS,
     LAYER_INTAKE_POLICY_ID,
     LayerIntakeError,
+    RegularPayloadRef,
     stage_layer,
 )
 from palimpsest_local.oci_image import OCIImageRef
@@ -325,6 +328,22 @@ def test_pax_size_override_controls_physical_member_framing(tmp_path: Path) -> N
     cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
     with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
         assert staged.members[0].size == 1
+        reference = staged.changeset.by_path()["value"].payload
+        with staged.lease_regular_payload(reference) as payload_lease:
+            assert b"".join(payload_lease.chunks()) == b"x"
+
+
+def test_pr2_base_fixture_binary_capability_stages_through_the_production_parser(tmp_path: Path) -> None:
+    uncompressed = (Path(__file__).parent.parent / "fixtures" / "oci-root" / "base_layer.tar").read_bytes()
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
+        capability = next(member for member in staged.members if member.path == "cap_file.txt")
+        value = dict(capability.xattrs)["security.capability"]
+        assert value.encode("latin-1") == b"\x01\0\0\x02\x01" + b"\0" * 15
+        reference = staged.changeset.by_path()["cap_file.txt"].payload
+        with staged.lease_regular_payload(reference) as payload_lease:
+            assert b"".join(payload_lease.chunks()) == b"file with capability"
 
 
 def test_large_pax_integer_is_range_checked_before_python_int_conversion(tmp_path: Path) -> None:
@@ -369,7 +388,7 @@ def test_whiteout_must_be_an_empty_regular_file_without_control_metadata(tmp_pat
             pass
 
 
-@pytest.mark.parametrize("name", [".wh.", ".wh.."])
+@pytest.mark.parametrize("name", [".wh.", ".wh..", ".wh..wh.foo"])
 def test_malformed_whiteout_target_is_rejected(tmp_path: Path, name: str) -> None:
     marker = tarfile.TarInfo(name)
     uncompressed = _tar(marker)
@@ -377,6 +396,157 @@ def test_malformed_whiteout_target_is_rejected(tmp_path: Path, name: str) -> Non
     with pytest.raises(LayerIntakeError, match="oci-whiteout"):
         with cas.lease_layer(image, 0) as lease, stage_layer(lease):
             pass
+
+
+def test_staged_changeset_binds_duplicate_path_to_the_winning_payload_occurrence(tmp_path: Path) -> None:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for payload in (b"first", b"second"):
+            member, _ = _file("value", payload)
+            archive.addfile(member, io.BytesIO(payload))
+    uncompressed = output.getvalue()
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        entry = staged.changeset.by_path()["value"]
+        assert entry.kind is EntryKind.FILE
+        assert isinstance(entry.payload, RegularPayloadRef)
+        assert entry.source_ordinal == 1
+        assert entry.payload.member_index == 1
+        assert entry.payload.size == 6
+        assert entry.payload.digest == f"sha256:{hashlib.sha256(b'second').hexdigest()}"
+        assert not hasattr(entry.payload, "offset")
+        with staged.lease_regular_payload(entry.payload) as payload_lease:
+            assert b"".join(payload_lease.chunks(2)) == b"second"
+
+
+def test_payload_leases_support_reverse_order_without_extra_spools(tmp_path: Path) -> None:
+    first, first_payload = _file("first", b"111")
+    second, second_payload = _file("second", b"2222")
+    uncompressed = _tar(
+        first,
+        second,
+        payloads={first.name: first_payload, second.name: second_payload},
+    )
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        entries = staged.changeset.by_path()
+        with (
+            staged.lease_regular_payload(entries["first"].payload) as first_lease,
+            staged.lease_regular_payload(entries["second"].payload) as second_lease,
+        ):
+            assert b"".join(second_lease.chunks()) == second_payload
+            assert b"".join(first_lease.chunks()) == first_payload
+
+
+def test_payload_reference_and_lease_are_nontransferable_capabilities(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        reference = staged.changeset.by_path()["value"].payload
+        assert isinstance(reference, RegularPayloadRef)
+        with pytest.raises(LayerIntakeError, match="cannot be copied"):
+            copy(reference)
+        with pytest.raises(LayerIntakeError, match="cannot be copied"):
+            deepcopy(reference)
+        with pytest.raises(TypeError, match="cannot be serialized"):
+            pickle.dumps(reference)
+        forged = RegularPayloadRef(reference.member_index, reference.size, reference.digest)
+        with pytest.raises(LayerIntakeError, match="does not belong"):
+            with staged.lease_regular_payload(forged):
+                pass
+        with staged.lease_regular_payload(reference) as payload_lease:
+            with pytest.raises(LayerIntakeError, match="cannot be copied"):
+                copy(payload_lease)
+            with pytest.raises(TypeError, match="cannot be serialized"):
+                pickle.dumps(payload_lease)
+            assert b"".join(payload_lease.chunks()) == payload
+
+
+def test_clean_payload_context_requires_complete_consumption(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        reference = staged.changeset.by_path()["value"].payload
+        with pytest.raises(LayerIntakeError, match="oci-payload-incomplete"):
+            with staged.lease_regular_payload(reference) as payload_lease:
+                next(payload_lease.chunks(1))
+
+
+def test_payload_lease_rehashes_bytes_at_verified_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        reference = staged.changeset.by_path()["value"].payload
+        original_pread = os.pread
+
+        def corrupt_pread(fd: int, size: int, offset: int) -> bytes:
+            actual = original_pread(fd, size, offset)
+            return bytes((actual[0] ^ 1,)) + actual[1:] if actual else actual
+
+        monkeypatch.setattr(oci_converter.os, "pread", corrupt_pread)
+        with pytest.raises(LayerIntakeError, match="oci-payload-digest"):
+            with staged.lease_regular_payload(reference) as payload_lease:
+                b"".join(payload_lease.chunks())
+
+
+@pytest.mark.parametrize("fault", ["oserror", "short-read"])
+def test_payload_read_fault_releases_its_token_and_allows_a_fresh_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        reference = staged.changeset.by_path()["value"].payload
+        original_pread = os.pread
+
+        def faulty_pread(fd: int, size: int, offset: int) -> bytes:
+            if fault == "oserror":
+                raise OSError("injected payload fault")
+            return original_pread(fd, size, offset)[:-1]
+
+        monkeypatch.setattr(oci_converter.os, "pread", faulty_pread)
+        with pytest.raises(LayerIntakeError, match="oci-payload-io|oci-payload-short-read"):
+            with staged.lease_regular_payload(reference) as payload_lease:
+                b"".join(payload_lease.chunks())
+
+        monkeypatch.setattr(oci_converter.os, "pread", original_pread)
+        with staged.lease_regular_payload(reference) as retry:
+            assert b"".join(retry.chunks()) == payload
+
+
+def test_outer_stage_close_revokes_an_open_payload_lease(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    with cas.lease_layer(image, 0) as source:
+        stage_context = stage_layer(source)
+        staged = stage_context.__enter__()
+        reference = staged.changeset.by_path()["value"].payload
+        payload_context = staged.lease_regular_payload(reference)
+        payload_lease = payload_context.__enter__()
+        stream = payload_lease.chunks(1)
+        assert next(stream) == b"p"
+        stage_context.__exit__(None, None, None)
+        try:
+            with pytest.raises(LayerIntakeError, match="oci-stage-closed|oci-payload-revoked") as failure:
+                next(stream)
+        finally:
+            payload_context.__exit__(type(failure.value), failure.value, failure.value.__traceback__)
 
 
 def test_uncompressed_and_member_limits_fail_at_exact_boundary(tmp_path: Path) -> None:
