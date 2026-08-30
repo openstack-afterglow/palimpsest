@@ -29,6 +29,7 @@ from palimpsest_local.runtime_types import (
     CapabilityCheck,
     CapabilityErrorCategory,
     CloudInitSnapshot,
+    CommitResult,
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
@@ -57,6 +58,7 @@ from palimpsest_local.runtime_types import (
     RuntimeOperation,
     RuntimePreflightError,
     RunVolumeIntent,
+    RunWarningCategory,
     _issue_lifecycle_adapter_outcome,
     _LifecycleAdapterOutcome,
     existing_record_subject_digest,
@@ -302,6 +304,27 @@ def test_create_resolver_is_pure_and_request_does_not_reflect_its_spec(
     assert str(spec.stack.base.local_path) not in rendered
     with pytest.raises(FrozenInstanceError):
         request.attachments_bound = False  # type: ignore[misc]
+
+
+def test_run_resolver_rejects_hvf_network_before_preflight_or_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = replace(_create_spec(tmp_path, arch="aarch64"), network="routed")
+    monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda *_args, **_kwargs: "libvirt-hvf")
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "capability_profile",
+        lambda *_args, **_kwargs: pytest.fail("network validation reached preflight"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("network validation reached adapter"),
+    )
+
+    with pytest.raises(StateError, match="only none or default"):
+        runtime_dispatch.resolve_run_request(spec, requested_backend="libvirt-hvf")
 
 
 @pytest.mark.parametrize("attack", ["kvm-host-path", "lima-backend-format"])
@@ -1226,6 +1249,7 @@ def test_create_dispatch_uses_only_the_resolved_backend_without_reselection(
     assert result.ready is True
     assert result.attachment_mode is RunAttachmentMode.DETACHED
     assert result.guest_ip == "192.0.2.10"
+    assert result.session is None
     assert "SENSITIVE_VALUE" not in repr(result)
     assert "local_path" not in repr(result)
     assert [name for name, _value in calls if name in {"cloud", "lima"}] == [adapter]
@@ -1437,6 +1461,66 @@ def test_run_result_public_constructor_validates_safe_immutable_fields() -> None
         RunResult(record, "running", False, RunAttachmentMode.DETACHED, None)
     with pytest.raises(ValueError, match="guest IP"):
         RunResult(record, "running", True, RunAttachmentMode.DETACHED, "/private/SENSITIVE_VALUE")
+
+
+@pytest.mark.parametrize("status", ["running", "exited"])
+def test_oci_run_result_attached_session_is_private_and_exit_remains_session_owned(status: str) -> None:
+    record = ExistingRunRecord(
+        "oci-demo",
+        "862ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+
+    class SecretSession(_FakeProcessSession):
+        def __repr__(self) -> str:
+            return "<session SENSITIVE_SESSION_TOKEN>"
+
+    session = SecretSession()
+    result = RunResult(record, status, True, RunAttachmentMode.ATTACHED, session=session)
+    equivalent = RunResult(record, status, True, RunAttachmentMode.ATTACHED, session=SecretSession())
+
+    assert result.session is session
+    assert result.launch_hint is None
+    assert result == equivalent
+    assert hash(result) == hash(equivalent)
+    assert "SENSITIVE_SESSION_TOKEN" not in repr(result)
+    assert not hasattr(result, "exit")
+
+
+def test_run_result_attachment_readiness_matrix_and_backend_neutral_projection() -> None:
+    cloud = ExistingRunRecord(
+        "cloud-demo",
+        "862ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIBVIRT_HVF),
+    )
+    lima_record = ExistingRunRecord(
+        "lima-demo",
+        "962ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+    )
+    oci = ExistingRunRecord(
+        "oci-demo",
+        "a62ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+
+    cloud_result = RunResult(cloud, "running", True, RunAttachmentMode.DETACHED, None)
+    assert cloud_result.launch_hint is None
+    assert cloud_result.warnings == (RunWarningCategory.EXPERIMENTAL_BACKEND,)
+    assert RunResult(lima_record, "running", True, RunAttachmentMode.DETACHED).launch_hint == "limactl shell lima-demo"
+    assert RunResult(oci, "failed", False, RunAttachmentMode.DETACHED).launch_hint is None
+    with pytest.raises(ValueError, match="process session"):
+        RunResult(oci, "running", True, RunAttachmentMode.DETACHED, session=_FakeProcessSession())
+    with pytest.raises(ValueError, match="ready OCI-root"):
+        RunResult(cloud, "running", True, RunAttachmentMode.ATTACHED, session=_FakeProcessSession())
+    with pytest.raises(ValueError, match="readiness"):
+        RunResult(oci, "starting", True, RunAttachmentMode.DETACHED)
+    with pytest.raises(ValueError, match="readiness"):
+        RunResult(oci, "failed", True, RunAttachmentMode.DETACHED)
 
 
 @pytest.mark.parametrize(
@@ -3186,6 +3270,156 @@ class _FakeProcessSession:
 
     def close(self) -> None:
         return None
+
+
+@pytest.mark.parametrize("backend", [RuntimeBackend.KVM, RuntimeBackend.LIBVIRT_HVF])
+def test_commit_dispatch_returns_strict_typed_receipt_for_exact_cloud_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: RuntimeBackend,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": backend.value,
+            "status": "running",
+        },
+    )
+    calls: list[tuple[str, str, ExistingRunRecord]] = []
+
+    def selected(name: str, tag: str, *, roots: state.StatePaths, _expected_record: ExistingRunRecord):
+        del roots
+        calls.append((name, tag, _expected_record))
+        return {
+            "tag": tag,
+            "digest": "sha256:" + "c" * 64,
+            "size_bytes": 4096,
+            "parent_digest": "sha256:" + "b" * 64,
+            "base_image_digest": "sha256:" + "a" * 64,
+            "source": "commit",
+        }
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "commit", selected)
+    result = runtime_dispatch.commit("demo", "captured", roots=roots)
+
+    assert isinstance(result, CommitResult)
+    assert result.record == calls[0][2]
+    assert result.record.dispatch_key.backend is backend
+    assert result.tag == "captured"
+    assert result.digest == "sha256:" + "c" * 64
+    assert result.size_bytes == 4096
+
+
+@pytest.mark.parametrize(
+    ("runtime_kind", "backend"),
+    [(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ), (RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)],
+)
+def test_commit_unavailable_routes_fail_before_any_adapter_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_kind: RuntimeKind,
+    backend: RuntimeBackend,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": runtime_kind.value,
+            "backend": backend.value,
+            "status": "running",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "commit",
+        lambda *_args, **_kwargs: pytest.fail("cloud commit adapter reached"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.lima,
+        "commit",
+        lambda *_args, **_kwargs: pytest.fail("Lima commit adapter reached"),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeCapabilityError) as captured:
+        runtime_dispatch.commit("demo", "captured", roots=roots)
+    assert captured.value.operation is RuntimeOperation.COMMIT
+
+
+def test_commit_missing_scp_fails_typed_preflight_before_adapter_or_guest_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+    effects: list[str] = []
+
+    def check(requirement, **_kwargs):
+        if requirement.capability_id == "tool.scp":
+            return CapabilityCheck(
+                "tool.scp",
+                "missing",
+                False,
+                CapabilityErrorCategory.MISSING,
+                "required tool is unavailable",
+            )
+        return CapabilityCheck(requirement.capability_id, "present", True)
+
+    monkeypatch.setattr(runtime_dispatch.platforms, "_check_capability", check)
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "commit",
+        lambda *_args, **_kwargs: effects.append("adapter") or pytest.fail("commit adapter reached"),
+    )
+
+    with pytest.raises(RuntimePreflightError) as captured:
+        runtime_dispatch.commit("demo", "captured", roots=roots)
+
+    assert captured.value.category is CapabilityErrorCategory.MISSING
+    assert captured.value.capability_id == "tool.scp"
+    assert effects == []
+
+
+def test_commit_expected_identity_rejects_replacement_before_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    _rpaths, original_id = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+    expected = ExpectedRunIdentity(
+        "demo",
+        original_id,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    _replace_ledger_with_oci(roots, state.run_paths(roots, "demo"))
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "commit",
+        lambda *_args, **_kwargs: pytest.fail("replacement reached adapter"),
+    )
+
+    with pytest.raises(StateError, match="identity changed"):
+        runtime_dispatch.commit("demo", "captured", roots=roots, expected_identity=expected)
 
 
 @pytest.mark.parametrize(

@@ -12,12 +12,13 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local import cli, digest, runtime_dispatch, state
-from palimpsest_local.errors import PalimpsestError
+from palimpsest_local.errors import PalimpsestError, StateError
 from palimpsest_local.oci_layout import ContentStore
-from palimpsest_local.refs import RunSpec
+from palimpsest_local.refs import ImageRef, RunSpec, StackRef
 from palimpsest_local.runtime_types import (
     CapabilityCheck,
     CapabilityErrorCategory,
+    CommitResult,
     DispatchKey,
     ExistingRunRecord,
     ProcessCapabilities,
@@ -647,6 +648,106 @@ def test_top_level_exec_consumes_dispatcher_session_without_spawning_in_cli(
     assert calls == [("demo", ["printf", "%s", "literal value"])]
 
 
+def test_cli_run_attached_result_bridges_generic_session_and_returns_its_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    image = tmp_path / "base.qcow2"
+    image.write_bytes(b"cloud")
+    stack = StackRef(
+        ImageRef("sha256:" + hashlib.sha256(b"cloud").hexdigest(), "qcow2", "x86_64", None, image),
+        (),
+    )
+    terminal = ProcessExit(7, 7, None, ProcessExitCategory.EXITED)
+
+    class Session:
+        capabilities = ProcessCapabilities(False, False, False, True)
+
+        def events(self):
+            yield ProcessOutputEvent(ProcessStream.STDOUT, b"attached\n")
+            yield ProcessStatusEvent(terminal)
+
+        def write_stdin(self, _data: bytes) -> None:
+            return None
+
+        def close_stdin(self) -> None:
+            return None
+
+        def resize(self, _rows: int, _columns: int) -> None:
+            return None
+
+        def signal(self, _requested: ProcessSignal) -> None:
+            return None
+
+        def wait(self) -> ProcessExit:
+            return terminal
+
+        def close(self) -> None:
+            pytest.fail("successful attached bridge closed its session")
+
+    session = Session()
+    record = ExistingRunRecord(
+        "attached-run",
+        "862ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+    request = object()
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr(cli.runtime_dispatch, "resolve_run_request", lambda *_args, **_kwargs: request)
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", lambda candidate: candidate)
+    monkeypatch.setattr(
+        cli.runtime_dispatch,
+        "run",
+        lambda candidate, *, preflight, roots: (
+            RunResult(record, "exited", True, RunAttachmentMode.ATTACHED, session=session)
+            if candidate is request and preflight is request
+            else pytest.fail("attached request binding changed")
+        ),
+    )
+
+    assert cli.main(["run", "unused", "--name", "attached-run"]) == 7
+    assert capsys.readouterr().out == "attached\n"
+
+
+def test_cli_run_nonready_result_fails_without_printing_a_launch_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    image = tmp_path / "base.qcow2"
+    image.write_bytes(b"cloud")
+    stack = StackRef(
+        ImageRef("sha256:" + hashlib.sha256(b"cloud").hexdigest(), "qcow2", "x86_64", None, image),
+        (),
+    )
+    record = ExistingRunRecord(
+        "failed-run",
+        "862ffb44-6795-4618-b2d8-c0750439fac3",
+        2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+    request = object()
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *_args, **_kwargs: stack)
+    monkeypatch.setattr(cli.runtime_dispatch, "resolve_run_request", lambda *_args, **_kwargs: request)
+    monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", lambda candidate: candidate)
+    monkeypatch.setattr(
+        cli.runtime_dispatch,
+        "run",
+        lambda candidate, *, preflight, roots: (
+            RunResult(record, "failed", False, RunAttachmentMode.DETACHED)
+            if candidate is request and preflight is request
+            else pytest.fail("non-ready request binding changed")
+        ),
+    )
+
+    assert cli.main(["run", "unused", "--name", "failed-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "runtime did not become ready (status: failed)" in captured.err
+
+
 def test_shell_requires_local_terminal_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1150,8 +1251,6 @@ def test_cli_existing_run_operations_route_only_through_durable_dispatch(
         target_name,
         lambda *_args, **_kwargs: pytest.fail("dispatcher selected the wrong runtime adapter"),
     )
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: pytest.fail("CLI used the legacy Lima heuristic"))
-
     assert cli.main(argv) == 0
 
     output = capsys.readouterr().out
@@ -1263,8 +1362,6 @@ def test_cli_oci_root_existing_operations_fail_typed_before_backend_subprocess_o
         lambda *_args, **_kwargs: forbidden("lima-backend"),
     )
     monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: forbidden("subprocess"))
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: forbidden("legacy-heuristic"))
-
     assert cli.main(argv) == 1
 
     captured = capsys.readouterr()
@@ -1306,8 +1403,6 @@ def test_cli_corrupt_existing_run_fails_closed_without_rewrite_or_legacy_fallbac
     roots, rpaths = _write_cli_run_ledger(backend="kvm")
     rpaths.state.write_text('{"schema_version":"secret-invalid-schema"}\n', encoding="utf-8")
     before = _snapshot_cli_state(roots.state)
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda *_args: pytest.fail("CLI used the legacy Lima heuristic"))
-
     assert cli.main(argv) == 1
 
     captured = capsys.readouterr()
@@ -1343,11 +1438,20 @@ def test_cli_dispatch_build_routes_verified_spec(monkeypatch: pytest.MonkeyPatch
 
 
 def test_cli_dispatch_commit_routes_runtime(monkeypatch: pytest.MonkeyPatch, capsys):
-    roots, _rpaths = _write_cli_run_ledger(backend="kvm")
+    roots, rpaths = _write_cli_run_ledger(backend="kvm")
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
+    record = state.read_run_dispatch_record(roots, rpaths.root.name)
     monkeypatch.setattr(
-        "palimpsest_local.cli.commit",
-        lambda name, tag, *, roots: {"name": name, "tag": tag, "digest": "sha256:" + "b" * 64},
+        cli.runtime_dispatch,
+        "commit",
+        lambda name, tag, *, roots: CommitResult(
+            record,
+            tag,
+            "sha256:" + "b" * 64,
+            4,
+            None,
+            "sha256:" + "a" * 64,
+        ),
     )
     assert cli.main(["commit", "demo-vm", "--tag", "delta"]) == 0
     assert "sha256:" in capsys.readouterr().out
@@ -1522,6 +1626,54 @@ def test_remote_run_capability_failure_precedes_pull_or_store_mutation(
     assert not store.root.exists()
 
 
+def test_remote_hvf_routed_network_rejection_precedes_pull_mkdir_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    digest_value = "sha256:" + "e" * 64
+    store = ContentStore(tmp_path / "must-not-exist")
+    effects: list[str] = []
+    monkeypatch.setenv("PALIMPSEST_URL", "https://hub.invalid")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        cli.HubClient,
+        "get_layer",
+        lambda _self, _digest: {
+            "kind": "cloud-image",
+            "disk_format": "qcow2",
+            "arch": "aarch64",
+        },
+    )
+    monkeypatch.setattr(
+        cli.HubClient,
+        "pull_blob",
+        lambda *_args, **_kwargs: effects.append("pull") or pytest.fail("pull reached"),
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.platforms,
+        "select_backend",
+        lambda *_args, **_kwargs: "libvirt-hvf",
+    )
+    monkeypatch.setattr(
+        store,
+        "write_metadata",
+        lambda *_args, **_kwargs: effects.append("metadata") or pytest.fail("metadata write reached"),
+    )
+
+    with pytest.raises(StateError, match="only none or default"):
+        cli._resolve_image_ref(
+            store,
+            digest_value,
+            None,
+            requested_backend="libvirt-hvf",
+            preflight_for_run=True,
+            run_network="routed",
+        )
+
+    assert effects == []
+    assert not store.root.exists()
+
+
 def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     d = "sha256:" + "d" * 64
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
@@ -1622,19 +1774,16 @@ def test_cli_rejects_commit_for_lima_run(
     monkeypatch.setattr(cli, "init_roots", lambda: roots)
 
     assert cli.main(["commit", "demo-vm", "--tag", "layer"]) == 1
-    assert "use palimpsest build" in capsys.readouterr().err
+    assert "runtime operation 'commit' is unavailable for cloud-image/lima-vz" in capsys.readouterr().err
 
 
-def test_cli_run_backend_parser_and_network_validation(capsys: pytest.CaptureFixture[str]):
+def test_cli_run_parser_defers_backend_network_validation_to_dispatcher():
     parser = cli.build_parser()
     args = parser.parse_args(
         ["run", "sha256:" + "a" * 64, "--name", "vm1", "--backend", "libvirt-hvf", "--network", "routed"]
     )
-    with pytest.raises(SystemExit) as exc_info:
-        cli._validate_args(args, parser)
-    assert exc_info.value.code != 0
-    err = capsys.readouterr().err
-    assert "--backend libvirt-hvf supports --network none or default" in err
+    cli._validate_args(args, parser)
+    assert args.network == "routed"
 
 
 def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
@@ -1673,7 +1822,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
         return token
 
     def run(request, *, preflight, roots=None):
-        assert "warning: libvirt-hvf is experimental" in capsys.readouterr().err
+        assert capsys.readouterr().err == ""
         assert preflight is token
         run_calls.append(request)
         return _fake_run_result(request.spec.name, RuntimeBackend.LIBVIRT_HVF, None)

@@ -22,6 +22,7 @@ from .errors import LifecycleError, PalimpsestError
 from .refs import RunSpec
 
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9.+\-]{0,63}$")
 _LIFECYCLE_ADAPTER_AUTHENTICATION_KEY = secrets.token_bytes(32)
 _MAX_LIFECYCLE_REVISION = 2**63 - 1
 
@@ -48,6 +49,13 @@ class RuntimeOperation(StrEnum):
     RECONCILE = "reconcile"
     EXEC = "exec"
     SHELL = "shell"
+    COMMIT = "commit"
+
+
+class RunWarningCategory(StrEnum):
+    """Stable warnings computed from a typed create result."""
+
+    EXPERIMENTAL_BACKEND = "experimental-backend"
 
 
 class LifecycleWarningCategory(StrEnum):
@@ -400,11 +408,12 @@ class ProcessCapabilityError(PalimpsestError):
 class RunAttachmentMode(StrEnum):
     """How a successful create result is attached to its caller.
 
-    Foreground process sessions are intentionally a later contract. The typed
-    create boundary currently returns only completed, detached VM launches.
+    A detached launch returns a durable identity and optional launch hint.  An
+    attached launch owns one process session whose exit remains authoritative.
     """
 
     DETACHED = "detached"
+    ATTACHED = "attached"
 
 
 class RunRequestProvenanceStage(StrEnum):
@@ -598,6 +607,7 @@ class RunResult:
     ready: bool
     attachment_mode: RunAttachmentMode
     guest_ip: str | None = None
+    session: ProcessSession | None = dataclass_field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, ExistingRunRecord):
@@ -609,12 +619,29 @@ class RunResult:
             raise ValueError("run result has an invalid runtime status")
         if type(self.ready) is not bool:
             raise TypeError("run result ready flag must be a bool")
-        if self.ready != (self.status == "running"):
-            raise ValueError("run result readiness does not match runtime status")
         if not isinstance(self.attachment_mode, RunAttachmentMode):
             raise TypeError("run result requires a RunAttachmentMode")
         if self.guest_ip is not None and not _valid_ip(self.guest_ip):
             raise ValueError("run result has an invalid guest IP")
+        if self.record.dispatch_key.runtime_kind is RuntimeKind.CLOUD_IMAGE:
+            if self.ready != (self.status == "running"):
+                raise ValueError("run result readiness does not match runtime status")
+        else:
+            ready_statuses = {"running", "exited"}
+            if self.ready and self.status not in ready_statuses:
+                raise ValueError("run result readiness does not match runtime status")
+            if not self.ready and self.status in {"running", "exited"}:
+                raise ValueError("run result readiness does not match runtime status")
+        if self.attachment_mode is RunAttachmentMode.DETACHED:
+            if self.session is not None:
+                raise ValueError("detached run result cannot contain a process session")
+        elif (
+            self.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT
+            or not self.ready
+            or self.status not in {"running", "exited"}
+            or not isinstance(self.session, ProcessSession)
+        ):
+            raise ValueError("attached run result requires a ready OCI-root process session")
 
     @property
     def name(self) -> str:
@@ -631,6 +658,53 @@ class RunResult:
     @property
     def backend(self) -> RuntimeBackend:
         return self.record.dispatch_key.backend
+
+    @property
+    def launch_hint(self) -> str | None:
+        """Return the existing detached CLI output without exposing routing."""
+
+        if not self.ready or self.attachment_mode is RunAttachmentMode.ATTACHED:
+            return None
+        if self.runtime_kind is RuntimeKind.OCI_ROOT:
+            return self.run_id
+        if self.backend is RuntimeBackend.LIMA_VZ:
+            return f"limactl shell {self.name}"
+        return self.guest_ip
+
+    @property
+    def warnings(self) -> tuple[RunWarningCategory, ...]:
+        if self.backend is RuntimeBackend.LIBVIRT_HVF:
+            return (RunWarningCategory.EXPERIMENTAL_BACKEND,)
+        return ()
+
+
+@dataclass(frozen=True, slots=True)
+class CommitResult:
+    """Safe immutable receipt for one exact existing-run commit."""
+
+    record: ExistingRunRecord
+    tag: str
+    digest: str
+    size_bytes: int
+    parent_digest: str | None
+    base_image_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, ExistingRunRecord):
+            raise TypeError("commit result requires an ExistingRunRecord")
+        if not isinstance(self.tag, str) or _TAG_RE.fullmatch(self.tag) is None:
+            raise ValueError("commit result has an invalid tag")
+        for label, value, optional in (
+            ("digest", self.digest, False),
+            ("parent digest", self.parent_digest, True),
+            ("base image digest", self.base_image_digest, False),
+        ):
+            if optional and value is None:
+                continue
+            if not isinstance(value, str) or _SUBJECT_DIGEST_RE.fullmatch(value) is None:
+                raise ValueError(f"commit result has an invalid {label}")
+        if type(self.size_bytes) is not int or self.size_bytes < 4:
+            raise ValueError("commit result has an invalid size")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1557,6 +1631,7 @@ __all__ = (
     "CloudImageInspectDetail",
     "CloudInitSnapshot",
     "CloudInitWriteFileSnapshot",
+    "CommitResult",
     "DispatchKey",
     "ExecRequest",
     "ExistingRunRecord",
@@ -1600,6 +1675,7 @@ __all__ = (
     "RunAggregationError",
     "RunAggregationResult",
     "RunResult",
+    "RunWarningCategory",
     "RunRequestProvenance",
     "RunRequestProvenanceStage",
     "RunSummary",

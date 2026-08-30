@@ -1614,6 +1614,30 @@ def _stage_process_ssh_artifacts(rpaths: RunPaths, directory: Path) -> tuple[Pat
     return staged[0], staged[1]
 
 
+def _write_private_staged_artifact(directory: Path, filename: str, content: bytes) -> Path:
+    target = directory / filename
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError
+            offset += written
+        os.fsync(descriptor)
+    except OSError:
+        raise StateError("cannot stage pinned run SSH trust artifacts") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return target
+
+
 def shell_session(
     name: str,
     *,
@@ -1717,18 +1741,49 @@ def commit(
     kvm_uri: str | None = None,
     profile: platforms.DomainProfile | None = None,
     runner: Callable[[list[str]], Any] | None = None,
+    _expected_record: ExistingRunRecord | None = None,
+    _mutation: state.ExistingRunMutation | None = None,
+    _staging: Path | None = None,
 ) -> dict[str, Any]:
     """Commit upper layer changes of a running run into a local content-store tag."""
     roots = roots or state.init_roots()
     state.validate_tag(tag)
+
+    if _expected_record is not None and _mutation is None:
+        with state.locked_existing_run(roots, name, expected=_expected_record) as mutation:
+            with tempfile.TemporaryDirectory(prefix=".commit-", dir=roots.state) as staging:
+                mutation.verify_binding()
+                return commit(
+                    name,
+                    tag,
+                    roots=roots,
+                    conn=conn,
+                    kvm_uri=kvm_uri,
+                    profile=profile,
+                    runner=runner,
+                    _expected_record=_expected_record,
+                    _mutation=mutation,
+                    _staging=Path(staging),
+                )
+    if _mutation is not None and (_expected_record is None or _mutation.record != _expected_record):
+        raise StateError("commit mutation authority does not match expected run")
+    if (_mutation is None) != (_staging is None):
+        raise StateError("commit staging does not match mutation authority")
 
     tag_path = state.tag_path(roots, tag)
     existing_tag: TagRecord | None = None
     if tag_path.is_file():
         existing_tag = state.read_tag_record(roots, tag)
 
-    rpaths = state.run_paths(roots, name)
-    owner_rec, st_data = _validate_run_ledger(rpaths)
+    if _mutation is None:
+        rpaths = state.run_paths(roots, name)
+        owner_rec, st_data = _validate_run_ledger(rpaths)
+        expected_run_id = owner_rec.run_id
+    else:
+        _mutation.verify_binding()
+        rpaths = _mutation.paths
+        st_data = _mutation.mutable_state()
+        expected_run_id = _mutation.record.run_id
 
     if st_data.get("status") != "running":
         raise LifecycleError(f"run '{name}' is not running (status: {st_data.get('status')})")
@@ -1737,10 +1792,14 @@ def commit(
     resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
     conn_obj = _get_conn(conn, resolved_uri)
     try:
+        if _mutation is not None:
+            _mutation.verify_binding()
         dom = conn_obj.lookupByName(name)
         dom_run_id = kvm.get_domain_run_id(dom)
-        if dom_run_id != owner_rec.run_id:
-            raise LifecycleError(f"domain '{name}' is not owned by run ID '{owner_rec.run_id}' (found '{dom_run_id}')")
+        if dom_run_id != expected_run_id:
+            raise LifecycleError(f"domain '{name}' is not owned by run ID '{expected_run_id}' (found '{dom_run_id}')")
+        if _mutation is not None:
+            _mutation.verify_binding()
     except Exception as exc:
         if isinstance(exc, LifecycleError):
             raise
@@ -1770,17 +1829,40 @@ def commit(
                 raise LifecycleError(f"recorded layer digest mismatch: {exc}") from exc
     parent_digest = layers_data[-1]["digest"] if layers_data else None
 
-    identity = rpaths.identity
-    known_hosts = rpaths.known_hosts
+    if _mutation is None:
+        identity = rpaths.identity
+        known_hosts = rpaths.known_hosts
+        tmp_host_out = rpaths.root / f"commit-{tag}.squashfs"
+    else:
+        assert _staging is not None
+        staging_metadata = _staging.lstat()
+        if (
+            not stat_module.S_ISDIR(staging_metadata.st_mode)
+            or staging_metadata.st_uid != os.geteuid()
+            or stat_module.S_IMODE(staging_metadata.st_mode) != 0o700
+        ):
+            raise StateError("commit staging is not owner-only")
+        identity_bytes, known_hosts_bytes = _mutation.read_ssh_trust_artifacts()
+        identity = _write_private_staged_artifact(_staging, "identity", identity_bytes)
+        known_hosts = _write_private_staged_artifact(_staging, "known_hosts", known_hosts_bytes)
+        tmp_host_out = _staging / "output.squashfs"
 
     def exec_guest(argv: list[str]) -> subprocess.CompletedProcess[str]:
         ssh_cmd = guest.build_exec_command(host, argv, identity=identity, known_hosts=known_hosts, port=port)
+        if _mutation is not None:
+            _mutation.verify_binding()
         if runner is not None:
             res = runner(ssh_cmd)
             if isinstance(res, subprocess.CompletedProcess):
+                if _mutation is not None:
+                    _mutation.verify_binding()
                 return res
-            return subprocess.CompletedProcess(ssh_cmd, 0 if res is None else res, "", "")
-        return subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
+            completed = subprocess.CompletedProcess(ssh_cmd, 0 if res is None else res, "", "")
+        else:
+            completed = subprocess.run(ssh_cmd, capture_output=True, text=True, check=False)
+        if _mutation is not None:
+            _mutation.verify_binding()
+        return completed
 
     res_fuser = exec_guest(["sudo", "-n", "fuser", "-m", "/opt/layers/merged"])
     if res_fuser.returncode == 0:
@@ -1840,14 +1922,17 @@ def commit(
     if res_pack.returncode != 0:
         raise LifecycleError(f"mksquashfs in guest failed during commit: {res_pack.stderr}")
 
-    tmp_host_out = rpaths.root / f"commit-{tag}.squashfs"
     scp_cmd = guest.build_scp_download_command(
         host, "/tmp/commit_output.squashfs", tmp_host_out, identity=identity, known_hosts=known_hosts, port=port
     )
+    if _mutation is not None:
+        _mutation.verify_binding()
     if runner is not None:
         res_scp = runner(scp_cmd)
     else:
         res_scp = subprocess.run(scp_cmd, capture_output=True, text=True, check=False)
+    if _mutation is not None:
+        _mutation.verify_binding()
     if isinstance(res_scp, subprocess.CompletedProcess) and res_scp.returncode != 0:
         raise LifecycleError(f"failed to scp commit output from guest: {res_scp.stderr}")
 
@@ -1868,7 +1953,11 @@ def commit(
             )
 
         store = ContentStore(roots.store)
+        if _mutation is not None:
+            _mutation.verify_binding()
         store.ingest_file(tmp_host_out, expected_digest=output_digest)
+        if _mutation is not None:
+            _mutation.verify_binding()
         store.write_metadata(
             output_digest,
             {
@@ -1878,6 +1967,8 @@ def commit(
                 "base_image_digest": base_digest,
             },
         )
+        if _mutation is not None:
+            _mutation.verify_binding()
 
         tag_record = TagRecord(
             schema_version=1,
@@ -1891,6 +1982,8 @@ def commit(
             created_at=state.utc_now_iso(),
         )
         state.write_tag_record(roots, tag_record)
+        if _mutation is not None:
+            _mutation.verify_binding()
 
         exec_guest(["sudo", "-n", "rm", "-f", "/tmp/commit_output.squashfs"])
 

@@ -27,9 +27,18 @@ _EXPECTED_PUBLIC_API = (
     "start_serial_builder",
     "stop",
 )
-_LEGACY_RUNTIME_IMPORTERS = {
-    "cli.py",
+_LEGACY_RUNTIME_IMPORTERS: set[str] = set()
+_EXPLICIT_BACKEND_OWNER_EXCEPTIONS = {
+    "build.py": (
+        "platforms.select_backend(",
+        "cloud_runtime.start_serial_builder(",
+        "cloud_runtime.receive_serial_builder_output(",
+        "cloud_runtime.rm(",
+    ),
+    "project_adapter.py": ("lima.inspect_instance_status(name)",),
 }
+_FORBIDDEN_CLI_MODULES = frozenset({"runtime", "cloud_runtime", "lima"})
+_ROUTING_ATTRIBUTES = frozenset({"backend", "runtime_kind", "dispatch_key"})
 
 
 def _source_root() -> Path:
@@ -54,6 +63,92 @@ def _imports_legacy_runtime(tree: ast.AST) -> bool:
         elif isinstance(node, ast.Import) and any(alias.name == "palimpsest_local.runtime" for alias in node.names):
             return True
     return False
+
+
+def _attribute_chain(node: ast.AST) -> tuple[str, ...] | None:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, ast.Attribute):
+        parent = _attribute_chain(node.value)
+        return None if parent is None else (*parent, node.attr)
+    return None
+
+
+def _imported_module_tail(node: ast.Import | ast.ImportFrom) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {alias.name.rsplit(".", 1)[-1] for alias in node.names}
+    module_tail = "" if node.module is None else node.module.rsplit(".", 1)[-1]
+    if module_tail in _FORBIDDEN_CLI_MODULES:
+        return {module_tail}
+    return {alias.name for alias in node.names if alias.name in _FORBIDDEN_CLI_MODULES}
+
+
+def _expression_uses_routing(node: ast.AST, aliases: set[str]) -> bool:
+    for candidate in ast.walk(node):
+        if isinstance(candidate, ast.Name) and candidate.id in aliases:
+            return True
+        chain = _attribute_chain(candidate)
+        if chain is not None and any(part in _ROUTING_ATTRIBUTES for part in chain[1:]):
+            return True
+    return False
+
+
+def _is_routing_alias_value(node: ast.AST, aliases: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    chain = _attribute_chain(node)
+    return chain is not None and (chain[0] in aliases or any(part in _ROUTING_ATTRIBUTES for part in chain[1:]))
+
+
+def _assigned_names(node: ast.AST) -> set[str]:
+    return {candidate.id for candidate in ast.walk(node) if isinstance(candidate, ast.Name)}
+
+
+def _cli_architecture_violations(source: str) -> tuple[str, ...]:
+    tree = ast.parse(source)
+    violations: list[str] = []
+    routing_aliases: set[str] = set()
+    run_path_aliases = {"run_paths"}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            run_path_aliases.update(alias.asname or alias.name for alias in node.names if alias.name == "run_paths")
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+                if value is not None and _is_routing_alias_value(value, routing_aliases):
+                    discovered = set().union(*(_assigned_names(target) for target in targets))
+                    if not discovered <= routing_aliases:
+                        routing_aliases.update(discovered)
+                        changed = True
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            forbidden = _imported_module_tail(node) & _FORBIDDEN_CLI_MODULES
+            if forbidden:
+                violations.append(f"forbidden-import:{','.join(sorted(forbidden))}:{node.lineno}")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and "limactl" in node.value:
+            violations.append(f"limactl-literal:{node.lineno}")
+        elif isinstance(node, ast.Call):
+            chain = _attribute_chain(node.func)
+            if chain is not None and chain[-1] in run_path_aliases:
+                violations.append(f"run-path-heuristic:{node.lineno}")
+        elif isinstance(node, ast.Compare) and _expression_uses_routing(node, routing_aliases):
+            violations.append(f"routing-comparison:{node.lineno}")
+        elif isinstance(node, (ast.If, ast.IfExp, ast.While)) and _expression_uses_routing(node.test, routing_aliases):
+            violations.append(f"routing-control:{node.lineno}")
+        elif isinstance(node, ast.Match):
+            if _expression_uses_routing(node.subject, routing_aliases):
+                violations.append(f"routing-match:{node.lineno}")
+            for case in node.cases:
+                if case.guard is not None and _expression_uses_routing(case.guard, routing_aliases):
+                    violations.append(f"routing-match-guard:{case.guard.lineno}")
+    return tuple(sorted(set(violations)))
 
 
 def test_runtime_facade_resolves_the_legacy_public_api() -> None:
@@ -171,6 +266,38 @@ def test_first_party_process_operations_use_dispatcher_sessions() -> None:
     dispatch_source = (source_root / "runtime_dispatch.py").read_text(encoding="utf-8")
     assert "adapter.exec_session(" in dispatch_source
     assert "adapter.shell_session(" in dispatch_source
+
+
+def test_cli_has_no_backend_lifecycle_escape_hatches() -> None:
+    source = (_source_root() / "cli.py").read_text(encoding="utf-8")
+    assert _cli_architecture_violations(source) == ()
+    assert "runtime_dispatch.commit(" in source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'if request.dispatch_key.backend.value == "lima-vz":\n    pass',
+        'route = result.record.dispatch_key\nbackend = route.backend\nif backend != "kvm":\n    pass',
+        'value = 1 if args.backend == "kvm" else 2',
+        'kind = result.runtime_kind\nwhile kind == "oci-root":\n    break',
+        'match request.dispatch_key.backend:\n    case "kvm":\n        pass',
+        'match value:\n    case _ if result.backend == "kvm":\n        pass',
+        "from .lima import available as host_available\nhost_available()",
+        "import palimpsest_local.cloud_runtime as adapter\nadapter.run(spec)",
+        "from .state import run_paths as paths\npaths(roots, name)",
+        'print("limactl shell demo")',
+    ],
+)
+def test_cli_architecture_gate_rejects_nested_alias_and_control_flow_bypasses(source: str) -> None:
+    assert _cli_architecture_violations(source), source
+
+
+def test_narrow_non_cli_backend_owner_exceptions_remain_explicit() -> None:
+    for filename, allowlist in _EXPLICIT_BACKEND_OWNER_EXCEPTIONS.items():
+        source = (_source_root() / filename).read_text(encoding="utf-8")
+        for allowed in allowlist:
+            assert allowed in source, (filename, allowed)
 
 
 def test_first_party_callers_cannot_use_the_legacy_cloud_bulk_reconcile_bypass() -> None:

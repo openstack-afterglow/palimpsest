@@ -382,13 +382,19 @@ def test_compose_env_file_must_remain_inside_project(tmp_path: Path, capsys: pyt
     assert "must stay inside" in capsys.readouterr().err
 
 
-def test_runtime_bundle_fails_early_on_apple_silicon_without_trusted_architecture(
+def test_runtime_bundle_validation_has_no_host_lima_availability_heuristic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
-    monkeypatch.setattr(cli.lima, "available", lambda: True)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "verify_layout_dir",
+        lambda path: calls.append(path) or SimpleNamespace(manifests=()),
+    )
 
-    with pytest.raises(cli.PalimpsestError, match="x86_64/KVM-only"):
+    with pytest.raises(cli.PalimpsestError, match="exactly one selectable manifest"):
         cli._resolve_runtime_stack(SimpleNamespace(), bundle, (), None)
+    assert calls == [bundle]

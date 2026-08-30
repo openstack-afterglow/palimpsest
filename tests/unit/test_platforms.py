@@ -471,7 +471,7 @@ def test_preflight_rejects_unknown_backend():
         platforms.preflight("bogus")
 
 
-def test_operation_capability_matrix_is_exact_for_all_28_supported_cloud_operations() -> None:
+def test_operation_capability_matrix_is_exact_for_all_30_supported_cloud_operations() -> None:
     kvm_run = (
         "host.kvm-device",
         "tool.qemu-img",
@@ -511,6 +511,7 @@ def test_operation_capability_matrix_is_exact_for_all_28_supported_cloud_operati
         expected[(backend, RuntimeOperation.PS)] = ()
         expected[(backend, RuntimeOperation.EXEC)] = ("tool.ssh",)
         expected[(backend, RuntimeOperation.SHELL)] = ("tool.ssh",)
+        expected[(backend, RuntimeOperation.COMMIT)] = ("python.libvirt", "tool.ssh", "tool.scp")
     expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.RUN)] = (
         "host.lima-vz",
         "tool.limactl",
@@ -527,7 +528,7 @@ def test_operation_capability_matrix_is_exact_for_all_28_supported_cloud_operati
     expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.LOGS)] = ()
     expected[(RuntimeBackend.LIMA_VZ, RuntimeOperation.PS)] = ()
 
-    assert len(expected) == 28
+    assert len(expected) == 30
     for (backend, operation), requirement_ids in expected.items():
         key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
         profile = platforms.capability_profile(key, operation)

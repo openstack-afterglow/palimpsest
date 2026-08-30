@@ -153,6 +153,8 @@ def capability_profile(
     elif backend is RuntimeBackend.KVM:
         if operation is RuntimeOperation.RUN:
             identifiers = _KVM_CREATE_REQUIREMENTS
+        elif operation is RuntimeOperation.COMMIT:
+            identifiers = ("python.libvirt", "tool.ssh", "tool.scp")
         elif operation in _LIBVIRT_LIVE_OPERATIONS:
             identifiers = ("python.libvirt",)
         elif operation in _PROCESS_OPERATIONS:
@@ -164,6 +166,8 @@ def capability_profile(
     elif backend is RuntimeBackend.LIBVIRT_HVF:
         if operation is RuntimeOperation.RUN:
             identifiers = _HVF_CREATE_REQUIREMENTS
+        elif operation is RuntimeOperation.COMMIT:
+            identifiers = ("python.libvirt", "tool.ssh", "tool.scp")
         elif operation in _LIBVIRT_LIVE_OPERATIONS:
             identifiers = ("python.libvirt",)
         elif operation in _PROCESS_OPERATIONS:

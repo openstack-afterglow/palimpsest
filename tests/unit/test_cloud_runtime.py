@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -1178,6 +1179,109 @@ def test_commit_success(tmp_path: Path):
     tag_rec = state.read_tag_record(roots, "committed-tag")
     assert tag_rec.digest == res["digest"]
     assert tag_rec.source == "commit"
+
+
+def test_typed_commit_binding_rejects_run_replacement_before_capture_or_publish(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "bound-run")
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    rpaths.ssh.mkdir(parents=True, mode=0o700)
+    rpaths.identity.write_text("original key")
+    rpaths.known_hosts.write_text("original host")
+    rpaths.identity.chmod(0o600)
+    rpaths.known_hosts.chmod(0o600)
+    original = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={"guest_ip": "192.168.122.50", "base_digest": "sha256:" + "a" * 64, "layers": []},
+    )
+    expected = state.read_run_dispatch_record(roots, "bound-run")
+    conn = FakeLibvirtConn()
+    conn.defineXML(
+        f'<domain><name>bound-run</name><metadata><palimpsest:run xmlns:palimpsest="https://afterglow.dev/palimpsest-local/domain/v1" id="{original.run_id}" schema="1" version="0.1.0"/></metadata></domain>'
+    )
+    replacement_id = "862ffb44-6795-4618-b2d8-c0750439fac3"
+    swapped = False
+    staged_credentials: list[tuple[Path, Path]] = []
+    scp_destination: Path | None = None
+
+    def replacing_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal scp_destination, swapped
+        identity = Path(cmd[cmd.index("-i") + 1])
+        known_hosts_argument = next(item for item in cmd if item.startswith("UserKnownHostsFile="))
+        known_hosts = Path(known_hosts_argument.split("=", 1)[1])
+        assert identity.read_text() == "original key"
+        assert known_hosts.read_text() == "original host"
+        assert rpaths.root not in identity.parents
+        assert rpaths.root not in known_hosts.parents
+        staged_credentials.append((identity, known_hosts))
+        if cmd[0] == "scp":
+            scp_destination = Path(cmd[-1])
+            assert rpaths.root not in scp_destination.parents
+            assert stat_module.S_IMODE(scp_destination.parent.stat().st_mode) == 0o700
+            swapped = True
+            rpaths.root.rename(roots.runs / "bound-run-original")
+            rpaths.root.mkdir(mode=0o700)
+            rpaths.ssh.mkdir(mode=0o700)
+            rpaths.identity.write_text("replacement key")
+            rpaths.known_hosts.write_text("replacement host")
+            rpaths.identity.chmod(0o600)
+            rpaths.known_hosts.chmod(0o600)
+            rpaths.owner.write_text(
+                json.dumps({"schema_version": 1, "run_id": replacement_id, "name": "bound-run"}) + "\n",
+                encoding="utf-8",
+            )
+            rpaths.state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "runtime_kind": "cloud-image",
+                        "backend": "kvm",
+                        "name": "bound-run",
+                        "run_id": replacement_id,
+                        "status": "stopped",
+                        "replacement_marker": "untouched",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rpaths.owner.chmod(0o600)
+            rpaths.state.chmod(0o600)
+            scp_destination.write_bytes(b"hsqs" + b"\x00" * 100)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        argv = parse_runner_cmd(cmd)
+        cmd_name = get_cmd_name(argv)
+        if cmd_name == "fuser":
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        if cmd_name == "findmnt":
+            return subprocess.CompletedProcess(cmd, 0, "ext4\n", "")
+        if cmd_name == "stat":
+            return subprocess.CompletedProcess(cmd, 0, "2049\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with pytest.raises(StateError, match="changed"):
+        commit(
+            "bound-run",
+            "must-not-publish",
+            roots=roots,
+            conn=conn,
+            runner=replacing_runner,
+            _expected_record=expected,
+        )
+
+    replacement = json.loads(rpaths.state.read_text(encoding="utf-8"))
+    assert replacement["run_id"] == replacement_id
+    assert replacement["status"] == "stopped"
+    assert replacement["replacement_marker"] == "untouched"
+    assert swapped is True
+    assert staged_credentials
+    assert rpaths.identity.read_text() == "replacement key"
+    assert rpaths.known_hosts.read_text() == "replacement host"
+    assert not (rpaths.root / "commit-must-not-publish.squashfs").exists()
+    assert scp_destination is not None and not scp_destination.exists()
+    assert not state.tag_path(roots, "must-not-publish").exists()
 
 
 def test_commit_refuses_non_running_or_unowned_state(tmp_path: Path):

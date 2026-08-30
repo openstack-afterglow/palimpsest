@@ -22,6 +22,7 @@ from .runtime_types import (
     ALLOWED_RUNTIME_STATUSES,
     CapabilityErrorCategory,
     CloudImageInspectDetail,
+    CommitResult,
     DispatchKey,
     ExecRequest,
     ExistingRunRecord,
@@ -297,6 +298,15 @@ def _parse_creation_receipt(raw: Any) -> _CreationReceipt:
     return _CreationReceipt(name, run_id, dispatch_key, status)
 
 
+def _validate_resolved_run_network(dispatch_key: DispatchKey, network: str | None) -> None:
+    if (
+        dispatch_key.backend is RuntimeBackend.LIBVIRT_HVF
+        and network is not None
+        and network not in {"none", "default"}
+    ):
+        raise StateError("libvirt-hvf supports only none or default networking")
+
+
 def resolve_run_request(
     spec: RunSpec,
     *,
@@ -324,8 +334,10 @@ def resolve_run_request(
     resolved_spec = spec if frozen_cloud_init is spec.cloud_init else replace(spec, cloud_init=frozen_cloud_init)
     resolved_intents = () if volume_intents is None else volume_intents
     backend = RuntimeBackend(platforms.select_backend(resolved_spec.stack.base.arch, requested=requested_backend))
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+    _validate_resolved_run_network(dispatch_key, resolved_spec.network)
     request = ResolvedRunRequest(
-        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+        dispatch_key=dispatch_key,
         spec=resolved_spec,
         volume_intents=resolved_intents,
         attachments_bound=not require_volume_binding,
@@ -345,6 +357,7 @@ def preflight_run_request(
     if not isinstance(request, ResolvedRunRequest):
         raise TypeError("run preflight requires a ResolvedRunRequest")
     _require_run_request_provenance(request)
+    _validate_resolved_run_network(request.dispatch_key, request.spec.network)
     profile = platforms.capability_profile(
         request.dispatch_key,
         RuntimeOperation.RUN,
@@ -386,6 +399,7 @@ def preflight_run_capabilities(
     resolved_host = host or platforms.detect_host()
     backend = RuntimeBackend(platforms.select_backend(arch, host=resolved_host, requested=requested_backend))
     key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+    _validate_resolved_run_network(key, network)
     profile = platforms.capability_profile(key, RuntimeOperation.RUN, network=network)
     raw_subject = f"early-run:{profile.profile_id}:{arch}:{network}".encode()
     report = platforms.evaluate_capability_profile(
@@ -922,6 +936,49 @@ def shell(
     )
 
 
+def commit(
+    name: str,
+    tag: str,
+    *,
+    roots: StatePaths | None = None,
+    expected_identity: ExpectedRunIdentity | None = None,
+) -> CommitResult:
+    """Capture one exact cloud VM run through a typed, fail-closed receipt."""
+
+    resolved_roots = roots or state.resolve_roots()
+    state.validate_tag(tag)
+    record = resolve_existing_run(name, roots=resolved_roots)
+    _require_expected_identity(record, expected_identity)
+    adapter = _preflight_existing_adapter(record, RuntimeOperation.COMMIT, resolved_roots)
+    raw = adapter.commit(
+        name,
+        tag,
+        roots=resolved_roots,
+        _expected_record=record,
+    )
+    expected_keys = {
+        "tag",
+        "digest",
+        "size_bytes",
+        "parent_digest",
+        "base_image_digest",
+        "source",
+    }
+    try:
+        if type(raw) is not dict or set(raw) != expected_keys or raw["source"] != "commit":
+            raise TypeError
+        return CommitResult(
+            record=record,
+            tag=raw["tag"],
+            digest=raw["digest"],
+            size_bytes=raw["size_bytes"],
+            parent_digest=raw["parent_digest"],
+            base_image_digest=raw["base_image_digest"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise StateError("runtime adapter returned an invalid commit receipt") from None
+
+
 def start(
     name: str,
     *,
@@ -1384,6 +1441,7 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
 
 __all__ = (
     "bind_run_request_volumes",
+    "commit",
     "exec",
     "inspect_run",
     "logs",

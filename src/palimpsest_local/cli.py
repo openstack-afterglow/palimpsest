@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completion, inventory, lima, runtime_dispatch, ui
+from . import __version__, completion, inventory, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
@@ -82,7 +82,6 @@ from .registry import (
     update_registry_config,
     use_profile,
 )
-from .runtime import commit
 from .runtime_types import (
     CloudImageInspectDetail,
     ExpectedRunIdentity,
@@ -96,6 +95,9 @@ from .runtime_types import (
     ProcessSignal,
     ProcessStatusEvent,
     ProcessStream,
+    RunAttachmentMode,
+    RunResult,
+    RunWarningCategory,
 )
 from .state import (
     StatePaths,
@@ -104,7 +106,6 @@ from .state import (
     init_roots,
     read_tag_record,
     resolve_roots,
-    run_paths,
     write_tag_record,
 )
 
@@ -170,6 +171,12 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
         },
         "warnings": [warning.value for warning in inspected.warnings],
     }
+
+
+def _render_run_warnings(result: RunResult) -> None:
+    for warning in result.warnings:
+        if warning is RunWarningCategory.EXPERIMENTAL_BACKEND:
+            print("warning: libvirt-hvf is experimental", file=sys.stderr)
 
 
 def _render_compose_log_event(
@@ -802,8 +809,6 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             parser.error("--memory must be between 256 and 1048576")
         if not 1 <= args.vcpus <= 256:
             parser.error("--vcpus must be between 1 and 256")
-        if args.backend == "libvirt-hvf" and args.network not in ("none", "default"):
-            parser.error("--backend libvirt-hvf supports --network none or default")
     if args.operation == "ui":
         if args.port != 0 and not 1024 <= args.port <= 65535:
             parser.error("--port must be 0 or between 1024 and 65535")
@@ -970,11 +975,6 @@ def _resolve_runtime_stack(
 ) -> StackRef:
     target_path = Path(image_or_bundle)
     if target_path.is_dir():
-        if lima.available():
-            raise PalimpsestError(
-                "OCI run bundles currently have no trusted boot-architecture field and are x86_64/KVM-only; "
-                "on Apple Silicon, use a cloud-image digest whose Hub metadata declares aarch64"
-            )
         layout = verify_layout_dir(target_path)
         if len(layout.manifests) != 1:
             raise PalimpsestError("run bundle must contain exactly one selectable manifest")
@@ -1955,15 +1955,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
         )
         request = runtime_dispatch.resolve_run_request(run_spec, requested_backend=args.backend)
         preflight = runtime_dispatch.preflight_run_request(request)
-        if request.dispatch_key.backend.value == "libvirt-hvf":
-            print("warning: libvirt-hvf is experimental", file=sys.stderr)
         result = runtime_dispatch.run(request, preflight=preflight, roots=roots)
-        if result.backend.value == "lima-vz":
-            print(f"limactl shell {args.name}")
-        else:
-            # Preserve the legacy dict result's ``get("guest_ip", name)``
-            # behavior: cloud/HVF states contain the key with a null value.
-            print(result.guest_ip)
+        _render_run_warnings(result)
+        if not result.ready:
+            raise PalimpsestError(f"runtime did not become ready (status: {result.status})")
+        if result.attachment_mode is RunAttachmentMode.ATTACHED:
+            if result.session is None:  # pragma: no cover - guarded by RunResult
+                raise PalimpsestError("attached run result is missing its process session")
+            return _run_process_session(result.session, interactive=False)
+        print(result.launch_hint)
 
     elif op == "ps":
         aggregation = runtime_dispatch.ps(roots=roots)
@@ -2028,10 +2028,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(f"removed {args.name}")
 
     elif op == "commit":
-        if lima.is_lima_run(run_paths(roots, args.name)):
-            raise PalimpsestError("native macOS Lima runs do not support commit; use palimpsest build")
-        result = commit(args.name, args.tag, roots=roots)
-        print(result["digest"])
+        result = runtime_dispatch.commit(args.name, args.tag, roots=roots)
+        print(result.digest)
     elif op == "ui":
         ui.serve(roots, port=args.port, open_browser=not args.no_browser)
         return 0

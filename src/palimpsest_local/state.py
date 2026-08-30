@@ -1411,6 +1411,38 @@ class ExistingRunMutation:
     def verify_binding(self) -> None:
         _verify_existing_run_mutation(self)
 
+    def read_ssh_trust_artifacts(self) -> tuple[bytes, bytes]:
+        """Read exact owner-only SSH bytes beneath this pinned run."""
+
+        self.verify_binding()
+        ssh_entry = _safe_stat("ssh", directory_fd=self._run_fd)
+        ssh_fd = _open_readonly_no_follow("ssh", directory_fd=self._run_fd, directory=True)
+        try:
+            ssh_open = None if ssh_fd is None else _safe_fstat(ssh_fd)
+            if (
+                ssh_entry is None
+                or ssh_fd is None
+                or ssh_open is None
+                or not stat_module.S_ISDIR(ssh_entry.st_mode)
+                or not stat_module.S_ISDIR(ssh_open.st_mode)
+                or ssh_entry.st_uid != os.geteuid()
+                or ssh_open.st_uid != os.geteuid()
+                or stat_module.S_IMODE(ssh_entry.st_mode) != 0o700
+                or stat_module.S_IMODE(ssh_open.st_mode) != 0o700
+                or _identity(ssh_entry) != _identity(ssh_open)
+            ):
+                raise StateError("run SSH trust artifacts changed during verification")
+            identity = _read_exact_private_file(ssh_fd, "id_ed25519")
+            known_hosts = _read_exact_private_file(ssh_fd, "known_hosts")
+            current = _safe_stat("ssh", directory_fd=self._run_fd)
+            if current is None or _identity(current) != _identity(ssh_open):
+                raise StateError("run SSH trust artifacts changed during verification")
+        finally:
+            if ssh_fd is not None:
+                _close_noerror(ssh_fd)
+        self.verify_binding()
+        return identity, known_hosts
+
     def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
         return _write_existing_run_mutation_state(self, status, data)
 
