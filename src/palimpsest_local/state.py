@@ -103,6 +103,11 @@ class StatePaths:
         return self.runtime_packs / "oci-derived-v1"
 
     @property
+    def oci_source_cas(self) -> Path:
+        """Private descriptor-verified source blobs for local OCI intake."""
+        return self.runtime_packs / "oci-source-v1"
+
+    @property
     def projects(self) -> Path:
         """Declarative ``palimpsest.yml`` project ledgers."""
         return self.state / "projects"
@@ -468,6 +473,7 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
         roots.build_cache,
         roots.runtime_packs,
         roots.oci_derived_store,
+        roots.oci_source_cas,
         roots.projects,
         roots.volumes,
     ):

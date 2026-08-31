@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import shutil
@@ -13,8 +14,11 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from .oci_packer import (
@@ -22,6 +26,7 @@ from .oci_packer import (
     SQUASHFS_PACK_POLICY_ID,
     VerifiedSquashFSToolchain,
 )
+from .oci_provenance import Descriptor, canonical_json_bytes
 from .oci_source import SnapshottedOCIImage
 from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
 from .oci_worker_protocol import (
@@ -58,6 +63,93 @@ class _WorkerBoundaryFailure(OCIHardWorkerError):
         self.process = process
         self.reaped = reaped
         super().__init__(code, detail)
+
+
+@dataclass(frozen=True, slots=True)
+class OCIImageMaterializationReceipt:
+    """Path-free, ordered result for one fully materialized OCI image graph."""
+
+    source_snapshot_binding_digest: str
+    source_image_digest: str
+    root_descriptor: Descriptor
+    manifest_digest: str
+    config_descriptor: Descriptor
+    platform_os: str
+    platform_architecture: str
+    layer_descriptors: tuple[Descriptor, ...]
+    layer_diff_ids: tuple[str, ...]
+    results: tuple[MaterializationResult, ...]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "source_snapshot_binding_digest",
+            "source_image_digest",
+            "manifest_digest",
+        ):
+            value = getattr(self, field_name)
+            try:
+                normalized = normalize_digest(value)
+            except (ArtifactValidationError, TypeError, ValueError):
+                raise OCIHardWorkerError("oci-image-receipt", "image materialization digest is invalid") from None
+            if normalized != value:
+                raise OCIHardWorkerError("oci-image-receipt", "image materialization digest is not canonical")
+        if not isinstance(self.root_descriptor, Descriptor) or not isinstance(self.config_descriptor, Descriptor):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization metadata is invalid")
+        if self.platform_os != "linux" or self.platform_architecture != "amd64":
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization platform is unsupported")
+        if (
+            not isinstance(self.layer_descriptors, tuple)
+            or any(not isinstance(descriptor, Descriptor) for descriptor in self.layer_descriptors)
+            or not isinstance(self.layer_diff_ids, tuple)
+            or len(self.layer_descriptors) != len(self.layer_diff_ids)
+        ):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization layer sources are invalid")
+        for diff_id in self.layer_diff_ids:
+            try:
+                normalized = normalize_digest(diff_id)
+            except (ArtifactValidationError, TypeError, ValueError):
+                raise OCIHardWorkerError("oci-image-receipt", "image materialization DiffID is invalid") from None
+            if normalized != diff_id:
+                raise OCIHardWorkerError("oci-image-receipt", "image materialization DiffID is not canonical")
+        if not isinstance(self.results, tuple) or not self.results:
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization results are invalid")
+        if any(not isinstance(result, MaterializationResult) for result in self.results):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization results are invalid")
+        if tuple(result.receipt.ordinal for result in self.results) != tuple(range(len(self.results))):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization order is invalid")
+        if len(self.results) != len(self.layer_descriptors):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization layer count is inconsistent")
+        if len({result.receipt.store_id for result in self.results}) != 1:
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization store binding is inconsistent")
+        if any(
+            result.receipt.source_snapshot_binding_digest != self.source_snapshot_binding_digest
+            or result.receipt.source_image_digest != self.source_image_digest
+            for result in self.results
+        ):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization source binding is inconsistent")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "config_descriptor": self.config_descriptor.to_dict(),
+            "layers": [
+                {"compressed": descriptor.to_dict(), "diff_id": diff_id, "ordinal": ordinal}
+                for ordinal, (descriptor, diff_id) in enumerate(
+                    zip(self.layer_descriptors, self.layer_diff_ids, strict=True)
+                )
+            ],
+            "manifest_digest": self.manifest_digest,
+            "platform": {"architecture": self.platform_architecture, "os": self.platform_os},
+            "retention": "none",
+            "results": [result.to_dict() for result in self.results],
+            "root_descriptor": self.root_descriptor.to_dict(),
+            "schema": "palimpsest.oci-image-materialization.v1",
+            "source_image_digest": self.source_image_digest,
+            "source_snapshot_binding_digest": self.source_snapshot_binding_digest,
+        }
+
+    @property
+    def digest(self) -> str:
+        return f"sha256:{hashlib.sha256(canonical_json_bytes(self.to_dict())).hexdigest()}"
 
 
 def _fixed_env() -> dict[str, str]:
@@ -368,4 +460,64 @@ def materialize_layer_hard(
             _cleanup_scratch(scratch, scratch_fd, scratch_parent)
 
 
-__all__ = ["OCIHardWorkerError", "materialize_layer_hard"]
+def materialize_image_hard(
+    image: SnapshottedOCIImage,
+    *,
+    source_cas_root: Path,
+    roots: StatePaths,
+    store: OCIStore,
+    packer_path: Path,
+    toolchain: VerifiedSquashFSToolchain,
+    timeout_seconds: float = 300.0,
+    terminate_grace_seconds: float = 1.0,
+) -> OCIImageMaterializationReceipt:
+    """Materialize every layer occurrence in order under one wall-clock deadline.
+
+    Results are immutable cache entries, not runtime leases.  If a later
+    occurrence fails, earlier cache entries may remain available for retry.
+    """
+    if not isinstance(image, SnapshottedOCIImage):
+        raise OCIHardWorkerError("oci-worker-input", "materializer image is invalid")
+    for value in (timeout_seconds, terminate_grace_seconds):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < float(value) < float("inf"):
+            raise OCIHardWorkerError("oci-worker-input", "materializer deadline is invalid")
+    started = time.monotonic()
+    results: list[MaterializationResult] = []
+    for ordinal in range(len(image.layers)):
+        remaining = float(timeout_seconds) - (time.monotonic() - started)
+        if remaining <= 0:
+            raise OCIHardWorkerError("oci-worker-timeout", "image materialization deadline expired")
+        result = materialize_layer_hard(
+            image,
+            ordinal,
+            source_cas_root=source_cas_root,
+            roots=roots,
+            store=store,
+            packer_path=packer_path,
+            toolchain=toolchain,
+            timeout_seconds=remaining,
+            terminate_grace_seconds=terminate_grace_seconds,
+        )
+        if time.monotonic() - started > float(timeout_seconds):
+            raise OCIHardWorkerError("oci-worker-timeout", "late image materialization success was discarded")
+        results.append(result)
+    return OCIImageMaterializationReceipt(
+        source_snapshot_binding_digest=image.binding_digest,
+        source_image_digest=image.image.digest,
+        root_descriptor=image.root.descriptor,
+        manifest_digest=image.image.manifest_descriptor.digest,
+        config_descriptor=image.config.descriptor,
+        platform_os=image.image.platform.os,
+        platform_architecture=image.image.platform.architecture,
+        layer_descriptors=tuple(layer.descriptor for layer in image.layers),
+        layer_diff_ids=tuple(layer.diff_id for layer in image.image.layers),
+        results=tuple(results),
+    )
+
+
+__all__ = [
+    "OCIHardWorkerError",
+    "OCIImageMaterializationReceipt",
+    "materialize_image_hard",
+    "materialize_layer_hard",
+]

@@ -280,6 +280,7 @@ def test_exact_nested_command_tree_and_defaults():
         "image",
         "layer",
         "bundle",
+        "oci",
         "build",
         "registry",
         "login",
@@ -348,6 +349,10 @@ def test_exact_nested_command_tree_and_defaults():
     assert build_args.network == "none"
     assert build_args.tag == ["layer"]
     assert parser.parse_args(["bundle", "pull", "sha256:" + "a" * 64, "--output", "out"]).include_base is False
+    oci_args = parser.parse_args(["oci", "materialize", "/tmp/image.oci.tar", "--manifest", "sha256:" + "a" * 64])
+    assert oci_args.platform == "linux/amd64"
+    assert oci_args.packer == Path("/usr/bin/mksquashfs")
+    assert oci_args.timeout == 300.0
 
 
 def test_parser_accepts_additive_buildkit_dockerfile_surface():
@@ -385,6 +390,80 @@ def test_parser_accepts_additive_buildkit_dockerfile_surface():
     assert parsed.offline is True
     assert parsed.network == "none"
     assert parsed.runtime_block_size == 262144
+
+
+def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real_state_home = tmp_path / "real-state-home"
+    real_state_home.mkdir()
+    state_home_alias = tmp_path / "state-home-alias"
+    state_home_alias.symlink_to(real_state_home, target_is_directory=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home_alias))
+    real_source = tmp_path / "real-source"
+    real_source.mkdir()
+    source_alias = tmp_path / "source-alias"
+    source_alias.symlink_to(real_source, target_is_directory=True)
+    archive = real_source / "image.oci.tar"
+    archive.write_bytes(b"archive")
+    packer = tmp_path / "mksquashfs"
+    packer.write_bytes(b"packer")
+    manifest = "sha256:" + "a" * 64
+    snapshot = object()
+    calls: dict[str, object] = {}
+
+    class FakeSource:
+        def __init__(self, *, archive: Path, root_digest: str):
+            calls["archive"] = archive
+            calls["root_digest"] = root_digest
+
+        def snapshot(self, reference, source_cas):
+            calls["reference"] = reference
+            calls["source_cas"] = source_cas
+            return snapshot
+
+    class FakeReceipt:
+        digest = "sha256:" + "b" * 64
+
+        def to_dict(self):
+            return {"schema": "palimpsest.oci-image-materialization.v1", "results": []}
+
+    def fake_materialize(selected, **kwargs):
+        calls["snapshot"] = selected
+        calls["materialize"] = kwargs
+        return FakeReceipt()
+
+    monkeypatch.setattr(cli, "LocalArchiveSource", FakeSource)
+    monkeypatch.setattr(cli, "OCIStore", lambda roots: ("store", roots))
+    monkeypatch.setattr(cli, "discover_squashfs_toolchain", lambda *args, **kwargs: (args, kwargs))
+    monkeypatch.setattr(cli, "materialize_image_hard", fake_materialize)
+
+    result = cli.main(
+        [
+            "oci",
+            "materialize",
+            str(source_alias / archive.name),
+            "--manifest",
+            manifest,
+            "--packer",
+            str(packer),
+            "--timeout",
+            "12",
+        ]
+    )
+
+    assert result == 0
+    assert calls["archive"] == archive.resolve()
+    assert calls["root_digest"] == manifest
+    assert calls["snapshot"] is snapshot
+    materialize = calls["materialize"]
+    assert isinstance(materialize, dict)
+    assert materialize["timeout_seconds"] == 12.0
+    assert materialize["roots"].state == (real_state_home / "palimpsest").resolve()
+    assert materialize["source_cas_root"] == (real_state_home / "palimpsest/runtime-packs/oci-source-v1").resolve()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["receipt_digest"] == FakeReceipt.digest
+    assert str(tmp_path) not in json.dumps(payload)
 
 
 def test_buildkit_offline_dispatch_never_constructs_hub_client(

@@ -30,7 +30,12 @@ from .digest import digest_file, digest_hex, require_digest
 from .errors import ArtifactValidationError, PalimpsestError
 from .hub import DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
 from .inventory import import_cloud_image
+from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
+from .oci_materializer import materialize_image_hard
+from .oci_packer import discover_squashfs_toolchain
+from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
+from .oci_store import OCIStore
 from .project import (
     DEFAULT_PROJECT_FILE,
     Project,
@@ -618,6 +623,16 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_verify = bundle_commands.add_parser("verify")
     bundle_verify.add_argument("directory", type=Path)
 
+    oci = commands.add_parser("oci")
+    oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
+    oci_materialize = oci_commands.add_parser("materialize")
+    oci_materialize.add_argument("source", type=Path)
+    oci_materialize.add_argument("--manifest", required=True)
+    oci_materialize.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
+    oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
+    oci_materialize.add_argument("--timeout", type=float, default=300.0)
+    oci_materialize.add_argument("--output", type=Path)
+
     build = commands.add_parser("build")
     build.add_argument("context", nargs="?", type=Path)
     build.add_argument("--frontend", choices=("auto", "palimpsestfile", "dockerfile"), default="auto")
@@ -832,6 +847,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if args.operation == "ui":
         if args.port != 0 and not 1024 <= args.port <= 65535:
             parser.error("--port must be 0 or between 1024 and 65535")
+    if args.operation == "oci" and not 0 < args.timeout < float("inf"):
+        parser.error("--timeout must be a positive finite number")
     if args.operation == "exec":
         if args.command[:1] == ["--"]:
             args.command = args.command[1:]
@@ -1376,8 +1393,57 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
     roots = resolve_roots() if op in read_only_root_operations else init_roots()
-    store = ContentStore(roots.store)
 
+    if op == "oci":
+        oci_roots = StatePaths(
+            config=roots.config.resolve(strict=True),
+            state=roots.state.resolve(strict=True),
+        )
+        manifest_digest = require_digest(args.manifest)
+        try:
+            source_path = args.source.expanduser().resolve(strict=True)
+        except OSError:
+            raise PalimpsestError(f"local OCI source does not exist: {args.source}") from None
+        try:
+            packer_path = args.packer.expanduser().resolve(strict=True)
+        except OSError:
+            raise PalimpsestError(f"SquashFS packer does not exist: {args.packer}") from None
+        if not packer_path.is_file():
+            raise PalimpsestError(f"SquashFS packer does not exist: {packer_path}")
+        source = (
+            LocalLayoutSource(layout=source_path, root_digest=manifest_digest)
+            if source_path.is_dir()
+            else LocalArchiveSource(archive=source_path, root_digest=manifest_digest)
+        )
+        reference = OCIImageRef(
+            registry="local.palimpsest.invalid",
+            repository="imported/image",
+            requested_reference=f"local.palimpsest.invalid/imported/image@{manifest_digest}",
+        )
+        source_cas = SourceCAS(oci_roots.oci_source_cas)
+        snapshot = source.snapshot(reference, source_cas)
+        toolchain = discover_squashfs_toolchain(
+            packer_path,
+            expected_packer_sha256=digest_hex(digest_file(packer_path)),
+        )
+        receipt = materialize_image_hard(
+            snapshot,
+            source_cas_root=oci_roots.oci_source_cas,
+            roots=oci_roots,
+            store=OCIStore(oci_roots),
+            packer_path=packer_path,
+            toolchain=toolchain,
+            timeout_seconds=args.timeout,
+        )
+        payload = {**receipt.to_dict(), "receipt_digest": receipt.digest}
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        if args.output is None:
+            sys.stdout.write(rendered)
+        else:
+            _write_generated_config(args.output, rendered, force=False)
+            print(args.output.expanduser().resolve(strict=False))
+        return 0
+    store = ContentStore(roots.store)
     if op == "registry":
         reg_op = args.registry_operation
         if reg_op == "ls":

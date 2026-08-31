@@ -17,13 +17,15 @@ import os
 import re
 import stat
 import sys
+import tarfile
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
 from .errors import ArtifactValidationError
@@ -47,6 +49,8 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_TEMP_MODE = 0o600
 _PRIVATE_BLOB_MODE = 0o400
 _PRIVATE_LOCK_MODE = 0o600
+_MAX_LOCAL_ARCHIVE_MEMBERS = 4096
+_OCI_ARCHIVE_BLOB_RE = re.compile(r"blobs/sha256/[0-9a-f]{64}\Z")
 
 _DIR_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -121,6 +125,42 @@ def _noop_checkpoint(_checkpoint: SnapshotCheckpoint) -> None:
 
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+@contextmanager
+def _open_absolute_regular_file(path: Path) -> Iterator[tuple[int, os.stat_result]]:
+    """Pin one absolute regular file and prove its visible binding on exit."""
+    if not isinstance(path, Path) or not path.is_absolute() or not path.name:
+        raise ArtifactValidationError("local OCI archive path must be absolute")
+    file_fd: int | None = None
+    with _open_absolute_directory(path.parent, _noop_checkpoint) as parent_fd:
+        try:
+            entry = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            file_fd = os.open(path.name, _READ_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(file_fd)
+        except OSError:
+            raise ArtifactValidationError("local OCI archive cannot be securely opened") from None
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _identity(entry) != _identity(opened)
+        ):
+            _close_noerror(file_fd)
+            raise ArtifactValidationError("local OCI archive is unsafe")
+        try:
+            yield file_fd, opened
+            try:
+                after = os.fstat(file_fd)
+                visible = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                raise ArtifactValidationError("local OCI archive changed during snapshot") from None
+            if _stable_metadata(opened) != _stable_metadata(after) or _stable_metadata(opened) != _stable_metadata(
+                visible
+            ):
+                raise ArtifactValidationError("local OCI archive changed during snapshot")
+        finally:
+            _close_noerror(file_fd)
 
 
 def _stable_metadata(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
@@ -1235,3 +1275,136 @@ class LocalLayoutSource:
             finally:
                 _close_noerror(sha256_fd)
                 _close_noerror(blobs_fd)
+
+
+def _canonical_archive_member(member: tarfile.TarInfo) -> str:
+    raw_name = member.name
+    if not isinstance(raw_name, str) or not raw_name or "\x00" in raw_name or "\\" in raw_name:
+        raise ArtifactValidationError("local OCI archive member name is invalid")
+    if raw_name.startswith("/"):
+        raise ArtifactValidationError("local OCI archive member path must be relative")
+    while raw_name.startswith("./"):
+        raw_name = raw_name[2:]
+    if member.isdir():
+        raw_name = raw_name.rstrip("/")
+    if not raw_name:
+        return "."
+    parts = raw_name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ArtifactValidationError("local OCI archive member path is not canonical")
+    canonical = PurePosixPath(*parts).as_posix()
+    if canonical != raw_name:
+        raise ArtifactValidationError("local OCI archive member path is not canonical")
+    return canonical
+
+
+def _write_archive_member(archive: tarfile.TarFile, member: tarfile.TarInfo, target: Path) -> None:
+    source = archive.extractfile(member)
+    if source is None:
+        raise ArtifactValidationError("local OCI archive member cannot be read")
+    target_fd: int | None = None
+    copied = 0
+    try:
+        target_fd = os.open(target, _TEMP_FLAGS, _PRIVATE_TEMP_MODE)
+        while copied < member.size:
+            chunk = source.read(min(_READ_CHUNK, member.size - copied))
+            if not chunk:
+                raise ArtifactValidationError("local OCI archive member ended before its declared size")
+            _write_all(target_fd, chunk)
+            copied += len(chunk)
+        if source.read(1):
+            raise ArtifactValidationError("local OCI archive member exceeds its declared size")
+        os.fsync(target_fd)
+    except OSError:
+        raise ArtifactValidationError("local OCI archive member cannot be staged") from None
+    finally:
+        source.close()
+        _close_noerror(target_fd)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalArchiveSource:
+    """One digest-pinned, uncompressed standard OCI image archive."""
+
+    archive: Path = field(repr=False)
+    root_digest: str
+    _checkpoint: Checkpoint = field(default=_noop_checkpoint, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.archive, Path) or not self.archive.is_absolute() or not self.archive.name:
+            raise ArtifactValidationError("local OCI archive path must be absolute")
+        if any(component in {"", ".", ".."} for component in self.archive.parts[1:]):
+            raise ArtifactValidationError("local OCI archive path must not contain relative components")
+        Descriptor(media_type="application/octet-stream", digest=self.root_digest, size=0)
+        if not callable(self._checkpoint):
+            raise ArtifactValidationError("local OCI archive checkpoint must be callable")
+
+    @classmethod
+    def parse(cls, value: str, *, checkpoint: Checkpoint = _noop_checkpoint) -> LocalArchiveSource:
+        prefix = "oci-archive://"
+        if not isinstance(value, str) or not value.startswith(prefix):
+            raise ArtifactValidationError("local OCI source must use oci-archive:///absolute/file@sha256:<digest>")
+        remainder = value[len(prefix) :]
+        if any(marker in remainder for marker in ("?", "#", "\x00")) or "@" not in remainder:
+            raise ArtifactValidationError("local OCI source URI contains unsupported query, fragment, or pin syntax")
+        raw_path, digest = remainder.rsplit("@", 1)
+        path = Path(raw_path)
+        if not raw_path.startswith("/") or not path.is_absolute():
+            raise ArtifactValidationError("local OCI source URI path must be absolute")
+        return cls(archive=path, root_digest=digest, _checkpoint=checkpoint)
+
+    def snapshot(self, reference: OCIImageRef, cas: SourceCAS) -> SnapshottedOCIImage:
+        if not isinstance(reference, OCIImageRef) or not isinstance(cas, SourceCAS):
+            raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
+        with _open_absolute_regular_file(self.archive) as (archive_fd, archive_metadata):
+            with tempfile.TemporaryDirectory(prefix="palimpsest-oci-archive-") as temporary:
+                # TemporaryDirectory may spell a platform alias such as macOS
+                # /var; canonicalize this process-created directory before the
+                # no-symlink layout walk.
+                layout = Path(temporary).resolve(strict=True)
+                os.chmod(layout, _PRIVATE_DIRECTORY_MODE)
+                (layout / "blobs" / "sha256").mkdir(parents=True, mode=_PRIVATE_DIRECTORY_MODE)
+                seen: set[str] = set()
+                content_bytes = 0
+                stream = os.fdopen(os.dup(archive_fd), "rb")
+                try:
+                    with tarfile.open(fileobj=stream, mode="r:") as tar:
+                        for member_index, member in enumerate(tar, start=1):
+                            if member_index > _MAX_LOCAL_ARCHIVE_MEMBERS:
+                                raise ArtifactValidationError("local OCI archive contains too many members")
+                            name = _canonical_archive_member(member)
+                            if name in seen:
+                                raise ArtifactValidationError("local OCI archive contains a duplicate member")
+                            seen.add(name)
+                            if member.isdir():
+                                if name not in {".", "blobs", "blobs/sha256"}:
+                                    raise ArtifactValidationError("local OCI archive contains an unexpected directory")
+                                continue
+                            if member.type not in {tarfile.REGTYPE, tarfile.AREGTYPE} or not member.isfile():
+                                raise ArtifactValidationError("local OCI archive contains a non-regular member")
+                            if (
+                                name not in {"oci-layout", "index.json"}
+                                and _OCI_ARCHIVE_BLOB_RE.fullmatch(name) is None
+                            ):
+                                raise ArtifactValidationError("local OCI archive contains an unexpected file")
+                            if type(member.size) is not int or member.size < 0:
+                                raise ArtifactValidationError("local OCI archive member size is invalid")
+                            content_bytes += member.size
+                            if content_bytes > archive_metadata.st_size:
+                                raise ArtifactValidationError("local OCI archive expands beyond its plain-tar bound")
+                            if name == "oci-layout" and member.size > 4096:
+                                raise ArtifactValidationError("local OCI archive marker exceeds its size limit")
+                            if name == "index.json" and member.size > MAX_IMAGE_JSON_BYTES:
+                                raise ArtifactValidationError("local OCI archive index exceeds its size limit")
+                            _write_archive_member(tar, member, layout.joinpath(*name.split("/")))
+                except (tarfile.TarError, EOFError):
+                    raise ArtifactValidationError("local OCI archive is not a valid uncompressed tar archive") from None
+                finally:
+                    stream.close()
+                if not {"oci-layout", "index.json"}.issubset(seen):
+                    raise ArtifactValidationError("local OCI archive is missing required layout metadata")
+                return LocalLayoutSource(
+                    layout=layout,
+                    root_digest=self.root_digest,
+                    _checkpoint=self._checkpoint,
+                ).snapshot(reference, cas)

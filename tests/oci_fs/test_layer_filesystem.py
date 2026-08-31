@@ -30,7 +30,7 @@ from palimpsest_local.oci_convert import (
 )
 from palimpsest_local.oci_converter import stage_layer
 from palimpsest_local.oci_image import OCIImageRef
-from palimpsest_local.oci_materializer import materialize_layer_hard
+from palimpsest_local.oci_materializer import materialize_image_hard, materialize_layer_hard
 from palimpsest_local.oci_packer import (
     PackedSquashFSReceipt,
     discover_squashfs_toolchain,
@@ -84,12 +84,17 @@ def _pack_staged_fixture(
 
 
 def _snapshot_fixture(root: Path, payload: bytes):
+    return _snapshot_fixtures(root, (payload,))
+
+
+def _snapshot_fixtures(root: Path, payloads: tuple[bytes, ...]):
     layout = root / "layout"
     blobs = layout / "blobs" / "sha256"
     blobs.mkdir(parents=True)
     (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}', encoding="utf-8")
-    layer = _descriptor(payload, OCI_LAYER_MEDIA_TYPE)
-    (blobs / layer.digest.removeprefix("sha256:")).write_bytes(payload)
+    layers = tuple(_descriptor(payload, OCI_LAYER_MEDIA_TYPE) for payload in payloads)
+    for layer, payload in zip(layers, payloads, strict=True):
+        (blobs / layer.digest.removeprefix("sha256:")).write_bytes(payload)
 
     def add_json(value: object, media_type: str) -> Descriptor:
         encoded = json.dumps(value, separators=(",", ":")).encode()
@@ -97,12 +102,12 @@ def _snapshot_fixture(root: Path, payload: bytes):
         (blobs / descriptor.digest.removeprefix("sha256:")).write_bytes(encoded)
         return descriptor
 
-    diff_id = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    diff_ids = [f"sha256:{hashlib.sha256(payload).hexdigest()}" for payload in payloads]
     config = add_json(
         {
             "architecture": "amd64",
             "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+            "rootfs": {"type": "layers", "diff_ids": diff_ids},
         },
         OCI_IMAGE_CONFIG_MEDIA_TYPE,
     )
@@ -111,7 +116,7 @@ def _snapshot_fixture(root: Path, payload: bytes):
             "schemaVersion": 2,
             "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
             "config": config.to_dict(),
-            "layers": [layer.to_dict()],
+            "layers": [layer.to_dict() for layer in layers],
         },
         OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     )
@@ -426,6 +431,54 @@ def test_hard_worker_materializes_then_reuses_a_local_oci_layer(tmp_path: Path) 
     with store.acquire_lease(cold.receipt, owner) as lease:
         materialized = b"".join(lease.chunks())
     assert hashlib.sha256(materialized).hexdigest() == cold.receipt.image_digest.removeprefix("sha256:")
+
+
+@pytest.mark.oci_fs
+def test_hard_worker_materializes_all_ordered_image_occurrences_cold_then_warm(tmp_path: Path) -> None:
+    """Prove an image-wide call does not deduplicate or reorder its layers."""
+    required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
+    try:
+        prerequisites = preflight_oci_filesystem_probe(FilesystemCandidate.SQUASHFS)
+    except UnsupportedPlatformError as exc:
+        reason = f"SquashFS image materialization proof unavailable: {exc}"
+        if required:
+            pytest.fail(reason)
+        pytest.skip(reason)
+    payloads = tuple((FIXTURES_DIR / name).read_bytes() for name in ("base_layer.tar", "leaf_layer.tar"))
+    source_root = tmp_path / "source"
+    _cas, image = _snapshot_fixtures(source_root, payloads)
+    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    store = OCIStore(roots)
+    packer = Path(prerequisites.packer)
+    toolchain = discover_squashfs_toolchain(
+        packer,
+        expected_packer_sha256=prerequisites.packer_sha256,
+    )
+
+    cold = materialize_image_hard(
+        image,
+        source_cas_root=source_root / "cas",
+        roots=roots,
+        store=store,
+        packer_path=packer,
+        toolchain=toolchain,
+        timeout_seconds=120,
+    )
+    warm = materialize_image_hard(
+        image,
+        source_cas_root=source_root / "cas",
+        roots=roots,
+        store=store,
+        packer_path=packer,
+        toolchain=toolchain,
+        timeout_seconds=120,
+    )
+
+    assert [result.receipt.ordinal for result in cold.results] == [0, 1]
+    assert [result.cache_result for result in cold.results] == ["cold_miss", "cold_miss"]
+    assert [result.cache_result for result in warm.results] == ["warm_hit", "warm_hit"]
+    assert [result.receipt for result in warm.results] == [result.receipt for result in cold.results]
+    assert cold.source_snapshot_binding_digest == image.binding_digest
 
 
 @pytest.mark.oci_fs

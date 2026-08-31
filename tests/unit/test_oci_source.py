@@ -10,12 +10,14 @@ import shutil
 import socket
 import stat
 import sys
+import tarfile
 import tempfile
 import threading
 from pathlib import Path
 
 import pytest
 
+import palimpsest_local.oci_materializer as oci_materializer
 import palimpsest_local.oci_source as oci_source
 from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_image import OCIImageRef
@@ -30,11 +32,13 @@ from palimpsest_local.oci_provenance import (
     Descriptor,
 )
 from palimpsest_local.oci_source import (
+    LocalArchiveSource,
     LocalLayoutSource,
     SnapshotCheckpoint,
     SnapshotStage,
     SourceCAS,
 )
+from palimpsest_local.oci_store import DerivedLayerReceipt, MaterializationResult
 
 
 def _ref(digest: str | None = None) -> OCIImageRef:
@@ -157,6 +161,32 @@ def _cas(tmp_path: Path) -> SourceCAS:
 
 def _target(cas_root: Path, descriptor: Descriptor) -> Path:
     return cas_root / "blobs" / "sha256" / descriptor.digest.split(":", 1)[1]
+
+
+def _write_oci_archive(layout: Path, archive: Path) -> None:
+    with tarfile.open(archive, "w") as stream:
+        for source in sorted(path for path in layout.rglob("*") if path.is_file()):
+            stream.add(source, arcname=source.relative_to(layout), recursive=False)
+
+
+def _derived_result(image, ordinal: int) -> MaterializationResult:
+    def digest(label: str) -> str:
+        return f"sha256:{hashlib.sha256(label.encode()).hexdigest()}"
+
+    return MaterializationResult(
+        receipt=DerivedLayerReceipt(
+            store_id="oci-store-v1:" + "1" * 64,
+            occurrence_digest=digest(f"occurrence-{ordinal}"),
+            record_digest=digest(f"record-{ordinal}"),
+            key_digest=digest(f"key-{ordinal}"),
+            source_snapshot_binding_digest=image.binding_digest,
+            source_image_digest=image.image.digest,
+            ordinal=ordinal,
+            image_digest=digest(f"image-{ordinal}"),
+            image_size=ordinal + 1,
+        ),
+        cache_result="cold_miss",
+    )
 
 
 def test_open_existing_reuses_identity_without_mutation(tmp_path: Path) -> None:
@@ -977,3 +1007,172 @@ def test_cas_component_replacement_prevents_receipt_and_preserves_replacement(tm
         assert list((cas_root / "locks").iterdir()) == []
         old_blob_dir = cas_root / "blobs" / "sha256"
     assert not list(old_blob_dir.glob(".source-tmp-*"))
+
+
+def test_local_archive_selects_same_ordered_graph_as_layout(tmp_path: Path) -> None:
+    layout, manifest, config, layers = _direct_layout(
+        tmp_path / "layout",
+        layer_payloads=(b"first", b"second"),
+    )
+    archive = tmp_path / "image.oci.tar"
+    _write_oci_archive(layout.root, archive)
+
+    from_layout = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "layout-cas"))
+    from_archive = LocalArchiveSource.parse(f"oci-archive://{archive}@{manifest.digest}").snapshot(
+        _ref(), SourceCAS(tmp_path / "archive-cas")
+    )
+
+    assert from_archive.image.digest == from_layout.image.digest
+    assert from_archive.manifest.descriptor == manifest
+    assert from_archive.config.descriptor == config
+    assert tuple(item.descriptor for item in from_archive.layers) == layers
+    assert [item.ordinal for item in from_archive.image.layers] == [0, 1]
+
+
+def test_local_archive_preserves_repeated_descriptor_occurrences(tmp_path: Path) -> None:
+    layout, manifest, _, layers = _direct_layout(tmp_path / "layout", repeated=True)
+    archive = tmp_path / "repeated.oci.tar"
+    _write_oci_archive(layout.root, archive)
+
+    image = LocalArchiveSource(archive=archive, root_digest=manifest.digest).snapshot(
+        _ref(), SourceCAS(tmp_path / "archive-cas")
+    )
+
+    assert len(image.layers) == 2
+    assert image.layers[0] == image.layers[1]
+    assert tuple(item.descriptor for item in image.layers) == layers
+    assert [item.ordinal for item in image.image.layers] == [0, 1]
+
+
+def test_local_archive_index_selects_only_exact_linux_amd64_graph(tmp_path: Path) -> None:
+    layout, index, manifest, config, layer = _index_layout(tmp_path / "layout")
+    archive = tmp_path / "indexed.oci.tar"
+    _write_oci_archive(layout.root, archive)
+
+    image = LocalArchiveSource(archive=archive, root_digest=index.digest).snapshot(
+        _ref(index.digest), SourceCAS(tmp_path / "archive-cas")
+    )
+
+    assert image.root.descriptor == index
+    assert image.manifest.descriptor == manifest
+    assert image.config.descriptor == config
+    assert tuple(item.descriptor for item in image.layers) == (layer,)
+
+
+def test_local_archive_same_inode_mutation_before_result_returns_no_snapshot(tmp_path: Path) -> None:
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout")
+    archive = tmp_path / "mutable.oci.tar"
+    _write_oci_archive(layout.root, archive)
+    changed = False
+
+    def checkpoint(item: SnapshotCheckpoint) -> None:
+        nonlocal changed
+        if item.stage is SnapshotStage.BEFORE_RESULT and not changed:
+            changed = True
+            with archive.open("r+b") as stream:
+                stream.seek(-1, os.SEEK_END)
+                stream.write(b"x")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    source = LocalArchiveSource(archive, manifest.digest, checkpoint)
+    with pytest.raises(ArtifactValidationError, match="changed during snapshot"):
+        source.snapshot(_ref(), SourceCAS(tmp_path / "archive-cas"))
+    assert changed is True
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "symlink", "unexpected", "compressed"])
+def test_local_archive_rejects_ambiguous_or_non_plain_members(tmp_path: Path, kind: str) -> None:
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout")
+    archive = tmp_path / "bad.oci.tar"
+    if kind == "compressed":
+        with tarfile.open(archive, "w:gz") as stream:
+            stream.add(layout.root / "oci-layout", arcname="oci-layout")
+    else:
+        _write_oci_archive(layout.root, archive)
+        with tarfile.open(archive, "a") as stream:
+            if kind == "duplicate":
+                stream.add(layout.root / "oci-layout", arcname="oci-layout", recursive=False)
+            elif kind == "symlink":
+                member = tarfile.TarInfo("alias")
+                member.type = tarfile.SYMTYPE
+                member.linkname = "oci-layout"
+                stream.addfile(member)
+            else:
+                member = tarfile.TarInfo("repositories")
+                member.size = 0
+                stream.addfile(member)
+
+    with pytest.raises(ArtifactValidationError):
+        LocalArchiveSource(archive=archive, root_digest=manifest.digest).snapshot(
+            _ref(), SourceCAS(tmp_path / "archive-cas")
+        )
+
+
+def test_materialize_image_hard_preserves_every_occurrence_and_canonical_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", repeated=True)
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    calls: list[tuple[int, float]] = []
+
+    def fake_materialize(selected, ordinal, **kwargs):
+        assert selected is image
+        calls.append((ordinal, kwargs["timeout_seconds"]))
+        return _derived_result(image, ordinal)
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", fake_materialize)
+    receipt = oci_materializer.materialize_image_hard(
+        image,
+        source_cas_root=tmp_path / "source-cas",
+        roots=object(),
+        store=object(),
+        packer_path=Path("/usr/bin/mksquashfs"),
+        toolchain=object(),
+        timeout_seconds=10.0,
+    )
+
+    assert [ordinal for ordinal, _ in calls] == [0, 1]
+    assert all(0 < remaining <= 10.0 for _, remaining in calls)
+    assert [result.receipt.ordinal for result in receipt.results] == [0, 1]
+    assert receipt.source_snapshot_binding_digest == image.binding_digest
+    assert receipt.manifest_digest == manifest.digest
+    payload = receipt.to_dict()
+    assert payload["retention"] == "none"
+    assert payload["root_descriptor"] == manifest.to_dict()
+    assert payload["config_descriptor"] == image.config.descriptor.to_dict()
+    assert [layer["ordinal"] for layer in payload["layers"]] == [0, 1]
+    assert payload["layers"][0]["compressed"] == payload["layers"][1]["compressed"]
+    expected_digest = (
+        "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    )
+    assert receipt.digest == expected_digest
+    serialized = json.dumps(payload, sort_keys=True)
+    assert os.fspath(tmp_path) not in serialized
+
+
+def test_materialize_image_hard_stops_after_first_failed_occurrence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"one", b"two", b"three"))
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    calls: list[int] = []
+
+    def fake_materialize(selected, ordinal, **_kwargs):
+        calls.append(ordinal)
+        if ordinal == 1:
+            raise oci_materializer.OCIHardWorkerError("oci-worker-test", "injected failure")
+        return _derived_result(selected, ordinal)
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", fake_materialize)
+    with pytest.raises(oci_materializer.OCIHardWorkerError, match="injected failure"):
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+        )
+
+    assert calls == [0, 1]

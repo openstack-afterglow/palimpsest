@@ -22,6 +22,18 @@ PALIMPSEST_BUILDKIT_BUILDER=palimpsest-e2e \
 uv run pytest -q tests/integration/test_buildkit_named_oci_context.py
 ```
 
+## Intake/materialization checkpoint
+
+The first-party bridge between Gate 1's OCI archive and the future boot plan is now explicit on Linux:
+
+```sh
+palimpsest oci materialize ./image.oci.tar \
+  --manifest sha256:<index-or-manifest> \
+  --output ./materialization.json
+```
+
+A standard OCI layout directory can replace the archive path. The command selects exactly `linux/amd64`, verifies the pinned descriptor graph into the private source CAS, and materializes every layer occurrence in manifest order through the hard-worker boundary. Repeated descriptors retain distinct ordinals. The output is a path-free derived-cache receipt, not a boot plan or runtime lease. On macOS, source intake is portable but real materialization intentionally fails at the Linux-only worker/toolchain boundary.
+
 ## Gate 2: OCI root `/` in a detached VM
 
 Gate 2 is intentionally opt-in until the OCI-root KVM adapter is implemented. It is split across two hosts so the runtime proof cannot reach Docker:
@@ -33,7 +45,7 @@ Gate 2 is intentionally opt-in until the OCI-root KVM adapter is implemented. It
 5. `palimpsest exec` runs the image-baked probe, which proves the random marker is visible both at `/` and through `/proc/1/root/`.
 6. The test requires a running libvirt domain, stops and removes the VM, and proves the domain and run-owned state are gone while the immutable archive remains.
 
-The gate must not be enabled merely because layer materialization succeeds. Activation additionally requires local OCI archive/layout intake, a bootable OCI-root KVM request, host kernel/initramfs policy, the OCI init supervisor, detached lifecycle support, and `exec` readiness. The KVM runtime job rejects standard local Docker sockets, replaces `docker` in `PATH` with a failing audit shim, and points `DOCKER_HOST` at a nonexistent socket. It also requires a running libvirt domain with the run name and verifies that removal undefines it.
+The gate must not be enabled merely because layer materialization succeeds. Local OCI archive/layout intake and ordered materialization now exist, but activation additionally requires durable boot-plan leases, a bootable OCI-root KVM request, host kernel/initramfs policy, VM-specific writable root volume ownership, the OCI init supervisor, detached lifecycle support, and `exec` readiness. The KVM runtime job rejects standard local Docker sockets, replaces `docker` in `PATH` with a failing audit shim, and points `DOCKER_HOST` at a nonexistent socket. It also requires a running libvirt domain with the run name and verifies that removal undefines it.
 
 On the BuildKit host, provide a bootable local OCI base pinned as `PATH@sha256:<manifest>` and create the transfer artifact:
 

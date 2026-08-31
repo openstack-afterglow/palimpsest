@@ -58,6 +58,9 @@ def test_nested_completion_candidates():
     assert "--quiet" in compose_config_candidates
     assert "--services" in compose_config_candidates
 
+    assert "materialize" in completion.resolve_candidates(parser, ["oci", ""])
+    assert "--manifest" in completion.resolve_candidates(parser, ["oci", "materialize", "--"])
+
 
 def test_option_and_choices_completion():
     parser = cli.build_parser()
@@ -308,6 +311,7 @@ def test_exact_top_level_command_set():
         "image",
         "layer",
         "bundle",
+        "oci",
         "build",
         "registry",
         "login",

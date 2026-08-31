@@ -302,6 +302,34 @@ Verification recorded for this slice:
 - Complete local `tests` tree: 2173 passed, 15 skipped; the skips are environment-gated Linux/KVM/product cases.
 - Product-level local BuildKit gate: 2 passed with `PALIMPSEST_BUILDKIT_E2E=1`.
 
+### PR 4 slice 8: first-party local OCI intake and ordered image materialization
+
+Implemented:
+
+- `LocalArchiveSource` accepts a digest-pinned, uncompressed standard OCI image-layout tar. It pins the archive as a no-follow regular file, rejects links/devices/duplicates/noncanonical names and unexpected files, bounds member count and plain-tar expansion, stages only the OCI layout whitelist, then reuses `LocalLayoutSource` for strict JSON, platform, descriptor size/SHA-256, and selected-graph verification.
+- Layout and archive intake both preserve manifest layer occurrence order. A repeated descriptor is stored once in the source CAS but remains two ordinal occurrences in the selected image.
+- `materialize_image_hard` invokes the existing Linux exec-worker boundary for every ordinal under one image-wide monotonic deadline. It does not digest-deduplicate occurrences. Its canonical path-free receipt binds source snapshot/image, selected manifest, exact `linux/amd64` platform, store-bound per-occurrence receipts, order, and invocation-local cold/warm result.
+- Partial success is explicitly immutable derived-cache state, not a runtime lease. If a later occurrence fails, earlier cache entries may remain for retry; this slice does not claim boot retention or activation.
+- The additive CLI entry point is:
+
+  ```text
+  palimpsest oci materialize IMAGE.OCI.TAR \
+    --manifest sha256:<pinned-index-or-manifest> \
+    [--packer /usr/bin/mksquashfs] [--timeout 300] [--output receipt.json]
+  ```
+
+  A layout directory is accepted in the same position. Existing `run` semantics are unchanged.
+- Portable tests cover archive/layout equivalence, exact `linux/amd64` index selection, repeated occurrences, archive mutation and ambiguous-member rejection, CLI dispatch, path-free receipt output, ordered orchestration, and fail-stop behavior. The Linux OCI filesystem suite adds a real two-layer image-wide cold-then-warm hard-worker proof.
+
+Verification recorded for this slice:
+
+- Complete local `tests` tree: 2184 passed, 16 skipped; skips are the intentionally gated Linux/KVM/BuildKit/filesystem cases on macOS.
+- Focused source/CLI/completion/state/worker/filesystem suite after path-alias correction: 321 passed, 6 skipped.
+- Ruff lint and format, Python compile, `git diff --check`, sdist, and wheel build: pass.
+- The repository-wide bare `pytest` command additionally discovers the separately packaged Hub tests and cannot collect them in the root-only environment without Hub dependencies; the established root product boundary is `pytest tests`.
+
+Scope boundary: this receipt is not yet an OCI-root boot plan. Durable lower leases, VM-specific writable root volume, retained boot-volume reuse, kernel/initramfs, stage-1 pivot, init supervision, and foreground/`-d` runtime lifecycle remain subsequent slices. Gate 2 stays inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -322,7 +350,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add first-party local OCI archive/layout intake and materialize every ordered occurrence through the hard-worker API.
-2. Define the OCI-root boot plan: immutable lower leases, VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
+1. Bind the ordered receipt set to durable immutable-lower leases and define the OCI-root boot plan: VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
+2. Implement boot-plan recovery and rollback so failed creation cannot leak run ownership or lose retained reusable volumes.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
