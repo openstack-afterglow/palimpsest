@@ -82,6 +82,33 @@ DEFAULT_SQUASHFS_PACK_POLICY = SquashFSPackPolicy()
 
 
 @dataclass(frozen=True, slots=True)
+class SquashFSPackExecution:
+    """Process/scratch boundary selected by an outer hard supervisor."""
+
+    scratch_root: Path | None = field(default=None, repr=False)
+    inherit_process_group: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.inherit_process_group) is not bool:
+            raise SquashFSPackError("oci-pack-execution", "process-group policy is invalid")
+        if not self.inherit_process_group:
+            if self.scratch_root is not None:
+                raise SquashFSPackError("oci-pack-execution", "standalone packing cannot use supervisor scratch")
+            return
+        if not isinstance(self.scratch_root, Path) or not self.scratch_root.is_absolute():
+            raise SquashFSPackError("oci-pack-execution", "supervisor scratch root is invalid")
+        try:
+            opened = os.stat(self.scratch_root, follow_symlinks=False)
+        except OSError:
+            raise SquashFSPackError("oci-pack-execution", "supervisor scratch root is unavailable") from None
+        if not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o700:
+            raise SquashFSPackError("oci-pack-execution", "supervisor scratch root is unsafe")
+
+
+DEFAULT_SQUASHFS_PACK_EXECUTION = SquashFSPackExecution()
+
+
+@dataclass(frozen=True, slots=True)
 class SquashFSToolchainIdentity:
     """Path-free identity for the executable and linked packer dependencies."""
 
@@ -420,9 +447,17 @@ def _pin_packer(source_path: Path, directory_fd: int) -> tuple[Path, str]:
             os.close(destination_fd)
 
 
-def _terminate_process(process: subprocess.Popen[bytes], grace_seconds: float) -> None:
+def _terminate_process(
+    process: subprocess.Popen[bytes],
+    grace_seconds: float,
+    *,
+    owns_process_group: bool,
+) -> None:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        if owns_process_group:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
     except (OSError, ProcessLookupError):
         pass
     try:
@@ -431,7 +466,10 @@ def _terminate_process(process: subprocess.Popen[bytes], grace_seconds: float) -
     except subprocess.TimeoutExpired:
         pass
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        if owns_process_group:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
     except (OSError, ProcessLookupError):
         pass
     process.wait()
@@ -446,6 +484,7 @@ def _run_pinned(
     timeout_seconds: float,
     grace_seconds: float,
     capture_output: bool = False,
+    execution: SquashFSPackExecution = DEFAULT_SQUASHFS_PACK_EXECUTION,
 ) -> tuple[int, bytes]:
     diagnostics: BinaryIO | None = None
     try:
@@ -463,18 +502,26 @@ def _run_pinned(
                 stderr=output_target,
                 close_fds=True,
                 pass_fds=(executable_fd, cwd_fd),
-                start_new_session=True,
+                start_new_session=not execution.inherit_process_group,
             )
         except OSError:
             raise SquashFSPackError("oci-packer-spawn", "filesystem packer could not be started") from None
         try:
             return_code = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            _terminate_process(process, grace_seconds)
+            _terminate_process(
+                process,
+                grace_seconds,
+                owns_process_group=not execution.inherit_process_group,
+            )
             raise SquashFSPackError("oci-packer-timeout", "filesystem packer exceeded its deadline") from None
         except BaseException as primary:
             try:
-                _terminate_process(process, grace_seconds)
+                _terminate_process(
+                    process,
+                    grace_seconds,
+                    owns_process_group=not execution.inherit_process_group,
+                )
             except BaseException as cleanup:
                 raise BaseExceptionGroup("filesystem packer interruption cleanup failed", [primary, cleanup]) from None
             raise
@@ -494,6 +541,7 @@ def _packer_version(
     executable_fd: int,
     cwd_fd: int,
     policy: SquashFSPackPolicy,
+    execution: SquashFSPackExecution = DEFAULT_SQUASHFS_PACK_EXECUTION,
 ) -> str:
     return_code, output = _run_pinned(
         executable_fd,
@@ -503,6 +551,7 @@ def _packer_version(
         timeout_seconds=min(30.0, float(policy.packer_timeout_seconds)),
         grace_seconds=float(policy.terminate_grace_seconds),
         capture_output=True,
+        execution=execution,
     )
     if return_code != 0:
         raise SquashFSPackError("oci-packer-version", "filesystem packer version check failed")
@@ -723,11 +772,16 @@ def pack_staged_squashfs(
     expected_packer_sha256: str,
     policy: SquashFSPackPolicy = DEFAULT_SQUASHFS_PACK_POLICY,
     toolchain: VerifiedSquashFSToolchain | None = None,
+    execution: SquashFSPackExecution = DEFAULT_SQUASHFS_PACK_EXECUTION,
 ) -> Iterator[LeasedSquashFS]:
     """Emit, pack, structurally verify and lease one normalized SquashFS image."""
     if os.name != "posix" or not sys.platform.startswith("linux"):
         raise UnsupportedPlatformError("Staged SquashFS packing requires Linux FD-bound execution")
-    if not isinstance(staged, StagedLayer) or not isinstance(policy, SquashFSPackPolicy):
+    if (
+        not isinstance(staged, StagedLayer)
+        or not isinstance(policy, SquashFSPackPolicy)
+        or not isinstance(execution, SquashFSPackExecution)
+    ):
         raise SquashFSPackError("oci-pack-input", "staged layer or pack policy is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", expected_packer_sha256 or "") is None:
         raise SquashFSPackError("oci-packer-digest", "expected packer SHA-256 is invalid")
@@ -742,7 +796,12 @@ def pack_staged_squashfs(
     toolchain.verify(packer_path, expected_packer_sha256)
 
     try:
-        directory = Path(tempfile.mkdtemp(prefix="palimpsest-oci-pack-"))
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix="palimpsest-oci-pack-",
+                dir=execution.scratch_root,
+            )
+        )
     except OSError:
         raise SquashFSPackError("oci-pack-private", "private pack directory could not be created") from None
     directory_fd = -1
@@ -764,7 +823,7 @@ def pack_staged_squashfs(
             raise SquashFSPackError("oci-packer-digest", "pinned packer digest does not match the selected toolchain")
         pinned_fd = _open_pinned_packer(directory_fd)
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
-        version = _packer_version(pinned_fd, directory_fd, policy)
+        version = _packer_version(pinned_fd, directory_fd, policy, execution)
         if toolchain.identity.version != version or toolchain.identity.executable_digest != f"sha256:{pinned_digest}":
             raise SquashFSPackError("oci-packer-toolchain", "selected packer does not match its toolchain identity")
         toolchain.verify(packer_path, expected_packer_sha256)
@@ -808,6 +867,7 @@ def pack_staged_squashfs(
                 stdin=normalized_tar,
                 timeout_seconds=float(policy.packer_timeout_seconds),
                 grace_seconds=float(policy.terminate_grace_seconds),
+                execution=execution,
             )
         if return_code != 0:
             raise SquashFSPackError("oci-packer-exit", "filesystem packer returned a nonzero status")
@@ -931,6 +991,7 @@ def pack_staged_squashfs(
 
 __all__ = [
     "DEFAULT_SQUASHFS_PACK_POLICY",
+    "DEFAULT_SQUASHFS_PACK_EXECUTION",
     "SQUASHFS_PACK_POLICY_ID",
     "SQUASHFS_PACKER_ARGV_CONTRACT_ID",
     "SQUASHFS_STRUCTURAL_VERIFIER_ID",
@@ -938,6 +999,7 @@ __all__ = [
     "LeasedSquashFS",
     "PackedSquashFSReceipt",
     "SquashFSPackError",
+    "SquashFSPackExecution",
     "SquashFSPackPolicy",
     "SquashFSToolchainIdentity",
     "VerifiedSquashFSToolchain",

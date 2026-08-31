@@ -24,6 +24,15 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python -m pytest tests/unit -v
+      - run: docker buildx create --name palimpsest-e2e --driver docker-container --driver-opt network=none --use --bootstrap
+      - name: Verify local OCI product build
+        env:
+          PALIMPSEST_BUILDKIT_E2E: "1"
+          PALIMPSEST_BUILDKIT_BUILDER: palimpsest-e2e
+        run: uv run python -m pytest tests/integration/test_buildkit_named_oci_context.py -vv
+      - name: Remove test builder
+        if: always()
+        run: docker buildx rm palimpsest-e2e || true
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz

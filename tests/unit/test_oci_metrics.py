@@ -31,7 +31,7 @@ def _run_id() -> str:
 def _result(cache_result: str = "cold_miss") -> MaterializationResult:
     return MaterializationResult(
         receipt=DerivedLayerReceipt(
-            store_id=_digest("0"),
+            store_id="oci-store-v1:" + "0" * 64,
             occurrence_digest=_digest("1"),
             record_digest=_digest("2"),
             key_digest=_digest("3"),

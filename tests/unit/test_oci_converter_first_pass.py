@@ -36,6 +36,7 @@ from palimpsest_local.oci_packer import (
     SQUASHFS_PACK_POLICY_ID,
     SQUASHFS_STRUCTURAL_VERIFIER_ID,
     SquashFSPackError,
+    SquashFSPackExecution,
     SquashFSPackPolicy,
     pack_staged_squashfs,
 )
@@ -674,6 +675,76 @@ def test_packer_interruption_terminates_and_reaps_the_process_group(
 
     assert process.waits == 2
     assert signals == [(process.pid, oci_packer.signal.SIGTERM)]
+
+
+def test_supervised_packer_inherits_outer_group_and_terminates_only_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimedOutProcess:
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.waits = 0
+            self.terminated = 0
+            self.killed = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise oci_packer.subprocess.TimeoutExpired("mksquashfs", timeout)
+            return 0
+
+        def terminate(self) -> None:
+            self.terminated += 1
+
+        def kill(self) -> None:
+            self.killed += 1
+
+    process = TimedOutProcess()
+    popen_options: dict[str, object] = {}
+    kill_groups: list[tuple[int, int]] = []
+
+    def popen(*_args, **kwargs):
+        popen_options.update(kwargs)
+        return process
+
+    scratch = tmp_path / "worker"
+    scratch.mkdir(mode=0o700)
+    execution = SquashFSPackExecution(scratch_root=scratch, inherit_process_group=True)
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", popen)
+    monkeypatch.setattr(oci_packer.os, "killpg", lambda pid, sig: kill_groups.append((pid, sig)))
+
+    with pytest.raises(SquashFSPackError, match="oci-packer-timeout"):
+        oci_packer._run_pinned(
+            1,
+            ["-version"],
+            cwd_fd=2,
+            stdin=oci_packer.subprocess.DEVNULL,
+            timeout_seconds=1,
+            grace_seconds=1,
+            execution=execution,
+        )
+
+    assert popen_options["start_new_session"] is False
+    assert process.terminated == 1
+    assert process.killed == 0
+    assert kill_groups == []
+
+
+def test_supervised_packer_execution_requires_owner_private_absolute_scratch(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    assert SquashFSPackExecution(private.resolve(), True).scratch_root == private.resolve()
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o755)
+    with pytest.raises(SquashFSPackError, match="unsafe"):
+        SquashFSPackExecution(unsafe.resolve(), True)
+    with pytest.raises(SquashFSPackError, match="invalid"):
+        SquashFSPackExecution(Path("relative"), True)
+    with pytest.raises(SquashFSPackError, match="cannot use supervisor scratch"):
+        SquashFSPackExecution(private.resolve(), False)
 
 
 def test_structural_verifier_rejects_missing_required_tables() -> None:

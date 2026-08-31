@@ -14,6 +14,7 @@ import errno
 import fcntl
 import hashlib
 import os
+import re
 import stat
 import sys
 import threading
@@ -316,6 +317,30 @@ def _ensure_private_root(path: Path) -> Path:
     return absolute
 
 
+def _open_existing_private_root(path: Path) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if absolute == Path("/") or not absolute.name:
+        raise ArtifactValidationError("source CAS root must be a private child directory")
+    with _open_absolute_directory(absolute.parent, _noop_checkpoint) as parent_fd:
+        root_fd: int | None = None
+        try:
+            root_fd = os.open(absolute.name, _DIR_FLAGS, dir_fd=parent_fd)
+            opened = os.fstat(root_fd)
+            entry = os.stat(absolute.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            raise ArtifactValidationError("existing source CAS is unavailable") from None
+        finally:
+            _close_noerror(root_fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != _PRIVATE_DIRECTORY_MODE
+            or _identity(opened) != _identity(entry)
+        ):
+            raise ArtifactValidationError("existing source CAS root is unsafe")
+    return absolute
+
+
 def _ensure_private_child(parent_fd: int, name: str) -> int:
     created = False
     try:
@@ -345,6 +370,28 @@ def _ensure_private_child(parent_fd: int, name: str) -> int:
         if "child_fd" in locals():
             _close_noerror(child_fd)
         raise ArtifactValidationError("cannot create private source-CAS component") from None
+
+
+def _open_existing_private_child(parent_fd: int, name: str) -> int:
+    child_fd: int | None = None
+    try:
+        child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(child_fd)
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != _PRIVATE_DIRECTORY_MODE
+            or _identity(opened) != _identity(entry)
+        ):
+            raise ArtifactValidationError("existing source CAS component is unsafe")
+        return child_fd
+    except ArtifactValidationError:
+        _close_noerror(child_fd)
+        raise
+    except OSError:
+        _close_noerror(child_fd)
+        raise ArtifactValidationError("existing source CAS component is unavailable") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,12 +649,24 @@ class LeasedSourceLayer:
 class SourceCAS:
     """Owner-only CAS authority used to reopen verified source snapshots."""
 
-    def __init__(self, root: Path):
-        self._root = _ensure_private_root(root)
+    def __init__(self, root: Path, *, _create_missing: bool = True):
+        if type(_create_missing) is not bool:
+            raise ArtifactValidationError("source CAS creation policy is invalid")
+        self._create_missing = _create_missing
+        self._root = _ensure_private_root(root) if _create_missing else _open_existing_private_root(root)
         with self._authority() as authority:
             pass
         self._cas_id = authority.cas_id
         self._signature = authority.signature
+
+    @classmethod
+    def open_existing(cls, root: Path, *, expected_cas_id: str) -> SourceCAS:
+        if not isinstance(expected_cas_id, str) or re.fullmatch(r"source-cas-v1:[0-9a-f]{64}", expected_cas_id) is None:
+            raise ArtifactValidationError("expected source CAS identity is invalid")
+        authority = cls(root, _create_missing=False)
+        if authority.identity != expected_cas_id:
+            raise ArtifactValidationError("existing source CAS identity does not match")
+        return authority
 
     @property
     def identity(self) -> str:
@@ -661,9 +720,10 @@ class SourceCAS:
                     or stat.S_IMODE(root_stat.st_mode) != _PRIVATE_DIRECTORY_MODE
                 ):
                     raise ArtifactValidationError("source CAS authority changed")
-                blobs_parent_fd = _ensure_private_child(root_fd, "blobs")
-                blobs_fd = _ensure_private_child(blobs_parent_fd, "sha256")
-                locks_fd = _ensure_private_child(root_fd, "locks")
+                child_opener = _ensure_private_child if self._create_missing else _open_existing_private_child
+                blobs_parent_fd = child_opener(root_fd, "blobs")
+                blobs_fd = child_opener(blobs_parent_fd, "sha256")
+                locks_fd = child_opener(root_fd, "locks")
                 signature = tuple(
                     _private_directory_signature(os.fstat(file_fd))
                     for file_fd in (root_fd, blobs_parent_fd, blobs_fd, locks_fd)

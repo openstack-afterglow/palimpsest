@@ -107,6 +107,14 @@ def _digest_bytes(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def _exact_wire_fields(data: Any, expected: set[str], field_name: str) -> dict[str, Any]:
+    if not isinstance(data, dict) or any(not isinstance(name, str) for name in data):
+        raise OCIStoreError("oci-store-wire", f"{field_name} must be an object")
+    if set(data) != expected:
+        raise OCIStoreError("oci-store-wire", f"{field_name} fields are invalid")
+    return data
+
+
 def _raise_with_cleanup(
     primary: BaseException,
     label: str,
@@ -218,6 +226,37 @@ class DerivedLayerOccurrence:
             "media_type": self.media_type,
         }
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "compressed_digest": self.compressed_digest,
+            "compressed_size": self.compressed_size,
+            "diff_id": self.diff_id,
+            "media_type": self.media_type,
+            "ordinal": self.ordinal,
+            "source_image_digest": self.source_image_digest,
+            "source_snapshot_binding_digest": self.source_snapshot_binding_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> DerivedLayerOccurrence:
+        fields = {
+            "compressed_digest",
+            "compressed_size",
+            "diff_id",
+            "media_type",
+            "ordinal",
+            "source_image_digest",
+            "source_snapshot_binding_digest",
+        }
+        value = _exact_wire_fields(data, fields, "derived occurrence")
+        try:
+            occurrence = cls(**value)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-wire", "derived occurrence is invalid") from None
+        if occurrence.to_dict() != value:
+            raise OCIStoreError("oci-store-wire", "derived occurrence is not canonical")
+        return occurrence
+
 
 @dataclass(frozen=True, slots=True)
 class DerivedSquashFSKey:
@@ -315,6 +354,41 @@ class DerivedSquashFSKey:
         value["packer_dependency_digests"] = list(self.packer_dependency_digests)
         return value
 
+    @classmethod
+    def from_dict(cls, data: Any) -> DerivedSquashFSKey:
+        fields = {
+            "compressed_digest",
+            "compressed_size",
+            "diff_id",
+            "domain",
+            "intake_policy_fingerprint",
+            "intake_policy_id",
+            "normalization_contract_id",
+            "pack_policy_fingerprint",
+            "pack_policy_id",
+            "packer_contract_id",
+            "packer_dependency_digests",
+            "packer_executable_digest",
+            "packer_toolchain_fingerprint",
+            "packer_version",
+            "source_media_type",
+            "structural_verifier",
+            "tar_emission_contract_id",
+        }
+        value = _exact_wire_fields(data, fields, "derived key")
+        if value["domain"] != DERIVED_RECIPE_SCHEMA or not isinstance(value["packer_dependency_digests"], list):
+            raise OCIStoreError("oci-store-wire", "derived key schema is invalid")
+        constructor = dict(value)
+        constructor.pop("domain")
+        constructor["packer_dependency_digests"] = tuple(value["packer_dependency_digests"])
+        try:
+            key = cls(**constructor)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-wire", "derived key is invalid") from None
+        if key.to_dict() != value:
+            raise OCIStoreError("oci-store-wire", "derived key is not canonical")
+        return key
+
     @property
     def digest(self) -> str:
         return _digest_bytes(_canonical(self.to_dict()))
@@ -340,6 +414,54 @@ class DerivedLayerReceipt:
     image_digest: str
     image_size: int
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.store_id, str) or re.fullmatch(r"oci-store-v1:[0-9a-f]{64}", self.store_id) is None:
+            raise OCIStoreError("oci-store-receipt", "derived receipt store identity is invalid")
+        for field_name in (
+            "occurrence_digest",
+            "record_digest",
+            "key_digest",
+            "source_snapshot_binding_digest",
+            "source_image_digest",
+            "image_digest",
+        ):
+            original = getattr(self, field_name)
+            try:
+                normalized = normalize_digest(original)
+            except (ArtifactValidationError, TypeError, ValueError):
+                raise OCIStoreError("oci-store-receipt", "derived receipt digest is invalid") from None
+            if normalized != original:
+                raise OCIStoreError("oci-store-receipt", "derived receipt digest is not canonical")
+        if type(self.ordinal) is not int or self.ordinal < 0:
+            raise OCIStoreError("oci-store-receipt", "derived receipt ordinal is invalid")
+        if type(self.image_size) is not int or self.image_size <= 0:
+            raise OCIStoreError("oci-store-receipt", "derived receipt image size is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> DerivedLayerReceipt:
+        fields = {
+            "image_digest",
+            "image_size",
+            "key_digest",
+            "occurrence_digest",
+            "ordinal",
+            "record_digest",
+            "source_image_digest",
+            "source_snapshot_binding_digest",
+            "store_id",
+        }
+        value = _exact_wire_fields(data, fields, "derived receipt")
+        try:
+            receipt = cls(**value)
+        except (OCIStoreError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-wire", "derived receipt is invalid") from None
+        if receipt.to_dict() != value:
+            raise OCIStoreError("oci-store-wire", "derived receipt is not canonical")
+        return receipt
+
 
 @dataclass(frozen=True, slots=True)
 class MaterializationResult:
@@ -353,6 +475,23 @@ class MaterializationResult:
             raise OCIStoreError("oci-store-result", "materialization receipt is invalid")
         if not isinstance(self.cache_result, str) or self.cache_result not in MATERIALIZATION_CACHE_RESULTS:
             raise OCIStoreError("oci-store-result", "materialization cache result is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"cache_result": self.cache_result, "receipt": self.receipt.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> MaterializationResult:
+        value = _exact_wire_fields(data, {"cache_result", "receipt"}, "materialization result")
+        try:
+            result = cls(
+                receipt=DerivedLayerReceipt.from_dict(value["receipt"]),
+                cache_result=value["cache_result"],
+            )
+        except (OCIStoreError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-wire", "materialization result is invalid") from None
+        if result.to_dict() != value:
+            raise OCIStoreError("oci-store-wire", "materialization result is not canonical")
+        return result
 
 
 @dataclass(frozen=True, slots=True)

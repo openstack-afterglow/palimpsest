@@ -7,6 +7,7 @@ import io
 import json
 import os
 import tarfile
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,12 @@ from palimpsest_local.oci_convert import (
 )
 from palimpsest_local.oci_converter import stage_layer
 from palimpsest_local.oci_image import OCIImageRef
-from palimpsest_local.oci_packer import PackedSquashFSReceipt, pack_staged_squashfs
+from palimpsest_local.oci_materializer import materialize_layer_hard
+from palimpsest_local.oci_packer import (
+    PackedSquashFSReceipt,
+    discover_squashfs_toolchain,
+    pack_staged_squashfs,
+)
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -37,6 +43,8 @@ from palimpsest_local.oci_provenance import (
     Descriptor,
 )
 from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
+from palimpsest_local.oci_store import ArtifactLeaseOwner, OCIStore
+from palimpsest_local.state import StatePaths, init_resolved_roots
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "oci-root"
 
@@ -61,6 +69,21 @@ def _pack_staged_fixture(
     packer: Path,
     packer_sha256: str,
 ) -> tuple[str, PackedSquashFSReceipt]:
+    cas, image = _snapshot_fixture(root, payload)
+    image_digest = hashlib.sha256()
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pack_staged_squashfs(
+            staged,
+            packer_path=packer,
+            expected_packer_sha256=packer_sha256,
+        ) as packed:
+            receipt = packed.receipt
+            for chunk in packed.chunks():
+                image_digest.update(chunk)
+    return image_digest.hexdigest(), receipt
+
+
+def _snapshot_fixture(root: Path, payload: bytes):
     layout = root / "layout"
     blobs = layout / "blobs" / "sha256"
     blobs.mkdir(parents=True)
@@ -103,17 +126,7 @@ def _pack_staged_fixture(
         requested_reference="registry.example.com/fixture/oci-root:latest",
     )
     image = LocalLayoutSource.parse(f"oci-layout://{layout}@{manifest.digest}").snapshot(reference, cas)
-    image_digest = hashlib.sha256()
-    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
-        with pack_staged_squashfs(
-            staged,
-            packer_path=packer,
-            expected_packer_sha256=packer_sha256,
-        ) as packed:
-            receipt = packed.receipt
-            for chunk in packed.chunks():
-                image_digest.update(chunk)
-    return image_digest.hexdigest(), receipt
+    return cas, image
 
 
 def test_non_linux_rejection_before_subprocess():
@@ -359,6 +372,60 @@ def test_layer_filesystem_semantics(tmp_path: Path):
         output_dir = Path(evidence_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / f"{candidate.value}.json").write_text(evidence.to_json(), encoding="utf-8")
+
+
+@pytest.mark.oci_fs
+def test_hard_worker_materializes_then_reuses_a_local_oci_layer(tmp_path: Path) -> None:
+    """Prove the parent→exec worker→packer→derived-store boundary on Linux."""
+    required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
+    try:
+        prerequisites = preflight_oci_filesystem_probe(FilesystemCandidate.SQUASHFS)
+    except UnsupportedPlatformError as exc:
+        reason = f"SquashFS hard-worker proof unavailable: {exc}"
+        if required:
+            pytest.fail(reason)
+        pytest.skip(reason)
+    payload = (FIXTURES_DIR / "base_layer.tar").read_bytes()
+    source_root = tmp_path / "source"
+    cas, image = _snapshot_fixture(source_root, payload)
+    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    store = OCIStore(roots)
+    packer = Path(prerequisites.packer)
+    toolchain = discover_squashfs_toolchain(
+        packer,
+        expected_packer_sha256=prerequisites.packer_sha256,
+    )
+
+    cold = materialize_layer_hard(
+        image,
+        0,
+        source_cas_root=source_root / "cas",
+        roots=roots,
+        store=store,
+        packer_path=packer,
+        toolchain=toolchain,
+        timeout_seconds=60,
+    )
+    warm = materialize_layer_hard(
+        image,
+        0,
+        source_cas_root=source_root / "cas",
+        roots=roots,
+        store=store,
+        packer_path=packer,
+        toolchain=toolchain,
+        timeout_seconds=60,
+    )
+
+    assert cold.cache_result == "cold_miss"
+    assert warm.cache_result == "warm_hit"
+    assert warm.receipt == cold.receipt
+    assert cold.receipt.source_snapshot_binding_digest == image.binding_digest
+    assert not list(roots.runtime_packs.glob(".oci-materializer-worker-*"))
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "hard-worker-proof", "root-layer")
+    with store.acquire_lease(cold.receipt, owner) as lease:
+        materialized = b"".join(lease.chunks())
+    assert hashlib.sha256(materialized).hexdigest() == cold.receipt.image_digest.removeprefix("sha256:")
 
 
 @pytest.mark.oci_fs

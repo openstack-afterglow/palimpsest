@@ -159,6 +159,39 @@ def _target(cas_root: Path, descriptor: Descriptor) -> Path:
     return cas_root / "blobs" / "sha256" / descriptor.digest.split(":", 1)[1]
 
 
+def test_open_existing_reuses_identity_without_mutation(tmp_path: Path) -> None:
+    root = tmp_path / "source-cas"
+    created = SourceCAS(root)
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+    reopened = SourceCAS.open_existing(root, expected_cas_id=created.identity)
+
+    assert reopened.identity == created.identity
+    assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
+
+
+def test_open_existing_missing_root_or_child_never_creates_it(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+    with pytest.raises(ArtifactValidationError):
+        SourceCAS.open_existing(missing, expected_cas_id="source-cas-v1:" + "0" * 64)
+    assert not missing.exists()
+
+    root = tmp_path / "source-cas"
+    created = SourceCAS(root)
+    shutil.rmtree(root / "locks")
+    with pytest.raises(ArtifactValidationError):
+        SourceCAS.open_existing(root, expected_cas_id=created.identity)
+    assert not (root / "locks").exists()
+
+
+def test_open_existing_rejects_identity_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "source-cas"
+    SourceCAS(root)
+
+    with pytest.raises(ArtifactValidationError, match="identity does not match"):
+        SourceCAS.open_existing(root, expected_cas_id="source-cas-v1:" + "0" * 64)
+
+
 def _process_snapshot_worker(uri: str, cas_root: str, barrier, results) -> None:
     source = LocalLayoutSource.parse(uri)
 

@@ -256,3 +256,53 @@ Collect separate timings for pull, bundle extraction, seed creation, boot-to-SSH
 - `backend/tests/test_palimpsest_kvm.py:57-275`
 - `backend/app/services/palimpsest_hub_store.py:37-50`
 - `openspec/changes/palimpsest-layered-vm/tasks.md:116-188`
+
+## OCI-root modernization continuation (2026-08-31)
+
+The original v0.1 plan above describes the cloud-image plus mounted-layer runtime and remains historical context. The current OCI-root program treats Docker/OCI image layers as source artifacts, derives deterministic read-only SquashFS lower layers, and will eventually make their merged tree the VM's actual `/`. It must not claim that runtime behavior until the boot acceptance gate below passes.
+
+### PR 4 slice 6: exec-owned hard materialization boundary
+
+Implemented and verified:
+
+- A Linux-only parent supervisor gives one complete layer materialization attempt a single monotonic wall-clock deadline. The worker starts in a new session/process group; timeout uses TERM, a bounded grace interval, KILL, and reap. Late success is discarded.
+- Parent/worker messages are bounded to 256 KiB and use exact-field, duplicate-key-free, finite, canonical UTF-8 JSON. A UUID nonce and canonical request digest bind the response. Failures expose only stable categories.
+- The exec worker owns `SourceCAS lease → staged intake → deterministic pack → derived CAS/record/key/occurrence publication`. Source graph, occurrence, recipe key, store identity, source-CAS identity, packer bytes, and dependency-bound toolchain identity are reconstructed or revalidated inside the worker.
+- `SourceCAS.open_existing` never creates a missing root or component. A warm derived-cache hit does not enter the lazy source/toolchain producer.
+- Supervised `mksquashfs` inherits the worker process group and creates its private pack directory below the worker's owner-only scratch. Standalone pack behavior retains its own process group.
+- The worker applies core, CPU, open-file, file-size, address-space, and process-count resource limits. This is not described as network isolation; a later kernel-enforced sandbox must fail closed before any `network=none` claim is made for the converter.
+- Scratch cleanup is tied to process reap. If a Linux task cannot be reaped immediately, a background reaper retains the scratch authority and removes it only after the process exits.
+
+Verification recorded for this slice:
+
+- Ruff lint and format, compile, package sdist/wheel, and `git diff --check`: pass.
+- Local unit and non-privileged OCI suite: 2151 passed, 9 skipped, 3 deselected.
+- Product-level local BuildKit gate: 2 passed with `PALIMPSEST_BUILDKIT_E2E=1`.
+- Privileged Linux `mksquashfs 4.6.1` container: hard-worker cold materialization followed by warm hit passed; the leased artifact bytes matched the receipt digest.
+- `mksquashfs 4.5` is rejected by the existing minimum-version preflight, as intended.
+
+### Local image build-to-run acceptance gates
+
+Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
+
+Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
+
+```text
+palimpsest build local-pinned-base → OCI archive
+→ transfer immutable archive + acceptance receipt to daemonless KVM host
+→ palimpsest run ARCHIVE --backend kvm -d
+→ palimpsest exec probe
+→ prove image marker is at / and PID 1 root is /
+→ stop → rm
+→ prove run-owned state is removed while immutable source image remains
+```
+
+Gate 2 activation requires all of the following, not merely successful layer conversion: local OCI archive/layout intake, bootable OCI-root run request and KVM adapter, host kernel/initramfs policy, guest stage-1/root assembly, init supervision, detached `-d` lifecycle, exec readiness, VM-specific writable root disk/volume ownership, and safe stop/remove recovery.
+
+### Next implementation order
+
+1. Centralize all physical artifact deletion/GC behind descriptor-pinned store mutations that honor durable OCI occurrence leases.
+2. Add first-party local OCI archive/layout intake and materialize every ordered occurrence through the hard-worker API.
+3. Define the OCI-root boot plan: immutable lower leases, VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
+4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

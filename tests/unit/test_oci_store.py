@@ -254,7 +254,7 @@ def test_observed_materialization_reports_validated_repair(tmp_path: Path) -> No
 
 def test_materialization_result_rejects_unhashable_cache_result() -> None:
     receipt = oci_store_module.DerivedLayerReceipt(
-        store_id=_digest("0"),
+        store_id="oci-store-v1:" + "0" * 64,
         occurrence_digest=_digest("1"),
         record_digest=_digest("2"),
         key_digest=_digest("3"),
