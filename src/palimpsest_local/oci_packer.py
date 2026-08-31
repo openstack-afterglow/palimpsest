@@ -16,10 +16,11 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_changeset import EntryKind
 from .oci_converter import StagedLayer
@@ -31,7 +32,9 @@ _SQUASHFS_MAGIC = 0x73717368
 _UINT64_MAX = (1 << 64) - 1
 
 SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
+SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v1"
 SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v1"
+SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
 
 
 class SquashFSPackError(ArtifactValidationError):
@@ -79,6 +82,199 @@ DEFAULT_SQUASHFS_PACK_POLICY = SquashFSPackPolicy()
 
 
 @dataclass(frozen=True, slots=True)
+class SquashFSToolchainIdentity:
+    """Path-free identity for the executable and linked packer dependencies."""
+
+    version: str
+    executable_digest: str
+    dependency_digests: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.version or "") is None:
+            raise SquashFSPackError("oci-packer-version", "toolchain version is invalid")
+        object.__setattr__(self, "executable_digest", normalize_digest(self.executable_digest))
+        if not isinstance(self.dependency_digests, tuple):
+            raise SquashFSPackError("oci-packer-toolchain", "dependency digests must be an immutable tuple")
+        normalized = tuple(sorted(normalize_digest(value) for value in self.dependency_digests))
+        if len(set(normalized)) != len(normalized):
+            raise SquashFSPackError("oci-packer-toolchain", "dependency digests must be unique")
+        object.__setattr__(self, "dependency_digests", normalized)
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(
+            {
+                "dependency_digests": list(self.dependency_digests),
+                "domain": SQUASHFS_TOOLCHAIN_ID,
+                "executable_digest": self.executable_digest,
+                "version": self.version,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolchainFileBinding:
+    path: Path = field(repr=False)
+    digest: str
+    signature: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedSquashFSToolchain:
+    """Verified executable/dependency capability used for both cache keys and packing."""
+
+    identity: SquashFSToolchainIdentity
+    _packer_path: Path = field(repr=False)
+    _dependencies: tuple[_ToolchainFileBinding, ...] = field(repr=False)
+
+    def verify(self, packer_path: Path, expected_packer_sha256: str) -> None:
+        expected = normalize_digest(f"sha256:{expected_packer_sha256}")
+        try:
+            selected = packer_path.resolve(strict=True)
+        except OSError:
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer is unavailable") from None
+        if selected != self._packer_path or expected != self.identity.executable_digest:
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer does not match its capability")
+        executable = _bind_toolchain_file(selected)
+        if executable.digest != expected:
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer bytes changed")
+        paths = _discover_dependency_paths(selected)
+        if paths != tuple(binding.path for binding in self._dependencies):
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer dependencies changed")
+        current = tuple(_bind_toolchain_file(path) for path in paths)
+        if current != self._dependencies:
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer dependency bytes changed")
+
+
+def _bind_toolchain_file(path: Path) -> _ToolchainFileBinding:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd: int | None = None
+    try:
+        resolved = path.resolve(strict=True)
+        fd = os.open(resolved, flags)
+        opened = os.fstat(fd)
+        visible = os.stat(resolved, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size <= 0
+            or opened.st_mode & 0o022
+            or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise SquashFSPackError("oci-packer-toolchain", "toolchain file is unsafe")
+        digest = _sha256_fd(fd, opened.st_size)
+        after = os.fstat(fd)
+        final = os.stat(resolved, follow_symlinks=False)
+        signature = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        if (
+            signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or (
+                final.st_dev,
+                final.st_ino,
+                final.st_size,
+                final.st_mtime_ns,
+                final.st_ctime_ns,
+            )
+            != signature
+        ):
+            raise SquashFSPackError("oci-packer-toolchain", "toolchain file changed during verification")
+        return _ToolchainFileBinding(resolved, digest, signature)
+    except SquashFSPackError:
+        raise
+    except OSError:
+        raise SquashFSPackError("oci-packer-toolchain", "toolchain file cannot be verified") from None
+    finally:
+        _close_fd(fd)
+
+
+def _discover_dependency_paths(packer_path: Path) -> tuple[Path, ...]:
+    inspector_path = next((path for path in (Path("/usr/bin/ldd"), Path("/bin/ldd")) if path.is_file()), None)
+    if inspector_path is None:
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector is unavailable")
+    inspector = _bind_toolchain_file(inspector_path)
+    try:
+        inspector_owner = inspector.path.stat().st_uid
+    except OSError:
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector is unavailable") from None
+    if inspector_owner not in {0, os.geteuid()}:
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector is unsafe")
+    try:
+        result = subprocess.run(
+            [os.fspath(inspector.path), os.fspath(packer_path)],
+            check=False,
+            capture_output=True,
+            env=_fixed_env(),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependencies cannot be inspected") from None
+    if _bind_toolchain_file(inspector.path) != inspector:
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector changed")
+    output = result.stdout + b"\n" + result.stderr
+    lowered = output.lower()
+    if b"not a dynamic executable" in lowered or b"statically linked" in lowered:
+        return ()
+    if result.returncode != 0 or b"not found" in lowered:
+        raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency resolution failed")
+    candidates: set[Path] = set()
+    for raw_line in output.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("linux-vdso"):
+            continue
+        candidate = line.split("=>", 1)[1].strip().split()[0] if "=>" in line else line.split()[0]
+        if not candidate.startswith("/"):
+            continue
+        try:
+            candidates.add(Path(candidate).resolve(strict=True))
+        except OSError:
+            raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency is unavailable") from None
+    return tuple(sorted(candidates, key=os.fspath))
+
+
+def discover_squashfs_toolchain(
+    packer_path: Path,
+    *,
+    expected_packer_sha256: str,
+    policy: SquashFSPackPolicy = DEFAULT_SQUASHFS_PACK_POLICY,
+) -> VerifiedSquashFSToolchain:
+    """Discover and seal the real mksquashfs executable plus every linked file."""
+    if os.name != "posix" or not sys.platform.startswith("linux"):
+        raise UnsupportedPlatformError("SquashFS toolchain discovery requires Linux")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_packer_sha256 or "") is None:
+        raise SquashFSPackError("oci-packer-digest", "expected packer SHA-256 is invalid")
+    executable = _bind_toolchain_file(packer_path)
+    if executable.digest != f"sha256:{expected_packer_sha256}":
+        raise SquashFSPackError("oci-packer-digest", "selected packer digest does not match")
+    try:
+        result = subprocess.run(
+            [os.fspath(executable.path), "-version"],
+            check=False,
+            capture_output=True,
+            env=_fixed_env(),
+            timeout=min(30.0, float(policy.packer_timeout_seconds)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise SquashFSPackError("oci-packer-version", "filesystem packer version check failed") from None
+    match = re.search(rb"mksquashfs version (\d+)\.(\d+)(?:\.(\d+))?", result.stdout + result.stderr, re.I)
+    if result.returncode != 0 or match is None:
+        raise SquashFSPackError("oci-packer-version", "filesystem packer version is not identifiable")
+    version_tuple = tuple(int(item or b"0") for item in match.groups())
+    if version_tuple < (4, 6, 0):
+        raise SquashFSPackError("oci-packer-version", "filesystem packer is older than 4.6.0")
+    dependencies = tuple(_bind_toolchain_file(path) for path in _discover_dependency_paths(executable.path))
+    identity = SquashFSToolchainIdentity(
+        ".".join(str(item) for item in version_tuple),
+        executable.digest,
+        tuple(sorted({binding.digest for binding in dependencies})),
+    )
+    capability = VerifiedSquashFSToolchain(identity, executable.path, dependencies)
+    capability.verify(packer_path, expected_packer_sha256)
+    return capability
+
+
+@dataclass(frozen=True, slots=True)
 class PackedSquashFSReceipt:
     policy_id: str
     policy_fingerprint: str
@@ -92,6 +288,8 @@ class PackedSquashFSReceipt:
     image_digest: str
     image_size: int
     structural_verifier: str
+    toolchain_fingerprint: str = ""
+    toolchain_dependency_digests: tuple[str, ...] = ()
 
 
 def _fixed_env() -> dict[str, str]:
@@ -116,6 +314,14 @@ def _sha256_fd(fd: int, size: int) -> str:
         digest.update(payload)
         offset += len(payload)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _verified_file_identity(fd: int) -> tuple[int, int, int, int, int]:
@@ -337,7 +543,13 @@ def _root_arguments(staged: StagedLayer, policy: SquashFSPackPolicy = DEFAULT_SQ
     return arguments
 
 
-def _verify_superblock(fd: int, image_size: int, maximum: int) -> None:
+def verify_squashfs_fd(fd: int, image_size: int, maximum: int) -> None:
+    """Verify one already-pinned SquashFS image without resolving a path.
+
+    Derived-cache hits use the same structural gate as freshly packed output;
+    callers must additionally verify the complete digest and stable file
+    identity around this check.
+    """
     if not _SQUASHFS_SUPERBLOCK_SIZE <= image_size <= maximum:
         raise SquashFSPackError("oci-pack-output-size", "packed image size is outside its policy")
     try:
@@ -396,6 +608,10 @@ def _verify_superblock(fd: int, image_size: int, maximum: int) -> None:
             raise SquashFSPackError("oci-pack-output-io", "cannot read SquashFS image padding") from None
         if len(padding) != padding_size or any(padding):
             raise SquashFSPackError("oci-pack-superblock", "SquashFS image padding is invalid")
+
+
+# Kept as a private compatibility alias for the existing focused fault tests.
+_verify_superblock = verify_squashfs_fd
 
 
 class LeasedSquashFS:
@@ -506,6 +722,7 @@ def pack_staged_squashfs(
     packer_path: Path,
     expected_packer_sha256: str,
     policy: SquashFSPackPolicy = DEFAULT_SQUASHFS_PACK_POLICY,
+    toolchain: VerifiedSquashFSToolchain | None = None,
 ) -> Iterator[LeasedSquashFS]:
     """Emit, pack, structurally verify and lease one normalized SquashFS image."""
     if os.name != "posix" or not sys.platform.startswith("linux"):
@@ -514,6 +731,15 @@ def pack_staged_squashfs(
         raise SquashFSPackError("oci-pack-input", "staged layer or pack policy is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", expected_packer_sha256 or "") is None:
         raise SquashFSPackError("oci-packer-digest", "expected packer SHA-256 is invalid")
+    if toolchain is None:
+        toolchain = discover_squashfs_toolchain(
+            packer_path,
+            expected_packer_sha256=expected_packer_sha256,
+            policy=policy,
+        )
+    elif not isinstance(toolchain, VerifiedSquashFSToolchain):
+        raise SquashFSPackError("oci-packer-toolchain", "verified toolchain capability is invalid")
+    toolchain.verify(packer_path, expected_packer_sha256)
 
     try:
         directory = Path(tempfile.mkdtemp(prefix="palimpsest-oci-pack-"))
@@ -539,6 +765,9 @@ def pack_staged_squashfs(
         pinned_fd = _open_pinned_packer(directory_fd)
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
         version = _packer_version(pinned_fd, directory_fd, policy)
+        if toolchain.identity.version != version or toolchain.identity.executable_digest != f"sha256:{pinned_digest}":
+            raise SquashFSPackError("oci-packer-toolchain", "selected packer does not match its toolchain identity")
+        toolchain.verify(packer_path, expected_packer_sha256)
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
 
         try:
@@ -583,6 +812,7 @@ def pack_staged_squashfs(
         if return_code != 0:
             raise SquashFSPackError("oci-packer-exit", "filesystem packer returned a nonzero status")
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
+        toolchain.verify(packer_path, expected_packer_sha256)
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -619,7 +849,7 @@ def pack_staged_squashfs(
                 sealed.st_mode,
                 sealed.st_nlink,
             )
-            _verify_superblock(image_fd, sealed.st_size, policy.max_image_bytes)
+            verify_squashfs_fd(image_fd, sealed.st_size, policy.max_image_bytes)
             image_digest = _sha256_fd(image_fd, sealed.st_size)
             current = os.fstat(image_fd)
             if stable_seal != (
@@ -656,6 +886,8 @@ def pack_staged_squashfs(
                 image_digest=image_digest,
                 image_size=sealed.st_size,
                 structural_verifier=SQUASHFS_STRUCTURAL_VERIFIER_ID,
+                toolchain_fingerprint=toolchain.identity.fingerprint,
+                toolchain_dependency_digests=toolchain.identity.dependency_digests,
             )
             leased = LeasedSquashFS(image_file, receipt)
             yield leased
@@ -700,10 +932,16 @@ def pack_staged_squashfs(
 __all__ = [
     "DEFAULT_SQUASHFS_PACK_POLICY",
     "SQUASHFS_PACK_POLICY_ID",
+    "SQUASHFS_PACKER_ARGV_CONTRACT_ID",
     "SQUASHFS_STRUCTURAL_VERIFIER_ID",
+    "SQUASHFS_TOOLCHAIN_ID",
     "LeasedSquashFS",
     "PackedSquashFSReceipt",
     "SquashFSPackError",
     "SquashFSPackPolicy",
+    "SquashFSToolchainIdentity",
+    "VerifiedSquashFSToolchain",
+    "discover_squashfs_toolchain",
     "pack_staged_squashfs",
+    "verify_squashfs_fd",
 ]

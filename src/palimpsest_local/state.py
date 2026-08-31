@@ -98,6 +98,11 @@ class StatePaths:
         return self.state / "runtime-packs"
 
     @property
+    def oci_derived_store(self) -> Path:
+        """Private v1 OCI-derived indexes, separate from BuildKit's flat schema."""
+        return self.runtime_packs / "oci-derived-v1"
+
+    @property
     def projects(self) -> Path:
         """Declarative ``palimpsest.yml`` project ledgers."""
         return self.state / "projects"
@@ -427,6 +432,7 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
         roots.builds,
         roots.build_cache,
         roots.runtime_packs,
+        roots.oci_derived_store,
         roots.projects,
         roots.volumes,
     ):

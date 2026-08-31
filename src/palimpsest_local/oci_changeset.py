@@ -8,6 +8,8 @@ from enum import StrEnum
 
 from .errors import ArtifactValidationError
 
+OCI_CHANGESET_NORMALIZATION_ID = "palimpsest.oci-changeset-normalization.v1"
+
 
 class ChangesetValidationError(ArtifactValidationError):
     """A validated physical member sequence has contradictory semantics."""

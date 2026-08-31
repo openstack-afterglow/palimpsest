@@ -40,6 +40,7 @@ def test_xdg_roots_and_permissions() -> None:
         assert state.permission_bits(roots.builds) == 0o700
         assert state.permission_bits(roots.build_cache) == 0o700
         assert state.permission_bits(roots.runtime_packs) == 0o700
+        assert state.permission_bits(roots.oci_derived_store) == 0o700
         assert state.permission_bits(roots.projects) == 0o700
         assert state.permission_bits(roots.volumes) == 0o700
 

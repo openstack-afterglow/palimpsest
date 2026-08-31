@@ -12,6 +12,8 @@ from typing import BinaryIO, Protocol
 from .errors import ArtifactValidationError
 from .oci_changeset import EntryKind, NormalizedChangeset, NormalizedEntry
 
+OCI_NORMALIZED_TAR_EMISSION_ID = "palimpsest.oci-normalized-tar-emission.v1"
+
 
 class _ReadablePayload(Protocol):
     def read(self, size: int = -1) -> bytes: ...

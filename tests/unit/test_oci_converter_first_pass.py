@@ -701,6 +701,53 @@ def test_structural_verifier_rejects_missing_required_tables() -> None:
             oci_packer._verify_superblock(image.fileno(), len(impossible), len(impossible))
 
 
+def test_squashfs_toolchain_identity_binds_version_executable_and_dependencies() -> None:
+    executable = "sha256:" + "1" * 64
+    dependency_a = "sha256:" + "2" * 64
+    dependency_b = "sha256:" + "3" * 64
+    identity = oci_packer.SquashFSToolchainIdentity(
+        "4.7.5",
+        executable,
+        (dependency_b, dependency_a),
+    )
+
+    assert identity.dependency_digests == (dependency_a, dependency_b)
+    assert identity.fingerprint.startswith("sha256:")
+    assert (
+        identity.fingerprint
+        != oci_packer.SquashFSToolchainIdentity("4.7.6", executable, (dependency_a, dependency_b)).fingerprint
+    )
+    assert (
+        identity.fingerprint
+        != oci_packer.SquashFSToolchainIdentity("4.7.5", "sha256:" + "4" * 64, (dependency_a, dependency_b)).fingerprint
+    )
+    assert (
+        identity.fingerprint != oci_packer.SquashFSToolchainIdentity("4.7.5", executable, (dependency_a,)).fingerprint
+    )
+
+
+def test_verified_squashfs_toolchain_rejects_dependency_byte_change(tmp_path: Path, monkeypatch) -> None:
+    packer = tmp_path / "mksquashfs"
+    dependency = tmp_path / "libcompress.so"
+    packer.write_bytes(b"packer-bytes")
+    dependency.write_bytes(b"dependency-a")
+    packer.chmod(0o500)
+    dependency.chmod(0o400)
+    executable = oci_packer._bind_toolchain_file(packer)
+    binding = oci_packer._bind_toolchain_file(dependency)
+    identity = oci_packer.SquashFSToolchainIdentity("4.7.5", executable.digest, (binding.digest,))
+    capability = oci_packer.VerifiedSquashFSToolchain(identity, packer.resolve(), (binding,))
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _packer: (dependency.resolve(),))
+
+    capability.verify(packer, executable.digest.removeprefix("sha256:"))
+    dependency.chmod(0o600)
+    dependency.write_bytes(b"dependency-b")
+    dependency.chmod(0o400)
+
+    with pytest.raises(SquashFSPackError, match="dependency bytes changed"):
+        capability.verify(packer, executable.digest.removeprefix("sha256:"))
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
 def test_staged_squashfs_lease_requires_verified_eof(tmp_path: Path) -> None:
     member, payload = _file("value", b"payload")
