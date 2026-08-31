@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,7 @@ DERIVED_RECIPE_SCHEMA = "palimpsest.oci-derived-recipe.v1"
 DERIVED_RECORD_SCHEMA = "palimpsest.oci-derived-record.v1"
 DERIVED_OCCURRENCE_SCHEMA = "palimpsest.oci-derived-occurrence.v1"
 DERIVED_LEASE_SCHEMA = "palimpsest.oci-derived-lease.v1"
+DERIVED_LEASE_SET_SCHEMA = "palimpsest.oci-derived-lease-set.v1"
 MATERIALIZATION_CACHE_RESULTS = frozenset({"warm_hit", "cold_miss", "cold_repair"})
 
 
@@ -509,6 +510,9 @@ class ArtifactLeaseOwner:
         if _NAME_RE.fullmatch(self.run_name or "") is None or _ROLE_RE.fullmatch(self.role or "") is None:
             raise OCIStoreError("oci-store-owner", "lease owner name or role is invalid")
 
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
 
 @dataclass(frozen=True, slots=True)
 class RecoverableDerivedLease:
@@ -520,6 +524,72 @@ class RecoverableDerivedLease:
     acquired_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class DurableLeaseSetMember:
+    """One ordinal-preserving member of an immutable durable lease set."""
+
+    ordinal: int
+    lease_id: str
+    receipt: DerivedLayerReceipt
+    acquired_ns: int
+
+    def __post_init__(self) -> None:
+        if type(self.ordinal) is not int or self.ordinal < 0:
+            raise OCIStoreError("oci-store-lease-set", "lease-set member ordinal is invalid")
+        try:
+            canonical_id = str(uuid.UUID(self.lease_id))
+        except (ValueError, AttributeError):
+            raise OCIStoreError("oci-store-lease-set", "lease-set member ID is invalid") from None
+        object.__setattr__(self, "lease_id", canonical_id)
+        if not isinstance(self.receipt, DerivedLayerReceipt) or self.receipt.ordinal != self.ordinal:
+            raise OCIStoreError("oci-store-lease-set", "lease-set member receipt is invalid")
+        if type(self.acquired_ns) is not int or self.acquired_ns < 0:
+            raise OCIStoreError("oci-store-lease-set", "lease-set member time is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DurableLeaseSet:
+    """Complete, path-free reservation of an ordered derived-layer graph."""
+
+    lease_set_id: str
+    plan_digest: str
+    owner: ArtifactLeaseOwner
+    members: tuple[DurableLeaseSetMember, ...]
+
+    def __post_init__(self) -> None:
+        try:
+            normalized_id = normalize_digest(self.lease_set_id)
+            normalized_plan = normalize_digest(self.plan_digest)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-lease-set", "lease-set digest is invalid") from None
+        if normalized_id != self.lease_set_id or normalized_plan != self.plan_digest:
+            raise OCIStoreError("oci-store-lease-set", "lease-set digest is not canonical")
+        if not isinstance(self.owner, ArtifactLeaseOwner):
+            raise OCIStoreError("oci-store-lease-set", "lease-set owner is invalid")
+        if not isinstance(self.members, tuple) or not self.members:
+            raise OCIStoreError("oci-store-lease-set", "lease-set members are invalid")
+        if tuple(member.ordinal for member in self.members) != tuple(range(len(self.members))):
+            raise OCIStoreError("oci-store-lease-set", "lease-set member order is invalid")
+        if len({member.lease_id for member in self.members}) != len(self.members):
+            raise OCIStoreError("oci-store-lease-set", "lease-set member IDs are not unique")
+
+
+@dataclass(frozen=True, slots=True)
+class RecoverableLeaseSetIntent:
+    """Restart-discoverable lease-set intent, including partial publication."""
+
+    lease_set_id: str
+    plan_digest: str
+    owner: ArtifactLeaseOwner
+    receipts: tuple[DerivedLayerReceipt, ...]
+    member_lease_ids: tuple[str, ...]
+    present_lease_ids: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return self.member_lease_ids == self.present_lease_ids
+
+
 @dataclass(slots=True)
 class _MetadataAuthority:
     root_fd: int
@@ -527,6 +597,7 @@ class _MetadataAuthority:
     keys_fd: int
     occurrences_fd: int
     leases_fd: int
+    lease_sets_fd: int
     locks_fd: int
     signature: tuple[tuple[int, int, int, int], ...]
     store_id: str
@@ -718,6 +789,13 @@ class DurableDerivedLayerLease:
             self._closed = True
             self._release_use_lock()
 
+    def detach(self) -> str:
+        """Close the reader while deliberately retaining its durable lease."""
+        self._check_owner()
+        lease_id = self.lease_id
+        self._abort()
+        return lease_id
+
     def _release_use_lock(self) -> None:
         cleanup_errors: list[BaseException] = []
         for context in (self._use_lock_context, self._use_authority_context):
@@ -810,6 +888,7 @@ class OCIStore:
                         authority.keys_fd,
                         authority.occurrences_fd,
                         authority.leases_fd,
+                        authority.lease_sets_fd,
                         authority.locks_fd,
                     )
                 )
@@ -822,6 +901,7 @@ class OCIStore:
                             "keys",
                             "occurrences",
                             "leases",
+                            "lease-sets",
                             "locks",
                         )
                     ),
@@ -846,7 +926,7 @@ class OCIStore:
                 root = os.fstat(root_fd)
                 if root.st_uid != os.geteuid() or stat.S_IMODE(root.st_mode) != _DIRECTORY_MODE:
                     raise OCIStoreError("oci-store-authority", "derived store root changed")
-                for name in ("records", "keys", "occurrences", "leases", "locks"):
+                for name in ("records", "keys", "occurrences", "leases", "lease-sets", "locks"):
                     opened.append(_ensure_child(root_fd, name))
                 signature = tuple(_directory_signature(os.fstat(fd)) for fd in (root_fd, *opened))
                 identity = _digest_bytes(repr(signature).encode())
@@ -1385,6 +1465,37 @@ class OCIStore:
             self._artifacts.verify_squashfs(receipt.image_digest, receipt.image_size, maximum=_MAX_IMAGE_BYTES)
         return value
 
+    def validate_receipt_occurrences(
+        self,
+        receipts: tuple[DerivedLayerReceipt, ...],
+        occurrences: tuple[DerivedLayerOccurrence, ...],
+    ) -> None:
+        """Bind public receipts back to the exact ordered OCI layer recipes."""
+        if (
+            not isinstance(receipts, tuple)
+            or not receipts
+            or not isinstance(occurrences, tuple)
+            or len(receipts) != len(occurrences)
+            or any(not isinstance(receipt, DerivedLayerReceipt) for receipt in receipts)
+            or any(not isinstance(occurrence, DerivedLayerOccurrence) for occurrence in occurrences)
+        ):
+            raise OCIStoreError("oci-store-receipt", "ordered receipt occurrences are invalid")
+        if tuple(receipt.ordinal for receipt in receipts) != tuple(range(len(receipts))) or tuple(
+            occurrence.ordinal for occurrence in occurrences
+        ) != tuple(range(len(occurrences))):
+            raise OCIStoreError("oci-store-receipt", "ordered receipt occurrences are out of order")
+        with self._authority() as authority:
+            for receipt, occurrence in zip(receipts, occurrences, strict=True):
+                value = self._read_occurrence(authority, receipt)
+                if (
+                    receipt.store_id != self.identity
+                    or occurrence.source_snapshot_binding_digest != receipt.source_snapshot_binding_digest
+                    or occurrence.source_image_digest != receipt.source_image_digest
+                    or occurrence.ordinal != receipt.ordinal
+                    or value.get("source") != occurrence.source_recipe()
+                ):
+                    raise OCIStoreError("oci-store-receipt", "derived receipt occurrence binding is invalid")
+
     def acquire_lease(
         self,
         receipt: DerivedLayerReceipt,
@@ -1541,6 +1652,446 @@ class OCIStore:
             raise OCIStoreError("oci-store-lease", "derived lease ID is invalid") from None
         return self._open_lease(canonical_id, owner, receipt)
 
+    def release_recoverable_lease(
+        self,
+        lease_id: str,
+        owner: ArtifactLeaseOwner,
+        receipt: DerivedLayerReceipt,
+    ) -> None:
+        """Release a detached/recovered lease without streaming its artifact."""
+        if not isinstance(owner, ArtifactLeaseOwner) or not isinstance(receipt, DerivedLayerReceipt):
+            raise OCIStoreError("oci-store-lease", "recoverable lease binding is invalid")
+        try:
+            canonical_id = str(uuid.UUID(lease_id))
+        except (ValueError, AttributeError):
+            raise OCIStoreError("oci-store-lease", "derived lease ID is invalid") from None
+        authority_context, use_lock_context, _authority = self._acquire_use_lock(canonical_id)
+        try:
+            self._release_lease(canonical_id, owner, receipt)
+        finally:
+            failures: list[BaseException] = []
+            for context in (use_lock_context, authority_context):
+                try:
+                    context.__exit__(None, None, None)
+                except BaseException as exc:
+                    failures.append(exc)
+            if failures:
+                primary = sys.exception()
+                combined = ([primary] if primary is not None else []) + failures
+                if len(combined) == 1:
+                    raise combined[0]
+                raise BaseExceptionGroup("recoverable lease release cleanup failed", combined) from None
+
+    @staticmethod
+    def _validate_lease_set_inputs(
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> str:
+        if not isinstance(owner, ArtifactLeaseOwner):
+            raise OCIStoreError("oci-store-owner", "lease-set owner is invalid")
+        try:
+            normalized_plan = normalize_digest(plan_digest)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-lease-set", "lease-set plan digest is invalid") from None
+        if normalized_plan != plan_digest:
+            raise OCIStoreError("oci-store-lease-set", "lease-set plan digest is not canonical")
+        if not isinstance(receipts, tuple) or not receipts:
+            raise OCIStoreError("oci-store-lease-set", "lease-set receipts are invalid")
+        if any(not isinstance(receipt, DerivedLayerReceipt) for receipt in receipts):
+            raise OCIStoreError("oci-store-lease-set", "lease-set receipt is invalid")
+        if tuple(receipt.ordinal for receipt in receipts) != tuple(range(len(receipts))):
+            raise OCIStoreError("oci-store-lease-set", "lease-set receipt order is invalid")
+        first = receipts[0]
+        if any(
+            receipt.store_id != first.store_id
+            or receipt.source_snapshot_binding_digest != first.source_snapshot_binding_digest
+            or receipt.source_image_digest != first.source_image_digest
+            for receipt in receipts
+        ):
+            raise OCIStoreError("oci-store-lease-set", "lease-set source binding is inconsistent")
+        return normalized_plan
+
+    @staticmethod
+    def _lease_set_identity(
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> str:
+        return _digest_bytes(
+            _canonical(
+                {
+                    "domain": DERIVED_LEASE_SET_SCHEMA,
+                    "owner": owner.to_dict(),
+                    "plan_digest": plan_digest,
+                    "receipts": [receipt.to_dict() for receipt in receipts],
+                }
+            )
+        )
+
+    @staticmethod
+    def _lease_set_member_id(lease_set_id: str, ordinal: int, receipt: DerivedLayerReceipt) -> str:
+        binding = _canonical(
+            {
+                "domain": f"{DERIVED_LEASE_SET_SCHEMA}.member",
+                "lease_set_id": lease_set_id,
+                "ordinal": ordinal,
+                "receipt": receipt.to_dict(),
+            }
+        )
+        return str(uuid.UUID(bytes=hashlib.sha256(binding).digest()[:16], version=5))
+
+    @classmethod
+    def _lease_set_intent_value(
+        cls,
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> dict[str, Any]:
+        lease_set_id = cls._lease_set_identity(receipts, owner, plan_digest)
+        return {
+            "lease_set_id": lease_set_id,
+            "members": [
+                {
+                    "lease_id": cls._lease_set_member_id(lease_set_id, ordinal, receipt),
+                    "ordinal": ordinal,
+                    "receipt": receipt.to_dict(),
+                }
+                for ordinal, receipt in enumerate(receipts)
+            ],
+            "owner": owner.to_dict(),
+            "plan_digest": plan_digest,
+            "schema": DERIVED_LEASE_SET_SCHEMA,
+        }
+
+    @classmethod
+    def _decode_lease_set_intent(
+        cls,
+        value: dict[str, Any],
+        lease_set_id: str,
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> tuple[DerivedLayerReceipt, ...]:
+        _exact_wire_fields(
+            value,
+            {"lease_set_id", "members", "owner", "plan_digest", "schema"},
+            "derived lease set",
+        )
+        if (
+            value.get("schema") != DERIVED_LEASE_SET_SCHEMA
+            or value.get("lease_set_id") != lease_set_id
+            or value.get("owner") != owner.to_dict()
+            or value.get("plan_digest") != plan_digest
+        ):
+            raise OCIStoreError("oci-store-corrupt", "derived lease-set binding is invalid")
+        members = value.get("members")
+        if not isinstance(members, list) or not members:
+            raise OCIStoreError("oci-store-corrupt", "derived lease-set members are invalid")
+        receipts: list[DerivedLayerReceipt] = []
+        for expected_ordinal, member_value in enumerate(members):
+            member = _exact_wire_fields(
+                member_value,
+                {"lease_id", "ordinal", "receipt"},
+                "derived lease-set member",
+            )
+            try:
+                receipt = DerivedLayerReceipt.from_dict(member["receipt"])
+                canonical_id = str(uuid.UUID(member["lease_id"]))
+            except (OCIStoreError, TypeError, ValueError, AttributeError):
+                raise OCIStoreError("oci-store-corrupt", "derived lease-set member is malformed") from None
+            if (
+                member["ordinal"] != expected_ordinal
+                or receipt.ordinal != expected_ordinal
+                or canonical_id != member["lease_id"]
+            ):
+                raise OCIStoreError("oci-store-corrupt", "derived lease-set member order is invalid")
+            receipts.append(receipt)
+        receipt_tuple = tuple(receipts)
+        cls._validate_lease_set_inputs(receipt_tuple, owner, plan_digest)
+        expected = cls._lease_set_intent_value(receipt_tuple, owner, plan_digest)
+        if value != expected:
+            raise OCIStoreError("oci-store-corrupt", "derived lease-set content is not deterministic")
+        return receipt_tuple
+
+    def _read_lease_set_intent(
+        self,
+        authority: _MetadataAuthority,
+        lease_set_id: str,
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> tuple[dict[str, Any], tuple[DerivedLayerReceipt, ...]]:
+        try:
+            canonical_set_id = normalize_digest(lease_set_id)
+            canonical_plan = normalize_digest(plan_digest)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-lease-set", "lease-set identity is invalid") from None
+        if canonical_set_id != lease_set_id or canonical_plan != plan_digest:
+            raise OCIStoreError("oci-store-lease-set", "lease-set identity is not canonical")
+        payload, _ = self._read_file(authority.lease_sets_fd, _digest_hex(canonical_set_id))
+        value = self._decode(payload)
+        receipts = self._decode_lease_set_intent(value, canonical_set_id, owner, canonical_plan)
+        if self._lease_set_identity(receipts, owner, canonical_plan) != canonical_set_id:
+            raise OCIStoreError("oci-store-corrupt", "derived lease-set identity is invalid")
+        return value, receipts
+
+    @staticmethod
+    def _lease_record_value(
+        lease_id: str,
+        owner: ArtifactLeaseOwner,
+        receipt: DerivedLayerReceipt,
+        acquired_ns: int,
+    ) -> dict[str, Any]:
+        return {
+            "acquired_ns": acquired_ns,
+            "image_digest": receipt.image_digest,
+            "image_size": receipt.image_size,
+            "lease_id": lease_id,
+            "occurrence_digest": receipt.occurrence_digest,
+            "owner": owner.to_dict(),
+            "receipt": receipt.to_dict(),
+            "schema": DERIVED_LEASE_SCHEMA,
+        }
+
+    def acquire_lease_set(
+        self,
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        *,
+        plan_digest: str,
+    ) -> DurableLeaseSet:
+        """Atomically converge an ordered boot-plan reservation after retries."""
+        self._validate_lease_set_inputs(receipts, owner, plan_digest)
+        if any(receipt.store_id != self.identity for receipt in receipts):
+            raise OCIStoreError("oci-store-receipt", "lease-set receipt belongs to a different store")
+        intent = self._lease_set_intent_value(receipts, owner, plan_digest)
+        lease_set_id = intent["lease_set_id"]
+        acquired_ns = self._clock()
+        if type(acquired_ns) is not int or acquired_ns < 0:
+            raise OCIStoreError("oci-store-clock", "lease-set acquisition clock is invalid")
+        with ExitStack() as guards:
+            for digest in sorted({receipt.image_digest for receipt in receipts}):
+                guards.enter_context(self._artifacts.digest_guard(digest))
+            with self._authority() as authority:
+                for receipt in receipts:
+                    self._read_occurrence(authority, receipt)
+                members: list[DurableLeaseSetMember] = []
+                with self._lock(authority, "lease-index.lock"):
+                    self._publish_file(
+                        authority,
+                        authority.lease_sets_fd,
+                        _digest_hex(lease_set_id),
+                        _canonical(intent),
+                    )
+                    for ordinal, receipt in enumerate(receipts):
+                        lease_id = intent["members"][ordinal]["lease_id"]
+                        try:
+                            payload, _ = self._read_file(authority.leases_fd, lease_id)
+                        except OCIStoreError as exc:
+                            if exc.code != "oci-store-missing":
+                                raise
+                            value = self._lease_record_value(lease_id, owner, receipt, acquired_ns)
+                            self._publish_file(authority, authority.leases_fd, lease_id, _canonical(value))
+                        else:
+                            value = self._decode(payload)
+                            self._validate_lease_value(value, lease_id, owner, receipt)
+                        member_time = value.get("acquired_ns")
+                        if type(member_time) is not int or member_time < 0:
+                            raise OCIStoreError("oci-store-corrupt", "derived lease acquisition time is invalid")
+                        members.append(DurableLeaseSetMember(ordinal, lease_id, receipt, member_time))
+        return DurableLeaseSet(lease_set_id, plan_digest, owner, tuple(members))
+
+    def lease_set_id(
+        self,
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        *,
+        plan_digest: str,
+    ) -> str:
+        """Return the deterministic identity for a validated ordered set."""
+        self._validate_lease_set_inputs(receipts, owner, plan_digest)
+        if any(receipt.store_id != self.identity for receipt in receipts):
+            raise OCIStoreError("oci-store-receipt", "lease-set receipt belongs to a different store")
+        return self._lease_set_identity(receipts, owner, plan_digest)
+
+    def load_lease_set(
+        self,
+        lease_set_id: str,
+        owner: ArtifactLeaseOwner,
+        *,
+        plan_digest: str,
+    ) -> DurableLeaseSet:
+        """Load only a complete, fully validated lease-set reservation."""
+        if not isinstance(owner, ArtifactLeaseOwner):
+            raise OCIStoreError("oci-store-owner", "lease-set owner is invalid")
+        members: list[DurableLeaseSetMember] = []
+        with self._authority() as authority:
+            with self._lock(authority, "lease-index.lock"):
+                intent, receipts = self._read_lease_set_intent(authority, lease_set_id, owner, plan_digest)
+                for ordinal, receipt in enumerate(receipts):
+                    lease_id = intent["members"][ordinal]["lease_id"]
+                    payload, _ = self._read_file(authority.leases_fd, lease_id)
+                    value = self._decode(payload)
+                    self._validate_lease_value(value, lease_id, owner, receipt)
+                    acquired_ns = value.get("acquired_ns")
+                    if type(acquired_ns) is not int or acquired_ns < 0:
+                        raise OCIStoreError("oci-store-corrupt", "derived lease acquisition time is invalid")
+                    members.append(DurableLeaseSetMember(ordinal, lease_id, receipt, acquired_ns))
+            for receipt in receipts:
+                self._read_occurrence(authority, receipt)
+        return DurableLeaseSet(lease_set_id, plan_digest, owner, tuple(members))
+
+    def list_lease_set_intents(
+        self,
+        owner: ArtifactLeaseOwner | None = None,
+    ) -> tuple[RecoverableLeaseSetIntent, ...]:
+        """Enumerate exact complete and partial intents for restart reconciliation."""
+        if owner is not None and not isinstance(owner, ArtifactLeaseOwner):
+            raise OCIStoreError("oci-store-owner", "lease-set owner filter is invalid")
+        found: list[RecoverableLeaseSetIntent] = []
+        with self._authority() as authority:
+            with self._lock(authority, "lease-index.lock"):
+                try:
+                    names = sorted(os.listdir(authority.lease_sets_fd))
+                except OSError:
+                    raise OCIStoreError("oci-store-lease-set", "lease-set intents cannot be enumerated") from None
+                for name in names:
+                    if _TEMP_RE.fullmatch(name) is not None:
+                        continue
+                    if _HEX_RE.fullmatch(name) is None:
+                        raise OCIStoreError("oci-store-corrupt", "derived lease-set name is invalid")
+                    lease_set_id = f"sha256:{name}"
+                    payload, _ = self._read_file(authority.lease_sets_fd, name)
+                    value = self._decode(payload)
+                    owner_value = _exact_wire_fields(
+                        value.get("owner"), {"role", "run_id", "run_name"}, "lease-set owner"
+                    )
+                    try:
+                        intent_owner = ArtifactLeaseOwner(**owner_value)
+                        plan_digest = normalize_digest(value.get("plan_digest", ""))
+                        receipts = self._decode_lease_set_intent(value, lease_set_id, intent_owner, plan_digest)
+                    except (OCIStoreError, ArtifactValidationError, TypeError, ValueError):
+                        raise OCIStoreError("oci-store-corrupt", "derived lease-set intent is malformed") from None
+                    if owner is not None and intent_owner != owner:
+                        continue
+                    member_ids = tuple(member["lease_id"] for member in value["members"])
+                    present: list[str] = []
+                    for lease_id, receipt in zip(member_ids, receipts, strict=True):
+                        try:
+                            lease_payload, _ = self._read_file(authority.leases_fd, lease_id)
+                        except OCIStoreError as exc:
+                            if exc.code == "oci-store-missing":
+                                continue
+                            raise
+                        lease_value = self._decode(lease_payload)
+                        self._validate_lease_value(lease_value, lease_id, intent_owner, receipt)
+                        acquired_ns = lease_value.get("acquired_ns")
+                        if type(acquired_ns) is not int or acquired_ns < 0:
+                            raise OCIStoreError("oci-store-corrupt", "derived lease acquisition time is invalid")
+                        present.append(lease_id)
+                    found.append(
+                        RecoverableLeaseSetIntent(
+                            lease_set_id,
+                            plan_digest,
+                            intent_owner,
+                            receipts,
+                            member_ids,
+                            tuple(present),
+                        )
+                    )
+            for intent in found:
+                for receipt in intent.receipts:
+                    self._read_occurrence(authority, receipt, verify_artifact=False)
+        return tuple(found)
+
+    def release_lease_set(self, lease_set: DurableLeaseSet) -> None:
+        """Release a complete lease set; interrupted releases remain retryable."""
+        if not isinstance(lease_set, DurableLeaseSet):
+            raise OCIStoreError("oci-store-lease-set", "lease-set release input is invalid")
+        expected_id = self.lease_set_id(
+            tuple(member.receipt for member in lease_set.members),
+            lease_set.owner,
+            plan_digest=lease_set.plan_digest,
+        )
+        expected_members = tuple(
+            self._lease_set_member_id(expected_id, member.ordinal, member.receipt) for member in lease_set.members
+        )
+        if expected_id != lease_set.lease_set_id or expected_members != tuple(
+            member.lease_id for member in lease_set.members
+        ):
+            raise OCIStoreError("oci-store-lease-set", "lease-set release binding changed")
+        try:
+            self.rollback_lease_set(
+                lease_set.lease_set_id,
+                lease_set.owner,
+                plan_digest=lease_set.plan_digest,
+            )
+        except OCIStoreError as exc:
+            if exc.code != "oci-store-missing":
+                raise
+            with self._authority() as authority, self._lock(authority, "lease-index.lock"):
+                for member in lease_set.members:
+                    try:
+                        self._read_file(authority.leases_fd, member.lease_id)
+                    except OCIStoreError as missing:
+                        if missing.code == "oci-store-missing":
+                            continue
+                        raise
+                    raise OCIStoreError(
+                        "oci-store-corrupt", "released lease-set intent is missing while a member remains"
+                    ) from None
+
+    def rollback_lease_set(
+        self,
+        lease_set_id: str,
+        owner: ArtifactLeaseOwner,
+        *,
+        plan_digest: str,
+    ) -> None:
+        """Remove an exact complete or partially published deterministic set."""
+        if not isinstance(owner, ArtifactLeaseOwner):
+            raise OCIStoreError("oci-store-owner", "lease-set owner is invalid")
+        with self._authority() as authority:
+            with self._lock(authority, "lease-index.lock"):
+                intent, receipts = self._read_lease_set_intent(authority, lease_set_id, owner, plan_digest)
+            with ExitStack() as locks:
+                lease_ids = tuple(member["lease_id"] for member in intent["members"])
+                for lease_id in sorted(lease_ids):
+                    locks.enter_context(
+                        self._lock(
+                            authority,
+                            f"lease-use-{lease_id.replace('-', '')}.lock",
+                            close_in_fork_child=True,
+                        )
+                    )
+                for digest in sorted({receipt.image_digest for receipt in receipts}):
+                    locks.enter_context(self._artifacts.digest_guard(digest))
+                with self._lock(authority, "lease-index.lock"):
+                    current, current_receipts = self._read_lease_set_intent(authority, lease_set_id, owner, plan_digest)
+                    if current != intent or current_receipts != receipts:
+                        raise OCIStoreError("oci-store-corrupt", "derived lease-set changed during release")
+                    for ordinal, receipt in enumerate(receipts):
+                        lease_id = lease_ids[ordinal]
+                        try:
+                            payload, _ = self._read_file(authority.leases_fd, lease_id)
+                        except OCIStoreError as exc:
+                            if exc.code == "oci-store-missing":
+                                continue
+                            raise
+                        value = self._decode(payload)
+                        self._validate_lease_value(value, lease_id, owner, receipt)
+                        try:
+                            os.unlink(lease_id, dir_fd=authority.leases_fd)
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            raise OCIStoreError("oci-store-lease", "lease-set member release failed") from None
+                    os.fsync(authority.leases_fd)
+                    try:
+                        os.unlink(_digest_hex(lease_set_id), dir_fd=authority.lease_sets_fd)
+                        os.fsync(authority.lease_sets_fd)
+                    except OSError:
+                        raise OCIStoreError("oci-store-lease-set", "lease-set intent release failed") from None
+
     def assert_artifact_unleased(self, digest: str) -> None:
         """Fail closed when any durable derived occurrence lease retains a digest.
 
@@ -1563,6 +2114,29 @@ class OCIStore:
             "schema",
         }
         with self._authority() as authority, self._lock(authority, "lease-index.lock"):
+            try:
+                lease_set_names = sorted(os.listdir(authority.lease_sets_fd))
+            except OSError:
+                raise OCIStoreError("oci-store-retention", "derived lease sets cannot be enumerated") from None
+            for name in lease_set_names:
+                if _TEMP_RE.fullmatch(name) is not None:
+                    continue
+                if _HEX_RE.fullmatch(name) is None:
+                    raise OCIStoreError("oci-store-corrupt", "derived lease-set name is invalid")
+                lease_set_id = f"sha256:{name}"
+                payload, _ = self._read_file(authority.lease_sets_fd, name)
+                value = self._decode(payload)
+                owner_value = _exact_wire_fields(value.get("owner"), {"role", "run_id", "run_name"}, "lease-set owner")
+                try:
+                    owner = ArtifactLeaseOwner(**owner_value)
+                    plan_digest = normalize_digest(value.get("plan_digest", ""))
+                    receipts = self._decode_lease_set_intent(value, lease_set_id, owner, plan_digest)
+                except (OCIStoreError, ArtifactValidationError, TypeError, ValueError):
+                    raise OCIStoreError("oci-store-corrupt", "derived lease-set retention is malformed") from None
+                for receipt in receipts:
+                    self._read_occurrence(authority, receipt, verify_artifact=False)
+                    if receipt.image_digest == normalized:
+                        raise OCIStoreError("oci-store-in-use", "artifact is retained by a durable OCI lease set")
             try:
                 names = sorted(os.listdir(authority.leases_fd))
             except OSError:
@@ -1670,6 +2244,7 @@ class OCIStore:
                     authority.keys_fd,
                     authority.occurrences_fd,
                     authority.leases_fd,
+                    authority.lease_sets_fd,
                 ):
                     try:
                         names = os.listdir(directory_fd)
@@ -1716,6 +2291,7 @@ class OCIStore:
 __all__ = [
     "ArtifactLeaseOwner",
     "DERIVED_LEASE_SCHEMA",
+    "DERIVED_LEASE_SET_SCHEMA",
     "DERIVED_OCCURRENCE_SCHEMA",
     "DERIVED_RECIPE_SCHEMA",
     "DERIVED_RECORD_SCHEMA",
@@ -1723,9 +2299,12 @@ __all__ = [
     "DerivedLayerReceipt",
     "DerivedSquashFSKey",
     "DurableDerivedLayerLease",
+    "DurableLeaseSet",
+    "DurableLeaseSetMember",
     "MATERIALIZATION_CACHE_RESULTS",
     "MaterializationResult",
     "OCIStore",
     "OCIStoreError",
     "RecoverableDerivedLease",
+    "RecoverableLeaseSetIntent",
 ]

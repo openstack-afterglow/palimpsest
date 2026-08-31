@@ -330,6 +330,27 @@ Verification recorded for this slice:
 
 Scope boundary: this receipt is not yet an OCI-root boot plan. Durable lower leases, VM-specific writable root volume, retained boot-volume reuse, kernel/initramfs, stage-1 pivot, init supervision, and foreground/`-d` runtime lifecycle remain subsequent slices. Gate 2 stays inactive.
 
+### PR 4 slice 9: crash-recoverable immutable-lower boot-plan reservation
+
+Implemented:
+
+- `OCIStore.acquire_lease_set` binds the complete ordinal-preserving materialization receipt tuple, run owner, and canonical boot-plan digest to one immutable lease-set intent. The set and every member lease ID are deterministic, so a retry after interruption converges on the same records instead of duplicating ownership.
+- Publication holds all unique artifact digest guards in canonical order, validates every occurrence/artifact, then commits the intent before member leases under the lease-index lock. The retention guard validates both intents and individual leases, so even a crash after the intent but before the first member prevents physical GC of every planned lower.
+- A complete set can be loaded only after strict owner, plan, source, occurrence, ordinal, lease, and artifact validation. A partial set can be rolled back from its durable intent; interrupted release removes the intent last and can retry over already-absent members.
+- `list_lease_set_intents` enumerates complete and partial intents with exact owner/run identity and present-member state, including after process restart. A reconciler can therefore resume a known plan or roll back an orphan instead of leaving intent-only GC retention undiscoverable. Durable run-ledger phase commit is intentionally deferred to the writable-root ownership transaction.
+- `DurableDerivedLayerLease.detach` and `release_recoverable_lease` make durable retention without an open reader explicit. Release serializes with the per-lease use lock and does not require streaming the whole SquashFS merely to roll back ownership.
+- `OCIBootPlanIntent` is a canonical path-free contract for one `oci-root`/KVM run. It preserves every layer occurrence, binds source graph/config/platform/derived receipts, declares only the `lower-reserved` phase, and records the VM-specific writable-root policy without claiming that a writable volume exists yet.
+- `PreparedOCIBootPlan` is returned only when the exact ordered lower lease set is complete. Recovery and release APIs reject owner/plan rebinding.
+- Fault-injection tests cover intent-only and partial-member crashes, deterministic retry, explicit partial rollback, interrupted release retry, malformed-intent fail-closed behavior, shared physical artifacts at multiple ordinals, GC retention, path-free plans, and detached single-lease cleanup.
+
+Verification recorded for this slice:
+
+- Complete local `tests` tree: 2197 passed, 16 skipped, 1 existing fork deprecation warning; skips are environment-gated Linux/KVM/BuildKit/filesystem cases.
+- Focused OCI store/boot-plan suite: 46 passed.
+- Ruff lint/format, Python compile, `git diff --check`, sdist, and wheel build: pass.
+
+Scope boundary: this slice reserves the immutable lower graph but does not create a root disk, emit a libvirt domain, select a kernel/initramfs, assemble/pivot `/`, supervise image init, or implement foreground/`-d`. Gate 2 remains inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -350,7 +371,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Bind the ordered receipt set to durable immutable-lower leases and define the OCI-root boot plan: VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
-2. Implement boot-plan recovery and rollback so failed creation cannot leak run ownership or lose retained reusable volumes.
+1. Add the VM-specific writable root volume/overlay ownership transaction and retained boot-volume reuse, committing the prepared lower reservation into run state without leaking either side on failure.
+2. Add the host kernel/initramfs policy plus stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

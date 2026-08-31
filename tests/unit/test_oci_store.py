@@ -22,12 +22,20 @@ import pytest
 import palimpsest_local.artifact_store as artifact_store_module
 import palimpsest_local.oci_store as oci_store_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
+from palimpsest_local.oci_boot_plan import (
+    OCIBootPlanIntent,
+    PreparedOCIBootPlan,
+    load_prepared_oci_boot_plan,
+    prepare_oci_boot_plan,
+    release_oci_boot_plan,
+)
 from palimpsest_local.oci_converter import (
     DEFAULT_LAYER_CONVERSION_LIMITS,
     LAYER_INTAKE_POLICY_ID,
     LayerIntakeReceipt,
 )
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
@@ -37,7 +45,12 @@ from palimpsest_local.oci_packer import (
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
 )
-from palimpsest_local.oci_provenance import OCI_LAYER_MEDIA_TYPE
+from palimpsest_local.oci_provenance import (
+    OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OCI_LAYER_MEDIA_TYPE,
+    Descriptor,
+)
 from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
@@ -365,6 +378,299 @@ def test_durable_lease_is_discoverable_and_public_bindings_are_read_only(tmp_pat
     with pytest.raises(AttributeError):
         lease.receipt = receipt
     lease._abort()
+
+
+def test_durable_lease_can_detach_and_release_without_streaming(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    occurrence = _occurrence()
+    image = _squashfs()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-layer")
+
+    lease = store.acquire_lease(receipt, owner)
+    lease_id = lease.detach()
+
+    assert [item.lease_id for item in store.list_leases(owner)] == [lease_id]
+    store.release_recoverable_lease(lease_id, owner, receipt)
+    assert store.list_leases(owner) == ()
+
+
+def _ordered_receipts(store: OCIStore, count: int = 3):
+    image = _squashfs()
+    receipts = []
+    for ordinal in range(count):
+        occurrence = _occurrence(ordinal)
+        result = store.materialize_observed(
+            occurrence,
+            _key(occurrence),
+            _producer(occurrence, [], image),
+        )
+        receipts.append(result.receipt)
+    return image, tuple(receipts)
+
+
+def test_lease_set_is_ordered_idempotent_and_retains_shared_artifact(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+
+    first = store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    second = store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+
+    assert second == first
+    assert tuple(member.ordinal for member in first.members) == (0, 1, 2)
+    assert tuple(member.receipt for member in first.members) == receipts
+    assert len({member.lease_id for member in first.members}) == 3
+    assert len(list((roots.oci_derived_store / "leases").iterdir())) == 3
+    assert store.load_lease_set(first.lease_set_id, owner, plan_digest=plan_digest) == first
+    assert store.list_lease_set_intents(owner)[0].complete
+    with pytest.raises(OCIStoreError, match="retained by a durable OCI lease"):
+        ArtifactStore(roots.store).delete_blob(
+            receipts[0].image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
+        )
+
+    store.release_lease_set(first)
+
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+    assert ArtifactStore(roots.store).delete_blob(
+        receipts[0].image_digest,
+        retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
+    ) == len(image)
+
+
+def test_partial_lease_set_publication_retry_converges(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+    expected_id = store.lease_set_id(receipts, owner, plan_digest=plan_digest)
+    real_publish = store._publish_file
+    lease_publications = 0
+
+    def fail_second_member(authority, directory_fd, name, payload, **kwargs):
+        nonlocal lease_publications
+        if json.loads(payload).get("schema") == oci_store_module.DERIVED_LEASE_SCHEMA:
+            lease_publications += 1
+            if lease_publications == 2:
+                raise OCIStoreError("injected-crash", "partial lease-set publication")
+        return real_publish(authority, directory_fd, name, payload, **kwargs)
+
+    monkeypatch.setattr(store, "_publish_file", fail_second_member)
+    with pytest.raises(OCIStoreError, match="partial lease-set"):
+        store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+
+    assert len(list((roots.oci_derived_store / "lease-sets").iterdir())) == 1
+    assert len(list((roots.oci_derived_store / "leases").iterdir())) == 1
+    monkeypatch.setattr(store, "_publish_file", real_publish)
+
+    recovered = store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    assert recovered.lease_set_id == expected_id
+    assert len(recovered.members) == 3
+    store.release_lease_set(recovered)
+
+
+def test_intent_only_crash_still_retains_every_planned_artifact(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+    lease_set_id = store.lease_set_id(receipts, owner, plan_digest=plan_digest)
+    real_publish = store._publish_file
+
+    def fail_first_member(authority, directory_fd, name, payload, **kwargs):
+        if json.loads(payload).get("schema") == oci_store_module.DERIVED_LEASE_SCHEMA:
+            raise OCIStoreError("injected-crash", "intent-only lease-set publication")
+        return real_publish(authority, directory_fd, name, payload, **kwargs)
+
+    monkeypatch.setattr(store, "_publish_file", fail_first_member)
+    with pytest.raises(OCIStoreError, match="intent-only"):
+        store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    assert len(list((roots.oci_derived_store / "leases").iterdir())) == 0
+    with pytest.raises(OCIStoreError, match="durable OCI lease set"):
+        ArtifactStore(roots.store).delete_blob(
+            receipts[0].image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
+        )
+
+    monkeypatch.setattr(store, "_publish_file", real_publish)
+    store.rollback_lease_set(lease_set_id, owner, plan_digest=plan_digest)
+
+
+def test_lease_set_acquisition_linearizes_before_physical_delete(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store, 2)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    physical = ArtifactStore(roots.store)
+    publishing_intent = threading.Event()
+    allow_publish = threading.Event()
+    delete_attempted = threading.Event()
+    outcomes: list[str] = []
+    acquired = []
+    real_publish = store._publish_file
+    real_delete_lock = physical._digest_lock
+
+    def delayed_publish(authority, directory_fd, name, payload, **kwargs):
+        if json.loads(payload).get("schema") == oci_store_module.DERIVED_LEASE_SET_SCHEMA:
+            publishing_intent.set()
+            assert allow_publish.wait(2)
+        return real_publish(authority, directory_fd, name, payload, **kwargs)
+
+    @contextmanager
+    def observed_delete_lock(authority, digest_hex):
+        delete_attempted.set()
+        with real_delete_lock(authority, digest_hex):
+            yield
+
+    monkeypatch.setattr(store, "_publish_file", delayed_publish)
+    monkeypatch.setattr(physical, "_digest_lock", observed_delete_lock)
+
+    acquire_thread = threading.Thread(
+        target=lambda: acquired.append(store.acquire_lease_set(receipts, owner, plan_digest=_digest("9")))
+    )
+
+    def delete() -> None:
+        try:
+            physical.delete_blob(
+                receipts[0].image_digest,
+                retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
+            )
+        except OCIStoreError as exc:
+            outcomes.append(exc.code)
+
+    delete_thread = threading.Thread(target=delete)
+    acquire_thread.start()
+    assert publishing_intent.wait(2)
+    delete_thread.start()
+    assert delete_attempted.wait(2)
+    assert delete_thread.is_alive()
+    allow_publish.set()
+    acquire_thread.join(2)
+    delete_thread.join(2)
+
+    assert outcomes == ["oci-store-in-use"]
+    assert len(acquired) == 1
+    store.release_lease_set(acquired[0])
+
+
+def test_partial_lease_set_can_be_rolled_back_from_durable_intent(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+    lease_set_id = store.lease_set_id(receipts, owner, plan_digest=plan_digest)
+    real_publish = store._publish_file
+    lease_publications = 0
+
+    def fail_second_member(authority, directory_fd, name, payload, **kwargs):
+        nonlocal lease_publications
+        if json.loads(payload).get("schema") == oci_store_module.DERIVED_LEASE_SCHEMA:
+            lease_publications += 1
+            if lease_publications == 2:
+                raise OCIStoreError("injected-crash", "partial lease-set publication")
+        return real_publish(authority, directory_fd, name, payload, **kwargs)
+
+    monkeypatch.setattr(store, "_publish_file", fail_second_member)
+    with pytest.raises(OCIStoreError, match="partial lease-set"):
+        store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    monkeypatch.setattr(store, "_publish_file", real_publish)
+
+    recoverable = store.list_lease_set_intents(owner)
+    assert len(recoverable) == 1
+    assert recoverable[0].lease_set_id == lease_set_id
+    assert recoverable[0].present_lease_ids == recoverable[0].member_lease_ids[:1]
+    assert not recoverable[0].complete
+
+    store.rollback_lease_set(lease_set_id, owner, plan_digest=plan_digest)
+
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+def test_interrupted_lease_set_release_retry_converges(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    lease_set = store.acquire_lease_set(receipts, owner, plan_digest=_digest("9"))
+    fail_id = lease_set.members[1].lease_id
+    real_unlink = oci_store_module.os.unlink
+    injected = False
+
+    def fail_one_member(name, *args, **kwargs):
+        nonlocal injected
+        if name == fail_id and not injected:
+            injected = True
+            raise OSError("injected lease-set release fault")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(oci_store_module.os, "unlink", fail_one_member)
+    with pytest.raises(OCIStoreError, match="member release failed"):
+        store.release_lease_set(lease_set)
+    assert len(list((roots.oci_derived_store / "lease-sets").iterdir())) == 1
+    monkeypatch.setattr(oci_store_module.os, "unlink", real_unlink)
+
+    store.release_lease_set(lease_set)
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+def test_intent_unlink_fsync_failure_is_terminally_idempotent(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    lease_set = store.acquire_lease_set(receipts, owner, plan_digest=_digest("9"))
+    lease_sets_stat = (roots.oci_derived_store / "lease-sets").stat()
+    target_identity = (lease_sets_stat.st_dev, lease_sets_stat.st_ino)
+    real_fsync = oci_store_module.os.fsync
+    injected = False
+
+    def fail_final_intent_fsync(fd):
+        nonlocal injected
+        opened = os.fstat(fd)
+        if not injected and (opened.st_dev, opened.st_ino) == target_identity:
+            injected = True
+            raise OSError("injected final intent fsync fault")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(oci_store_module.os, "fsync", fail_final_intent_fsync)
+    with pytest.raises(OCIStoreError, match="intent release failed"):
+        store.release_lease_set(lease_set)
+    monkeypatch.setattr(oci_store_module.os, "fsync", real_fsync)
+
+    store.release_lease_set(lease_set)
+    store.release_lease_set(lease_set)
+    assert store.list_lease_set_intents(owner) == ()
+
+
+def test_malformed_lease_set_intent_fails_closed(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+    lease_set = store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    intent_path = roots.oci_derived_store / "lease-sets" / lease_set.lease_set_id.removeprefix("sha256:")
+    original = intent_path.read_bytes()
+    malformed = json.loads(original)
+    malformed["members"][0]["ordinal"] = 1
+    intent_path.chmod(0o600)
+    intent_path.write_bytes(json.dumps(malformed, sort_keys=True, separators=(",", ":")).encode())
+    intent_path.chmod(0o400)
+
+    with pytest.raises(OCIStoreError, match="member order is invalid"):
+        store.load_lease_set(lease_set.lease_set_id, owner, plan_digest=plan_digest)
+    with pytest.raises(OCIStoreError, match="lease-set retention is malformed"):
+        ArtifactStore(roots.store).delete_blob(
+            receipts[0].image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
+        )
+    assert len(list((roots.oci_derived_store / "leases").iterdir())) == 3
+
+    intent_path.chmod(0o600)
+    intent_path.write_bytes(original)
+    intent_path.chmod(0o400)
+    store.release_lease_set(lease_set)
 
 
 def test_physical_delete_honors_durable_lease_and_legacy_publish_reuses_inode(tmp_path: Path) -> None:
@@ -877,7 +1183,7 @@ def test_stale_repair_preserves_fresh_then_removes_old_metadata_and_artifact_tem
     now = time.time_ns()
     fresh_store = OCIStore(roots, repair_min_age_seconds=3600, wall_clock_ns=lambda: now)
     temporary_names: list[Path] = []
-    for directory in ("records", "keys", "occurrences", "leases"):
+    for directory in ("records", "keys", "occurrences", "leases", "lease-sets"):
         temporary = roots.oci_derived_store / directory / f".oci-derived-tmp-{uuid.uuid4().hex}"
         temporary.write_bytes(b"temporary")
         temporary.chmod(0o400)
@@ -1045,3 +1351,91 @@ def test_failed_recipe_producer_releases_waiter_for_successful_retry(tmp_path: P
 
     assert calls == 2
     assert sorted(isinstance(result, str) for result in results) == [False, True]
+
+
+def _image_materialization(store: OCIStore) -> OCIImageMaterializationReceipt:
+    _image, receipts = _ordered_receipts(store)
+    layers = tuple(Descriptor(OCI_LAYER_MEDIA_TYPE, _digest("c"), 123) for _receipt in receipts)
+    return OCIImageMaterializationReceipt(
+        source_snapshot_binding_digest=receipts[0].source_snapshot_binding_digest,
+        source_image_digest=receipts[0].source_image_digest,
+        root_descriptor=Descriptor(OCI_IMAGE_MANIFEST_MEDIA_TYPE, _digest("2"), 512),
+        manifest_digest=_digest("2"),
+        config_descriptor=Descriptor(OCI_IMAGE_CONFIG_MEDIA_TYPE, _digest("3"), 256),
+        platform_os="linux",
+        platform_architecture="amd64",
+        layer_descriptors=layers,
+        layer_diff_ids=tuple(_digest("d") for _receipt in receipts),
+        results=tuple(MaterializationResult(receipt, "warm_hit") for receipt in receipts),
+    )
+
+
+def test_boot_plan_is_path_free_ordered_and_recoverable(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    run_id = str(uuid.uuid4())
+
+    prepared = prepare_oci_boot_plan(materialization, run_id=run_id, run_name="demo", store=store)
+    recovered = load_prepared_oci_boot_plan(prepared.intent, store)
+    encoded = json.dumps(prepared.to_dict(), sort_keys=True)
+
+    assert recovered == prepared
+    assert prepared.intent.owner == ArtifactLeaseOwner(run_id, "demo", "root-lower")
+    assert tuple(member.ordinal for member in prepared.lower_leases.members) == (0, 1, 2)
+    assert prepared.intent.to_dict()["phase"] == "lower-reserved"
+    assert prepared.intent.to_dict()["writable_root_policy"] == "vm-specific"
+    assert str(tmp_path) not in encoded
+    assert "/blobs/" not in encoded and "/lease-sets/" not in encoded
+
+    release_oci_boot_plan(prepared, store)
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+def test_boot_plan_digest_and_lease_set_are_deterministic(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    run_id = str(uuid.uuid4())
+    first_intent = OCIBootPlanIntent(run_id, "demo", materialization)
+    second_intent = OCIBootPlanIntent(run_id, "demo", materialization)
+
+    first = prepare_oci_boot_plan(materialization, run_id=run_id, run_name="demo", store=store)
+    second = prepare_oci_boot_plan(materialization, run_id=run_id, run_name="demo", store=store)
+
+    assert first_intent.digest == second_intent.digest == first.intent.digest
+    assert first == second
+    release_oci_boot_plan(first, store)
+
+
+def test_prepared_boot_plan_rejects_owner_rebinding(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    prepared = prepare_oci_boot_plan(
+        materialization,
+        run_id=str(uuid.uuid4()),
+        run_name="demo",
+        store=store,
+    )
+    foreign_owner = ArtifactLeaseOwner(str(uuid.uuid4()), "other", "root-lower")
+
+    with pytest.raises(OCIStoreError, match="lease binding is invalid"):
+        PreparedOCIBootPlan(prepared.intent, replace(prepared.lower_leases, owner=foreign_owner))
+
+    release_oci_boot_plan(prepared, store)
+
+
+def test_boot_plan_rejects_materialization_metadata_rebinding(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    forged = replace(
+        materialization,
+        layer_diff_ids=(_digest("e"), *materialization.layer_diff_ids[1:]),
+    )
+
+    with pytest.raises(OCIStoreError, match="receipt occurrence binding is invalid"):
+        prepare_oci_boot_plan(
+            forged,
+            run_id=str(uuid.uuid4()),
+            run_name="demo",
+            store=store,
+        )
