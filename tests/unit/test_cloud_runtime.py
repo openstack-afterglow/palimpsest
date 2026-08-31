@@ -140,6 +140,13 @@ def _sha256_file(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
+def _stub_store_blob(roots: state.StatePaths, digest: str) -> None:
+    target = roots.store / "blobs" / "sha256" / digest.split(":", 1)[1]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"stub")
+    target.chmod(0o444)
+
+
 def _serve_serial_frame(path: Path, header: dict[str, object], body: bytes = b"") -> threading.Thread:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
@@ -1136,6 +1143,8 @@ def test_commit_success(tmp_path: Path):
 
     base_digest = "sha256:" + "a" * 64
     layer_digest = "sha256:" + "b" * 64
+    _stub_store_blob(roots, base_digest)
+    _stub_store_blob(roots, layer_digest)
     owner_rec = state.write_owner_record(rpaths)
     state.write_run_state(
         rpaths,
@@ -1191,6 +1200,7 @@ def test_typed_commit_binding_rejects_run_replacement_before_capture_or_publish(
     rpaths.identity.chmod(0o600)
     rpaths.known_hosts.chmod(0o600)
     original = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, "sha256:" + "a" * 64)
     state.write_run_state(
         rpaths,
         status="running",
@@ -1314,6 +1324,7 @@ def test_commit_refuses_busy_merged_tree(tmp_path: Path):
     rpaths.identity.write_text("key")
     rpaths.known_hosts.write_text("host")
     owner_rec = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, "sha256:" + "a" * 64)
     state.write_run_state(
         rpaths, status="running", data={"guest_ip": "192.168.122.50", "base_digest": "sha256:" + "a" * 64}
     )
@@ -1348,6 +1359,7 @@ def test_commit_tag_conflict(tmp_path: Path):
     rpaths.known_hosts.write_text("host")
     base_digest = "sha256:" + "a" * 64
     owner_rec = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, base_digest)
     state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.50", "base_digest": base_digest})
 
     conn = FakeLibvirtConn()
@@ -1367,6 +1379,7 @@ def test_commit_tag_conflict(tmp_path: Path):
         source="commit",
         created_at=state.utc_now_iso(),
     )
+    _stub_store_blob(roots, existing_rec.digest)
     state.write_tag_record(roots, existing_rec)
 
     def fake_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1853,7 +1866,7 @@ def test_single_run_reconcile_uses_exact_backend_uri_without_profile_or_firmware
     assert uris == ["qemu:///system", "qemu:///session"]
 
 
-def test_single_run_connection_failure_does_not_create_lock_or_mutate_ledgers(
+def test_single_run_connection_failure_creates_no_additional_lock_or_mutates_ledgers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1865,18 +1878,20 @@ def test_single_run_connection_failure_does_not_create_lock_or_mutate_ledgers(
     state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
     expected = state.read_run_dispatch_record(roots, "offline-run")
     before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    locks_before = sorted(path.name for path in roots.locks.iterdir())
     monkeypatch.setattr(kvm, "connect", lambda _uri: (_ for _ in ()).throw(kvm.KvmError("offline")))
 
     with pytest.raises(LifecycleError, match="offline"):
         runtime.reconcile_run("offline-run", roots=roots, _expected_record=expected)
 
-    assert not roots.locks.exists()
+    assert locks_before == ["artifact-references-v1.lock"]
+    assert sorted(path.name for path in roots.locks.iterdir()) == locks_before
     assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
 
     result = runtime.inspect_run("offline-run", roots=roots)
     assert result["owner"]["run_id"] == owner.run_id
     assert result["state"]["status"] == "stopped"
-    assert not roots.locks.exists()
+    assert sorted(path.name for path in roots.locks.iterdir()) == locks_before
     assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
 
 

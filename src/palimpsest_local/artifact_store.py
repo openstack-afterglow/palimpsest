@@ -32,6 +32,7 @@ _DIR_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _TEMP_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
 _LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+_SEALED_MODES = frozenset({_BLOB_MODE, 0o444})
 _DIGEST_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 _TEMP_RE = re.compile(r"^\.oci-artifact-tmp-([0-9a-f]{64})-[0-9a-f]{32}$")
 
@@ -576,6 +577,54 @@ class ArtifactStore:
         finally:
             _close_noerror(fd)
 
+    def _open_verified_blob_fd(
+        self,
+        authority: _Authority,
+        digest: str,
+    ) -> tuple[int, os.stat_result]:
+        """Open and hash one generic CAS blob through its pinned directory entry."""
+        name = _digest_hex(digest)
+        fd: int | None = None
+        try:
+            entry = os.stat(name, dir_fd=authority.blobs_fd, follow_symlinks=False)
+            fd = os.open(name, _READ_FLAGS, dir_fd=authority.blobs_fd)
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) not in _SEALED_MODES
+                or _identity(entry) != _identity(opened)
+            ):
+                raise ArtifactStoreError("artifact-corrupt", "artifact target metadata is invalid")
+            hasher = hashlib.sha256()
+            offset = 0
+            while offset < opened.st_size:
+                payload = os.pread(fd, min(_CHUNK, opened.st_size - offset), offset)
+                if not payload:
+                    raise ArtifactStoreError("artifact-corrupt", "artifact target ended during verification")
+                hasher.update(payload)
+                offset += len(payload)
+            if f"sha256:{hasher.hexdigest()}" != digest:
+                raise ArtifactStoreError("artifact-corrupt", "artifact target digest is invalid")
+            after = os.fstat(fd)
+            final_entry = os.stat(name, dir_fd=authority.blobs_fd, follow_symlinks=False)
+            if _stable(after) != _stable(opened) or _stable(final_entry) != _stable(opened):
+                raise ArtifactStoreError("artifact-corrupt", "artifact target changed during verification")
+            os.lseek(fd, 0, os.SEEK_SET)
+            result = fd, opened
+            fd = None
+            return result
+        except FileNotFoundError:
+            raise ArtifactStoreError("artifact-missing", "artifact target is missing") from None
+        except ArtifactStoreError:
+            raise
+        except OSError:
+            raise ArtifactStoreError("artifact-corrupt", "artifact target cannot be fully verified") from None
+        finally:
+            _close_noerror(fd)
+
     def verify_squashfs(self, digest: str, size: int, *, maximum: int) -> StoredArtifact:
         if type(size) is not int or type(maximum) is not int or not 0 < size <= maximum:
             raise ArtifactStoreError("artifact-size", "artifact size bound is invalid")
@@ -583,6 +632,156 @@ class ArtifactStore:
             fd, _opened = self._open_verified_fd(authority, digest, size, maximum)
             _close_noerror(fd)
             return StoredArtifact(digest=digest, size=size, store_id=authority.store_id)
+
+    def verify_blob(self, digest: str) -> StoredArtifact:
+        """Verify one generic CAS descriptor without exposing its path or FD."""
+        with self._authority() as authority:
+            fd, opened = self._open_verified_blob_fd(authority, digest)
+            _close_noerror(fd)
+            return StoredArtifact(digest=digest, size=opened.st_size, store_id=authority.store_id)
+
+    def publish_blob(
+        self,
+        chunks: Iterable[bytes],
+        *,
+        expected_digest: str,
+        sealed_mode: int = 0o444,
+    ) -> StoredArtifact:
+        """Publish generic CAS bytes without replacing an already-valid digest inode."""
+        digest_hex = _digest_hex(expected_digest)
+        if sealed_mode not in _SEALED_MODES:
+            raise ArtifactStoreError("artifact-mode", "artifact sealed mode is invalid")
+        temporary_name: str | None = None
+        temporary_fd: int | None = None
+        with self._authority() as authority, self._digest_lock(authority, digest_hex):
+            try:
+                temporary_name = f".oci-artifact-tmp-{digest_hex}-{uuid.uuid4().hex}"
+                temporary_fd = os.open(temporary_name, _TEMP_FLAGS, _TEMP_MODE, dir_fd=authority.blobs_fd)
+                initial = os.fstat(temporary_fd)
+                blobs = os.fstat(authority.blobs_fd)
+                if (
+                    not stat.S_ISREG(initial.st_mode)
+                    or initial.st_uid != os.geteuid()
+                    or initial.st_nlink != 1
+                    or initial.st_dev != blobs.st_dev
+                    or stat.S_IMODE(initial.st_mode) != _TEMP_MODE
+                ):
+                    raise ArtifactStoreError("artifact-temp", "artifact temporary is unsafe")
+                hasher = hashlib.sha256()
+                total = 0
+                for payload in chunks:
+                    if not isinstance(payload, bytes):
+                        raise ArtifactStoreError("artifact-write", "artifact producer yielded non-bytes")
+                    total += len(payload)
+                    hasher.update(payload)
+                    _write_all(temporary_fd, payload)
+                if f"sha256:{hasher.hexdigest()}" != expected_digest:
+                    raise ArtifactStoreError("artifact-digest", "artifact producer did not match its descriptor")
+                os.fchmod(temporary_fd, sealed_mode)
+                os.fsync(temporary_fd)
+                sealed = os.fstat(temporary_fd)
+                if (
+                    _identity(initial) != _identity(sealed)
+                    or sealed.st_size != total
+                    or sealed.st_nlink != 1
+                    or stat.S_IMODE(sealed.st_mode) != sealed_mode
+                ):
+                    raise ArtifactStoreError("artifact-temp", "artifact temporary changed while sealing")
+                try:
+                    existing_fd, existing = self._open_verified_blob_fd(authority, expected_digest)
+                except ArtifactStoreError as exc:
+                    if exc.code not in {"artifact-missing", "artifact-corrupt"}:
+                        raise
+                else:
+                    _close_noerror(existing_fd)
+                    return StoredArtifact(expected_digest, existing.st_size, authority.store_id)
+                os.replace(
+                    temporary_name,
+                    digest_hex,
+                    src_dir_fd=authority.blobs_fd,
+                    dst_dir_fd=authority.blobs_fd,
+                )
+                temporary_name = None
+                os.fsync(authority.blobs_fd)
+                published = os.stat(digest_hex, dir_fd=authority.blobs_fd, follow_symlinks=False)
+                if _identity(published) != _identity(sealed):
+                    raise ArtifactStoreError("artifact-publish", "artifact target changed during publication")
+                verified_fd, verified = self._open_verified_blob_fd(authority, expected_digest)
+                _close_noerror(verified_fd)
+                return StoredArtifact(expected_digest, verified.st_size, authority.store_id)
+            except ArtifactStoreError:
+                raise
+            except OSError:
+                raise ArtifactStoreError("artifact-publish", "artifact publication failed") from None
+            finally:
+                cleanup_errors: list[BaseException] = []
+                if temporary_fd is not None:
+                    try:
+                        os.close(temporary_fd)
+                    except OSError:
+                        cleanup_errors.append(ArtifactStoreError("artifact-cleanup", "artifact temporary close failed"))
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=authority.blobs_fd)
+                        os.fsync(authority.blobs_fd)
+                    except OSError:
+                        cleanup_errors.append(
+                            ArtifactStoreError("artifact-cleanup", "artifact temporary cleanup failed")
+                        )
+                if cleanup_errors:
+                    primary = sys.exception()
+                    failures = ([primary] if primary is not None else []) + cleanup_errors
+                    if len(failures) == 1:
+                        raise failures[0]
+                    raise BaseExceptionGroup("artifact publication cleanup failed", failures) from None
+
+    def delete_blob(
+        self,
+        digest: str,
+        *,
+        retention_guard: Callable[[], None],
+        finalize: Callable[[], None] | None = None,
+    ) -> int:
+        """Delete one pinned blob and finalize its indexes under the digest lock.
+
+        Callbacks must not re-enter this store for the same digest.  They run
+        while the digest lock is held so retention and index cleanup are one
+        mutation with respect to cooperating publishers.
+        """
+        digest_hex = _digest_hex(digest)
+        if not callable(retention_guard) or (finalize is not None and not callable(finalize)):
+            raise ArtifactStoreError("artifact-retention", "artifact deletion requires a retention guard")
+        with self._authority() as authority, self._digest_lock(authority, digest_hex):
+            retention_guard()
+            try:
+                fd, opened = self._open_verified_blob_fd(authority, digest)
+            except ArtifactStoreError as exc:
+                if exc.code == "artifact-missing":
+                    if finalize is not None:
+                        finalize()
+                    return 0
+                raise
+            try:
+                current = os.stat(digest_hex, dir_fd=authority.blobs_fd, follow_symlinks=False)
+                if _stable(current) != _stable(opened):
+                    raise ArtifactStoreError("artifact-changed", "artifact target changed before deletion")
+                os.unlink(digest_hex, dir_fd=authority.blobs_fd)
+                os.fsync(authority.blobs_fd)
+                try:
+                    os.stat(digest_hex, dir_fd=authority.blobs_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ArtifactStoreError("artifact-delete", "artifact target remained after deletion")
+                if finalize is not None:
+                    finalize()
+                return opened.st_size
+            except ArtifactStoreError:
+                raise
+            except OSError:
+                raise ArtifactStoreError("artifact-delete", "artifact deletion failed") from None
+            finally:
+                _close_noerror(fd)
 
     @contextmanager
     def digest_guard(self, digest: str) -> Iterator[None]:

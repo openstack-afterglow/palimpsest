@@ -328,6 +328,9 @@ def test_build_layer_rejects_conflicting_tag(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
     roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
     spec = _build_spec(tmp_path, tag="conflict")
+    conflicting_blob = roots.store / "blobs" / "sha256" / ("f" * 64)
+    conflicting_blob.parent.mkdir(parents=True, exist_ok=True)
+    conflicting_blob.write_bytes(b"stub")
     state.write_tag_record(
         roots,
         state.TagRecord(

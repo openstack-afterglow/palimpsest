@@ -21,12 +21,13 @@ import pytest
 
 import palimpsest_local.artifact_store as artifact_store_module
 import palimpsest_local.oci_store as oci_store_module
-from palimpsest_local.artifact_store import ArtifactStoreError
+from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
 from palimpsest_local.oci_converter import (
     DEFAULT_LAYER_CONVERSION_LIMITS,
     LAYER_INTAKE_POLICY_ID,
     LayerIntakeReceipt,
 )
+from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
@@ -364,6 +365,218 @@ def test_durable_lease_is_discoverable_and_public_bindings_are_read_only(tmp_pat
     with pytest.raises(AttributeError):
         lease.receipt = receipt
     lease._abort()
+
+
+def test_physical_delete_honors_durable_lease_and_legacy_publish_reuses_inode(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    occurrence = _occurrence()
+    image = _squashfs()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-layer")
+    lease = store.acquire_lease(receipt, owner)
+    physical = ArtifactStore(roots.store)
+    blob = roots.store / "blobs" / "sha256" / receipt.image_digest.split(":", 1)[1]
+    identity = (blob.stat().st_dev, blob.stat().st_ino)
+
+    ContentStore(roots.store).write_stream([image], expected_digest=receipt.image_digest)
+
+    assert (blob.stat().st_dev, blob.stat().st_ino) == identity
+    with pytest.raises(OCIStoreError, match="durable OCI lease"):
+        physical.delete_blob(
+            receipt.image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+        )
+    assert blob.is_file()
+
+    with lease:
+        assert b"".join(lease.chunks(19)) == image
+    assert physical.delete_blob(
+        receipt.image_digest,
+        retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+    ) == len(image)
+    assert not blob.exists()
+
+
+def test_physical_delete_fails_closed_on_malformed_lease_record(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    image = _squashfs()
+    occurrence = _occurrence()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    malformed = roots.oci_derived_store / "leases" / str(uuid.uuid4())
+    malformed.write_bytes(b"{}")
+    malformed.chmod(0o400)
+    physical = ArtifactStore(roots.store)
+
+    with pytest.raises(OCIStoreError, match="fields are invalid"):
+        physical.delete_blob(
+            receipt.image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+        )
+
+    assert (roots.store / "blobs" / "sha256" / receipt.image_digest.split(":", 1)[1]).is_file()
+
+
+def test_lease_acquisition_linearizes_before_physical_delete(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    image = _squashfs()
+    occurrence = _occurrence()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-layer")
+    physical = ArtifactStore(roots.store)
+    publishing = threading.Event()
+    allow_publish = threading.Event()
+    acquired = threading.Event()
+    release = threading.Event()
+    delete_attempted = threading.Event()
+    outcomes: list[str] = []
+    real_publish = store._publish_file
+    real_delete_lock = physical._digest_lock
+
+    @contextmanager
+    def observed_delete_lock(authority, digest_hex):
+        delete_attempted.set()
+        with real_delete_lock(authority, digest_hex):
+            yield
+
+    def delayed_publish(authority, directory_fd, name, payload, **kwargs):
+        if json.loads(payload).get("schema") == oci_store_module.DERIVED_LEASE_SCHEMA:
+            publishing.set()
+            assert allow_publish.wait(2)
+        return real_publish(authority, directory_fd, name, payload, **kwargs)
+
+    monkeypatch.setattr(store, "_publish_file", delayed_publish)
+    monkeypatch.setattr(physical, "_digest_lock", observed_delete_lock)
+
+    def acquire() -> None:
+        lease = store.acquire_lease(receipt, owner)
+        acquired.set()
+        assert release.wait(2)
+        lease._abort()
+
+    def delete() -> None:
+        try:
+            physical.delete_blob(
+                receipt.image_digest,
+                retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+            )
+        except OCIStoreError as exc:
+            outcomes.append(exc.code)
+
+    acquire_thread = threading.Thread(target=acquire)
+    delete_thread = threading.Thread(target=delete)
+    acquire_thread.start()
+    assert publishing.wait(2)
+    delete_thread.start()
+    assert delete_attempted.wait(2)
+    assert delete_thread.is_alive() and outcomes == []
+    allow_publish.set()
+    assert acquired.wait(2)
+    delete_thread.join(2)
+    release.set()
+    acquire_thread.join(2)
+
+    assert not acquire_thread.is_alive() and not delete_thread.is_alive()
+    assert outcomes == ["oci-store-in-use"]
+    assert (roots.store / "blobs" / "sha256" / receipt.image_digest.split(":", 1)[1]).is_file()
+
+
+def test_physical_delete_linearizes_before_lease_acquisition(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    image = _squashfs()
+    occurrence = _occurrence()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-layer")
+    physical = ArtifactStore(roots.store)
+    retention_checked = threading.Event()
+    allow_delete = threading.Event()
+    acquire_attempted = threading.Event()
+    outcomes: list[str] = []
+    real_acquire_lock = store._artifacts._digest_lock
+
+    @contextmanager
+    def observed_acquire_lock(authority, digest_hex):
+        acquire_attempted.set()
+        with real_acquire_lock(authority, digest_hex):
+            yield
+
+    monkeypatch.setattr(store._artifacts, "_digest_lock", observed_acquire_lock)
+
+    def guard() -> None:
+        store.assert_artifact_unleased(receipt.image_digest)
+        retention_checked.set()
+        assert allow_delete.wait(2)
+
+    def delete() -> None:
+        physical.delete_blob(receipt.image_digest, retention_guard=guard)
+
+    def acquire() -> None:
+        try:
+            store.acquire_lease(receipt, owner)
+        except ArtifactStoreError as exc:
+            outcomes.append(exc.code)
+
+    delete_thread = threading.Thread(target=delete)
+    acquire_thread = threading.Thread(target=acquire)
+    delete_thread.start()
+    assert retention_checked.wait(2)
+    acquire_thread.start()
+    assert acquire_attempted.wait(2)
+    assert acquire_thread.is_alive() and outcomes == []
+    allow_delete.set()
+    delete_thread.join(2)
+    acquire_thread.join(2)
+
+    assert not delete_thread.is_alive() and not acquire_thread.is_alive()
+    assert outcomes == ["artifact-missing"]
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+
+
+def test_physical_delete_unlink_fault_keeps_blob_and_reports_no_success(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    image = _squashfs()
+    occurrence = _occurrence()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    blob = roots.store / "blobs" / "sha256" / receipt.image_digest.split(":", 1)[1]
+    real_unlink = artifact_store_module.os.unlink
+
+    def fail_target_unlink(name, *args, **kwargs):
+        if name == receipt.image_digest.split(":", 1)[1]:
+            raise OSError("injected unlink failure")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_store_module.os, "unlink", fail_target_unlink)
+    with pytest.raises(ArtifactStoreError, match="artifact deletion failed"):
+        ArtifactStore(roots.store).delete_blob(
+            receipt.image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+        )
+
+    assert blob.is_file()
+
+
+def test_physical_delete_fsync_fault_reports_no_success(tmp_path: Path, monkeypatch) -> None:
+    roots, store = _store(tmp_path)
+    image = _squashfs()
+    occurrence = _occurrence()
+    receipt = store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+    blob = roots.store / "blobs" / "sha256" / receipt.image_digest.split(":", 1)[1]
+    blobs_stat = (blob.parent.stat().st_dev, blob.parent.stat().st_ino)
+    real_fsync = artifact_store_module.os.fsync
+
+    def fail_blobs_fsync(fd: int) -> None:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == blobs_stat:
+            raise OSError("injected fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(artifact_store_module.os, "fsync", fail_blobs_fsync)
+    with pytest.raises(ArtifactStoreError, match="artifact deletion failed"):
+        ArtifactStore(roots.store).delete_blob(
+            receipt.image_digest,
+            retention_guard=lambda: store.assert_artifact_unleased(receipt.image_digest),
+        )
+
+    assert not blob.exists()
 
 
 def test_lease_open_failure_does_not_publish_orphan_record(tmp_path: Path, monkeypatch) -> None:

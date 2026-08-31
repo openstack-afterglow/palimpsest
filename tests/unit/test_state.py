@@ -932,6 +932,9 @@ def test_tag_records() -> None:
         env = {"XDG_CONFIG_HOME": str(tmppath / "cfg"), "XDG_STATE_HOME": str(tmppath / "st")}
         roots = state.init_roots(env)
         digest = "sha256:" + "a" * 64
+        blob = roots.store / "blobs" / "sha256" / ("a" * 64)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"stub")
 
         tag_rec = state.TagRecord(
             schema_version=1,
@@ -970,6 +973,10 @@ def test_tag_records() -> None:
 
 def test_conflicting_tag_writers_are_serialized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    for character in ("a", "b"):
+        blob = roots.store / "blobs" / "sha256" / (character * 64)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"stub")
     first_entered_write = threading.Event()
     release_first_write = threading.Event()
     original_atomic_write = state.atomic_write_json
@@ -1018,6 +1025,47 @@ def test_conflicting_tag_writers_are_serialized(tmp_path: Path, monkeypatch: pyt
         "sha256:" + "a" * 64,
         "sha256:" + "b" * 64,
     }
+
+
+def test_tag_writer_rejects_missing_artifact(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    record = state.TagRecord(
+        schema_version=1,
+        tag="missing",
+        digest="sha256:" + "c" * 64,
+        media_type="application/octet-stream",
+        size_bytes=1,
+        parent_digest=None,
+        base_image_digest=None,
+        source="test",
+        created_at=state.utc_now_iso(),
+    )
+
+    with pytest.raises(StateError, match="missing artifact"):
+        state.write_tag_record(roots, record)
+
+    assert not state.tag_path(roots, "missing").exists()
+
+
+def test_read_tag_record_rejects_payload_filename_mismatch(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    state.atomic_write_json(
+        roots.tags / "alias.json",
+        {
+            "schema_version": 1,
+            "tag": "different",
+            "digest": "sha256:" + "1" * 64,
+            "media_type": "application/octet-stream",
+            "size_bytes": 1,
+            "parent_digest": None,
+            "base_image_digest": None,
+            "source": "test",
+            "created_at": "2026-08-31T00:00:00Z",
+        },
+    )
+
+    with pytest.raises(StateError, match="does not match its filename"):
+        state.read_tag_record(roots, "alias")
 
 
 def test_transfer_records() -> None:

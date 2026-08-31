@@ -1608,7 +1608,7 @@ def test_hub_runtime_pack_pull_requires_unsquashfs_and_exact_embedded_manifest(t
         == valid_hub.digest
     )
 
-    store.delete(valid_hub.digest)
+    store.delete(valid_hub.digest, retention_guard=lambda: None)
     (tmp_path / "build-bad").mkdir()
     with pytest.raises(PalimpsestError, match="embedded manifest"):
         buildkit._pull_hub_runtime_pack(

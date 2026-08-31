@@ -232,14 +232,16 @@ class NewRunReservation:
         _verify_new_run_binding(self)
 
     def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
-        payload = _write_reserved_run_state(self, status, data)
+        with artifact_reference_guard(self.roots):
+            payload = _write_reserved_run_state(self, status, data)
         object.__setattr__(self, "_last_status", status)
         object.__setattr__(self, "_lifecycle_revision", payload["lifecycle_revision"])
         return payload
 
     def write_failure(self, data: Mapping[str, Any]) -> dict[str, Any]:
         """Publish failure through the pinned directory even after name-path loss."""
-        payload = _write_reserved_run_state(self, "failed", data, require_visible_binding=False)
+        with artifact_reference_guard(self.roots):
+            payload = _write_reserved_run_state(self, "failed", data, require_visible_binding=False)
         object.__setattr__(self, "_last_status", "failed")
         object.__setattr__(self, "_lifecycle_revision", payload["lifecycle_revision"])
         return payload
@@ -267,6 +269,7 @@ class TagRecord:
     created_at: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "tag", validate_tag(self.tag))
         object.__setattr__(self, "digest", normalize_digest(self.digest))
         if self.parent_digest is not None:
             object.__setattr__(self, "parent_digest", normalize_digest(self.parent_digest))
@@ -327,6 +330,38 @@ def fsync_directory(path: Path) -> None:
         raise StateError(f"cannot durably sync state directory: {directory}") from exc
     finally:
         os.close(fd)
+
+
+@contextmanager
+def pinned_owner_directory(path: Path, *, missing_ok: bool = False) -> Iterator[int | None]:
+    """Pin one owner-private directory without following its final component."""
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise StateError("state directory authority must be absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            if missing_ok:
+                yield None
+                return
+            raise StateError("state directory authority is missing") from None
+        except OSError:
+            raise StateError("state directory authority cannot be securely opened") from None
+        opened = os.fstat(fd)
+        visible = os.stat(path, follow_symlinks=False)
+        if (
+            not stat_module.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat_module.S_IMODE(opened.st_mode) & 0o022 != 0
+            or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise StateError("state directory authority is not owner-bound")
+        yield fd
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _toml_format_value(val: Any) -> str:
@@ -1045,6 +1080,45 @@ _RESERVED_RUN_STATE_FIELDS = frozenset(
 )
 
 
+def _require_run_artifact_target(state_root: Path, digest: Any, local_path: Any = None) -> None:
+    if not isinstance(digest, str):
+        raise StateError("run ledger artifact digest is invalid")
+    normalized = normalize_digest(digest)
+    target = (
+        Path(local_path)
+        if isinstance(local_path, str)
+        else state_root / "store" / "blobs" / "sha256" / normalized.split(":", 1)[1]
+    )
+    try:
+        entry = target.stat(follow_symlinks=False)
+    except OSError:
+        raise StateError("run ledger references a missing artifact") from None
+    if not stat_module.S_ISREG(entry.st_mode):
+        raise StateError("run ledger references an unsafe artifact")
+
+
+def _validate_run_reference_targets(state_root: Path, payload: Mapping[str, Any]) -> None:
+    if "base" in payload:
+        base = payload["base"]
+        if not isinstance(base, Mapping):
+            raise StateError("run ledger base reference is invalid")
+        if "digest" in base:
+            _require_run_artifact_target(state_root, base["digest"], base.get("local_path"))
+    if "base_digest" in payload and payload["base_digest"] is not None:
+        _require_run_artifact_target(state_root, payload["base_digest"])
+    if "layers" in payload:
+        layers = payload["layers"]
+        if not isinstance(layers, (list, tuple)):
+            raise StateError("run ledger layers must be a sequence")
+        for layer in layers:
+            if isinstance(layer, str):
+                _require_run_artifact_target(state_root, layer)
+            elif isinstance(layer, Mapping) and "digest" in layer:
+                _require_run_artifact_target(state_root, layer["digest"], layer.get("local_path"))
+            else:
+                raise StateError("run ledger layer reference is invalid")
+
+
 def _write_reserved_run_state(
     reservation: NewRunReservation,
     status: str,
@@ -1068,6 +1142,7 @@ def _write_reserved_run_state(
         "status": status,
         "lifecycle_revision": reservation.lifecycle_revision + 1,
     }
+    _validate_run_reference_targets(reservation.roots.state, payload)
     content = _json_bytes(payload)
 
     def verify() -> None:
@@ -1450,7 +1525,8 @@ class ExistingRunMutation:
         return identity, known_hosts
 
     def write_state(self, status: str, data: Mapping[str, Any]) -> dict[str, Any]:
-        return _write_existing_run_mutation_state(self, status, data)
+        with artifact_reference_guard(self._roots):
+            return _write_existing_run_mutation_state(self, status, data)
 
     def write_file(self, relative_name: str, content: bytes) -> None:
         _write_existing_run_file(self, relative_name, content, append=False)
@@ -1689,6 +1765,7 @@ def _write_existing_run_mutation_state(
     data: Mapping[str, Any],
 ) -> dict[str, Any]:
     payload = _validated_existing_state_payload(mutation, status, data)
+    _validate_run_reference_targets(mutation._roots.state, payload)
     content = _json_bytes(payload)
     mutation.verify_binding()
     temporary = f".state-mutation-{uuid.uuid4().hex}"
@@ -2186,7 +2263,9 @@ def run_entry_present_or_ambiguous(roots: StatePaths, name: str) -> bool:
         _close_noerror(runs_fd)
 
 
-def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]:
+def _read_pinned_json_object_snapshot(
+    directory_fd: int, filename: str
+) -> tuple[dict[str, Any], tuple[int, int, int, int, int]]:
     """Read one bounded regular JSON file relative to an already pinned directory."""
     pre_open = _safe_stat(filename, directory_fd=directory_fd)
     if pre_open is None or not stat_module.S_ISREG(pre_open.st_mode) or pre_open.st_size > _MAX_RUN_LEDGER_BYTES:
@@ -2265,9 +2344,13 @@ def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]
             raise StateError("cannot securely read run ledger")
         if not isinstance(value, dict):
             raise StateError("cannot securely read run ledger")
-        return value
+        return value, (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
     finally:
         _close_noerror(file_fd)
+
+
+def _read_pinned_json_object(directory_fd: int, filename: str) -> dict[str, Any]:
+    return _read_pinned_json_object_snapshot(directory_fd, filename)[0]
 
 
 def _read_pinned_run_payloads(
@@ -2861,6 +2944,15 @@ def file_lock(path: Path) -> Iterator[None]:
 
 
 @contextmanager
+def artifact_reference_guard(roots: StatePaths) -> Iterator[None]:
+    """Serialize artifact-reference commits with physical removal/GC scans."""
+    if not isinstance(roots, StatePaths):
+        raise StateError("invalid artifact reference lock authority")
+    with file_lock(roots.locks / "artifact-references-v1.lock"):
+        yield
+
+
+@contextmanager
 def locked(rpaths: RunPaths) -> Iterator[None]:
     with file_lock(rpaths.lock):
         yield
@@ -2870,7 +2962,9 @@ def write_run_state(rpaths: RunPaths, *, status: str, data: dict[str, Any]) -> d
     if status not in _STATUSES:
         raise StateError("invalid run status")
     payload = {**data, "status": status}
-    atomic_write_json(rpaths.state, payload)
+    with file_lock(rpaths.lock.parent / "artifact-references-v1.lock"):
+        _validate_run_reference_targets(rpaths.root.parent.parent, payload)
+        atomic_write_json(rpaths.state, payload)
     return payload
 
 
@@ -2883,7 +2977,7 @@ def utc_now_iso() -> str:
 
 
 def validate_tag(tag: str) -> str:
-    if _TAG_RE.fullmatch(tag) is None:
+    if not isinstance(tag, str) or _TAG_RE.fullmatch(tag) is None:
         raise StateError("invalid tag name")
     return tag
 
@@ -2895,17 +2989,47 @@ def tag_path(roots: StatePaths, tag: str) -> Path:
 def write_tag_record(roots: StatePaths, record: TagRecord) -> None:
     target = tag_path(roots, record.tag)
     lock_path = roots.locks / f"tag-{validate_tag(record.tag)}.lock"
-    with file_lock(lock_path):
+    with artifact_reference_guard(roots), file_lock(lock_path):
         if target.exists() and read_tag_record(roots, record.tag).digest != record.digest:
             raise StateError("tag already maps to a different digest")
+        normalized = normalize_digest(record.digest)
+        blob = roots.store / "blobs" / "sha256" / normalized.split(":", 1)[1]
+        try:
+            entry = blob.stat(follow_symlinks=False)
+        except OSError:
+            raise StateError("tag references a missing artifact") from None
+        if not stat_module.S_ISREG(entry.st_mode):
+            raise StateError("tag references an unsafe artifact")
         atomic_write_json(target, asdict(record))
 
 
 def read_tag_record(roots: StatePaths, tag: str) -> TagRecord:
+    expected_tag = validate_tag(tag)
     try:
-        return TagRecord(**read_json(tag_path(roots, tag)))
+        record = TagRecord(**read_json(tag_path(roots, expected_tag)))
     except TypeError as exc:
         raise StateError("invalid tag record") from exc
+    if record.tag != expected_tag:
+        raise StateError("tag record does not match its filename")
+    return record
+
+
+def read_tag_record_at(directory_fd: int, tag: str) -> TagRecord:
+    """Read a filename-bound tag record through an already-pinned tag directory."""
+    return read_tag_record_snapshot_at(directory_fd, tag)[0]
+
+
+def read_tag_record_snapshot_at(directory_fd: int, tag: str) -> tuple[TagRecord, tuple[int, int, int, int, int]]:
+    """Read one tag record and return the identity of the exact file read."""
+    expected_tag = validate_tag(tag)
+    try:
+        payload, identity = _read_pinned_json_object_snapshot(directory_fd, f"{expected_tag}.json")
+        record = TagRecord(**payload)
+    except TypeError as exc:
+        raise StateError("invalid tag record") from exc
+    if record.tag != expected_tag:
+        raise StateError("tag record does not match its filename")
+    return record, identity
 
 
 def _transfer_path(roots: StatePaths, digest: str) -> Path:

@@ -196,6 +196,44 @@ def test_non_run_image_resolution_pulls_without_runtime_capability_gate(
     assert calls == [("https://hub.example.test", "test-token")]
 
 
+def test_image_resolution_repairs_unsealed_legacy_blob_via_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    store = ContentStore(roots.store)
+    payload = b"legacy-direct-download"
+    digest_value = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    blob = store.blob_path(digest_value)
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(payload)
+    assert blob.stat().st_mode & 0o777 == 0o644
+    destinations: list[Path] = []
+
+    class FakeHub:
+        def __init__(self, _url: str, _token: str):
+            pass
+
+        def get_layer(self, requested: str):
+            assert requested == digest_value
+            return {"kind": "cloud-image", "disk_format": "raw", "arch": "aarch64"}
+
+        def pull_blob(self, requested: str, target: Path):
+            assert requested == digest_value
+            destinations.append(target)
+            target.write_bytes(payload)
+            return target
+
+    monkeypatch.setattr(cli, "HubClient", FakeHub)
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+
+    image = cli._resolve_image_ref(store, digest_value, "https://hub.example.test")
+
+    assert image.local_path == blob
+    assert store.verify_blob(digest_value) == len(payload)
+    assert blob.stat().st_mode & 0o777 == 0o444
+    assert len(destinations) == 1 and destinations[0] != blob
+
+
 def test_pack_command_matches_fixed_mksquashfs_argv(tmp_path: Path):
     source = tmp_path / "rootfs"
     source.mkdir()
@@ -406,7 +444,7 @@ def test_buildkit_runtime_base_arch_mismatch_fails_before_build(
     base_digest = f"sha256:{hashlib.sha256(base_bytes).hexdigest()}"
     store = ContentStore(roots.store)
     store.blobs_dir.mkdir(parents=True)
-    store.blob_path(base_digest).write_bytes(base_bytes)
+    store.write_stream([base_bytes], expected_digest=base_digest)
     store.write_metadata(base_digest, {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64"})
 
     monkeypatch.setattr(
@@ -1417,8 +1455,8 @@ def test_cli_dispatch_build_routes_verified_spec(monkeypatch: pytest.MonkeyPatch
     base_bytes = b"base"
     base_digest = f"sha256:{hashlib.sha256(base_bytes).hexdigest()}"
     store = ContentStore(tmp_path / "state" / "palimpsest" / "store")
-    store.blobs_dir.mkdir(parents=True)
-    store.blob_path(base_digest).write_bytes(base_bytes)
+    store.root.parent.mkdir(parents=True)
+    store.write_stream([base_bytes], expected_digest=base_digest)
     store.write_metadata(
         base_digest,
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64", "os_variant": None},
@@ -1513,11 +1551,10 @@ def test_cli_dispatch_run_passes_cli_layers(
     base_digest = f"sha256:{base_hex}"
     layer_digest = f"sha256:{layer_hex}"
 
-    store_dir = tmp_path / "state" / "palimpsest" / "store" / "blobs" / "sha256"
-    store_dir.mkdir(parents=True)
-    (store_dir / base_hex).write_bytes(base_content)
-    (store_dir / layer_hex).write_bytes(layer_content)
     store = ContentStore(tmp_path / "state" / "palimpsest" / "store")
+    store.root.parent.mkdir(parents=True)
+    store.write_stream([base_content], expected_digest=base_digest)
+    store.write_stream([layer_content], expected_digest=layer_digest)
     store.write_metadata(
         base_digest,
         {
@@ -1675,7 +1712,8 @@ def test_remote_hvf_routed_network_rejection_precedes_pull_mkdir_and_metadata(
 
 
 def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    d = "sha256:" + "d" * 64
+    payload = b"downloaded blob content"
+    d = f"sha256:{hashlib.sha256(payload).hexdigest()}"
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
     monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
@@ -1689,7 +1727,7 @@ def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tm
 
     def mock_pull(self, digest, destination, resume=True):
         pulled_destinations.append(destination)
-        destination.write_bytes(b"downloaded blob content")
+        destination.write_bytes(payload)
         return destination
 
     monkeypatch.setattr("palimpsest_local.cli.HubClient.pull_blob", mock_pull)
@@ -1697,7 +1735,9 @@ def test_cli_dispatch_image_pull_fresh_state(monkeypatch: pytest.MonkeyPatch, tm
     ret = cli.main(["image", "pull", d])
     assert ret == 0
     assert len(pulled_destinations) == 1
-    assert pulled_destinations[0].exists()
+    store = ContentStore(tmp_path / "state" / "palimpsest" / "store")
+    assert store.verify_blob(d) == len(payload)
+    assert pulled_destinations[0] != store.blob_path(d)
 
 
 def test_cli_image_import_ingests_verified_cloud_image(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1796,8 +1836,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
     base_digest = f"sha256:{hex_digest}"
     roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     store = ContentStore(roots.store)
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
-    (roots.store / "blobs" / "sha256" / hex_digest).write_bytes(content)
+    store.write_stream([content], expected_digest=base_digest)
     store.write_metadata(
         base_digest,
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64", "os_variant": None},
@@ -1855,8 +1894,7 @@ def test_cli_run_dispatch_lima_routing(
     base_digest = f"sha256:{hex_digest}"
     roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     store = ContentStore(roots.store)
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
-    (roots.store / "blobs" / "sha256" / hex_digest).write_bytes(content)
+    store.write_stream([content], expected_digest=base_digest)
     store.write_metadata(
         base_digest,
         {"kind": "cloud-image", "disk_format": "qcow2", "arch": "aarch64", "os_variant": None},

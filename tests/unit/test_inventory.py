@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -196,15 +198,12 @@ def test_list_artifacts(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     store = ContentStore(roots.store)
 
-    img_digest = "sha256:" + "1" * 64
-    layer_digest = "sha256:" + "2" * 64
-    unknown_digest = "sha256:" + "3" * 64
+    img_digest = f"sha256:{store.write_stream([b'image artifact']).name}"
+    layer_digest = f"sha256:{store.write_stream([b'layer artifact']).name}"
+    unknown_digest = f"sha256:{store.write_stream([b'unknown artifact']).name}"
 
     # Write store blobs & metadata
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
     (roots.store / "metadata").mkdir(parents=True, exist_ok=True)
-    for d in (img_digest, layer_digest, unknown_digest):
-        (roots.store / "blobs" / "sha256" / d.split(":", 1)[1]).write_bytes(b"dummy artifact bytes")
 
     store.write_metadata(
         img_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "ubuntu.img"}
@@ -264,13 +263,12 @@ def test_remove_artifact_refusal_and_success(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     store = ContentStore(roots.store)
 
-    ref_digest = "sha256:" + "4" * 64
-    free_digest = "sha256:" + "5" * 64
+    ref_digest = store.write_stream([b"referenced blob"]).name
+    free_digest = store.write_stream([b"free blob"]).name
+    ref_digest = f"sha256:{ref_digest}"
+    free_digest = f"sha256:{free_digest}"
 
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
     (roots.store / "metadata").mkdir(parents=True, exist_ok=True)
-    for d in (ref_digest, free_digest):
-        (roots.store / "blobs" / "sha256" / d.split(":", 1)[1]).write_bytes(b"blob bytes")
 
     store.write_metadata(ref_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64"})
     store.write_metadata(free_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS})
@@ -308,6 +306,310 @@ def test_remove_artifact_refusal_and_success(tmp_path: Path):
     assert rem_res["removed_tags"] == ["free-tag"]
     assert not store.exists(free_digest)
     assert not (roots.tags / "free-tag.json").exists()
+
+
+def test_remove_artifact_rejects_malformed_run_layer_shape(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'guarded layer']).name}"
+    run_dir = roots.runs / "malformed-run"
+    run_dir.mkdir()
+    state.atomic_write_json(run_dir / "state.json", {"layers": {"digest": digest}})
+
+    with pytest.raises(StateError, match="run ledger is invalid"):
+        inventory.remove_artifact(roots, digest)
+
+    assert store.exists(digest)
+
+
+def test_remove_artifact_accepts_symlinked_state_root(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'symlinked state root']).name}"
+    store.write_metadata(digest, {"kind": "other"})
+    alias = tmp_path / "state-alias"
+    try:
+        alias.symlink_to(roots.state, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = inventory.remove_artifact(state.StatePaths(config=roots.config, state=alias), digest)
+
+    assert result["digest"] == digest
+    assert not store.exists(digest)
+    assert not store.metadata_path(digest).exists()
+
+
+def test_remove_artifact_rejects_tag_payload_path_traversal(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'tag traversal target']).name}"
+    victim = roots.state.parent / "victim.json"
+    victim.write_text("preserve me", encoding="utf-8")
+    state.atomic_write_json(
+        roots.tags / "alias.json",
+        {
+            "schema_version": 1,
+            "tag": "../../victim",
+            "digest": digest,
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "size_bytes": 20,
+            "parent_digest": None,
+            "base_image_digest": None,
+            "source": "test",
+            "created_at": "2026-08-31T00:00:00Z",
+        },
+    )
+
+    with pytest.raises(StateError, match="tag record is invalid"):
+        inventory.remove_artifact(roots, digest)
+
+    assert victim.read_text(encoding="utf-8") == "preserve me"
+    assert store.exists(digest)
+
+
+@pytest.mark.parametrize("component", ["tags", "metadata"])
+def test_remove_artifact_rejects_symlinked_index_directory(tmp_path: Path, component: str) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'external index target']).name}"
+    external = tmp_path / f"external-{component}"
+    external.mkdir(mode=0o700)
+    if component == "tags":
+        roots.tags.rmdir()
+        attacked = roots.tags
+        external_entry = external / "outside.json"
+    else:
+        store.write_metadata(digest, {"kind": "other"})
+        metadata = roots.store / "metadata"
+        for entry in metadata.iterdir():
+            entry.unlink()
+        metadata.rmdir()
+        attacked = metadata
+        external_entry = external / f"{digest.split(':', 1)[1]}.json"
+    external_entry.write_text("preserve me", encoding="utf-8")
+    try:
+        attacked.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(StateError, match="state directory authority"):
+        inventory.remove_artifact(roots, digest)
+
+    assert external_entry.read_text(encoding="utf-8") == "preserve me"
+    assert store.exists(digest)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "in-place"])
+def test_remove_artifact_rejects_mutated_tag_snapshot(tmp_path: Path, monkeypatch, mutation: str) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'original tag target']).name}"
+    replacement_digest = f"sha256:{store.write_stream([b'replacement tag target']).name}"
+    write_tag_record(
+        roots,
+        TagRecord(
+            schema_version=1,
+            tag="race-tag",
+            digest=digest,
+            media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+            size_bytes=19,
+            parent_digest=None,
+            base_image_digest=None,
+            source="test",
+            created_at="2026-08-31T00:00:00Z",
+        ),
+    )
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    failures: list[str] = []
+    real_delete = inventory.ArtifactStore.delete_blob
+
+    def paused_delete(self, *args, **kwargs):
+        delete_entered.set()
+        assert allow_delete.wait(2)
+        return real_delete(self, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.ArtifactStore, "delete_blob", paused_delete)
+
+    def remove() -> None:
+        try:
+            inventory.remove_artifact(roots, digest)
+        except StateError as exc:
+            failures.append(str(exc))
+
+    remove_thread = threading.Thread(target=remove)
+    remove_thread.start()
+    assert delete_entered.wait(2)
+    replacement = {
+        "schema_version": 1,
+        "tag": "race-tag",
+        "digest": replacement_digest,
+        "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+        "size_bytes": 23,
+        "parent_digest": None,
+        "base_image_digest": None,
+        "source": "test",
+        "created_at": "2026-08-31T00:00:01Z",
+    }
+    if mutation == "replace":
+        state.atomic_write_json(roots.tags / "race-tag.json", replacement)
+    else:
+        (roots.tags / "race-tag.json").write_text(
+            json.dumps(replacement, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    allow_delete.set()
+    remove_thread.join(2)
+
+    assert not remove_thread.is_alive()
+    assert failures == ["tag record changed before removal"]
+    assert store.exists(digest)
+    assert state.read_tag_record(roots, "race-tag").digest == replacement_digest
+
+
+@pytest.mark.parametrize("replacement_target", ["other", "same"])
+def test_remove_artifact_reconciles_tag_replacement_during_finalize(
+    tmp_path: Path, monkeypatch, replacement_target: str
+) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'multi-tag target']).name}"
+    other_digest = f"sha256:{store.write_stream([b'late replacement']).name}"
+    replacement_digest = other_digest if replacement_target == "other" else digest
+    for tag in ("a-tag", "b-tag"):
+        write_tag_record(
+            roots,
+            TagRecord(
+                schema_version=1,
+                tag=tag,
+                digest=digest,
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                size_bytes=16,
+                parent_digest=None,
+                base_image_digest=None,
+                source="test",
+                created_at="2026-08-31T00:00:00Z",
+            ),
+        )
+    real_unlink = inventory._unlink_index_entry
+
+    def replace_later_tag(filename: str, *, directory_fd: int) -> None:
+        real_unlink(filename, directory_fd=directory_fd)
+        if filename == "a-tag.json":
+            state.atomic_write_json(
+                roots.tags / "b-tag.json",
+                {
+                    "schema_version": 1,
+                    "tag": "b-tag",
+                    "digest": replacement_digest,
+                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                    "size_bytes": 16,
+                    "parent_digest": None,
+                    "base_image_digest": None,
+                    "source": "test",
+                    "created_at": "2026-08-31T00:00:01Z",
+                },
+            )
+
+    monkeypatch.setattr(inventory, "_unlink_index_entry", replace_later_tag)
+
+    result = inventory.remove_artifact(roots, digest)
+
+    assert not store.exists(digest)
+    if replacement_target == "other":
+        assert result["removed_tags"] == ["a-tag"]
+        assert state.read_tag_record(roots, "b-tag").digest == other_digest
+    else:
+        assert result["removed_tags"] == ["a-tag", "b-tag"]
+        assert not state.tag_path(roots, "b-tag").exists()
+
+
+def test_remove_artifact_serializes_late_run_reference_commit(tmp_path: Path, monkeypatch) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'reference race']).name}"
+    store.write_metadata(digest, {"kind": "other"})
+    rpaths = state.run_paths(roots, "late-run")
+    rpaths.root.mkdir()
+    entered_delete = threading.Event()
+    allow_delete = threading.Event()
+    writer_started = threading.Event()
+    outcomes: list[str] = []
+    real_delete = inventory.ArtifactStore.delete_blob
+
+    def paused_delete(self, *args, **kwargs):
+        entered_delete.set()
+        assert allow_delete.wait(2)
+        return real_delete(self, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.ArtifactStore, "delete_blob", paused_delete)
+
+    def remove() -> None:
+        inventory.remove_artifact(roots, digest)
+
+    def write_reference() -> None:
+        writer_started.set()
+        try:
+            state.write_run_state(rpaths, status="running", data={"base_digest": digest})
+        except StateError as exc:
+            outcomes.append(str(exc))
+
+    remove_thread = threading.Thread(target=remove)
+    writer_thread = threading.Thread(target=write_reference)
+    remove_thread.start()
+    assert entered_delete.wait(2)
+    writer_thread.start()
+    assert writer_started.wait(2)
+    allow_delete.set()
+    remove_thread.join(2)
+    writer_thread.join(2)
+
+    assert not remove_thread.is_alive() and not writer_thread.is_alive()
+    assert outcomes == ["run ledger references a missing artifact"]
+    assert not rpaths.state.exists() and not store.exists(digest)
+
+
+def test_remove_cleanup_is_serialized_with_same_digest_republish(tmp_path: Path, monkeypatch) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    payload = b"same digest republish"
+    digest = f"sha256:{store.write_stream([payload]).name}"
+    store.write_metadata(digest, {"kind": "old"})
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    publish_started = threading.Event()
+    real_fsync_index_directory = inventory._fsync_index_directory
+
+    def paused_fsync(directory_fd: int) -> None:
+        if not cleanup_entered.is_set():
+            cleanup_entered.set()
+            assert allow_cleanup.wait(2)
+        real_fsync_index_directory(directory_fd)
+
+    monkeypatch.setattr(inventory, "_fsync_index_directory", paused_fsync)
+
+    def remove() -> None:
+        inventory.remove_artifact(roots, digest)
+
+    def republish() -> None:
+        publish_started.set()
+        store.write_stream([payload], expected_digest=digest)
+        store.write_metadata(digest, {"kind": "new"})
+
+    remove_thread = threading.Thread(target=remove)
+    publish_thread = threading.Thread(target=republish)
+    remove_thread.start()
+    assert cleanup_entered.wait(2)
+    publish_thread.start()
+    assert publish_started.wait(2)
+    allow_cleanup.set()
+    remove_thread.join(2)
+    publish_thread.join(2)
+
+    assert not remove_thread.is_alive() and not publish_thread.is_alive()
+    assert store.verify_blob(digest) == len(payload)
+    assert store.read_metadata(digest)["kind"] == "new"
 
 
 def test_list_builds_and_get_build_and_log(tmp_path: Path):

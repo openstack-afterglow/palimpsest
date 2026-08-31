@@ -27,7 +27,7 @@ from . import __version__, completion, inventory, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
-from .errors import PalimpsestError
+from .errors import ArtifactValidationError, PalimpsestError
 from .hub import DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
 from .inventory import import_cloud_image
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
@@ -280,6 +280,23 @@ def _image_ref_from_store(store: ContentStore, digest: str) -> ImageRef:
     )
 
 
+def _pull_blob_into_store(client: HubClient, store: ContentStore, digest: str) -> Path:
+    """Download outside the CAS namespace, then publish through its mutation authority."""
+    normalized = require_digest(digest)
+    if store.exists(normalized):
+        try:
+            store.verify_blob(normalized)
+        except ArtifactValidationError:
+            pass
+        else:
+            return store.blob_path(normalized)
+    with tempfile.TemporaryDirectory(prefix="palimpsest-pull-") as temporary:
+        staged = Path(temporary) / digest_hex(normalized)
+        client.pull_blob(normalized, staged)
+        store.ingest_file(staged, expected_digest=normalized)
+    return store.blob_path(normalized)
+
+
 def _resolve_image_ref(
     store: ContentStore,
     digest: str,
@@ -292,7 +309,12 @@ def _resolve_image_ref(
     """Resolve a cloud image from verified local storage or the selected Hub."""
     normalized = require_digest(digest)
     if store.exists(normalized):
-        return _image_ref_from_store(store, normalized)
+        try:
+            store.verify_blob(normalized)
+        except ArtifactValidationError:
+            pass
+        else:
+            return _image_ref_from_store(store, normalized)
     client = HubClient(resolve_url(explicit_url), resolve_token())
     metadata = client.get_layer(normalized)
     if metadata.get("kind") != KIND_CLOUD_IMAGE:
@@ -307,9 +329,7 @@ def _resolve_image_ref(
             requested_backend=requested_backend,
             network=run_network,
         )
-    blob_path = store.blob_path(normalized)
-    blob_path.parent.mkdir(parents=True, exist_ok=True)
-    client.pull_blob(normalized, blob_path)
+    _pull_blob_into_store(client, store, normalized)
     store.write_metadata(
         normalized,
         {
@@ -1596,10 +1616,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 raise PalimpsestError(f"digest {norm_digest} is not a cloud-image (kind={kind})")
             if meta.get("disk_format") not in DISK_FORMAT_MEDIA_TYPES or meta.get("arch") not in {"x86_64", "aarch64"}:
                 raise PalimpsestError(f"cloud-image metadata is incomplete for {norm_digest}")
-            blob_path = store.blob_path(norm_digest)
-            if not store.exists(norm_digest):
-                blob_path.parent.mkdir(parents=True, exist_ok=True)
-                client.pull_blob(norm_digest, blob_path)
+            blob_path = _pull_blob_into_store(client, store, norm_digest)
             store.write_metadata(
                 norm_digest,
                 {
@@ -1679,10 +1696,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             meta = client.get_layer(norm_digest)
             if meta.get("kind") != "squashfs" or meta.get("media_type") != MEDIA_TYPE_LAYER_SQUASHFS:
                 raise PalimpsestError(f"digest {norm_digest} is not a SquashFS layer")
-            blob_path = store.blob_path(norm_digest)
-            if not store.exists(norm_digest):
-                blob_path.parent.mkdir(parents=True, exist_ok=True)
-                client.pull_blob(norm_digest, blob_path)
+            blob_path = _pull_blob_into_store(client, store, norm_digest)
             store.write_metadata(
                 norm_digest,
                 {

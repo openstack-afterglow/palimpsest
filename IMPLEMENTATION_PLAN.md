@@ -281,6 +281,27 @@ Verification recorded for this slice:
 - Privileged Linux `mksquashfs 4.6.1` container: hard-worker cold materialization followed by warm hit passed; the leased artifact bytes matched the receipt digest.
 - `mksquashfs 4.5` is rejected by the existing minimum-version preflight, as intended.
 
+### PR 4 slice 7: descriptor-pinned physical mutations and lease-safe deletion
+
+Implemented and verified:
+
+- `ArtifactStore` is now the sole production authority for shared `${state}/store/blobs/sha256` publication and deletion. Generic legacy blobs are written through the same owner-bound directories, per-digest `flock`, no-follow descriptors, hash verification, sealing, rename, and parent-directory `fsync` boundary as OCI-derived artifacts.
+- Re-publishing an already-valid digest consumes and verifies the proposed bytes but preserves the existing inode. This prevents legacy `ContentStore` ingestion from invalidating an active OCI same-FD reader. Corrupt or missing targets can still be repaired under the digest lock.
+- Physical deletion requires an explicit retention guard, re-hashes the pinned target descriptor, verifies its directory binding, unlinks through the directory FD, and durably syncs the parent. The legacy unguarded `ContentStore.delete` path now fails closed.
+- `OCIStore.assert_artifact_unleased` acquires the durable lease-index lock while the caller holds the artifact digest lock, strictly validates every committed lease, owner, receipt, occurrence, and record binding, and refuses deletion when the target is retained. The lock order matches lease acquisition (`artifact digest → lease index`), so acquisition and deletion have a single winner without a dangling durable lease.
+- Run/tag reference commits and removal scans share a state-root reference lock. Run writers validate referenced local/shared targets before committing; tag writers reject missing targets; inventory strictly validates the `base`/`base_digest`/`layers` ledger shapes. A reference commit can therefore win before the scan, or observe the completed deletion and fail, but cannot land in the scan-to-unlink gap.
+- Inventory removal no longer unlinks CAS paths directly. Physical unlink and metadata/tag cleanup complete under the same digest lock, invalid run/tag ledgers and malformed OCI retention metadata block removal, and removed metadata/tag directory entries are explicitly synced.
+- Inventory canonicalizes configured state/config roots once at the removal boundary, so platform-level directory aliases such as macOS `/var` → `/private/var` use the same lock and descriptor-pinned store authority instead of failing or splitting synchronization domains.
+- Tag payloads are validated and bound to their filename. Removal pins owner-bound `tags` and `store/metadata` directories with no-follow FDs, reads tag ledgers through that authority, and removes only the scanned/digest-derived entries with dirfd-relative unlink plus `fsync`; nested directory symlink substitution cannot redirect cleanup outside the state root.
+- CLI image/layer pulls now download to private staging outside the CAS namespace and then call `ContentStore.ingest_file`; the transport client's `os.replace` can no longer target the final shared blob path. Existing unsealed legacy downloads are re-fetched and repaired through the same boundary.
+- Adversarial tests cover both acquisition/deletion orderings, active and recoverable leases, malformed lease/run ledgers, late run-reference commits, same-digest cleanup/republish, legacy same-digest inode stability, CLI pull staging, poisoned target repair, missing retention guards, and unlink/`fsync` fault reporting.
+
+Verification recorded for this slice:
+
+- Ruff lint/format, compile, package sdist/wheel, and `git diff --check`: pass.
+- Complete local `tests` tree: 2173 passed, 15 skipped; the skips are environment-gated Linux/KVM/product cases.
+- Product-level local BuildKit gate: 2 passed with `PALIMPSEST_BUILDKIT_E2E=1`.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -301,8 +322,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Centralize all physical artifact deletion/GC behind descriptor-pinned store mutations that honor durable OCI occurrence leases.
-2. Add first-party local OCI archive/layout intake and materialize every ordered occurrence through the hard-worker API.
-3. Define the OCI-root boot plan: immutable lower leases, VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
-4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Add first-party local OCI archive/layout intake and materialize every ordered occurrence through the hard-worker API.
+2. Define the OCI-root boot plan: immutable lower leases, VM-specific writable root volume, reusable retained boot volume, kernel/initramfs, stage-1 mount/pivot, and init supervisor.
+3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

@@ -1541,6 +1541,55 @@ class OCIStore:
             raise OCIStoreError("oci-store-lease", "derived lease ID is invalid") from None
         return self._open_lease(canonical_id, owner, receipt)
 
+    def assert_artifact_unleased(self, digest: str) -> None:
+        """Fail closed when any durable derived occurrence lease retains a digest.
+
+        Callers that mutate physical bytes must already hold ArtifactStore's
+        per-digest guard.  This preserves the shared lock order used by lease
+        acquisition: artifact digest, then durable lease index.
+        """
+        try:
+            normalized = normalize_digest(digest)
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise OCIStoreError("oci-store-retention", "artifact retention digest is invalid") from None
+        expected_fields = {
+            "acquired_ns",
+            "image_digest",
+            "image_size",
+            "lease_id",
+            "occurrence_digest",
+            "owner",
+            "receipt",
+            "schema",
+        }
+        with self._authority() as authority, self._lock(authority, "lease-index.lock"):
+            try:
+                names = sorted(os.listdir(authority.leases_fd))
+            except OSError:
+                raise OCIStoreError("oci-store-retention", "derived leases cannot be enumerated") from None
+            for name in names:
+                if _TEMP_RE.fullmatch(name) is not None:
+                    continue
+                try:
+                    canonical_id = str(uuid.UUID(name))
+                except (ValueError, AttributeError):
+                    raise OCIStoreError("oci-store-corrupt", "derived lease name is invalid") from None
+                payload, _ = self._read_file(authority.leases_fd, canonical_id)
+                value = _exact_wire_fields(self._decode(payload), expected_fields, "derived lease")
+                owner_value = _exact_wire_fields(value.get("owner"), {"role", "run_id", "run_name"}, "lease owner")
+                try:
+                    owner = ArtifactLeaseOwner(**owner_value)
+                    receipt = DerivedLayerReceipt.from_dict(value.get("receipt"))
+                except (OCIStoreError, TypeError, ValueError):
+                    raise OCIStoreError("oci-store-corrupt", "derived lease binding is malformed") from None
+                self._validate_lease_value(value, canonical_id, owner, receipt)
+                acquired_ns = value.get("acquired_ns")
+                if type(acquired_ns) is not int or acquired_ns < 0:
+                    raise OCIStoreError("oci-store-corrupt", "derived lease acquisition time is invalid")
+                self._read_occurrence(authority, receipt, verify_artifact=False)
+                if receipt.image_digest == normalized:
+                    raise OCIStoreError("oci-store-in-use", "artifact is retained by a durable OCI lease")
+
     def list_leases(self, owner: ArtifactLeaseOwner) -> tuple[RecoverableDerivedLease, ...]:
         """List fully validated durable leases owned by one run identity."""
         if not isinstance(owner, ArtifactLeaseOwner):

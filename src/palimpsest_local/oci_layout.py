@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import io
 import json
 import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import digest_file, digest_hex, normalize_digest
 from .errors import ArtifactValidationError, DigestMismatchError
 from .state import atomic_write_json, read_json
@@ -153,6 +153,9 @@ class ContentStore:
     def __init__(self, root: Path):
         self.root = root.resolve()
 
+    def _physical_store(self) -> ArtifactStore:
+        return ArtifactStore(self.root)
+
     @property
     def blobs_dir(self) -> Path:
         return self.root / "blobs" / "sha256"
@@ -167,10 +170,14 @@ class ContentStore:
     def write_metadata(self, digest: str, metadata: dict[str, Any]) -> Path:
         """Persist non-secret verified descriptor metadata beside an immutable blob."""
         normalized = normalize_digest(digest)
-        if not self.exists(normalized):
-            raise ArtifactValidationError(f"cannot record metadata for missing blob: {normalized}")
-        record = {**metadata, "digest": normalized, "size": self.size(normalized)}
-        atomic_write_json(self.metadata_path(normalized), record)
+        physical = self._physical_store()
+        with physical.digest_guard(normalized):
+            try:
+                size = physical.verify_blob(normalized).size
+            except ArtifactStoreError:
+                raise ArtifactValidationError(f"cannot record metadata for missing blob: {normalized}") from None
+            record = {**metadata, "digest": normalized, "size": size}
+            atomic_write_json(self.metadata_path(normalized), record)
         return self.metadata_path(normalized)
 
     def read_metadata(self, digest: str) -> dict[str, Any]:
@@ -199,33 +206,38 @@ class ContentStore:
             raise ArtifactValidationError(f"blob does not exist in store: {digest}")
         return path.open("rb")
 
+    def verify_blob(self, digest: str) -> int:
+        """Verify a generic blob through the descriptor-pinned store boundary."""
+        return self._physical_store().verify_blob(normalize_digest(digest)).size
+
     def write_stream(self, chunks: Iterator[bytes] | Sequence[bytes], expected_digest: str | None = None) -> Path:
-        """Stream bytes into a temp file, hash, fsync, and replace into store atomically."""
-        self.blobs_dir.mkdir(parents=True, exist_ok=True)
-        hasher = hashlib.sha256()
-        fd, tmp_path_str = tempfile.mkstemp(dir=self.blobs_dir, prefix=".tmp_blob_")
-        tmp_path = Path(tmp_path_str)
-        try:
-            with os.fdopen(fd, "wb") as out:
+        """Publish through the descriptor-pinned physical mutation authority."""
+        if expected_digest is None:
+            with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode="w+b") as spool:
+                hasher = hashlib.sha256()
                 for chunk in chunks:
+                    if not isinstance(chunk, bytes):
+                        raise ArtifactValidationError("content store producer yielded non-bytes")
                     hasher.update(chunk)
-                    out.write(chunk)
-                out.flush()
-                os.fsync(out.fileno())
+                    spool.write(chunk)
+                expected_digest = f"sha256:{hasher.hexdigest()}"
+                spool.seek(0)
 
-            actual_digest = f"sha256:{hasher.hexdigest()}"
-            if expected_digest is not None:
-                norm_expected = normalize_digest(expected_digest)
-                if not hmac.compare_digest(actual_digest, norm_expected):
-                    raise DigestMismatchError(f"stream digest mismatch: expected {norm_expected}, got {actual_digest}")
+                def replay() -> Iterator[bytes]:
+                    while payload := spool.read(READ_CHUNK):
+                        yield payload
 
-            target = self.blob_path(actual_digest)
-            os.chmod(tmp_path, 0o444)
-            os.replace(tmp_path, target)
-            return target
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+                self._physical_store().publish_blob(replay(), expected_digest=expected_digest)
+        else:
+            normalized = normalize_digest(expected_digest)
+            try:
+                self._physical_store().publish_blob(chunks, expected_digest=normalized)
+            except ArtifactStoreError as exc:
+                if exc.code == "artifact-digest":
+                    raise DigestMismatchError(f"stream digest mismatch: expected {normalized}") from None
+                raise
+            expected_digest = normalized
+        return self.blob_path(expected_digest)
 
     def ingest_file(self, source: Path, expected_digest: str | None = None) -> Path:
         """Ingest a local file into the store via streaming verification."""
@@ -240,8 +252,11 @@ class ContentStore:
 
         return self.write_stream(_iter_file(), expected_digest=expected_digest)
 
-    def delete(self, digest: str) -> None:
-        self.blob_path(digest).unlink(missing_ok=True)
+    def delete(self, digest: str, *, retention_guard: Callable[[], None] | None = None) -> int:
+        """Delete only through a caller-supplied durable-reference guard."""
+        if retention_guard is None:
+            raise ArtifactValidationError("content store deletion requires a durable-reference guard")
+        return self._physical_store().delete_blob(normalize_digest(digest), retention_guard=retention_guard)
 
 
 def _safe_member_name(name: str) -> str:
