@@ -41,6 +41,7 @@ from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
     DerivedSquashFSKey,
+    MaterializationResult,
     OCIStore,
     OCIStoreError,
 )
@@ -211,6 +212,61 @@ def test_cold_materialization_warm_hit_and_repeated_occurrence_share_physical_by
     assert first_receipt.record_digest == second_receipt.record_digest
     assert first_receipt.occurrence_digest != second_receipt.occurrence_digest
     assert len(list((roots.store / "blobs" / "sha256").glob("[0-9a-f]" * 64))) == 1
+
+
+def test_observed_materialization_reports_invocation_local_cache_result(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    image = _squashfs()
+    first = _occurrence(0)
+    second = _occurrence(1)
+    key = _key(first)
+
+    cold = store.materialize_observed(first, key, _producer(first, [], image))
+    warm = store.materialize_observed(
+        second,
+        _key(second),
+        lambda: (_ for _ in ()).throw(AssertionError("warm producer invoked")),
+    )
+
+    assert isinstance(cold, MaterializationResult)
+    assert cold.cache_result == "cold_miss"
+    assert warm.cache_result == "warm_hit"
+    assert cold.receipt.record_digest == warm.receipt.record_digest
+    assert cold.receipt.occurrence_digest != warm.receipt.occurrence_digest
+
+
+def test_observed_materialization_reports_validated_repair(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path, repair_age=0)
+    occurrence = _occurrence()
+    key = _key(occurrence)
+    image = _squashfs()
+    first = store.materialize(occurrence, key, _producer(occurrence, [], image))
+    index = roots.oci_derived_store / "keys" / key.digest.removeprefix("sha256:")
+    os.chmod(index, 0o600)
+    index.write_bytes(b"x" * index.stat().st_size)
+    os.chmod(index, 0o400)
+
+    repaired = store.materialize_observed(occurrence, key, _producer(occurrence, [], image))
+
+    assert repaired.cache_result == "cold_repair"
+    assert repaired.receipt == first
+
+
+def test_materialization_result_rejects_unhashable_cache_result() -> None:
+    receipt = oci_store_module.DerivedLayerReceipt(
+        store_id=_digest("0"),
+        occurrence_digest=_digest("1"),
+        record_digest=_digest("2"),
+        key_digest=_digest("3"),
+        source_snapshot_binding_digest=_digest("4"),
+        source_image_digest=_digest("5"),
+        ordinal=0,
+        image_digest=_digest("6"),
+        image_size=1,
+    )
+
+    with pytest.raises(OCIStoreError, match="cache result is invalid"):
+        MaterializationResult(receipt, [])  # type: ignore[arg-type]
 
 
 def test_cold_inconsistent_receipts_publish_nothing(tmp_path: Path) -> None:
@@ -426,10 +482,11 @@ def test_same_size_blob_corruption_is_rebuilt_only_for_requested_recipe(tmp_path
     os.chmod(blob, 0o400)
     calls: list[int] = []
 
-    repaired = store.materialize(occurrence, _key(occurrence), _producer(occurrence, calls, image))
+    result = store.materialize_observed(occurrence, _key(occurrence), _producer(occurrence, calls, image))
 
     assert calls == [0]
-    assert repaired == first
+    assert result.cache_result == "cold_repair"
+    assert result.receipt == first
     assert blob.read_bytes() == image
 
 
@@ -452,10 +509,14 @@ def test_same_recipe_thread_contention_invokes_one_producer(tmp_path: Path) -> N
             packed._close()
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        receipts = list(executor.map(lambda _index: store.materialize(occurrence, key, slow_producer), range(4)))
+        results = list(
+            executor.map(lambda _index: store.materialize_observed(occurrence, key, slow_producer), range(4))
+        )
 
     assert calls == [0]
-    assert len(set(receipts)) == 1
+    assert [result.cache_result for result in results].count("cold_miss") == 1
+    assert [result.cache_result for result in results].count("warm_hit") == 3
+    assert len({result.receipt for result in results}) == 1
 
 
 def test_same_recipe_spawn_process_contention_invokes_one_producer(tmp_path: Path) -> None:

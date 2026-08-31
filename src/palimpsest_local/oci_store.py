@@ -69,6 +69,7 @@ DERIVED_RECIPE_SCHEMA = "palimpsest.oci-derived-recipe.v1"
 DERIVED_RECORD_SCHEMA = "palimpsest.oci-derived-record.v1"
 DERIVED_OCCURRENCE_SCHEMA = "palimpsest.oci-derived-occurrence.v1"
 DERIVED_LEASE_SCHEMA = "palimpsest.oci-derived-lease.v1"
+MATERIALIZATION_CACHE_RESULTS = frozenset({"warm_hit", "cold_miss", "cold_repair"})
 
 
 def _close_inherited_lease_locks() -> None:
@@ -338,6 +339,20 @@ class DerivedLayerReceipt:
     ordinal: int
     image_digest: str
     image_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializationResult:
+    """One receipt plus the invocation-local derived-cache result."""
+
+    receipt: DerivedLayerReceipt
+    cache_result: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, DerivedLayerReceipt):
+            raise OCIStoreError("oci-store-result", "materialization receipt is invalid")
+        if not isinstance(self.cache_result, str) or self.cache_result not in MATERIALIZATION_CACHE_RESULTS:
+            raise OCIStoreError("oci-store-result", "materialization cache result is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1118,22 +1133,35 @@ class OCIStore:
         key: DerivedSquashFSKey,
         producer: Producer,
     ) -> DerivedLayerReceipt:
+        return self.materialize_observed(occurrence, key, producer).receipt
+
+    def materialize_observed(
+        self,
+        occurrence: DerivedLayerOccurrence,
+        key: DerivedSquashFSKey,
+        producer: Producer,
+    ) -> MaterializationResult:
         if not isinstance(occurrence, DerivedLayerOccurrence) or not isinstance(key, DerivedSquashFSKey):
             raise OCIStoreError("oci-store-input", "derived materialization input is invalid")
         if not key.matches(occurrence) or not callable(producer):
             raise OCIStoreError("oci-store-input", "derived recipe does not match its occurrence")
         with self._authority() as authority, self._lock(authority, f"recipe-{_digest_hex(key.digest)}.lock"):
+            cache_result = "warm_hit"
             try:
                 cached = self._record_from_index(authority, key)
             except OCIStoreError as exc:
                 if exc.code not in {"oci-store-corrupt", "oci-store-missing"}:
                     raise
                 cached = None
+                cache_result = "cold_repair"
             except ArtifactStoreError as exc:
                 if exc.code not in {"artifact-corrupt", "artifact-missing", "artifact-structure"}:
                     raise
                 cached = None
+                cache_result = "cold_repair"
             if cached is None:
+                if cache_result == "warm_hit":
+                    cache_result = "cold_miss"
                 with producer() as produced:
                     if not isinstance(produced, tuple) or len(produced) != 2:
                         raise OCIStoreError("oci-store-producer", "derived producer contract is invalid")
@@ -1183,7 +1211,8 @@ class OCIStore:
                     )
                     cached = record, record_digest
             record, record_digest = cached
-            return self._occurrence_receipt(authority, occurrence, key, record, record_digest)
+            receipt = self._occurrence_receipt(authority, occurrence, key, record, record_digest)
+            return MaterializationResult(receipt=receipt, cache_result=cache_result)
 
     def _read_occurrence(
         self,
@@ -1506,6 +1535,8 @@ __all__ = [
     "DerivedLayerReceipt",
     "DerivedSquashFSKey",
     "DurableDerivedLayerLease",
+    "MATERIALIZATION_CACHE_RESULTS",
+    "MaterializationResult",
     "OCIStore",
     "OCIStoreError",
     "RecoverableDerivedLease",
