@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from palimpsest_local import platforms
+from palimpsest_local.errors import StateError
 from palimpsest_local.kvm import (
     DOMAIN_MARKER_NAMESPACE,
     DOMAIN_MARKER_VERSION,
@@ -19,11 +20,14 @@ from palimpsest_local.kvm import (
     DomainSpec,
     KvmError,
     KvmUnavailable,
+    LayerDisk,
+    OCIRootDomainSpec,
     VolumeDisk,
     build_domain_xml,
     build_hdiutil_seed_command,
     build_layer_activation_script,
     build_layer_disks,
+    build_oci_root_domain_xml,
     build_seed_iso_command,
     connect,
     destroy_and_undefine,
@@ -34,6 +38,7 @@ from palimpsest_local.kvm import (
     validate_domain_name_available,
     validate_network,
 )
+from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
 
 _ROOT = Path("/var/lib/palimpsest/layers")
 _DIGESTS = [f"sha256:{chr(ord('a') + index) * 64}" for index in range(3)]
@@ -68,6 +73,102 @@ def _spec(layers=None) -> DomainSpec:
         seed_iso=Path("/var/lib/palimpsest/domains/demo-seed.iso"),
         layers=layers if layers is not None else build_layer_disks(_ROOT, _DIGESTS),
     )
+
+
+def _oci_root_spec() -> OCIRootDomainSpec:
+    return OCIRootDomainSpec(
+        name="oci-demo",
+        memory_mib=1024,
+        vcpus=1,
+        kernel=Path("/var/lib/palimpsest/boot/vmlinuz"),
+        initramfs=Path("/var/lib/palimpsest/boot/initramfs"),
+        kernel_cmdline=(
+            "console=ttyS0,115200n8 panic=1 rdinit=/init "
+            "palimpsest.root=virtio-11111111111111111111 "
+            "palimpsest.lowers=virtio-22222222222222222222,virtio-33333333333333333333"
+        ),
+        root_disk=Path("/var/lib/palimpsest/roots/demo.raw"),
+        root_serial="11111111111111111111",
+        layers=(
+            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdb", "22222222222222222222"),
+            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdc", "33333333333333333333"),
+        ),
+        run_id="f6f546e2-e734-4920-9eff-1762b348a249",
+        boot_contract_digest="sha256:" + "4" * 64,
+    )
+
+
+def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
+    xml = ET.fromstring(build_oci_root_domain_xml(_oci_root_spec(), _X86_PROFILE))
+
+    assert xml.findtext("./os/kernel") == "/var/lib/palimpsest/boot/vmlinuz"
+    assert xml.findtext("./os/initrd") == "/var/lib/palimpsest/boot/initramfs"
+    assert xml.find("./os/boot") is None
+    disks = xml.findall("./devices/disk")
+    assert len(disks) == 3
+    assert all(disk.get("device") == "disk" for disk in disks)
+    root = disks[0]
+    assert root.find("target").attrib == {"dev": "vda", "bus": "virtio"}
+    assert root.find("driver").get("type") == "raw"
+    assert root.find("readonly") is None
+    assert [disk.findtext("serial") for disk in disks] == [
+        "11111111111111111111",
+        "22222222222222222222",
+        "33333333333333333333",
+    ]
+    assert all(disk.find("readonly") is not None for disk in disks[1:])
+    assert all(disk.find("shareable") is not None for disk in disks[1:])
+    marker = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
+    assert marker is not None and marker.get("contract") == "sha256:" + "4" * 64
+
+
+def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
+    with pytest.raises(KvmError, match="x86_64 KVM"):
+        build_oci_root_domain_xml(_oci_root_spec(), _AARCH64_KVM_PROFILE)
+    spec = _oci_root_spec()
+    reordered = (spec.layers[1], spec.layers[0])
+    with pytest.raises(KvmError, match="order or identity"):
+        build_oci_root_domain_xml(OCIRootDomainSpec(**{**spec.__dict__, "layers": reordered}), _X86_PROFILE)
+
+
+def test_host_boot_artifact_policy_hashes_valid_explicit_files(tmp_path: Path):
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"\x1f\x8b" + b"payload")
+
+    verified = verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+
+    assert verified.architecture == "x86_64"
+    assert verified.kernel.digest.startswith("sha256:")
+    assert "path" not in verified.to_dict()["kernel"]
+    assert str(tmp_path) not in repr(verified.to_dict())
+
+
+def test_host_boot_artifact_policy_rejects_symlink_writable_and_digest_rebinding(tmp_path: Path):
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"\x1f\x8bpayload")
+    link = tmp_path / "kernel-link"
+    link.symlink_to(kernel)
+
+    with pytest.raises(StateError, match="securely read"):
+        verify_host_boot_artifacts(link.absolute(), initramfs.resolve())
+    kernel.chmod(0o666)
+    with pytest.raises(StateError, match="metadata is unsafe"):
+        verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+    kernel.chmod(0o644)
+    with pytest.raises(StateError, match="does not match"):
+        verify_host_boot_artifacts(
+            kernel.resolve(),
+            initramfs.resolve(),
+            expected_kernel_digest="sha256:" + "0" * 64,
+        )
 
 
 def test_layer_blob_path_matches_oci_image_layout():

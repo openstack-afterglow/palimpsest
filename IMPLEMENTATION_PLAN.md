@@ -373,6 +373,26 @@ Verification recorded for this slice:
 
 Scope boundary: the OCI graph and VM-specific writable root now have one crash-recoverable run-ledger preparation transaction. No libvirt domain is emitted, no host kernel/initramfs is selected, and no guest has mounted, assembled, or pivoted this graph to `/`. Gate 2 remains inactive.
 
+### PR 4 slice 11: host boot-artifact policy and path-free KVM domain handoff
+
+Implemented:
+
+- OCI-root now has a separate typed libvirt contract instead of overloading the cloud-image domain shape. It uses direct x86_64 KVM kernel/initramfs boot, a writable raw ext4 root at `vda`, and ordinal-preserving read-only raw lower disks from `vdb` onward. It emits no firmware boot entry, qcow2 root, NoCloud seed CD-ROM, guest agent, or cloud activation script.
+- Host kernel and initramfs selection is explicit; ambient `/boot` discovery is not allowed. The policy pins each no-follow regular file while hashing, accepts only root/current-user ownership with a single link and no group/world write bits, bounds size, validates the x86 boot-protocol `HdrS` marker and a supported initramfs header, and supports exact expected-digest revalidation.
+- Disk serials are deterministic logical identities rather than physical-image prefixes. The root serial is derived from its volume UUID; every lower serial is derived from its occurrence digest. Repeated OCI occurrences may therefore share one SquashFS CAS file while retaining distinct guest identities and exact order.
+- `OCIRootDomainPlan` is a canonical, digest-bound, path-free handoff. It binds the run, preparation-plan digest, durable lower lease-set, lower-graph digest, boot-artifact digests/sizes/policy, root volume UUID/generation/size/serial, ordered lower occurrence/image identities, compute shape, network, and fixed future stage-1 command line.
+- Planning reloads and strictly validates the exact durable lease set and attached writable root before resolving local paths. Nested plan data is recursively immutable. Committing the plan uses the pinned existing-run mutation boundary and revalidates the exact preparation, lease members, root, boot artifacts, spec, profile, and XML before appending it to the ledger. Loading re-derives deterministic disk serials and the fixed command line before accepting the canonical plan digest and run binding.
+- The existing cloud-image XML builder remains unchanged. The path-bearing resolved XML is explicitly an ephemeral preview, not a launch authority; the future libvirt define/start consumer must resolve and revalidate all paths at its own mutation boundary. OCI-root `RUN` capability and libvirt define/start are still disabled, so this contract cannot be mistaken for successful guest root assembly.
+
+Verification recorded for this slice:
+
+- Focused KVM/OCI-store suite: 140 passed.
+- Complete local `tests` tree: 2224 passed, 16 skipped, with one existing macOS fork deprecation warning.
+- Ruff lint/format, Python compile, `git diff --check`, and sdist/wheel build pass. Adversarial coverage includes wrong-platform rejection, reordered lower rejection, boot-artifact symlink/permission/digest rejection, nested-plan mutation, shared physical lower bytes with occurrence-unique serials and `shareable`, foreign root-owner rejection, and path-free ledger recovery.
+- Independent code review and verifier: P0 0 / P1 0. OCI-root `RUN` remains fail-closed and existing x86/aarch64/HVF cloud XML goldens remain unchanged.
+
+Scope boundary: this slice emits an ephemeral libvirt XML preview and durably binds only its path-free plan. It does not authorize or call libvirt, provide the stage-1 `/init`, mount or assemble the lowers, pivot the OCI tree to `/`, launch image init as PID 1, or enable foreground/`-d`. Gate 2 remains inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -393,7 +413,6 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add the host kernel/initramfs policy and a KVM domain contract that attaches the ordered immutable lowers plus the VM-specific raw ext4 root without yet claiming a successful pivot.
-2. Implement guest stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
-3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Implement guest stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
+2. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+3. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

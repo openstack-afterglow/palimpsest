@@ -71,6 +71,25 @@ class DomainSpec:
     nvram: Path | None = None
 
 
+@dataclass(frozen=True)
+class OCIRootDomainSpec:
+    """Local-only libvirt inputs for a direct-kernel OCI-root guest."""
+
+    name: str
+    memory_mib: int
+    vcpus: int
+    kernel: Path
+    initramfs: Path
+    kernel_cmdline: str
+    root_disk: Path
+    root_serial: str
+    layers: tuple[LayerDisk, ...]
+    network: str | None = "default"
+    console_log: Path | None = None
+    run_id: str | None = None
+    boot_contract_digest: str | None = None
+
+
 def _valid_name(name: str) -> bool:
     return _DOMAIN_NAME_RE.fullmatch(name) is not None
 
@@ -114,6 +133,7 @@ def _disk(
     readonly: bool,
     device: str = "disk",
     bus: str = "virtio",
+    shareable: bool = False,
 ) -> ET.Element:
     disk = ET.SubElement(devices, "disk", {"type": "file", "device": device})
     driver = {"name": "qemu", "type": disk_format}
@@ -124,6 +144,8 @@ def _disk(
     ET.SubElement(disk, "target", {"dev": target, "bus": bus})
     if readonly:
         ET.SubElement(disk, "readonly")
+    if shareable:
+        ET.SubElement(disk, "shareable")
     return disk
 
 
@@ -219,6 +241,116 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
         )
         ET.SubElement(commandline, "qemu:arg", {"value": "-device"})
         ET.SubElement(commandline, "qemu:arg", {"value": "virtio-net-pci,netdev=palimpsest0"})
+    return ET.tostring(domain, encoding="unicode")
+
+
+def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -> str:
+    """Build the fail-closed direct-kernel domain shape used by OCI-root.
+
+    This deliberately does not share the cloud-image builder: OCI-root has a
+    raw writable root, no firmware boot disk, and no NoCloud seed device.
+    """
+
+    if profile.backend != "kvm" or profile.domain_type != "kvm" or profile.arch != "x86_64":
+        raise KvmError("OCI-root direct boot currently requires x86_64 KVM")
+    if profile.firmware is not None or profile.autoselect_firmware:
+        raise KvmError("OCI-root direct boot does not accept a firmware profile")
+    if not _valid_name(spec.name):
+        raise KvmError("domain name must match ^[a-z0-9][a-z0-9-]{0,62}$")
+    if not 256 <= spec.memory_mib <= 1_048_576:
+        raise KvmError("memory_mib is outside the supported range")
+    if not 1 <= spec.vcpus <= 256:
+        raise KvmError("vcpus is outside the supported range")
+    if not spec.layers or len(spec.layers) > MAX_LAYER_DISKS:
+        raise KvmError("OCI-root layer count is outside the supported range")
+    for label, path in (
+        ("kernel", spec.kernel),
+        ("initramfs", spec.initramfs),
+        ("root disk", spec.root_disk),
+    ):
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise KvmError(f"OCI-root {label} path must be absolute")
+    if spec.console_log is not None and not spec.console_log.is_absolute():
+        raise KvmError("OCI-root console path must be absolute")
+    if not isinstance(spec.kernel_cmdline, str) or not spec.kernel_cmdline or len(spec.kernel_cmdline) > 4096:
+        raise KvmError("OCI-root kernel command line is invalid")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in spec.kernel_cmdline):
+        raise KvmError("OCI-root kernel command line contains control characters")
+    if re.fullmatch(r"[0-9a-f]{20}", spec.root_serial or "") is None:
+        raise KvmError("OCI-root root disk serial is invalid")
+    if spec.network is not None and _NETWORK_NAME_RE.fullmatch(spec.network) is None:
+        raise KvmError("OCI-root network name is invalid")
+    try:
+        run_id = str(uuid.UUID(spec.run_id or ""))
+    except (AttributeError, TypeError, ValueError):
+        raise KvmError("OCI-root run ID is invalid") from None
+    if run_id != spec.run_id:
+        raise KvmError("OCI-root run ID is not canonical")
+    try:
+        contract_digest = normalize_digest(spec.boot_contract_digest or "")
+    except Exception:
+        raise KvmError("OCI-root boot contract digest is invalid") from None
+    if contract_digest != spec.boot_contract_digest:
+        raise KvmError("OCI-root boot contract digest is not canonical")
+
+    seen_serials = {spec.root_serial}
+    for index, layer in enumerate(spec.layers):
+        try:
+            layer_digest = normalize_digest(layer.blob_digest)
+        except Exception:
+            raise KvmError("OCI-root layer digest is invalid") from None
+        if (
+            layer.target_dev != f"vd{_DISK_LETTERS[index]}"
+            or not layer.host_path.is_absolute()
+            or layer.host_path == spec.root_disk
+            or layer_digest != layer.blob_digest
+            or re.fullmatch(r"[0-9a-f]{20}", layer.serial or "") is None
+            or layer.serial in seen_serials
+        ):
+            raise KvmError("OCI-root layer disk order or identity is invalid")
+        seen_serials.add(layer.serial)
+
+    domain = ET.Element("domain", {"type": "kvm"})
+    ET.SubElement(domain, "name").text = spec.name
+    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(spec.memory_mib)
+    ET.SubElement(domain, "vcpu").text = str(spec.vcpus)
+    os_element = ET.SubElement(domain, "os")
+    ET.SubElement(os_element, "type", {"arch": profile.arch, "machine": profile.machine}).text = "hvm"
+    ET.SubElement(os_element, "kernel").text = str(spec.kernel)
+    ET.SubElement(os_element, "initrd").text = str(spec.initramfs)
+    ET.SubElement(os_element, "cmdline").text = spec.kernel_cmdline
+    features = ET.SubElement(domain, "features")
+    ET.SubElement(features, "acpi")
+    ET.SubElement(features, "apic")
+    ET.SubElement(domain, "cpu", {"mode": "host-passthrough"})
+    metadata = ET.SubElement(domain, "metadata")
+    ET.SubElement(
+        metadata,
+        "{https://afterglow.dev/palimpsest-local/domain/v1}run",
+        {
+            "id": run_id,
+            "schema": "1",
+            "version": DOMAIN_MARKER_VERSION,
+            "contract": contract_digest,
+        },
+    )
+    devices = ET.SubElement(domain, "devices")
+    ET.SubElement(devices, "emulator").text = str(profile.emulator)
+    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False)
+    ET.SubElement(root, "serial").text = spec.root_serial
+    for layer in spec.layers:
+        disk = _disk(devices, layer.host_path, layer.target_dev, "raw", readonly=True, shareable=True)
+        ET.SubElement(disk, "serial").text = layer.serial
+    if profile.network_mode == "libvirt-network" and spec.network is not None:
+        interface = ET.SubElement(devices, "interface", {"type": "network"})
+        ET.SubElement(interface, "source", {"network": spec.network})
+        ET.SubElement(interface, "model", {"type": "virtio"})
+    if spec.console_log is None:
+        console = ET.SubElement(devices, "console", {"type": "pty"})
+    else:
+        console = ET.SubElement(devices, "console", {"type": "file"})
+        ET.SubElement(console, "source", {"path": str(spec.console_log), "append": "on"})
+    ET.SubElement(console, "target", {"type": "serial", "port": "0"})
     return ET.tostring(domain, encoding="unicode")
 
 

@@ -23,6 +23,7 @@ import pytest
 import palimpsest_local.artifact_store as artifact_store_module
 import palimpsest_local.oci_root_prepare as oci_root_prepare_module
 import palimpsest_local.oci_store as oci_store_module
+import palimpsest_local.platforms as platforms
 import palimpsest_local.state as state_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
 from palimpsest_local.errors import StateError
@@ -54,6 +55,12 @@ from palimpsest_local.oci_provenance import (
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OCI_LAYER_MEDIA_TYPE,
     Descriptor,
+)
+from palimpsest_local.oci_root_kvm import (
+    build_oci_root_domain_plan,
+    commit_oci_root_domain_plan,
+    load_oci_root_domain_plan,
+    verify_host_boot_artifacts,
 )
 from palimpsest_local.oci_root_prepare import (
     OCIRootPreparationTransaction,
@@ -1542,6 +1549,97 @@ def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: 
     release_prepared_oci_root_run(roots, prepared, store, runner=tools)
     assert not prepared.root_volume.path.exists()
     assert store.list_lease_set_intents(prepared.transaction.owner) == ()
+
+
+def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    tools = _RootVolumeTools()
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"\x1f\x8bpayload")
+    boot = verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+
+    with reserve_new_run(roots, "domain-plan", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            _image_materialization(store),
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+    resolved = build_oci_root_domain_plan(
+        roots,
+        prepared,
+        store,
+        boot,
+        platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64"),
+        memory_mib=2048,
+        vcpus=2,
+        runner=tools,
+    )
+    plan = commit_oci_root_domain_plan(roots, resolved, store, runner=tools)
+    encoded = (roots.runs / "domain-plan" / "state.json").read_text(encoding="utf-8")
+
+    assert load_oci_root_domain_plan(roots, "domain-plan") == plan
+    assert str(tmp_path) not in json.dumps(plan.to_dict(), sort_keys=True)
+    assert str(tmp_path) not in encoded
+    assert [layer["ordinal"] for layer in plan.layers] == [0, 1, 2]
+    assert len({layer["serial"] for layer in plan.layers}) == 3
+    assert len({layer["image_digest"] for layer in plan.layers}) == 1
+    assert [layer["target"] for layer in plan.layers] == ["vdb", "vdc", "vdd"]
+    assert "<kernel>" in resolved.xml and "<initrd>" in resolved.xml
+    assert 'type="raw"' in resolved.xml and 'device="cdrom"' not in resolved.xml
+    assert "palimpsest.root=virtio-" in plan.kernel_cmdline
+
+    tampered = deepcopy(plan.to_dict())
+    tampered["layers"][0]["serial"] = "0" * 20
+    with pytest.raises(StateError, match="order or identity"):
+        type(plan).from_dict(tampered)
+    with pytest.raises(TypeError):
+        plan.layers[0]["serial"] = "0" * 20
+
+    release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+
+
+def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    tools = _RootVolumeTools()
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"070701payload")
+    boot = verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+
+    with reserve_new_run(roots, "domain-tamper", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            _image_materialization(store),
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+    stem = prepared.transaction.volume_id.replace("-", "")
+    record_path = roots.oci_root_volumes / f"{stem}.json"
+    raw = json.loads(record_path.read_text(encoding="utf-8"))
+    raw["attached_run_name"] = "foreign"
+    record_path.chmod(0o600)
+    record_path.write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    record_path.chmod(0o600)
+
+    with pytest.raises(StateError, match="root volume binding"):
+        build_oci_root_domain_plan(
+            roots,
+            prepared,
+            store,
+            boot,
+            platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64"),
+            runner=tools,
+        )
 
 
 def test_oci_root_prepare_retains_and_reuses_exact_root_volume(tmp_path: Path) -> None:
