@@ -117,6 +117,11 @@ class StatePaths:
         """Project-owned writable block-volume artifacts."""
         return self.state / "volumes"
 
+    @property
+    def oci_root_volumes(self) -> Path:
+        """Independently retained OCI-root writable block volumes."""
+        return self.state / "oci-root-volumes"
+
 
 @dataclass(frozen=True)
 class RunPaths:
@@ -476,6 +481,7 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
         roots.oci_source_cas,
         roots.projects,
         roots.volumes,
+        roots.oci_root_volumes,
     ):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
@@ -982,7 +988,6 @@ def _verify_new_run_binding(reservation: NewRunReservation) -> None:
         or reservation.record.schema_version != 1
         or reservation.record.name != reservation.paths.name
         or not isinstance(reservation.dispatch_key, DispatchKey)
-        or reservation.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
     ):
         raise StateError("invalid new run reservation authority")
     parsed_run_id: uuid.UUID | None = None
@@ -1306,8 +1311,8 @@ def reserve_new_run(
     dispatch_key: DispatchKey,
 ) -> Iterator[NewRunReservation]:
     """Exclusively reserve and pin one new run directory for its full create."""
-    if not isinstance(dispatch_key, DispatchKey) or dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE:
-        raise StateError("new run reservation requires a cloud-image DispatchKey")
+    if not isinstance(dispatch_key, DispatchKey):
+        raise StateError("new run reservation requires a DispatchKey")
     rpaths = _new_run_paths(roots, name)
     with _new_run_name_lock(roots, name) as name_lock:
         runs_fd = _open_readonly_no_follow(roots.runs, directory=True)

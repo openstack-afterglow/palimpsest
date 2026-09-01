@@ -303,6 +303,160 @@ def _fsync_file(path: Path) -> None:
         raise StateError(f"cannot durably sync volume file: {path}") from exc
 
 
+def _ensure_ext4_raw_file_locked(
+    path: Path,
+    size_bytes: int,
+    label: str,
+    logical_name: str,
+    runner: CommandRunner,
+    creation_temp_path: Path | None = None,
+) -> bool:
+    """Create or verify one locked raw ext4 artifact at an owner-bound path."""
+    if creation_temp_path is not None:
+        if creation_temp_path.parent != path.parent or creation_temp_path == path:
+            raise StateError("KVM volume creation temporary path is invalid")
+        temporary_exists = creation_temp_path.exists() or creation_temp_path.is_symlink()
+        if temporary_exists and (path.exists() or path.is_symlink()):
+            temporary_entry = creation_temp_path.stat(follow_symlinks=False)
+            published_entry = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(temporary_entry.st_mode)
+                or (temporary_entry.st_dev, temporary_entry.st_ino) != (published_entry.st_dev, published_entry.st_ino)
+                or temporary_entry.st_nlink != 2
+                or published_entry.st_nlink != 2
+            ):
+                raise StateError("KVM volume creation publication is inconsistent")
+            creation_temp_path.unlink()
+            state.fsync_directory(path.parent)
+            _verify_kvm_path(path, size_bytes, label, runner)
+            return True
+        if temporary_exists:
+            temporary_entry = creation_temp_path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(temporary_entry.st_mode)
+                or temporary_entry.st_uid != os.geteuid()
+                or temporary_entry.st_nlink != 1
+            ):
+                raise StateError("KVM volume creation temporary is unsafe")
+            creation_temp_path.unlink()
+            state.fsync_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        _verify_kvm_path(path, size_bytes, label, runner)
+        return False
+
+    _preflight_kvm_tools(runner)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    if creation_temp_path is None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{logical_name}-",
+            suffix=".raw.tmp",
+            dir=path.parent,
+        )
+        temporary = Path(temporary_name)
+    else:
+        temporary = creation_temp_path
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            raise StateError(f"cannot create KVM volume temporary: {temporary}") from None
+    published_identity: tuple[int, int] | None = None
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.ftruncate(descriptor, size_bytes)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        _run_required(
+            runner,
+            ["mkfs.ext4", "-F", "-q", "-L", label, str(temporary)],
+            f"format KVM volume {logical_name}",
+        )
+        _fsync_file(temporary)
+        _verify_kvm_path(temporary, size_bytes, label, runner)
+
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise StateError(f"KVM volume appeared concurrently and was not overwritten: {path}") from exc
+        published = path.stat()
+        published_identity = (published.st_dev, published.st_ino)
+        state.fsync_directory(path.parent)
+        temporary.unlink()
+        state.fsync_directory(path.parent)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if published_identity is not None:
+            try:
+                current = path.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == published_identity:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+        temporary.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _delete_ext4_raw_file_locked(
+    path: Path,
+    size_bytes: int,
+    label: str,
+    logical_name: str,
+    runner: CommandRunner,
+    quarantine_validator: Callable[[Path, Path], None] | None = None,
+    quarantine_path: Path | None = None,
+) -> bool:
+    """Verify and quarantine-delete one locked raw ext4 artifact."""
+    quarantine = quarantine_path
+    if quarantine is not None:
+        if quarantine.parent != path.parent or quarantine == path:
+            raise StateError("KVM volume quarantine path is invalid")
+        if quarantine.exists() or quarantine.is_symlink():
+            if path.exists() or path.is_symlink():
+                raise StateError(f"KVM volume and quarantine both exist: {path}")
+            _verify_kvm_path(quarantine, size_bytes, label, runner)
+            quarantine.unlink()
+            state.fsync_directory(path.parent)
+            return True
+    if not path.exists() and not path.is_symlink():
+        return False
+    _verify_kvm_path(path, size_bytes, label, runner)
+    quarantine = quarantine or path.with_name(f".{logical_name}-delete-{uuid.uuid4().hex}.raw")
+    try:
+        os.replace(path, quarantine)
+        state.fsync_directory(path.parent)
+        if quarantine_validator is not None:
+            quarantine_validator(path, quarantine)
+        if path.exists() or path.is_symlink():
+            raise StateError(f"KVM volume path was recreated during deletion: {path}")
+        _verify_kvm_path(quarantine, size_bytes, label, runner)
+        quarantine.unlink()
+        state.fsync_directory(path.parent)
+        return True
+    except Exception as exc:
+        if quarantine.exists() or quarantine.is_symlink():
+            if not path.exists() and not path.is_symlink():
+                try:
+                    os.replace(quarantine, path)
+                    state.fsync_directory(path.parent)
+                except OSError as restore_exc:
+                    raise StateError(
+                        f"KVM volume deletion failed and quarantine could not be restored: {quarantine}"
+                    ) from restore_exc
+            else:
+                raise StateError(
+                    f"KVM volume deletion failed after a concurrent path replacement; "
+                    f"original data remains quarantined at {quarantine}"
+                ) from exc
+        raise
+
+
 def ensure_kvm_volume(
     roots: StatePaths,
     project: str,
@@ -319,62 +473,19 @@ def ensure_kvm_volume(
     path = kvm_volume_path(roots, project, name)
     lock_path = _volume_lock_path(roots, project, name, "kvm")
     with state.file_lock(lock_path):
-        if path.exists() or path.is_symlink():
-            _verify_kvm_path(path, size_bytes, kvm_volume_label(project, name), runner)
-            return KvmVolume(project=project, name=name, path=path, size_bytes=size_bytes)
-
-        _preflight_kvm_tools(runner)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(path.parent, 0o700)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{name}-",
-            suffix=".raw.tmp",
-            dir=path.parent,
+        created = _ensure_ext4_raw_file_locked(
+            path,
+            size_bytes,
+            kvm_volume_label(project, name),
+            name,
+            runner,
         )
-        temporary = Path(temporary_name)
-        published_identity: tuple[int, int] | None = None
-        try:
-            os.fchmod(descriptor, 0o600)
-            os.ftruncate(descriptor, size_bytes)
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            label = kvm_volume_label(project, name)
-            _run_required(
-                runner,
-                ["mkfs.ext4", "-F", "-q", "-L", label, str(temporary)],
-                f"format KVM volume {name}",
-            )
-            _fsync_file(temporary)
-            _verify_kvm_path(temporary, size_bytes, label, runner)
-
-            try:
-                os.link(temporary, path, follow_symlinks=False)
-            except FileExistsError as exc:
-                raise StateError(f"KVM volume appeared concurrently and was not overwritten: {path}") from exc
-            published = path.stat()
-            published_identity = (published.st_dev, published.st_ino)
-            state.fsync_directory(path.parent)
-            temporary.unlink()
-            state.fsync_directory(path.parent)
-        except Exception:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if published_identity is not None:
-                try:
-                    current = path.stat(follow_symlinks=False)
-                    if (current.st_dev, current.st_ino) == published_identity:
-                        path.unlink()
-                except FileNotFoundError:
-                    pass
-            temporary.unlink(missing_ok=True)
-            raise
         return KvmVolume(
             project=project,
             name=name,
             path=path,
             size_bytes=size_bytes,
-            created=True,
+            created=created,
         )
 
 
@@ -398,38 +509,14 @@ def delete_kvm_volume(
     path = kvm_volume_path(roots, project, name)
     lock_path = _volume_lock_path(roots, project, name, "kvm")
     with state.file_lock(lock_path):
-        if not path.exists() and not path.is_symlink():
-            return False
-        expected_label = kvm_volume_label(project, name)
-        _verify_kvm_path(path, size_bytes, expected_label, runner)
-        quarantine = path.with_name(f".{name}-delete-{uuid.uuid4().hex}.raw")
-        try:
-            os.replace(path, quarantine)
-            state.fsync_directory(path.parent)
-            if quarantine_validator is not None:
-                quarantine_validator(path, quarantine)
-            if path.exists() or path.is_symlink():
-                raise StateError(f"KVM volume path was recreated during deletion: {path}")
-            _verify_kvm_path(quarantine, size_bytes, expected_label, runner)
-            quarantine.unlink()
-            state.fsync_directory(path.parent)
-            return True
-        except Exception as exc:
-            if quarantine.exists() or quarantine.is_symlink():
-                if not path.exists() and not path.is_symlink():
-                    try:
-                        os.replace(quarantine, path)
-                        state.fsync_directory(path.parent)
-                    except OSError as restore_exc:
-                        raise StateError(
-                            f"KVM volume deletion failed and quarantine could not be restored: {quarantine}"
-                        ) from restore_exc
-                else:
-                    raise StateError(
-                        f"KVM volume deletion failed after a concurrent path replacement; "
-                        f"original data remains quarantined at {quarantine}"
-                    ) from exc
-            raise
+        return _delete_ext4_raw_file_locked(
+            path,
+            size_bytes,
+            kvm_volume_label(project, name),
+            name,
+            runner,
+            quarantine_validator,
+        )
 
 
 def lima_backend_name(project: str, name: str) -> str:

@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import pickle
 import struct
+import subprocess
 import threading
 import time
 import uuid
@@ -20,8 +21,11 @@ from pathlib import Path
 import pytest
 
 import palimpsest_local.artifact_store as artifact_store_module
+import palimpsest_local.oci_root_prepare as oci_root_prepare_module
 import palimpsest_local.oci_store as oci_store_module
+import palimpsest_local.state as state_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
+from palimpsest_local.errors import StateError
 from palimpsest_local.oci_boot_plan import (
     OCIBootPlanIntent,
     PreparedOCIBootPlan,
@@ -51,6 +55,19 @@ from palimpsest_local.oci_provenance import (
     OCI_LAYER_MEDIA_TYPE,
     Descriptor,
 )
+from palimpsest_local.oci_root_prepare import (
+    OCIRootPreparationTransaction,
+    prepare_oci_root_run,
+    reconcile_oci_root_preparation,
+    release_prepared_oci_root_run,
+)
+from palimpsest_local.oci_root_volume import (
+    OCIRootVolumeRecord,
+    claim_oci_root_volume,
+    load_oci_root_volume,
+    oci_root_volume_label,
+    release_oci_root_volume,
+)
 from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
@@ -59,7 +76,8 @@ from palimpsest_local.oci_store import (
     OCIStore,
     OCIStoreError,
 )
-from palimpsest_local.state import StatePaths, init_resolved_roots
+from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from palimpsest_local.state import StatePaths, init_resolved_roots, read_run_ledger_snapshot, reserve_new_run
 
 
 def _digest(byte: str) -> str:
@@ -1407,6 +1425,23 @@ def test_boot_plan_digest_and_lease_set_are_deterministic(tmp_path: Path) -> Non
     release_oci_boot_plan(first, store)
 
 
+def test_lower_graph_digest_ignores_invocation_local_cache_results(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    changed_results = tuple(
+        replace(result, cache_result="cold_miss" if result.cache_result == "warm_hit" else "warm_hit")
+        for result in materialization.results
+    )
+    changed = replace(materialization, results=changed_results)
+
+    first = OCIBootPlanIntent(str(uuid.uuid4()), "first", materialization)
+    second = OCIBootPlanIntent(str(uuid.uuid4()), "second", changed)
+
+    assert first.lower_graph_dict() == second.lower_graph_dict()
+    assert first.lower_graph_digest == second.lower_graph_digest
+    assert first.digest != second.digest
+
+
 def test_prepared_boot_plan_rejects_owner_rebinding(tmp_path: Path) -> None:
     _roots, store = _store(tmp_path)
     materialization = _image_materialization(store)
@@ -1438,4 +1473,389 @@ def test_boot_plan_rejects_materialization_metadata_rebinding(tmp_path: Path) ->
             run_id=str(uuid.uuid4()),
             run_name="demo",
             store=store,
+        )
+
+
+_ROOT_VOLUME_SIZE = 16 * 1024 * 1024
+
+
+class _RootVolumeTools:
+    def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv == ["qemu-img", "--version"]:
+            return subprocess.CompletedProcess(argv, 0, "qemu-img 9.2\n", "")
+        if argv == ["mkfs.ext4", "-V"]:
+            return subprocess.CompletedProcess(argv, 0, "mke2fs 1.47\n", "")
+        if argv[0] == "mkfs.ext4":
+            path = Path(argv[-1])
+            label = argv[argv.index("-L") + 1]
+            with path.open("r+b") as stream:
+                stream.seek(1024 + 56)
+                stream.write(b"\x53\xef")
+                stream.seek(1024 + 96)
+                stream.write((0x40).to_bytes(4, "little"))
+                stream.seek(1024 + 120)
+                stream.write(label.encode("ascii").ljust(16, b"\0"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["qemu-img", "info", "--output=json"]:
+            path = Path(argv[-1])
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"format": "raw", "virtual-size": path.stat().st_size}),
+                "",
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+def _oci_dispatch() -> DispatchKey:
+    return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+
+
+def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+
+    with reserve_new_run(roots, "oci-demo", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            materialization,
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+
+    snapshot = read_run_ledger_snapshot(roots, "oci-demo")
+    encoded = (roots.runs / "oci-demo" / "state.json").read_text(encoding="utf-8")
+    recovered = reconcile_oci_root_preparation(roots, "oci-demo", store, runner=tools)
+
+    assert snapshot.state["status"] == "creating"
+    assert snapshot.state["lifecycle_revision"] == 2
+    assert snapshot.state["oci_root"]["phase"] == "resources-ready"
+    assert str(tmp_path) not in encoded
+    assert recovered.transaction == prepared.transaction
+    assert recovered.lower_leases == prepared.boot_plan.lower_leases
+    assert recovered.root_volume == prepared.root_volume.record
+
+    release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+    assert not prepared.root_volume.path.exists()
+    assert store.list_lease_set_intents(prepared.transaction.owner) == ()
+
+
+def test_oci_root_prepare_retains_and_reuses_exact_root_volume(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+
+    with reserve_new_run(roots, "first", _oci_dispatch()) as reservation:
+        first = prepare_oci_root_run(
+            reservation,
+            materialization,
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            retention_policy="retain",
+            runner=tools,
+        )
+    volume_id = first.transaction.volume_id
+    release_prepared_oci_root_run(roots, first, store, runner=tools)
+    retained = load_oci_root_volume(roots, volume_id, runner=tools).record
+    assert retained.status == "retained"
+
+    with reserve_new_run(roots, "second", _oci_dispatch()) as reservation:
+        second = prepare_oci_root_run(
+            reservation,
+            materialization,
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            retained_volume_id=volume_id,
+            retention_policy="retain",
+            runner=tools,
+        )
+    assert second.root_volume.claimed_from_retained is True
+    assert second.root_volume.record.attached_run_name == "second"
+    assert second.transaction.lower_graph_digest == first.transaction.lower_graph_digest
+    release_prepared_oci_root_run(roots, second, store, runner=tools)
+
+
+def test_oci_root_prepare_rolls_back_lowers_when_volume_claim_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+
+    def fail_claim(*_args: object, **_kwargs: object) -> None:
+        raise StateError("injected volume claim failure")
+
+    monkeypatch.setattr(oci_root_prepare_module, "claim_oci_root_volume", fail_claim)
+    with pytest.raises(StateError, match="injected volume claim failure"):
+        with reserve_new_run(roots, "claim-failure", _oci_dispatch()) as reservation:
+            prepare_oci_root_run(
+                reservation,
+                materialization,
+                store,
+                root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+                runner=tools,
+            )
+
+    snapshot = read_run_ledger_snapshot(roots, "claim-failure")
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root"]["phase"] == "rolled-back"
+    assert store.list_lease_set_intents() == ()
+
+
+def test_release_required_reconcile_finishes_after_root_released_before_lower_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+    with reserve_new_run(roots, "release-fault", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            materialization,
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+
+    original_rollback = oci_root_prepare_module._rollback_lower
+
+    def fail_lower(*_args: object, **_kwargs: object) -> None:
+        raise OCIStoreError("oci-store-test", "injected lower release failure")
+
+    monkeypatch.setattr(oci_root_prepare_module, "_rollback_lower", fail_lower)
+    with pytest.raises(OCIStoreError, match="injected lower release failure"):
+        release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+    assert not prepared.root_volume.path.exists()
+    assert read_run_ledger_snapshot(roots, "release-fault").state["oci_root"]["phase"] == "release-required"
+
+    monkeypatch.setattr(oci_root_prepare_module, "_rollback_lower", original_rollback)
+    reconciled = reconcile_oci_root_preparation(roots, "release-fault", store, runner=tools)
+    assert reconciled.transaction.phase == "released"
+    assert read_run_ledger_snapshot(roots, "release-fault").state["status"] == "removed"
+    assert store.list_lease_set_intents() == ()
+
+
+def test_release_required_reconcile_accepts_already_retained_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store = _store(tmp_path)
+    tools = _RootVolumeTools()
+    with reserve_new_run(roots, "retain-release-fault", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            _image_materialization(store),
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            retention_policy="retain",
+            runner=tools,
+        )
+    original_rollback = oci_root_prepare_module._rollback_lower
+    monkeypatch.setattr(
+        oci_root_prepare_module,
+        "_rollback_lower",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OCIStoreError("oci-store-test", "injected lower release failure")
+        ),
+    )
+    with pytest.raises(OCIStoreError, match="injected lower release failure"):
+        release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+    retained = load_oci_root_volume(roots, prepared.transaction.volume_id, runner=tools).record
+    assert retained.status == "retained"
+
+    monkeypatch.setattr(oci_root_prepare_module, "_rollback_lower", original_rollback)
+    reconciled = reconcile_oci_root_preparation(roots, "retain-release-fault", store, runner=tools)
+    assert reconciled.transaction.phase == "released"
+    assert reconciled.root_volume is not None and reconciled.root_volume.status == "retained"
+
+
+def test_reconcile_rolls_back_resources_acquired_after_planned_commit(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+
+    with reserve_new_run(roots, "crashed", _oci_dispatch()) as reservation:
+        intent = OCIBootPlanIntent(reservation.record.run_id, reservation.record.name, materialization)
+        lease_set_id = store.lease_set_id(intent.receipts, intent.owner, plan_digest=intent.digest)
+        transaction = OCIRootPreparationTransaction(
+            "resources-planned",
+            intent.to_dict(),
+            intent.digest,
+            lease_set_id,
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "delete",
+            "delete",
+        )
+        reservation.write_state("creating", {"created_at": "2026-09-01T00:00:00Z", "oci_root": transaction.to_dict()})
+        prepared_lower = prepare_oci_boot_plan(
+            materialization,
+            run_id=reservation.record.run_id,
+            run_name=reservation.record.name,
+            store=store,
+        )
+        claimed = claim_oci_root_volume(
+            roots,
+            transaction.volume_id,
+            size_bytes=_ROOT_VOLUME_SIZE,
+            lower_graph_digest=intent.lower_graph_digest,
+            retention_policy="delete",
+            owner=intent.owner,
+            runner=tools,
+        )
+
+    reconciled = reconcile_oci_root_preparation(roots, "crashed", store, runner=tools)
+    snapshot = read_run_ledger_snapshot(roots, "crashed")
+
+    assert reconciled.transaction.phase == "rolled-back"
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root"]["phase"] == "rolled-back"
+    assert not claimed.path.exists()
+    assert store.list_lease_set_intents(prepared_lower.intent.owner) == ()
+
+
+def test_reconcile_removes_creating_hardlink_pair_after_publish_crash(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+    with reserve_new_run(roots, "create-marker", _oci_dispatch()) as reservation:
+        intent = OCIBootPlanIntent(reservation.record.run_id, reservation.record.name, materialization)
+        transaction = OCIRootPreparationTransaction(
+            "resources-planned",
+            intent.to_dict(),
+            intent.digest,
+            store.lease_set_id(intent.receipts, intent.owner, plan_digest=intent.digest),
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "delete",
+            "delete",
+        )
+        reservation.write_state("creating", {"created_at": "2026-09-01T00:00:00Z", "oci_root": transaction.to_dict()})
+        record = OCIRootVolumeRecord(
+            transaction.volume_id,
+            transaction.volume_size_bytes,
+            transaction.lower_graph_digest,
+            transaction.retention_policy,
+            "creating",
+            intent.owner.run_id,
+            intent.owner.run_name,
+            1,
+        )
+        record_path = roots.oci_root_volumes / f"{transaction.volume_id.replace('-', '')}.json"
+        state_module.atomic_write_json(record_path, record.to_dict())
+        stem = transaction.volume_id.replace("-", "")
+        creating_path = roots.oci_root_volumes / f".{stem}-creating.raw"
+        raw_path = roots.oci_root_volumes / f"{stem}.raw"
+        with creating_path.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.truncate(_ROOT_VOLUME_SIZE)
+        tools(
+            [
+                "mkfs.ext4",
+                "-F",
+                "-q",
+                "-L",
+                oci_root_volume_label(transaction.volume_id),
+                str(creating_path),
+            ]
+        )
+        os.link(creating_path, raw_path)
+        state_module.fsync_directory(roots.oci_root_volumes)
+        assert raw_path.stat().st_nlink == creating_path.stat().st_nlink == 2
+
+    reconciled = reconcile_oci_root_preparation(roots, "create-marker", store, runner=tools)
+    assert reconciled.transaction.phase == "rolled-back"
+    assert not record_path.exists()
+    assert not raw_path.exists()
+    assert not creating_path.exists()
+
+
+def test_reconcile_restores_interrupted_retained_volume_claim(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    tools = _RootVolumeTools()
+    original_owner = ArtifactLeaseOwner(str(uuid.uuid4()), "old", "root-lower")
+    seed_intent = OCIBootPlanIntent(original_owner.run_id, original_owner.run_name, materialization)
+    volume_id = str(uuid.uuid4())
+    seed = claim_oci_root_volume(
+        roots,
+        volume_id,
+        size_bytes=_ROOT_VOLUME_SIZE,
+        lower_graph_digest=seed_intent.lower_graph_digest,
+        retention_policy="retain",
+        owner=original_owner,
+        runner=tools,
+    )
+    release_oci_root_volume(
+        roots,
+        volume_id,
+        owner=original_owner,
+        lower_graph_digest=seed.record.lower_graph_digest,
+        runner=tools,
+    )
+
+    with reserve_new_run(roots, "reuse-crash", _oci_dispatch()) as reservation:
+        intent = OCIBootPlanIntent(reservation.record.run_id, reservation.record.name, materialization)
+        lease_set_id = store.lease_set_id(intent.receipts, intent.owner, plan_digest=intent.digest)
+        transaction = OCIRootPreparationTransaction(
+            "resources-planned",
+            intent.to_dict(),
+            intent.digest,
+            lease_set_id,
+            volume_id,
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "retain",
+            "retain",
+        )
+        reservation.write_state("creating", {"created_at": "2026-09-01T00:00:00Z", "oci_root": transaction.to_dict()})
+        prepare_oci_boot_plan(
+            materialization,
+            run_id=reservation.record.run_id,
+            run_name=reservation.record.name,
+            store=store,
+        )
+        claim_oci_root_volume(
+            roots,
+            volume_id,
+            size_bytes=_ROOT_VOLUME_SIZE,
+            lower_graph_digest=intent.lower_graph_digest,
+            retention_policy="retain",
+            owner=intent.owner,
+            runner=tools,
+        )
+
+    reconcile_oci_root_preparation(roots, "reuse-crash", store, runner=tools)
+    restored = load_oci_root_volume(roots, volume_id, runner=tools).record
+    assert restored.status == "retained"
+    assert restored.attached_run_id is None
+
+
+def test_preparation_ledger_rejects_path_field_even_with_rehashed_plan(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    intent = OCIBootPlanIntent(str(uuid.uuid4()), "strict", _image_materialization(store))
+    plan = intent.to_dict()
+    plan["host_path"] = "/tmp/attacker-root.raw"
+    forged_bytes = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    forged_digest = f"sha256:{hashlib.sha256(forged_bytes).hexdigest()}"
+
+    with pytest.raises(StateError, match="boot plan fields"):
+        OCIRootPreparationTransaction(
+            "resources-planned",
+            plan,
+            forged_digest,
+            _digest("9"),
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "delete",
+            "delete",
         )

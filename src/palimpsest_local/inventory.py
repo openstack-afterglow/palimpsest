@@ -112,6 +112,7 @@ def storage_report(roots: StatePaths) -> dict[str, Any]:
             "tags": _dir_size(roots.tags),
             "transfers": _dir_size(roots.transfers),
             "volumes": _dir_size(roots.volumes),
+            "oci_root_volumes": _dir_size(roots.oci_root_volumes),
             "build_cache": _dir_size(roots.build_cache),
         },
         "total_state_bytes": _dir_size(roots.state),

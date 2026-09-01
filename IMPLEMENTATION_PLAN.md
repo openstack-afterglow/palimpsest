@@ -351,6 +351,28 @@ Verification recorded for this slice:
 
 Scope boundary: this slice reserves the immutable lower graph but does not create a root disk, emit a libvirt domain, select a kernel/initramfs, assemble/pivot `/`, supervise image init, or implement foreground/`-d`. Gate 2 remains inactive.
 
+### PR 4 slice 10: VM-specific writable root ownership and run-ledger preparation
+
+Implemented:
+
+- OCI-root writable ext4 disks now live in a dedicated owner-only `${state}/oci-root-volumes` authority, separate from shareable project volumes. Each volume has a canonical UUID, deterministic filesystem label, exact size and lower-graph binding, explicit `delete` or `retain` policy, generation, lifecycle state, and at most one attached run owner.
+- New volume creation commits a `creating` owner intent before publishing raw ext4 bytes, then promotes it to `attached`. The physical artifact is sparse raw ext4 with no backing file and is verified before reuse. Owner records use canonical JSON and descriptor-relative atomic publication. A deterministic deletion quarantine makes rename-before-unlink crashes recoverable.
+- The root disk is VM-specific by default. Teardown removes a `delete` root with the run; `retain` detaches it for later use. Reuse requires an explicit retained volume ID plus exact size and immutable lower-graph digest, and the retained volume remains single-writer rather than becoming a shared root disk.
+- `OCIBootPlanIntent.lower_graph_digest` identifies the immutable OCI graph independently of run identity and invocation-local cold/warm cache results. This allows a retained writable root to be accepted only with the same ordered source/config/platform/layer/DiffID/derived-receipt graph.
+- `prepare_oci_root_run` writes a path-free `resources-planned` run-ledger record before acquiring resources, acquires the deterministic lower lease-set and exclusive root volume, then commits `resources-ready`. Ordinary failures roll back only the exact claim provenance and lower intent; incomplete rollback is recorded as `rollback-required`.
+- Restart reconciliation cross-validates the embedded boot plan, ordered receipt/occurrence tuple, loaded lower lease members, run owner, lower-graph digest, and root-volume attachment. A planned transaction is rolled back exactly; a ready transaction is recovered without formatting or duplicating either resource.
+- Teardown has durable `release-required` and `released` phases. Restart can finish after either root detach/delete or lower release has already succeeded. Already-retained roots and already-absent deleted roots are terminal idempotent states.
+- This slice intentionally stops before libvirt domain definition. The raw ext4 root volume is ownership/transaction infrastructure and is not yet attached as the bootable OCI `/` disk.
+
+Verification recorded for this slice:
+
+- Complete local `tests` tree: 2218 passed, 16 skipped, with one existing macOS fork deprecation warning.
+- Focused OCI root/store/project-volume/state suite: 161 passed.
+- Crash/fault coverage includes creating-intent recovery, claim failure after lower reservation, resources-planned crash after both resources exist, retained-claim rollback, release after root completion but lower failure, already-retained release retry, and deterministic deletion-quarantine recovery.
+- Ruff lint/format, Python compile, `git diff --check`, and sdist/wheel build pass.
+
+Scope boundary: the OCI graph and VM-specific writable root now have one crash-recoverable run-ledger preparation transaction. No libvirt domain is emitted, no host kernel/initramfs is selected, and no guest has mounted, assembled, or pivoted this graph to `/`. Gate 2 remains inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -371,7 +393,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add the VM-specific writable root volume/overlay ownership transaction and retained boot-volume reuse, committing the prepared lower reservation into run state without leaking either side on failure.
-2. Add the host kernel/initramfs policy plus stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
+1. Add the host kernel/initramfs policy and a KVM domain contract that attaches the ordered immutable lowers plus the VM-specific raw ext4 root without yet claiming a successful pivot.
+2. Implement guest stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

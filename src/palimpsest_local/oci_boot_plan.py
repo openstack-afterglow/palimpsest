@@ -60,7 +60,8 @@ class OCIBootPlanIntent:
             )
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def lower_graph_dict(self) -> dict[str, Any]:
+        """Return the immutable OCI graph identity, independent of one run."""
         materialization = self.materialization
         return {
             "config_descriptor": materialization.config_descriptor.to_dict(),
@@ -81,13 +82,26 @@ class OCIBootPlanIntent:
                 )
             ],
             "manifest_digest": materialization.manifest_digest,
-            "phase": "lower-reserved",
             "platform": {
                 "architecture": materialization.platform_architecture,
                 "os": materialization.platform_os,
             },
-            "retention": "durable-lease-set",
             "root_descriptor": materialization.root_descriptor.to_dict(),
+            "source_image_digest": materialization.source_image_digest,
+            "source_snapshot_binding_digest": materialization.source_snapshot_binding_digest,
+        }
+
+    @property
+    def lower_graph_digest(self) -> str:
+        return f"sha256:{hashlib.sha256(canonical_json_bytes(self.lower_graph_dict())).hexdigest()}"
+
+    def to_dict(self) -> dict[str, Any]:
+        lower_graph = self.lower_graph_dict()
+        return {
+            **lower_graph,
+            "lower_graph_digest": self.lower_graph_digest,
+            "phase": "lower-reserved",
+            "retention": "durable-lease-set",
             "run": {
                 "backend": "kvm",
                 "name": self.owner.run_name,
@@ -95,8 +109,6 @@ class OCIBootPlanIntent:
                 "runtime_kind": "oci-root",
             },
             "schema": OCI_ROOT_BOOT_PLAN_SCHEMA,
-            "source_image_digest": materialization.source_image_digest,
-            "source_snapshot_binding_digest": materialization.source_snapshot_binding_digest,
             "writable_root_policy": "vm-specific",
         }
 

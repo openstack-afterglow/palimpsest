@@ -20,6 +20,10 @@ def _cloud_key(backend: RuntimeBackend = RuntimeBackend.KVM) -> DispatchKey:
     return DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
 
 
+def _oci_root_key() -> DispatchKey:
+    return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+
+
 def test_xdg_roots_and_permissions() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmppath = Path(tmp)
@@ -43,6 +47,7 @@ def test_xdg_roots_and_permissions() -> None:
         assert state.permission_bits(roots.oci_derived_store) == 0o700
         assert state.permission_bits(roots.projects) == 0o700
         assert state.permission_bits(roots.volumes) == 0o700
+        assert state.permission_bits(roots.oci_root_volumes) == 0o700
 
 
 def test_run_paths_and_owner_record() -> None:
@@ -127,6 +132,18 @@ def test_new_run_reservation_writes_exact_v2_identity_and_rejects_smuggling(tmp_
     }
     assert state.permission_bits(state.run_paths(roots, "fresh").owner) == 0o600
     assert state.permission_bits(state.run_paths(roots, "fresh").state) == 0o600
+
+
+def test_new_run_reservation_supports_oci_root_kvm_identity(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+
+    with state.reserve_new_run(roots, "oci-vm", _oci_root_key()) as reservation:
+        written = reservation.write_state("creating", {"prepare_phase": "resources-planned"})
+
+    assert written["runtime_kind"] == "oci-root"
+    assert written["backend"] == "kvm"
+    assert written["status"] == "creating"
+    assert state.read_run_dispatch_record(roots, "oci-vm").dispatch_key == _oci_root_key()
 
 
 def test_new_run_reservation_uses_canonical_public_path_spelling(tmp_path: Path) -> None:
