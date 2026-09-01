@@ -14,7 +14,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -29,6 +29,7 @@ from .kvm import (
     OCIRootDomainSpec,
     build_oci_root_domain_xml,
 )
+from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
@@ -144,13 +145,18 @@ def _verify_host_boot_artifact(
     kind: str,
     maximum: int,
     expected_digest: str | None,
+    payload_validator: Callable[[bytes], None] | None = None,
 ) -> VerifiedHostBootArtifact:
     if not isinstance(path, Path) or not path.is_absolute() or "\0" in os.fspath(path):
         raise StateError(f"host {kind} path must be absolute")
     fd: int | None = None
     try:
         visible = path.stat(follow_symlinks=False)
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        if stat.S_ISLNK(visible.st_mode):
+            raise StateError(f"host {kind} artifact cannot be securely read")
+        if not stat.S_ISREG(visible.st_mode):
+            raise StateError(f"host {kind} artifact metadata is unsafe")
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
         opened = os.fstat(fd)
         mode = stat.S_IMODE(opened.st_mode)
         if (
@@ -176,12 +182,15 @@ def _verify_host_boot_artifact(
         ):
             raise StateError("host initramfs compression or archive format is unsupported")
         hasher = hashlib.sha256()
+        collected = bytearray() if payload_validator is not None else None
         offset = 0
         while offset < opened.st_size:
             chunk = os.pread(fd, min(1024 * 1024, opened.st_size - offset), offset)
             if not chunk:
                 raise StateError(f"host {kind} artifact ended during verification")
             hasher.update(chunk)
+            if collected is not None:
+                collected.extend(chunk)
             offset += len(chunk)
         digest = f"sha256:{hasher.hexdigest()}"
         if (
@@ -189,6 +198,9 @@ def _verify_host_boot_artifact(
             and _canonical_digest(expected_digest, f"expected host {kind} digest is invalid") != digest
         ):
             raise StateError(f"host {kind} digest does not match the boot contract")
+        if payload_validator is not None:
+            assert collected is not None
+            payload_validator(bytes(collected))
         after = os.fstat(fd)
         final = path.stat(follow_symlinks=False)
 
@@ -241,6 +253,30 @@ def verify_host_boot_artifacts(
             maximum=_MAX_INITRAMFS_BYTES,
             expected_digest=expected_initramfs_digest,
         ),
+    )
+
+
+def verify_first_party_bootstrap_initramfs(
+    path: Path,
+    manifest: OCIInitramfsManifest,
+) -> VerifiedHostBootArtifact:
+    """Pin and structurally verify the bootstrap-only first-party initramfs."""
+
+    if not isinstance(manifest, OCIInitramfsManifest):
+        raise StateError("first-party initramfs manifest is invalid")
+
+    def validate(payload: bytes) -> None:
+        try:
+            verify_bootstrap_initramfs(payload, manifest)
+        except ArtifactValidationError:
+            raise StateError("first-party initramfs structure or provenance is invalid") from None
+
+    return _verify_host_boot_artifact(
+        path,
+        kind="initramfs",
+        maximum=MAX_OCI_INITRAMFS_BYTES,
+        expected_digest=manifest.artifact_digest,
+        payload_validator=validate,
     )
 
 
@@ -745,4 +781,5 @@ __all__ = [
     "commit_oci_root_domain_plan",
     "load_oci_root_domain_plan",
     "verify_host_boot_artifacts",
+    "verify_first_party_bootstrap_initramfs",
 ]

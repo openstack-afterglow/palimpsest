@@ -408,6 +408,19 @@ Implemented:
 
 Scope boundary: this is a typed contract, not an initramfs implementation. Palimpsest still does not build or install `/init`, discover and mount guest disks, create OverlayFS, pivot/chroot into the merged OCI root, resolve named users inside that root, run or supervise image init, define/start libvirt, or enable foreground/`-d`. Gate 2 remains inactive.
 
+### PR 4 slice 13: deterministic first-party bootstrap initramfs provenance
+
+Implemented:
+
+- Palimpsest now emits a tool-independent, uncompressed canonical `newc` archive entirely from Python. Entry order, inode sequence, root ownership, mode, link count, zero timestamps/device fields/checksum, hexadecimal encoding, NUL termination, four-byte zero padding, one terminal `TRAILER!!!`, and no trailing bytes are fixed by `palimpsest.initramfs.newc.v1`.
+- The portable parser accepts only that closed subset. It bounds archive/member/path sizes and entry count, rejects missing parents, links/devices, absolute or noncanonical paths, duplicates/reordering, malformed/truncated headers, nonzero padding, metadata drift, missing/duplicate/non-final trailers, concatenated archives, and trailing bytes. Acceptance is confirmed by byte-for-byte canonical re-emission.
+- The initial first-party `/init` is a deterministic standalone x86_64 ELF emitted by Palimpsest itself, with no compiler, libc, interpreter, dynamic section, or runtime dependency. The ELF verifier requires ELF64 little-endian `ET_EXEC`, x86_64, bounded program headers and segments, an entry in a file-backed readable/executable `PT_LOAD`, no `PT_INTERP`/`PT_DYNAMIC`, no writable+executable load, and no executable stack.
+- This `/init` is intentionally a **fail-closed bootstrap**, not the root assembler: it writes a fixed diagnostic and sleeps. Its embedded stage-1 ABI records `capability=bootstrap-fail-closed`, `root_assembly=false`, and `plan_transport=unimplemented`. The artifact therefore cannot be represented as OCI-root boot readiness.
+- A canonical path-free manifest binds architecture, archive format/generator, complete entry path/mode/size/digest receipts, stage-1 ABI and binary digests, static linkage, capability, and plan-transport state. Verification requires the exact first-party `/init` and ABI bytes, not merely a self-consistent attacker-supplied manifest.
+- `verify_first_party_bootstrap_initramfs` reuses the existing no-follow, owner/mode/link-count, same-FD hash and metadata-stability host boot-artifact boundary, but adds a 64 MiB bound and full archive/manifest/ELF verification while the descriptor remains pinned. A fake `070701` prefix is no longer sufficient at this first-party boundary.
+
+Scope boundary: this slice creates and verifies a real deterministic initramfs containing an executable `/init`, but that `/init` deliberately does not discover devices, mount ext4/SquashFS, assemble OverlayFS, pivot, resolve users, execute/supervise the OCI process, or signal readiness. It is not selected by the OCI-root domain planner, does not implement a per-run digest-bound plan transport, and does not authorize libvirt. Generic explicitly supplied host initramfs preview behavior remains compatible. Gate 2 remains inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -428,7 +441,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Build a deterministic first-party initramfs artifact containing `/init` and the minimum statically linked guest tooling, with a digest-bound plan transport and fail-closed device discovery.
-2. Implement guest stage-1 mounting, writable-root OverlayFS assembly, pivot to the OCI tree, and first-party PID 1 supervision, then prove it under privileged Linux/KVM tests.
+1. Define and implement the per-run digest-bound stage-1 plan transport without creating a domain/initramfs digest cycle, then bind it at the domain mutation boundary.
+2. Replace the fail-closed bootstrap with the first-party device discovery, ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and PID 1 supervisor; prove it under privileged Linux/KVM tests.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
