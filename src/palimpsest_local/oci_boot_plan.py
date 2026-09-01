@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+from .errors import ArtifactValidationError
 from .oci_materializer import OCIImageMaterializationReceipt
 from .oci_provenance import canonical_json_bytes
 from .oci_store import (
@@ -17,7 +18,7 @@ from .oci_store import (
     OCIStoreError,
 )
 
-OCI_ROOT_BOOT_PLAN_SCHEMA = "palimpsest.oci-root-boot-plan.v1"
+OCI_ROOT_BOOT_PLAN_SCHEMA = "palimpsest.oci-root-boot-plan.v2"
 OCI_ROOT_LOWER_ROLE = "root-lower"
 
 
@@ -33,6 +34,10 @@ class OCIBootPlanIntent:
         ArtifactLeaseOwner(self.run_id, self.run_name, OCI_ROOT_LOWER_ROLE)
         if not isinstance(self.materialization, OCIImageMaterializationReceipt):
             raise OCIStoreError("oci-boot-plan", "boot-plan materialization is invalid")
+        try:
+            self.materialization.process.require_bootable()
+        except ArtifactValidationError:
+            raise OCIStoreError("oci-boot-plan", "OCI image process is not bootable") from None
 
     @property
     def owner(self) -> ArtifactLeaseOwner:
@@ -101,6 +106,7 @@ class OCIBootPlanIntent:
             **lower_graph,
             "lower_graph_digest": self.lower_graph_digest,
             "phase": "lower-reserved",
+            "process": self.materialization.process.to_dict(),
             "retention": "durable-lease-set",
             "run": {
                 "backend": "kvm",

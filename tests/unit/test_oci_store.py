@@ -50,6 +50,7 @@ from palimpsest_local.oci_packer import (
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
 )
+from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -75,6 +76,7 @@ from palimpsest_local.oci_root_volume import (
     oci_root_volume_label,
     release_oci_root_volume,
 )
+from palimpsest_local.oci_stage1 import OCIStage1Plan
 from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
@@ -307,6 +309,11 @@ def test_materialization_result_rejects_unhashable_cache_result() -> None:
     with pytest.raises(OCIStoreError, match="cache result is invalid"):
         MaterializationResult(receipt, [])  # type: ignore[arg-type]
 
+    wire = receipt.to_dict()
+    wire["filesystem"] = "ext4"
+    with pytest.raises(OCIStoreError, match="derived receipt is invalid"):
+        oci_store_module.DerivedLayerReceipt.from_dict(wire)
+
 
 def test_cold_inconsistent_receipts_publish_nothing(tmp_path: Path) -> None:
     roots, store = _store(tmp_path)
@@ -420,6 +427,33 @@ def test_durable_lease_can_detach_and_release_without_streaming(tmp_path: Path) 
     assert store.list_leases(owner) == ()
 
 
+def test_legacy_v1_durable_lease_is_discoverable_and_releasable(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    occurrence = _occurrence()
+    receipt = store.materialize(
+        occurrence,
+        _key(occurrence),
+        _producer(occurrence, [], _squashfs()),
+    )
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-layer")
+    lease = store.acquire_lease(receipt, owner)
+    lease_id = lease.detach()
+    path = roots.oci_derived_store / "leases" / lease_id
+    value = json.loads(path.read_bytes())
+    value["schema"] = oci_store_module._DERIVED_LEASE_SCHEMA_V1
+    value["receipt"].pop("filesystem")
+    path.chmod(0o600)
+    path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+    path.chmod(0o400)
+
+    recovered = store.list_leases(owner)
+
+    assert len(recovered) == 1
+    assert recovered[0].receipt.filesystem == "squashfs"
+    store.release_recoverable_lease(lease_id, owner, recovered[0].receipt)
+    assert store.list_leases(owner) == ()
+
+
 def _ordered_receipts(store: OCIStore, count: int = 3):
     image = _squashfs()
     receipts = []
@@ -464,6 +498,39 @@ def test_lease_set_is_ordered_idempotent_and_retains_shared_artifact(tmp_path: P
         receipts[0].image_digest,
         retention_guard=lambda: store.assert_artifact_unleased(receipts[0].image_digest),
     ) == len(image)
+
+
+def test_legacy_v1_lease_set_is_recoverable_and_releasable(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    _image, receipts = _ordered_receipts(store)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "demo", "root-lower")
+    plan_digest = _digest("9")
+    legacy_schema = oci_store_module._DERIVED_LEASE_SET_SCHEMA_V1
+    intent = store._lease_set_intent_value(receipts, owner, plan_digest, schema=legacy_schema)
+    set_path = roots.oci_derived_store / "lease-sets" / intent["lease_set_id"].removeprefix("sha256:")
+    set_path.write_bytes(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())
+    set_path.chmod(0o400)
+    for member, receipt in zip(intent["members"][:1], receipts[:1], strict=True):
+        lease_value = store._lease_record_value(member["lease_id"], owner, receipt, 1)
+        lease_value["schema"] = oci_store_module._DERIVED_LEASE_SCHEMA_V1
+        lease_value["receipt"].pop("filesystem")
+        lease_path = roots.oci_derived_store / "leases" / member["lease_id"]
+        lease_path.write_bytes(json.dumps(lease_value, sort_keys=True, separators=(",", ":")).encode())
+        lease_path.chmod(0o400)
+
+    recoverable = store.list_lease_set_intents(owner)
+    reacquired = store.acquire_lease_set(receipts, owner, plan_digest=plan_digest)
+    loaded = store.load_lease_set(intent["lease_set_id"], owner, plan_digest=plan_digest)
+
+    assert len(recoverable) == 1 and not recoverable[0].complete
+    assert reacquired == loaded
+    assert reacquired.lease_set_id == intent["lease_set_id"]
+    assert len(list((roots.oci_derived_store / "lease-sets").iterdir())) == 1
+    assert len(list((roots.oci_derived_store / "leases").iterdir())) == len(receipts)
+    assert {member.receipt.filesystem for member in loaded.members} == {"squashfs"}
+    store.release_lease_set(loaded)
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
 
 
 def test_partial_lease_set_publication_retry_converges(tmp_path: Path, monkeypatch) -> None:
@@ -1391,6 +1458,9 @@ def _image_materialization(store: OCIStore) -> OCIImageMaterializationReceipt:
         platform_architecture="amd64",
         layer_descriptors=layers,
         layer_diff_ids=tuple(_digest("d") for _receipt in receipts),
+        process=OCIProcessSpec(
+            ("/sbin/init",), (("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),), "/", OCIUserSpec("0", "0"), 15
+        ),
         results=tuple(MaterializationResult(receipt, "warm_hit") for receipt in receipts),
     )
 
@@ -1447,6 +1517,14 @@ def test_lower_graph_digest_ignores_invocation_local_cache_results(tmp_path: Pat
     assert first.lower_graph_dict() == second.lower_graph_dict()
     assert first.lower_graph_digest == second.lower_graph_digest
     assert first.digest != second.digest
+
+
+def test_boot_plan_rejects_image_without_a_process(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    materialization = replace(_image_materialization(store), process=OCIProcessSpec.empty())
+
+    with pytest.raises(OCIStoreError, match="process is not bootable"):
+        OCIBootPlanIntent(str(uuid.uuid4()), "demo", materialization)
 
 
 def test_prepared_boot_plan_rejects_owner_rebinding(tmp_path: Path) -> None:
@@ -1593,6 +1671,14 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert "<kernel>" in resolved.xml and "<initrd>" in resolved.xml
     assert 'type="raw"' in resolved.xml and 'device="cdrom"' not in resolved.xml
     assert "palimpsest.root=virtio-" in plan.kernel_cmdline
+    assert f"palimpsest.plan={prepared.transaction.boot_plan_digest}" in plan.kernel_cmdline
+    assert {layer["filesystem"] for layer in plan.layers} == {"squashfs"}
+
+    stage1 = OCIStage1Plan.from_domain_plan(plan)
+    assert OCIStage1Plan.from_dict(stage1.to_dict(), expected_domain_plan=plan) == stage1
+    assert stage1.process.argv == ("/sbin/init",)
+    assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
+    assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
     tampered = deepcopy(plan.to_dict())
     tampered["layers"][0]["serial"] = "0" * 20
@@ -1600,6 +1686,29 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
         type(plan).from_dict(tampered)
     with pytest.raises(TypeError):
         plan.layers[0]["serial"] = "0" * 20
+    with pytest.raises(TypeError):
+        stage1.root["serial"] = "0" * 20
+
+    stage1_wire = stage1.to_dict()
+    stage1_wire["assembly"]["layers"][0]["filesystem"] = "ext4"
+    with pytest.raises(StateError, match="lower mount policy"):
+        OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
+
+    stage1_wire = stage1.to_dict()
+    stage1_wire["assembly"]["lowerdir_ordinals"] = [0, 1, 2]
+    with pytest.raises(StateError, match="policy"):
+        OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
+
+    stage1_wire = stage1.to_dict()
+    stage1_wire["process"]["argv"] = []
+    with pytest.raises(StateError, match="not bootable"):
+        OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
+
+    stage1_wire = stage1.to_dict()
+    original_serial = stage1_wire["assembly"]["root"]["serial"]
+    stage1_wire["assembly"]["root"]["serial"] = "f" * 20 if original_serial != "f" * 20 else "e" * 20
+    with pytest.raises(StateError, match="expected domain plan"):
+        OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
 
     release_prepared_oci_root_run(roots, prepared, store, runner=tools)
 

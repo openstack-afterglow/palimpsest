@@ -393,6 +393,21 @@ Verification recorded for this slice:
 
 Scope boundary: this slice emits an ephemeral libvirt XML preview and durably binds only its path-free plan. It does not authorize or call libvirt, provide the stage-1 `/init`, mount or assemble the lowers, pivot the OCI tree to `/`, launch image init as PID 1, or enable foreground/`-d`. Gate 2 remains inactive.
 
+### PR 4 slice 12: OCI process identity and guest stage-1 contract
+
+Implemented:
+
+- OCI image `Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`, and `StopSignal` are now parsed into one canonical, shell-free process contract. Argument boundaries, empty arguments, newlines, and shell metacharacters remain literal. The contract rejects NULs, duplicate or malformed environment names, noncanonical users and paths, unsupported signals, `ArgsEscaped`, and bounded-input violations.
+- An image with no `Entrypoint` and no `Cmd` remains valid source material but fails closed when promoted to an OCI-root boot plan. The process contract is carried through image selection, hard materialization, boot-plan reservation, run preparation, KVM domain planning, and the future guest handoff.
+- Derived lower receipts now state their filesystem type explicitly. The current closed policy accepts only `squashfs`; domain and stage-1 plans therefore never infer `mount -t` from a path, filename, or host state.
+- Worker responses and durable lease/lease-set records that embed the expanded receipt use v2 schemas. Existing v1 durable records have an explicit legacy decoder that supplies only the historically guaranteed `squashfs` type while preserving their original deterministic set/member identities, so restart discovery, GC retention, and release remain available after upgrade.
+- `OCIStage1Plan` is a canonical, path-free input contract for the future first-party `/init`. It binds the run and boot/domain plan digests, writable ext4 root identity and generation, ordered SquashFS device serials, mount policies, reverse lowerdir order for OverlayFS, and exact image process identity.
+- Stage-1 deserialization independently validates canonical UUIDs/digests, run names, disk serial uniqueness, generation, filesystem and mount policy, layer-count bound, overlay order, and a bootable process. It also requires the already validated expected domain plan and rejects any wire contract that cannot be re-derived exactly from it. Nested root and layer state is recursively immutable.
+- The fixed kernel command line now includes the resource-plan digest. This is a future guest lookup/binding input only; this slice does not define a transport or claim that `/init` can retrieve the plan.
+- The process contract is included in the boot intent while the lower graph retains the exact OCI source/config provenance policy from slice 10. A separately published config therefore remains a distinct retained-root identity even when its layer descriptors match; this slice does not broaden retained-root reuse semantics.
+
+Scope boundary: this is a typed contract, not an initramfs implementation. Palimpsest still does not build or install `/init`, discover and mount guest disks, create OverlayFS, pivot/chroot into the merged OCI root, resolve named users inside that root, run or supervise image init, define/start libvirt, or enable foreground/`-d`. Gate 2 remains inactive.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -413,6 +428,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Implement guest stage-1 lower mounting, writable-root assembly, pivot to the OCI tree, and image init supervision.
-2. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-3. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Build a deterministic first-party initramfs artifact containing `/init` and the minimum statically linked guest tooling, with a digest-bound plan transport and fail-closed device discovery.
+2. Implement guest stage-1 mounting, writable-root OverlayFS assembly, pivot to the OCI tree, and first-party PID 1 supervision, then prove it under privileged Linux/KVM tests.
+3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

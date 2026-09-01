@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import ArtifactValidationError
+from .oci_process import OCIProcessSpec
 from .oci_provenance import (
     DOCKER_IMAGE_CONFIG_MEDIA_TYPE,
     DOCKER_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -172,6 +173,7 @@ class OCIConfig:
     architecture: str
     rootfs_type: str
     diff_ids: tuple[str, ...]
+    process: OCIProcessSpec
 
     def __post_init__(self) -> None:
         if not isinstance(self.descriptor, Descriptor):
@@ -186,12 +188,15 @@ class OCIConfig:
             raise ArtifactValidationError("image config rootfs.diff_ids must be an immutable tuple")
         for index, diff_id in enumerate(self.diff_ids):
             _canonical_digest(diff_id, f"image config rootfs.diff_ids[{index}]")
+        if not isinstance(self.process, OCIProcessSpec):
+            raise ArtifactValidationError("image config process must be an OCIProcessSpec")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "architecture": self.architecture,
             "descriptor": self.descriptor.to_dict(),
             "os": self.os,
+            "process": self.process.to_dict(),
             "rootfs": {"diff_ids": list(self.diff_ids), "type": self.rootfs_type},
         }
 
@@ -385,6 +390,7 @@ def _parse_config(reader: BlobReader, descriptor: Descriptor) -> OCIConfig:
         architecture=document.get("architecture"),
         rootfs_type=rootfs.get("type"),
         diff_ids=tuple(diff_ids),
+        process=OCIProcessSpec.from_config(document.get("config")),
     )
 
 

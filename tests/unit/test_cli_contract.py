@@ -426,7 +426,7 @@ def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
         digest = "sha256:" + "b" * 64
 
         def to_dict(self):
-            return {"schema": "palimpsest.oci-image-materialization.v1", "results": []}
+            return {"schema": "palimpsest.oci-image-materialization.v2", "results": []}
 
     def fake_materialize(selected, **kwargs):
         calls["snapshot"] = selected

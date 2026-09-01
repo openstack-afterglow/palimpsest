@@ -120,6 +120,7 @@ def image_graph(
     rootfs_type: str = "layers",
     diff_ids: list[str] | None = None,
     layer_media_type: str | None = None,
+    process_config: dict[str, object] | None = None,
 ) -> tuple[Graph, Descriptor, Descriptor, list[Descriptor]]:
     graph = Graph()
     config_media_type = DOCKER_IMAGE_CONFIG_MEDIA_TYPE if docker else OCI_IMAGE_CONFIG_MEDIA_TYPE
@@ -131,7 +132,7 @@ def image_graph(
             "architecture": architecture,
             "os": os_name,
             "rootfs": {"type": rootfs_type, "diff_ids": ids},
-            "config": {"Env": ["A=B"]},
+            "config": {"Env": ["A=B"]} if process_config is None else process_config,
         },
         config_media_type,
     )
@@ -146,6 +147,27 @@ def image_graph(
         manifest_media_type,
     )
     return graph, manifest, config, layers
+
+
+def test_image_config_preserves_shell_free_process_contract() -> None:
+    graph, manifest, _config, _layers = image_graph(
+        process_config={
+            "Entrypoint": ["/usr/bin/app"],
+            "Cmd": ["serve", "--port=8080"],
+            "Env": ["A=B"],
+            "WorkingDir": "/srv/app",
+            "User": "1000:1001",
+            "StopSignal": "SIGINT",
+        }
+    )
+
+    process = resolve_image(ref(), manifest, graph.read).config.process
+
+    assert process.argv == ("/usr/bin/app", "serve", "--port=8080")
+    assert process.environment == (("A", "B"),)
+    assert process.cwd == "/srv/app"
+    assert process.user.to_dict() == {"group": "1001", "user": "1000"}
+    assert process.stop_signal == 2
 
 
 def add_index(

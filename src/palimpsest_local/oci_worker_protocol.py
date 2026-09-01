@@ -21,7 +21,7 @@ from .oci_store import (
 )
 
 OCI_WORKER_REQUEST_SCHEMA = "palimpsest.oci-materialize-worker-request.v1"
-OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v1"
+OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v2"
 MAX_OCI_WORKER_MESSAGE_BYTES = 256 * 1024
 MAX_OCI_WORKER_JSON_DEPTH = 12
 OCI_WORKER_ERROR_CATEGORIES = frozenset(

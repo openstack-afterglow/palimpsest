@@ -12,6 +12,7 @@ from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
 from .oci_boot_plan import OCIBootPlanIntent, PreparedOCIBootPlan, prepare_oci_boot_plan
 from .oci_materializer import OCIImageMaterializationReceipt
+from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_volume import (
     ClaimedOCIRootVolume,
@@ -41,7 +42,7 @@ from .state import (
     utc_now_iso,
 )
 
-OCI_ROOT_PREPARATION_SCHEMA = "palimpsest.oci-root-run-prepare.v1"
+OCI_ROOT_PREPARATION_SCHEMA = "palimpsest.oci-root-run-prepare.v2"
 _PHASES = frozenset(
     {
         "resources-planned",
@@ -61,6 +62,7 @@ _BOOT_PLAN_FIELDS = frozenset(
         "manifest_digest",
         "phase",
         "platform",
+        "process",
         "retention",
         "root_descriptor",
         "run",
@@ -142,8 +144,12 @@ class OCIRootPreparationTransaction:
         actual_graph = _json_digest(graph, "OCI-root preparation lower graph is invalid")
         if actual_graph != lower_graph or plan.get("lower_graph_digest") != lower_graph:
             raise StateError("OCI-root preparation lower graph binding is invalid")
-        if plan.get("schema") != "palimpsest.oci-root-boot-plan.v1":
+        if plan.get("schema") != "palimpsest.oci-root-boot-plan.v2":
             raise StateError("OCI-root preparation boot plan schema is invalid")
+        try:
+            OCIProcessSpec.from_dict(plan.get("process")).require_bootable()
+        except (ArtifactValidationError, TypeError, ValueError):
+            raise StateError("OCI-root preparation process contract is invalid") from None
         if (
             plan.get("phase") != "lower-reserved"
             or plan.get("retention") != "durable-lease-set"

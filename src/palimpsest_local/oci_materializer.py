@@ -26,6 +26,7 @@ from .oci_packer import (
     SQUASHFS_PACK_POLICY_ID,
     VerifiedSquashFSToolchain,
 )
+from .oci_process import OCIProcessSpec
 from .oci_provenance import Descriptor, canonical_json_bytes
 from .oci_source import SnapshottedOCIImage
 from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
@@ -78,6 +79,7 @@ class OCIImageMaterializationReceipt:
     platform_architecture: str
     layer_descriptors: tuple[Descriptor, ...]
     layer_diff_ids: tuple[str, ...]
+    process: OCIProcessSpec
     results: tuple[MaterializationResult, ...]
 
     def __post_init__(self) -> None:
@@ -95,6 +97,8 @@ class OCIImageMaterializationReceipt:
                 raise OCIHardWorkerError("oci-image-receipt", "image materialization digest is not canonical")
         if not isinstance(self.root_descriptor, Descriptor) or not isinstance(self.config_descriptor, Descriptor):
             raise OCIHardWorkerError("oci-image-receipt", "image materialization metadata is invalid")
+        if not isinstance(self.process, OCIProcessSpec):
+            raise OCIHardWorkerError("oci-image-receipt", "image materialization process is invalid")
         if self.platform_os != "linux" or self.platform_architecture != "amd64":
             raise OCIHardWorkerError("oci-image-receipt", "image materialization platform is unsupported")
         if (
@@ -139,10 +143,11 @@ class OCIImageMaterializationReceipt:
             ],
             "manifest_digest": self.manifest_digest,
             "platform": {"architecture": self.platform_architecture, "os": self.platform_os},
+            "process": self.process.to_dict(),
             "retention": "none",
             "results": [result.to_dict() for result in self.results],
             "root_descriptor": self.root_descriptor.to_dict(),
-            "schema": "palimpsest.oci-image-materialization.v1",
+            "schema": "palimpsest.oci-image-materialization.v2",
             "source_image_digest": self.source_image_digest,
             "source_snapshot_binding_digest": self.source_snapshot_binding_digest,
         }
@@ -511,6 +516,7 @@ def materialize_image_hard(
         platform_architecture=image.image.platform.architecture,
         layer_descriptors=tuple(layer.descriptor for layer in image.layers),
         layer_diff_ids=tuple(layer.diff_id for layer in image.image.layers),
+        process=image.image.config.process,
         results=tuple(results),
     )
 

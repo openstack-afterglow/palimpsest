@@ -68,8 +68,10 @@ _FORK_REGISTRY_LOCK = threading.Lock()
 DERIVED_RECIPE_SCHEMA = "palimpsest.oci-derived-recipe.v1"
 DERIVED_RECORD_SCHEMA = "palimpsest.oci-derived-record.v1"
 DERIVED_OCCURRENCE_SCHEMA = "palimpsest.oci-derived-occurrence.v1"
-DERIVED_LEASE_SCHEMA = "palimpsest.oci-derived-lease.v1"
-DERIVED_LEASE_SET_SCHEMA = "palimpsest.oci-derived-lease-set.v1"
+_DERIVED_LEASE_SCHEMA_V1 = "palimpsest.oci-derived-lease.v1"
+_DERIVED_LEASE_SET_SCHEMA_V1 = "palimpsest.oci-derived-lease-set.v1"
+DERIVED_LEASE_SCHEMA = "palimpsest.oci-derived-lease.v2"
+DERIVED_LEASE_SET_SCHEMA = "palimpsest.oci-derived-lease-set.v2"
 MATERIALIZATION_CACHE_RESULTS = frozenset({"warm_hit", "cold_miss", "cold_repair"})
 
 
@@ -414,6 +416,7 @@ class DerivedLayerReceipt:
     ordinal: int
     image_digest: str
     image_size: int
+    filesystem: str = "squashfs"
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_id, str) or re.fullmatch(r"oci-store-v1:[0-9a-f]{64}", self.store_id) is None:
@@ -437,6 +440,8 @@ class DerivedLayerReceipt:
             raise OCIStoreError("oci-store-receipt", "derived receipt ordinal is invalid")
         if type(self.image_size) is not int or self.image_size <= 0:
             raise OCIStoreError("oci-store-receipt", "derived receipt image size is invalid")
+        if self.filesystem != "squashfs":
+            raise OCIStoreError("oci-store-receipt", "derived receipt filesystem is unsupported")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -446,6 +451,7 @@ class DerivedLayerReceipt:
         fields = {
             "image_digest",
             "image_size",
+            "filesystem",
             "key_digest",
             "occurrence_digest",
             "ordinal",
@@ -462,6 +468,35 @@ class DerivedLayerReceipt:
         if receipt.to_dict() != value:
             raise OCIStoreError("oci-store-wire", "derived receipt is not canonical")
         return receipt
+
+
+def _durable_receipt_value(receipt: DerivedLayerReceipt, schema: str) -> dict[str, Any]:
+    value = receipt.to_dict()
+    if schema in {_DERIVED_LEASE_SCHEMA_V1, _DERIVED_LEASE_SET_SCHEMA_V1}:
+        value.pop("filesystem")
+    elif schema not in {DERIVED_LEASE_SCHEMA, DERIVED_LEASE_SET_SCHEMA}:
+        raise OCIStoreError("oci-store-wire", "derived durable receipt schema is invalid")
+    return value
+
+
+def _durable_receipt_from_dict(value: Any, schema: Any) -> DerivedLayerReceipt:
+    if schema in {DERIVED_LEASE_SCHEMA, DERIVED_LEASE_SET_SCHEMA}:
+        return DerivedLayerReceipt.from_dict(value)
+    if schema not in {_DERIVED_LEASE_SCHEMA_V1, _DERIVED_LEASE_SET_SCHEMA_V1}:
+        raise OCIStoreError("oci-store-wire", "derived durable receipt schema is invalid")
+    legacy_fields = {
+        "image_digest",
+        "image_size",
+        "key_digest",
+        "occurrence_digest",
+        "ordinal",
+        "record_digest",
+        "source_image_digest",
+        "source_snapshot_binding_digest",
+        "store_id",
+    }
+    legacy = _exact_wire_fields(value, legacy_fields, "legacy derived receipt")
+    return DerivedLayerReceipt.from_dict({**legacy, "filesystem": "squashfs"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1304,6 +1339,7 @@ class OCIStore:
             ordinal=occurrence.ordinal,
             image_digest=normalize_digest(record["image_digest"]),
             image_size=record["image_size"],
+            filesystem="squashfs",
         )
 
     @staticmethod
@@ -1459,7 +1495,11 @@ class OCIStore:
         if _digest_bytes(record_payload) != receipt.record_digest:
             raise OCIStoreError("oci-store-corrupt", "derived record digest is invalid")
         record = self._decode(record_payload)
-        if record.get("image_digest") != receipt.image_digest or record.get("image_size") != receipt.image_size:
+        if (
+            record.get("image_digest") != receipt.image_digest
+            or record.get("image_size") != receipt.image_size
+            or receipt.filesystem != "squashfs"
+        ):
             raise OCIStoreError("oci-store-corrupt", "derived receipt image binding is invalid")
         if verify_artifact:
             self._artifacts.verify_squashfs(receipt.image_digest, receipt.image_size, maximum=_MAX_IMAGE_BYTES)
@@ -1530,7 +1570,7 @@ class OCIStore:
                         "lease_id": lease_id,
                         "occurrence_digest": receipt.occurrence_digest,
                         "owner": asdict(owner),
-                        "receipt": asdict(receipt),
+                        "receipt": _durable_receipt_value(receipt, DERIVED_LEASE_SCHEMA),
                         "schema": DERIVED_LEASE_SCHEMA,
                     }
                 )
@@ -1596,11 +1636,13 @@ class OCIStore:
         owner: ArtifactLeaseOwner,
         receipt: DerivedLayerReceipt,
     ) -> None:
+        schema = value.get("schema")
+        if schema not in {DERIVED_LEASE_SCHEMA, _DERIVED_LEASE_SCHEMA_V1}:
+            raise OCIStoreError("oci-store-corrupt", "derived lease record schema is invalid")
         if (
-            value.get("schema") != DERIVED_LEASE_SCHEMA
-            or value.get("lease_id") != lease_id
+            value.get("lease_id") != lease_id
             or value.get("owner") != asdict(owner)
-            or value.get("receipt") != asdict(receipt)
+            or value.get("receipt") != _durable_receipt_value(receipt, schema)
             or value.get("occurrence_digest") != receipt.occurrence_digest
             or value.get("image_digest") != receipt.image_digest
             or value.get("image_size") != receipt.image_size
@@ -1713,33 +1755,52 @@ class OCIStore:
         return normalized_plan
 
     @staticmethod
-    def _lease_set_identity(
+    def _lease_set_identity_for_schema(
         receipts: tuple[DerivedLayerReceipt, ...],
         owner: ArtifactLeaseOwner,
         plan_digest: str,
+        schema: str,
     ) -> str:
         return _digest_bytes(
             _canonical(
                 {
-                    "domain": DERIVED_LEASE_SET_SCHEMA,
+                    "domain": schema,
                     "owner": owner.to_dict(),
                     "plan_digest": plan_digest,
-                    "receipts": [receipt.to_dict() for receipt in receipts],
+                    "receipts": [_durable_receipt_value(receipt, schema) for receipt in receipts],
                 }
             )
         )
 
     @staticmethod
-    def _lease_set_member_id(lease_set_id: str, ordinal: int, receipt: DerivedLayerReceipt) -> str:
+    def _lease_set_member_id_for_schema(
+        lease_set_id: str,
+        ordinal: int,
+        receipt: DerivedLayerReceipt,
+        schema: str,
+    ) -> str:
         binding = _canonical(
             {
-                "domain": f"{DERIVED_LEASE_SET_SCHEMA}.member",
+                "domain": f"{schema}.member",
                 "lease_set_id": lease_set_id,
                 "ordinal": ordinal,
-                "receipt": receipt.to_dict(),
+                "receipt": _durable_receipt_value(receipt, schema),
             }
         )
         return str(uuid.UUID(bytes=hashlib.sha256(binding).digest()[:16], version=5))
+
+    @classmethod
+    def _lease_set_identity(
+        cls,
+        receipts: tuple[DerivedLayerReceipt, ...],
+        owner: ArtifactLeaseOwner,
+        plan_digest: str,
+    ) -> str:
+        return cls._lease_set_identity_for_schema(receipts, owner, plan_digest, DERIVED_LEASE_SET_SCHEMA)
+
+    @classmethod
+    def _lease_set_member_id(cls, lease_set_id: str, ordinal: int, receipt: DerivedLayerReceipt) -> str:
+        return cls._lease_set_member_id_for_schema(lease_set_id, ordinal, receipt, DERIVED_LEASE_SET_SCHEMA)
 
     @classmethod
     def _lease_set_intent_value(
@@ -1747,21 +1808,23 @@ class OCIStore:
         receipts: tuple[DerivedLayerReceipt, ...],
         owner: ArtifactLeaseOwner,
         plan_digest: str,
+        *,
+        schema: str = DERIVED_LEASE_SET_SCHEMA,
     ) -> dict[str, Any]:
-        lease_set_id = cls._lease_set_identity(receipts, owner, plan_digest)
+        lease_set_id = cls._lease_set_identity_for_schema(receipts, owner, plan_digest, schema)
         return {
             "lease_set_id": lease_set_id,
             "members": [
                 {
-                    "lease_id": cls._lease_set_member_id(lease_set_id, ordinal, receipt),
+                    "lease_id": cls._lease_set_member_id_for_schema(lease_set_id, ordinal, receipt, schema),
                     "ordinal": ordinal,
-                    "receipt": receipt.to_dict(),
+                    "receipt": _durable_receipt_value(receipt, schema),
                 }
                 for ordinal, receipt in enumerate(receipts)
             ],
             "owner": owner.to_dict(),
             "plan_digest": plan_digest,
-            "schema": DERIVED_LEASE_SET_SCHEMA,
+            "schema": schema,
         }
 
     @classmethod
@@ -1777,9 +1840,11 @@ class OCIStore:
             {"lease_set_id", "members", "owner", "plan_digest", "schema"},
             "derived lease set",
         )
+        schema = value.get("schema")
+        if schema not in {DERIVED_LEASE_SET_SCHEMA, _DERIVED_LEASE_SET_SCHEMA_V1}:
+            raise OCIStoreError("oci-store-corrupt", "derived lease-set schema is invalid")
         if (
-            value.get("schema") != DERIVED_LEASE_SET_SCHEMA
-            or value.get("lease_set_id") != lease_set_id
+            value.get("lease_set_id") != lease_set_id
             or value.get("owner") != owner.to_dict()
             or value.get("plan_digest") != plan_digest
         ):
@@ -1795,7 +1860,7 @@ class OCIStore:
                 "derived lease-set member",
             )
             try:
-                receipt = DerivedLayerReceipt.from_dict(member["receipt"])
+                receipt = _durable_receipt_from_dict(member["receipt"], schema)
                 canonical_id = str(uuid.UUID(member["lease_id"]))
             except (OCIStoreError, TypeError, ValueError, AttributeError):
                 raise OCIStoreError("oci-store-corrupt", "derived lease-set member is malformed") from None
@@ -1808,7 +1873,7 @@ class OCIStore:
             receipts.append(receipt)
         receipt_tuple = tuple(receipts)
         cls._validate_lease_set_inputs(receipt_tuple, owner, plan_digest)
-        expected = cls._lease_set_intent_value(receipt_tuple, owner, plan_digest)
+        expected = cls._lease_set_intent_value(receipt_tuple, owner, plan_digest, schema=schema)
         if value != expected:
             raise OCIStoreError("oci-store-corrupt", "derived lease-set content is not deterministic")
         return receipt_tuple
@@ -1830,7 +1895,7 @@ class OCIStore:
         payload, _ = self._read_file(authority.lease_sets_fd, _digest_hex(canonical_set_id))
         value = self._decode(payload)
         receipts = self._decode_lease_set_intent(value, canonical_set_id, owner, canonical_plan)
-        if self._lease_set_identity(receipts, owner, canonical_plan) != canonical_set_id:
+        if self._lease_set_identity_for_schema(receipts, owner, canonical_plan, value["schema"]) != canonical_set_id:
             raise OCIStoreError("oci-store-corrupt", "derived lease-set identity is invalid")
         return value, receipts
 
@@ -1840,7 +1905,11 @@ class OCIStore:
         owner: ArtifactLeaseOwner,
         receipt: DerivedLayerReceipt,
         acquired_ns: int,
+        *,
+        schema: str = DERIVED_LEASE_SCHEMA,
     ) -> dict[str, Any]:
+        if schema not in {DERIVED_LEASE_SCHEMA, _DERIVED_LEASE_SCHEMA_V1}:
+            raise OCIStoreError("oci-store-wire", "derived lease schema is invalid")
         return {
             "acquired_ns": acquired_ns,
             "image_digest": receipt.image_digest,
@@ -1848,8 +1917,8 @@ class OCIStore:
             "lease_id": lease_id,
             "occurrence_digest": receipt.occurrence_digest,
             "owner": owner.to_dict(),
-            "receipt": receipt.to_dict(),
-            "schema": DERIVED_LEASE_SCHEMA,
+            "receipt": _durable_receipt_value(receipt, schema),
+            "schema": schema,
         }
 
     def acquire_lease_set(
@@ -1863,8 +1932,13 @@ class OCIStore:
         self._validate_lease_set_inputs(receipts, owner, plan_digest)
         if any(receipt.store_id != self.identity for receipt in receipts):
             raise OCIStoreError("oci-store-receipt", "lease-set receipt belongs to a different store")
-        intent = self._lease_set_intent_value(receipts, owner, plan_digest)
-        lease_set_id = intent["lease_set_id"]
+        current_intent = self._lease_set_intent_value(receipts, owner, plan_digest)
+        legacy_intent = self._lease_set_intent_value(
+            receipts,
+            owner,
+            plan_digest,
+            schema=_DERIVED_LEASE_SET_SCHEMA_V1,
+        )
         acquired_ns = self._clock()
         if type(acquired_ns) is not int or acquired_ns < 0:
             raise OCIStoreError("oci-store-clock", "lease-set acquisition clock is invalid")
@@ -1876,6 +1950,31 @@ class OCIStore:
                     self._read_occurrence(authority, receipt)
                 members: list[DurableLeaseSetMember] = []
                 with self._lock(authority, "lease-index.lock"):
+                    intent = current_intent
+                    try:
+                        legacy_payload, _ = self._read_file(
+                            authority.lease_sets_fd,
+                            _digest_hex(legacy_intent["lease_set_id"]),
+                        )
+                    except OCIStoreError as exc:
+                        if exc.code != "oci-store-missing":
+                            raise
+                    else:
+                        legacy_value = self._decode(legacy_payload)
+                        legacy_receipts = self._decode_lease_set_intent(
+                            legacy_value,
+                            legacy_intent["lease_set_id"],
+                            owner,
+                            plan_digest,
+                        )
+                        if legacy_receipts != receipts:
+                            raise OCIStoreError("oci-store-corrupt", "legacy lease-set receipt binding is invalid")
+                        intent = legacy_intent
+                    lease_set_id = intent["lease_set_id"]
+                    set_schema = intent["schema"]
+                    lease_schema = (
+                        _DERIVED_LEASE_SCHEMA_V1 if set_schema == _DERIVED_LEASE_SET_SCHEMA_V1 else DERIVED_LEASE_SCHEMA
+                    )
                     self._publish_file(
                         authority,
                         authority.lease_sets_fd,
@@ -1889,7 +1988,13 @@ class OCIStore:
                         except OCIStoreError as exc:
                             if exc.code != "oci-store-missing":
                                 raise
-                            value = self._lease_record_value(lease_id, owner, receipt, acquired_ns)
+                            value = self._lease_record_value(
+                                lease_id,
+                                owner,
+                                receipt,
+                                acquired_ns,
+                                schema=lease_schema,
+                            )
                             self._publish_file(authority, authority.leases_fd, lease_id, _canonical(value))
                         else:
                             value = self._decode(payload)
@@ -2007,16 +2112,24 @@ class OCIStore:
         """Release a complete lease set; interrupted releases remain retryable."""
         if not isinstance(lease_set, DurableLeaseSet):
             raise OCIStoreError("oci-store-lease-set", "lease-set release input is invalid")
-        expected_id = self.lease_set_id(
-            tuple(member.receipt for member in lease_set.members),
-            lease_set.owner,
-            plan_digest=lease_set.plan_digest,
-        )
-        expected_members = tuple(
-            self._lease_set_member_id(expected_id, member.ordinal, member.receipt) for member in lease_set.members
-        )
-        if expected_id != lease_set.lease_set_id or expected_members != tuple(
-            member.lease_id for member in lease_set.members
+        receipts = tuple(member.receipt for member in lease_set.members)
+        valid_bindings = []
+        for schema in (DERIVED_LEASE_SET_SCHEMA, _DERIVED_LEASE_SET_SCHEMA_V1):
+            expected_id = self._lease_set_identity_for_schema(
+                receipts,
+                lease_set.owner,
+                lease_set.plan_digest,
+                schema,
+            )
+            expected_members = tuple(
+                self._lease_set_member_id_for_schema(expected_id, member.ordinal, member.receipt, schema)
+                for member in lease_set.members
+            )
+            valid_bindings.append((expected_id, expected_members))
+        if not any(
+            expected_id == lease_set.lease_set_id
+            and expected_members == tuple(member.lease_id for member in lease_set.members)
+            for expected_id, expected_members in valid_bindings
         ):
             raise OCIStoreError("oci-store-lease-set", "lease-set release binding changed")
         try:
@@ -2153,7 +2266,7 @@ class OCIStore:
                 owner_value = _exact_wire_fields(value.get("owner"), {"role", "run_id", "run_name"}, "lease owner")
                 try:
                     owner = ArtifactLeaseOwner(**owner_value)
-                    receipt = DerivedLayerReceipt.from_dict(value.get("receipt"))
+                    receipt = _durable_receipt_from_dict(value.get("receipt"), value.get("schema"))
                 except (OCIStoreError, TypeError, ValueError):
                     raise OCIStoreError("oci-store-corrupt", "derived lease binding is malformed") from None
                 self._validate_lease_value(value, canonical_id, owner, receipt)
@@ -2187,10 +2300,9 @@ class OCIStore:
                     value = self._decode(payload)
                     if value.get("owner") != asdict(owner):
                         continue
-                    receipt_value = value.get("receipt")
                     try:
-                        receipt = DerivedLayerReceipt(**receipt_value)
-                    except (TypeError, ValueError):
+                        receipt = _durable_receipt_from_dict(value.get("receipt"), value.get("schema"))
+                    except (OCIStoreError, TypeError, ValueError):
                         raise OCIStoreError("oci-store-corrupt", "derived lease receipt is malformed") from None
                     self._validate_lease_value(value, canonical_id, owner, receipt)
                     acquired_ns = value.get("acquired_ns")

@@ -29,6 +29,7 @@ from .kvm import (
     OCIRootDomainSpec,
     build_oci_root_domain_xml,
 )
+from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
 from .oci_root_volume import load_oci_root_volume
@@ -38,7 +39,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v1"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v2"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
@@ -253,6 +254,7 @@ class OCIRootDomainPlan:
     boot_artifacts: Mapping[str, Any]
     root_volume: Mapping[str, Any]
     layers: tuple[Mapping[str, Any], ...]
+    process: OCIProcessSpec
     memory_mib: int
     vcpus: int
     network: str | None
@@ -311,15 +313,30 @@ class OCIRootDomainPlan:
             raise StateError("OCI-root domain root volume identity is invalid")
         if not isinstance(self.layers, tuple) or not self.layers or len(self.layers) > MAX_LAYER_DISKS:
             raise StateError("OCI-root domain lower layers are invalid")
+        if not isinstance(self.process, OCIProcessSpec):
+            raise StateError("OCI-root domain process contract is invalid")
+        try:
+            self.process.require_bootable()
+        except ArtifactValidationError:
+            raise StateError("OCI-root domain process is not bootable") from None
         serials = {root["serial"]}
         for ordinal, raw in enumerate(self.layers):
             layer = dict(raw) if isinstance(raw, Mapping) else {}
-            if set(layer) != {"image_digest", "occurrence_digest", "ordinal", "serial", "size_bytes", "target"}:
+            if set(layer) != {
+                "filesystem",
+                "image_digest",
+                "occurrence_digest",
+                "ordinal",
+                "serial",
+                "size_bytes",
+                "target",
+            }:
                 raise StateError("OCI-root domain lower layer fields are invalid")
             serial = layer.get("serial")
             if (
                 layer.get("ordinal") != ordinal
                 or layer.get("target") != f"vd{chr(ord('b') + ordinal)}"
+                or layer.get("filesystem") != "squashfs"
                 or _SERIAL_RE.fullmatch(serial if isinstance(serial, str) else "") is None
                 or serial != _serial("lower", str(layer.get("occurrence_digest", "")))
                 or serial in serials
@@ -337,6 +354,7 @@ class OCIRootDomainPlan:
         expected_lowers = ",".join(f"virtio-{layer['serial']}" for layer in self.layers)
         expected_cmdline = (
             "console=ttyS0,115200n8 panic=1 rdinit=/init "
+            f"palimpsest.plan={self.resource_plan_digest} "
             f"palimpsest.root=virtio-{root['serial']} palimpsest.lowers={expected_lowers}"
         )
         if self.kernel_cmdline != expected_cmdline or len(self.kernel_cmdline) > 4096:
@@ -354,6 +372,7 @@ class OCIRootDomainPlan:
             "lower_lease_set_id": self.lower_lease_set_id,
             "machine": {"memory_mib": self.memory_mib, "network": self.network, "vcpus": self.vcpus},
             "phase": "domain-planned",
+            "process": self.process.to_dict(),
             "resource_plan_digest": self.resource_plan_digest,
             "root_volume": _plain_json(self.root_volume),
             "run": {"backend": "kvm", "name": self.run_name, "run_id": self.run_id, "runtime_kind": "oci-root"},
@@ -374,6 +393,7 @@ class OCIRootDomainPlan:
             "lower_lease_set_id",
             "machine",
             "phase",
+            "process",
             "resource_plan_digest",
             "root_volume",
             "run",
@@ -406,12 +426,13 @@ class OCIRootDomainPlan:
                 boot_artifacts=value["boot_artifacts"],
                 root_volume=value["root_volume"],
                 layers=tuple(value["layers"]),
+                process=OCIProcessSpec.from_dict(value["process"]),
                 memory_mib=machine["memory_mib"],
                 vcpus=machine["vcpus"],
                 network=machine["network"],
                 kernel_cmdline=value["kernel_cmdline"],
             )
-        except (KeyError, TypeError, ValueError):
+        except (ArtifactValidationError, KeyError, TypeError, ValueError):
             raise StateError("OCI-root domain plan is invalid") from None
         if plan.to_dict() != value:
             raise StateError("OCI-root domain plan is not canonical")
@@ -520,6 +541,7 @@ def build_oci_root_domain_plan(
         layers.append(
             {
                 "image_digest": receipt.image_digest,
+                "filesystem": receipt.filesystem,
                 "occurrence_digest": receipt.occurrence_digest,
                 "ordinal": member.ordinal,
                 "serial": serial,
@@ -531,6 +553,7 @@ def build_oci_root_domain_plan(
     lower_ids = ",".join(f"virtio-{layer['serial']}" for layer in layers)
     cmdline = (
         "console=ttyS0,115200n8 panic=1 rdinit=/init "
+        f"palimpsest.plan={transaction.boot_plan_digest} "
         f"palimpsest.root=virtio-{root_serial} palimpsest.lowers={lower_ids}"
     )
     plan = OCIRootDomainPlan(
@@ -549,6 +572,7 @@ def build_oci_root_domain_plan(
             "volume_id": root.volume_id,
         },
         tuple(layers),
+        OCIProcessSpec.from_dict(transaction.boot_plan["process"]),
         memory_mib,
         vcpus,
         network,
@@ -626,6 +650,7 @@ def commit_oci_root_domain_plan(
         expected_layers.append(
             {
                 "image_digest": receipt.image_digest,
+                "filesystem": receipt.filesystem,
                 "occurrence_digest": receipt.occurrence_digest,
                 "ordinal": member.ordinal,
                 "serial": serial,
@@ -636,6 +661,8 @@ def commit_oci_root_domain_plan(
         expected_disks.append(LayerDisk(receipt.image_digest, path, target, serial))
     if _plain_json(plan.layers) != expected_layers:
         raise StateError("OCI-root domain plan lower lease binding is invalid")
+    if plan.process != OCIProcessSpec.from_dict(transaction.boot_plan["process"]):
+        raise StateError("OCI-root domain plan process binding is invalid")
     verified_root = load_oci_root_volume(roots, transaction.volume_id, runner=runner)
     root = verified_root.record
     expected_root = {
