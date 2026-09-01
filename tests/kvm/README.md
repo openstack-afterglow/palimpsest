@@ -5,8 +5,10 @@ path. It direct-boots a Linux bzImage with the exact source-controlled
 initramfs, raw stage-1 transport, writable root, and two read-only lower disks
 under `-accel kvm -cpu host`. Device attachment order is intentionally
 permuted. The positive boot must reach the single pre-mount post-ioctl marker and remain alive in
-the fail-closed PID 1 wait. A second boot exposes the same bytes through a
-writable virtio-blk mapping and must reach only the rejection marker.
+the fail-closed PID 1 wait. Thirteen separate negative boots exercise writable
+transport, missing/wrong/read-only/wrong-size root, missing/wrong/writable/wrong-size
+lower, duplicate serial, and extra-disk controls. Each must reach exactly one
+rejection marker, no success/preparation marker, and remain alive as PID 1.
 
 The kernel and its config are selected together from `PALIMPSEST_KVM_KERNEL`
 and `PALIMPSEST_KVM_KERNEL_CONFIG`, or together from the running Linux release's standard
@@ -30,6 +32,10 @@ development smoke evidence only and are never accepted by this harness. This
 proof stops after authenticated root/lower block identity. Filesystem magic
 and content verification, mounting, OverlayFS, pivot, workload supervision and
 production define/start remain disabled.
+
+The v3 canonical receipt binds every path-free negative topology contract and
+its console digest. Evidence contains `negative-<case>.bin` for every named
+control; all evidence files are exclusively created owner-readable (`0400`).
 
 The PR workflow also has an always-running `Required native KVM proof`
 aggregator. It fails if the self-hosted job is disabled, skipped or

@@ -62,11 +62,14 @@ configuration must provide the initrd, devtmpfs, proc/sysfs, PCI, serial
 console and virtio block requirements as built-ins (`=y`). A successful boot
 attaches a writable root and two ordered read-only lowers in deliberately
 permuted QEMU order. A successful boot must emit the pre-mount-device-set
-marker exactly once and remain alive in the
-PID 1 fail-closed wait. A second boot exposes the same transport bytes as a
-writable virtio block device and must emit only the rejection marker.
+marker exactly once and remain alive in the PID 1 fail-closed wait. Thirteen
+separate negative boots cover writable transport, root/lower absence, wrong
+serial, read-only-mode mismatch, capacity mismatch, duplicate serial, and an
+extra disk. Each must emit only one rejection marker and remain in the PID 1
+fail-closed wait.
 
-The proof retains owner-only console and canonical receipt artifacts. Missing
+The v3 proof retains owner-only positive and per-control consoles plus a
+canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport plus pre-mount block

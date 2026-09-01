@@ -151,7 +151,7 @@ jobs:
       - run: uv sync --frozen --extra dev
       - name: Create private stage-1 evidence directory
         run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
-      - name: Prove actual PID 1 authenticated pre-mount device set
+      - name: Prove actual PID 1 pre-mount device set and rejection matrix
         env:
           PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
           PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence

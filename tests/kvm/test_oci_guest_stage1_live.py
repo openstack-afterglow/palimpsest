@@ -9,6 +9,9 @@ import pytest
 
 from palimpsest_local._oci_stage1_kvm_proof import (
     EVIDENCE_ENV,
+    EVIDENCE_FILE_NAMES,
+    NEGATIVE_CONTROL_NAMES,
+    PREPARATION_FAILURE_MARKER,
     REJECTION_MARKER,
     SUCCESS_MARKER,
     _logical_line_count,
@@ -18,7 +21,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
 pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
 
 
-def test_packaged_stage1_runs_as_pid1_and_checks_readonly_virtio_transport() -> None:
+def test_packaged_stage1_runs_as_pid1_and_rejects_the_full_premount_device_matrix() -> None:
     if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
         pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
 
@@ -39,15 +42,14 @@ def test_packaged_stage1_runs_as_pid1_and_checks_readonly_virtio_transport() -> 
     assert receipt["mount_attempted"] is False
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
-    assert _logical_line_count(result.writable_console, REJECTION_MARKER) == 1
-    assert _logical_line_count(result.writable_console, SUCCESS_MARKER) == 0
+    assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
+    for console in result.negative_consoles.values():
+        assert _logical_line_count(console, REJECTION_MARKER) == 1
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
 
     evidence_value = os.environ.get(EVIDENCE_ENV)
     if evidence_value is not None:
         evidence = Path(evidence_value)
-        assert {path.name for path in evidence.iterdir()} == {
-            "console.bin",
-            "receipt.json",
-            "writable-console.bin",
-        }
+        assert {path.name for path in evidence.iterdir()} == set(EVIDENCE_FILE_NAMES)
         assert all(path.stat().st_mode & 0o777 == 0o400 for path in evidence.iterdir())

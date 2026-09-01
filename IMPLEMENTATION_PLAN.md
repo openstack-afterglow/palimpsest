@@ -486,6 +486,19 @@ Scope boundary: this slice authenticates block identity only. It does not read f
 
 Qualification state: the v2 harness, packaged ELF and required CI gate are source-controlled and locally verified through parser/differential tests. This macOS arm64 host cannot execute native x86_64 KVM, the repository currently has no connected `linux/x64/kvm` runner, and no actual v2 KVM receipt was collected in this slice. The topology mutation matrix is pure contract evidence, not a substitute for native-KVM negative boots.
 
+### PR 4 slice 19: native-KVM pre-mount rejection matrix
+
+Implemented:
+
+- The native-KVM harness now executes the positive permuted topology and thirteen independent negative boots from one private temporary root while reusing the same pinned QEMU, kernel and packaged initramfs. The controls are writable transport; missing, wrong-serial, read-only, smaller and larger root; missing, wrong-serial, writable, smaller and larger lower; duplicate serial; and extra disk.
+- Each negative control is an exact path-free contract for backing digest, size and owner-only mode plus attachment role, read-only flag and serial. Every actual backing and the pinned boot artifacts are rechecked before and after its boot. Acceptance requires exactly one rejection marker, zero success/preparation markers and a live QEMU/PID 1 after the marker; no control can qualify the positive path.
+- The v3 canonical receipt binds every control contract, console digest/size, exact marker counts and post-marker liveness attestation. Results expose a name-to-console mapping, and exclusive `0400` evidence includes every `negative-<case>.bin` together with the positive console and receipt.
+- Pure tests cover all QEMU argv/topology mutations, contract and receipt missing/extra/tamper boundaries, marker counts and reserved evidence names. The required PR and release KVM jobs execute the full matrix and retain all evidence.
+
+Scope boundary: this remains a block-identity proof. It does not inspect filesystem magic or structure, verify filesystem content, mount any disk, assemble OverlayFS, pivot, execute a workload, or enable production VM launch.
+
+Qualification state: the v3 harness and CI gate are source-controlled and locally policy-tested. This macOS arm64 host cannot execute native x86_64 KVM, so no actual v3 positive or negative runtime receipt is claimed locally; collection requires the qualified self-hosted Linux x86_64/KVM runner.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -506,7 +519,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add native-KVM root/lower missing, wrong serial, role inversion, capacity mismatch, duplicate and extra-disk negative boots, then collect a qualified v2 receipt on a connected Linux x86_64 KVM runner.
+1. Collect a qualified v3 positive plus full negative-matrix receipt on a connected Linux x86_64 KVM runner.
 2. Add fail-closed ext4/SquashFS filesystem-magic and structural/content verification evidence without mounting.
 3. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
 4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
