@@ -458,6 +458,20 @@ Implemented:
 
 Scope boundary: a verified plan still ends in a permanent fail-closed wait. This slice does not mount ext4/SquashFS, assemble OverlayFS, make the OCI root actual `/`, pivot, resolve users, supervise or execute the image workload, authorize libvirt, implement foreground/`-d`, or activate Gate 2.
 
+### PR 4 slice 17: native-KVM actual PID 1 qualification gate
+
+Implemented:
+
+- A private, production-inert qualification harness direct-boots the exact packaged x86_64 initramfs and deterministic raw stage-1 transport with QEMU `-accel kvm -cpu host`. Qualification requires native Linux x86_64, a character `/dev/kvm` opened read/write, KVM API version 12, an executable ELF QEMU binary, a bounded Linux bzImage, and an owner/root-controlled kernel config. Initrd, ELF, devtmpfs, proc/sysfs, PCI, serial console and virtio block requirements must all be built in (`=y`); module-only kernels fail closed.
+- The proof uses argv-only process creation, no monitor/display/network, QEMU sandboxing, a private `0700` workspace, exclusive sealed artifacts, bounded console capture, a process-group timeout and cleanup. The transport is verified before and after boot. Success requires the post-verification marker exactly once, no preparation/rejection marker, and a still-running QEMU after the marker, which uniquely places the packaged `/init` in its permanent live PID 1 wait after sysfs driver/serial/ro, block major/minor, `BLKROGET`, `BLKGETSIZE64`, envelope and full plan binding checks.
+- A negative control reboots the same transport bytes with guest-visible write access. It must remain alive after exactly one rejection marker and must never emit the success marker. This prevents host file mode or positional `vdb` assumptions from standing in for the guest `BLKROGET` result.
+- The canonical proof receipt binds kernel/config, initramfs manifest/artifact, packaged stage-1 ELF, complete transport receipt/serial, exact cmdline, QEMU version and bounded console digest. Owner-only console, receipt and writable-control console are retained as CI artifacts. Pure tests cover kernel/config metadata and built-in policy, the KVM-only/networkless command, exact marker/liveness handling, and exclusive evidence publication.
+- The existing self-hosted KVM PR and release jobs now set qualified mode explicitly. An always-running PR aggregator fails when the KVM job is disabled, skipped or unsuccessful, so missing prerequisites cannot become a green merge check. Release publication remains dependent on the KVM proof job.
+
+Qualification state: the harness and required gate are source-controlled and locally policy-tested. This macOS arm64 development host has no native x86_64 KVM, so no new qualified runtime receipt is claimed from the local run; the self-hosted native Linux/KVM job must execute and retain it.
+
+Scope boundary: this proof exercises only the actual PID 1 transport consumer. Root and lower serials are cross-bound in the authenticated plan but their block nodes are not yet discovered or mounted. No ext4/SquashFS mount, OverlayFS, pivot, workload PID 1 supervisor, production libvirt define/start, foreground/`-d`, readiness, exec/log, or Gate 2 activation is included. OCI rootfs is still not claimed as actual `/`.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.

@@ -57,9 +57,20 @@ jobs:
         with:
           python-version: "3.12"
       - run: test -c /dev/kvm
-      - run: virsh -c qemu:///system net-info default
-      - run: uv sync --frozen --extra dev --extra kvm
-      - run: uv run python -m pytest -m kvm tests/kvm -vv
+      - run: uv sync --frozen --extra dev
+      - name: Create private stage-1 evidence directory
+        run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
+      - name: Require actual PID 1 and virtio-blk transport proof
+        env:
+          PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
+          PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence
+        run: uv run python -m pytest -m stage1_kvm tests/kvm -vv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-stage1-native-kvm-proof
+          path: ${{ runner.temp }}/stage1-kvm-evidence
+          if-no-files-found: error
 
   publish:
     name: Publish signed release

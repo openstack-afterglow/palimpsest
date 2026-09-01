@@ -50,3 +50,21 @@ no group/world write bits. Exit codes are `0` verified, `64` fixture usage,
 rejection. Live PID 1 never exits: both success and failure wait fail-closed.
 The root-volume generation is bounded consistently in Python and C to 4096
 canonical decimal digits.
+
+## Native KVM qualification
+
+`tests/kvm/test_oci_guest_stage1_live.py` is the only release-qualified live
+consumer proof. It direct-boots this exact packaged initramfs on native Linux
+x86_64 with KVM API 12 and QEMU `-accel kvm -cpu host`. The selected kernel
+configuration must provide the initrd, devtmpfs, proc/sysfs, PCI, serial
+console and virtio block requirements as built-ins (`=y`). A successful boot
+must emit the transport-verified marker exactly once and remain alive in the
+PID 1 fail-closed wait. A second boot exposes the same transport bytes as a
+writable virtio block device and must emit only the rejection marker.
+
+The proof retains owner-only console and canonical receipt artifacts. Missing
+KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
+converted into skips. TCG can be useful for development but is never accepted
+as qualified evidence. This boundary proves only the live transport consumer;
+root/lower discovery, filesystem mounts, pivot, workload supervision and
+production VM launch remain disabled.

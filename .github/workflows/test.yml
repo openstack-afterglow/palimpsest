@@ -138,7 +138,7 @@ jobs:
       - run: tar -tzf dist/*.tar.gz
 
   kvm:
-    name: KVM end to end
+    name: Native KVM stage-1 proof
     if: vars.PALIMPSEST_KVM_ENABLED == 'true'
     runs-on: [self-hosted, linux, x64, kvm]
     steps:
@@ -148,6 +148,31 @@ jobs:
         with:
           python-version: "3.12"
       - run: test -c /dev/kvm
-      - run: virsh -c qemu:///system net-info default
-      - run: uv sync --frozen --extra dev --extra kvm
-      - run: uv run python -m pytest -m kvm tests/kvm -vv
+      - run: uv sync --frozen --extra dev
+      - name: Create private stage-1 evidence directory
+        run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
+      - name: Prove actual PID 1 and virtio-blk transport under native KVM
+        env:
+          PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
+          PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence
+        run: uv run python -m pytest -m stage1_kvm tests/kvm -vv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-native-kvm-proof
+          path: ${{ runner.temp }}/stage1-kvm-evidence
+          if-no-files-found: error
+
+  kvm-required:
+    name: Required native KVM proof
+    if: always()
+    needs: [kvm]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse skipped or failed KVM qualification
+        env:
+          PALIMPSEST_KVM_ENABLED: ${{ vars.PALIMPSEST_KVM_ENABLED }}
+          PALIMPSEST_KVM_RESULT: ${{ needs.kvm.result }}
+        run: |
+          test "$PALIMPSEST_KVM_ENABLED" = "true"
+          test "$PALIMPSEST_KVM_RESULT" = "success"
