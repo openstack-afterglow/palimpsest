@@ -40,6 +40,7 @@ from palimpsest_local.oci_converter import (
     LAYER_INTAKE_POLICY_ID,
     LayerIntakeReceipt,
 )
+from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
 from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
 from palimpsest_local.oci_packer import (
@@ -1684,6 +1685,9 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
 
     stage1 = OCIStage1Plan.from_domain_plan(plan)
     assert OCIStage1Plan.from_dict(stage1.to_dict(), expected_domain_plan=plan) == stage1
+    guest_bindings = parse_guest_kernel_cmdline(plan.kernel_cmdline)
+    guest_verified = verify_guest_stage1_transport(transport_path.read_bytes(), guest_bindings)
+    assert guest_verified.plan == stage1
     assert stage1.process.argv == ("/sbin/init",)
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()

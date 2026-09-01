@@ -77,6 +77,7 @@ def test_bootstrap_initramfs_is_byte_deterministic_and_independently_well_formed
     assert [record["name"] for record in records] == [
         "etc",
         "etc/palimpsest",
+        "etc/palimpsest/guest-stage1-consumer.json",
         "etc/palimpsest/stage1-abi.json",
         "init",
         "TRAILER!!!",
@@ -84,6 +85,7 @@ def test_bootstrap_initramfs_is_byte_deterministic_and_independently_well_formed
     assert [record["mode"] for record in records[:-1]] == [
         stat.S_IFDIR | 0o755,
         stat.S_IFDIR | 0o755,
+        stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o755,
     ]
@@ -120,10 +122,19 @@ def test_bootstrap_manifest_is_canonical_path_free_and_explicitly_not_root_assem
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
     assert value["stage1"]["capability"] == "bootstrap-fail-closed"
     assert value["stage1"]["plan_transport"] == "unimplemented"
+    assert value["stage1"]["embedded_consumer"] is False
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v1"
     assert value["stage1"]["root_assembly"] is False
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
     assert "run_id" not in rendered and "domain_plan" not in rendered
+    entries = {entry.path: entry.data for entry in parse_newc(built.payload)}
+    consumer = json.loads(entries["etc/palimpsest/guest-stage1-consumer.json"])
+    abi = json.loads(entries["etc/palimpsest/stage1-abi.json"])
+    assert consumer["embedded_in_init"] is False
+    assert consumer["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
+    assert abi["embedded_consumer"] is False
+    assert abi["consumer_contract_digest"] == built.manifest.consumer_contract_digest
 
 
 @pytest.mark.parametrize(
