@@ -446,6 +446,18 @@ Implemented:
 
 Scope boundary: this slice closes and tests the guest-side **consumer contract**, but does not yet ship a freestanding x86_64 implementation of its SHA-256, JSON and sysfs/block-node checks. The embedded `/init` therefore remains a permanent fail-closed wait and the OCI-root planner still does not select or launch it. No device is mounted, no OverlayFS or actual `/` is assembled, no pivot/process supervision/foreground/`-d` lifecycle is enabled, and Gate 2 remains inactive. The next slice must build a source-controlled reproducible freestanding binary without requiring a compiler at normal package runtime, execute it on Linux x86_64 fixtures, and bind `/dev` block identity before any mount work begins.
 
+### PR 4 slice 16: freestanding Linux x86_64 transport consumer
+
+Implemented:
+
+- The first-party `/init` is now built from source-controlled `guest/stage1/init.c` with raw Linux x86_64 syscalls and no libc or system headers. It embeds SHA-256 and a bounded deterministic JSON parser matching the Python wire constants. The parser requires compact sorted-key canonical JSON, canonical UTF-8 and escapes, complete stage-1 schema/policy/process semantics, a shared 4096-decimal-digit root-generation bound, and exact `B`/`C`/`T`/root/ordered-lower bindings. Digit-prefixed run names, large valid environment names, Unicode process strings and the full numeric uid/gid ceiling remain in parity with the producer.
+- The build pins the exact linux/amd64 GCC 14.3.0 Bookworm manifest digest, disables network access, uses a read-only container as the invoking UID/GID, and fixes locale/timezone/home/epoch and path mappings. A deterministic seal rejects interpreter/dynamic/WX/malformed segments and executable stack, preserves the complete program-header/load extent, removes section headers and writes the exact static ELF. Normal package/initramfs construction only reads the packaged raw asset, so neither Docker nor a compiler is a runtime dependency.
+- The initramfs manifest and ABI bind source, build recipe, seal recipe, toolchain, consumer contract and ELF digests. `embedded_consumer=true`, transport capability is real, and `root_assembly=false` remains explicit. Canonical `dev`, `proc` and `sys` mountpoints are included in the `newc` archive.
+- Live PID 1 creates and verifies proc/sysfs/devtmpfs pseudo-filesystems, including filesystem magic after an existing mount, then reads the six closed cmdline bindings. It requires one canonical `vd*` sysfs link under `devices`, exact serial, `virtio_blk`, `ro=1`, major/minor identity, a block node, `BLKROGET=1` and exact `BLKGETSIZE64`. It repeats descriptor/ioctl and serial/ro/dev checks after the bounded read before accepting the envelope and plan.
+- The same ELF exposes `--fixture-v1 ROOT` only outside PID 1; non-PID1 invocations can never enter the live mount path. It verifies a single-link, non-writable regular transport fixture and returns stable typed exit codes. Unprivileged, capability-free Docker scratch linux/amd64 differential tests prove canonical Unicode/control data and large environment names accepted by both Python and ELF, while noncanonical JSON escapes, trailing lower separators and writable inputs are rejected by both. Two independent pinned builds reproduce the packaged bytes exactly. A required Linux x86_64 CI job and release verification pull the pinned toolchain, execute the ELF and perform the rebuild comparison. The fixture exercises the shared parser/envelope core but cannot execute the live `BLKROGET`/`BLKGETSIZE64` branch; that branch still requires qualified KVM or privileged Linux block-device evidence before any mount work is authorized.
+
+Scope boundary: a verified plan still ends in a permanent fail-closed wait. This slice does not mount ext4/SquashFS, assemble OverlayFS, make the OCI root actual `/`, pivot, resolve users, supervise or execute the image workload, authorize libvirt, implement foreground/`-d`, or activate Gate 2.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -466,7 +478,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Teach the first-party bootstrap to parse trusted cmdline transport keys, discover exactly one read-only virtio block device by serial, verify the raw envelope/digest, and decode the stage-1 plan fail-closed under Linux/KVM tests.
+1. Collect qualified native Linux/KVM evidence for actual PID 1 pseudo-filesystem setup, virtio serial discovery, block-node major/minor plus `BLKROGET`/`BLKGETSIZE64`, transport verification and the final pre-mount handoff boundary.
 2. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

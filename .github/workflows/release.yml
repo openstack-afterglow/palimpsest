@@ -24,6 +24,10 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python -m pytest tests/unit -v
+      - name: Pin the offline x86_64 guest toolchain
+        run: docker pull --platform linux/amd64 docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
+      - name: Reproduce and execute the packaged guest stage-1 ELF
+        run: uv run python -m pytest -m guest_stage1_binary tests/integration/test_oci_guest_stage1_binary.py -vv
       - run: docker buildx create --name palimpsest-e2e --driver docker-container --driver-opt network=none --use --bootstrap
       - name: Verify local OCI product build
         env:

@@ -34,6 +34,8 @@ from .state import StatePaths, file_lock, pinned_owner_directory
 
 OCI_ROOT_VOLUME_SCHEMA = "palimpsest.oci-root-volume.v1"
 OCI_ROOT_VOLUME_RETENTION_POLICIES = frozenset({"delete", "retain"})
+MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS = 4096
+MAX_OCI_ROOT_VOLUME_GENERATION = 10**MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS - 1
 _RECORD_BYTES = 64 * 1024
 _HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -149,7 +151,7 @@ class OCIRootVolumeRecord:
             raise StateError("OCI-root volume retention policy is invalid")
         if self.status not in {"creating", "attached", "retained", "deleting"}:
             raise StateError("OCI-root volume status is invalid")
-        if type(self.generation) is not int or self.generation < 1:
+        if type(self.generation) is not int or self.generation < 1 or self.generation > MAX_OCI_ROOT_VOLUME_GENERATION:
             raise StateError("OCI-root volume generation is invalid")
         if self.status == "retained":
             if self.attached_run_id is not None or self.attached_run_name is not None:
@@ -642,6 +644,8 @@ def list_oci_root_volume_records(roots: StatePaths) -> tuple[OCIRootVolumeRecord
 
 __all__ = [
     "ClaimedOCIRootVolume",
+    "MAX_OCI_ROOT_VOLUME_GENERATION",
+    "MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS",
     "OCI_ROOT_VOLUME_RETENTION_POLICIES",
     "OCI_ROOT_VOLUME_SCHEMA",
     "OCIRootVolumeRecord",

@@ -1,16 +1,16 @@
-"""Deterministic, structurally verified OCI-root bootstrap initramfs artifacts.
+"""Deterministic, structurally verified OCI-root stage-1 initramfs artifacts.
 
-The artifact emitted here is deliberately bootstrap-only.  Its first-party
-static ``/init`` prints a stable diagnostic and sleeps forever; it does not yet
-execute the portable guest-consumer contract included in the archive.  It also
-does not mount disks, assemble OverlayFS, pivot root, or execute the image
-process.  The explicit provenance prevents this portable contract milestone
-from being confused with the later OCI-root runtime.
+The first-party static ``/init`` authenticates the raw stage-1 transport and
+then sleeps forever.  It deliberately does not mount root/lower disks, assemble
+OverlayFS, pivot root, or execute the image process.  Exact source, toolchain,
+sealing recipe, binary and ABI provenance prevents transport consumption from
+being confused with full OCI-root boot readiness.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import re
 import stat
 import struct
@@ -27,12 +27,20 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v2"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v3"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.bootstrap-init.x86_64.v1"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v2"
-OCI_STAGE1_PLAN_TRANSPORT = "unimplemented"
-OCI_BOOTSTRAP_CAPABILITY = "bootstrap-fail-closed"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v1"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v3"
+OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
+OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
+OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
+OCI_STAGE1_TOOLCHAIN_IMAGE = (
+    "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
+)
+OCI_STAGE1_SOURCE_DIGEST = "sha256:3dfc042e0bf902c17bc58ab7ab70db3e00c3d3b39e23f4146990ddd7038b5d91"
+OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
+OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
+OCI_STAGE1_BINARY_DIGEST = "sha256:4a44b5e1e56f58607e8e310f9f5956bb64cd4e59287d9c191839da9d95af31e0"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -42,11 +50,14 @@ _NEWC_HEADER_BYTES = 110
 _TRAILER = "TRAILER!!!"
 _PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _REQUIRED_LAYOUT = (
+    ("dev", stat.S_IFDIR | 0o755),
     ("etc", stat.S_IFDIR | 0o755),
     ("etc/palimpsest", stat.S_IFDIR | 0o755),
     ("etc/palimpsest/guest-stage1-consumer.json", stat.S_IFREG | 0o644),
     ("etc/palimpsest/stage1-abi.json", stat.S_IFREG | 0o644),
     ("init", stat.S_IFREG | 0o755),
+    ("proc", stat.S_IFDIR | 0o755),
+    ("sys", stat.S_IFDIR | 0o755),
 )
 _REQUIRED_PATHS = tuple(path for path, _mode in _REQUIRED_LAYOUT)
 
@@ -326,44 +337,16 @@ def verify_static_x86_64_elf(payload: bytes) -> None:
 
 
 def _bootstrap_stage1_binary() -> bytes:
-    """Emit a tiny static ELF PID 1 that reports and then sleeps fail-closed."""
+    """Load the packaged, compiler-free-at-runtime first-party stage-1 ELF."""
 
-    message = b"palimpsest bootstrap: guest transport consumer is not embedded; waiting fail-closed\n"
-    code = (
-        b"\xb8\x01\x00\x00\x00"  # mov eax, SYS_write
-        b"\xbf\x02\x00\x00\x00"  # mov edi, stderr
-        b"\x48\x8d\x35\x10\x00\x00\x00"  # lea rsi, [rip + message]
-        + b"\xba"
-        + len(message).to_bytes(4, "little")
-        + b"\x0f\x05"  # syscall
-        b"\xb8\x22\x00\x00\x00"  # mov eax, SYS_pause
-        b"\x0f\x05"  # syscall
-        b"\xeb\xf7"  # loop around pause
-    )
-    code_offset = 0x1000
-    file_size = code_offset + len(code) + len(message)
-    ident = b"\x7fELF\x02\x01\x01\x00" + b"\0" * 8
-    header = struct.pack(
-        "<16sHHIQQQIHHHHHH",
-        ident,
-        2,
-        62,
-        1,
-        0x400000 + code_offset,
-        64,
-        0,
-        0,
-        64,
-        56,
-        2,
-        0,
-        0,
-        0,
-    )
-    load_program = struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0x400000, file_size, file_size, 0x1000)
-    stack_program = struct.pack("<IIQQQQQQ", 0x6474E551, 6, 0, 0, 0, 0, 0, 16)
-    program_headers = load_program + stack_program
-    payload = header + program_headers + b"\0" * (code_offset - len(header) - len(program_headers)) + code + message
+    try:
+        payload = (
+            importlib.resources.files("palimpsest_local").joinpath("assets", "oci-stage1-init.x86_64").read_bytes()
+        )
+    except (FileNotFoundError, OSError):
+        raise ArtifactValidationError("packaged stage-1 ELF asset is missing") from None
+    if _digest(payload) != OCI_STAGE1_BINARY_DIGEST:
+        raise ArtifactValidationError("packaged stage-1 ELF digest is invalid")
     verify_static_x86_64_elf(payload)
     return payload
 
@@ -373,12 +356,13 @@ def _guest_consumer_contract_bytes() -> bytes:
         {
             "capability": OCI_GUEST_STAGE1_CAPABILITY,
             "contract": OCI_GUEST_STAGE1_CONTRACT,
-            "embedded_in_init": False,
+            "embedded_in_init": True,
             "plan_transport": OCI_GUEST_STAGE1_PLAN_TRANSPORT,
             "root_assembly": False,
             "validation": [
                 "bounded-closed-world-kernel-cmdline",
-                "unique-read-only-vd-serial-sysfs-discovery",
+                "proc-sysfs-devtmpfs-pseudo-filesystems",
+                "unique-virtio-blk-read-only-major-minor-ioctl-identity",
                 "raw-envelope-header-sha256-zero-padding",
                 "canonical-json-exact-stage1-semantics",
                 "resource-core-transport-root-lowers-cross-binding",
@@ -394,7 +378,7 @@ def _stage1_abi_bytes() -> bytes:
             "capability": OCI_BOOTSTRAP_CAPABILITY,
             "consumer_contract": OCI_GUEST_STAGE1_CONTRACT,
             "consumer_contract_digest": _digest(consumer),
-            "embedded_consumer": False,
+            "embedded_consumer": True,
             "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
             "root_assembly": False,
             "schema": OCI_STAGE1_ABI,
@@ -480,11 +464,18 @@ class OCIInitramfsManifest:
                 "abi": OCI_STAGE1_ABI,
                 "abi_digest": self.stage1_abi_digest,
                 "binary_digest": self.stage1_binary_digest,
+                "build": {
+                    "contract": OCI_STAGE1_BUILD_CONTRACT,
+                    "recipe_digest": OCI_STAGE1_BUILD_RECIPE_DIGEST,
+                    "seal_recipe_digest": OCI_STAGE1_SEAL_RECIPE_DIGEST,
+                    "source_digest": OCI_STAGE1_SOURCE_DIGEST,
+                    "toolchain_image": OCI_STAGE1_TOOLCHAIN_IMAGE,
+                },
                 "capability": OCI_BOOTSTRAP_CAPABILITY,
                 "consumer_contract": OCI_GUEST_STAGE1_CONTRACT,
                 "consumer_contract_digest": self.consumer_contract_digest,
                 "contract": OCI_BOOTSTRAP_STAGE1_CONTRACT,
-                "embedded_consumer": False,
+                "embedded_consumer": True,
                 "linkage": "static",
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
                 "root_assembly": False,
@@ -522,11 +513,18 @@ class OCIInitramfsManifest:
                 "abi": OCI_STAGE1_ABI,
                 "abi_digest": stage1.get("abi_digest"),
                 "binary_digest": stage1.get("binary_digest"),
+                "build": {
+                    "contract": OCI_STAGE1_BUILD_CONTRACT,
+                    "recipe_digest": OCI_STAGE1_BUILD_RECIPE_DIGEST,
+                    "seal_recipe_digest": OCI_STAGE1_SEAL_RECIPE_DIGEST,
+                    "source_digest": OCI_STAGE1_SOURCE_DIGEST,
+                    "toolchain_image": OCI_STAGE1_TOOLCHAIN_IMAGE,
+                },
                 "capability": OCI_BOOTSTRAP_CAPABILITY,
                 "consumer_contract": OCI_GUEST_STAGE1_CONTRACT,
                 "consumer_contract_digest": stage1.get("consumer_contract_digest"),
                 "contract": OCI_BOOTSTRAP_STAGE1_CONTRACT,
-                "embedded_consumer": False,
+                "embedded_consumer": True,
                 "linkage": "static",
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
                 "root_assembly": False,
@@ -570,11 +568,14 @@ def build_bootstrap_initramfs() -> BuiltOCIInitramfs:
     consumer = _guest_consumer_contract_bytes()
     abi = _stage1_abi_bytes()
     entries = (
+        NewcEntry("dev", stat.S_IFDIR | 0o755, b""),
         NewcEntry("etc", stat.S_IFDIR | 0o755, b""),
         NewcEntry("etc/palimpsest", stat.S_IFDIR | 0o755, b""),
         NewcEntry("etc/palimpsest/guest-stage1-consumer.json", stat.S_IFREG | 0o644, consumer),
         NewcEntry("etc/palimpsest/stage1-abi.json", stat.S_IFREG | 0o644, abi),
         NewcEntry("init", stat.S_IFREG | 0o755, stage1),
+        NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("sys", stat.S_IFDIR | 0o755, b""),
     )
     payload = build_newc(entries)
     manifest = OCIInitramfsManifest(
@@ -630,7 +631,13 @@ __all__ = [
     "OCI_INITRAMFS_GENERATOR_CONTRACT",
     "OCI_INITRAMFS_MANIFEST_SCHEMA",
     "OCI_STAGE1_ABI",
+    "OCI_STAGE1_BINARY_DIGEST",
+    "OCI_STAGE1_BUILD_CONTRACT",
+    "OCI_STAGE1_BUILD_RECIPE_DIGEST",
     "OCI_STAGE1_PLAN_TRANSPORT",
+    "OCI_STAGE1_SEAL_RECIPE_DIGEST",
+    "OCI_STAGE1_SOURCE_DIGEST",
+    "OCI_STAGE1_TOOLCHAIN_IMAGE",
     "build_bootstrap_initramfs",
     "build_newc",
     "parse_newc",

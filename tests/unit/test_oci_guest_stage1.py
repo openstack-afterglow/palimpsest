@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.oci_guest_stage1 import (
     MAX_GUEST_KERNEL_CMDLINE_BYTES,
     GuestBlockCandidate,
@@ -20,6 +21,7 @@ from palimpsest_local.oci_guest_stage1 import (
 )
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import canonical_json_bytes
+from palimpsest_local.oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION
 from palimpsest_local.oci_stage1 import OCIStage1Plan
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
 
@@ -98,6 +100,21 @@ def test_guest_consumer_cross_binds_cmdline_envelope_and_full_plan() -> None:
     assert verified.bindings.root_serial == "1" * 20
     assert verified.bindings.lower_serials == ("2" * 20,)
     assert verified.artifact_size_bytes == len(built.artifact)
+
+
+def test_stage1_generation_has_an_explicit_cross_language_decimal_bound() -> None:
+    plan = _plan()
+    accepted = replace(
+        plan,
+        root={**dict(plan.root), "generation": MAX_OCI_ROOT_VOLUME_GENERATION},
+    )
+
+    assert accepted.root["generation"] == MAX_OCI_ROOT_VOLUME_GENERATION
+    with pytest.raises(StateError, match="root mount"):
+        replace(
+            plan,
+            root={**dict(plan.root), "generation": MAX_OCI_ROOT_VOLUME_GENERATION + 1},
+        )
 
 
 @pytest.mark.parametrize(

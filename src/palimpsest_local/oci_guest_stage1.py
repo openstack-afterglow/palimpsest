@@ -1,9 +1,9 @@
 """First-party guest consumer for the OCI stage-1 plan transport.
 
-This module is the portable reference contract for a future freestanding
-x86_64 ``/init`` implementation.  It deliberately stops after validating the
-plan against trusted kernel-command-line bindings: no filesystem is mounted
-and no process from the image is executed.
+This module is the portable reference contract shared with the packaged
+freestanding x86_64 ``/init`` implementation.  Both deliberately stop after
+validating the plan against trusted kernel-command-line bindings: no OCI
+filesystem is mounted and no process from the image is executed.
 """
 
 from __future__ import annotations

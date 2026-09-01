@@ -1,8 +1,8 @@
 """Deterministic run-owned transport for the OCI guest stage-1 plan.
 
-The transport is a fixed-header, 4 KiB-aligned raw block artifact.  It is
-attached read-only to a future OCI-root guest, but the current bootstrap
-``/init`` deliberately does not consume it and runtime launch remains disabled.
+The transport is a fixed-header, 4 KiB-aligned raw block artifact.  The
+packaged first-party ``/init`` consumes and authenticates it fail-closed, while
+OCI filesystem assembly and runtime launch remain disabled.
 """
 
 from __future__ import annotations

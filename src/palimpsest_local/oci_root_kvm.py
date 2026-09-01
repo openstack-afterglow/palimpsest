@@ -34,7 +34,7 @@ from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
-from .oci_root_volume import load_oci_root_volume
+from .oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION, load_oci_root_volume
 from .oci_stage1 import OCIStage1Plan
 from .oci_stage1_transport import (
     OCI_STAGE1_TRANSPORT_FILENAME,
@@ -397,6 +397,7 @@ class OCIRootDomainPlan:
             or root["size_bytes"] <= 0
             or type(root["generation"]) is not int
             or root["generation"] < 1
+            or root["generation"] > MAX_OCI_ROOT_VOLUME_GENERATION
         ):
             raise StateError("OCI-root domain root volume identity is invalid")
         if not isinstance(self.layers, tuple) or not self.layers or len(self.layers) > MAX_OCI_ROOT_LAYER_DISKS:

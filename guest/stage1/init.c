@@ -1,0 +1,1017 @@
+/* SPDX-License-Identifier: MIT
+ * Palimpsest OCI guest stage-1 transport consumer.
+ *
+ * Freestanding Linux x86_64: no libc and no system headers.  This program
+ * authenticates the stage-1 plan and then waits fail-closed.  It deliberately
+ * performs no root/lower mount, OverlayFS assembly, pivot_root, or workload
+ * execution.
+ */
+
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long u64;
+typedef signed long i64;
+typedef unsigned long usize;
+
+#define SYS_read 0
+#define SYS_write 1
+#define SYS_open 2
+#define SYS_close 3
+#define SYS_fstat 5
+#define SYS_pread64 17
+#define SYS_ioctl 16
+#define SYS_pause 34
+#define SYS_getpid 39
+#define SYS_exit 60
+#define SYS_mkdir 83
+#define SYS_readlink 89
+#define SYS_mount 165
+#define SYS_statfs 137
+
+#define O_RDONLY 0
+#define O_NONBLOCK 04000
+#define O_CLOEXEC 02000000
+#define O_NOFOLLOW 0400000
+#define S_IFMT 0170000
+#define S_IFREG 0100000
+#define S_IFBLK 0060000
+#define MS_NOSUID 2
+#define MS_NODEV 4
+#define MS_NOEXEC 8
+#define EEXIST 17
+#define EBUSY 16
+#define BLKROGET 0x125e
+#define BLKGETSIZE64 0x80081272
+
+#define CMDLINE_MAX 4096
+#define PAYLOAD_MAX (2 * 1024 * 1024)
+#define ARTIFACT_MAX (PAYLOAD_MAX + 4096)
+#define PATH_MAX_LOCAL 4096
+#define LOWER_MAX 24
+#define ARG_MAX_LOCAL 4096
+#define ENV_MAX_LOCAL 4096
+#define STRING_MAX_LOCAL (32 * 1024)
+#define PROCESS_MAX_LOCAL (256 * 1024)
+#define GENERATION_DIGITS_MAX 4096
+
+#define EXIT_USAGE 64
+#define EXIT_CMDLINE 65
+#define EXIT_DISCOVERY 66
+#define EXIT_TRANSPORT 67
+#define EXIT_PLAN 68
+
+struct timespec_local {
+    i64 sec;
+    i64 nsec;
+};
+
+struct stat_local {
+    u64 dev;
+    u64 ino;
+    u64 nlink;
+    u32 mode;
+    u32 uid;
+    u32 gid;
+    u32 pad0;
+    u64 rdev;
+    i64 size;
+    i64 blksize;
+    i64 blocks;
+    struct timespec_local atime;
+    struct timespec_local mtime;
+    struct timespec_local ctime;
+    i64 reserved[3];
+};
+
+struct statfs_local {
+    i64 type;
+    i64 block_size;
+    u64 blocks;
+    u64 blocks_free;
+    u64 blocks_available;
+    u64 files;
+    u64 files_free;
+    struct { int value[2]; } fsid;
+    i64 name_length;
+    i64 fragment_size;
+    i64 flags;
+    i64 spare[4];
+};
+
+static inline i64 sc0(i64 n) {
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n) : "rcx", "r11", "memory");
+    return r;
+}
+
+static inline i64 sc1(i64 n, i64 a) {
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
+    return r;
+}
+
+static inline i64 sc2(i64 n, i64 a, i64 b) {
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b) : "rcx", "r11", "memory");
+    return r;
+}
+
+static inline i64 sc3(i64 n, i64 a, i64 b, i64 c) {
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+    return r;
+}
+
+static inline i64 sc4(i64 n, i64 a, i64 b, i64 c, i64 d) {
+    register i64 r10 __asm__("r10") = d;
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+    return r;
+}
+
+static inline i64 sc5(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e) {
+    register i64 r10 __asm__("r10") = d;
+    register i64 r8 __asm__("r8") = e;
+    i64 r;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+void *memcpy(void *dst, const void *src, usize n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    usize i;
+    for (i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
+void *memset(void *dst, int value, usize n) {
+    u8 *d = (u8 *)dst;
+    usize i;
+    for (i = 0; i < n; i++) d[i] = (u8)value;
+    return dst;
+}
+
+static usize slen(const char *s) {
+    usize n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static int bytes_equal(const void *a0, const void *b0, usize n) {
+    const u8 *a = (const u8 *)a0;
+    const u8 *b = (const u8 *)b0;
+    usize i;
+    u8 diff = 0;
+    for (i = 0; i < n; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+static int text_equal(const char *a, const char *b) {
+    usize an = slen(a), bn = slen(b);
+    return an == bn && bytes_equal(a, b, an);
+}
+
+static void write_all(int fd, const char *s) {
+    usize left = slen(s);
+    while (left) {
+        i64 n = sc3(SYS_write, fd, (i64)s, (i64)left);
+        if (n <= 0) return;
+        s += n;
+        left -= (usize)n;
+    }
+}
+
+static __attribute__((noreturn)) void exit_now(int code) {
+    sc1(SYS_exit, code);
+    for (;;) {}
+}
+
+static __attribute__((noreturn)) void wait_closed(const char *message) {
+    write_all(2, message);
+    for (;;) sc0(SYS_pause);
+}
+
+static u32 rotr32(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }
+
+struct sha256_ctx {
+    u32 h[8];
+    u64 total;
+    u8 block[64];
+    u32 used;
+};
+
+static const u32 sha_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+static void sha_transform(struct sha256_ctx *c, const u8 *p) {
+    u32 w[64], a, b, d, e, f, g, h, i, cc;
+    for (i = 0; i < 16; i++)
+        w[i] = ((u32)p[i * 4] << 24) | ((u32)p[i * 4 + 1] << 16) | ((u32)p[i * 4 + 2] << 8) | p[i * 4 + 3];
+    for (i = 16; i < 64; i++) {
+        u32 s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        u32 s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = c->h[0]; b = c->h[1]; cc = c->h[2]; d = c->h[3];
+    e = c->h[4]; f = c->h[5]; g = c->h[6]; h = c->h[7];
+    for (i = 0; i < 64; i++) {
+        u32 s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        u32 ch = (e & f) ^ ((~e) & g);
+        u32 t1 = h + s1 + ch + sha_k[i] + w[i];
+        u32 s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        u32 maj = (a & b) ^ (a & cc) ^ (b & cc);
+        u32 t2 = s0 + maj;
+        h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+    }
+    c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+    c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
+}
+
+static void sha_init(struct sha256_ctx *c) {
+    static const u32 initial[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    memcpy(c->h, initial, sizeof(initial));
+    c->total = 0;
+    c->used = 0;
+}
+
+static void sha_update(struct sha256_ctx *c, const void *data0, usize n) {
+    const u8 *data = (const u8 *)data0;
+    c->total += n;
+    while (n) {
+        usize take = 64 - c->used;
+        if (take > n) take = n;
+        memcpy(c->block + c->used, data, take);
+        c->used += (u32)take;
+        data += take;
+        n -= take;
+        if (c->used == 64) {
+            sha_transform(c, c->block);
+            c->used = 0;
+        }
+    }
+}
+
+static void sha_final(struct sha256_ctx *c, u8 out[32]) {
+    u64 bits = c->total * 8;
+    u32 i;
+    c->block[c->used++] = 0x80;
+    if (c->used > 56) {
+        while (c->used < 64) c->block[c->used++] = 0;
+        sha_transform(c, c->block);
+        c->used = 0;
+    }
+    while (c->used < 56) c->block[c->used++] = 0;
+    for (i = 0; i < 8; i++) c->block[56 + i] = (u8)(bits >> (56 - i * 8));
+    sha_transform(c, c->block);
+    for (i = 0; i < 8; i++) {
+        out[i * 4] = (u8)(c->h[i] >> 24);
+        out[i * 4 + 1] = (u8)(c->h[i] >> 16);
+        out[i * 4 + 2] = (u8)(c->h[i] >> 8);
+        out[i * 4 + 3] = (u8)c->h[i];
+    }
+}
+
+static void sha_bytes(const void *p, usize n, u8 out[32]) {
+    struct sha256_ctx c;
+    sha_init(&c);
+    sha_update(&c, p, n);
+    sha_final(&c, out);
+}
+
+static char hex_digit(u8 value) { return (char)(value < 10 ? '0' + value : 'a' + value - 10); }
+
+static void digest_text(const void *p, usize n, char out[72]) {
+    u8 digest[32];
+    usize i;
+    sha_bytes(p, n, digest);
+    memcpy(out, "sha256:", 7);
+    for (i = 0; i < 32; i++) {
+        out[7 + i * 2] = hex_digit(digest[i] >> 4);
+        out[8 + i * 2] = hex_digit(digest[i] & 15);
+    }
+    out[71] = 0;
+}
+
+static int is_hex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
+
+static int valid_digest(const char *s, usize n) {
+    usize i;
+    if (n != 71 || !bytes_equal(s, "sha256:", 7)) return 0;
+    for (i = 7; i < 71; i++) if (!is_hex(s[i])) return 0;
+    return 1;
+}
+
+static int valid_serial(const char *s, usize n) {
+    usize i;
+    if (n != 20) return 0;
+    for (i = 0; i < 20; i++) if (!is_hex(s[i])) return 0;
+    return 1;
+}
+
+static int append_text(char *dst, usize *used, const char *s) {
+    usize n = slen(s);
+    if (*used + n + 1 > PATH_MAX_LOCAL) return 0;
+    memcpy(dst + *used, s, n);
+    *used += n;
+    dst[*used] = 0;
+    return 1;
+}
+
+static int fixture_path(char out[PATH_MAX_LOCAL], const char *root, const char *suffix) {
+    usize used = 0;
+    out[0] = 0;
+    if (!append_text(out, &used, root)) return 0;
+    if (used && out[used - 1] == '/') used--;
+    out[used] = 0;
+    return append_text(out, &used, suffix);
+}
+
+static i64 open_read(const char *path, int nofollow) {
+    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+    if (nofollow) flags |= O_NOFOLLOW;
+    return sc3(SYS_open, (i64)path, flags, 0);
+}
+
+static i64 read_bounded_file(const char *path, u8 *out, usize cap, int nofollow, struct stat_local *st_out) {
+    i64 fd = open_read(path, nofollow), total = 0;
+    struct stat_local st;
+    if (fd < 0) return -1;
+    if (sc2(SYS_fstat, fd, (i64)&st) < 0) { sc1(SYS_close, fd); return -1; }
+    while ((usize)total < cap) {
+        i64 n = sc3(SYS_read, fd, (i64)(out + total), cap - (usize)total);
+        if (n < 0) { sc1(SYS_close, fd); return -1; }
+        if (n == 0) break;
+        total += n;
+    }
+    if ((usize)total == cap) {
+        u8 extra;
+        if (sc3(SYS_read, fd, (i64)&extra, 1) != 0) { sc1(SYS_close, fd); return -1; }
+    }
+    if (st_out) *st_out = st;
+    sc1(SYS_close, fd);
+    return total;
+}
+
+struct bindings {
+    char resource[72];
+    char core[72];
+    char transport[72];
+    char transport_serial[21];
+    char root_serial[21];
+    char lowers[LOWER_MAX][21];
+    u32 lower_count;
+};
+
+struct span { const char *p; usize n; };
+
+static int starts(const char *p, usize n, const char *prefix) {
+    usize pn = slen(prefix);
+    return n >= pn && bytes_equal(p, prefix, pn);
+}
+
+static int copy_span(char *dst, usize cap, struct span s) {
+    if (s.n + 1 > cap) return 0;
+    memcpy(dst, s.p, s.n);
+    dst[s.n] = 0;
+    return 1;
+}
+
+static int parse_cmdline(char *buf, usize n, struct bindings *b) {
+    struct span fields[6];
+    const char *keys[6] = {"palimpsest.resource=", "palimpsest.core=", "palimpsest.stage1=",
+                           "palimpsest.stage1dev=", "palimpsest.root=", "palimpsest.lowers="};
+    u32 seen = 0, i;
+    usize pos = 0;
+    if (!n || n > CMDLINE_MAX) return 0;
+    memset(fields, 0, sizeof(fields));
+    while (pos < n) {
+        usize start, end;
+        while (pos < n && (buf[pos] == ' ' || buf[pos] == '\n' || buf[pos] == '\t')) pos++;
+        if (pos == n) break;
+        start = pos;
+        while (pos < n && buf[pos] != ' ' && buf[pos] != '\n' && buf[pos] != '\t') {
+            u8 c = (u8)buf[pos];
+            if (!c || c >= 0x80) return 0;
+            pos++;
+        }
+        end = pos;
+        if (!starts(buf + start, end - start, "palimpsest.")) continue;
+        for (i = 0; i < 6; i++) {
+            usize kn = slen(keys[i]);
+            if (end - start > kn && bytes_equal(buf + start, keys[i], kn)) break;
+        }
+        if (i == 6 || (seen & (1u << i))) return 0;
+        seen |= 1u << i;
+        fields[i].p = buf + start + slen(keys[i]);
+        fields[i].n = end - start - slen(keys[i]);
+    }
+    if (seen != 0x3f || !valid_digest(fields[0].p, fields[0].n) ||
+        !valid_digest(fields[1].p, fields[1].n) || !valid_digest(fields[2].p, fields[2].n)) return 0;
+    if (!copy_span(b->resource, sizeof(b->resource), fields[0]) ||
+        !copy_span(b->core, sizeof(b->core), fields[1]) ||
+        !copy_span(b->transport, sizeof(b->transport), fields[2])) return 0;
+    if (!starts(fields[3].p, fields[3].n, "virtio-") || fields[3].n != 27 ||
+        !valid_serial(fields[3].p + 7, 20)) return 0;
+    if (!starts(fields[4].p, fields[4].n, "virtio-") || fields[4].n != 27 ||
+        !valid_serial(fields[4].p + 7, 20)) return 0;
+    memcpy(b->transport_serial, fields[3].p + 7, 20); b->transport_serial[20] = 0;
+    memcpy(b->root_serial, fields[4].p + 7, 20); b->root_serial[20] = 0;
+    b->lower_count = 0;
+    pos = 0;
+    while (pos < fields[5].n) {
+        usize end = pos;
+        while (end < fields[5].n && fields[5].p[end] != ',') end++;
+        if (b->lower_count >= LOWER_MAX || end - pos != 27 ||
+            !bytes_equal(fields[5].p + pos, "virtio-", 7) || !valid_serial(fields[5].p + pos + 7, 20)) return 0;
+        memcpy(b->lowers[b->lower_count], fields[5].p + pos + 7, 20);
+        b->lowers[b->lower_count][20] = 0;
+        b->lower_count++;
+        if (end == fields[5].n) { pos = end; break; }
+        if (end + 1 == fields[5].n) return 0;
+        pos = end + 1;
+    }
+    if (!b->lower_count) return 0;
+    for (i = 0; i < b->lower_count; i++) {
+        u32 j;
+        if (text_equal(b->lowers[i], b->root_serial) || text_equal(b->lowers[i], b->transport_serial)) return 0;
+        for (j = 0; j < i; j++) if (text_equal(b->lowers[i], b->lowers[j])) return 0;
+    }
+    if (text_equal(b->root_serial, b->transport_serial)) return 0;
+    {
+        struct sha256_ctx c;
+        u8 digest[32];
+        char expected[21];
+        const char prefix[] = "palimpsest-oci-root-stage1-transport-v1\0";
+        sha_init(&c);
+        sha_update(&c, prefix, sizeof(prefix) - 1);
+        sha_update(&c, b->transport, 71);
+        sha_final(&c, digest);
+        for (i = 0; i < 10; i++) { expected[i * 2] = hex_digit(digest[i] >> 4); expected[i * 2 + 1] = hex_digit(digest[i] & 15); }
+        expected[20] = 0;
+        if (!text_equal(expected, b->transport_serial)) return 0;
+    }
+    return 1;
+}
+
+struct parser {
+    const u8 *p;
+    const u8 *end;
+    usize process_bytes;
+    struct span env_names[ENV_MAX_LOCAL];
+    u32 env_count;
+};
+
+static int take_char(struct parser *j, u8 c) {
+    if (j->p >= j->end || *j->p != c) return 0;
+    j->p++;
+    return 1;
+}
+
+static int utf8_advance(const u8 *p, const u8 *end, usize *count) {
+    u32 cp;
+    if (*p < 0x80) { *count = 1; return *p >= 0x20; }
+    if (*p >= 0xc2 && *p <= 0xdf && p + 1 < end && (p[1] & 0xc0) == 0x80) { *count = 2; return 1; }
+    if (*p >= 0xe0 && *p <= 0xef && p + 2 < end && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
+        cp = ((u32)(p[0] & 15) << 12) | ((u32)(p[1] & 63) << 6) | (p[2] & 63);
+        if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) return 0;
+        *count = 3; return 1;
+    }
+    if (*p >= 0xf0 && *p <= 0xf4 && p + 3 < end && (p[1] & 0xc0) == 0x80 &&
+        (p[2] & 0xc0) == 0x80 && (p[3] & 0xc0) == 0x80) {
+        cp = ((u32)(p[0] & 7) << 18) | ((u32)(p[1] & 63) << 12) | ((u32)(p[2] & 63) << 6) | (p[3] & 63);
+        if (cp < 0x10000 || cp > 0x10ffff) return 0;
+        *count = 4; return 1;
+    }
+    return 0;
+}
+
+static int json_string(struct parser *j, struct span *raw, usize *decoded, int allow_nul) {
+    const u8 *start;
+    usize out = 0;
+    if (!take_char(j, '"')) return 0;
+    start = j->p;
+    while (j->p < j->end && *j->p != '"') {
+        if (*j->p == '\\') {
+            u8 e;
+            if (++j->p >= j->end) return 0;
+            e = *j->p++;
+            if (e == '"' || e == '\\' || e == 'b' || e == 'f' || e == 'n' || e == 'r' || e == 't') out++;
+            else if (e == 'u') {
+                u8 value;
+                if (j->end - j->p < 4 || j->p[0] != '0' || j->p[1] != '0' ||
+                    !is_hex((char)j->p[2]) || !is_hex((char)j->p[3])) return 0;
+                value = (u8)((j->p[2] <= '9' ? j->p[2] - '0' : j->p[2] - 'a' + 10) * 16 +
+                             (j->p[3] <= '9' ? j->p[3] - '0' : j->p[3] - 'a' + 10));
+                if (value >= 0x20 || value == 8 || value == 9 || value == 10 || value == 12 || value == 13 ||
+                    (!allow_nul && value == 0)) return 0;
+                j->p += 4; out++;
+            } else return 0;
+        } else {
+            usize width;
+            if (!utf8_advance(j->p, j->end, &width) || (!allow_nul && *j->p == 0)) return 0;
+            j->p += width; out += width;
+        }
+    }
+    if (j->p >= j->end) return 0;
+    if (raw) { raw->p = (const char *)start; raw->n = (usize)(j->p - start); }
+    if (decoded) *decoded = out;
+    j->p++;
+    return 1;
+}
+
+static int key(struct parser *j, const char *expected) {
+    struct span s;
+    usize n = slen(expected);
+    if (!json_string(j, &s, 0, 0) || s.n != n || !bytes_equal(s.p, expected, n) || !take_char(j, ':')) return 0;
+    return 1;
+}
+
+static int exact_string(struct parser *j, const char *expected) {
+    struct span s;
+    usize n = slen(expected);
+    return json_string(j, &s, 0, 0) && s.n == n && bytes_equal(s.p, expected, n);
+}
+
+static int plain_string(struct parser *j, struct span *s, usize *decoded) {
+    const char *p;
+    usize i;
+    if (!json_string(j, s, decoded, 0)) return 0;
+    p = s->p;
+    for (i = 0; i < s->n; i++) if (p[i] == '\\' || (u8)p[i] >= 0x80) return 0;
+    return 1;
+}
+
+static int uint_value(struct parser *j, u64 *value) {
+    u64 v = 0;
+    const u8 *start = j->p;
+    if (start >= j->end || *start < '0' || *start > '9') return 0;
+    if (*start == '0' && start + 1 < j->end && start[1] >= '0' && start[1] <= '9') return 0;
+    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') {
+        u32 d = *j->p++ - '0';
+        if (v > (~(u64)0 - d) / 10) return 0;
+        v = v * 10 + d;
+    }
+    *value = v;
+    return j->p > start;
+}
+
+static int positive_decimal(struct parser *j) {
+    const u8 *start = j->p;
+    if (start >= j->end || *start < '1' || *start > '9') return 0;
+    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
+    return j->p > start && (usize)(j->p - start) <= GENERATION_DIGITS_MAX;
+}
+
+static int exact_string_array3(struct parser *j, const char *a, const char *b, const char *c) {
+    return take_char(j, '[') && exact_string(j, a) && take_char(j, ',') && exact_string(j, b) &&
+           take_char(j, ',') && exact_string(j, c) && take_char(j, ']');
+}
+
+static int valid_uuid_span(struct span s) {
+    usize i;
+    if (s.n != 36) return 0;
+    for (i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (s.p[i] != '-') return 0; }
+        else if (!is_hex(s.p[i])) return 0;
+    }
+    return 1;
+}
+
+static int valid_run_name(struct span s) {
+    usize i;
+    if (!s.n || s.n > 63 || !((s.p[0] >= 'a' && s.p[0] <= 'z') ||
+                              (s.p[0] >= '0' && s.p[0] <= '9'))) return 0;
+    for (i = 0; i < s.n; i++) if (!((s.p[i] >= 'a' && s.p[i] <= 'z') ||
+                                      (s.p[i] >= '0' && s.p[i] <= '9') || s.p[i] == '-')) return 0;
+    return 1;
+}
+
+static int valid_account(struct span s) {
+    usize i = 0;
+    if (!s.n || s.n > 32) return 0;
+    while (i < s.n && s.p[i] >= '0' && s.p[i] <= '9') i++;
+    if (i == s.n) {
+        u64 value = 0;
+        usize j;
+        if (s.n > 1 && s.p[0] == '0') return 0;
+        if (s.n > 10) return 0;
+        for (j = 0; j < s.n; j++) value = value * 10 + (u64)(s.p[j] - '0');
+        return value <= 4294967294ULL;
+    }
+    if (!((s.p[0] >= 'A' && s.p[0] <= 'Z') || (s.p[0] >= 'a' && s.p[0] <= 'z') || s.p[0] == '_')) return 0;
+    for (i = 1; i < s.n; i++) if (!((s.p[i] >= 'A' && s.p[i] <= 'Z') ||
+        (s.p[i] >= 'a' && s.p[i] <= 'z') || (s.p[i] >= '0' && s.p[i] <= '9') ||
+        s.p[i] == '_' || s.p[i] == '.' || s.p[i] == '-')) return 0;
+    return 1;
+}
+
+static int valid_env_name(struct span s) {
+    usize i;
+    if (!s.n || !((s.p[0] >= 'A' && s.p[0] <= 'Z') || (s.p[0] >= 'a' && s.p[0] <= 'z') || s.p[0] == '_')) return 0;
+    for (i = 1; i < s.n; i++) if (!((s.p[i] >= 'A' && s.p[i] <= 'Z') ||
+        (s.p[i] >= 'a' && s.p[i] <= 'z') || (s.p[i] >= '0' && s.p[i] <= '9') || s.p[i] == '_')) return 0;
+    return 1;
+}
+
+static int valid_cwd(struct span s) {
+    usize i;
+    if (!s.n || s.p[0] != '/') return 0;
+    if (s.n > 1 && s.p[s.n - 1] == '/') return 0;
+    for (i = 0; i < s.n; i++) {
+        if (i && s.p[i] == '/' && s.p[i - 1] == '/') return 0;
+        if ((i == 0 || s.p[i - 1] == '/') && s.p[i] == '.' &&
+            (i + 1 == s.n || s.p[i + 1] == '/' || (s.p[i + 1] == '.' && (i + 2 == s.n || s.p[i + 2] == '/')))) return 0;
+    }
+    return 1;
+}
+
+static int parse_process(struct parser *j) {
+    u32 argc = 0, i;
+    u64 number;
+    struct span s;
+    usize decoded;
+    if (!take_char(j, '{') || !key(j, "argv") || !take_char(j, '[')) return 0;
+    if (!take_char(j, ']')) {
+        for (;;) {
+            if (argc >= ARG_MAX_LOCAL || !json_string(j, &s, &decoded, 0) || decoded > STRING_MAX_LOCAL) return 0;
+            if (argc == 0 && decoded == 0) return 0;
+            j->process_bytes += decoded + 1;
+            argc++;
+            if (take_char(j, ']')) break;
+            if (!take_char(j, ',')) return 0;
+        }
+    }
+    if (!argc || !take_char(j, ',') || !key(j, "cwd") || !json_string(j, &s, &decoded, 0) ||
+        decoded > STRING_MAX_LOCAL || !valid_cwd(s)) return 0;
+    j->process_bytes += decoded;
+    if (!take_char(j, ',') || !key(j, "environment") || !take_char(j, '[')) return 0;
+    if (!take_char(j, ']')) {
+        for (;;) {
+            struct span name, value;
+            usize value_decoded;
+            if (j->env_count >= ENV_MAX_LOCAL || !take_char(j, '{') || !key(j, "name") ||
+                !plain_string(j, &name, &decoded) || !valid_env_name(name) || !take_char(j, ',') ||
+                !key(j, "value") || !json_string(j, &value, &value_decoded, 0) ||
+                value_decoded > STRING_MAX_LOCAL || !take_char(j, '}')) return 0;
+            for (i = 0; i < j->env_count; i++)
+                if (j->env_names[i].n == name.n && bytes_equal(j->env_names[i].p, name.p, name.n)) return 0;
+            j->env_names[j->env_count++] = name;
+            j->process_bytes += decoded + value_decoded + 2;
+            if (take_char(j, ']')) break;
+            if (!take_char(j, ',')) return 0;
+        }
+    }
+    if (!take_char(j, ',') || !key(j, "stop_signal") || !uint_value(j, &number) || number < 1 || number > 64 ||
+        !take_char(j, ',') || !key(j, "user") || !take_char(j, '{') || !key(j, "group")) return 0;
+    if (j->end - j->p >= 4 && bytes_equal(j->p, "null", 4)) {
+        j->p += 4;
+        j->process_bytes += 27;
+    } else {
+        if (!plain_string(j, &s, &decoded) || !valid_account(s)) return 0;
+        j->process_bytes += decoded + 25;
+    }
+    if (!take_char(j, ',') || !key(j, "user") || !plain_string(j, &s, &decoded) || !valid_account(s) ||
+        !take_char(j, '}') || !take_char(j, '}')) return 0;
+    j->process_bytes += decoded;
+    return j->process_bytes <= PROCESS_MAX_LOCAL;
+}
+
+static int parse_plan(const u8 *payload, usize size, const struct bindings *b) {
+    struct parser j;
+    u32 layer_count = 0, i;
+    char layer_serials[LOWER_MAX][21];
+    struct span s;
+    u64 number;
+    j.p = payload; j.end = payload + size; j.process_bytes = 0; j.env_count = 0;
+    if (!take_char(&j, '{') || !key(&j, "assembly") || !take_char(&j, '{') ||
+        !key(&j, "device_policy") || !exact_string(&j, "virtio-serial-sysfs.v1") ||
+        !take_char(&j, ',') || !key(&j, "layers") || !take_char(&j, '[')) return 0;
+    if (!take_char(&j, ']')) {
+        for (;;) {
+            if (layer_count >= LOWER_MAX || !take_char(&j, '{') || !key(&j, "filesystem") ||
+                !exact_string(&j, "squashfs") || !take_char(&j, ',') || !key(&j, "mount_options") ||
+                !exact_string_array3(&j, "ro", "nodev", "nosuid") || !take_char(&j, ',') ||
+                !key(&j, "ordinal") || !uint_value(&j, &number) || number != layer_count ||
+                !take_char(&j, ',') || !key(&j, "serial") || !plain_string(&j, &s, 0) ||
+                !valid_serial(s.p, s.n) || !take_char(&j, '}')) return 0;
+            memcpy(layer_serials[layer_count], s.p, 20); layer_serials[layer_count][20] = 0;
+            layer_count++;
+            if (take_char(&j, ']')) break;
+            if (!take_char(&j, ',')) return 0;
+        }
+    }
+    if (!layer_count || layer_count != b->lower_count || !take_char(&j, ',') ||
+        !key(&j, "lowerdir_ordinals") || !take_char(&j, '[')) return 0;
+    for (i = 0; i < layer_count; i++) {
+        if (i && !take_char(&j, ',')) return 0;
+        if (!uint_value(&j, &number) || number != layer_count - 1 - i) return 0;
+    }
+    if (!take_char(&j, ']') || !take_char(&j, ',') || !key(&j, "overlay_mount_options") ||
+        !exact_string_array3(&j, "rw", "nodev", "nosuid") || !take_char(&j, ',') ||
+        !key(&j, "root") || !take_char(&j, '{') || !key(&j, "filesystem") || !exact_string(&j, "ext4") ||
+        !take_char(&j, ',') || !key(&j, "generation") || !positive_decimal(&j) ||
+        !take_char(&j, ',') || !key(&j, "mount_options") || !exact_string_array3(&j, "rw", "nodev", "nosuid") ||
+        !take_char(&j, ',') || !key(&j, "serial") || !plain_string(&j, &s, 0) || !valid_serial(s.p, s.n) ||
+        s.n != 20 || !bytes_equal(s.p, b->root_serial, 20) || !take_char(&j, ',') ||
+        !key(&j, "volume_id") || !plain_string(&j, &s, 0) || !valid_uuid_span(s) ||
+        !take_char(&j, '}') || !take_char(&j, '}')) return 0;
+    for (i = 0; i < layer_count; i++) if (!text_equal(layer_serials[i], b->lowers[i])) return 0;
+    if (!take_char(&j, ',') || !key(&j, "boot_plan_digest") || !plain_string(&j, &s, 0) ||
+        s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
+        !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
+        !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
+        !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
+        !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
+        !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
+        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v2") ||
+        !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
+        !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
+        !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v2") || !take_char(&j, '}') ||
+        j.p != j.end) return 0;
+    return 1;
+}
+
+static u8 artifact[ARTIFACT_MAX];
+static char cmdline[CMDLINE_MAX + 1];
+static u8 attribute[128];
+
+static u32 little32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static u64 little64(const u8 *p) { return (u64)little32(p) | ((u64)little32(p + 4) << 32); }
+
+static int parse_u32_decimal(const u8 *p, usize n, u32 *value) {
+    u64 v = 0;
+    usize i;
+    if (!n) return 0;
+    for (i = 0; i < n; i++) { if (p[i] < '0' || p[i] > '9') return 0; v = v * 10 + p[i] - '0'; if (v > 0xffffffffu) return 0; }
+    *value = (u32)v;
+    return 1;
+}
+
+static u32 dev_major(u64 dev) { return (u32)(((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000)); }
+static u32 dev_minor(u64 dev) { return (u32)((dev & 0xff) | ((dev >> 12) & 0xffffff00)); }
+
+struct discovered {
+    char path[PATH_MAX_LOCAL];
+    char serial_path[PATH_MAX_LOCAL];
+    char ro_path[PATH_MAX_LOCAL];
+    char dev_path[PATH_MAX_LOCAL];
+    u64 size;
+    u32 major;
+    u32 minor;
+    int fixture;
+};
+
+static int read_exact_attr(const char *path, const char *expected) {
+    i64 n = read_bounded_file(path, attribute, sizeof(attribute), 1, 0);
+    usize en = slen(expected);
+    return n == (i64)en && bytes_equal(attribute, expected, en);
+}
+
+static int discover(const char *root, int fixture, const struct bindings *b, struct discovered *found) {
+    char base[PATH_MAX_LOCAL], path[PATH_MAX_LOCAL], selected_name[4] = {0};
+    u32 matches = 0, letter;
+    if (fixture) {
+        if (!fixture_path(base, root, "/sys/class/block")) return 0;
+    } else memcpy(base, "/sys/class/block", 17);
+    for (letter = 0; letter < 26; letter++) {
+        usize used = slen(base);
+        i64 n;
+        if (used + 5 >= sizeof(path)) return 0;
+        memcpy(path, base, used); path[used++] = '/'; path[used++] = 'v'; path[used++] = 'd'; path[used++] = (char)('a' + letter); path[used] = 0;
+        if (!fixture) {
+            char link[PATH_MAX_LOCAL];
+            usize k;
+            n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
+            if (n < 0) continue;
+            if (n < 10 || !starts(link, (usize)n, "../../devices/")) return 0;
+            for (k = 14; k < (usize)n;) {
+                usize component = k;
+                while (k < (usize)n && link[k] != '/') k++;
+                if (k == component || (k - component == 1 && link[component] == '.') ||
+                    (k - component == 2 && link[component] == '.' && link[component + 1] == '.')) return 0;
+                k++;
+            }
+        }
+        if (used + 8 >= sizeof(path)) return 0;
+        memcpy(path + used, "/serial", 8); path[used + 7] = 0;
+        n = read_bounded_file(path, attribute, 64, 1, 0);
+        if (n < 0) continue;
+        if (n == 21 && attribute[20] == '\n') n = 20;
+        if (n != 20 || !valid_serial((char *)attribute, 20)) continue;
+        if (!bytes_equal(attribute, b->transport_serial, 20)) continue;
+        matches++;
+        selected_name[0] = 'v'; selected_name[1] = 'd'; selected_name[2] = (char)('a' + letter);
+    }
+    if (matches != 1) return 0;
+    {
+        usize used = slen(base);
+        memcpy(path, base, used); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3; path[used] = 0;
+        if (fixture) {
+            memcpy(path + used, "/driver", 8); path[used + 7] = 0;
+            if (!read_exact_attr(path, "virtio_blk\n")) return 0;
+        } else {
+            char link[PATH_MAX_LOCAL];
+            memcpy(path + used, "/device/driver", 15); path[used + 14] = 0;
+            i64 n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
+            if (n < 11 || !bytes_equal(link + n - 11, "/virtio_blk", 11)) return 0;
+        }
+        memcpy(path + used, "/ro", 4); path[used + 3] = 0;
+        if (!read_exact_attr(path, "1\n")) return 0;
+        memcpy(path + used, "/dev", 5); path[used + 4] = 0;
+        {
+            i64 n = read_bounded_file(path, attribute, 32, 1, 0);
+            usize colon = 0, end;
+            u32 major, minor;
+            if (n < 4 || attribute[n - 1] != '\n') return 0;
+            end = (usize)n - 1;
+            while (colon < end && attribute[colon] != ':') colon++;
+            if (colon == end || !parse_u32_decimal(attribute, colon, &major) ||
+                !parse_u32_decimal(attribute + colon + 1, end - colon - 1, &minor)) return 0;
+            if (fixture) {
+                if (!fixture_path(found->path, root, "/dev/")) return 0;
+                usize fp = slen(found->path); memcpy(found->path + fp, selected_name, 4);
+                found->fixture = 1;
+                found->major = major;
+                found->minor = minor;
+            } else {
+                struct stat_local st;
+                int ro = 0;
+                u64 bytes = 0;
+                i64 fd;
+                memcpy(found->path, "/dev/", 5); memcpy(found->path + 5, selected_name, 4);
+                fd = open_read(found->path, 1);
+                if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFBLK ||
+                    dev_major(st.rdev) != major || dev_minor(st.rdev) != minor ||
+                    sc3(SYS_ioctl, fd, BLKROGET, (i64)&ro) < 0 || ro != 1 ||
+                    sc3(SYS_ioctl, fd, BLKGETSIZE64, (i64)&bytes) < 0) { if (fd >= 0) sc1(SYS_close, fd); return 0; }
+                sc1(SYS_close, fd);
+                found->fixture = 0;
+                found->size = bytes;
+                found->major = major;
+                found->minor = minor;
+            }
+        }
+        memcpy(path, base, slen(base)); used = slen(base); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3;
+        memcpy(path + used, "/serial", 8); path[used + 7] = 0;
+        {
+            i64 n = read_bounded_file(path, attribute, 64, 1, 0);
+            if (n == 21 && attribute[20] == '\n') n = 20;
+            if (n != 20 || !bytes_equal(attribute, b->transport_serial, 20)) return 0;
+        }
+        memcpy(found->serial_path, path, slen(path) + 1);
+        used = slen(base); memcpy(path, base, used); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3;
+        memcpy(path + used, "/ro", 4); path[used + 3] = 0; memcpy(found->ro_path, path, slen(path) + 1);
+        used = slen(base); memcpy(path, base, used); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3;
+        memcpy(path + used, "/dev", 5); path[used + 4] = 0; memcpy(found->dev_path, path, slen(path) + 1);
+    }
+    return 1;
+}
+
+static int verify_transport(const struct discovered *device, const struct bindings *b) {
+    struct stat_local st;
+    i64 fd = open_read(device->path, 1), n;
+    u64 payload_size, total, offset = 0;
+    u8 payload_digest[32];
+    char artifact_digest[72];
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0) { if (fd >= 0) sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+    if (device->fixture && ((st.mode & S_IFMT) != S_IFREG || st.nlink != 1 || (st.mode & 0022))) {
+        sc1(SYS_close, fd); return EXIT_TRANSPORT;
+    }
+    if (!device->fixture) {
+        int ro = 0;
+        u64 bytes = 0;
+        if ((st.mode & S_IFMT) != S_IFBLK || dev_major(st.rdev) != device->major || dev_minor(st.rdev) != device->minor ||
+            sc3(SYS_ioctl, fd, BLKROGET, (i64)&ro) < 0 || ro != 1 ||
+            sc3(SYS_ioctl, fd, BLKGETSIZE64, (i64)&bytes) < 0 || bytes != device->size) {
+            sc1(SYS_close, fd); return EXIT_TRANSPORT;
+        }
+    }
+    while (offset < 64) {
+        n = sc4(SYS_pread64, fd, (i64)(artifact + offset), 64 - offset, offset);
+        if (n <= 0) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+        offset += (u64)n;
+    }
+    if (!bytes_equal(artifact, "PALIMPSEST-S1\0\0\0", 16) || little32(artifact + 16) != 1 ||
+        little32(artifact + 20) != 64) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+    payload_size = little64(artifact + 24);
+    if (!payload_size || payload_size > PAYLOAD_MAX) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+    total = (64 + payload_size + 4095) & ~(u64)4095;
+    if (total > ARTIFACT_MAX || (!device->fixture && device->size != total) ||
+        (device->fixture && (u64)st.size != total)) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+    while (offset < total) {
+        n = sc4(SYS_pread64, fd, (i64)(artifact + offset), total - offset, offset);
+        if (n <= 0) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+        offset += (u64)n;
+    }
+    if (!device->fixture) {
+        struct stat_local after;
+        int ro = 0;
+        u64 bytes = 0;
+        if (sc2(SYS_fstat, fd, (i64)&after) < 0 || after.dev != st.dev || after.ino != st.ino ||
+            after.rdev != st.rdev || (after.mode & S_IFMT) != S_IFBLK ||
+            sc3(SYS_ioctl, fd, BLKROGET, (i64)&ro) < 0 || ro != 1 ||
+            sc3(SYS_ioctl, fd, BLKGETSIZE64, (i64)&bytes) < 0 || bytes != device->size ||
+            !read_exact_attr(device->ro_path, "1\n")) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+        {
+            i64 an = read_bounded_file(device->serial_path, attribute, 64, 1, 0);
+            if (an == 21 && attribute[20] == '\n') an = 20;
+            if (an != 20 || !bytes_equal(attribute, b->transport_serial, 20)) {
+                sc1(SYS_close, fd); return EXIT_TRANSPORT;
+            }
+        }
+        {
+            i64 an = read_bounded_file(device->dev_path, attribute, 32, 1, 0);
+            usize colon = 0, end;
+            u32 major, minor;
+            if (an < 4 || attribute[an - 1] != '\n') { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+            end = (usize)an - 1;
+            while (colon < end && attribute[colon] != ':') colon++;
+            if (colon == end || !parse_u32_decimal(attribute, colon, &major) ||
+                !parse_u32_decimal(attribute + colon + 1, end - colon - 1, &minor) ||
+                major != device->major || minor != device->minor) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+        }
+    }
+    sc1(SYS_close, fd);
+    digest_text(artifact, total, artifact_digest);
+    if (!text_equal(artifact_digest, b->transport)) return EXIT_TRANSPORT;
+    sha_bytes(artifact + 64, payload_size, payload_digest);
+    if (!bytes_equal(payload_digest, artifact + 32, 32)) return EXIT_TRANSPORT;
+    for (offset = 64 + payload_size; offset < total; offset++) if (artifact[offset]) return EXIT_TRANSPORT;
+    if (!parse_plan(artifact + 64, payload_size, b)) return EXIT_PLAN;
+    return 0;
+}
+
+static int mkdir_ok(const char *path) {
+    i64 r = sc2(SYS_mkdir, (i64)path, 0755);
+    return r == 0 || r == -EEXIST;
+}
+
+static int mount_ok(const char *source, const char *target, const char *type, u64 flags, i64 magic) {
+    i64 r = sc5(SYS_mount, (i64)source, (i64)target, (i64)type, flags, 0);
+    struct statfs_local fs;
+    if (r != 0 && r != -EBUSY) return 0;
+    return sc2(SYS_statfs, (i64)target, (i64)&fs) == 0 && fs.type == magic;
+}
+
+static int prepare_live(void) {
+    return mkdir_ok("/proc") && mkdir_ok("/sys") && mkdir_ok("/dev") &&
+           mount_ok("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, 0x9fa0) &&
+           mount_ok("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, 0x62656572) &&
+           mount_ok("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, 0x01021994);
+}
+
+static int run_consumer(const char *fixture_root) {
+    struct bindings b;
+    struct discovered device;
+    char path[PATH_MAX_LOCAL];
+    i64 n;
+    int fixture = fixture_root != 0;
+    memset(&b, 0, sizeof(b));
+    memset(&device, 0, sizeof(device));
+    if (fixture) {
+        if (!fixture_path(path, fixture_root, "/proc/cmdline")) return EXIT_USAGE;
+    } else memcpy(path, "/proc/cmdline", 14);
+    n = read_bounded_file(path, (u8 *)cmdline, CMDLINE_MAX, 1, 0);
+    if (n <= 0 || !parse_cmdline(cmdline, (usize)n, &b)) return EXIT_CMDLINE;
+    if (!discover(fixture_root, fixture, &b, &device)) return EXIT_DISCOVERY;
+    return verify_transport(&device, &b);
+}
+
+static __attribute__((noreturn, used)) void start_c(u64 *stack) {
+    u64 argc = stack[0];
+    char **argv = (char **)(stack + 1);
+    i64 pid = sc0(SYS_getpid);
+    int fixture = argc == 3 && text_equal(argv[1], "--fixture-v1") && pid != 1;
+    int code;
+    if (fixture) {
+        code = run_consumer(argv[2]);
+        if (!code) write_all(1, "palimpsest guest stage1 fixture: verified\n");
+        else write_all(2, "palimpsest guest stage1 fixture: rejected\n");
+        exit_now(code);
+    }
+    if (pid != 1) exit_now(EXIT_USAGE);
+    if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
+    code = run_consumer(0);
+    if (code) wait_closed("palimpsest guest stage1: transport rejected; waiting fail-closed\n");
+    wait_closed("palimpsest guest stage1: transport verified; root assembly disabled; waiting fail-closed\n");
+}
+
+__attribute__((naked, noreturn, visibility("default"))) void _start(void) {
+    __asm__ volatile("mov %rsp,%rdi\n"
+                     "and $-16,%rsp\n"
+                     "call start_c\n");
+}

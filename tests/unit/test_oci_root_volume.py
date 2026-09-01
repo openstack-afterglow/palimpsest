@@ -115,6 +115,8 @@ def test_new_root_volume_is_formatted_owned_and_idempotently_claimed(roots: stat
     assert first.path.stat().st_size == VOLUME_SIZE
     assert oci_root_volume.load_oci_root_volume(roots, volume_id, runner=tools).record == first.record
     assert oci_root_volume.list_oci_root_volume_records(roots) == (first.record,)
+    with pytest.raises(StateError, match="generation"):
+        replace(first.record, generation=oci_root_volume.MAX_OCI_ROOT_VOLUME_GENERATION + 1)
 
 
 def test_new_root_owner_intent_is_durable_before_raw_creation(

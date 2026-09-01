@@ -1,8 +1,8 @@
 """Path-free guest stage-1 assembly and workload handoff contract.
 
-This module defines what the future first-party ``/init`` must consume.  It
-does not build an initramfs, perform mounts, pivot root, supervise PID 1, or
-enable the OCI-root runtime.
+This module defines the contract consumed by the packaged first-party
+``/init``.  It does not perform OCI filesystem mounts, pivot root, supervise
+the image process as PID 1, or enable the OCI-root runtime.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .errors import ArtifactValidationError, StateError
 from .kvm import MAX_OCI_ROOT_LAYER_DISKS
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
+from .oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION
 
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
@@ -100,6 +101,7 @@ class OCIStage1Plan:
             or volume_id != root["volume_id"]
             or type(root["generation"]) is not int
             or root["generation"] < 1
+            or root["generation"] > MAX_OCI_ROOT_VOLUME_GENERATION
             or _SERIAL_RE.fullmatch(root["serial"] if isinstance(root["serial"], str) else "") is None
         ):
             raise StateError("stage-1 root mount policy is invalid")

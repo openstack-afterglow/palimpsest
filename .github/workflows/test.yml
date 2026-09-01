@@ -88,6 +88,21 @@ jobs:
         if: always()
         run: docker buildx rm palimpsest-e2e || true
 
+  guest-stage1-binary:
+    name: Guest stage-1 binary (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - name: Pin the offline x86_64 build toolchain
+        run: docker pull --platform linux/amd64 docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
+      - name: Execute and reproduce the packaged stage-1 ELF
+        run: uv run python -m pytest -m guest_stage1_binary tests/integration/test_oci_guest_stage1_binary.py -vv
+
 
   unit-macos:
     name: Unit tests (macOS 15)

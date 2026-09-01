@@ -17,6 +17,10 @@ import pytest
 from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.oci_initramfs import (
     MAX_OCI_INITRAMFS_ENTRIES,
+    OCI_STAGE1_BINARY_DIGEST,
+    OCI_STAGE1_BUILD_RECIPE_DIGEST,
+    OCI_STAGE1_SEAL_RECIPE_DIGEST,
+    OCI_STAGE1_SOURCE_DIGEST,
     InitramfsEntryReceipt,
     NewcEntry,
     OCIInitramfsManifest,
@@ -75,19 +79,25 @@ def test_bootstrap_initramfs_is_byte_deterministic_and_independently_well_formed
 
     assert first == second
     assert [record["name"] for record in records] == [
+        "dev",
         "etc",
         "etc/palimpsest",
         "etc/palimpsest/guest-stage1-consumer.json",
         "etc/palimpsest/stage1-abi.json",
         "init",
+        "proc",
+        "sys",
         "TRAILER!!!",
     ]
     assert [record["mode"] for record in records[:-1]] == [
         stat.S_IFDIR | 0o755,
         stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
         stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o755,
+        stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
     ]
     assert records[-1]["end"] == len(first.payload)
     assert verify_bootstrap_initramfs(first.payload, first.manifest) == parse_newc(first.payload)
@@ -120,9 +130,9 @@ def test_bootstrap_manifest_is_canonical_path_free_and_explicitly_not_root_assem
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "bootstrap-fail-closed"
-    assert value["stage1"]["plan_transport"] == "unimplemented"
-    assert value["stage1"]["embedded_consumer"] is False
+    assert value["stage1"]["capability"] == "plan-consumer-fail-closed"
+    assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
+    assert value["stage1"]["embedded_consumer"] is True
     assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v1"
     assert value["stage1"]["root_assembly"] is False
     assert value["stage1"]["linkage"] == "static"
@@ -131,10 +141,26 @@ def test_bootstrap_manifest_is_canonical_path_free_and_explicitly_not_root_assem
     entries = {entry.path: entry.data for entry in parse_newc(built.payload)}
     consumer = json.loads(entries["etc/palimpsest/guest-stage1-consumer.json"])
     abi = json.loads(entries["etc/palimpsest/stage1-abi.json"])
-    assert consumer["embedded_in_init"] is False
+    assert consumer["embedded_in_init"] is True
     assert consumer["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
-    assert abi["embedded_consumer"] is False
+    assert abi["embedded_consumer"] is True
     assert abi["consumer_contract_digest"] == built.manifest.consumer_contract_digest
+    assert value["stage1"]["build"]["toolchain_image"].endswith(
+        "@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
+    )
+
+
+def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    paths = {
+        OCI_STAGE1_SOURCE_DIGEST: repository / "guest/stage1/init.c",
+        OCI_STAGE1_BUILD_RECIPE_DIGEST: repository / "scripts/build_oci_guest_init.sh",
+        OCI_STAGE1_SEAL_RECIPE_DIGEST: repository / "scripts/seal_static_elf.py",
+        OCI_STAGE1_BINARY_DIGEST: repository / "src/palimpsest_local/assets/oci-stage1-init.x86_64",
+    }
+    for expected, path in paths.items():
+        assert f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" == expected
+    assert stat.S_IMODE(paths[OCI_STAGE1_BINARY_DIGEST].stat().st_mode) == 0o644
 
 
 @pytest.mark.parametrize(
