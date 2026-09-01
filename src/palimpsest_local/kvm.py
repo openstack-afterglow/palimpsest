@@ -21,6 +21,7 @@ _DOMAIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _NETWORK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _DISK_LETTERS = "bcdefghijklmnopqrstuvwxyz"
 MAX_LAYER_DISKS = len(_DISK_LETTERS)
+MAX_OCI_ROOT_LAYER_DISKS = MAX_LAYER_DISKS - 1
 DOMAIN_MARKER_VERSION = "0.1.0"
 DOMAIN_MARKER_NAMESPACE = "https://afterglow.dev/palimpsest-local/domain/v1"
 ET.register_namespace("palimpsest", DOMAIN_MARKER_NAMESPACE)
@@ -37,6 +38,14 @@ class KvmUnavailable(KvmError):
 @dataclass(frozen=True)
 class LayerDisk:
     blob_digest: str
+    host_path: Path
+    target_dev: str
+    serial: str
+
+
+@dataclass(frozen=True)
+class Stage1TransportDisk:
+    artifact_digest: str
     host_path: Path
     target_dev: str
     serial: str
@@ -84,6 +93,7 @@ class OCIRootDomainSpec:
     root_disk: Path
     root_serial: str
     layers: tuple[LayerDisk, ...]
+    stage1_transport: Stage1TransportDisk
     network: str | None = "default"
     console_log: Path | None = None
     run_id: str | None = None
@@ -261,7 +271,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("memory_mib is outside the supported range")
     if not 1 <= spec.vcpus <= 256:
         raise KvmError("vcpus is outside the supported range")
-    if not spec.layers or len(spec.layers) > MAX_LAYER_DISKS:
+    if not spec.layers or len(spec.layers) > MAX_OCI_ROOT_LAYER_DISKS:
         raise KvmError("OCI-root layer count is outside the supported range")
     for label, path in (
         ("kernel", spec.kernel),
@@ -300,7 +310,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         except Exception:
             raise KvmError("OCI-root layer digest is invalid") from None
         if (
-            layer.target_dev != f"vd{_DISK_LETTERS[index]}"
+            layer.target_dev != f"vd{_DISK_LETTERS[index + 1]}"
             or not layer.host_path.is_absolute()
             or layer.host_path == spec.root_disk
             or layer_digest != layer.blob_digest
@@ -309,6 +319,21 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         ):
             raise KvmError("OCI-root layer disk order or identity is invalid")
         seen_serials.add(layer.serial)
+    transport = spec.stage1_transport
+    try:
+        transport_digest = normalize_digest(transport.artifact_digest)
+    except Exception:
+        raise KvmError("OCI-root stage-1 transport digest is invalid") from None
+    if (
+        transport_digest != transport.artifact_digest
+        or not transport.host_path.is_absolute()
+        or transport.host_path == spec.root_disk
+        or transport.host_path in {layer.host_path for layer in spec.layers}
+        or transport.target_dev != "vdb"
+        or re.fullmatch(r"[0-9a-f]{20}", transport.serial or "") is None
+        or transport.serial in seen_serials
+    ):
+        raise KvmError("OCI-root stage-1 transport identity is invalid")
 
     domain = ET.Element("domain", {"type": "kvm"})
     ET.SubElement(domain, "name").text = spec.name
@@ -338,6 +363,14 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
     ET.SubElement(devices, "emulator").text = str(profile.emulator)
     root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False)
     ET.SubElement(root, "serial").text = spec.root_serial
+    transport_disk = _disk(
+        devices,
+        transport.host_path,
+        transport.target_dev,
+        "raw",
+        readonly=True,
+    )
+    ET.SubElement(transport_disk, "serial").text = transport.serial
     for layer in spec.layers:
         disk = _disk(devices, layer.host_path, layer.target_dev, "raw", readonly=True, shareable=True)
         ET.SubElement(disk, "serial").text = layer.serial

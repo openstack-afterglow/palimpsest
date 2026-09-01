@@ -421,6 +421,20 @@ Implemented:
 
 Scope boundary: this slice creates and verifies a real deterministic initramfs containing an executable `/init`, but that `/init` deliberately does not discover devices, mount ext4/SquashFS, assemble OverlayFS, pivot, resolve users, execute/supervise the OCI process, or signal readiness. It is not selected by the OCI-root domain planner, does not implement a per-run digest-bound plan transport, and does not authorize libvirt. Generic explicitly supplied host initramfs preview behavior remains compatible. Gate 2 remains inactive.
 
+### PR 4 slice 14: cycle-free per-run stage-1 plan transport
+
+Implemented:
+
+- The digest graph is explicit and acyclic: the durable OCI resource-plan digest `B` feeds a transport-independent domain-core digest `C`; the canonical stage-1 payload binds `B`, `C`, run identity, root generation/serial, ordered lower serials and process; its raw transport artifact has digest `T`; the final domain plan digest `D` binds the complete transport receipt and cmdline. `D` is never embedded back into the transport.
+- `OCIStage1Plan` v2 replaces the cyclic final-domain digest with `domain_core_digest`. Its wire still requires exact reconstruction from an expected domain plan, and the transport verifier compares against an independently constructed typed stage-1 projection rather than trusting a self-consistent payload.
+- The per-run transport is a bounded deterministic raw envelope: a fixed 64-byte little-endian header binds magic, version, header size, payload length and SHA-256; canonical UTF-8 JSON follows; the artifact is zero-padded to exactly one 4 KiB boundary. Receipt fields bind schema, format, device policy, payload/artifact digest and exact sizes.
+- OCI-root reserves `vdb` for the run-specific read-only, non-shareable transport disk and shifts ordered immutable lowers to `vdc..vdz`. OCI-root therefore supports at most 24 lowers while the generic cloud VM disk limit remains unchanged. Kernel cmdline fields separately bind resource/core/transport digests and the exact virtio serial; no host path is accepted by the guest contract.
+- Domain planning keeps only the path-free receipt, target and serial. At the pinned run-ledger mutation boundary, commit deterministically reconstructs the artifact, atomically publishes the owner-readable sealed (`0400`) `stage1-plan.raw`, verifies no-follow regular-file ownership/mode/link/size plus same-FD structure/digest and final metadata stability, and only then commits the domain plan. A verification failure leaves the prior `resources-ready` ledger retryable; a retry replaces the uncommitted run-owned artifact with the same deterministic bytes.
+- Every durable domain-plan load re-verifies the physical transport against the receipt and independently reconstructed stage-1 plan; a changed mode, inode shape, size, digest or payload is rejected. Future define/start must repeat this check at its own final handoff boundary. As with all owner-controlled state, this is fail-closed validation rather than an OS sandbox against a deliberately hostile same-UID process that can chmod or replace its own files.
+- Domain-plan decoding independently recomputes `C`, the complete stage-1 payload and exact `T` receipt. Cross-run replay, altered root/lower/process/core, receipt/serial/cmdline drift, malformed header/length/hash/JSON/padding, symlink/FIFO/hardlink/writable file and same-size byte tampering fail closed.
+
+Scope boundary: this is the **host delivery contract** only. The bootstrap `/init` still records `plan_transport=unimplemented`, does not discover or read `vdb`, and remains fail-closed. The XML remains a non-launching preview; no libvirt define/start, guest mount/pivot, PID 1 supervisor, foreground/`-d`, readiness, exec/log, or Gate 2 activation is included.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -441,7 +455,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Define and implement the per-run digest-bound stage-1 plan transport without creating a domain/initramfs digest cycle, then bind it at the domain mutation boundary.
-2. Replace the fail-closed bootstrap with the first-party device discovery, ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and PID 1 supervisor; prove it under privileged Linux/KVM tests.
+1. Teach the first-party bootstrap to parse trusted cmdline transport keys, discover exactly one read-only virtio block device by serial, verify the raw envelope/digest, and decode the stage-1 plan fail-closed under Linux/KVM tests.
+2. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
 3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

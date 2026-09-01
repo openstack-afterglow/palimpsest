@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import palimpsest_local.artifact_store as artifact_store_module
+import palimpsest_local.oci_root_kvm as oci_root_kvm_module
 import palimpsest_local.oci_root_prepare as oci_root_prepare_module
 import palimpsest_local.oci_store as oci_store_module
 import palimpsest_local.platforms as platforms
@@ -1664,25 +1665,38 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert load_oci_root_domain_plan(roots, "domain-plan") == plan
     assert str(tmp_path) not in json.dumps(plan.to_dict(), sort_keys=True)
     assert str(tmp_path) not in encoded
+    assert "stage1-plan.raw" not in encoded
     assert [layer["ordinal"] for layer in plan.layers] == [0, 1, 2]
     assert len({layer["serial"] for layer in plan.layers}) == 3
     assert len({layer["image_digest"] for layer in plan.layers}) == 1
-    assert [layer["target"] for layer in plan.layers] == ["vdb", "vdc", "vdd"]
+    assert [layer["target"] for layer in plan.layers] == ["vdc", "vdd", "vde"]
     assert "<kernel>" in resolved.xml and "<initrd>" in resolved.xml
     assert 'type="raw"' in resolved.xml and 'device="cdrom"' not in resolved.xml
     assert "palimpsest.root=virtio-" in plan.kernel_cmdline
-    assert f"palimpsest.plan={prepared.transaction.boot_plan_digest}" in plan.kernel_cmdline
+    assert f"palimpsest.resource={prepared.transaction.boot_plan_digest}" in plan.kernel_cmdline
+    assert f"palimpsest.core={plan.domain_core_digest}" in plan.kernel_cmdline
+    assert f"palimpsest.stage1={plan.stage1_transport['artifact_digest']}" in plan.kernel_cmdline
+    assert plan.stage1_transport["target"] == "vdb"
+    transport_path = roots.runs / "domain-plan" / "stage1-plan.raw"
+    assert transport_path.is_file()
+    assert transport_path.stat().st_mode & 0o777 == 0o400
     assert {layer["filesystem"] for layer in plan.layers} == {"squashfs"}
 
     stage1 = OCIStage1Plan.from_domain_plan(plan)
     assert OCIStage1Plan.from_dict(stage1.to_dict(), expected_domain_plan=plan) == stage1
     assert stage1.process.argv == ("/sbin/init",)
+    assert stage1.domain_core_digest == plan.domain_core_digest
+    assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
     tampered = deepcopy(plan.to_dict())
     tampered["layers"][0]["serial"] = "0" * 20
     with pytest.raises(StateError, match="order or identity"):
+        type(plan).from_dict(tampered)
+    tampered = deepcopy(plan.to_dict())
+    tampered["stage1_transport"]["artifact_digest"] = "sha256:" + "0" * 64
+    with pytest.raises(StateError, match="transport"):
         type(plan).from_dict(tampered)
     with pytest.raises(TypeError):
         plan.layers[0]["serial"] = "0" * 20
@@ -1709,6 +1723,14 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     stage1_wire["assembly"]["root"]["serial"] = "f" * 20 if original_serial != "f" * 20 else "e" * 20
     with pytest.raises(StateError, match="expected domain plan"):
         OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
+
+    corrupted_transport = bytearray(transport_path.read_bytes())
+    corrupted_transport[64] ^= 1
+    transport_path.chmod(0o600)
+    transport_path.write_bytes(corrupted_transport)
+    transport_path.chmod(0o400)
+    with pytest.raises(StateError, match="stage-1 transport"):
+        load_oci_root_domain_plan(roots, "domain-plan")
 
     release_prepared_oci_root_run(roots, prepared, store, runner=tools)
 
@@ -1749,6 +1771,52 @@ def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -
             platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64"),
             runner=tools,
         )
+
+
+def test_oci_root_domain_transport_commit_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store = _store(tmp_path)
+    tools = _RootVolumeTools()
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"070701payload")
+    boot = verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+    with reserve_new_run(roots, "transport-retry", _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            _image_materialization(store),
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+    resolved = build_oci_root_domain_plan(
+        roots,
+        prepared,
+        store,
+        boot,
+        platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64"),
+        runner=tools,
+    )
+
+    original_verify = oci_root_kvm_module.verify_stage1_transport_file
+
+    def fail_verify(*_args: object, **_kwargs: object) -> None:
+        raise StateError("injected stage-1 transport verification failure")
+
+    monkeypatch.setattr(oci_root_kvm_module, "verify_stage1_transport_file", fail_verify)
+    with pytest.raises(StateError, match="injected"):
+        commit_oci_root_domain_plan(roots, resolved, store, runner=tools)
+    assert "oci_root_domain" not in read_run_ledger_snapshot(roots, "transport-retry").state
+    assert (roots.runs / "transport-retry" / "stage1-plan.raw").is_file()
+
+    monkeypatch.setattr(oci_root_kvm_module, "verify_stage1_transport_file", original_verify)
+    plan = commit_oci_root_domain_plan(roots, resolved, store, runner=tools)
+    assert load_oci_root_domain_plan(roots, "transport-retry") == plan
 
 
 def test_oci_root_prepare_retains_and_reuses_exact_root_volume(tmp_path: Path) -> None:

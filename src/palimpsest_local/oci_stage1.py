@@ -13,17 +13,19 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
-from .kvm import MAX_LAYER_DISKS
+from .kvm import MAX_OCI_ROOT_LAYER_DISKS
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
-from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v1"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v1"
+if TYPE_CHECKING:
+    from .oci_root_kvm import OCIRootDomainPlan
+
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v2"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v2"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -64,7 +66,7 @@ class OCIStage1Plan:
     run_id: str
     run_name: str
     boot_plan_digest: str
-    domain_plan_digest: str
+    domain_core_digest: str
     root: Mapping[str, Any]
     layers: tuple[Mapping[str, Any], ...]
     process: OCIProcessSpec
@@ -76,7 +78,7 @@ class OCIStage1Plan:
             raise StateError("stage-1 run ID is invalid") from None
         if parsed != self.run_id or _RUN_NAME_RE.fullmatch(self.run_name or "") is None:
             raise StateError("stage-1 run identity is invalid")
-        for value in (self.boot_plan_digest, self.domain_plan_digest):
+        for value in (self.boot_plan_digest, self.domain_core_digest):
             if not _canonical_digest(value):
                 raise StateError("stage-1 plan digest is invalid") from None
         root = _plain(self.root)
@@ -101,7 +103,7 @@ class OCIStage1Plan:
             or _SERIAL_RE.fullmatch(root["serial"] if isinstance(root["serial"], str) else "") is None
         ):
             raise StateError("stage-1 root mount policy is invalid")
-        if not isinstance(self.layers, tuple) or not 1 <= len(self.layers) <= MAX_LAYER_DISKS:
+        if not isinstance(self.layers, tuple) or not 1 <= len(self.layers) <= MAX_OCI_ROOT_LAYER_DISKS:
             raise StateError("stage-1 lower contract is invalid")
         layers = tuple(_plain(layer) for layer in self.layers)
         serials = {root["serial"]}
@@ -132,30 +134,59 @@ class OCIStage1Plan:
         object.__setattr__(self, "layers", tuple(_freeze(layer) for layer in layers))
 
     @classmethod
+    def from_domain_resources(
+        cls,
+        *,
+        run_id: str,
+        run_name: str,
+        boot_plan_digest: str,
+        domain_core_digest: str,
+        root_volume: Mapping[str, Any],
+        layers: tuple[Mapping[str, Any], ...],
+        process: OCIProcessSpec,
+    ) -> OCIStage1Plan:
+        """Build the guest projection without depending on the final domain digest."""
+
+        try:
+            return cls(
+                run_id=run_id,
+                run_name=run_name,
+                boot_plan_digest=boot_plan_digest,
+                domain_core_digest=domain_core_digest,
+                root={
+                    "filesystem": root_volume["filesystem"],
+                    "generation": root_volume["generation"],
+                    "mount_options": ["rw", "nodev", "nosuid"],
+                    "serial": root_volume["serial"],
+                    "volume_id": root_volume["volume_id"],
+                },
+                layers=tuple(
+                    {
+                        "filesystem": layer["filesystem"],
+                        "mount_options": ["ro", "nodev", "nosuid"],
+                        "ordinal": layer["ordinal"],
+                        "serial": layer["serial"],
+                    }
+                    for layer in layers
+                ),
+                process=process,
+            )
+        except (KeyError, TypeError):
+            raise StateError("stage-1 domain resources are invalid") from None
+
+    @classmethod
     def from_domain_plan(cls, plan: OCIRootDomainPlan) -> OCIStage1Plan:
+        from .oci_root_kvm import OCIRootDomainPlan
+
         if not isinstance(plan, OCIRootDomainPlan):
             raise StateError("stage-1 requires an OCI-root domain plan")
-        return cls(
+        return cls.from_domain_resources(
             run_id=plan.run_id,
             run_name=plan.run_name,
             boot_plan_digest=plan.resource_plan_digest,
-            domain_plan_digest=plan.digest,
-            root={
-                "filesystem": plan.root_volume["filesystem"],
-                "generation": plan.root_volume["generation"],
-                "mount_options": ["rw", "nodev", "nosuid"],
-                "serial": plan.root_volume["serial"],
-                "volume_id": plan.root_volume["volume_id"],
-            },
-            layers=tuple(
-                {
-                    "filesystem": layer["filesystem"],
-                    "mount_options": ["ro", "nodev", "nosuid"],
-                    "ordinal": layer["ordinal"],
-                    "serial": layer["serial"],
-                }
-                for layer in plan.layers
-            ),
+            domain_core_digest=plan.domain_core_digest,
+            root_volume=plan.root_volume,
+            layers=plan.layers,
             process=plan.process,
         )
 
@@ -169,7 +200,7 @@ class OCIStage1Plan:
                 "root": _plain(self.root),
             },
             "boot_plan_digest": self.boot_plan_digest,
-            "domain_plan_digest": self.domain_plan_digest,
+            "domain_core_digest": self.domain_core_digest,
             "handoff": "first-party-pid1-supervisor-required",
             "phase": "stage1-contract",
             "process": self.process.to_dict(),
@@ -184,12 +215,14 @@ class OCIStage1Plan:
 
     @classmethod
     def from_dict(cls, value: Any, *, expected_domain_plan: OCIRootDomainPlan) -> OCIStage1Plan:
+        from .oci_root_kvm import OCIRootDomainPlan
+
         if not isinstance(expected_domain_plan, OCIRootDomainPlan):
             raise StateError("stage-1 wire requires an expected OCI-root domain plan")
         if not isinstance(value, Mapping) or set(value) != {
             "assembly",
             "boot_plan_digest",
-            "domain_plan_digest",
+            "domain_core_digest",
             "handoff",
             "phase",
             "process",
@@ -224,7 +257,7 @@ class OCIStage1Plan:
             run_id=run["run_id"],
             run_name=run["name"],
             boot_plan_digest=value["boot_plan_digest"],
-            domain_plan_digest=value["domain_plan_digest"],
+            domain_core_digest=value["domain_core_digest"],
             root=assembly["root"],
             layers=tuple(assembly["layers"]),
             process=process,

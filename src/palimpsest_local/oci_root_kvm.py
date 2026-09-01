@@ -23,10 +23,11 @@ from typing import Any
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
 from .kvm import (
-    MAX_LAYER_DISKS,
+    MAX_OCI_ROOT_LAYER_DISKS,
     KvmError,
     LayerDisk,
     OCIRootDomainSpec,
+    Stage1TransportDisk,
     build_oci_root_domain_xml,
 )
 from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
@@ -34,17 +35,36 @@ from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
 from .oci_root_volume import load_oci_root_volume
+from .oci_stage1 import OCIStage1Plan
+from .oci_stage1_transport import (
+    OCI_STAGE1_TRANSPORT_FILENAME,
+    OCIStage1TransportReceipt,
+    build_stage1_transport,
+    verify_stage1_transport_file,
+)
 from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
-from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot
+from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v2"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v3"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v1"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
+_TRANSPORT_RECEIPT_FIELDS = frozenset(
+    {
+        "artifact_digest",
+        "artifact_size_bytes",
+        "device_policy",
+        "format",
+        "payload_digest",
+        "payload_size_bytes",
+        "schema",
+    }
+)
 
 
 def _canonical_digest(value: Any, message: str) -> str:
@@ -89,6 +109,35 @@ def _frozen_json_object(value: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _serial(namespace: str, identity: str) -> str:
     return hashlib.sha256(f"palimpsest-oci-root-{namespace}-v1\0{identity}".encode()).hexdigest()[:20]
+
+
+def _domain_core_dict(
+    *,
+    run_id: str,
+    run_name: str,
+    resource_plan_digest: str,
+    lower_lease_set_id: str,
+    lower_graph_digest: str,
+    boot_artifacts: Mapping[str, Any],
+    root_volume: Mapping[str, Any],
+    layers: tuple[Mapping[str, Any], ...],
+    process: OCIProcessSpec,
+    memory_mib: int,
+    vcpus: int,
+    network: str | None,
+) -> dict[str, Any]:
+    return {
+        "boot_artifacts": _plain_json(boot_artifacts),
+        "layers": _plain_json(layers),
+        "lower_graph_digest": lower_graph_digest,
+        "lower_lease_set_id": lower_lease_set_id,
+        "machine": {"memory_mib": memory_mib, "network": network, "vcpus": vcpus},
+        "process": process.to_dict(),
+        "resource_plan_digest": resource_plan_digest,
+        "root_volume": _plain_json(root_volume),
+        "run": {"backend": "kvm", "name": run_name, "run_id": run_id, "runtime_kind": "oci-root"},
+        "schema": OCI_ROOT_DOMAIN_CORE_SCHEMA,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,9 +334,11 @@ class OCIRootDomainPlan:
     run_id: str
     run_name: str
     resource_plan_digest: str
+    domain_core_digest: str
     lower_lease_set_id: str
     lower_graph_digest: str
     boot_artifacts: Mapping[str, Any]
+    stage1_transport: Mapping[str, Any]
     root_volume: Mapping[str, Any]
     layers: tuple[Mapping[str, Any], ...]
     process: OCIProcessSpec
@@ -305,6 +356,7 @@ class OCIRootDomainPlan:
             raise StateError("OCI-root domain plan run identity is invalid")
         for value, message in (
             (self.resource_plan_digest, "OCI-root resource plan digest is invalid"),
+            (self.domain_core_digest, "OCI-root domain core digest is invalid"),
             (self.lower_lease_set_id, "OCI-root lower lease-set ID is invalid"),
             (self.lower_graph_digest, "OCI-root lower graph digest is invalid"),
         ):
@@ -347,7 +399,7 @@ class OCIRootDomainPlan:
             or root["generation"] < 1
         ):
             raise StateError("OCI-root domain root volume identity is invalid")
-        if not isinstance(self.layers, tuple) or not self.layers or len(self.layers) > MAX_LAYER_DISKS:
+        if not isinstance(self.layers, tuple) or not self.layers or len(self.layers) > MAX_OCI_ROOT_LAYER_DISKS:
             raise StateError("OCI-root domain lower layers are invalid")
         if not isinstance(self.process, OCIProcessSpec):
             raise StateError("OCI-root domain process contract is invalid")
@@ -371,7 +423,7 @@ class OCIRootDomainPlan:
             serial = layer.get("serial")
             if (
                 layer.get("ordinal") != ordinal
-                or layer.get("target") != f"vd{chr(ord('b') + ordinal)}"
+                or layer.get("target") != f"vd{chr(ord('c') + ordinal)}"
                 or layer.get("filesystem") != "squashfs"
                 or _SERIAL_RE.fullmatch(serial if isinstance(serial, str) else "") is None
                 or serial != _serial("lower", str(layer.get("occurrence_digest", "")))
@@ -383,6 +435,24 @@ class OCIRootDomainPlan:
             _canonical_digest(layer["image_digest"], "OCI-root domain lower image digest is invalid")
             _canonical_digest(layer["occurrence_digest"], "OCI-root domain occurrence digest is invalid")
             serials.add(serial)
+        transport = dict(self.stage1_transport) if isinstance(self.stage1_transport, Mapping) else {}
+        if set(transport) != _TRANSPORT_RECEIPT_FIELDS | {"serial", "target"}:
+            raise StateError("OCI-root stage-1 transport fields are invalid")
+        try:
+            transport_receipt = OCIStage1TransportReceipt.from_dict(
+                {key: transport[key] for key in _TRANSPORT_RECEIPT_FIELDS}
+            )
+        except ArtifactValidationError:
+            raise StateError("OCI-root stage-1 transport receipt is invalid") from None
+        transport_serial = transport.get("serial")
+        if (
+            transport.get("target") != "vdb"
+            or _SERIAL_RE.fullmatch(transport_serial if isinstance(transport_serial, str) else "") is None
+            or transport_serial != _serial("stage1-transport", transport_receipt.artifact_digest)
+            or transport_serial in serials
+        ):
+            raise StateError("OCI-root stage-1 transport identity is invalid")
+        serials.add(transport_serial)
         if not 256 <= self.memory_mib <= 1_048_576 or not 1 <= self.vcpus <= 256:
             raise StateError("OCI-root domain compute shape is invalid")
         if self.network is not None and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,62}", self.network) is None:
@@ -390,18 +460,54 @@ class OCIRootDomainPlan:
         expected_lowers = ",".join(f"virtio-{layer['serial']}" for layer in self.layers)
         expected_cmdline = (
             "console=ttyS0,115200n8 panic=1 rdinit=/init "
-            f"palimpsest.plan={self.resource_plan_digest} "
+            f"palimpsest.resource={self.resource_plan_digest} "
+            f"palimpsest.core={self.domain_core_digest} "
+            f"palimpsest.stage1={transport_receipt.artifact_digest} "
+            f"palimpsest.stage1dev=virtio-{transport_serial} "
             f"palimpsest.root=virtio-{root['serial']} palimpsest.lowers={expected_lowers}"
         )
         if self.kernel_cmdline != expected_cmdline or len(self.kernel_cmdline) > 4096:
             raise StateError("OCI-root domain kernel command line is invalid")
+        expected_core = _json_digest(
+            _domain_core_dict(
+                run_id=self.run_id,
+                run_name=self.run_name,
+                resource_plan_digest=self.resource_plan_digest,
+                lower_lease_set_id=self.lower_lease_set_id,
+                lower_graph_digest=self.lower_graph_digest,
+                boot_artifacts=boot,
+                root_volume=root,
+                layers=tuple(self.layers),
+                process=self.process,
+                memory_mib=self.memory_mib,
+                vcpus=self.vcpus,
+                network=self.network,
+            ),
+            "OCI-root domain core is not canonical",
+        )
+        if expected_core != self.domain_core_digest:
+            raise StateError("OCI-root domain core binding is invalid")
+        expected_stage1 = OCIStage1Plan.from_domain_resources(
+            run_id=self.run_id,
+            run_name=self.run_name,
+            boot_plan_digest=self.resource_plan_digest,
+            domain_core_digest=self.domain_core_digest,
+            root_volume=root,
+            layers=tuple(self.layers),
+            process=self.process,
+        )
+        expected_transport = build_stage1_transport(expected_stage1)
+        if expected_transport.receipt != transport_receipt:
+            raise StateError("OCI-root stage-1 transport payload binding is invalid")
         object.__setattr__(self, "boot_artifacts", _frozen_json_object(boot))
+        object.__setattr__(self, "stage1_transport", _frozen_json_object(transport))
         object.__setattr__(self, "root_volume", _frozen_json_object(root))
         object.__setattr__(self, "layers", tuple(_frozen_json_object(dict(layer)) for layer in self.layers))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "boot_artifacts": _plain_json(self.boot_artifacts),
+            "domain_core_digest": self.domain_core_digest,
             "kernel_cmdline": self.kernel_cmdline,
             "layers": _plain_json(self.layers),
             "lower_graph_digest": self.lower_graph_digest,
@@ -413,6 +519,7 @@ class OCIRootDomainPlan:
             "root_volume": _plain_json(self.root_volume),
             "run": {"backend": "kvm", "name": self.run_name, "run_id": self.run_id, "runtime_kind": "oci-root"},
             "schema": OCI_ROOT_DOMAIN_PLAN_SCHEMA,
+            "stage1_transport": _plain_json(self.stage1_transport),
         }
 
     @property
@@ -423,6 +530,7 @@ class OCIRootDomainPlan:
     def from_dict(cls, value: Any) -> OCIRootDomainPlan:
         expected = {
             "boot_artifacts",
+            "domain_core_digest",
             "kernel_cmdline",
             "layers",
             "lower_graph_digest",
@@ -434,6 +542,7 @@ class OCIRootDomainPlan:
             "root_volume",
             "run",
             "schema",
+            "stage1_transport",
         }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise StateError("OCI-root domain plan fields are invalid")
@@ -457,9 +566,11 @@ class OCIRootDomainPlan:
                 run_id=run["run_id"],
                 run_name=run["name"],
                 resource_plan_digest=value["resource_plan_digest"],
+                domain_core_digest=value["domain_core_digest"],
                 lower_lease_set_id=value["lower_lease_set_id"],
                 lower_graph_digest=value["lower_graph_digest"],
                 boot_artifacts=value["boot_artifacts"],
+                stage1_transport=value["stage1_transport"],
                 root_volume=value["root_volume"],
                 layers=tuple(value["layers"]),
                 process=OCIProcessSpec.from_dict(value["process"]),
@@ -563,6 +674,14 @@ def build_oci_root_domain_plan(
     ):
         raise StateError("OCI-root domain root volume binding is invalid")
     root_serial = _serial("root", root.volume_id)
+    root_contract = {
+        "filesystem": "ext4",
+        "generation": root.generation,
+        "serial": root_serial,
+        "size_bytes": root.size_bytes,
+        "target": "vda",
+        "volume_id": root.volume_id,
+    }
     layers: list[dict[str, Any]] = []
     layer_disks: list[LayerDisk] = []
     serials = {root_serial}
@@ -572,7 +691,7 @@ def build_oci_root_domain_plan(
         if serial in serials:
             raise StateError("OCI-root domain disk serial collision")
         serials.add(serial)
-        target = f"vd{chr(ord('b') + member.ordinal)}"
+        target = f"vd{chr(ord('c') + member.ordinal)}"
         path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
         layers.append(
             {
@@ -586,34 +705,65 @@ def build_oci_root_domain_plan(
             }
         )
         layer_disks.append(LayerDisk(receipt.image_digest, path, target, serial))
+    process = OCIProcessSpec.from_dict(transaction.boot_plan["process"])
+    core = _domain_core_dict(
+        run_id=transaction.owner.run_id,
+        run_name=transaction.owner.run_name,
+        resource_plan_digest=transaction.boot_plan_digest,
+        lower_lease_set_id=transaction.lower_lease_set_id,
+        lower_graph_digest=transaction.lower_graph_digest,
+        boot_artifacts=boot_artifacts.to_dict(),
+        root_volume=root_contract,
+        layers=tuple(layers),
+        process=process,
+        memory_mib=memory_mib,
+        vcpus=vcpus,
+        network=network,
+    )
+    domain_core_digest = _json_digest(core, "OCI-root domain core is not canonical")
+    stage1_plan = OCIStage1Plan.from_domain_resources(
+        run_id=transaction.owner.run_id,
+        run_name=transaction.owner.run_name,
+        boot_plan_digest=transaction.boot_plan_digest,
+        domain_core_digest=domain_core_digest,
+        root_volume=root_contract,
+        layers=tuple(layers),
+        process=process,
+    )
+    transport = build_stage1_transport(stage1_plan)
+    transport_serial = _serial("stage1-transport", transport.receipt.artifact_digest)
+    transport_contract = {
+        **transport.receipt.to_dict(),
+        "serial": transport_serial,
+        "target": "vdb",
+    }
     lower_ids = ",".join(f"virtio-{layer['serial']}" for layer in layers)
     cmdline = (
         "console=ttyS0,115200n8 panic=1 rdinit=/init "
-        f"palimpsest.plan={transaction.boot_plan_digest} "
+        f"palimpsest.resource={transaction.boot_plan_digest} "
+        f"palimpsest.core={domain_core_digest} "
+        f"palimpsest.stage1={transport.receipt.artifact_digest} "
+        f"palimpsest.stage1dev=virtio-{transport_serial} "
         f"palimpsest.root=virtio-{root_serial} palimpsest.lowers={lower_ids}"
     )
     plan = OCIRootDomainPlan(
-        transaction.owner.run_id,
-        transaction.owner.run_name,
-        transaction.boot_plan_digest,
-        transaction.lower_lease_set_id,
-        transaction.lower_graph_digest,
-        boot_artifacts.to_dict(),
-        {
-            "filesystem": "ext4",
-            "generation": root.generation,
-            "serial": root_serial,
-            "size_bytes": root.size_bytes,
-            "target": "vda",
-            "volume_id": root.volume_id,
-        },
-        tuple(layers),
-        OCIProcessSpec.from_dict(transaction.boot_plan["process"]),
-        memory_mib,
-        vcpus,
-        network,
-        cmdline,
+        run_id=transaction.owner.run_id,
+        run_name=transaction.owner.run_name,
+        resource_plan_digest=transaction.boot_plan_digest,
+        domain_core_digest=domain_core_digest,
+        lower_lease_set_id=transaction.lower_lease_set_id,
+        lower_graph_digest=transaction.lower_graph_digest,
+        boot_artifacts=boot_artifacts.to_dict(),
+        stage1_transport=transport_contract,
+        root_volume=root_contract,
+        layers=tuple(layers),
+        process=process,
+        memory_mib=memory_mib,
+        vcpus=vcpus,
+        network=network,
+        kernel_cmdline=cmdline,
     )
+    transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
     spec = OCIRootDomainSpec(
         name=plan.run_name,
         memory_mib=memory_mib,
@@ -624,6 +774,12 @@ def build_oci_root_domain_plan(
         root_disk=verified_root.path,
         root_serial=root_serial,
         layers=tuple(layer_disks),
+        stage1_transport=Stage1TransportDisk(
+            transport.receipt.artifact_digest,
+            transport_path,
+            "vdb",
+            transport_serial,
+        ),
         network=network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
@@ -681,7 +837,7 @@ def commit_oci_root_domain_plan(
     for member in leases.members:
         receipt = member.receipt
         serial = _serial("lower", receipt.occurrence_digest)
-        target = f"vd{chr(ord('b') + member.ordinal)}"
+        target = f"vd{chr(ord('c') + member.ordinal)}"
         path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
         expected_layers.append(
             {
@@ -727,6 +883,25 @@ def commit_oci_root_domain_plan(
     )
     if boot.to_dict() != _plain_json(plan.boot_artifacts):
         raise StateError("OCI-root domain plan boot artifact binding is invalid")
+    try:
+        transport_receipt = OCIStage1TransportReceipt.from_dict(
+            {key: plan.stage1_transport[key] for key in _TRANSPORT_RECEIPT_FIELDS}
+        )
+    except (ArtifactValidationError, KeyError, TypeError):
+        raise StateError("OCI-root stage-1 transport receipt binding is invalid") from None
+    expected_stage1 = OCIStage1Plan.from_domain_plan(plan)
+    built_transport = build_stage1_transport(expected_stage1)
+    expected_transport_contract = {
+        **built_transport.receipt.to_dict(),
+        "serial": _serial("stage1-transport", built_transport.receipt.artifact_digest),
+        "target": "vdb",
+    }
+    if (
+        transport_receipt != built_transport.receipt
+        or _plain_json(plan.stage1_transport) != expected_transport_contract
+    ):
+        raise StateError("OCI-root stage-1 transport projection is invalid")
+    transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
     expected_spec = OCIRootDomainSpec(
         name=plan.run_name,
         memory_mib=plan.memory_mib,
@@ -737,6 +912,12 @@ def commit_oci_root_domain_plan(
         root_disk=verified_root.path,
         root_serial=str(plan.root_volume["serial"]),
         layers=tuple(expected_disks),
+        stage1_transport=Stage1TransportDisk(
+            built_transport.receipt.artifact_digest,
+            transport_path,
+            "vdb",
+            str(plan.stage1_transport["serial"]),
+        ),
         network=plan.network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
@@ -751,6 +932,14 @@ def commit_oci_root_domain_plan(
         data = mutation.mutable_state()
         if "oci_root_domain" in data:
             raise StateError("OCI-root domain plan is already committed")
+        mutation.write_file(OCI_STAGE1_TRANSPORT_FILENAME, built_transport.artifact, mode=0o400)
+        verified_transport = verify_stage1_transport_file(
+            transport_path,
+            built_transport.receipt,
+            expected_stage1_plan=expected_stage1,
+        )
+        if verified_transport.plan != expected_stage1:
+            raise StateError("OCI-root stage-1 transport changed during commit")
         data.pop("status", None)
         data.pop("lifecycle_revision", None)
         data["oci_root_domain"] = {"digest": plan.digest, "plan": plan.to_dict()}
@@ -767,6 +956,20 @@ def load_oci_root_domain_plan(roots: StatePaths, name: str) -> OCIRootDomainPlan
     digest = _canonical_digest(value.get("digest"), "OCI-root domain plan ledger digest is invalid")
     if digest != plan.digest or plan.run_id != snapshot.record.run_id or plan.run_name != snapshot.record.name:
         raise StateError("OCI-root domain plan ledger binding is invalid")
+    try:
+        transport_receipt = OCIStage1TransportReceipt.from_dict(
+            {key: plan.stage1_transport[key] for key in _TRANSPORT_RECEIPT_FIELDS}
+        )
+    except (ArtifactValidationError, KeyError, TypeError):
+        raise StateError("OCI-root stage-1 transport ledger binding is invalid") from None
+    expected_stage1 = OCIStage1Plan.from_domain_plan(plan)
+    verified_transport = verify_stage1_transport_file(
+        run_paths(roots, name).root / OCI_STAGE1_TRANSPORT_FILENAME,
+        transport_receipt,
+        expected_stage1_plan=expected_stage1,
+    )
+    if verified_transport.plan != expected_stage1:
+        raise StateError("OCI-root stage-1 transport ledger projection is invalid")
     return plan
 
 

@@ -22,6 +22,7 @@ from palimpsest_local.kvm import (
     KvmUnavailable,
     LayerDisk,
     OCIRootDomainSpec,
+    Stage1TransportDisk,
     VolumeDisk,
     build_domain_xml,
     build_hdiutil_seed_command,
@@ -90,8 +91,14 @@ def _oci_root_spec() -> OCIRootDomainSpec:
         root_disk=Path("/var/lib/palimpsest/roots/demo.raw"),
         root_serial="11111111111111111111",
         layers=(
-            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdb", "22222222222222222222"),
-            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdc", "33333333333333333333"),
+            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdc", "22222222222222222222"),
+            LayerDisk(_DIGESTS[0], Path("/var/lib/palimpsest/store/a"), "vdd", "33333333333333333333"),
+        ),
+        stage1_transport=Stage1TransportDisk(
+            "sha256:" + "5" * 64,
+            Path("/var/lib/palimpsest/runs/oci-demo/stage1-plan.raw"),
+            "vdb",
+            "44444444444444444444",
         ),
         run_id="f6f546e2-e734-4920-9eff-1762b348a249",
         boot_contract_digest="sha256:" + "4" * 64,
@@ -105,19 +112,22 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     assert xml.findtext("./os/initrd") == "/var/lib/palimpsest/boot/initramfs"
     assert xml.find("./os/boot") is None
     disks = xml.findall("./devices/disk")
-    assert len(disks) == 3
+    assert len(disks) == 4
     assert all(disk.get("device") == "disk" for disk in disks)
     root = disks[0]
     assert root.find("target").attrib == {"dev": "vda", "bus": "virtio"}
+    assert [disk.find("target").get("dev") for disk in disks] == ["vda", "vdb", "vdc", "vdd"]
     assert root.find("driver").get("type") == "raw"
     assert root.find("readonly") is None
     assert [disk.findtext("serial") for disk in disks] == [
         "11111111111111111111",
+        "44444444444444444444",
         "22222222222222222222",
         "33333333333333333333",
     ]
     assert all(disk.find("readonly") is not None for disk in disks[1:])
-    assert all(disk.find("shareable") is not None for disk in disks[1:])
+    assert disks[1].find("shareable") is None
+    assert all(disk.find("shareable") is not None for disk in disks[2:])
     marker = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
     assert marker is not None and marker.get("contract") == "sha256:" + "4" * 64
 
@@ -129,6 +139,17 @@ def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
     reordered = (spec.layers[1], spec.layers[0])
     with pytest.raises(KvmError, match="order or identity"):
         build_oci_root_domain_xml(OCIRootDomainSpec(**{**spec.__dict__, "layers": reordered}), _X86_PROFILE)
+    wrong_transport = Stage1TransportDisk(
+        spec.stage1_transport.artifact_digest,
+        spec.stage1_transport.host_path,
+        "vdc",
+        spec.stage1_transport.serial,
+    )
+    with pytest.raises(KvmError, match="transport identity"):
+        build_oci_root_domain_xml(
+            OCIRootDomainSpec(**{**spec.__dict__, "stage1_transport": wrong_transport}),
+            _X86_PROFILE,
+        )
 
 
 def test_host_boot_artifact_policy_hashes_valid_explicit_files(tmp_path: Path):

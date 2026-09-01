@@ -706,9 +706,11 @@ def _read_exact_private_file(
     filename: str,
     *,
     max_bytes: int = _MAX_RUN_LEDGER_BYTES,
+    expected_mode: int = 0o600,
 ) -> bytes:
     """Read one writer-owned file while proving inode and metadata stability."""
-    expected_mode = 0o600
+    if type(expected_mode) is not int or expected_mode not in {0o400, 0o600}:
+        raise StateError("invalid private file verification mode")
     entry_before = _safe_stat(filename, directory_fd=directory_fd)
     if (
         entry_before is None
@@ -1539,11 +1541,11 @@ class ExistingRunMutation:
         with artifact_reference_guard(self._roots):
             return _write_existing_run_mutation_state(self, status, data)
 
-    def write_file(self, relative_name: str, content: bytes) -> None:
-        _write_existing_run_file(self, relative_name, content, append=False)
+    def write_file(self, relative_name: str, content: bytes, *, mode: int = 0o600) -> None:
+        _write_existing_run_file(self, relative_name, content, append=False, mode=mode)
 
     def append_file(self, relative_name: str, content: bytes) -> None:
-        _write_existing_run_file(self, relative_name, content, append=True)
+        _write_existing_run_file(self, relative_name, content, append=True, mode=0o600)
 
     def delete_run_tree(self) -> None:
         _delete_existing_run_tree(self)
@@ -1669,8 +1671,14 @@ def _write_existing_run_file(
     content: bytes,
     *,
     append: bool,
+    mode: int,
 ) -> None:
-    if not isinstance(content, bytes):
+    if (
+        not isinstance(content, bytes)
+        or type(mode) is not int
+        or mode not in {0o400, 0o600}
+        or (append and mode != 0o600)
+    ):
         raise StateError("invalid existing run file payload")
     components = _safe_relative_components(relative_name)
     mutation.verify_binding()
@@ -1731,8 +1739,8 @@ def _write_existing_run_file(
         else:
             temporary = f".artifact-mutation-{uuid.uuid4().hex}"
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-            file_fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
-            os.fchmod(file_fd, 0o600)
+            file_fd = os.open(temporary, flags, mode, dir_fd=parent_fd)
+            os.fchmod(file_fd, mode)
             _write_all(file_fd, content)
             os.fsync(file_fd)
             staged = _safe_fstat(file_fd)
@@ -1741,7 +1749,7 @@ def _write_existing_run_file(
                 or not stat_module.S_ISREG(staged.st_mode)
                 or staged.st_uid != os.geteuid()
                 or staged.st_nlink != 1
-                or stat_module.S_IMODE(staged.st_mode) != 0o600
+                or stat_module.S_IMODE(staged.st_mode) != mode
             ):
                 raise StateError("cannot securely write existing run file")
             mutation.verify_binding()
@@ -1752,7 +1760,13 @@ def _write_existing_run_file(
             if (
                 published is None
                 or _identity(published) != _identity(staged)
-                or _read_exact_private_file(parent_fd, components[-1], max_bytes=max(len(content), 1)) != content
+                or _read_exact_private_file(
+                    parent_fd,
+                    components[-1],
+                    max_bytes=max(len(content), 1),
+                    expected_mode=mode,
+                )
+                != content
             ):
                 raise StateError("existing run file changed during write")
         mutation.verify_binding()
