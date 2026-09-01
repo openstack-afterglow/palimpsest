@@ -130,10 +130,10 @@ def test_bootstrap_manifest_is_canonical_path_free_and_explicitly_not_root_assem
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "plan-consumer-fail-closed"
+    assert value["stage1"]["capability"] == "pre-mount-device-set-consumer-fail-closed"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v1"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v2"
     assert value["stage1"]["root_assembly"] is False
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered

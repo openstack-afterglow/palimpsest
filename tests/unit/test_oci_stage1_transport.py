@@ -16,7 +16,7 @@ import pytest
 from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.kvm import MAX_OCI_ROOT_LAYER_DISKS
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
-from palimpsest_local.oci_stage1 import OCIStage1Plan
+from palimpsest_local.oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from palimpsest_local.oci_stage1_transport import (
     OCIStage1TransportReceipt,
     build_stage1_transport,
@@ -42,15 +42,19 @@ def _plan(*, run_name: str = "transport-demo", layers: int = 2) -> OCIStage1Plan
             "filesystem": "ext4",
             "generation": 3,
             "mount_options": ["rw", "nodev", "nosuid"],
-            "serial": "1" * 20,
+            "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
+            "size_bytes": 16 * 1024 * 1024,
             "volume_id": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
         },
         layers=tuple(
             {
                 "filesystem": "squashfs",
+                "image_digest": f"sha256:{ordinal + 2:064x}",
                 "mount_options": ["ro", "nodev", "nosuid"],
+                "occurrence_digest": f"sha256:{ordinal + 100:064x}",
                 "ordinal": ordinal,
-                "serial": f"{ordinal + 2:020x}",
+                "serial": oci_stage1_device_serial("lower", f"sha256:{ordinal + 100:064x}"),
+                "size_bytes": 4096 * (ordinal + 1),
             }
             for ordinal in range(layers)
         ),
@@ -102,15 +106,19 @@ def test_stage1_transport_is_deterministic_in_a_fresh_process() -> None:
     built = build_stage1_transport(_plan())
     script = """
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
-from palimpsest_local.oci_stage1 import OCIStage1Plan
+from palimpsest_local.oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
 plan = OCIStage1Plan(
     run_id="f6f546e2-e734-4920-9eff-1762b348a249", run_name="transport-demo",
     boot_plan_digest="sha256:" + "a" * 64, domain_core_digest="sha256:" + "b" * 64,
     root={"filesystem":"ext4","generation":3,"mount_options":["rw","nodev","nosuid"],
-          "serial":"1"*20,"volume_id":"1fd7a60e-fdb2-4877-91d3-148bbca3884f"},
-    layers=tuple({"filesystem":"squashfs","mount_options":["ro","nodev","nosuid"],
-                  "ordinal":i,"serial":f"{i+2:020x}"} for i in range(2)),
+          "serial":oci_stage1_device_serial("root","1fd7a60e-fdb2-4877-91d3-148bbca3884f"),"size_bytes":16777216,
+          "volume_id":"1fd7a60e-fdb2-4877-91d3-148bbca3884f"},
+    layers=tuple({"filesystem":"squashfs","image_digest":f"sha256:{i+2:064x}",
+                  "mount_options":["ro","nodev","nosuid"],
+                  "occurrence_digest":f"sha256:{i+100:064x}",
+                  "ordinal":i,"serial":oci_stage1_device_serial("lower",f"sha256:{i+100:064x}"),
+                  "size_bytes":4096*(i+1)} for i in range(2)),
     process=OCIProcessSpec(("/usr/bin/demo","--serve"),(("LANG","C.UTF-8"),),"/srv",
                            OCIUserSpec("1000","1000"),15),
 )
@@ -177,6 +185,7 @@ def test_stage1_transport_rejects_self_consistent_cross_run_replay() -> None:
 def test_stage1_transport_receipt_is_exact_and_layer_budget_reserves_plan_disk() -> None:
     receipt = build_stage1_transport(_plan()).receipt
     assert OCIStage1TransportReceipt.from_dict(receipt.to_dict()) == receipt
+    assert len(build_stage1_transport(_plan(layers=MAX_OCI_ROOT_LAYER_DISKS)).stage1_plan.layers) == 24
 
     value = receipt.to_dict()
     value["unknown"] = True
@@ -184,6 +193,29 @@ def test_stage1_transport_receipt_is_exact_and_layer_budget_reserves_plan_disk()
         OCIStage1TransportReceipt.from_dict(value)
     with pytest.raises(StateError, match="lower contract"):
         _plan(layers=MAX_OCI_ROOT_LAYER_DISKS + 1)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda root, _layers: root.__setitem__("size_bytes", True),
+        lambda root, _layers: root.__setitem__("size_bytes", 16 * 1024 * 1024 - 512),
+        lambda root, _layers: root.__setitem__("serial", "f" * 20),
+        lambda _root, layers: layers[0].__setitem__("size_bytes", True),
+        lambda _root, layers: layers[0].__setitem__("size_bytes", 513),
+        lambda _root, layers: layers[0].__setitem__("size_bytes", 32 * 1024**3 + 512),
+        lambda _root, layers: layers[0].__setitem__("occurrence_digest", "sha256:" + "f" * 64),
+        lambda _root, layers: layers[0].__setitem__("ordinal", 1),
+    ],
+)
+def test_stage1_plan_rejects_block_identity_size_and_ordinal_drift(mutate: object) -> None:
+    plan = _plan()
+    root = dict(plan.root)
+    layers = [dict(layer) for layer in plan.layers]
+    mutate(root, layers)  # type: ignore[operator]
+
+    with pytest.raises(StateError, match="root mount policy|lower mount policy"):
+        replace(plan, root=root, layers=tuple(layers))
 
 
 def test_stage1_transport_covers_worst_case_canonical_process_escaping() -> None:

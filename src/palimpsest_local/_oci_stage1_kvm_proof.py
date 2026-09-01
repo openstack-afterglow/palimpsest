@@ -28,10 +28,10 @@ from .errors import ArtifactValidationError, StateError
 from .oci_initramfs import OCI_BOOTSTRAP_STAGE1_CONTRACT, build_bootstrap_initramfs
 from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_provenance import canonical_json_bytes
-from .oci_stage1 import OCIStage1Plan
+from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v1"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v2"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -41,8 +41,8 @@ MAX_CONSOLE_BYTES = 4 * 1024 * 1024
 DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # Do not include the line ending: a real 8250 console commonly maps LF to
 # CRLF, while the pipe-based pure test preserves LF exactly.
-SUCCESS_MARKER = b"palimpsest guest stage1: transport verified; root assembly disabled; waiting fail-closed"
-REJECTION_MARKER = b"palimpsest guest stage1: transport rejected; waiting fail-closed"
+SUCCESS_MARKER = b"palimpsest guest stage1: pre-mount device set verified; root assembly disabled; waiting fail-closed"
+REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
 PREPARATION_FAILURE_MARKER = b"palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed"
 
 KERNEL_ENV = "PALIMPSEST_KVM_KERNEL"
@@ -319,15 +319,28 @@ def build_proof_plan() -> OCIStage1Plan:
             "filesystem": "ext4",
             "generation": 1,
             "mount_options": ["rw", "nodev", "nosuid"],
-            "serial": "1" * 20,
+            "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
+            "size_bytes": 16 * 1024 * 1024,
             "volume_id": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
         },
         layers=(
             {
                 "filesystem": "squashfs",
+                "image_digest": "sha256:" + "2" * 64,
                 "mount_options": ["ro", "nodev", "nosuid"],
+                "occurrence_digest": "sha256:" + "3" * 64,
                 "ordinal": 0,
-                "serial": "2" * 20,
+                "serial": oci_stage1_device_serial("lower", "sha256:" + "3" * 64),
+                "size_bytes": 4096,
+            },
+            {
+                "filesystem": "squashfs",
+                "image_digest": "sha256:" + "4" * 64,
+                "mount_options": ["ro", "nodev", "nosuid"],
+                "occurrence_digest": "sha256:" + "5" * 64,
+                "ordinal": 1,
+                "serial": oci_stage1_device_serial("lower", "sha256:" + "5" * 64),
+                "size_bytes": 8192,
             },
         ),
         process=OCIProcessSpec(("/sbin/init",), (("LANG", "C.UTF-8"),), "/", OCIUserSpec("0", "0"), 15),
@@ -366,22 +379,27 @@ def build_qemu_command(
     kernel_path: Path,
     initramfs_path: Path,
     transport_path: Path,
+    root_path: Path,
+    lower_paths: tuple[Path, ...],
+    plan: OCIStage1Plan,
     cmdline: str,
     serial: str,
     transport_readonly: bool = True,
 ) -> tuple[str, ...]:
-    paths = (qemu_path, kernel_path, initramfs_path, transport_path)
+    paths = (qemu_path, kernel_path, initramfs_path, transport_path, root_path, *lower_paths)
     if any(not isinstance(path, Path) or not path.is_absolute() for path in paths):
         raise ArtifactValidationError("KVM proof command path is invalid")
     if (
         not isinstance(cmdline, str)
         or not cmdline
+        or not isinstance(plan, OCIStage1Plan)
+        or len(lower_paths) != len(plan.layers)
         or not isinstance(serial, str)
         or _SERIAL_RE.fullmatch(serial) is None
     ):
         raise ArtifactValidationError("KVM proof command binding is invalid")
     readonly = "on" if transport_readonly else "off"
-    return (
+    command = (
         os.fspath(qemu_path),
         "-accel",
         "kvm",
@@ -412,11 +430,73 @@ def build_qemu_command(
         os.fspath(initramfs_path),
         "-append",
         cmdline,
+    )
+    # Deliberately permute role order so the proof cannot accidentally rely on
+    # vda/vdb positions instead of authenticated virtio serials.
+    first_lower = plan.layers[0]
+    command += (
+        "-drive",
+        f"if=none,file={lower_paths[0]},format=raw,readonly=on,id=lower0",
+        "-device",
+        f"virtio-blk-pci,drive=lower0,serial={first_lower['serial']}",
         "-drive",
         f"if=none,file={transport_path},format=raw,readonly={readonly},id=stage1",
         "-device",
         f"virtio-blk-pci,drive=stage1,serial={serial}",
+        "-drive",
+        f"if=none,file={root_path},format=raw,readonly=off,id=root",
+        "-device",
+        f"virtio-blk-pci,drive=root,serial={plan.root['serial']}",
     )
+    for index, (path, layer) in enumerate(zip(lower_paths[1:], plan.layers[1:], strict=True), 1):
+        command += (
+            "-drive",
+            f"if=none,file={path},format=raw,readonly=on,id=lower{index}",
+            "-device",
+            f"virtio-blk-pci,drive=lower{index},serial={layer['serial']}",
+        )
+    return command
+
+
+def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
+    if not isinstance(plan, OCIStage1Plan) or plan.to_dict() != build_proof_plan().to_dict():
+        raise ArtifactValidationError("KVM proof topology plan is invalid")
+
+    def zero_digest(size_bytes: int) -> str:
+        hasher = hashlib.sha256()
+        chunk = b"\0" * min(size_bytes, 1024 * 1024)
+        remaining = size_bytes
+        while remaining:
+            piece = chunk[: min(len(chunk), remaining)]
+            hasher.update(piece)
+            remaining -= len(piece)
+        return f"sha256:{hasher.hexdigest()}"
+
+    devices = [
+        {
+            "artifact_digest": zero_digest(plan.root["size_bytes"]),
+            "read_only": False,
+            "role": "root",
+            "serial": plan.root["serial"],
+            "size_bytes": plan.root["size_bytes"],
+        }
+    ]
+    devices.extend(
+        {
+            "artifact_digest": zero_digest(layer["size_bytes"]),
+            "image_digest": layer["image_digest"],
+            "occurrence_digest": layer["occurrence_digest"],
+            "ordinal": layer["ordinal"],
+            "read_only": True,
+            "role": "lower",
+            "serial": layer["serial"],
+            "size_bytes": layer["size_bytes"],
+        }
+        for layer in plan.layers
+    )
+    topology = {"devices": devices, "policy": "virtio-blk-pre-mount-device-set.v1"}
+    topology["digest"] = _digest(canonical_json_bytes(topology))
+    return topology
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +597,10 @@ class OCIStage1KVMProofReceipt:
                     "rejection_marker": REJECTION_MARKER.decode("ascii").rstrip("\n"),
                 }
             },
+            "pre_mount_devices": True,
+            "filesystem_verified": False,
+            "content_verified": False,
+            "mount_attempted": False,
             "qualification": {
                 "accelerator": "kvm",
                 "architecture": "x86_64",
@@ -533,6 +617,7 @@ class OCIStage1KVMProofReceipt:
             "root_assembly": False,
             "schema": OCI_STAGE1_KVM_PROOF_SCHEMA,
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
+            "topology": pre_mount_topology(build_proof_plan()),
             "transport": {**dict(self.transport), "serial": self.transport_serial},
         }
 
@@ -548,11 +633,16 @@ class OCIStage1KVMProofReceipt:
             "initramfs",
             "kernel",
             "negative_controls",
+            "pre_mount_devices",
+            "filesystem_verified",
+            "content_verified",
+            "mount_attempted",
             "qualification",
             "qemu",
             "root_assembly",
             "schema",
             "stage1",
+            "topology",
             "transport",
         }:
             raise ArtifactValidationError("KVM proof receipt fields are invalid")
@@ -568,6 +658,11 @@ class OCIStage1KVMProofReceipt:
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
             or value.get("root_assembly") is not False
+            or value.get("pre_mount_devices") is not True
+            or value.get("filesystem_verified") is not False
+            or value.get("content_verified") is not False
+            or value.get("mount_attempted") is not False
+            or value.get("topology") != pre_mount_topology(build_proof_plan())
             or qualification
             != {
                 "accelerator": "kvm",
@@ -767,6 +862,27 @@ def _verify_file_digest(path: Path, expected_digest: str, expected_mode: int) ->
         raise KVMProofFailure("KVM proof temporary artifact changed")
 
 
+def _write_pre_mount_topology(directory: Path, plan: OCIStage1Plan) -> tuple[Path, tuple[Path, ...]]:
+    topology = pre_mount_topology(plan)["devices"]
+    root_contract = topology[0]
+    root_path = _secure_write(directory, "root.raw", b"\0" * root_contract["size_bytes"], mode=0o600)
+    lower_paths = tuple(
+        _secure_write(directory, f"lower-{layer['ordinal']}.raw", b"\0" * layer["size_bytes"], mode=0o400)
+        for layer in topology[1:]
+    )
+    _verify_file_digest(root_path, root_contract["artifact_digest"], 0o600)
+    for path, layer in zip(lower_paths, topology[1:], strict=True):
+        _verify_file_digest(path, layer["artifact_digest"], 0o400)
+    return root_path, lower_paths
+
+
+def _verify_pre_mount_topology(root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan) -> None:
+    devices = pre_mount_topology(plan)["devices"]
+    _verify_file_digest(root_path, devices[0]["artifact_digest"], 0o600)
+    for path, layer in zip(lower_paths, devices[1:], strict=True):
+        _verify_file_digest(path, layer["artifact_digest"], 0o400)
+
+
 def _actual_evidence_directory() -> Path | None:
     configured = os.environ.get(EVIDENCE_ENV)
     if configured is None:
@@ -780,17 +896,22 @@ def run_writable_transport_rejection_probe(
     """Prove that a guest-visible writable transport is rejected, never qualified."""
 
     initramfs = build_bootstrap_initramfs()
+    plan = transport.stage1_plan
     with _temp_root() as temporary_name:
         root = Path(temporary_name)
         qemu_path = _secure_write(root, "qemu-system-x86_64", qemu.payload, mode=0o500)
         kernel_path = _secure_write(root, "kernel", kernel.payload, mode=0o400)
         initramfs_path = _secure_write(root, "initramfs.cpio", initramfs.payload, mode=0o400)
         transport_path = _secure_write(root, "stage1-plan.raw", transport.artifact, mode=0o600)
+        root_path, lower_paths = _write_pre_mount_topology(root, plan)
         command = build_qemu_command(
             qemu_path=qemu_path,
             kernel_path=kernel_path,
             initramfs_path=initramfs_path,
             transport_path=transport_path,
+            root_path=root_path,
+            lower_paths=lower_paths,
+            plan=plan,
             cmdline=cmdline,
             serial=transport_serial(transport.receipt.artifact_digest),
             transport_readonly=False,
@@ -806,6 +927,7 @@ def run_writable_transport_rejection_probe(
         )
         _verify_file_digest(qemu_path, qemu.digest, 0o500)
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o600)
+        _verify_pre_mount_topology(root_path, lower_paths, plan)
         return console
 
 
@@ -833,6 +955,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         kernel_path = _secure_write(root, "kernel", kernel.payload, mode=0o400)
         initramfs_path = _secure_write(root, "initramfs.cpio", initramfs.payload, mode=0o400)
         transport_path = _secure_write(root, "stage1-plan.raw", transport.artifact, mode=0o400)
+        root_path, lower_paths = _write_pre_mount_topology(root, plan)
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
 
         command = build_qemu_command(
@@ -840,6 +963,9 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             kernel_path=kernel_path,
             initramfs_path=initramfs_path,
             transport_path=transport_path,
+            root_path=root_path,
+            lower_paths=lower_paths,
+            plan=plan,
             cmdline=cmdline,
             serial=serial,
         )
@@ -852,6 +978,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         )
         _verify_file_digest(qemu_path, qemu.digest, 0o500)
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
+        _verify_pre_mount_topology(root_path, lower_paths, plan)
 
     writable_console = run_writable_transport_rejection_probe(
         kernel=kernel,

@@ -2,8 +2,9 @@
 
 This suite is the release-qualified proof for the packaged x86_64 `/init` live
 path. It direct-boots a Linux bzImage with the exact source-controlled
-initramfs and raw stage-1 transport under `-accel kvm -cpu host`. The positive
-boot must reach the single post-ioctl verification marker and remain alive in
+initramfs, raw stage-1 transport, writable root, and two read-only lower disks
+under `-accel kvm -cpu host`. Device attachment order is intentionally
+permuted. The positive boot must reach the single pre-mount post-ioctl marker and remain alive in
 the fail-closed PID 1 wait. A second boot exposes the same bytes through a
 writable virtio-blk mapping and must reach only the rejection marker.
 
@@ -26,9 +27,9 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-proof stops at authenticated transport consumption: root/lower discovery,
-mounting, OverlayFS, pivot, workload supervision and production define/start
-remain disabled.
+proof stops after authenticated root/lower block identity. Filesystem magic
+and content verification, mounting, OverlayFS, pivot, workload supervision and
+production define/start remain disabled.
 
 The PR workflow also has an always-running `Required native KVM proof`
 aggregator. It fails if the self-hosted job is disabled, skipped or

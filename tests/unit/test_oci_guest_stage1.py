@@ -15,14 +15,16 @@ from palimpsest_local.oci_guest_stage1 import (
     MAX_GUEST_KERNEL_CMDLINE_BYTES,
     GuestBlockCandidate,
     discover_stage1_block_device,
+    expected_pre_mount_block_devices,
     parse_guest_kernel_cmdline,
+    select_pre_mount_block_devices,
     select_stage1_block_device,
     verify_guest_stage1_transport,
 )
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import canonical_json_bytes
 from palimpsest_local.oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION
-from palimpsest_local.oci_stage1 import OCIStage1Plan
+from palimpsest_local.oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
 
 _HEADER = struct.Struct("<16sIIQ32s")
@@ -38,15 +40,19 @@ def _plan() -> OCIStage1Plan:
             "filesystem": "ext4",
             "generation": 3,
             "mount_options": ["rw", "nodev", "nosuid"],
-            "serial": "1" * 20,
+            "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
+            "size_bytes": 16 * 1024 * 1024,
             "volume_id": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
         },
         layers=(
             {
                 "filesystem": "squashfs",
+                "image_digest": "sha256:" + "2" * 64,
                 "mount_options": ["ro", "nodev", "nosuid"],
+                "occurrence_digest": "sha256:" + "3" * 64,
                 "ordinal": 0,
-                "serial": "2" * 20,
+                "serial": oci_stage1_device_serial("lower", "sha256:" + "3" * 64),
+                "size_bytes": 4096,
             },
         ),
         process=OCIProcessSpec(
@@ -97,8 +103,8 @@ def test_guest_consumer_cross_binds_cmdline_envelope_and_full_plan() -> None:
             f"palimpsest-oci-root-stage1-transport-v1\0{built.receipt.artifact_digest}".encode()
         ).hexdigest()[:20]
     )
-    assert verified.bindings.root_serial == "1" * 20
-    assert verified.bindings.lower_serials == ("2" * 20,)
+    assert verified.bindings.root_serial == _plan().root["serial"]
+    assert verified.bindings.lower_serials == (_plan().layers[0]["serial"],)
     assert verified.artifact_size_bytes == len(built.artifact)
 
 
@@ -153,6 +159,24 @@ def test_guest_block_selection_requires_one_allowlisted_name_and_exact_serial() 
         GuestBlockCandidate("../../vdb", expected)
     with pytest.raises(ArtifactValidationError, match="ambiguous"):
         select_stage1_block_device(candidates + (GuestBlockCandidate("vdb", "e" * 20),), expected_serial=expected)
+
+
+def test_pre_mount_selection_is_role_aware_ordered_and_exact_topology() -> None:
+    plan = _plan()
+    expected = expected_pre_mount_block_devices(plan)
+    candidates = (
+        GuestBlockCandidate("vdc", plan.layers[0]["serial"], True),
+        GuestBlockCandidate("vda", plan.root["serial"], False),
+    )
+
+    selected = select_pre_mount_block_devices(candidates, expected)
+
+    assert tuple(item.expected.role for item in selected) == ("root", "lower")
+    assert tuple(item.path.name for item in selected) == ("vda", "vdc")
+    with pytest.raises(ArtifactValidationError, match="wrong role"):
+        select_pre_mount_block_devices((replace(candidates[0], read_only=False), candidates[1]), expected)
+    with pytest.raises(ArtifactValidationError, match="ambiguous"):
+        select_pre_mount_block_devices(candidates + (GuestBlockCandidate("vdd", "f" * 20, True),), expected)
 
 
 def test_guest_sysfs_discovery_uses_bounded_exact_serial_files(tmp_path: Path) -> None:

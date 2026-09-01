@@ -21,13 +21,14 @@ from typing import Any
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
+from .oci_packer import SQUASHFS_BLOCK_DEVICE_ALIGNMENT
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCI_STAGE1_DEVICE_POLICY, OCI_STAGE1_PLAN_SCHEMA, OCI_STAGE1_PROTOCOL, OCIStage1Plan
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v1"
-OCI_GUEST_STAGE1_CAPABILITY = "plan-consumer-fail-closed"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v2"
+OCI_GUEST_STAGE1_CAPABILITY = "pre-mount-device-set-consumer-fail-closed"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64
@@ -169,12 +170,148 @@ def parse_guest_kernel_cmdline(cmdline: bytes | str) -> GuestStage1KernelBinding
 class GuestBlockCandidate:
     name: str
     serial: str
+    read_only: bool | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _BLOCK_NAME_RE.fullmatch(self.name) is None:
             raise ArtifactValidationError("guest block-device name is invalid")
         if not isinstance(self.serial, str) or _SERIAL_RE.fullmatch(self.serial) is None:
             raise ArtifactValidationError("guest block-device serial is invalid")
+        if self.read_only is not None and type(self.read_only) is not bool:
+            raise ArtifactValidationError("guest block-device read-only state is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class GuestExpectedBlockDevice:
+    role: str
+    ordinal: int | None
+    serial: str
+    read_only: bool
+    size_bytes: int
+    image_digest: str | None = None
+    occurrence_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.role not in {"root", "lower"}
+            or (self.role == "root" and self.ordinal is not None)
+            or (self.role == "lower" and (type(self.ordinal) is not int or self.ordinal < 0))
+            or not isinstance(self.serial, str)
+            or _SERIAL_RE.fullmatch(self.serial) is None
+            or type(self.read_only) is not bool
+            or self.read_only != (self.role == "lower")
+            or type(self.size_bytes) is not int
+            or self.size_bytes <= 0
+            or (
+                self.role == "root"
+                and (not 16 * 1024 * 1024 <= self.size_bytes <= 16 * 1024**4 or self.size_bytes % (1024 * 1024))
+            )
+            or (
+                self.role == "lower"
+                and (
+                    not SQUASHFS_BLOCK_DEVICE_ALIGNMENT <= self.size_bytes <= 32 * 1024**3
+                    or self.size_bytes % SQUASHFS_BLOCK_DEVICE_ALIGNMENT
+                )
+            )
+        ):
+            raise ArtifactValidationError("guest expected block-device contract is invalid")
+        if self.role == "root":
+            if self.image_digest is not None or self.occurrence_digest is not None:
+                raise ArtifactValidationError("guest root block-device provenance is invalid")
+        else:
+            object.__setattr__(self, "image_digest", _canonical_digest(self.image_digest, "guest lower image digest"))
+            object.__setattr__(
+                self,
+                "occurrence_digest",
+                _canonical_digest(self.occurrence_digest, "guest lower occurrence digest"),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GuestSelectedBlockDevice:
+    expected: GuestExpectedBlockDevice
+    path: Path
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.expected, GuestExpectedBlockDevice)
+            or not isinstance(self.path, Path)
+            or not self.path.is_absolute()
+        ):
+            raise ArtifactValidationError("guest selected block-device contract is invalid")
+
+
+def expected_pre_mount_block_devices(plan: OCIStage1Plan) -> tuple[GuestExpectedBlockDevice, ...]:
+    """Project the authenticated plan into ordered root/lower block roles."""
+
+    if not isinstance(plan, OCIStage1Plan):
+        raise ArtifactValidationError("guest pre-mount plan is invalid")
+    return (
+        GuestExpectedBlockDevice("root", None, plan.root["serial"], False, plan.root["size_bytes"]),
+        *tuple(
+            GuestExpectedBlockDevice(
+                "lower",
+                layer["ordinal"],
+                layer["serial"],
+                True,
+                layer["size_bytes"],
+                layer["image_digest"],
+                layer["occurrence_digest"],
+            )
+            for layer in plan.layers
+        ),
+    )
+
+
+def select_pre_mount_block_devices(
+    candidates: Sequence[GuestBlockCandidate],
+    expected: Sequence[GuestExpectedBlockDevice],
+    *,
+    dev_root: Path = Path("/dev"),
+) -> tuple[GuestSelectedBlockDevice, ...]:
+    """Bind every ordered role to one serial and exact sysfs ``ro`` state.
+
+    The portable contract intentionally cannot prove block-node major/minor or
+    ``BLKROGET``/``BLKGETSIZE64``.  The freestanding Linux PID 1 keeps those
+    descriptors open and performs the ioctl checks before emitting readiness.
+    """
+
+    if (
+        not isinstance(candidates, Sequence)
+        or isinstance(candidates, (str, bytes))
+        or any(not isinstance(item, GuestBlockCandidate) for item in candidates)
+        or not isinstance(expected, Sequence)
+        or isinstance(expected, (str, bytes))
+        or not expected
+        or any(not isinstance(item, GuestExpectedBlockDevice) for item in expected)
+        or not isinstance(dev_root, Path)
+        or not dev_root.is_absolute()
+    ):
+        raise ArtifactValidationError("guest pre-mount discovery input is invalid")
+    if (
+        expected[0].role != "root"
+        or expected[0].ordinal is not None
+        or any(item.role != "lower" or item.ordinal != ordinal for ordinal, item in enumerate(expected[1:]))
+    ):
+        raise ArtifactValidationError("guest pre-mount discovery role order is invalid")
+    names = tuple(item.name for item in candidates)
+    serials = tuple(item.serial for item in candidates)
+    expected_serials = tuple(item.serial for item in expected)
+    if (
+        len(candidates) != len(expected)
+        or len(names) != len(set(names))
+        or len(serials) != len(set(serials))
+        or len(expected_serials) != len(set(expected_serials))
+    ):
+        raise ArtifactValidationError("guest pre-mount discovery is ambiguous")
+    by_serial = {item.serial: item for item in candidates}
+    selected: list[GuestSelectedBlockDevice] = []
+    for contract in expected:
+        candidate = by_serial.get(contract.serial)
+        if candidate is None or candidate.read_only is not contract.read_only:
+            raise ArtifactValidationError("guest pre-mount block device is missing or has the wrong role")
+        selected.append(GuestSelectedBlockDevice(contract, dev_root / candidate.name))
+    return tuple(selected)
 
 
 def select_stage1_block_device(
@@ -430,13 +567,17 @@ def verify_guest_stage1_transport(
 __all__ = [
     "MAX_GUEST_KERNEL_CMDLINE_BYTES",
     "GuestBlockCandidate",
+    "GuestExpectedBlockDevice",
+    "GuestSelectedBlockDevice",
     "GuestStage1KernelBindings",
     "OCI_GUEST_STAGE1_CAPABILITY",
     "OCI_GUEST_STAGE1_CONTRACT",
     "OCI_GUEST_STAGE1_PLAN_TRANSPORT",
     "VerifiedGuestStage1Plan",
     "discover_stage1_block_device",
+    "expected_pre_mount_block_devices",
     "parse_guest_kernel_cmdline",
     "select_stage1_block_device",
+    "select_pre_mount_block_devices",
     "verify_guest_stage1_transport",
 ]

@@ -27,20 +27,20 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v3"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v4"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v1"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v3"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v2"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v4"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:3dfc042e0bf902c17bc58ab7ab70db3e00c3d3b39e23f4146990ddd7038b5d91"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:6135cbeaf1c155541871032243a5383043ab857a44e3b7ef86fb18c847cdf15a"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:4a44b5e1e56f58607e8e310f9f5956bb64cd4e59287d9c191839da9d95af31e0"
+OCI_STAGE1_BINARY_DIGEST = "sha256:a51104c527b96abd345594f511c91105c6e76181c4bc3c108007fc036d74b0d6"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -366,6 +366,7 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "raw-envelope-header-sha256-zero-padding",
                 "canonical-json-exact-stage1-semantics",
                 "resource-core-transport-root-lowers-cross-binding",
+                "root-lower-role-size-readonly-open-fd-final-recheck",
             ],
         }
     )

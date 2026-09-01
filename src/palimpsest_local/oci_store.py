@@ -24,6 +24,7 @@ from .errors import ArtifactValidationError
 from .oci_changeset import OCI_CHANGESET_NORMALIZATION_ID
 from .oci_converter import LayerIntakeReceipt
 from .oci_packer import (
+    SQUASHFS_BLOCK_DEVICE_ALIGNMENT,
     SQUASHFS_PACKER_ARGV_CONTRACT_ID,
     SQUASHFS_STRUCTURAL_VERIFIER_ID,
     LeasedSquashFS,
@@ -40,7 +41,8 @@ _FILE_MODE = 0o400
 _TEMP_MODE = 0o600
 _LOCK_MODE = 0o600
 _MAX_RECORD_BYTES = 1024 * 1024
-_MAX_IMAGE_BYTES = 32 * 1024**3
+MAX_OCI_STORE_IMAGE_BYTES = 32 * 1024**3
+_MAX_IMAGE_BYTES = MAX_OCI_STORE_IMAGE_BYTES
 _DIR_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _TEMP_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -49,6 +51,14 @@ _HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _TEMP_RE = re.compile(r"^\.oci-derived-tmp-[0-9a-f]{32}$")
+
+
+def _valid_image_size(value: Any) -> bool:
+    return (
+        type(value) is int
+        and SQUASHFS_BLOCK_DEVICE_ALIGNMENT <= value <= _MAX_IMAGE_BYTES
+        and value % SQUASHFS_BLOCK_DEVICE_ALIGNMENT == 0
+    )
 
 
 class _ForkCloseFD:
@@ -438,7 +448,7 @@ class DerivedLayerReceipt:
                 raise OCIStoreError("oci-store-receipt", "derived receipt digest is not canonical")
         if type(self.ordinal) is not int or self.ordinal < 0:
             raise OCIStoreError("oci-store-receipt", "derived receipt ordinal is invalid")
-        if type(self.image_size) is not int or self.image_size <= 0:
+        if not _valid_image_size(self.image_size):
             raise OCIStoreError("oci-store-receipt", "derived receipt image size is invalid")
         if self.filesystem != "squashfs":
             raise OCIStoreError("oci-store-receipt", "derived receipt filesystem is unsupported")
@@ -1245,7 +1255,7 @@ class OCIStore:
         except (ArtifactValidationError, TypeError, ValueError):
             raise OCIStoreError("oci-store-corrupt", "derived record image digest is invalid") from None
         image_size = record.get("image_size")
-        if type(image_size) is not int or not 0 < image_size <= _MAX_IMAGE_BYTES:
+        if not _valid_image_size(image_size):
             raise OCIStoreError("oci-store-corrupt", "derived record image size is invalid")
         self._validate_cached_receipts(record, key, image_digest, image_size)
         self._artifacts.verify_squashfs(image_digest, image_size, maximum=_MAX_IMAGE_BYTES)
@@ -1258,6 +1268,8 @@ class OCIStore:
         image_digest: str,
         image_size: int,
     ) -> None:
+        if not _valid_image_size(image_size):
+            raise OCIStoreError("oci-store-corrupt", "derived record image size is invalid")
         intake_value = record.get("intake_receipt")
         packed_value = record.get("packed_receipt")
         if not isinstance(intake_value, dict) or not isinstance(packed_value, dict):

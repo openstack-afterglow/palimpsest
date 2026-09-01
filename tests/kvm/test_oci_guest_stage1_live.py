@@ -33,6 +33,10 @@ def test_packaged_stage1_runs_as_pid1_and_checks_readonly_virtio_transport() -> 
         "live_pid1": True,
     }
     assert receipt["root_assembly"] is False
+    assert receipt["pre_mount_devices"] is True
+    assert receipt["filesystem_verified"] is False
+    assert receipt["content_verified"] is False
+    assert receipt["mount_attempted"] is False
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
     assert _logical_line_count(result.writable_console, REJECTION_MARKER) == 1

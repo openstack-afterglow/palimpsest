@@ -30,10 +30,11 @@ _IO_CHUNK = 1024 * 1024
 _SQUASHFS_SUPERBLOCK_SIZE = 96
 _SQUASHFS_MAGIC = 0x73717368
 _UINT64_MAX = (1 << 64) - 1
+SQUASHFS_BLOCK_DEVICE_ALIGNMENT = 512
 
 SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
 SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v1"
-SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v1"
+SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v2"
 SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
 
 
@@ -599,7 +600,7 @@ def verify_squashfs_fd(fd: int, image_size: int, maximum: int) -> None:
     callers must additionally verify the complete digest and stable file
     identity around this check.
     """
-    if not _SQUASHFS_SUPERBLOCK_SIZE <= image_size <= maximum:
+    if not SQUASHFS_BLOCK_DEVICE_ALIGNMENT <= image_size <= maximum or image_size % SQUASHFS_BLOCK_DEVICE_ALIGNMENT:
         raise SquashFSPackError("oci-pack-output-size", "packed image size is outside its policy")
     try:
         payload = os.pread(fd, _SQUASHFS_SUPERBLOCK_SIZE, 0)
@@ -994,6 +995,7 @@ __all__ = [
     "DEFAULT_SQUASHFS_PACK_EXECUTION",
     "SQUASHFS_PACK_POLICY_ID",
     "SQUASHFS_PACKER_ARGV_CONTRACT_ID",
+    "SQUASHFS_BLOCK_DEVICE_ALIGNMENT",
     "SQUASHFS_STRUCTURAL_VERIFIER_ID",
     "SQUASHFS_TOOLCHAIN_ID",
     "LeasedSquashFS",

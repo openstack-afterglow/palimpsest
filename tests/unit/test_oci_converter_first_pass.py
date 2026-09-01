@@ -185,15 +185,16 @@ if BEHAVIOR == "bad":
     pathlib.Path("layer.squashfs").write_bytes(b"not-squashfs")
     raise SystemExit(0)
 tail = hashlib.sha256(payload).digest() + hashlib.sha256("\\0".join(sys.argv[3:]).encode()).digest()
-image_size = 96 + len(tail)
+bytes_used = 96 + len(tail)
+image_size = ((bytes_used + 511) // 512) * 512
 superblock = struct.pack(
     "<5I6H8Q",
     0x73717368, 1, 0, 131072, 0,
     1, 17, 0, 1, 4, 0,
-    0, image_size,
+    0, bytes_used,
     144, 2**64 - 1, 96, 112, 2**64 - 1, 2**64 - 1,
 )
-pathlib.Path("layer.squashfs").write_bytes(superblock + tail)
+pathlib.Path("layer.squashfs").write_bytes(superblock + tail + b"\\0" * (image_size - bytes_used))
 """,
         encoding="utf-8",
     )
@@ -765,6 +766,7 @@ def test_structural_verifier_rejects_missing_required_tables() -> None:
         96,
         *([2**64 - 1] * 6),
     )
+    impossible += b"\0" * (512 - len(impossible))
     with tempfile.TemporaryFile(mode="w+b") as image:
         image.write(impossible)
         image.flush()

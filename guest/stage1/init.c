@@ -27,11 +27,13 @@ typedef unsigned long usize;
 #define SYS_readlink 89
 #define SYS_mount 165
 #define SYS_statfs 137
+#define SYS_getdents64 217
 
 #define O_RDONLY 0
 #define O_NONBLOCK 04000
 #define O_CLOEXEC 02000000
 #define O_NOFOLLOW 0400000
+#define O_DIRECTORY 0200000
 #define S_IFMT 0170000
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
@@ -474,6 +476,18 @@ struct parser {
     u32 env_count;
 };
 
+struct expected_device {
+    char serial[21];
+    u64 size;
+    int read_only;
+};
+
+struct expected_device_set {
+    struct expected_device root;
+    struct expected_device lowers[LOWER_MAX];
+    u32 lower_count;
+};
+
 static int take_char(struct parser *j, u8 c) {
     if (j->p >= j->end || *j->p != c) return 0;
     j->p++;
@@ -573,6 +587,24 @@ static int positive_decimal(struct parser *j) {
     if (start >= j->end || *start < '1' || *start > '9') return 0;
     while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
     return j->p > start && (usize)(j->p - start) <= GENERATION_DIGITS_MAX;
+}
+
+static int derived_serial_matches(const char *name_space, struct span identity, const char *serial) {
+    struct sha256_ctx c;
+    u8 digest[32];
+    char expected[21];
+    u32 i;
+    const char prefix[] = "palimpsest-oci-root-";
+    const char suffix[] = "-v1\0";
+    sha_init(&c);
+    sha_update(&c, prefix, sizeof(prefix) - 1);
+    sha_update(&c, name_space, slen(name_space));
+    sha_update(&c, suffix, sizeof(suffix) - 1);
+    sha_update(&c, identity.p, identity.n);
+    sha_final(&c, digest);
+    for (i = 0; i < 10; i++) { expected[i * 2] = hex_digit(digest[i] >> 4); expected[i * 2 + 1] = hex_digit(digest[i] & 15); }
+    expected[20] = 0;
+    return text_equal(expected, serial);
 }
 
 static int exact_string_array3(struct parser *j, const char *a, const char *b, const char *c) {
@@ -689,10 +721,12 @@ static int parse_process(struct parser *j) {
     return j->process_bytes <= PROCESS_MAX_LOCAL;
 }
 
-static int parse_plan(const u8 *payload, usize size, const struct bindings *b) {
+static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices) {
     struct parser j;
     u32 layer_count = 0, i;
     char layer_serials[LOWER_MAX][21];
+    char occurrence_digest[72];
+    char root_serial[21];
     struct span s;
     u64 number;
     j.p = payload; j.end = payload + size; j.process_bytes = 0; j.env_count = 0;
@@ -702,12 +736,23 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b) {
     if (!take_char(&j, ']')) {
         for (;;) {
             if (layer_count >= LOWER_MAX || !take_char(&j, '{') || !key(&j, "filesystem") ||
-                !exact_string(&j, "squashfs") || !take_char(&j, ',') || !key(&j, "mount_options") ||
+                !exact_string(&j, "squashfs")) return 0;
+            if (!take_char(&j, ',') || !key(&j, "image_digest") || !plain_string(&j, &s, 0) ||
+                !valid_digest(s.p, s.n) || !take_char(&j, ',') || !key(&j, "mount_options") ||
                 !exact_string_array3(&j, "ro", "nodev", "nosuid") || !take_char(&j, ',') ||
+                !key(&j, "occurrence_digest") || !plain_string(&j, &s, 0) || !valid_digest(s.p, s.n) ||
+                !copy_span(occurrence_digest, sizeof(occurrence_digest), s) || !take_char(&j, ',') ||
                 !key(&j, "ordinal") || !uint_value(&j, &number) || number != layer_count ||
                 !take_char(&j, ',') || !key(&j, "serial") || !plain_string(&j, &s, 0) ||
-                !valid_serial(s.p, s.n) || !take_char(&j, '}')) return 0;
+                !valid_serial(s.p, s.n)) return 0;
             memcpy(layer_serials[layer_count], s.p, 20); layer_serials[layer_count][20] = 0;
+            memcpy(devices->lowers[layer_count].serial, s.p, 20); devices->lowers[layer_count].serial[20] = 0;
+            if (!derived_serial_matches("lower", (struct span){occurrence_digest, 71},
+                                        devices->lowers[layer_count].serial)) return 0;
+            devices->lowers[layer_count].read_only = 1;
+            if (!take_char(&j, ',') || !key(&j, "size_bytes") || !uint_value(&j, &number) ||
+                number < 512 || number > 34359738368ul || number % 512 || !take_char(&j, '}')) return 0;
+            devices->lowers[layer_count].size = number;
             layer_count++;
             if (take_char(&j, ']')) break;
             if (!take_char(&j, ',')) return 0;
@@ -725,8 +770,15 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b) {
         !take_char(&j, ',') || !key(&j, "generation") || !positive_decimal(&j) ||
         !take_char(&j, ',') || !key(&j, "mount_options") || !exact_string_array3(&j, "rw", "nodev", "nosuid") ||
         !take_char(&j, ',') || !key(&j, "serial") || !plain_string(&j, &s, 0) || !valid_serial(s.p, s.n) ||
-        s.n != 20 || !bytes_equal(s.p, b->root_serial, 20) || !take_char(&j, ',') ||
+        s.n != 20 || !bytes_equal(s.p, b->root_serial, 20)) return 0;
+    memcpy(devices->root.serial, s.p, 20); devices->root.serial[20] = 0; devices->root.read_only = 0;
+    memcpy(root_serial, s.p, 20); root_serial[20] = 0;
+    if (!take_char(&j, ',') || !key(&j, "size_bytes") || !uint_value(&j, &number) ||
+        number < 16777216 || number > 17592186044416ul || number % 1048576) return 0;
+    devices->root.size = number;
+    if (!take_char(&j, ',') ||
         !key(&j, "volume_id") || !plain_string(&j, &s, 0) || !valid_uuid_span(s) ||
+        !derived_serial_matches("root", s, root_serial) ||
         !take_char(&j, '}') || !take_char(&j, '}')) return 0;
     for (i = 0; i < layer_count; i++) if (!text_equal(layer_serials[i], b->lowers[i])) return 0;
     if (!take_char(&j, ',') || !key(&j, "boot_plan_digest") || !plain_string(&j, &s, 0) ||
@@ -736,12 +788,13 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b) {
         !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
-        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v2") ||
+        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v3") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v2") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v3") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
+    devices->lower_count = layer_count;
     return 1;
 }
 
@@ -765,13 +818,17 @@ static u32 dev_major(u64 dev) { return (u32)(((dev >> 8) & 0xfff) | ((dev >> 32)
 static u32 dev_minor(u64 dev) { return (u32)((dev & 0xff) | ((dev >> 12) & 0xffffff00)); }
 
 struct discovered {
+    char name[4];
     char path[PATH_MAX_LOCAL];
     char serial_path[PATH_MAX_LOCAL];
     char ro_path[PATH_MAX_LOCAL];
     char dev_path[PATH_MAX_LOCAL];
+    char driver_path[PATH_MAX_LOCAL];
     u64 size;
     u32 major;
     u32 minor;
+    u64 identity_dev;
+    u64 identity_ino;
     int fixture;
 };
 
@@ -828,6 +885,7 @@ static int discover(const char *root, int fixture, const struct bindings *b, str
             memcpy(path + used, "/device/driver", 15); path[used + 14] = 0;
             i64 n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
             if (n < 11 || !bytes_equal(link + n - 11, "/virtio_blk", 11)) return 0;
+            memcpy(found->driver_path, path, slen(path) + 1);
         }
         memcpy(path + used, "/ro", 4); path[used + 3] = 0;
         if (!read_exact_attr(path, "1\n")) return 0;
@@ -863,6 +921,8 @@ static int discover(const char *root, int fixture, const struct bindings *b, str
                 found->size = bytes;
                 found->major = major;
                 found->minor = minor;
+                found->identity_dev = st.dev;
+                found->identity_ino = st.ino;
             }
         }
         memcpy(path, base, slen(base)); used = slen(base); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3;
@@ -877,11 +937,168 @@ static int discover(const char *root, int fixture, const struct bindings *b, str
         memcpy(path + used, "/ro", 4); path[used + 3] = 0; memcpy(found->ro_path, path, slen(path) + 1);
         used = slen(base); memcpy(path, base, used); path[used++] = '/'; memcpy(path + used, selected_name, 3); used += 3;
         memcpy(path + used, "/dev", 5); path[used + 4] = 0; memcpy(found->dev_path, path, slen(path) + 1);
+        memcpy(found->name, selected_name, 4);
     }
     return 1;
 }
 
-static int verify_transport(const struct discovered *device, const struct bindings *b) {
+struct opened_role {
+    struct discovered device;
+    char serial[21];
+    u64 expected_size;
+    int expected_ro;
+    int fd;
+};
+
+static int driver_is_virtio_blk(const char *path) {
+    char link[PATH_MAX_LOCAL];
+    i64 n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
+    return n >= 11 && bytes_equal(link + n - 11, "/virtio_blk", 11);
+}
+
+static int parse_dev_attribute(const char *path, u32 *major, u32 *minor) {
+    i64 n = read_bounded_file(path, attribute, 32, 1, 0);
+    usize colon = 0, end;
+    if (n < 4 || attribute[n - 1] != '\n') return 0;
+    end = (usize)n - 1;
+    while (colon < end && attribute[colon] != ':') colon++;
+    return colon != end && parse_u32_decimal(attribute, colon, major) &&
+           parse_u32_decimal(attribute + colon + 1, end - colon - 1, minor);
+}
+
+static int discover_live_role(const struct expected_device *expected, struct opened_role *opened) {
+    char path[PATH_MAX_LOCAL], selected[4] = {0};
+    u32 matches = 0, letter, major, minor;
+    for (letter = 0; letter < 26; letter++) {
+        char link[PATH_MAX_LOCAL];
+        i64 n;
+        usize k;
+        memcpy(path, "/sys/class/block/vd", 19); path[19] = (char)('a' + letter); path[20] = 0;
+        n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
+        if (n < 0) continue;
+        if (n < 10 || !starts(link, (usize)n, "../../devices/")) return 0;
+        for (k = 14; k < (usize)n;) {
+            usize component = k;
+            while (k < (usize)n && link[k] != '/') k++;
+            if (k == component || (k - component == 1 && link[component] == '.') ||
+                (k - component == 2 && link[component] == '.' && link[component + 1] == '.')) return 0;
+            k++;
+        }
+        memcpy(path + 20, "/serial", 8);
+        n = read_bounded_file(path, attribute, 64, 1, 0);
+        if (n == 21 && attribute[20] == '\n') n = 20;
+        if (n == 20 && bytes_equal(attribute, expected->serial, 20)) {
+            matches++;
+            selected[0] = 'v'; selected[1] = 'd'; selected[2] = (char)('a' + letter);
+        }
+    }
+    if (matches != 1) return 0;
+    memcpy(path, "/sys/class/block/", 17); memcpy(path + 17, selected, 3); path[20] = 0;
+    {
+        char link[PATH_MAX_LOCAL];
+        usize used = 20;
+        i64 n;
+        memcpy(path + used, "/device/driver", 15);
+        n = sc3(SYS_readlink, (i64)path, (i64)link, sizeof(link));
+        if (n < 11 || !bytes_equal(link + n - 11, "/virtio_blk", 11)) return 0;
+        memcpy(opened->device.driver_path, path, slen(path) + 1);
+        memcpy(path + used, "/ro", 4);
+        if (!read_exact_attr(path, expected->read_only ? "1\n" : "0\n")) return 0;
+        memcpy(opened->device.ro_path, path, slen(path) + 1);
+        memcpy(path + used, "/dev", 5);
+        if (!parse_dev_attribute(path, &major, &minor)) return 0;
+        memcpy(opened->device.dev_path, path, slen(path) + 1);
+        memcpy(path + used, "/serial", 8);
+        n = read_bounded_file(path, attribute, 64, 1, 0);
+        if (n == 21 && attribute[20] == '\n') n = 20;
+        if (n != 20 || !bytes_equal(attribute, expected->serial, 20)) return 0;
+        memcpy(opened->device.serial_path, path, slen(path) + 1);
+    }
+    memcpy(opened->device.path, "/dev/", 5); memcpy(opened->device.path + 5, selected, 4);
+    opened->fd = (int)open_read(opened->device.path, 1);
+    if (opened->fd < 0) return 0;
+    {
+        struct stat_local st;
+        int ro = -1;
+        u64 bytes = 0;
+        if (sc2(SYS_fstat, opened->fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFBLK ||
+            dev_major(st.rdev) != major || dev_minor(st.rdev) != minor ||
+            sc3(SYS_ioctl, opened->fd, BLKROGET, (i64)&ro) < 0 || ro != expected->read_only ||
+            sc3(SYS_ioctl, opened->fd, BLKGETSIZE64, (i64)&bytes) < 0 || bytes != expected->size) {
+            sc1(SYS_close, opened->fd); opened->fd = -1; return 0;
+        }
+    }
+    memcpy(opened->serial, expected->serial, 21);
+    memcpy(opened->device.name, selected, 4);
+    opened->device.major = major; opened->device.minor = minor; opened->device.size = expected->size;
+    {
+        struct stat_local st;
+        if (sc2(SYS_fstat, opened->fd, (i64)&st) < 0) { sc1(SYS_close, opened->fd); opened->fd = -1; return 0; }
+        opened->device.identity_dev = st.dev; opened->device.identity_ino = st.ino;
+    }
+    opened->expected_size = expected->size; opened->expected_ro = expected->read_only;
+    return 1;
+}
+
+static int recheck_open_role(const struct opened_role *opened) {
+    struct stat_local st;
+    int ro = -1;
+    u64 bytes = 0;
+    u32 major, minor;
+    i64 n;
+    if (opened->fd < 0 || sc2(SYS_fstat, opened->fd, (i64)&st) < 0 ||
+        (st.mode & S_IFMT) != S_IFBLK || dev_major(st.rdev) != opened->device.major ||
+        dev_minor(st.rdev) != opened->device.minor ||
+        st.dev != opened->device.identity_dev || st.ino != opened->device.identity_ino ||
+        sc3(SYS_ioctl, opened->fd, BLKROGET, (i64)&ro) < 0 || ro != opened->expected_ro ||
+        sc3(SYS_ioctl, opened->fd, BLKGETSIZE64, (i64)&bytes) < 0 || bytes != opened->expected_size ||
+        !driver_is_virtio_blk(opened->device.driver_path) ||
+        !read_exact_attr(opened->device.ro_path, opened->expected_ro ? "1\n" : "0\n") ||
+        !parse_dev_attribute(opened->device.dev_path, &major, &minor) ||
+        major != opened->device.major || minor != opened->device.minor) return 0;
+    n = read_bounded_file(opened->device.serial_path, attribute, 64, 1, 0);
+    if (n == 21 && attribute[20] == '\n') n = 20;
+    return n == 20 && bytes_equal(attribute, opened->serial, 20);
+}
+
+static int exact_vd_disk_count(u32 expected) {
+    u8 entries[4096];
+    u32 count = 0;
+    i64 fd = sc3(SYS_open, (i64)"/sys/class/block", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (fd < 0) return 0;
+    for (;;) {
+        i64 n = sc3(SYS_getdents64, fd, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (n < 0) { sc1(SYS_close, fd); return 0; }
+        if (!n) break;
+        while (offset < (usize)n) {
+            const u8 *entry = entries + offset;
+            usize i, name_bytes;
+            u32 reclen;
+            if ((usize)n - offset < 20) { sc1(SYS_close, fd); return 0; }
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, fd); return 0; }
+            name_bytes = reclen - 19;
+            for (i = 0; i < name_bytes && entry[19 + i]; i++) {}
+            if (i == name_bytes) { sc1(SYS_close, fd); return 0; }
+            if (i >= 2 && entry[19] == 'v' && entry[20] == 'd') {
+                usize suffix;
+                if (i < 3) { sc1(SYS_close, fd); return 0; }
+                for (suffix = 2; suffix < i; suffix++)
+                    if (entry[19 + suffix] < 'a' || entry[19 + suffix] > 'z') {
+                        sc1(SYS_close, fd); return 0;
+                    }
+                count++;
+            }
+            offset += reclen;
+        }
+    }
+    sc1(SYS_close, fd);
+    return count == expected;
+}
+
+static int verify_transport(const struct discovered *device, const struct bindings *b,
+                            struct expected_device_set *devices, int *kept_fd) {
     struct stat_local st;
     i64 fd = open_read(device->path, 1), n;
     u64 payload_size, total, offset = 0;
@@ -894,7 +1111,8 @@ static int verify_transport(const struct discovered *device, const struct bindin
     if (!device->fixture) {
         int ro = 0;
         u64 bytes = 0;
-        if ((st.mode & S_IFMT) != S_IFBLK || dev_major(st.rdev) != device->major || dev_minor(st.rdev) != device->minor ||
+        if ((st.mode & S_IFMT) != S_IFBLK || st.dev != device->identity_dev || st.ino != device->identity_ino ||
+            dev_major(st.rdev) != device->major || dev_minor(st.rdev) != device->minor ||
             sc3(SYS_ioctl, fd, BLKROGET, (i64)&ro) < 0 || ro != 1 ||
             sc3(SYS_ioctl, fd, BLKGETSIZE64, (i64)&bytes) < 0 || bytes != device->size) {
             sc1(SYS_close, fd); return EXIT_TRANSPORT;
@@ -945,13 +1163,15 @@ static int verify_transport(const struct discovered *device, const struct bindin
                 major != device->major || minor != device->minor) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
         }
     }
-    sc1(SYS_close, fd);
     digest_text(artifact, total, artifact_digest);
-    if (!text_equal(artifact_digest, b->transport)) return EXIT_TRANSPORT;
+    if (!text_equal(artifact_digest, b->transport)) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
     sha_bytes(artifact + 64, payload_size, payload_digest);
-    if (!bytes_equal(payload_digest, artifact + 32, 32)) return EXIT_TRANSPORT;
-    for (offset = 64 + payload_size; offset < total; offset++) if (artifact[offset]) return EXIT_TRANSPORT;
-    if (!parse_plan(artifact + 64, payload_size, b)) return EXIT_PLAN;
+    if (!bytes_equal(payload_digest, artifact + 32, 32)) { sc1(SYS_close, fd); return EXIT_TRANSPORT; }
+    for (offset = 64 + payload_size; offset < total; offset++) if (artifact[offset]) {
+        sc1(SYS_close, fd); return EXIT_TRANSPORT;
+    }
+    if (!parse_plan(artifact + 64, payload_size, b, devices)) { sc1(SYS_close, fd); return EXIT_PLAN; }
+    if (device->fixture) sc1(SYS_close, fd); else *kept_fd = (int)fd;
     return 0;
 }
 
@@ -977,18 +1197,55 @@ static int prepare_live(void) {
 static int run_consumer(const char *fixture_root) {
     struct bindings b;
     struct discovered device;
+    struct expected_device_set expected;
+    struct opened_role roles[LOWER_MAX + 1], transport_role;
     char path[PATH_MAX_LOCAL];
     i64 n;
+    u32 i, j;
+    int transport_fd = -1;
     int fixture = fixture_root != 0;
     memset(&b, 0, sizeof(b));
     memset(&device, 0, sizeof(device));
+    memset(&expected, 0, sizeof(expected));
+    memset(roles, 0, sizeof(roles));
+    for (i = 0; i < LOWER_MAX + 1; i++) roles[i].fd = -1;
     if (fixture) {
         if (!fixture_path(path, fixture_root, "/proc/cmdline")) return EXIT_USAGE;
     } else memcpy(path, "/proc/cmdline", 14);
     n = read_bounded_file(path, (u8 *)cmdline, CMDLINE_MAX, 1, 0);
     if (n <= 0 || !parse_cmdline(cmdline, (usize)n, &b)) return EXIT_CMDLINE;
     if (!discover(fixture_root, fixture, &b, &device)) return EXIT_DISCOVERY;
-    return verify_transport(&device, &b);
+    {
+        int code = verify_transport(&device, &b, &expected, &transport_fd);
+        if (code || fixture) return code;
+    }
+    if (!discover_live_role(&expected.root, &roles[0])) return EXIT_DISCOVERY;
+    for (i = 0; i < expected.lower_count; i++)
+        if (!discover_live_role(&expected.lowers[i], &roles[i + 1])) return EXIT_DISCOVERY;
+    if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
+    memset(&transport_role, 0, sizeof(transport_role));
+    transport_role.device = device;
+    memcpy(transport_role.serial, b.transport_serial, 21);
+    transport_role.expected_size = device.size;
+    transport_role.expected_ro = 1;
+    transport_role.fd = transport_fd;
+    for (i = 0; i < expected.lower_count + 1; i++) {
+        if (text_equal(roles[i].device.name, device.name) ||
+            (roles[i].device.major == device.major && roles[i].device.minor == device.minor) ||
+            (roles[i].device.identity_dev == device.identity_dev && roles[i].device.identity_ino == device.identity_ino))
+            return EXIT_DISCOVERY;
+        for (j = 0; j < i; j++)
+            if (text_equal(roles[i].device.name, roles[j].device.name) ||
+                (roles[i].device.major == roles[j].device.major && roles[i].device.minor == roles[j].device.minor) ||
+                (roles[i].device.identity_dev == roles[j].device.identity_dev &&
+                 roles[i].device.identity_ino == roles[j].device.identity_ino))
+                return EXIT_DISCOVERY;
+    }
+    if (!recheck_open_role(&transport_role)) return EXIT_DISCOVERY;
+    for (i = 0; i < expected.lower_count + 1; i++)
+        if (!recheck_open_role(&roles[i])) return EXIT_DISCOVERY;
+    if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
+    return 0;
 }
 
 static __attribute__((noreturn, used)) void start_c(u64 *stack) {
@@ -1006,8 +1263,8 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     if (pid != 1) exit_now(EXIT_USAGE);
     if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
     code = run_consumer(0);
-    if (code) wait_closed("palimpsest guest stage1: transport rejected; waiting fail-closed\n");
-    wait_closed("palimpsest guest stage1: transport verified; root assembly disabled; waiting fail-closed\n");
+    if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
+    wait_closed("palimpsest guest stage1: pre-mount device set verified; root assembly disabled; waiting fail-closed\n");
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {

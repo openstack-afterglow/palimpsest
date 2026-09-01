@@ -35,7 +35,7 @@ from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
 from .oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION, load_oci_root_volume
-from .oci_stage1 import OCIStage1Plan
+from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import (
     OCI_STAGE1_TRANSPORT_FILENAME,
     OCIStage1TransportReceipt,
@@ -108,7 +108,7 @@ def _frozen_json_object(value: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _serial(namespace: str, identity: str) -> str:
-    return hashlib.sha256(f"palimpsest-oci-root-{namespace}-v1\0{identity}".encode()).hexdigest()[:20]
+    return oci_stage1_device_serial(namespace, identity)
 
 
 def _domain_core_dict(

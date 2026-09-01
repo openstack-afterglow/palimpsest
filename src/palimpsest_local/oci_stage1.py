@@ -16,17 +16,20 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .digest import normalize_digest
-from .errors import ArtifactValidationError, StateError
+from .errors import ArtifactValidationError, InvalidDigestError, StateError
 from .kvm import MAX_OCI_ROOT_LAYER_DISKS
+from .oci_packer import SQUASHFS_BLOCK_DEVICE_ALIGNMENT
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION
+from .oci_store import MAX_OCI_STORE_IMAGE_BYTES
+from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v2"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v2"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v3"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v3"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -37,8 +40,16 @@ def _canonical_digest(value: Any) -> bool:
         return False
     try:
         return normalize_digest(value) == value
-    except (ArtifactValidationError, TypeError, ValueError):
+    except (ArtifactValidationError, InvalidDigestError, TypeError, ValueError):
         return False
+
+
+def oci_stage1_device_serial(namespace: str, identity: str) -> str:
+    """Derive the shared domain/stage-1 virtio serial."""
+
+    if namespace not in {"root", "lower", "stage1-transport"} or not isinstance(identity, str) or not identity:
+        raise StateError("stage-1 device serial input is invalid")
+    return hashlib.sha256(f"palimpsest-oci-root-{namespace}-v1\0{identity}".encode()).hexdigest()[:20]
 
 
 def _plain(value: Any) -> Any:
@@ -88,6 +99,7 @@ class OCIStage1Plan:
             "generation",
             "mount_options",
             "serial",
+            "size_bytes",
             "volume_id",
         }:
             raise StateError("stage-1 root contract fields are invalid")
@@ -102,7 +114,11 @@ class OCIStage1Plan:
             or type(root["generation"]) is not int
             or root["generation"] < 1
             or root["generation"] > MAX_OCI_ROOT_VOLUME_GENERATION
+            or type(root["size_bytes"]) is not int
+            or not MIN_VOLUME_BYTES <= root["size_bytes"] <= MAX_VOLUME_BYTES
+            or root["size_bytes"] % (1024 * 1024) != 0
             or _SERIAL_RE.fullmatch(root["serial"] if isinstance(root["serial"], str) else "") is None
+            or root["serial"] != oci_stage1_device_serial("root", volume_id)
         ):
             raise StateError("stage-1 root mount policy is invalid")
         if not isinstance(self.layers, tuple) or not 1 <= len(self.layers) <= MAX_OCI_ROOT_LAYER_DISKS:
@@ -112,9 +128,12 @@ class OCIStage1Plan:
         for ordinal, layer in enumerate(layers):
             if not isinstance(layer, dict) or set(layer) != {
                 "filesystem",
+                "image_digest",
                 "mount_options",
+                "occurrence_digest",
                 "ordinal",
                 "serial",
+                "size_bytes",
             }:
                 raise StateError("stage-1 lower fields are invalid")
             if (
@@ -123,6 +142,12 @@ class OCIStage1Plan:
                 or layer["mount_options"] != ["ro", "nodev", "nosuid"]
                 or _SERIAL_RE.fullmatch(layer["serial"] if isinstance(layer["serial"], str) else "") is None
                 or layer["serial"] in serials
+                or not _canonical_digest(layer["image_digest"])
+                or not _canonical_digest(layer["occurrence_digest"])
+                or type(layer["size_bytes"]) is not int
+                or not SQUASHFS_BLOCK_DEVICE_ALIGNMENT <= layer["size_bytes"] <= MAX_OCI_STORE_IMAGE_BYTES
+                or layer["size_bytes"] % SQUASHFS_BLOCK_DEVICE_ALIGNMENT != 0
+                or layer["serial"] != oci_stage1_device_serial("lower", layer["occurrence_digest"])
             ):
                 raise StateError("stage-1 lower mount policy is invalid")
             serials.add(layer["serial"])
@@ -160,14 +185,18 @@ class OCIStage1Plan:
                     "generation": root_volume["generation"],
                     "mount_options": ["rw", "nodev", "nosuid"],
                     "serial": root_volume["serial"],
+                    "size_bytes": root_volume["size_bytes"],
                     "volume_id": root_volume["volume_id"],
                 },
                 layers=tuple(
                     {
                         "filesystem": layer["filesystem"],
+                        "image_digest": layer["image_digest"],
                         "mount_options": ["ro", "nodev", "nosuid"],
+                        "occurrence_digest": layer["occurrence_digest"],
                         "ordinal": layer["ordinal"],
                         "serial": layer["serial"],
+                        "size_bytes": layer["size_bytes"],
                     }
                     for layer in layers
                 ),
@@ -276,4 +305,5 @@ __all__ = [
     "OCI_STAGE1_PLAN_SCHEMA",
     "OCI_STAGE1_PROTOCOL",
     "OCIStage1Plan",
+    "oci_stage1_device_serial",
 ]

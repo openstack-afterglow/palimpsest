@@ -183,7 +183,7 @@ def _derived_result(image, ordinal: int) -> MaterializationResult:
             source_image_digest=image.image.digest,
             ordinal=ordinal,
             image_digest=digest(f"image-{ordinal}"),
-            image_size=ordinal + 1,
+            image_size=(ordinal + 1) * 512,
         ),
         cache_result="cold_miss",
     )

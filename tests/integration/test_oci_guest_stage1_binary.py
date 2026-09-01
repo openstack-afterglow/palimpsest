@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import shutil
 import struct
@@ -14,7 +15,7 @@ from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import canonical_json_bytes
-from palimpsest_local.oci_stage1 import OCIStage1Plan
+from palimpsest_local.oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
 
 _HEADER = struct.Struct("<16sIIQ32s")
@@ -68,15 +69,19 @@ def _plan(*, environment_name: str = "LANG") -> OCIStage1Plan:
             "filesystem": "ext4",
             "generation": 10**80,
             "mount_options": ["rw", "nodev", "nosuid"],
-            "serial": "1" * 20,
+            "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
+            "size_bytes": 16 * 1024 * 1024,
             "volume_id": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
         },
         layers=(
             {
                 "filesystem": "squashfs",
+                "image_digest": "sha256:" + "2" * 64,
                 "mount_options": ["ro", "nodev", "nosuid"],
+                "occurrence_digest": "sha256:" + "3" * 64,
                 "ordinal": 0,
-                "serial": "2" * 20,
+                "serial": oci_stage1_device_serial("lower", "sha256:" + "3" * 64),
+                "size_bytes": 4096,
             },
         ),
         process=OCIProcessSpec(
@@ -321,3 +326,33 @@ def test_freestanding_binary_rejects_writable_discovery_and_artifact_metadata(
     (tmp_path / "sys/class/block/vdb/ro").write_text("1\n", encoding="ascii")
     (tmp_path / "dev/vdb").chmod(0o666)
     assert _run(scratch_image, tmp_path).returncode == 67
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["assembly"]["layers"][0].__setitem__("occurrence_digest", "sha256:" + "9" * 64),
+        lambda value: value["assembly"]["layers"][0].__setitem__("serial", "f" * 20),
+        lambda value: value["assembly"]["layers"][0].__setitem__("size_bytes", True),
+        lambda value: value["assembly"]["layers"][0].__setitem__("size_bytes", 513),
+        lambda value: value["assembly"]["layers"][0].__setitem__("ordinal", 1),
+        lambda value: value["assembly"]["layers"][0].__setitem__("image_digest", "sha256:" + "z" * 64),
+        lambda value: value["assembly"]["root"].__setitem__("size_bytes", 512),
+        lambda value: value["assembly"]["root"].__setitem__("size_bytes", 2**64),
+    ],
+)
+def test_freestanding_binary_rejects_device_identity_and_size_semantic_drift(
+    scratch_image: str,
+    tmp_path: Path,
+    mutate: object,
+) -> None:
+    plan = _plan()
+    changed = copy.deepcopy(plan.to_dict())
+    mutate(changed)  # type: ignore[operator]
+    artifact = _envelope(canonical_json_bytes(changed))
+    _write_fixture(tmp_path, plan, artifact)
+    bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    with pytest.raises(ArtifactValidationError, match="semantics"):
+        verify_guest_stage1_transport(artifact, bindings)
+
+    assert _run(scratch_image, tmp_path).returncode == 68

@@ -2,8 +2,10 @@
 
 `init.c` is a freestanding Linux x86_64 PID 1. It uses raw syscalls and embeds
 its own SHA-256 and canonical JSON validation; it has no libc, dynamic loader,
-or system-header dependency. It authenticates the stage-1 transport and then
-waits permanently. It does not mount OCI root/lower filesystems, assemble
+or system-header dependency. It authenticates the stage-1 transport, then
+opens and authenticates the complete root/lower block-device set by role,
+serial, read-only state, exact size and stable identity before waiting
+permanently. It does not inspect or mount OCI root/lower filesystems, assemble
 OverlayFS, pivot root, or execute the image workload.
 
 The reproducible build is:
@@ -58,13 +60,15 @@ consumer proof. It direct-boots this exact packaged initramfs on native Linux
 x86_64 with KVM API 12 and QEMU `-accel kvm -cpu host`. The selected kernel
 configuration must provide the initrd, devtmpfs, proc/sysfs, PCI, serial
 console and virtio block requirements as built-ins (`=y`). A successful boot
-must emit the transport-verified marker exactly once and remain alive in the
+attaches a writable root and two ordered read-only lowers in deliberately
+permuted QEMU order. A successful boot must emit the pre-mount-device-set
+marker exactly once and remain alive in the
 PID 1 fail-closed wait. A second boot exposes the same transport bytes as a
 writable virtio block device and must emit only the rejection marker.
 
 The proof retains owner-only console and canonical receipt artifacts. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
-as qualified evidence. This boundary proves only the live transport consumer;
-root/lower discovery, filesystem mounts, pivot, workload supervision and
-production VM launch remain disabled.
+as qualified evidence. This boundary proves transport plus pre-mount block
+identity only. Filesystem magic/content verification, mounts, pivot, workload
+supervision and production VM launch remain disabled.

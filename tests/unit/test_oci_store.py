@@ -95,8 +95,9 @@ def _digest(byte: str) -> str:
     return "sha256:" + byte * 64
 
 
-def _squashfs(payload: bytes = b"payload" + b"\0" * 57) -> bytes:
-    image_size = 96 + len(payload)
+def _squashfs(payload: bytes = b"payload" + b"\0" * 57, *, align: bool = True) -> bytes:
+    bytes_used = 96 + len(payload)
+    image_size = ((bytes_used + 511) // 512) * 512 if align else bytes_used
     superblock = struct.pack(
         "<5I6H8Q",
         0x73717368,
@@ -111,7 +112,7 @@ def _squashfs(payload: bytes = b"payload" + b"\0" * 57) -> bytes:
         4,
         0,
         0,
-        image_size,
+        bytes_used,
         144,
         2**64 - 1,
         96,
@@ -119,7 +120,7 @@ def _squashfs(payload: bytes = b"payload" + b"\0" * 57) -> bytes:
         2**64 - 1,
         2**64 - 1,
     )
-    return superblock + payload
+    return superblock + payload + b"\0" * (image_size - bytes_used)
 
 
 def _store(tmp_path: Path, *, repair_age: float = 0) -> tuple[StatePaths, OCIStore]:
@@ -257,6 +258,16 @@ def test_cold_materialization_warm_hit_and_repeated_occurrence_share_physical_by
     assert len(list((roots.store / "blobs" / "sha256").glob("[0-9a-f]" * 64))) == 1
 
 
+def test_materialization_rejects_structurally_valid_but_unaligned_squashfs(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    occurrence = _occurrence()
+    image = _squashfs(align=False)
+    assert len(image) % 512 != 0
+
+    with pytest.raises(OCIStoreError, match="producer receipts are internally inconsistent"):
+        store.materialize(occurrence, _key(occurrence), _producer(occurrence, [], image))
+
+
 def test_observed_materialization_reports_invocation_local_cache_result(tmp_path: Path) -> None:
     _roots, store = _store(tmp_path)
     image = _squashfs()
@@ -305,7 +316,7 @@ def test_materialization_result_rejects_unhashable_cache_result() -> None:
         source_image_digest=_digest("5"),
         ordinal=0,
         image_digest=_digest("6"),
-        image_size=1,
+        image_size=512,
     )
 
     with pytest.raises(OCIStoreError, match="cache result is invalid"):
@@ -1725,7 +1736,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     stage1_wire = stage1.to_dict()
     original_serial = stage1_wire["assembly"]["root"]["serial"]
     stage1_wire["assembly"]["root"]["serial"] = "f" * 20 if original_serial != "f" * 20 else "e" * 20
-    with pytest.raises(StateError, match="expected domain plan"):
+    with pytest.raises(StateError, match="root mount policy"):
         OCIStage1Plan.from_dict(stage1_wire, expected_domain_plan=plan)
 
     corrupted_transport = bytearray(transport_path.read_bytes())

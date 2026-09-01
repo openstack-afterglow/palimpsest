@@ -472,6 +472,20 @@ Qualification state: the harness and required gate are source-controlled and loc
 
 Scope boundary: this proof exercises only the actual PID 1 transport consumer. Root and lower serials are cross-bound in the authenticated plan but their block nodes are not yet discovered or mounted. No ext4/SquashFS mount, OverlayFS, pivot, workload PID 1 supervisor, production libvirt define/start, foreground/`-d`, readiness, exec/log, or Gate 2 activation is included. OCI rootfs is still not claimed as actual `/`.
 
+### PR 4 slice 18: authenticated pre-mount block-device set
+
+Implemented:
+
+- `OCIStage1Plan` v3 preserves the writable root byte size and each ordered lower's image digest, occurrence digest and byte size. Root and lower serials are independently re-derived with the same domain-separated identities used by domain planning. Root volume bounds/alignment and SquashFS store bounds/sector alignment are validated in both producer and freestanding consumer.
+- The portable reference projects an ordered root/lower role contract and requires an exact, unique serial topology with exact sysfs read-only roles. It explicitly leaves block-node major/minor, `fstat`, `BLKROGET`, and `BLKGETSIZE64` to the Linux consumer boundary.
+- Live PID 1 authenticates the transport first, then discovers one writable root and every ordered read-only lower by virtio serial. It requires `virtio_blk`, exact sysfs `ro`, major/minor, block node, exact ioctl size, unique guest name/major-minor/inode identity and no extra `vd*` disk. All descriptors remain open through a final sysfs/fstat/ioctl recheck before the exact pre-mount marker and permanent fail-closed wait.
+- The KVM qualification harness attaches a zero-filled writable 16 MiB root and two ordered read-only lower artifacts in a deliberately permuted device order. Its v2 receipt binds the complete path-free topology digest and records `pre_mount_devices=true` while `filesystem_verified`, `content_verified`, `mount_attempted`, and `root_assembly` remain false. Pure negative receipt/contract tests cover read-only role inversion, size mismatch, missing/wrong/duplicate/extra topology; the live writable-transport rejection control remains required.
+- Source/build/seal/toolchain/ELF/initramfs provenance is refreshed and the non-PID1 fixture continues to exercise only the shared regular-file envelope/parser semantics.
+
+Scope boundary: this slice authenticates block identity only. It does not read filesystem magic or filesystem structure, hash mounted content, mount ext4/SquashFS, assemble OverlayFS, pivot, execute/supervise a workload, authorize production libvirt launch, implement foreground/`-d`, or activate Gate 2.
+
+Qualification state: the v2 harness, packaged ELF and required CI gate are source-controlled and locally verified through parser/differential tests. This macOS arm64 host cannot execute native x86_64 KVM, the repository currently has no connected `linux/x64/kvm` runner, and no actual v2 KVM receipt was collected in this slice. The topology mutation matrix is pure contract evidence, not a substitute for native-KVM negative boots.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -492,7 +506,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect qualified native Linux/KVM evidence for actual PID 1 pseudo-filesystem setup, virtio serial discovery, block-node major/minor plus `BLKROGET`/`BLKGETSIZE64`, transport verification and the final pre-mount handoff boundary.
-2. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
-3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Add native-KVM root/lower missing, wrong serial, role inversion, capacity mismatch, duplicate and extra-disk negative boots, then collect a qualified v2 receipt on a connected Linux x86_64 KVM runner.
+2. Add fail-closed ext4/SquashFS filesystem-magic and structural/content verification evidence without mounting.
+3. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
+4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

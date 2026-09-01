@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -23,6 +24,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     build_kernel_cmdline,
     build_proof_plan,
     build_qemu_command,
+    pre_mount_topology,
     transport_serial,
     verify_evidence_directory,
     verify_kernel_config,
@@ -99,6 +101,9 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
         kernel_path=paths[1],
         initramfs_path=paths[2],
         transport_path=paths[3],
+        root_path=(tmp_path / "root").resolve(),
+        lower_paths=tuple((tmp_path / f"lower-{index}").resolve() for index in range(len(plan.layers))),
+        plan=plan,
         cmdline=cmdline,
         serial=transport_serial(transport.receipt.artifact_digest),
     )
@@ -112,6 +117,13 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
     assert "readonly=on" in command[command.index("-drive") + 1]
     assert "accel=tcg" not in " ".join(command)
     assert f"palimpsest.stage1={transport.receipt.artifact_digest}" in cmdline
+    devices = tuple(command[index + 1] for index, item in enumerate(command) if item == "-device")
+    assert devices == (
+        f"virtio-blk-pci,drive=lower0,serial={plan.layers[0]['serial']}",
+        f"virtio-blk-pci,drive=stage1,serial={transport_serial(transport.receipt.artifact_digest)}",
+        f"virtio-blk-pci,drive=root,serial={plan.root['serial']}",
+        f"virtio-blk-pci,drive=lower1,serial={plan.layers[1]['serial']}",
+    )
 
 
 def test_console_reader_requires_one_marker_and_a_live_process() -> None:
@@ -177,6 +189,11 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
     assert decoded["root_assembly"] is False
+    assert decoded["pre_mount_devices"] is True
+    assert decoded["filesystem_verified"] is False
+    assert decoded["content_verified"] is False
+    assert decoded["mount_attempted"] is False
+    assert decoded["topology"] == pre_mount_topology(plan)
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, transport_serial="f" * 20)
     with pytest.raises(ArtifactValidationError, match="receipt value"):
@@ -186,6 +203,52 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
                 transport.receipt.artifact_digest,
                 "sha256:" + "f" * 64,
             ),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["topology"]["devices"][0].__setitem__("read_only", True),
+        lambda value: value["topology"]["devices"][1].__setitem__("read_only", False),
+        lambda value: value["topology"]["devices"][1].__setitem__("size_bytes", 512),
+        lambda value: value["topology"]["devices"].pop(),
+        lambda value: value["topology"]["devices"][1].__setitem__("serial", "f" * 20),
+        lambda value: value["topology"]["devices"][1].__setitem__("serial", value["topology"]["devices"][0]["serial"]),
+        lambda value: value["topology"]["devices"].append(dict(value["topology"]["devices"][-1])),
+    ],
+)
+def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topology(mutate: object) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    initramfs = build_bootstrap_initramfs()
+    console = b"boot\n" + SUCCESS_MARKER + b"\n"
+    writable_console = b"boot\n" + REJECTION_MARKER + b"\n"
+    receipt = OCIStage1KVMProofReceipt(
+        "sha256:" + "1" * 64,
+        4096,
+        "sha256:" + "2" * 64,
+        initramfs.manifest.artifact_digest,
+        initramfs.manifest.artifact_size_bytes,
+        initramfs.manifest.digest,
+        initramfs.manifest.stage1_binary_digest,
+        transport.receipt.to_dict(),
+        transport_serial(transport.receipt.artifact_digest),
+        build_kernel_cmdline(plan, transport),
+        "sha256:" + "3" * 64,
+        8192,
+        b"QEMU emulator version 9.2.0\n",
+        console,
+        writable_console,
+    )
+    changed = copy.deepcopy(receipt.to_dict())
+    mutate(changed)  # type: ignore[operator]
+
+    with pytest.raises(ArtifactValidationError, match="policy|canonical"):
+        OCIStage1KVMProofReceipt.from_dict(
+            changed,
+            console=console,
+            writable_console=writable_console,
         )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(
