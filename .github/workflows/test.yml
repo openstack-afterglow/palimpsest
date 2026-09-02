@@ -151,7 +151,7 @@ jobs:
       - run: uv sync --frozen --extra dev
       - name: Create private stage-1 evidence directory
         run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
-      - name: Prove retained root, overlay precedence, and rejection matrices
+      - name: Prove retained root, root transition, overlay precedence, and rejection matrices
         timeout-minutes: 45
         env:
           PALIMPSEST_REQUIRE_STAGE1_KVM: "1"

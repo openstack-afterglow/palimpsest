@@ -30,6 +30,42 @@
       "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
       "raw_sha256": "ef607002f63f445491b659898009ff1322affe8a8ff6ef980b6b30af34ca6cf7",
       "raw_size_bytes": 16777216
+    },
+    "transition_dev": {
+      "base64_file": "transition-dev.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "d1570b817bde5bca5a8250dab6a6f7733ca6df12068293beaba414d2a53f1aae",
+      "raw_size_bytes": 4096,
+      "source_files": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
+        {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      ],
+      "source_root": "inputs/transition-dev"
+    },
+    "transition_proc": {
+      "base64_file": "transition-proc.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "b0344088410bed455d75f973dacdd1e4fe84d461f21bc0d4a67e537f54c4906a",
+      "raw_size_bytes": 4096,
+      "source_files": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
+        {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      ],
+      "source_root": "inputs/transition-proc"
+    },
+    "transition_sys": {
+      "base64_file": "transition-sys.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "f19f8e5253cde2ae361e557a7aa9d0909d019ddfae53691bc4aa7a96300634e0",
+      "raw_size_bytes": 4096,
+      "source_files": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
+        {"mode": 420, "path": "sys", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      ],
+      "source_root": "inputs/transition-sys"
     }
   },
   "assembly_probe": {
@@ -38,7 +74,7 @@
     "size_bytes": 10,
     "top_ordinal": 1
   },
-  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v2",
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v3",
   "provenance": {
     "lower_builder": {
       "argv_policy": "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress",
@@ -53,5 +89,5 @@
       "version": "mke2fs 1.47.0"
     }
   },
-  "schema": "palimpsest.kvm-filesystem-fixtures.v2"
+  "schema": "palimpsest.kvm-filesystem-fixtures.v3"
 }

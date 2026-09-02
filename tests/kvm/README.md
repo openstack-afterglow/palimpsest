@@ -5,8 +5,9 @@ path. It direct-boots a Linux bzImage with the exact source-controlled
 initramfs, raw stage-1 transport, writable root, and two read-only lower disks
 under `-accel kvm -cpu host`. Device attachment order is intentionally
 permuted. The positive boot must mount the authenticated ext4/SquashFS set,
-assemble `/run/palimpsest/merged`, reach the single staging-overlay marker, and
-remain alive in the fail-closed PID 1 wait. Thirteen separate negative boots exercise writable
+assemble OverlayFS, perform the authenticated move-mount/chroot root
+transition, reach the single root-transition marker with that OverlayFS as
+actual `/`, and remain alive in the fail-closed PID 1 wait. Thirteen separate negative boots exercise writable
 transport, missing/wrong/read-only/wrong-size root, missing/wrong/writable/wrong-size
 lower, duplicate serial, and extra-disk controls. Each must reach exactly one
 rejection marker, no success/preparation marker, and remain alive as PID 1.
@@ -31,16 +32,22 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-proof stops after authenticated filesystem mounts and staging OverlayFS
-assembly. The assembled tree is not `/`; pivot, workload supervision, and
-production define/start remain disabled.
+proof stops after the authenticated OverlayFS is moved onto `/` and PID 1
+enters it with `chroot(2)`. Receipt v8 records exact root and moved
+pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
+does not claim that the initial initramfs root was unmounted or reclaimed.
+Workload supervision and production define/start remain disabled.
 
-The v6 canonical receipt binds every path-free negative topology contract and
+The v8 canonical receipt binds every path-free negative topology contract and
 its console digest, records mutable-root seed/boot-one/boot-two digests, and
 keeps immutable transport/lower equality. The two committed real SquashFS
 fixtures use zstd level 3 and contain an ordinal-specific collision sentinel;
 the authenticated proof-only merged-tree probe checks highest-ordinal
 precedence. Three post-overlay probe controls fail only at assembly validation.
+Three additional transition-target boots use distinct real zstd SquashFS
+highest lowers containing a regular `dev`, `sys`, or `proc`; each must reach
+only the root-transition rejection marker while its independent mutable root
+seed/post digest and immutable lower/transport bytes remain receipt-bound.
 Evidence contains positive and retained-boot consoles plus
 `negative-<case>.bin` for every named control; all evidence files are
 exclusively created owner-readable (`0400`).
@@ -49,3 +56,10 @@ The PR workflow also has an always-running `Required native KVM proof`
 aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
+
+The stage-1 plan/protocol remains v6 and its supervisor-required handoff is
+unchanged. Pre-mount, filesystem, and assembly negative controls reject before
+root transition and must contain no root-transition rejection marker. A
+failure after an irreversible mount move emits the dedicated indeterminate
+root-state marker and waits fail-closed; no rollback is claimed. This source
+update is not itself native-KVM runtime evidence.

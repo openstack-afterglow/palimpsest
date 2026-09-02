@@ -7,9 +7,11 @@ opens and authenticates the complete root/lower block-device set by role,
 serial, read-only state, exact size and stable identity before waiting
 permanently. It verifies the root ext4 identity and geometry, then every
 lower's SquashFS v4 structure and whole-device image digest. Live PID 1 mounts
-the authenticated block FDs at deterministic staging paths and assembles an
-OverlayFS root at `/run/palimpsest/merged`. It does not pivot/chroot into that
-tree or execute or supervise the image workload.
+the authenticated block FDs at deterministic staging paths, assembles
+OverlayFS, moves devtmpfs, sysfs, and proc into that tree, then moves the
+OverlayFS mount onto `/` and enters it with `chroot(2)`. This is an
+initramfs-safe switch-root choreography, not a `pivot_root(2)` call. It does
+not execute or supervise the image workload.
 
 New OCI-root volumes are formatted with a closed ext4 feature allow-list and
 fixed geometry rather than host `mke2fs.conf` defaults, then verified before
@@ -62,8 +64,10 @@ portable fixture. The transport and filesystem files must be single-link
 regular files with no group/world write bits; lowers must have no write bits.
 Exit codes are `0` verified, `64` fixture usage,
 `65` cmdline, `66` discovery, `67` envelope/artifact, and `68` semantic plan
-rejection, `69` filesystem rejection, and live-only `70` mount/assembly
-rejection. Live PID 1 never exits: both success and failure wait fail-closed.
+rejection, `69` filesystem rejection, live-only `70` mount/assembly rejection,
+and live-only `71` root-transition rejection. A partial transition is reported
+as indeterminate rather than rolled back. Live PID 1 never exits: both success
+and failure wait fail-closed.
 The root-volume generation is bounded consistently in Python and C to 4096
 canonical decimal digits.
 
@@ -77,7 +81,11 @@ console, virtio block, ext4, SquashFS xattr plus gzip/zstd codecs, and
 OverlayFS requirements as built-ins (`=y`). A successful boot
 attaches an actual ext4 writable root and two actual SquashFS read-only lowers
 in deliberately permuted QEMU order. A successful boot must emit the
-staging-overlay marker exactly once and remain alive in the PID 1 fail-closed wait. Thirteen
+root-transition marker exactly once and remain alive in the PID 1 fail-closed
+wait. Before that marker, PID 1 proves `/` is the same authenticated OverlayFS
+inode previously mounted at staging, `/proc/self/root` matches `/`, the moved
+pseudo-filesystems retain their pre-transition identities, probes still pass
+at `/`, and every device passes a final recheck. Thirteen
 separate negative boots cover writable transport, root/lower absence, wrong
 serial, read-only-mode mismatch, capacity mismatch, duplicate serial, and an
 extra disk. Six separate same-topology filesystem negatives cover root magic,
@@ -88,14 +96,17 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v5 proof retains owner-only positive and per-control consoles plus a
+The v8 proof retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
-filesystem structure/content policy and staging OverlayFS assembly. Mutable
-root content is not authenticated; the merged tree is not `/`, and pivot,
-workload supervision and production VM launch remain disabled.
+filesystem structure/content policy, OverlayFS assembly, and an actual `/`
+through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`.
+Literal `pivot_root` remains false, the initial initramfs root is covered rather
+than claimed unmounted or reclaimed, mutable root content is not authenticated,
+and workload supervision and production VM launch remain disabled. Stage-1
+plan/protocol v6 and its supervisor-required handoff remain unchanged.
 
 Proof v6 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
@@ -107,3 +118,7 @@ synchronized retained-root reassembly checkpoint after `syncfs` on the mounted
 ext4 filesystem. QEMU is terminated after the marker, so it is neither a
 graceful guest-shutdown nor a crash-recovery claim. Three additional boots
 isolate missing, wrong-sized, and wrong-digest post-overlay probe rejection.
+Three v3-fixture-backed transition controls independently replace the highest
+lower with a real zstd SquashFS containing a regular `dev`, `sys`, or `proc`.
+Each reaches valid assembly and then proves that the named target must be an
+exact root-owned 0755 empty directory before any mount move.

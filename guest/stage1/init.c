@@ -2,9 +2,10 @@
  * Palimpsest OCI guest stage-1 transport consumer.
  *
  * Freestanding Linux x86_64: no libc and no system headers.  This program
- * authenticates the stage-1 plan, mounts its filesystems, assembles a staging
- * OverlayFS root, and then waits fail-closed.  It deliberately performs no
- * pivot_root, chroot, workload execution, or supervision.
+ * authenticates the stage-1 plan, mounts its filesystems, assembles an
+ * OverlayFS root, moves that mount onto / with an initramfs-safe switch-root
+ * choreography, and then waits fail-closed.  It deliberately performs no
+ * pivot_root syscall, workload execution, or supervision.
  */
 
 typedef unsigned char u8;
@@ -25,9 +26,11 @@ struct span { const char *p; usize n; };
 #define SYS_pause 34
 #define SYS_getpid 39
 #define SYS_exit 60
+#define SYS_chdir 80
 #define SYS_mkdir 83
 #define SYS_readlink 89
 #define SYS_mount 165
+#define SYS_chroot 161
 #define SYS_syncfs 306
 #define SYS_statfs 137
 #define SYS_fstatfs 138
@@ -48,6 +51,7 @@ struct span { const char *p; usize n; };
 #define MS_NOEXEC 8
 #define MS_REC 16384
 #define MS_PRIVATE 262144
+#define MS_MOVE 8192
 #define EEXIST 17
 #define EBUSY 16
 #define BLKROGET 0x125e
@@ -75,6 +79,7 @@ struct span { const char *p; usize n; };
 #define EXIT_PLAN 68
 #define EXIT_FILESYSTEM 69
 #define EXIT_ASSEMBLY 70
+#define EXIT_ROOT_TRANSITION 71
 
 struct timespec_local {
     i64 sec;
@@ -1484,7 +1489,7 @@ static int safe_dir(const char *path, int create, int require_empty, int expecte
     }
     fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
     if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFDIR ||
-        (expected_mode && (st.uid != 0 || st.gid != 0 || (st.mode & 0777) != (u32)expected_mode))) {
+        (expected_mode && (st.uid != 0 || st.gid != 0 || (st.mode & 07777) != (u32)expected_mode))) {
         if (fd >= 0) sc1(SYS_close, fd);
         return 0;
     }
@@ -1665,7 +1670,7 @@ static int build_overlay_data(char out[PATH_MAX_LOCAL], u32 lower_count) {
            append_text(out, &used, ",workdir=/run/palimpsest/root/.palimpsest/work");
 }
 
-static int verify_merged_probe(const struct expected_device_set *expected, u32 index) {
+static int verify_probe_at(const struct expected_device_set *expected, u32 index, const char *base) {
     char path[PATH_MAX_LOCAL];
     usize used = 0;
     struct stat_local before, after;
@@ -1674,7 +1679,7 @@ static int verify_merged_probe(const struct expected_device_set *expected, u32 i
     u64 offset = 0;
     i64 fd;
     if (index >= expected->probe_count ||
-        !append_text(path, &used, "/run/palimpsest/merged") ||
+        !append_text(path, &used, base) ||
         !append_text(path, &used, expected->probes[index].path)) return 0;
     fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (fd < 0 || sc2(SYS_fstat, fd, (i64)&before) < 0 ||
@@ -1702,8 +1707,18 @@ static int verify_merged_probe(const struct expected_device_set *expected, u32 i
     return 1;
 }
 
+static void close_staging_fds(int root_fd, int lower_fds[LOWER_MAX], u32 lower_count,
+                              int state_fd, int upper_fd, int work_fd) {
+    u32 i;
+    if (root_fd >= 0) sc1(SYS_close, root_fd);
+    for (i = 0; i < lower_count; i++) if (lower_fds[i] >= 0) sc1(SYS_close, lower_fds[i]);
+    if (state_fd >= 0) sc1(SYS_close, state_fd);
+    if (upper_fd >= 0) sc1(SYS_close, upper_fd);
+    if (work_fd >= 0) sc1(SYS_close, work_fd);
+}
+
 static int assemble_staging_root(const struct expected_device_set *expected, struct opened_role *roles,
-                                 const struct opened_role *transport) {
+                                 const struct opened_role *transport, int *kept_merged_fd) {
     static const char *base_dirs[] = {"/run", "/run/palimpsest", "/run/palimpsest/root",
                                       "/run/palimpsest/lowers", "/run/palimpsest/merged"};
     int base_fds[5] = {-1, -1, -1, -1, -1};
@@ -1745,10 +1760,142 @@ static int assemble_staging_root(const struct expected_device_set *expected, str
     for (i = 0; i < expected->lower_count; i++)
         if (!recheck_open_role(&roles[i + 1]) || !lower_path(path, i) ||
             !stable_dir(path, lower_fds[i], SQUASHFS_MAGIC)) return 0;
-    for (i = 0; i < expected->probe_count; i++) if (!verify_merged_probe(expected, i)) return 0;
-    if (sc1(SYS_syncfs, root_fd) != 0 || !recheck_open_role(&roles[0])) return 0;
-    return stable_dir("/run/palimpsest/root", root_fd, EXT4_MAGIC) &&
-           stable_dir("/run/palimpsest/merged", merged_fd, OVERLAYFS_MAGIC);
+    for (i = 0; i < expected->probe_count; i++)
+        if (!verify_probe_at(expected, i, "/run/palimpsest/merged")) return 0;
+    if (sc1(SYS_syncfs, root_fd) != 0 || !recheck_open_role(&roles[0]) ||
+        !stable_dir("/run/palimpsest/root", root_fd, EXT4_MAGIC) ||
+        !stable_dir("/run/palimpsest/merged", merged_fd, OVERLAYFS_MAGIC)) return 0;
+    close_staging_fds(root_fd, lower_fds, expected->lower_count, state_fd, upper_fd, work_fd);
+    *kept_merged_fd = merged_fd;
+    return 1;
+}
+
+static int transition_target_dir(const char *path, int *kept_fd) {
+    return safe_dir(path, 1, 1, 0755, kept_fd) &&
+           stable_dir(path, *kept_fd, OVERLAYFS_MAGIC);
+}
+
+static int transition_target_ready(const char *path, int retained_fd) {
+    struct stat_local retained, current;
+    struct statfs_local fs;
+    int current_fd = -1;
+    int valid = safe_dir(path, 0, 1, 0755, &current_fd) &&
+        sc2(SYS_fstat, retained_fd, (i64)&retained) == 0 &&
+        sc2(SYS_fstat, current_fd, (i64)&current) == 0 &&
+        retained.dev == current.dev && retained.ino == current.ino &&
+        retained.mode == current.mode && retained.uid == current.uid && retained.gid == current.gid &&
+        sc2(SYS_fstatfs, current_fd, (i64)&fs) == 0 && fs.type == OVERLAYFS_MAGIC;
+    if (current_fd >= 0) sc1(SYS_close, current_fd);
+    return valid;
+}
+
+struct held_filesystem {
+    int fd;
+    struct stat_local identity;
+    i64 magic;
+};
+
+static int hold_filesystem(const char *path, i64 magic, struct held_filesystem *held) {
+    struct statfs_local fs;
+    i64 fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&held->identity) < 0 ||
+        (held->identity.mode & S_IFMT) != S_IFDIR ||
+        sc2(SYS_fstatfs, fd, (i64)&fs) < 0 || fs.type != magic) {
+        if (fd >= 0) sc1(SYS_close, fd);
+        return 0;
+    }
+    held->fd = (int)fd;
+    held->magic = magic;
+    return 1;
+}
+
+static int verify_held_filesystem(const char *path, struct held_filesystem *held) {
+    struct stat_local current, retained;
+    struct statfs_local fs;
+    i64 fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    int valid = held->fd >= 0 && fd >= 0 &&
+        sc2(SYS_fstat, held->fd, (i64)&retained) == 0 &&
+        sc2(SYS_fstat, fd, (i64)&current) == 0 &&
+        retained.dev == held->identity.dev && retained.ino == held->identity.ino &&
+        retained.mode == held->identity.mode && current.dev == held->identity.dev &&
+        current.ino == held->identity.ino && current.mode == held->identity.mode &&
+        sc2(SYS_fstatfs, fd, (i64)&fs) == 0 && fs.type == held->magic;
+    if (fd >= 0) sc1(SYS_close, fd);
+    return valid;
+}
+
+static int verify_root_identity(int merged_fd, const struct stat_local *merged_identity) {
+    struct stat_local slash, proc_root, retained;
+    struct statfs_local fs;
+    i64 slash_fd = sc3(SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    i64 proc_root_fd = sc3(SYS_open, (i64)"/proc/self/root", O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0);
+    int valid = slash_fd >= 0 && proc_root_fd >= 0 &&
+        sc2(SYS_fstat, slash_fd, (i64)&slash) == 0 &&
+        sc2(SYS_fstat, proc_root_fd, (i64)&proc_root) == 0 &&
+        sc2(SYS_fstat, merged_fd, (i64)&retained) == 0 &&
+        retained.dev == merged_identity->dev && retained.ino == merged_identity->ino &&
+        retained.mode == merged_identity->mode && slash.dev == merged_identity->dev &&
+        slash.ino == merged_identity->ino && slash.mode == merged_identity->mode &&
+        slash.dev == proc_root.dev && slash.ino == proc_root.ino && slash.mode == proc_root.mode &&
+        sc2(SYS_fstatfs, slash_fd, (i64)&fs) == 0 && fs.type == OVERLAYFS_MAGIC &&
+        sc1(SYS_syncfs, slash_fd) == 0;
+    if (proc_root_fd >= 0) sc1(SYS_close, proc_root_fd);
+    if (slash_fd >= 0) sc1(SYS_close, slash_fd);
+    return valid;
+}
+
+static int transition_root(struct expected_device_set *expected, struct opened_role *roles,
+                           struct opened_role *transport, int merged_fd) {
+    struct held_filesystem dev = {.fd = -1}, sys = {.fd = -1}, proc = {.fd = -1};
+    struct stat_local merged_identity;
+    int dev_target = -1, sys_target = -1, proc_target = -1;
+    u32 i;
+    int valid;
+    if (merged_fd < 0 || sc2(SYS_fstat, merged_fd, (i64)&merged_identity) < 0 ||
+        (merged_identity.mode & S_IFMT) != S_IFDIR ||
+        !hold_filesystem("/dev", 0x01021994, &dev) ||
+        !hold_filesystem("/sys", 0x62656572, &sys) ||
+        !hold_filesystem("/proc", 0x9fa0, &proc) ||
+        !transition_target_dir("/run/palimpsest/merged/proc", &proc_target) ||
+        !transition_target_dir("/run/palimpsest/merged/sys", &sys_target) ||
+        !transition_target_dir("/run/palimpsest/merged/dev", &dev_target)) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/dev", dev_target)) goto rejected;
+    sc1(SYS_close, dev_target); dev_target = -1;
+    if (sc5(SYS_mount, (i64)"/dev", (i64)"/run/palimpsest/merged/dev", 0, MS_MOVE, 0) != 0) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/sys", sys_target)) goto rejected;
+    sc1(SYS_close, sys_target); sys_target = -1;
+    if (sc5(SYS_mount, (i64)"/sys", (i64)"/run/palimpsest/merged/sys", 0, MS_MOVE, 0) != 0) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/proc", proc_target)) goto rejected;
+    sc1(SYS_close, proc_target); proc_target = -1;
+    if (sc5(SYS_mount, (i64)"/proc", (i64)"/run/palimpsest/merged/proc", 0, MS_MOVE, 0) != 0 ||
+        sc1(SYS_chdir, (i64)"/run/palimpsest/merged") != 0 ||
+        sc5(SYS_mount, (i64)".", (i64)"/", 0, MS_MOVE, 0) != 0 ||
+        sc1(SYS_chroot, (i64)".") != 0 || sc1(SYS_chdir, (i64)"/") != 0) goto rejected;
+    valid = sc0(SYS_getpid) == 1 && verify_root_identity(merged_fd, &merged_identity) &&
+        verify_mountinfo("/", "overlay", 0, 0, 0, 0, 0) &&
+        verify_held_filesystem("/dev", &dev) &&
+        verify_held_filesystem("/sys", &sys) &&
+        verify_held_filesystem("/proc", &proc) &&
+        recheck_open_role(transport) && recheck_open_role(&roles[0]) &&
+        exact_vd_disk_count(expected->lower_count + 2);
+    for (i = 0; valid && i < expected->lower_count; i++)
+        if (!recheck_open_role(&roles[i + 1])) valid = 0;
+    for (i = 0; valid && i < expected->probe_count; i++)
+        if (!verify_probe_at(expected, i, "")) valid = 0;
+    sc1(SYS_close, dev.fd);
+    sc1(SYS_close, sys.fd);
+    sc1(SYS_close, proc.fd);
+    sc1(SYS_close, merged_fd);
+    return valid;
+rejected:
+    if (dev_target >= 0) sc1(SYS_close, dev_target);
+    if (sys_target >= 0) sc1(SYS_close, sys_target);
+    if (proc_target >= 0) sc1(SYS_close, proc_target);
+    if (dev.fd >= 0) sc1(SYS_close, dev.fd);
+    if (sys.fd >= 0) sc1(SYS_close, sys.fd);
+    if (proc.fd >= 0) sc1(SYS_close, proc.fd);
+    if (merged_fd >= 0) sc1(SYS_close, merged_fd);
+    return 0;
 }
 
 static int run_consumer(const char *fixture_root, int fixture_mode) {
@@ -1760,6 +1907,7 @@ static int run_consumer(const char *fixture_root, int fixture_mode) {
     i64 n;
     u32 i, j;
     int transport_fd = -1;
+    int merged_fd = -1;
     int fixture = fixture_mode != 0;
     memset(&b, 0, sizeof(b));
     memset(&device, 0, sizeof(device));
@@ -1812,7 +1960,8 @@ static int run_consumer(const char *fixture_root, int fixture_mode) {
     for (i = 0; i < expected.lower_count + 1; i++)
         if (!recheck_open_role(&roles[i])) return EXIT_DISCOVERY;
     if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
-    return assemble_staging_root(&expected, roles, &transport_role) ? 0 : EXIT_ASSEMBLY;
+    if (!assemble_staging_root(&expected, roles, &transport_role, &merged_fd)) return EXIT_ASSEMBLY;
+    return transition_root(&expected, roles, &transport_role, merged_fd) ? 0 : EXIT_ROOT_TRANSITION;
 }
 
 static __attribute__((noreturn, used)) void start_c(u64 *stack) {
@@ -1836,8 +1985,9 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     code = run_consumer(0, 0);
     if (code == EXIT_FILESYSTEM) wait_closed("palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed\n");
     if (code == EXIT_ASSEMBLY) wait_closed("palimpsest guest stage1: mount or staging assembly rejected; root is not slash; pivot and workload disabled; waiting fail-closed\n");
+    if (code == EXIT_ROOT_TRANSITION) wait_closed("palimpsest guest stage1: root transition rejected; root state is indeterminate; workload disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
-    wait_closed("palimpsest guest stage1: staging overlay assembled; root is not slash; pivot and workload disabled; waiting fail-closed\n");
+    wait_closed("palimpsest guest stage1: root transition complete; root is slash; workload disabled; waiting fail-closed\n");
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {

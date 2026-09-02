@@ -2,8 +2,10 @@
 
 The first-party static ``/init`` authenticates the raw stage-1 transport,
 block-device identities, root ext4 structure, and immutable lower SquashFS
-structure/content, mounts them into staging, assembles OverlayFS, and verifies
-optional authenticated root-level probes before sleeping forever. It deliberately does not pivot root or execute the image process. Exact source, toolchain,
+structure/content, mounts them, assembles OverlayFS, verifies optional
+authenticated root-level probes, and performs an initramfs-safe
+move-mount/chroot root transition before sleeping forever. It deliberately
+does not call ``pivot_root(2)`` or execute the image process. Exact source, toolchain,
 sealing recipe, binary and ABI provenance prevents transport consumption from
 being confused with full OCI-root boot readiness.
 """
@@ -28,20 +30,21 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v7"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v9"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v5"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v7"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v7"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v9"
+OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:489eca240ef49072c3a91a2871662bc561c26e83a0aa744761b4333385e87f7b"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:f512ef7a2be7181582b8a5200fc7d3508a9838e25f777c5ca0601e06bcfb8c90"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:839c8cf10c5bdf525c7a6e09393d806dd66cb589255159ed60443531af91a741"
+OCI_STAGE1_BINARY_DIGEST = "sha256:a5195b2d670a0e9911c606982d0e444103ba422ec76e39a5c9410dd49bc2a6ee"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -366,7 +369,18 @@ def _guest_consumer_contract_bytes() -> bytes:
             "plan_transport": OCI_GUEST_STAGE1_PLAN_TRANSPORT,
             "pivot_root": False,
             "root_assembly": True,
-            "root_is_slash": False,
+            "root_is_slash": True,
+            "root_transition": {
+                "contract": OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
+                "method": "move-mount-chroot",
+                "pid1_root_matches_slash": True,
+                "pivot_root": False,
+                "pseudo_filesystems": ["dev", "sys", "proc"],
+                "root_filesystem": "overlay",
+                "switch_root": True,
+                "workload_started": False,
+            },
+            "switch_root": True,
             "validation": [
                 "bounded-closed-world-kernel-cmdline",
                 "proc-sysfs-devtmpfs-pseudo-filesystems",
@@ -380,6 +394,9 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "proc-fd-bound-ext4-squashfs-mount-source",
                 "nofollow-staging-directories-mountinfo-statfs-final-recheck",
                 "highest-ordinal-leftmost-overlay-upper-work-assembly",
+                "move-mounted-root-chroot-pid1-root-identity",
+                "root-owned-0755-empty-pseudo-filesystem-move-targets",
+                "moved-proc-sysfs-devtmpfs-post-transition-identity",
             ],
             "workload_started": False,
         }
@@ -397,8 +414,19 @@ def _stage1_abi_bytes() -> bytes:
             "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
             "pivot_root": False,
             "root_assembly": True,
-            "root_is_slash": False,
+            "root_is_slash": True,
+            "root_transition": {
+                "contract": OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
+                "method": "move-mount-chroot",
+                "pid1_root_matches_slash": True,
+                "pivot_root": False,
+                "pseudo_filesystems": ["dev", "sys", "proc"],
+                "root_filesystem": "overlay",
+                "switch_root": True,
+                "workload_started": False,
+            },
             "schema": OCI_STAGE1_ABI,
+            "switch_root": True,
             "workload_started": False,
         }
     )
@@ -498,7 +526,18 @@ class OCIInitramfsManifest:
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
                 "pivot_root": False,
                 "root_assembly": True,
-                "root_is_slash": False,
+                "root_is_slash": True,
+                "root_transition": {
+                    "contract": OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
+                    "method": "move-mount-chroot",
+                    "pid1_root_matches_slash": True,
+                    "pivot_root": False,
+                    "pseudo_filesystems": ["dev", "sys", "proc"],
+                    "root_filesystem": "overlay",
+                    "switch_root": True,
+                    "workload_started": False,
+                },
+                "switch_root": True,
                 "workload_started": False,
             },
         }
@@ -550,7 +589,18 @@ class OCIInitramfsManifest:
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
                 "pivot_root": False,
                 "root_assembly": True,
-                "root_is_slash": False,
+                "root_is_slash": True,
+                "root_transition": {
+                    "contract": OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
+                    "method": "move-mount-chroot",
+                    "pid1_root_matches_slash": True,
+                    "pivot_root": False,
+                    "pseudo_filesystems": ["dev", "sys", "proc"],
+                    "root_filesystem": "overlay",
+                    "switch_root": True,
+                    "workload_started": False,
+                },
+                "switch_root": True,
                 "workload_started": False,
             }
             or not isinstance(entries, list)
@@ -664,6 +714,7 @@ __all__ = [
     "OCI_STAGE1_BUILD_CONTRACT",
     "OCI_STAGE1_BUILD_RECIPE_DIGEST",
     "OCI_STAGE1_PLAN_TRANSPORT",
+    "OCI_STAGE1_ROOT_TRANSITION_CONTRACT",
     "OCI_STAGE1_SEAL_RECIPE_DIGEST",
     "OCI_STAGE1_SOURCE_DIGEST",
     "OCI_STAGE1_TOOLCHAIN_IMAGE",

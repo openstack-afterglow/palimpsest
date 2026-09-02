@@ -550,6 +550,51 @@ macOS host cannot run native x86_64 KVM, so no v6 runtime receipt is claimed.
 Pivot, workload execution/supervision, production launch and Gate 2 remain
 disabled.
 
+### PR 4 slice 23: authenticated initramfs switch-root checkpoint
+
+Implemented:
+
+- Stage-1 plan/protocol v6 and its supervisor-required handoff remain
+  unchanged. After authenticated mount, OverlayFS assembly, and proof probes,
+  the packaged PID 1 closes staging directory descriptors while retaining the
+  authenticated merged-root identity. It validates no-follow `/dev`, `/sys`,
+  and `/proc` targets, retains the original pseudo-filesystem mount identities,
+  moves those mounts into the merged tree, then moves OverlayFS onto `/` and
+  enters it with `chroot(2)`.
+- This is the explicit `palimpsest.stage1-root-transition.v1`
+  `move-mount-chroot` contract required by an initramfs initial rootfs. It does
+  not call or claim `pivot_root(2)`, and does not claim the covered initial
+  rootfs was unmounted or reclaimed. A failure after any irreversible move has
+  a dedicated indeterminate-root-state marker and permanent fail-closed wait;
+  no rollback is attempted or implied.
+- Before the success marker, PID 1 proves it is still PID 1, `/` is OverlayFS
+  and matches the exact pre-transition merged inode, `/proc/self/root` matches
+  `/`, devtmpfs/sysfs/proc match their retained pre-move inode and filesystem
+  identities, authenticated probes still pass from `/`, and all transport,
+  root, and lower block identities pass final sysfs/ioctl checks.
+- Initramfs manifest v9, bootstrap ABI v9, consumer/init contract v7, and KVM
+  receipt v8 bind `root_is_slash=true`, `switch_root=true`,
+  `pivot_root=false`, and `workload_started=false`. Existing topology,
+  filesystem, and assembly negative controls remain pre-transition and forbid
+  the transition-rejection marker. The packaged deterministic static ELF and
+  its exact source/binary provenance are refreshed.
+- Transition targets are held by no-follow descriptors and must be exact
+  root-owned 0755 empty directories on the authenticated OverlayFS both during
+  preparation and immediately before their individual move. Three independent
+  real-zstd-SquashFS controls replace the highest lower with a regular `dev`,
+  `sys`, or `proc`; valid assembly then reaches exactly the dedicated
+  transition rejection marker, and receipt v8 binds each control's distinct
+  plan/transport/lower plus mutable-root seed and post-run digest.
+
+Scope boundary: the OCI filesystem is now the PID 1 `/` only in this
+qualification bootstrap. No image process is executed, no supervisor is
+started, and production libvirt define/start, foreground/`-d`, readiness,
+exec/log, Gate 2, and initramfs-root reclamation remain disabled.
+
+Qualification state: portable receipt/contract and packaged-ELF tests run on
+this macOS host, but the move-mount/chroot sequence itself requires the
+qualified Linux x86_64 native-KVM runner. No local v8 KVM success is claimed.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -568,8 +613,13 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect a qualified v4 positive plus topology and filesystem negative-matrix receipt on a connected Linux x86_64 KVM runner.
-2. Collect the qualified v5 staging-mount/OverlayFS receipt and add targeted mount/assembly rejection evidence.
-3. Implement pivot_root plus the first-party PID 1 supervisor as a separate checkpoint.
-4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Collect the qualified v8 move-mount/chroot root-transition receipt and all
+   retained-root plus topology/filesystem/assembly negative evidence on the
+   connected Linux x86_64 KVM runner.
+2. Implement the first-party PID 1 supervisor and image workload startup as a
+   separate checkpoint; do not alias the current permanent wait to readiness.
+3. Implement foreground-default `run` and detached `run -d`, then
+   lifecycle/exec/log readiness for OCI-root/KVM.
+4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
+   KVM runner and require it before claiming production OCI-image-to-VM-root
+   readiness.

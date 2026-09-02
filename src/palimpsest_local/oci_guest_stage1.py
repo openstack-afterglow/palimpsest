@@ -3,8 +3,9 @@
 This module is the portable transport and block-role reference shared with the
 packaged freestanding x86_64 ``/init`` implementation. Filesystem byte parsing
 lives in :mod:`oci_guest_filesystems`. The packaged PID 1 additionally mounts
-the authenticated filesystems and assembles a staging OverlayFS root; this
-portable reference does not mount, pivot, or execute a process from the image.
+the authenticated filesystems, assembles OverlayFS, and performs an
+initramfs-safe move-mount/chroot root transition. This portable reference does
+not mount, transition root, or execute a process from the image.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ from .oci_stage1 import (
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v5"
-OCI_GUEST_STAGE1_CAPABILITY = "authenticated-staging-overlay-probes-fail-closed"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v7"
+OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-fail-closed"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64

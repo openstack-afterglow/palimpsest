@@ -17,6 +17,8 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     NEGATIVE_CONTROL_NAMES,
     PREPARATION_FAILURE_MARKER,
     REJECTION_MARKER,
+    ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
+    ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
     _logical_line_count,
     run_oci_stage1_kvm_proof,
@@ -40,8 +42,19 @@ def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesyste
         "live_pid1": True,
     }
     assert receipt["root_assembly"] is True
-    assert receipt["root_is_slash"] is False
+    assert receipt["root_is_slash"] is True
     assert receipt["pivot_root"] is False
+    assert receipt["switch_root"] is True
+    assert receipt["root_transition"] == {
+        "contract": "palimpsest.stage1-root-transition.v1",
+        "method": "move-mount-chroot",
+        "pid1_root_matches_slash": True,
+        "pivot_root": False,
+        "pseudo_filesystems": ["dev", "sys", "proc"],
+        "root_filesystem": "overlay",
+        "switch_root": True,
+        "workload_started": False,
+    }
     assert receipt["workload_started"] is False
     assert receipt["pre_mount_devices"] is True
     assert receipt["filesystem_verified"] is True
@@ -56,22 +69,34 @@ def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesyste
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
     assert _logical_line_count(result.console, ASSEMBLY_REJECTION_MARKER) == 0
+    assert _logical_line_count(result.console, ROOT_TRANSITION_REJECTION_MARKER) == 0
     assert _logical_line_count(result.retained_console, SUCCESS_MARKER) == 1
     assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
     for console in result.negative_consoles.values():
         assert _logical_line_count(console, REJECTION_MARKER) == 1
         assert _logical_line_count(console, SUCCESS_MARKER) == 0
         assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
     assert set(result.filesystem_negative_consoles) == set(FILESYSTEM_NEGATIVE_CONTROL_NAMES)
     for console in result.filesystem_negative_consoles.values():
         assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 1
         assert _logical_line_count(console, REJECTION_MARKER) == 0
         assert _logical_line_count(console, SUCCESS_MARKER) == 0
         assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
     assert set(result.assembly_negative_consoles) == set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
     for console in result.assembly_negative_consoles.values():
         assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 1
         assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+    assert set(result.root_transition_negative_consoles) == set(ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES)
+    for console in result.root_transition_negative_consoles.values():
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, REJECTION_MARKER) == 0
+        assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
 
     evidence_value = os.environ.get(EVIDENCE_ENV)
     if evidence_value is not None:

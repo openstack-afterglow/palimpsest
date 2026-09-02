@@ -22,6 +22,8 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     NEGATIVE_CONTROL_NAMES,
     PREPARATION_FAILURE_MARKER,
     REJECTION_MARKER,
+    ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
+    ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
     KVMProofFailure,
     KVMProofUnavailable,
@@ -37,9 +39,11 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     build_negative_qemu_command,
     build_proof_plan,
     build_qemu_command,
+    build_root_transition_negative_qemu_command,
     filesystem_negative_control_contract,
     negative_control_contract,
     pre_mount_topology,
+    root_transition_negative_control_contract,
     transport_serial,
     verify_evidence_directory,
     verify_kernel_config,
@@ -70,6 +74,13 @@ def _assembly_negative_consoles() -> dict[str, bytes]:
     return {name: b"kernel boot\n" + ASSEMBLY_REJECTION_MARKER + b"\n" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES}
 
 
+def _root_transition_negative_consoles() -> dict[str, bytes]:
+    return {
+        name: b"kernel boot\n" + ROOT_TRANSITION_REJECTION_MARKER + b"\n"
+        for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES
+    }
+
+
 def _receipt() -> OCIStage1KVMProofReceipt:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
@@ -97,6 +108,8 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         _filesystem_negative_consoles(),
         _assembly_negative_consoles(),
         {name: "sha256:" + "6" * 64 for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES},
+        _root_transition_negative_consoles(),
+        {name: "sha256:" + "7" * 64 for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES},
     )
 
 
@@ -187,8 +200,8 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:a76fa4275e95e7bfd8f57c37ad259bea571cebe1698878fa7f64a174ddcf5313"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v2"
+    assert manifest_digest == "sha256:c318c5ab6d07d58b5a4806d4641d7491c31fca2054b8b8ac2698c2bebfa5b9ad"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v3"
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
         verify_proof_filesystem_manifest({"schema": "palimpsest.kvm-filesystem-fixtures.v1"})
 
@@ -230,6 +243,36 @@ def test_each_assembly_negative_binds_distinct_post_overlay_probe_boot(tmp_path:
     assert contract["rejection_marker"] == ASSEMBLY_REJECTION_MARKER.decode("ascii")
     assert command[command.index("-append") + 1] == contract["cmdline"]
     assert contract["stage1_plan"]["assembly"]["probes"] != build_proof_plan().to_dict()["assembly"]["probes"]
+
+
+@pytest.mark.parametrize("control_name", ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES)
+def test_each_root_transition_negative_binds_distinct_real_lower_and_boot(tmp_path: Path, control_name: str) -> None:
+    contract = root_transition_negative_control_contract(control_name)
+    paths = {name: (tmp_path / name).resolve() for name in contract["backings"]}
+    command = build_root_transition_negative_qemu_command(
+        qemu_path=(tmp_path / "qemu").resolve(),
+        kernel_path=(tmp_path / "kernel").resolve(),
+        initramfs_path=(tmp_path / "initrd").resolve(),
+        backing_paths=paths,
+        cmdline=contract["cmdline"],
+        control=contract,
+    )
+    assert contract["stage"] == "root-transition-target-preparation"
+    assert contract["target"] in {"dev", "sys", "proc"}
+    assert contract["rejection_marker"] == ROOT_TRANSITION_REJECTION_MARKER.decode("ascii")
+    assert command[command.index("-append") + 1] == contract["cmdline"]
+    assert (
+        contract["stage1_plan"]["assembly"]["layers"][1]["image_digest"]
+        == contract["backings"]["lower1"]["artifact_digest"]
+    )
+    assert (
+        contract["stage1_plan"]["assembly"]["layers"][1]["occurrence_digest"]
+        == build_proof_plan().layers[1]["occurrence_digest"]
+    )
+    assert (
+        contract["backings"]["root"]["artifact_digest"]
+        == pre_mount_topology(build_proof_plan())["devices"][0]["artifact_digest"]
+    )
 
 
 @pytest.mark.parametrize("control_name", NEGATIVE_CONTROL_NAMES)
@@ -396,13 +439,26 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
             retained_console=receipt.retained_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+            root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+            root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
         )
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
     assert decoded["root_assembly"] is True
-    assert decoded["root_is_slash"] is False
+    assert decoded["root_is_slash"] is True
     assert decoded["pivot_root"] is False
+    assert decoded["switch_root"] is True
+    assert decoded["root_transition"] == {
+        "contract": "palimpsest.stage1-root-transition.v1",
+        "method": "move-mount-chroot",
+        "pid1_root_matches_slash": True,
+        "pivot_root": False,
+        "pseudo_filesystems": ["dev", "sys", "proc"],
+        "root_filesystem": "overlay",
+        "switch_root": True,
+        "workload_started": False,
+    }
     assert decoded["workload_started"] is False
     assert decoded["pre_mount_devices"] is True
     assert decoded["filesystem_verified"] is True
@@ -427,6 +483,10 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         assert decoded["negative_controls"][name]["contract"] == negative_control_contract(name)
     for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES:
         assert decoded["filesystem_negative_controls"][name]["contract"] == filesystem_negative_control_contract(name)
+    for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES:
+        assert decoded["root_transition_negative_controls"][name]["contract"] == (
+            root_transition_negative_control_contract(name)
+        )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, transport_serial="f" * 20)
     with pytest.raises(ArtifactValidationError, match="receipt value"):
@@ -436,6 +496,45 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
                 transport.receipt.artifact_digest,
                 "sha256:" + "f" * 64,
             ),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "extra", "method", "pivot", "switch", "root", "pseudo-order", "workload"],
+)
+def test_receipt_rejects_root_transition_claim_tamper(mutation: str) -> None:
+    receipt = _receipt()
+    value = copy.deepcopy(receipt.to_dict())
+    transition = value["root_transition"]
+    if mutation == "missing":
+        del transition["root_filesystem"]
+    elif mutation == "extra":
+        transition["old_root_detached"] = True
+    elif mutation == "method":
+        transition["method"] = "pivot-root"
+    elif mutation == "pivot":
+        transition["pivot_root"] = True
+    elif mutation == "switch":
+        transition["switch_root"] = False
+    elif mutation == "root":
+        transition["pid1_root_matches_slash"] = False
+    elif mutation == "pseudo-order":
+        transition["pseudo_filesystems"] = ["dev", "proc", "sys"]
+    else:
+        transition["workload_started"] = True
+
+    with pytest.raises(ArtifactValidationError, match="policy|canonical"):
+        OCIStage1KVMProofReceipt.from_dict(
+            value,
+            console=receipt.console,
+            negative_consoles=receipt.negative_consoles,
+            filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+            retained_console=receipt.retained_console,
+            assembly_negative_consoles=receipt.assembly_negative_consoles,
+            assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+            root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+            root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
         )
 
 
@@ -468,6 +567,8 @@ def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topolog
             retained_console=receipt.retained_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+            root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+            root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
         )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(
@@ -511,6 +612,8 @@ def test_receipt_rejects_negative_control_mapping_tamper(mutation: str) -> None:
             retained_console=receipt.retained_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+            root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+            root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
         )
 
 
@@ -542,11 +645,20 @@ def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> Non
             retained_console=receipt.retained_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+            root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+            root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
         )
 
 
 @pytest.mark.parametrize(
-    "marker", [REJECTION_MARKER, SUCCESS_MARKER, ASSEMBLY_REJECTION_MARKER, PREPARATION_FAILURE_MARKER]
+    "marker",
+    [
+        REJECTION_MARKER,
+        SUCCESS_MARKER,
+        ASSEMBLY_REJECTION_MARKER,
+        ROOT_TRANSITION_REJECTION_MARKER,
+        PREPARATION_FAILURE_MARKER,
+    ],
 )
 def test_receipt_requires_exactly_one_rejection_and_no_other_marker(marker: bytes) -> None:
     receipt = _receipt()
@@ -567,6 +679,7 @@ def test_receipt_requires_exactly_one_rejection_and_no_other_marker(marker: byte
         REJECTION_MARKER,
         SUCCESS_MARKER,
         ASSEMBLY_REJECTION_MARKER,
+        ROOT_TRANSITION_REJECTION_MARKER,
         PREPARATION_FAILURE_MARKER,
     ],
 )
@@ -577,6 +690,46 @@ def test_receipt_requires_one_filesystem_rejection_and_no_other_marker(marker: b
     consoles[name] += marker + b"\n"
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, filesystem_negative_consoles=consoles)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        ASSEMBLY_REJECTION_MARKER,
+        FILESYSTEM_REJECTION_MARKER,
+        REJECTION_MARKER,
+        SUCCESS_MARKER,
+        ROOT_TRANSITION_REJECTION_MARKER,
+        PREPARATION_FAILURE_MARKER,
+    ],
+)
+def test_receipt_requires_one_assembly_rejection_and_no_other_marker(marker: bytes) -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.assembly_negative_consoles)
+    name = ASSEMBLY_NEGATIVE_CONTROL_NAMES[0]
+    consoles[name] += marker + b"\n"
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, assembly_negative_consoles=consoles)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        ROOT_TRANSITION_REJECTION_MARKER,
+        ASSEMBLY_REJECTION_MARKER,
+        FILESYSTEM_REJECTION_MARKER,
+        REJECTION_MARKER,
+        SUCCESS_MARKER,
+        PREPARATION_FAILURE_MARKER,
+    ],
+)
+def test_receipt_requires_one_root_transition_rejection_and_no_other_marker(marker: bytes) -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.root_transition_negative_consoles)
+    name = ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES[0]
+    consoles[name] += marker + b"\n"
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, root_transition_negative_consoles=consoles)
 
 
 def test_empty_owner_only_evidence_directory_is_required(tmp_path: Path) -> None:
@@ -613,6 +766,7 @@ def test_evidence_names_and_owner_only_publication_are_exact(tmp_path: Path) -> 
         *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
         *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
         *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
+        *(f"root-transition-negative-{name}.bin" for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES),
     )
     evidence = tmp_path / "evidence"
     evidence.mkdir(mode=0o700)

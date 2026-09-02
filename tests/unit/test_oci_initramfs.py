@@ -134,19 +134,30 @@ print(json.dumps({"manifest": built.manifest.to_dict(), "payload": built.payload
     assert fresh["manifest"] == built.manifest.to_dict()
 
 
-def test_bootstrap_manifest_is_canonical_path_free_staging_assembly_only() -> None:
+def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> None:
     built = build_bootstrap_initramfs()
     value = built.manifest.to_dict()
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "authenticated-staging-overlay-probes-fail-closed"
+    assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-fail-closed"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v5"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v7"
     assert value["stage1"]["root_assembly"] is True
-    assert value["stage1"]["root_is_slash"] is False
+    assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
+    assert value["stage1"]["switch_root"] is True
+    assert value["stage1"]["root_transition"] == {
+        "contract": "palimpsest.stage1-root-transition.v1",
+        "method": "move-mount-chroot",
+        "pid1_root_matches_slash": True,
+        "pivot_root": False,
+        "pseudo_filesystems": ["dev", "sys", "proc"],
+        "root_filesystem": "overlay",
+        "switch_root": True,
+        "workload_started": False,
+    }
     assert value["stage1"]["workload_started"] is False
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
@@ -158,6 +169,8 @@ def test_bootstrap_manifest_is_canonical_path_free_staging_assembly_only() -> No
     assert consumer["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert abi["embedded_consumer"] is True
     assert abi["consumer_contract_digest"] == built.manifest.consumer_contract_digest
+    assert consumer["root_transition"] == value["stage1"]["root_transition"]
+    assert abi["root_transition"] == value["stage1"]["root_transition"]
     assert value["stage1"]["build"]["toolchain_image"].endswith(
         "@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     )
@@ -324,6 +337,13 @@ def test_manifest_and_artifact_tampering_fail_closed() -> None:
 def test_bootstrap_verifier_rejects_non_bytes_with_typed_error(payload: object) -> None:
     with pytest.raises(ArtifactValidationError, match="archive bytes"):
         verify_bootstrap_initramfs(payload, build_bootstrap_initramfs().manifest)  # type: ignore[arg-type]
+
+
+def test_guest_init_exact_mode_checks_include_special_permission_bits() -> None:
+    source = (Path(__file__).resolve().parents[2] / "guest/stage1/init.c").read_text(encoding="utf-8")
+
+    assert "(st.mode & 07777) != (u32)expected_mode" in source
+    assert "(st.mode & 0777) != (u32)expected_mode" not in source
 
 
 def test_host_boundary_pins_and_verifies_first_party_archive(tmp_path: Path) -> None:
