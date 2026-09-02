@@ -940,6 +940,7 @@ def test_lima_run_explains_how_to_free_retained_name(tmp_path: Path, monkeypatch
     state.write_owner_record(rpaths)
     state.write_run_state(rpaths, status="removed", data={"backend": "lima-vz"})
     monkeypatch.setattr(lima, "available", lambda: True)
+    monkeypatch.setattr(lima, "_instance_info_or_none", lambda _name: None)
     with pytest.raises(StateError, match=r"free it with: palimpsest rm mac-prototype --volumes"):
         lima.run(_spec(tmp_path), roots=roots)
 
@@ -979,13 +980,25 @@ def test_lima_logs_read_current_boot_guest_journal(tmp_path: Path, monkeypatch: 
     assert calls[0] == ["limactl", "list", "--format", "json"]
 
 
-def test_lima_stopped_logs_use_local_console_and_cannot_follow(tmp_path: Path):
+def test_lima_stopped_logs_use_local_console_and_cannot_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     rpaths = state.run_paths(roots, "mac-prototype")
     rpaths.root.mkdir(parents=True, mode=0o700)
-    state.write_owner_record(rpaths)
+    owner = state.write_owner_record(rpaths)
     state.write_run_state(rpaths, status="stopped", data={"backend": "lima-vz"})
     rpaths.console.write_text("provisioned\n", encoding="utf-8")
+    monkeypatch.setattr(
+        lima,
+        "_instance_info_or_none",
+        lambda _name: {
+            "name": "mac-prototype",
+            "status": "Stopped",
+            "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
+        },
+    )
 
     assert list(lima.logs("mac-prototype", roots=roots)) == ["provisioned\n"]
     with pytest.raises(LifecycleError, match="cannot follow"):

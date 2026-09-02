@@ -1385,6 +1385,11 @@ services:
     run_name = service_run_name(project, "api")
     backend_name = project_adapter.lima_backend_name(project.name, "app_data")
     assert len(backend_name) == 11
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda _arch, **_kwargs: "lima-vz",
+    )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
     monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
@@ -1523,6 +1528,11 @@ services:
             "created_at": now,
             "updated_at": now,
         },
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "select_backend",
+        lambda _arch, **_kwargs: "lima-vz",
     )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
     callbacks = project_adapter.build_project_callbacks(
