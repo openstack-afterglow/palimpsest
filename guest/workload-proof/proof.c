@@ -172,7 +172,7 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
     cwd_size = sc2(SYS_getcwd, (i64)cwd, sizeof(cwd));
     if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 0;
     return read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
-           read_exact_file("/proc/1/root/.__palimpsest_oci_root_workload_proof_v1", sentinel);
+           read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel);
 }
 
 static __attribute__((noreturn)) void run_descendant(int ready_writer, int completion_writer,

@@ -621,7 +621,10 @@ Implemented:
   x86_64 ELF stored in the highest real zstd SquashFS lower. It validates the
   exact argv/environment/cwd/65534:65534/no-supplementary-group contract,
   parent PID 1, process group, and OCI-root sentinel through both `/` and
-  `/proc/1/root`. It creates one descendant, self-stimulates PID 1 with
+  `/proc/self/root`. Using the workload's own procfs root link avoids requiring
+  ptrace permission to dereference PID 1 after dropping to UID/GID 65534; PID 1
+  independently verifies its own root before launch. The helper creates one
+  descendant, self-stimulates PID 1 with
   SIGTERM, and preserves descendant exit 43 with `waitid(WNOWAIT)` before main
   exit 42 so PID 1 must establish both statuses itself.
 - KVM receipt v9 and fixture policy/schema v4 retain positive and second-boot

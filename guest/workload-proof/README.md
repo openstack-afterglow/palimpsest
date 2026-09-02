@@ -25,11 +25,16 @@ supplementary groups = []
 It also requires a non-PID1 main process whose parent is PID 1 and whose
 process-group ID equals its PID. From the OCI root it reads both
 `/.__palimpsest_oci_root_workload_proof_v1` and the same path below
-`/proc/1/root`; each must contain exactly:
+`/proc/self/root`; each must contain exactly:
 
 ```text
 palimpsest-oci-root-workload-proof-v1
 ```
+
+The workload deliberately uses its own procfs root link. The proof runs as
+UID/GID 65534 and must not depend on ptrace permission to dereference PID 1's
+`/proc/1/root`. PID 1 independently verifies `/proc/self/root` against the
+moved OCI root before dropping credentials and launching this helper.
 
 After validating the contract, the main process blocks SIGTERM, creates a
 `signalfd`, forks one same-process-group descendant, and waits for the

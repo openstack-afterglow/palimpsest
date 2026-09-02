@@ -123,10 +123,11 @@ only the explicit absolute/numeric process subset.
 
 The positive highest lower contains the separately reproducible proof workload
 and its OCI-root sentinel. That workload validates argv, environment, cwd,
-credentials, parent PID, process group, and `/proc/1/root`, creates one child,
-and sends SIGTERM to PID 1. Both processes require the signal to be forwarded
-by PID 1; `waitid(WNOWAIT)` preserves descendant exit 43 for PID 1 to reap
-after main exit 42. Three additional launch controls independently bind a
+credentials, parent PID, process group, and its own `/proc/self/root`, creates
+one child, and sends SIGTERM to PID 1. Both processes require the signal to be
+forwarded by PID 1; `waitid(WNOWAIT)` preserves descendant exit 43 for PID 1
+to reap after main exit 42. Three additional launch controls independently
+bind a
 missing executable, non-executable target, and missing cwd to exact child
 setup stage/errno rejection markers.
 

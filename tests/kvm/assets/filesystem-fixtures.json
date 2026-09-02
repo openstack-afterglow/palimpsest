@@ -14,12 +14,12 @@
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "5e29723d30f853c821f887f8b61ecf3ea6e5228ee1427a26999f21e275082aad",
+      "raw_sha256": "328fe88796d2a3804d495515059b5b8157405e1a74c2e219f7a415be1d163ffa",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583", "size_bytes": 8640, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -39,12 +39,12 @@
     "transition_dev": {
       "base64_file": "transition-dev.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "79efc4074384e63cd0c3080680067e237c52bd9c555390d5bc8cd4030fa13390",
+      "raw_sha256": "6dfd3bec2af02f9fbd8c7e280c0f6080c7a1a1068f7afa73159349ac1678e6e7",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583", "size_bytes": 8640, "type": "file"},
         {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
@@ -56,12 +56,12 @@
     "transition_proc": {
       "base64_file": "transition-proc.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "86e4e25d2841b84cd771399b431204b7d464f3dd4b717b53e50797237bf0f102",
+      "raw_sha256": "8e3a98add6b1a29e5aa3d6ce74953c4e0436ec6e2437b5ee8126032ba2d1d63c",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583", "size_bytes": 8640, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
@@ -73,12 +73,12 @@
     "transition_sys": {
       "base64_file": "transition-sys.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "68a93d5f3427029c06167eee43d3cc3302d642851163fbc9baac507f30e0178a",
+      "raw_sha256": "41902ef54cf4b8bfde0a8647a3cfad2697125d259a65dfa1552184dc91d65c95",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583", "size_bytes": 8640, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -112,10 +112,10 @@
       "build_script": "scripts/build_oci_guest_workload_proof.sh",
       "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
       "elf_mode": 493,
-      "elf_sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c",
+      "elf_sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583",
       "elf_size_bytes": 8640,
       "source": "guest/workload-proof/proof.c",
-      "source_sha256": "b8a5ebbdb984e344d9f35267af95e6bd381210b42761c3f3f74402ce5f489a0a",
+      "source_sha256": "75bb832903979faac69f80865dcdb20b7440160bb6c7dda371ed8264fa98ae90",
       "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     }
   },
