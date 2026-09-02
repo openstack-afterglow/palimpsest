@@ -43,7 +43,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v5"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v6"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -97,11 +97,18 @@ FILESYSTEM_NEGATIVE_CONTROL_NAMES = (
     "lower_bad_structure",
     "lower_digest_mismatch",
 )
+ASSEMBLY_NEGATIVE_CONTROL_NAMES = (
+    "probe_missing",
+    "probe_size_mismatch",
+    "probe_digest_mismatch",
+)
 EVIDENCE_FILE_NAMES = (
     "console.bin",
+    "retained-console.bin",
     "receipt.json",
     *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
     *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
+    *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
 )
 _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_64BIT",
@@ -151,13 +158,45 @@ _PROOF_FILESYSTEM_MANIFEST = {
     "artifacts": {
         "lower0": {
             "base64_file": "lower0.squashfs.b64",
-            "raw_sha256": "496c4af5e04571966cc8c66762ce95db84f291197e9ac3df5d37e9b7256413c6",
+            "compression_id": 6,
+            "raw_sha256": "7a7d9c3b0bcdbde58c2cd2af250ffd52fa52cb9d96ce8e86ccfd1713da86ca3b",
             "raw_size_bytes": 4096,
+            "source_files": [
+                {
+                    "mode": 420,
+                    "path": ".__palimpsest_overlay_order_probe_v1",
+                    "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06",
+                    "size_bytes": 11,
+                },
+                {
+                    "mode": 420,
+                    "path": "layer.txt",
+                    "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0",
+                    "size_bytes": 22,
+                },
+            ],
+            "source_root": "inputs/lower0",
         },
         "lower1": {
             "base64_file": "lower1.squashfs.b64",
-            "raw_sha256": "5f9899075df21604a8402da6d1c4bde1cdabc78d8d525a0ab910e82dd89b94af",
+            "compression_id": 6,
+            "raw_sha256": "81babe432de10fc4157a9cdde6929d6f96dbcaf352d66a25f6b15bd16a49fb64",
             "raw_size_bytes": 4096,
+            "source_files": [
+                {
+                    "mode": 420,
+                    "path": ".__palimpsest_overlay_order_probe_v1",
+                    "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+                    "size_bytes": 10,
+                },
+                {
+                    "mode": 420,
+                    "path": "layer.txt",
+                    "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
+                    "size_bytes": 21,
+                },
+            ],
+            "source_root": "inputs/lower1",
         },
         "root": {
             "base64_file": "root-ext4.raw.gz.b64",
@@ -169,13 +208,22 @@ _PROOF_FILESYSTEM_MANIFEST = {
             "raw_size_bytes": 16777216,
         },
     },
-    "policy": "palimpsest.kvm-actual-filesystem-fixtures.v1",
+    "assembly_probe": {
+        "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+        "path": "/.__palimpsest_overlay_order_probe_v1",
+        "size_bytes": 10,
+        "top_ordinal": 1,
+    },
+    "policy": "palimpsest.kvm-actual-filesystem-fixtures.v2",
     "provenance": {
         "lower_builder": {
             "argv_policy": (
-                "mksquashfs source output -noappend -xattrs -mkfs-time 0 -all-time 0 "
-                "-all-root -processors 1 -no-progress"
+                "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 "
+                "-noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root "
+                "-processors 1 -no-progress"
             ),
+            "compression": "zstd",
+            "compression_id": 6,
             "executable_sha256": "0e2bc38611d42bd385112d4f72e5030a7b79df59d34079c9b00dec7109237c30",
             "version": "mksquashfs 4.7.5",
         },
@@ -185,7 +233,7 @@ _PROOF_FILESYSTEM_MANIFEST = {
             "version": "mke2fs 1.47.0",
         },
     },
-    "schema": "palimpsest.kvm-filesystem-fixtures.v1",
+    "schema": "palimpsest.kvm-filesystem-fixtures.v2",
 }
 
 
@@ -193,6 +241,35 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     if not isinstance(value, Mapping) or dict(value) != _PROOF_FILESYSTEM_MANIFEST:
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
     return _digest(canonical_json_bytes(value))
+
+
+def _verify_fixture_source_tree(source_root: Path, sources: list[dict[str, Any]]) -> None:
+    expected_source_names = {source["path"] for source in sources}
+    try:
+        source_root_stat = source_root.lstat()
+        actual_source_names = {entry.name for entry in os.scandir(source_root)}
+    except OSError:
+        raise ArtifactValidationError("KVM SquashFS fixture source root is unavailable") from None
+    if not stat.S_ISDIR(source_root_stat.st_mode) or actual_source_names != expected_source_names:
+        raise ArtifactValidationError("KVM SquashFS fixture source tree is invalid")
+    for source in sources:
+        source_path = source_root / source["path"]
+        try:
+            visible = source_path.lstat()
+            with source_path.open("rb") as opened:
+                source_stat = os.fstat(opened.fileno())
+                source_payload = opened.read(65 * 1024)
+        except OSError:
+            raise ArtifactValidationError("KVM SquashFS fixture source is unavailable") from None
+        if (
+            not stat.S_ISREG(source_stat.st_mode)
+            or (visible.st_dev, visible.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+            or source_stat.st_nlink != 1
+            or stat.S_IMODE(source_stat.st_mode) != source["mode"]
+            or len(source_payload) != source["size_bytes"]
+            or hashlib.sha256(source_payload).hexdigest() != source["sha256"]
+        ):
+            raise ArtifactValidationError("KVM SquashFS fixture source binding is invalid")
 
 
 @lru_cache(maxsize=1)
@@ -241,7 +318,11 @@ def load_proof_filesystems() -> ProofFilesystemSet:
         digest = f"sha256:{item['raw_sha256']}"
         if len(payload) != item["raw_size_bytes"] or _digest(payload) != digest:
             raise ArtifactValidationError("KVM SquashFS fixture binding is invalid")
-        verify_lower_device(payload, expected_digest=digest)
+        identity = verify_lower_device(payload, expected_digest=digest)
+        if identity.compression != item["compression_id"]:
+            raise ArtifactValidationError("KVM SquashFS fixture compression is invalid")
+        source_root = directory / item["source_root"]
+        _verify_fixture_source_tree(source_root, item["source_files"])
         lower_digests.append(digest)
     return ProofFilesystemSet(
         root,
@@ -532,6 +613,7 @@ def build_proof_plan() -> OCIStage1Plan:
             },
         ),
         process=OCIProcessSpec(("/sbin/init",), (("LANG", "C.UTF-8"),), "/", OCIUserSpec("0", "0"), 15),
+        assembly_probes=(dict(_PROOF_FILESYSTEM_MANIFEST["assembly_probe"]),),
     )
 
 
@@ -676,7 +758,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v1",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v2",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -875,6 +957,7 @@ def _filesystem_negative_context(name: str) -> tuple[OCIStage1Plan, BuiltOCIStag
         dict(base.root),
         tuple(layers),
         base.process,
+        base.assembly_probes,
     )
     return plan, build_stage1_transport(plan)
 
@@ -966,6 +1049,114 @@ def filesystem_negative_control_contracts() -> dict[str, dict[str, Any]]:
     return {name: filesystem_negative_control_contract(name) for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES}
 
 
+def _assembly_negative_context(name: str) -> tuple[OCIStage1Plan, BuiltOCIStage1Transport]:
+    if name not in ASSEMBLY_NEGATIVE_CONTROL_NAMES:
+        raise ArtifactValidationError("KVM assembly control input is invalid")
+    base = build_proof_plan()
+    probe = dict(base.assembly_probes[0])
+    if name == "probe_missing":
+        probe["path"] = "/.__palimpsest_missing_probe_v1"
+    elif name == "probe_size_mismatch":
+        probe["size_bytes"] -= 1
+    else:
+        probe["digest"] = "sha256:" + "e" * 64
+    plan = OCIStage1Plan(
+        base.run_id,
+        base.run_name,
+        base.boot_plan_digest,
+        base.domain_core_digest,
+        dict(base.root),
+        tuple(dict(layer) for layer in base.layers),
+        base.process,
+        (probe,),
+    )
+    return plan, build_stage1_transport(plan)
+
+
+def assembly_negative_control_contract(name: str) -> dict[str, Any]:
+    """Bind one post-mount merged-tree probe rejection."""
+
+    plan, transport = _assembly_negative_context(name)
+    filesystems = load_proof_filesystems()
+    serial = transport_serial(transport.receipt.artifact_digest)
+    attachments = [
+        {
+            "backing": "lower0",
+            "drive_id": "lower0",
+            "ordinal": 0,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[0]["serial"],
+        },
+        {
+            "backing": "transport",
+            "drive_id": "stage1",
+            "ordinal": None,
+            "read_only": True,
+            "role": "transport",
+            "serial": serial,
+        },
+        {
+            "backing": "root",
+            "drive_id": "root",
+            "ordinal": None,
+            "read_only": False,
+            "role": "root",
+            "serial": plan.root["serial"],
+        },
+        {
+            "backing": "lower1",
+            "drive_id": "lower1",
+            "ordinal": 1,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[1]["serial"],
+        },
+    ]
+    backings = {
+        "lower0": {
+            "artifact_digest": filesystems.lower_digests[0],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[0]),
+        },
+        "lower1": {
+            "artifact_digest": filesystems.lower_digests[1],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[1]),
+        },
+        "root": {"artifact_digest": filesystems.root_digest, "mode": 0o600, "size_bytes": len(filesystems.root)},
+        "transport": {
+            "artifact_digest": transport.receipt.artifact_digest,
+            "mode": 0o400,
+            "size_bytes": transport.receipt.artifact_size_bytes,
+        },
+    }
+    contract: dict[str, Any] = {
+        "attachments": attachments,
+        "backings": backings,
+        "cmdline": build_kernel_cmdline(plan, transport),
+        "name": name,
+        "policy": "palimpsest.stage1-kvm-assembly-negative-control.v1",
+        "rejection_marker": ASSEMBLY_REJECTION_MARKER.decode("ascii"),
+        "stage": "post-overlay-probe",
+        "stage1_plan": plan.to_dict(),
+        "stage1_transport": {**transport.receipt.to_dict(), "serial": serial},
+    }
+    contract["digest"] = _digest(canonical_json_bytes(contract))
+    return contract
+
+
+def assembly_negative_control_contracts() -> dict[str, dict[str, Any]]:
+    return {name: assembly_negative_control_contract(name) for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES}
+
+
+def verify_assembly_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
+    expected = assembly_negative_control_contract(name)
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ArtifactValidationError("KVM assembly negative control contract is invalid")
+    return expected
+
+
 def verify_filesystem_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
     expected = filesystem_negative_control_contract(name)
     if not isinstance(value, Mapping) or dict(value) != expected:
@@ -1014,6 +1205,29 @@ def build_filesystem_negative_qemu_command(
     contract = verify_filesystem_negative_control_contract(name, control)
     if cmdline != contract["cmdline"]:
         raise ArtifactValidationError("KVM filesystem control cmdline is invalid")
+    return _build_control_qemu_command(
+        qemu_path=qemu_path,
+        kernel_path=kernel_path,
+        initramfs_path=initramfs_path,
+        backing_paths=backing_paths,
+        cmdline=cmdline,
+        contract=contract,
+    )
+
+
+def build_assembly_negative_qemu_command(
+    *,
+    qemu_path: Path,
+    kernel_path: Path,
+    initramfs_path: Path,
+    backing_paths: Mapping[str, Path],
+    cmdline: str,
+    control: Mapping[str, Any],
+) -> tuple[str, ...]:
+    name = control.get("name") if isinstance(control, Mapping) else None
+    contract = verify_assembly_negative_control_contract(name, control)
+    if cmdline != contract["cmdline"]:
+        raise ArtifactValidationError("KVM assembly control cmdline is invalid")
     return _build_control_qemu_command(
         qemu_path=qemu_path,
         kernel_path=kernel_path,
@@ -1101,9 +1315,13 @@ class OCIStage1KVMProofReceipt:
     qemu_version_bytes: bytes
     root_seed_digest: str
     root_post_run_digest: str
+    root_second_boot_digest: str
     console: bytes
+    retained_console: bytes
     negative_consoles: Mapping[str, bytes]
     filesystem_negative_consoles: Mapping[str, bytes]
+    assembly_negative_consoles: Mapping[str, bytes]
+    assembly_negative_root_post_digests: Mapping[str, str]
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -1115,6 +1333,7 @@ class OCIStage1KVMProofReceipt:
             (self.qemu_digest, "QEMU digest"),
             (self.root_seed_digest, "root seed digest"),
             (self.root_post_run_digest, "root post-run digest"),
+            (self.root_second_boot_digest, "root second-boot digest"),
         ):
             _validate_digest(value, field)
         try:
@@ -1157,6 +1376,18 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, FILESYSTEM_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, ASSEMBLY_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, PREPARATION_FAILURE_MARKER) != 0
+            or not isinstance(self.retained_console, bytes)
+            or not 1 <= len(self.retained_console) <= MAX_CONSOLE_BYTES
+            or _logical_line_count(self.retained_console, SUCCESS_MARKER) != 1
+            or any(
+                _logical_line_count(self.retained_console, marker) != 0
+                for marker in (
+                    REJECTION_MARKER,
+                    FILESYSTEM_REJECTION_MARKER,
+                    ASSEMBLY_REJECTION_MARKER,
+                    PREPARATION_FAILURE_MARKER,
+                )
+            )
             or not isinstance(self.negative_consoles, Mapping)
             or set(self.negative_consoles) != set(NEGATIVE_CONTROL_NAMES)
             or any(
@@ -1180,6 +1411,24 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.filesystem_negative_consoles.values()
             )
+            or not isinstance(self.assembly_negative_consoles, Mapping)
+            or set(self.assembly_negative_consoles) != set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(control_console, bytes)
+                or not 1 <= len(control_console) <= MAX_CONSOLE_BYTES
+                or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 1
+                or _logical_line_count(control_console, REJECTION_MARKER) != 0
+                or _logical_line_count(control_console, FILESYSTEM_REJECTION_MARKER) != 0
+                or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
+                for control_console in self.assembly_negative_consoles.values()
+            )
+            or not isinstance(self.assembly_negative_root_post_digests, Mapping)
+            or set(self.assembly_negative_root_post_digests) != set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
+                for value in self.assembly_negative_root_post_digests.values()
+            )
         ):
             raise ArtifactValidationError("KVM proof receipt value is invalid")
 
@@ -1190,6 +1439,11 @@ class OCIStage1KVMProofReceipt:
                 "digest": _digest(self.console),
                 "size_bytes": len(self.console),
                 "success_marker": SUCCESS_MARKER.decode("ascii").rstrip("\n"),
+            },
+            "retained_console": {
+                "digest": _digest(self.retained_console),
+                "size_bytes": len(self.retained_console),
+                "success_marker": SUCCESS_MARKER.decode("ascii"),
             },
             "initramfs": {
                 "artifact_digest": self.initramfs_digest,
@@ -1228,6 +1482,19 @@ class OCIStage1KVMProofReceipt:
                 }
                 for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES
             },
+            "assembly_negative_controls": {
+                name: {
+                    "contract": assembly_negative_control_contract(name),
+                    "console_digest": _digest(self.assembly_negative_consoles[name]),
+                    "console_size_bytes": len(self.assembly_negative_consoles[name]),
+                    "pid1_alive_after_marker": True,
+                    "rejection_marker_count": 1,
+                    "root_post_digest": self.assembly_negative_root_post_digests[name],
+                    "root_seed_digest": assembly_negative_control_contract(name)["backings"]["root"]["artifact_digest"],
+                    "success_marker_count": 0,
+                }
+                for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES
+            },
             "pre_mount_devices": True,
             "filesystem_verified": True,
             "root_filesystem_verified": True,
@@ -1255,8 +1522,10 @@ class OCIStage1KVMProofReceipt:
             "root_assembly": True,
             "root_is_slash": False,
             "root_volume": {
+                "boot1_post_and_boot2_pre_digest": self.root_post_run_digest,
+                "boot2_post_digest": self.root_second_boot_digest,
                 "content_verified": False,
-                "post_run_digest": self.root_post_run_digest,
+                "retained_same_backing": True,
                 "seed_digest": self.root_seed_digest,
             },
             "schema": OCI_STAGE1_KVM_PROOF_SCHEMA,
@@ -1278,8 +1547,12 @@ class OCIStage1KVMProofReceipt:
         console: bytes,
         negative_consoles: Mapping[str, bytes],
         filesystem_negative_consoles: Mapping[str, bytes],
+        retained_console: bytes,
+        assembly_negative_consoles: Mapping[str, bytes],
+        assembly_negative_root_post_digests: Mapping[str, str],
     ) -> OCIStage1KVMProofReceipt:
         if not isinstance(value, Mapping) or set(value) != {
+            "assembly_negative_controls",
             "cmdline",
             "console",
             "initramfs",
@@ -1299,6 +1572,7 @@ class OCIStage1KVMProofReceipt:
             "pivot_root",
             "qualification",
             "qemu",
+            "retained_console",
             "root_assembly",
             "root_is_slash",
             "root_volume",
@@ -1311,6 +1585,7 @@ class OCIStage1KVMProofReceipt:
             raise ArtifactValidationError("KVM proof receipt fields are invalid")
         cmdline = value.get("cmdline")
         console_value = value.get("console")
+        retained_console_value = value.get("retained_console")
         initramfs = value.get("initramfs")
         kernel = value.get("kernel")
         qemu = value.get("qemu")
@@ -1319,6 +1594,7 @@ class OCIStage1KVMProofReceipt:
         qualification = value.get("qualification")
         negative_controls = value.get("negative_controls")
         filesystem_negative_controls = value.get("filesystem_negative_controls")
+        assembly_negative_controls = value.get("assembly_negative_controls")
         root_volume = value.get("root_volume")
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
@@ -1337,8 +1613,16 @@ class OCIStage1KVMProofReceipt:
             or value.get("lower_filesystems_mounted") is not True
             or value.get("overlay_assembled") is not True
             or not isinstance(root_volume, Mapping)
-            or set(root_volume) != {"content_verified", "post_run_digest", "seed_digest"}
+            or set(root_volume)
+            != {
+                "boot1_post_and_boot2_pre_digest",
+                "boot2_post_digest",
+                "content_verified",
+                "retained_same_backing",
+                "seed_digest",
+            }
             or root_volume.get("content_verified") is not False
+            or root_volume.get("retained_same_backing") is not True
             or value.get("topology") != pre_mount_topology(build_proof_plan())
             or qualification
             != {
@@ -1352,6 +1636,8 @@ class OCIStage1KVMProofReceipt:
             or set(cmdline) != {"digest", "text"}
             or not isinstance(console_value, Mapping)
             or set(console_value) != {"digest", "size_bytes", "success_marker"}
+            or not isinstance(retained_console_value, Mapping)
+            or set(retained_console_value) != {"digest", "size_bytes", "success_marker"}
             or not isinstance(initramfs, Mapping)
             or set(initramfs) != {"artifact_digest", "artifact_size_bytes", "manifest_digest"}
             or not isinstance(kernel, Mapping)
@@ -1393,6 +1679,24 @@ class OCIStage1KVMProofReceipt:
                 or filesystem_negative_controls[name].get("contract") != filesystem_negative_control_contract(name)
                 for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES
             )
+            or not isinstance(assembly_negative_controls, Mapping)
+            or set(assembly_negative_controls) != set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(assembly_negative_controls.get(name), Mapping)
+                or set(assembly_negative_controls[name])
+                != {
+                    "console_digest",
+                    "console_size_bytes",
+                    "contract",
+                    "pid1_alive_after_marker",
+                    "rejection_marker_count",
+                    "root_post_digest",
+                    "root_seed_digest",
+                    "success_marker_count",
+                }
+                or assembly_negative_controls[name].get("contract") != assembly_negative_control_contract(name)
+                for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES
+            )
             or not isinstance(qemu, Mapping)
             or set(qemu) != {"artifact_digest", "artifact_size_bytes", "version_digest", "version_text"}
             or not isinstance(stage1, Mapping)
@@ -1418,10 +1722,14 @@ class OCIStage1KVMProofReceipt:
             qemu["artifact_size_bytes"],
             qemu["version_text"].encode("utf-8"),
             root_volume["seed_digest"],
-            root_volume["post_run_digest"],
+            root_volume["boot1_post_and_boot2_pre_digest"],
+            root_volume["boot2_post_digest"],
             console,
+            retained_console,
             negative_consoles,
             filesystem_negative_consoles,
+            assembly_negative_consoles,
+            assembly_negative_root_post_digests,
         )
         if receipt.to_dict() != dict(value):
             raise ArtifactValidationError("KVM proof receipt is not canonical")
@@ -1432,8 +1740,10 @@ class OCIStage1KVMProofReceipt:
 class OCIStage1KVMProofResult:
     receipt: OCIStage1KVMProofReceipt
     console: bytes
+    retained_console: bytes
     negative_consoles: Mapping[str, bytes]
     filesystem_negative_consoles: Mapping[str, bytes]
+    assembly_negative_consoles: Mapping[str, bytes]
     evidence_directory: Path | None
 
 
@@ -1691,6 +2001,62 @@ def _verify_filesystem_negative_backings(
             raise KVMProofFailure("KVM filesystem negative backing size changed")
 
 
+def _materialize_assembly_negative_backings(
+    directory: Path,
+    contracts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Path]]:
+    filesystems = load_proof_filesystems()
+    result: dict[str, dict[str, Path]] = {}
+    for control_name in ASSEMBLY_NEGATIVE_CONTROL_NAMES:
+        contract = verify_assembly_negative_control_contract(control_name, contracts.get(control_name))
+        _control_plan, control_transport = _assembly_negative_context(control_name)
+        payloads = {
+            "transport": control_transport.artifact,
+            "root": filesystems.root,
+            "lower0": filesystems.lowers[0],
+            "lower1": filesystems.lowers[1],
+        }
+        paths: dict[str, Path] = {}
+        for backing_name, backing in contract["backings"].items():
+            payload = payloads[backing_name]
+            if len(payload) != backing["size_bytes"] or _digest(payload) != backing["artifact_digest"]:
+                raise KVMProofFailure("KVM assembly negative backing contract is invalid")
+            paths[backing_name] = _secure_write(
+                directory,
+                f"assembly-negative-{control_name}-{backing_name}.raw",
+                payload,
+                mode=backing["mode"],
+            )
+        result[control_name] = paths
+    return result
+
+
+def _verify_assembly_negative_backings(
+    control_name: str,
+    paths: Mapping[str, Path],
+    contract: Mapping[str, Any],
+    *,
+    after_boot: bool = False,
+) -> str:
+    verified = verify_assembly_negative_control_contract(control_name, contract)
+    if set(paths) != set(verified["backings"]):
+        raise KVMProofFailure("KVM assembly negative backing set changed")
+    for backing_name, backing in verified["backings"].items():
+        path = paths[backing_name]
+        if backing_name == "root" and after_boot:
+            opened = _read_pinned_regular_file(
+                path, maximum=MAX_KERNEL_BYTES, label="KVM assembly control mutable root"
+            )
+            if stat.S_IMODE(path.stat().st_mode) != backing["mode"]:
+                raise KVMProofFailure("KVM assembly control root mode changed")
+            root_digest = opened.digest
+        else:
+            _verify_file_digest(path, backing["artifact_digest"], backing["mode"])
+        if path.stat().st_size != backing["size_bytes"]:
+            raise KVMProofFailure("KVM assembly negative backing size changed")
+    return root_digest if after_boot else verified["backings"]["root"]["artifact_digest"]
+
+
 def _verify_pinned_boot_files(
     *,
     qemu_path: Path,
@@ -1784,6 +2150,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         negative_backings = _materialize_negative_backings(root, contracts, transport)
         filesystem_contracts = filesystem_negative_control_contracts()
         filesystem_negative_backings = _materialize_filesystem_negative_backings(root, filesystem_contracts)
+        assembly_contracts = assembly_negative_control_contracts()
+        assembly_negative_backings = _materialize_assembly_negative_backings(root, assembly_contracts)
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
             qemu=qemu,
@@ -1827,6 +2195,31 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         )
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
         root_post_run_digest = _verify_post_run_topology(root_path, lower_paths, plan)
+        # The second boot consumes the exact mutable backing left by boot one.
+        if _verify_post_run_topology(root_path, lower_paths, plan) != root_post_run_digest:
+            raise KVMProofFailure("KVM retained root changed between boots")
+        retained_console = _read_console_until(
+            command,
+            expected=SUCCESS_MARKER,
+            forbidden=(
+                REJECTION_MARKER,
+                FILESYSTEM_REJECTION_MARKER,
+                ASSEMBLY_REJECTION_MARKER,
+                PREPARATION_FAILURE_MARKER,
+            ),
+            timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+            require_alive_after_marker=True,
+        )
+        _verify_pinned_boot_files(
+            qemu_path=qemu_path,
+            qemu=qemu,
+            kernel_path=kernel_path,
+            kernel=kernel,
+            initramfs_path=initramfs_path,
+            initramfs_digest=initramfs.manifest.artifact_digest,
+        )
+        _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
+        root_second_boot_digest = _verify_post_run_topology(root_path, lower_paths, plan)
         negative_consoles: dict[str, bytes] = {}
         for control_name in NEGATIVE_CONTROL_NAMES:
             contract = contracts[control_name]
@@ -1906,6 +2299,46 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 initramfs_digest=initramfs.manifest.artifact_digest,
             )
             _verify_filesystem_negative_backings(control_name, backing_paths, contract)
+        assembly_negative_consoles: dict[str, bytes] = {}
+        assembly_negative_root_post_digests: dict[str, str] = {}
+        for control_name in ASSEMBLY_NEGATIVE_CONTROL_NAMES:
+            contract = assembly_contracts[control_name]
+            backing_paths = assembly_negative_backings[control_name]
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            _verify_assembly_negative_backings(control_name, backing_paths, contract)
+            control_command = build_assembly_negative_qemu_command(
+                qemu_path=qemu_path,
+                kernel_path=kernel_path,
+                initramfs_path=initramfs_path,
+                backing_paths=backing_paths,
+                cmdline=contract["cmdline"],
+                control=contract,
+            )
+            assembly_negative_consoles[control_name] = _read_console_until(
+                control_command,
+                expected=ASSEMBLY_REJECTION_MARKER,
+                forbidden=(SUCCESS_MARKER, REJECTION_MARKER, FILESYSTEM_REJECTION_MARKER, PREPARATION_FAILURE_MARKER),
+                timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+                require_alive_after_marker=True,
+            )
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            assembly_negative_root_post_digests[control_name] = _verify_assembly_negative_backings(
+                control_name, backing_paths, contract, after_boot=True
+            )
 
     receipt = OCIStage1KVMProofReceipt(
         kernel.digest,
@@ -1923,12 +2356,17 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         version,
         load_proof_filesystems().root_digest,
         root_post_run_digest,
+        root_second_boot_digest,
         console,
+        retained_console,
         negative_consoles,
         filesystem_negative_consoles,
+        assembly_negative_consoles,
+        assembly_negative_root_post_digests,
     )
     if evidence is not None:
         _secure_write(evidence, "console.bin", console, mode=0o400)
+        _secure_write(evidence, "retained-console.bin", retained_console, mode=0o400)
         for control_name in NEGATIVE_CONTROL_NAMES:
             _secure_write(
                 evidence,
@@ -1943,5 +2381,20 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 filesystem_negative_consoles[control_name],
                 mode=0o400,
             )
+        for control_name in ASSEMBLY_NEGATIVE_CONTROL_NAMES:
+            _secure_write(
+                evidence,
+                f"assembly-negative-{control_name}.bin",
+                assembly_negative_consoles[control_name],
+                mode=0o400,
+            )
         _secure_write(evidence, "receipt.json", receipt.canonical_bytes, mode=0o400)
-    return OCIStage1KVMProofResult(receipt, console, negative_consoles, filesystem_negative_consoles, evidence)
+    return OCIStage1KVMProofResult(
+        receipt,
+        console,
+        retained_console,
+        negative_consoles,
+        filesystem_negative_consoles,
+        assembly_negative_consoles,
+        evidence,
+    )

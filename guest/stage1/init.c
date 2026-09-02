@@ -28,6 +28,7 @@ struct span { const char *p; usize n; };
 #define SYS_mkdir 83
 #define SYS_readlink 89
 #define SYS_mount 165
+#define SYS_syncfs 306
 #define SYS_statfs 137
 #define SYS_fstatfs 138
 #define SYS_getdents64 217
@@ -57,6 +58,8 @@ struct span { const char *p; usize n; };
 #define ARTIFACT_MAX (PAYLOAD_MAX + 4096)
 #define PATH_MAX_LOCAL 4096
 #define LOWER_MAX 24
+#define PROBE_MAX 8
+#define PROBE_BYTES_MAX (64 * 1024)
 #define ARG_MAX_LOCAL 4096
 #define ENV_MAX_LOCAL 4096
 #define STRING_MAX_LOCAL (32 * 1024)
@@ -532,6 +535,13 @@ struct expected_device_set {
     struct expected_device root;
     struct expected_device lowers[LOWER_MAX];
     u32 lower_count;
+    struct {
+        char path[256];
+        u8 digest[32];
+        u64 size;
+        u32 top_ordinal;
+    } probes[PROBE_MAX];
+    u32 probe_count;
 };
 
 static int take_char(struct parser *j, u8 c) {
@@ -656,6 +666,18 @@ static int derived_serial_matches(const char *name_space, struct span identity, 
 static int exact_string_array3(struct parser *j, const char *a, const char *b, const char *c) {
     return take_char(j, '[') && exact_string(j, a) && take_char(j, ',') && exact_string(j, b) &&
            take_char(j, ',') && exact_string(j, c) && take_char(j, ']');
+}
+
+static int valid_probe_path(struct span s) {
+    usize i;
+    if (s.n < 2 || s.n > 255 || s.p[0] != '/' || s.p[s.n - 1] == '/') return 0;
+    for (i = 1; i < s.n; i++) {
+        u8 c = (u8)s.p[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return 0;
+    }
+    return !((s.n == 2 && s.p[1] == '.') ||
+             (s.n == 3 && s.p[1] == '.' && s.p[2] == '.'));
 }
 
 static int valid_uuid_span(struct span s) {
@@ -817,6 +839,33 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
     }
     if (!take_char(&j, ']') || !take_char(&j, ',') || !key(&j, "overlay_mount_options") ||
         !exact_string_array3(&j, "rw", "nodev", "nosuid") || !take_char(&j, ',') ||
+        !key(&j, "probes") || !take_char(&j, '[')) return 0;
+    if (!take_char(&j, ']')) {
+        for (;;) {
+            u64 probe_size;
+            u32 probe_index;
+            if (devices->probe_count >= PROBE_MAX || !take_char(&j, '{') || !key(&j, "digest") ||
+                !plain_string(&j, &s, 0) || !digest_bytes(s, devices->probes[devices->probe_count].digest) ||
+                !take_char(&j, ',') || !key(&j, "path") || !plain_string(&j, &s, 0) ||
+                !valid_probe_path(s) || !copy_span(devices->probes[devices->probe_count].path,
+                                                    sizeof(devices->probes[devices->probe_count].path), s) ||
+                !take_char(&j, ',') || !key(&j, "size_bytes") || !uint_value(&j, &number) ||
+                number < 1 || number > PROBE_BYTES_MAX) return 0;
+            probe_size = number;
+            for (probe_index = 0; probe_index < devices->probe_count; probe_index++)
+                if (text_equal(devices->probes[probe_index].path,
+                               devices->probes[devices->probe_count].path)) return 0;
+            if (!take_char(&j, ',') ||
+                !key(&j, "top_ordinal") || !uint_value(&j, &number) ||
+                number != layer_count - 1 || !take_char(&j, '}')) return 0;
+            devices->probes[devices->probe_count].size = probe_size;
+            devices->probes[devices->probe_count].top_ordinal = layer_count - 1;
+            devices->probe_count++;
+            if (take_char(&j, ']')) break;
+            if (!take_char(&j, ',')) return 0;
+        }
+    }
+    if (!take_char(&j, ',') ||
         !key(&j, "root") || !take_char(&j, '{') || !key(&j, "filesystem") || !exact_string(&j, "ext4") ||
         !take_char(&j, ',') || !key(&j, "filesystem_uuid") || !plain_string(&j, &s, 0) ||
         !uuid_bytes(s, devices->root.filesystem_uuid) ||
@@ -843,11 +892,11 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
-        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v5") ||
+        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v6") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v5") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v6") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     devices->lower_count = layer_count;
     return 1;
@@ -1616,6 +1665,43 @@ static int build_overlay_data(char out[PATH_MAX_LOCAL], u32 lower_count) {
            append_text(out, &used, ",workdir=/run/palimpsest/root/.palimpsest/work");
 }
 
+static int verify_merged_probe(const struct expected_device_set *expected, u32 index) {
+    char path[PATH_MAX_LOCAL];
+    usize used = 0;
+    struct stat_local before, after;
+    struct sha256_ctx hash;
+    u8 digest[32];
+    u64 offset = 0;
+    i64 fd;
+    if (index >= expected->probe_count ||
+        !append_text(path, &used, "/run/palimpsest/merged") ||
+        !append_text(path, &used, expected->probes[index].path)) return 0;
+    fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&before) < 0 ||
+        (before.mode & S_IFMT) != S_IFREG || before.nlink != 1 || before.size < 0 ||
+        (u64)before.size != expected->probes[index].size) {
+        if (fd >= 0) sc1(SYS_close, fd);
+        return 0;
+    }
+    sha_init(&hash);
+    while (offset < expected->probes[index].size) {
+        usize chunk = expected->probes[index].size - offset > FILESYSTEM_IO_BYTES ?
+            FILESYSTEM_IO_BYTES : (usize)(expected->probes[index].size - offset);
+        if (!pread_exact((int)fd, filesystem_io, chunk, offset)) { sc1(SYS_close, fd); return 0; }
+        sha_update(&hash, filesystem_io, chunk);
+        offset += chunk;
+    }
+    sha_final(&hash, digest);
+    if (sc2(SYS_fstat, fd, (i64)&after) < 0 || before.dev != after.dev || before.ino != after.ino ||
+        before.size != after.size || before.mode != after.mode || before.nlink != after.nlink ||
+        !bytes_equal(digest, expected->probes[index].digest, 32)) {
+        sc1(SYS_close, fd);
+        return 0;
+    }
+    sc1(SYS_close, fd);
+    return 1;
+}
+
 static int assemble_staging_root(const struct expected_device_set *expected, struct opened_role *roles,
                                  const struct opened_role *transport) {
     static const char *base_dirs[] = {"/run", "/run/palimpsest", "/run/palimpsest/root",
@@ -1659,6 +1745,8 @@ static int assemble_staging_root(const struct expected_device_set *expected, str
     for (i = 0; i < expected->lower_count; i++)
         if (!recheck_open_role(&roles[i + 1]) || !lower_path(path, i) ||
             !stable_dir(path, lower_fds[i], SQUASHFS_MAGIC)) return 0;
+    for (i = 0; i < expected->probe_count; i++) if (!verify_merged_probe(expected, i)) return 0;
+    if (sc1(SYS_syncfs, root_fd) != 0 || !recheck_open_role(&roles[0])) return 0;
     return stable_dir("/run/palimpsest/root", root_fd, EXT4_MAGIC) &&
            stable_dir("/run/palimpsest/merged", merged_fd, OVERLAYFS_MAGIC);
 }

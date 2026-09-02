@@ -2,8 +2,8 @@
 
 The first-party static ``/init`` authenticates the raw stage-1 transport,
 block-device identities, root ext4 structure, and immutable lower SquashFS
-structure/content before sleeping forever.  It deliberately does not mount
-root/lower disks, assemble OverlayFS, pivot root, or execute the image process. Exact source, toolchain,
+structure/content, mounts them into staging, assembles OverlayFS, and verifies
+optional authenticated root-level probes before sleeping forever. It deliberately does not pivot root or execute the image process. Exact source, toolchain,
 sealing recipe, binary and ABI provenance prevents transport consumption from
 being confused with full OCI-root boot readiness.
 """
@@ -28,20 +28,20 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v6"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v7"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v4"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v6"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v5"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v7"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:2abf465d359d4c68382465e36bb299e1eafe6c2a6d3a16fe9a05ca7826544bf1"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:489eca240ef49072c3a91a2871662bc561c26e83a0aa744761b4333385e87f7b"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:df40478cf52ea0067ddfaffc27a37ba9147f05659348ea4bb1f3bf737211cf3f"
+OCI_STAGE1_BINARY_DIGEST = "sha256:839c8cf10c5bdf525c7a6e09393d806dd66cb589255159ed60443531af91a741"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64

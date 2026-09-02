@@ -29,12 +29,15 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v5"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v5"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v6"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v6"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
+_PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+$")
+MAX_OCI_STAGE1_ASSEMBLY_PROBES = 8
+MAX_OCI_STAGE1_PROBE_BYTES = 64 * 1024
 
 
 def _canonical_digest(value: Any) -> bool:
@@ -84,6 +87,7 @@ class OCIStage1Plan:
     root: Mapping[str, Any]
     layers: tuple[Mapping[str, Any], ...]
     process: OCIProcessSpec
+    assembly_probes: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -166,8 +170,33 @@ class OCIStage1Plan:
             self.process.require_bootable()
         except ArtifactValidationError:
             raise StateError("stage-1 process is not bootable") from None
+        if not isinstance(self.assembly_probes, tuple) or len(self.assembly_probes) > MAX_OCI_STAGE1_ASSEMBLY_PROBES:
+            raise StateError("stage-1 assembly probes are invalid")
+        probes: list[dict[str, Any]] = []
+        paths: set[str] = set()
+        for raw_probe in self.assembly_probes:
+            probe = _plain(raw_probe)
+            if (
+                not isinstance(probe, dict)
+                or set(probe) != {"digest", "path", "size_bytes", "top_ordinal"}
+                or not _canonical_digest(probe.get("digest"))
+                or not isinstance(probe.get("path"), str)
+                or len(probe["path"].encode("ascii", errors="ignore")) != len(probe["path"])
+                or len(probe["path"]) > 255
+                or _PROBE_PATH_RE.fullmatch(probe["path"]) is None
+                or probe["path"] in {"/.", "/.."}
+                or probe["path"] in paths
+                or type(probe.get("size_bytes")) is not int
+                or not 1 <= probe["size_bytes"] <= MAX_OCI_STAGE1_PROBE_BYTES
+                or type(probe.get("top_ordinal")) is not int
+                or probe.get("top_ordinal") != len(layers) - 1
+            ):
+                raise StateError("stage-1 assembly probe policy is invalid")
+            paths.add(probe["path"])
+            probes.append(probe)
         object.__setattr__(self, "root", _freeze(root))
         object.__setattr__(self, "layers", tuple(_freeze(layer) for layer in layers))
+        object.__setattr__(self, "assembly_probes", tuple(_freeze(probe) for probe in probes))
 
     @classmethod
     def from_domain_resources(
@@ -238,6 +267,7 @@ class OCIStage1Plan:
                 "layers": _plain(self.layers),
                 "lowerdir_ordinals": list(reversed(range(len(self.layers)))),
                 "overlay_mount_options": ["rw", "nodev", "nosuid"],
+                "probes": _plain(self.assembly_probes),
                 "root": _plain(self.root),
                 "root_layout": OCI_STAGE1_ROOT_LAYOUT,
             },
@@ -285,10 +315,19 @@ class OCIStage1Plan:
             or set(run) != {"name", "run_id"}
             or not isinstance(assembly, dict)
             or set(assembly)
-            != {"device_policy", "layers", "lowerdir_ordinals", "overlay_mount_options", "root", "root_layout"}
+            != {
+                "device_policy",
+                "layers",
+                "lowerdir_ordinals",
+                "overlay_mount_options",
+                "probes",
+                "root",
+                "root_layout",
+            }
             or assembly.get("device_policy") != OCI_STAGE1_DEVICE_POLICY
             or assembly.get("overlay_mount_options") != ["rw", "nodev", "nosuid"]
             or assembly.get("root_layout") != OCI_STAGE1_ROOT_LAYOUT
+            or not isinstance(assembly.get("probes"), list)
             or not isinstance(assembly.get("layers"), list)
             or assembly.get("lowerdir_ordinals") != list(reversed(range(len(assembly["layers"]))))
         ):
@@ -305,6 +344,7 @@ class OCIStage1Plan:
             root=assembly["root"],
             layers=tuple(assembly["layers"]),
             process=process,
+            assembly_probes=tuple(assembly["probes"]),
         )
         if plan.to_dict() != value:
             raise StateError("stage-1 plan is not canonical")
@@ -315,6 +355,8 @@ class OCIStage1Plan:
 
 __all__ = [
     "OCI_STAGE1_DEVICE_POLICY",
+    "MAX_OCI_STAGE1_ASSEMBLY_PROBES",
+    "MAX_OCI_STAGE1_PROBE_BYTES",
     "OCI_STAGE1_PLAN_SCHEMA",
     "OCI_STAGE1_PROTOCOL",
     "OCI_STAGE1_ROOT_LAYOUT",

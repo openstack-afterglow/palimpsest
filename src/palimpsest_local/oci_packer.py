@@ -33,7 +33,7 @@ _UINT64_MAX = (1 << 64) - 1
 SQUASHFS_BLOCK_DEVICE_ALIGNMENT = 512
 
 SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
-SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v1"
+SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v2"
 SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v2"
 SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
 
@@ -854,6 +854,10 @@ def pack_staged_squashfs(
                 "-tar",
                 "-noappend",
                 "-xattrs",
+                "-comp",
+                "zstd",
+                "-Xcompression-level",
+                "3",
                 "-mkfs-time",
                 "0",
                 "-processors",
@@ -911,6 +915,8 @@ def pack_staged_squashfs(
                 sealed.st_nlink,
             )
             verify_squashfs_fd(image_fd, sealed.st_size, policy.max_image_bytes)
+            if os.pread(image_fd, 2, 20) != b"\x06\x00":
+                raise SquashFSPackError("oci-pack-superblock", "new packed image is not zstd-compressed")
             image_digest = _sha256_fd(image_fd, sealed.st_size)
             current = os.fstat(image_fd)
             if stable_seal != (

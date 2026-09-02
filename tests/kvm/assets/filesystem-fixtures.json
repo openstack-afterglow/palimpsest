@@ -2,13 +2,25 @@
   "artifacts": {
     "lower0": {
       "base64_file": "lower0.squashfs.b64",
-      "raw_sha256": "496c4af5e04571966cc8c66762ce95db84f291197e9ac3df5d37e9b7256413c6",
-      "raw_size_bytes": 4096
+      "compression_id": 6,
+      "raw_sha256": "7a7d9c3b0bcdbde58c2cd2af250ffd52fa52cb9d96ce8e86ccfd1713da86ca3b",
+      "raw_size_bytes": 4096,
+      "source_files": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06", "size_bytes": 11},
+        {"mode": 420, "path": "layer.txt", "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0", "size_bytes": 22}
+      ],
+      "source_root": "inputs/lower0"
     },
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
-      "raw_sha256": "5f9899075df21604a8402da6d1c4bde1cdabc78d8d525a0ab910e82dd89b94af",
-      "raw_size_bytes": 4096
+      "compression_id": 6,
+      "raw_sha256": "81babe432de10fc4157a9cdde6929d6f96dbcaf352d66a25f6b15bd16a49fb64",
+      "raw_size_bytes": 4096,
+      "source_files": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      ],
+      "source_root": "inputs/lower1"
     },
     "root": {
       "base64_file": "root-ext4.raw.gz.b64",
@@ -20,10 +32,18 @@
       "raw_size_bytes": 16777216
     }
   },
-  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v1",
+  "assembly_probe": {
+    "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+    "path": "/.__palimpsest_overlay_order_probe_v1",
+    "size_bytes": 10,
+    "top_ordinal": 1
+  },
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v2",
   "provenance": {
     "lower_builder": {
-      "argv_policy": "mksquashfs source output -noappend -xattrs -mkfs-time 0 -all-time 0 -all-root -processors 1 -no-progress",
+      "argv_policy": "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress",
+      "compression": "zstd",
+      "compression_id": 6,
       "executable_sha256": "0e2bc38611d42bd385112d4f72e5030a7b79df59d34079c9b00dec7109237c30",
       "version": "mksquashfs 4.7.5"
     },
@@ -33,5 +53,5 @@
       "version": "mke2fs 1.47.0"
     }
   },
-  "schema": "palimpsest.kvm-filesystem-fixtures.v1"
+  "schema": "palimpsest.kvm-filesystem-fixtures.v2"
 }

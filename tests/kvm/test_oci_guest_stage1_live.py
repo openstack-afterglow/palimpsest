@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local._oci_stage1_kvm_proof import (
+    ASSEMBLY_NEGATIVE_CONTROL_NAMES,
     ASSEMBLY_REJECTION_MARKER,
     EVIDENCE_ENV,
     EVIDENCE_FILE_NAMES,
@@ -55,6 +56,7 @@ def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesyste
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
     assert _logical_line_count(result.console, ASSEMBLY_REJECTION_MARKER) == 0
+    assert _logical_line_count(result.retained_console, SUCCESS_MARKER) == 1
     assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
     for console in result.negative_consoles.values():
         assert _logical_line_count(console, REJECTION_MARKER) == 1
@@ -66,6 +68,10 @@ def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesyste
         assert _logical_line_count(console, REJECTION_MARKER) == 0
         assert _logical_line_count(console, SUCCESS_MARKER) == 0
         assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+    assert set(result.assembly_negative_consoles) == set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+    for console in result.assembly_negative_consoles.values():
+        assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
 
     evidence_value = os.environ.get(EVIDENCE_ENV)
     if evidence_value is not None:

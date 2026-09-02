@@ -34,8 +34,8 @@ from .oci_stage1 import (
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v4"
-OCI_GUEST_STAGE1_CAPABILITY = "staging-overlay-root-assembly-fail-closed"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v5"
+OCI_GUEST_STAGE1_CAPABILITY = "authenticated-staging-overlay-probes-fail-closed"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64
@@ -474,10 +474,19 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         or set(run) != {"name", "run_id"}
         or not isinstance(assembly, Mapping)
         or set(assembly)
-        != {"device_policy", "layers", "lowerdir_ordinals", "overlay_mount_options", "root", "root_layout"}
+        != {
+            "device_policy",
+            "layers",
+            "lowerdir_ordinals",
+            "overlay_mount_options",
+            "probes",
+            "root",
+            "root_layout",
+        }
         or assembly.get("device_policy") != OCI_STAGE1_DEVICE_POLICY
         or assembly.get("overlay_mount_options") != ["rw", "nodev", "nosuid"]
         or assembly.get("root_layout") != OCI_STAGE1_ROOT_LAYOUT
+        or not isinstance(assembly.get("probes"), list)
         or not isinstance(assembly.get("layers"), list)
         or assembly.get("lowerdir_ordinals") != list(reversed(range(len(assembly["layers"]))))
     ):
@@ -492,6 +501,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
             root=assembly["root"],
             layers=tuple(assembly["layers"]),
             process=process,
+            assembly_probes=tuple(assembly["probes"]),
         )
     except (ArtifactValidationError, KeyError, TypeError, ValueError):
         raise ArtifactValidationError("guest stage-1 plan semantics are invalid") from None

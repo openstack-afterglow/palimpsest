@@ -35,9 +35,13 @@ proof stops after authenticated filesystem mounts and staging OverlayFS
 assembly. The assembled tree is not `/`; pivot, workload supervision, and
 production define/start remain disabled.
 
-The v5 canonical receipt binds every path-free negative topology contract and
-its console digest, records separate mutable-root seed/post-run digests, and
-keeps immutable transport/lower equality. Evidence contains
+The v6 canonical receipt binds every path-free negative topology contract and
+its console digest, records mutable-root seed/boot-one/boot-two digests, and
+keeps immutable transport/lower equality. The two committed real SquashFS
+fixtures use zstd level 3 and contain an ordinal-specific collision sentinel;
+the authenticated proof-only merged-tree probe checks highest-ordinal
+precedence. Three post-overlay probe controls fail only at assembly validation.
+Evidence contains positive and retained-boot consoles plus
 `negative-<case>.bin` for every named control; all evidence files are
 exclusively created owner-readable (`0400`).
 

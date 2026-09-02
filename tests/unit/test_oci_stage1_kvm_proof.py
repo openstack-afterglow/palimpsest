@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ import pytest
 
 from palimpsest_local._oci_stage1_kvm_proof import (
     _REQUIRED_KERNEL_CONFIG,
+    ASSEMBLY_NEGATIVE_CONTROL_NAMES,
     ASSEMBLY_REJECTION_MARKER,
     EVIDENCE_FILE_NAMES,
     FILESYSTEM_NEGATIVE_CONTROL_NAMES,
@@ -27,6 +29,9 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     _logical_line_count,
     _read_console_until,
     _secure_write,
+    _verify_fixture_source_tree,
+    assembly_negative_control_contract,
+    build_assembly_negative_qemu_command,
     build_filesystem_negative_qemu_command,
     build_kernel_cmdline,
     build_negative_qemu_command,
@@ -61,6 +66,10 @@ def _filesystem_negative_consoles() -> dict[str, bytes]:
     return {name: b"kernel boot\n" + FILESYSTEM_REJECTION_MARKER + b"\n" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES}
 
 
+def _assembly_negative_consoles() -> dict[str, bytes]:
+    return {name: b"kernel boot\n" + ASSEMBLY_REJECTION_MARKER + b"\n" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES}
+
+
 def _receipt() -> OCIStage1KVMProofReceipt:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
@@ -81,9 +90,13 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         b"QEMU emulator version 9.2.0\n",
         pre_mount_topology(plan)["devices"][0]["artifact_digest"],
         "sha256:" + "4" * 64,
+        "sha256:" + "5" * 64,
+        b"kernel boot\r\n" + SUCCESS_MARKER + b"\r\n",
         b"kernel boot\r\n" + SUCCESS_MARKER + b"\r\n",
         _negative_consoles(),
         _filesystem_negative_consoles(),
+        _assembly_negative_consoles(),
+        {name: "sha256:" + "6" * 64 for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES},
     )
 
 
@@ -174,10 +187,49 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:d8a754816989d50339d47f11b84b2839b337903dcda86762099ef4f00a68c04f"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v1"
+    assert manifest_digest == "sha256:a76fa4275e95e7bfd8f57c37ad259bea571cebe1698878fa7f64a174ddcf5313"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v2"
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
         verify_proof_filesystem_manifest({"schema": "palimpsest.kvm-filesystem-fixtures.v1"})
+
+
+def test_fixture_source_tree_rejects_unlisted_entries(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "probe"
+    source.write_bytes(b"x")
+    source.chmod(0o644)
+    sources = [
+        {
+            "mode": 0o644,
+            "path": "probe",
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+            "size_bytes": 1,
+        }
+    ]
+    _verify_fixture_source_tree(source_root, sources)
+
+    (source_root / "unlisted").write_bytes(b"extra")
+    with pytest.raises(ArtifactValidationError, match="source tree"):
+        _verify_fixture_source_tree(source_root, sources)
+
+
+@pytest.mark.parametrize("control_name", ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+def test_each_assembly_negative_binds_distinct_post_overlay_probe_boot(tmp_path: Path, control_name: str) -> None:
+    contract = assembly_negative_control_contract(control_name)
+    paths = {name: (tmp_path / name).resolve() for name in contract["backings"]}
+    command = build_assembly_negative_qemu_command(
+        qemu_path=(tmp_path / "qemu").resolve(),
+        kernel_path=(tmp_path / "kernel").resolve(),
+        initramfs_path=(tmp_path / "initrd").resolve(),
+        backing_paths=paths,
+        cmdline=contract["cmdline"],
+        control=contract,
+    )
+    assert contract["stage"] == "post-overlay-probe"
+    assert contract["rejection_marker"] == ASSEMBLY_REJECTION_MARKER.decode("ascii")
+    assert command[command.index("-append") + 1] == contract["cmdline"]
+    assert contract["stage1_plan"]["assembly"]["probes"] != build_proof_plan().to_dict()["assembly"]["probes"]
 
 
 @pytest.mark.parametrize("control_name", NEGATIVE_CONTROL_NAMES)
@@ -341,6 +393,9 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
             console=console,
             negative_consoles=negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+            retained_console=receipt.retained_console,
+            assembly_negative_consoles=receipt.assembly_negative_consoles,
+            assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
         )
         == receipt
     )
@@ -360,8 +415,10 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     assert decoded["lower_filesystems_mounted"] is True
     assert decoded["overlay_assembled"] is True
     assert decoded["root_volume"] == {
+        "boot1_post_and_boot2_pre_digest": "sha256:" + "4" * 64,
+        "boot2_post_digest": "sha256:" + "5" * 64,
         "content_verified": False,
-        "post_run_digest": "sha256:" + "4" * 64,
+        "retained_same_backing": True,
         "seed_digest": pre_mount_topology(build_proof_plan())["devices"][0]["artifact_digest"],
     }
     assert decoded["topology"] == pre_mount_topology(build_proof_plan())
@@ -408,6 +465,9 @@ def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topolog
             console=console,
             negative_consoles=negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+            retained_console=receipt.retained_console,
+            assembly_negative_consoles=receipt.assembly_negative_consoles,
+            assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
         )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(
@@ -448,6 +508,9 @@ def test_receipt_rejects_negative_control_mapping_tamper(mutation: str) -> None:
             console=receipt.console,
             negative_consoles=consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+            retained_console=receipt.retained_console,
+            assembly_negative_consoles=receipt.assembly_negative_consoles,
+            assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
         )
 
 
@@ -476,6 +539,9 @@ def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> Non
             console=receipt.console,
             negative_consoles=receipt.negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+            retained_console=receipt.retained_console,
+            assembly_negative_consoles=receipt.assembly_negative_consoles,
+            assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
         )
 
 
@@ -542,9 +608,11 @@ def test_evidence_directory_rejects_every_reserved_output_name(tmp_path: Path, r
 def test_evidence_names_and_owner_only_publication_are_exact(tmp_path: Path) -> None:
     assert EVIDENCE_FILE_NAMES == (
         "console.bin",
+        "retained-console.bin",
         "receipt.json",
         *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
         *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
+        *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
     )
     evidence = tmp_path / "evidence"
     evidence.mkdir(mode=0o700)

@@ -140,10 +140,10 @@ def test_bootstrap_manifest_is_canonical_path_free_staging_assembly_only() -> No
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "staging-overlay-root-assembly-fail-closed"
+    assert value["stage1"]["capability"] == "authenticated-staging-overlay-probes-fail-closed"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v4"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v5"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is False
     assert value["stage1"]["pivot_root"] is False

@@ -220,6 +220,20 @@ def test_stage1_plan_rejects_block_identity_size_and_ordinal_drift(mutate: objec
         replace(plan, root=root, layers=tuple(layers))
 
 
+@pytest.mark.parametrize("path", ["/.", "/.."])
+def test_stage1_plan_rejects_probe_paths_rejected_by_guest_parser(path: str) -> None:
+    plan = _plan()
+    probe = {
+        "digest": "sha256:" + "c" * 64,
+        "path": path,
+        "size_bytes": 1,
+        "top_ordinal": 1,
+    }
+
+    with pytest.raises(StateError, match="assembly probe policy"):
+        replace(plan, assembly_probes=(probe,))
+
+
 def test_stage1_transport_covers_worst_case_canonical_process_escaping() -> None:
     escaped_argument = "\x01" * (32 * 1024)
     process = OCIProcessSpec(

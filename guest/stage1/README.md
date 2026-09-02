@@ -96,3 +96,14 @@ as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy and staging OverlayFS assembly. Mutable
 root content is not authenticated; the merged tree is not `/`, and pivot,
 workload supervision and production VM launch remain disabled.
+
+Proof v6 uses two real zstd SquashFS images built from the committed
+`tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
+sentinel with different bytes; an optional authenticated plan probe (empty for
+normal production plans) verifies that the highest ordinal is visible through
+the merged tree. The positive path boots the same ext4 backing twice and binds
+seed, boot-one/post=boot-two/pre, and boot-two/post digests. This is a
+synchronized retained-root reassembly checkpoint after `syncfs` on the mounted
+ext4 filesystem. QEMU is terminated after the marker, so it is neither a
+graceful guest-shutdown nor a crash-recovery claim. Three additional boots
+isolate missing, wrong-sized, and wrong-digest post-overlay probe rejection.

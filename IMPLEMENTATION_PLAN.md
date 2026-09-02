@@ -527,6 +527,29 @@ Qualification state: portable policy, packaged ELF fixture, and proof-harness te
 
 ### Local image build-to-run acceptance gates
 
+### PR 4 slice 22: merged precedence and retained-root qualification
+
+Implemented:
+
+- Stage-1 plan/protocol v6 adds up to eight authenticated, bounded root-level
+  assembly probes; normal production plans encode an empty list. The live PID
+  1 verifies exact size and SHA-256 through the assembled tree before its
+  success marker, while leaf symlinks and nested paths fail closed.
+- The two KVM lowers are real `mksquashfs 4.7.5` zstd-level-3 outputs built
+  from committed inputs. Their exact source bytes, builder argv/tool digest,
+  compression id, image bytes, and highest-ordinal collision sentinel are
+  manifest-bound. New OCI packing uses the matching explicit zstd policy.
+- Proof v6 boots the same mutable root backing twice, calls `syncfs` on its
+  mounted ext4 filesystem before each success marker, and binds seed,
+  boot-one-post/boot-two-pre, and boot-two-post digests. It proves synchronized
+  retained-root reassembly, not graceful shutdown or crash recovery. Three additional boots isolate
+  post-overlay missing/size/digest probe rejection with independent roots.
+
+Qualification state: contracts and portable tests are source-controlled. This
+macOS host cannot run native x86_64 KVM, so no v6 runtime receipt is claimed.
+Pivot, workload execution/supervision, production launch and Gate 2 remain
+disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:

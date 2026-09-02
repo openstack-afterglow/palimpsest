@@ -176,7 +176,8 @@ if BEHAVIOR == "missing":
     raise SystemExit(0)
 payload = sys.stdin.buffer.read()
 expected = [
-    "-", "layer.squashfs", "-tar", "-noappend", "-xattrs", "-mkfs-time", "0", "-processors", "1", "-no-progress",
+    "-", "layer.squashfs", "-tar", "-noappend", "-xattrs", "-comp", "zstd", "-Xcompression-level", "3",
+    "-mkfs-time", "0", "-processors", "1", "-no-progress",
     "-root-mode", "755", "-root-uid", "0", "-root-gid", "0", "-root-time", "0",
 ]
 if sys.argv[1:] != expected:
@@ -190,7 +191,7 @@ image_size = ((bytes_used + 511) // 512) * 512
 superblock = struct.pack(
     "<5I6H8Q",
     0x73717368, 1, 0, 131072, 0,
-    1, 17, 0, 1, 4, 0,
+    6, 17, 0, 1, 4, 0,
     0, bytes_used,
     144, 2**64 - 1, 96, 112, 2**64 - 1, 2**64 - 1,
 )
