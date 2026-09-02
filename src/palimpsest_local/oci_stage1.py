@@ -29,10 +29,11 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v6"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v6"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v7"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v7"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
+OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-explicit-user-group.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
 _PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+$")
@@ -170,6 +171,13 @@ class OCIStage1Plan:
             self.process.require_bootable()
         except ArtifactValidationError:
             raise StateError("stage-1 process is not bootable") from None
+        if (
+            not self.process.argv[0].startswith("/")
+            or not self.process.user.user.isdecimal()
+            or self.process.user.group is None
+            or not self.process.user.group.isdecimal()
+        ):
+            raise StateError("stage-1 process is outside the executable process subset")
         if not isinstance(self.assembly_probes, tuple) or len(self.assembly_probes) > MAX_OCI_STAGE1_ASSEMBLY_PROBES:
             raise StateError("stage-1 assembly probes are invalid")
         probes: list[dict[str, Any]] = []
@@ -273,9 +281,10 @@ class OCIStage1Plan:
             },
             "boot_plan_digest": self.boot_plan_digest,
             "domain_core_digest": self.domain_core_digest,
-            "handoff": "first-party-pid1-supervisor-required",
+            "handoff": "first-party-pid1-supervisor.v1",
             "phase": "stage1-contract",
             "process": self.process.to_dict(),
+            "process_policy": OCI_STAGE1_PROCESS_POLICY,
             "protocol": OCI_STAGE1_PROTOCOL,
             "run": {"name": self.run_name, "run_id": self.run_id},
             "schema": OCI_STAGE1_PLAN_SCHEMA,
@@ -298,6 +307,7 @@ class OCIStage1Plan:
             "handoff",
             "phase",
             "process",
+            "process_policy",
             "protocol",
             "run",
             "schema",
@@ -310,7 +320,8 @@ class OCIStage1Plan:
             value.get("schema") != OCI_STAGE1_PLAN_SCHEMA
             or value.get("protocol") != OCI_STAGE1_PROTOCOL
             or value.get("phase") != "stage1-contract"
-            or value.get("handoff") != "first-party-pid1-supervisor-required"
+            or value.get("handoff") != "first-party-pid1-supervisor.v1"
+            or value.get("process_policy") != OCI_STAGE1_PROCESS_POLICY
             or not isinstance(run, dict)
             or set(run) != {"name", "run_id"}
             or not isinstance(assembly, dict)
@@ -359,6 +370,7 @@ __all__ = [
     "MAX_OCI_STAGE1_PROBE_BYTES",
     "OCI_STAGE1_PLAN_SCHEMA",
     "OCI_STAGE1_PROTOCOL",
+    "OCI_STAGE1_PROCESS_POLICY",
     "OCI_STAGE1_ROOT_LAYOUT",
     "OCIStage1Plan",
     "oci_stage1_device_serial",

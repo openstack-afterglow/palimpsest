@@ -140,10 +140,10 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-fail-closed"
+    assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-pid1-supervisor"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v7"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v8"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -158,7 +158,18 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "switch_root": True,
         "workload_started": False,
     }
-    assert value["stage1"]["workload_started"] is False
+    assert value["stage1"]["workload_started"] is True
+    assert value["stage1"]["supervisor"] == {
+        "cleanup_scope": "dedicated-qualification-guest-whole-guest",
+        "contract": "palimpsest.guest-pid1-supervisor.v1",
+        "credentials": "numeric-explicit-user-group-empty-supplementary-groups",
+        "environment": "authenticated-image-environment-only",
+        "execution": "fork-execve-cloexec-error-pipe",
+        "signal_transport": "blocked-signalfd-process-group-forwarding",
+        "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
+        "terminal_state": "parent-marker-then-fail-closed-wait",
+        "wait": "wait4-all-adopted-descendants",
+    }
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
     assert "run_id" not in rendered and "domain_plan" not in rendered
@@ -169,6 +180,8 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert consumer["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert abi["embedded_consumer"] is True
     assert abi["consumer_contract_digest"] == built.manifest.consumer_contract_digest
+    assert consumer["supervisor"] == value["stage1"]["supervisor"]
+    assert abi["supervisor"] == value["stage1"]["supervisor"]
     assert consumer["root_transition"] == value["stage1"]["root_transition"]
     assert abi["root_transition"] == value["stage1"]["root_transition"]
     assert value["stage1"]["build"]["toolchain_image"].endswith(
@@ -187,6 +200,11 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     for expected, path in paths.items():
         assert f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" == expected
     assert stat.S_IMODE(paths[OCI_STAGE1_BINARY_DIGEST].stat().st_mode) == 0o644
+    stage1 = paths[OCI_STAGE1_BINARY_DIGEST].read_bytes()
+    assert b"workload terminal; main_status=" in stage1
+    assert b"; descendant_status=" in stage1
+    assert b"; reaped=" in stage1
+    assert b"; forwarded=" in stage1
 
 
 @pytest.mark.parametrize(

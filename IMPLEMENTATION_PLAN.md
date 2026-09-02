@@ -595,6 +595,58 @@ Qualification state: portable receipt/contract and packaged-ELF tests run on
 this macOS host, but the move-mount/chroot sequence itself requires the
 qualified Linux x86_64 native-KVM runner. No local v8 KVM success is claimed.
 
+### PR 4 slice 24: authenticated PID 1 supervisor checkpoint
+
+Implemented:
+
+- Stage-1 plan/protocol v7 replaces the pending handoff with
+  `first-party-pid1-supervisor.v1` and binds the first executable process
+  policy: absolute `argv[0]`, canonical numeric user, and explicit canonical
+  numeric group. General OCI image parsing still preserves named identities,
+  omitted groups, and relative commands, but OCI-root boot preparation rejects
+  those forms until image-root passwd/group and PATH semantics exist.
+- The freestanding PID 1 decodes authenticated JSON strings into a bounded
+  256 KiB arena, constructs null-terminated argv and `name=value` environment
+  vectors, and never inherits bootstrap environment. After root transition it
+  blocks the supervised signals, creates a `signalfd`, forks a new workload
+  process group, clears supplementary groups, applies gid/uid/cwd, and calls
+  `execve`. A close-on-exec pipe reports exact setup stage and errno; only EOF
+  confirms that exec succeeded.
+- PID 1 forwards the allow-listed signals to the workload process group,
+  translating external SIGTERM to the image stop signal, and uses
+  `wait4(-1)` for the main process and adopted descendants. The trusted
+  terminal marker records main status, last non-main status, reap count, and
+  last forwarded signal before permanent terminal fail-closed wait.
+- The qualification workload is a separately reproducible pinned static
+  x86_64 ELF stored in the highest real zstd SquashFS lower. It validates the
+  exact argv/environment/cwd/65534:65534/no-supplementary-group contract,
+  parent PID 1, process group, and OCI-root sentinel through both `/` and
+  `/proc/1/root`. It creates one descendant, self-stimulates PID 1 with
+  SIGTERM, and preserves descendant exit 43 with `waitid(WNOWAIT)` before main
+  exit 42 so PID 1 must establish both statuses itself.
+- KVM receipt v9 and fixture policy/schema v4 retain positive and second-boot
+  terminal consoles plus all prior controls. Three new independent writable
+  roots/plans/transports/cmdlines isolate missing executable, non-executable
+  target, and missing cwd; each proves root transition completed, exact
+  stage/errno launch rejection occurred once, no started/terminal marker was
+  emitted, and PID 1 remained alive.
+- Initramfs manifest/bootstrap ABI v10 and consumer/init contract v8 bind
+  `workload_started=true` only after confirmed exec. The nested root-transition
+  contract remains `workload_started=false` because that checkpoint precedes
+  launch.
+
+Scope boundary: this is a dedicated qualification guest, not production
+lifecycle. After main exit it may kill every remaining non-PID1 guest process;
+that is safe only because this checkpoint has no agent, exec session, or other
+service. Cgroup-scoped cleanup is mandatory before those features. Named
+user/group resolution, omitted group semantics, PATH search, host stop/control
+transport, VM poweroff and exit mapping, production libvirt define/start,
+foreground/`-d`, exec/log readiness, and Gate 2 remain disabled.
+
+Qualification state: all contracts, fixtures, reproducible ELFs, portable
+tests, and the v9 receipt collector are source-controlled. This macOS host
+cannot run native Linux x86_64 KVM, so no actual 30-boot v9 receipt is claimed.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -613,13 +665,15 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v8 move-mount/chroot root-transition receipt and all
-   retained-root plus topology/filesystem/assembly negative evidence on the
+1. Collect the qualified v9 supervisor receipt and all retained-root plus
+   topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
-2. Implement the first-party PID 1 supervisor and image workload startup as a
-   separate checkpoint; do not alias the current permanent wait to readiness.
-3. Implement foreground-default `run` and detached `run -d`, then
-   lifecycle/exec/log readiness for OCI-root/KVM.
+2. Implement image-root passwd/group lookup, omitted primary-group and PATH
+   search semantics, then replace whole-guest cleanup with a cgroup-scoped
+   workload boundary suitable for an agent and exec sessions.
+3. Connect production final handoff, host stop/control and exit mapping,
+   foreground-default `run` and detached `run -d`, then lifecycle/exec/log
+   readiness for OCI-root/KVM.
 4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
    KVM runner and require it before claiming production OCI-image-to-VM-root
    readiness.

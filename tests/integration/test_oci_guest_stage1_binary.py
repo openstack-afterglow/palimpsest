@@ -250,6 +250,44 @@ def test_freestanding_binary_matches_python_reference_for_canonical_unicode_fixt
     assert completed.stdout == "palimpsest guest stage1 fixture: verified\n"
 
 
+def test_freestanding_binary_rejects_named_user_even_with_valid_envelope(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    value = plan.to_dict()
+    value["process"]["user"]["user"] = "root"
+    artifact = _envelope(canonical_json_bytes(value))
+    bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    with pytest.raises(ArtifactValidationError, match="semantics"):
+        verify_guest_stage1_transport(artifact, bindings)
+    _write_fixture(tmp_path, plan, artifact)
+
+    completed = _run(scratch_image, tmp_path)
+
+    assert completed.returncode == 68
+
+
+@pytest.mark.parametrize("field", ["user", "group"])
+def test_freestanding_binary_rejects_wrapping_numeric_account(
+    scratch_image: str,
+    tmp_path: Path,
+    field: str,
+) -> None:
+    plan = _plan()
+    value = plan.to_dict()
+    value["process"]["user"][field] = "18446744073709551616"
+    artifact = _envelope(canonical_json_bytes(value))
+    bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    with pytest.raises(ArtifactValidationError, match="semantics"):
+        verify_guest_stage1_transport(artifact, bindings)
+    _write_fixture(tmp_path, plan, artifact)
+
+    completed = _run(scratch_image, tmp_path)
+
+    assert completed.returncode == 68
+
+
 def test_freestanding_binary_fixture_v2_matches_portable_filesystem_verifiers(
     scratch_image: str,
     tmp_path: Path,

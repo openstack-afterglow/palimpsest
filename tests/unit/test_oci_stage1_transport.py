@@ -258,6 +258,20 @@ def test_stage1_transport_covers_worst_case_canonical_process_escaping() -> None
     )
 
 
+@pytest.mark.parametrize(
+    "process",
+    [
+        OCIProcessSpec(("demo",), (), "/", OCIUserSpec("0", "0"), 15),
+        OCIProcessSpec(("/bin/demo",), (), "/", OCIUserSpec("root", "0"), 15),
+        OCIProcessSpec(("/bin/demo",), (), "/", OCIUserSpec("0", "root"), 15),
+        OCIProcessSpec(("/bin/demo",), (), "/", OCIUserSpec("0", None), 15),
+    ],
+)
+def test_stage1_admission_rejects_processes_outside_executable_subset(process: OCIProcessSpec) -> None:
+    with pytest.raises(StateError, match="executable process subset"):
+        replace(_plan(), process=process)
+
+
 def test_stage1_transport_file_boundary_rejects_tamper_links_modes_and_fifo(tmp_path: Path) -> None:
     plan = _plan()
     built = build_stage1_transport(plan)

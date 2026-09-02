@@ -4,8 +4,9 @@ The first-party static ``/init`` authenticates the raw stage-1 transport,
 block-device identities, root ext4 structure, and immutable lower SquashFS
 structure/content, mounts them, assembles OverlayFS, verifies optional
 authenticated root-level probes, and performs an initramfs-safe
-move-mount/chroot root transition before sleeping forever. It deliberately
-does not call ``pivot_root(2)`` or execute the image process. Exact source, toolchain,
+move-mount/chroot root transition, then executes and supervises the admitted
+image process before entering a terminal fail-closed wait. It deliberately
+does not call ``pivot_root(2)``. Exact source, toolchain,
 sealing recipe, binary and ABI provenance prevents transport consumption from
 being confused with full OCI-root boot readiness.
 """
@@ -30,21 +31,22 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v9"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v10"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v7"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v9"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v8"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v10"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v1"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:f512ef7a2be7181582b8a5200fc7d3508a9838e25f777c5ca0601e06bcfb8c90"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:75ab451eb75528c6f6c911e39b1699f98a08e1b68aa9434858538001b243e02a"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:a5195b2d670a0e9911c606982d0e444103ba422ec76e39a5c9410dd49bc2a6ee"
+OCI_STAGE1_BINARY_DIGEST = "sha256:456c0b75d814429c58c2ccf83837fea271e50776f5ae2d6493fb1ef2cd6398f8"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -360,6 +362,20 @@ def _bootstrap_stage1_binary() -> bytes:
     return payload
 
 
+def _supervisor_contract_dict() -> dict[str, Any]:
+    return {
+        "cleanup_scope": "dedicated-qualification-guest-whole-guest",
+        "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
+        "credentials": "numeric-explicit-user-group-empty-supplementary-groups",
+        "environment": "authenticated-image-environment-only",
+        "execution": "fork-execve-cloexec-error-pipe",
+        "signal_transport": "blocked-signalfd-process-group-forwarding",
+        "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
+        "terminal_state": "parent-marker-then-fail-closed-wait",
+        "wait": "wait4-all-adopted-descendants",
+    }
+
+
 def _guest_consumer_contract_bytes() -> bytes:
     return canonical_json_bytes(
         {
@@ -380,6 +396,7 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "switch_root": True,
                 "workload_started": False,
             },
+            "supervisor": _supervisor_contract_dict(),
             "switch_root": True,
             "validation": [
                 "bounded-closed-world-kernel-cmdline",
@@ -397,8 +414,12 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "move-mounted-root-chroot-pid1-root-identity",
                 "root-owned-0755-empty-pseudo-filesystem-move-targets",
                 "moved-proc-sysfs-devtmpfs-post-transition-identity",
+                "bounded-canonical-json-process-decode",
+                "absolute-argv0-numeric-explicit-user-group-admission",
+                "fork-execve-cloexec-launch-status",
+                "signalfd-process-group-forwarding-wait4-reaping",
             ],
-            "workload_started": False,
+            "workload_started": True,
         }
     )
 
@@ -426,8 +447,9 @@ def _stage1_abi_bytes() -> bytes:
                 "workload_started": False,
             },
             "schema": OCI_STAGE1_ABI,
+            "supervisor": _supervisor_contract_dict(),
             "switch_root": True,
-            "workload_started": False,
+            "workload_started": True,
         }
     )
 
@@ -537,8 +559,9 @@ class OCIInitramfsManifest:
                     "switch_root": True,
                     "workload_started": False,
                 },
+                "supervisor": _supervisor_contract_dict(),
                 "switch_root": True,
-                "workload_started": False,
+                "workload_started": True,
             },
         }
 
@@ -600,8 +623,9 @@ class OCIInitramfsManifest:
                     "switch_root": True,
                     "workload_started": False,
                 },
+                "supervisor": _supervisor_contract_dict(),
                 "switch_root": True,
-                "workload_started": False,
+                "workload_started": True,
             }
             or not isinstance(entries, list)
             or len(entries) != len(_REQUIRED_LAYOUT)
@@ -717,6 +741,7 @@ __all__ = [
     "OCI_STAGE1_ROOT_TRANSITION_CONTRACT",
     "OCI_STAGE1_SEAL_RECIPE_DIGEST",
     "OCI_STAGE1_SOURCE_DIGEST",
+    "OCI_STAGE1_SUPERVISOR_CONTRACT",
     "OCI_STAGE1_TOOLCHAIN_IMAGE",
     "build_bootstrap_initramfs",
     "build_newc",

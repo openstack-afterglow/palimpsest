@@ -28,6 +28,14 @@ jobs:
         run: docker pull --platform linux/amd64 docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
       - name: Reproduce and execute the packaged guest stage-1 ELF
         run: uv run python -m pytest -m guest_stage1_binary tests/integration/test_oci_guest_stage1_binary.py -vv
+      - name: Reproduce the native-KVM workload proof ELF
+        run: |
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-a.x86_64"
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-b.x86_64"
+          cmp tests/kvm/assets/workload-proof.x86_64 "$RUNNER_TEMP/workload-proof-a.x86_64"
+          cmp "$RUNNER_TEMP/workload-proof-a.x86_64" "$RUNNER_TEMP/workload-proof-b.x86_64"
+      - name: Verify KVM filesystem and workload fixture bindings
+        run: uv run python tests/kvm/assets/check_filesystem_fixtures.py
       - run: docker buildx create --name palimpsest-e2e --driver docker-container --driver-opt network=none --use --bootstrap
       - name: Verify local OCI product build
         env:
@@ -60,7 +68,7 @@ jobs:
       - run: uv sync --frozen --extra dev
       - name: Create private stage-1 evidence directory
         run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
-      - name: Require retained root, root transition, overlay precedence, and rejection matrices
+      - name: Require retained root, root transition, PID 1 supervision, and rejection matrices
         timeout-minutes: 45
         env:
           PALIMPSEST_REQUIRE_STAGE1_KVM: "1"

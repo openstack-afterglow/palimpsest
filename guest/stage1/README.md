@@ -4,14 +4,24 @@
 its own SHA-256 and canonical JSON validation; it has no libc, dynamic loader,
 or system-header dependency. It authenticates the stage-1 transport, then
 opens and authenticates the complete root/lower block-device set by role,
-serial, read-only state, exact size and stable identity before waiting
-permanently. It verifies the root ext4 identity and geometry, then every
+serial, read-only state, exact size and stable identity. It verifies the root
+ext4 identity and geometry, then every
 lower's SquashFS v4 structure and whole-device image digest. Live PID 1 mounts
 the authenticated block FDs at deterministic staging paths, assembles
 OverlayFS, moves devtmpfs, sysfs, and proc into that tree, then moves the
 OverlayFS mount onto `/` and enters it with `chroot(2)`. This is an
-initramfs-safe switch-root choreography, not a `pivot_root(2)` call. It does
-not execute or supervise the image workload.
+initramfs-safe switch-root choreography, not a `pivot_root(2)` call. It then
+decodes the authenticated process contract, forks the admitted image process
+into its own process group, confirms `execve(2)` through a close-on-exec error
+pipe, forwards an allow-listed signal set through `signalfd`, and reaps all
+children with `wait4(2)`.
+
+The first executable subset is deliberately narrow: `argv[0]` must be an
+absolute path and both user and group must be explicit canonical numeric IDs.
+The child receives only the authenticated image environment, starts with no
+supplementary groups, then applies group, user, cwd, and executable in that
+order. Name lookup, an omitted primary group, and `PATH` search remain
+fail-closed until their image-root semantics are implemented.
 
 New OCI-root volumes are formatted with a closed ext4 feature allow-list and
 fixed geometry rather than host `mke2fs.conf` defaults, then verified before
@@ -81,8 +91,10 @@ console, virtio block, ext4, SquashFS xattr plus gzip/zstd codecs, and
 OverlayFS requirements as built-ins (`=y`). A successful boot
 attaches an actual ext4 writable root and two actual SquashFS read-only lowers
 in deliberately permuted QEMU order. A successful boot must emit the
-root-transition marker exactly once and remain alive in the PID 1 fail-closed
-wait. Before that marker, PID 1 proves `/` is the same authenticated OverlayFS
+root-transition and workload-started markers, then a PID-1-authored terminal
+marker binding main status 42, adopted descendant status 43, two reaps, and
+forwarded signal 15. It remains alive in the terminal fail-closed wait. Before
+the root-transition marker, PID 1 proves `/` is the same authenticated OverlayFS
 inode previously mounted at staging, `/proc/self/root` matches `/`, the moved
 pseudo-filesystems retain their pre-transition identities, probes still pass
 at `/`, and every device passes a final recheck. Thirteen
@@ -96,17 +108,32 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v8 proof retains owner-only positive and per-control consoles plus a
+The v9 proof retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
-through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`.
+through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
+the `palimpsest.guest-pid1-supervisor.v1` execution checkpoint.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and workload supervision and production VM launch remain disabled. Stage-1
-plan/protocol v6 and its supervisor-required handoff remain unchanged.
+and production VM launch remains disabled. Stage-1 plan/protocol v7 admits
+only the explicit absolute/numeric process subset.
+
+The positive highest lower contains the separately reproducible proof workload
+and its OCI-root sentinel. That workload validates argv, environment, cwd,
+credentials, parent PID, process group, and `/proc/1/root`, creates one child,
+and sends SIGTERM to PID 1. Both processes require the signal to be forwarded
+by PID 1; `waitid(WNOWAIT)` preserves descendant exit 43 for PID 1 to reap
+after main exit 42. Three additional launch controls independently bind a
+missing executable, non-executable target, and missing cwd to exact child
+setup stage/errno rejection markers.
+
+After the main process exits, this qualification-only guest uses a whole-guest
+cleanup because no agent, exec session, or unrelated service exists. A
+cgroup-scoped workload boundary is required before production agent/exec or
+lifecycle readiness; the current cleanup must not be treated as that feature.
 
 Proof v6 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level

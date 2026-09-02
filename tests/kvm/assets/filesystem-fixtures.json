@@ -5,20 +5,25 @@
       "compression_id": 6,
       "raw_sha256": "7a7d9c3b0bcdbde58c2cd2af250ffd52fa52cb9d96ce8e86ccfd1713da86ca3b",
       "raw_size_bytes": 4096,
-      "source_files": [
-        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06", "size_bytes": 11},
-        {"mode": 420, "path": "layer.txt", "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0", "size_bytes": 22}
+      "source_entries": [
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06", "size_bytes": 11, "type": "file"},
+        {"mode": 420, "path": "layer.txt", "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0", "size_bytes": 22, "type": "file"}
       ],
       "source_root": "inputs/lower0"
     },
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "81babe432de10fc4157a9cdde6929d6f96dbcaf352d66a25f6b15bd16a49fb64",
+      "raw_sha256": "5e29723d30f853c821f887f8b61ecf3ea6e5228ee1427a26999f21e275082aad",
       "raw_size_bytes": 4096,
-      "source_files": [
-        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
-        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      "source_entries": [
+        {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
+        {"mode": 493, "path": "proof", "type": "directory"},
+        {"mode": 493, "path": "proof/workdir", "type": "directory"},
+        {"mode": 420, "path": "proof/workdir/.__palimpsest_workdir_v1", "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d", "size_bytes": 22, "type": "file"}
       ],
       "source_root": "inputs/lower1"
     },
@@ -34,36 +39,51 @@
     "transition_dev": {
       "base64_file": "transition-dev.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "d1570b817bde5bca5a8250dab6a6f7733ca6df12068293beaba414d2a53f1aae",
+      "raw_sha256": "79efc4074384e63cd0c3080680067e237c52bd9c555390d5bc8cd4030fa13390",
       "raw_size_bytes": 4096,
-      "source_files": [
-        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
-        {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
-        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      "source_entries": [
+        {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
+        {"mode": 493, "path": "proof", "type": "directory"},
+        {"mode": 493, "path": "proof/workdir", "type": "directory"},
+        {"mode": 420, "path": "proof/workdir/.__palimpsest_workdir_v1", "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d", "size_bytes": 22, "type": "file"}
       ],
       "source_root": "inputs/transition-dev"
     },
     "transition_proc": {
       "base64_file": "transition-proc.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "b0344088410bed455d75f973dacdd1e4fe84d461f21bc0d4a67e537f54c4906a",
+      "raw_sha256": "86e4e25d2841b84cd771399b431204b7d464f3dd4b717b53e50797237bf0f102",
       "raw_size_bytes": 4096,
-      "source_files": [
-        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
-        {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
-        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      "source_entries": [
+        {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
+        {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
+        {"mode": 493, "path": "proof", "type": "directory"},
+        {"mode": 493, "path": "proof/workdir", "type": "directory"},
+        {"mode": 420, "path": "proof/workdir/.__palimpsest_workdir_v1", "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d", "size_bytes": 22, "type": "file"}
       ],
       "source_root": "inputs/transition-proc"
     },
     "transition_sys": {
       "base64_file": "transition-sys.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "f19f8e5253cde2ae361e557a7aa9d0909d019ddfae53691bc4aa7a96300634e0",
+      "raw_sha256": "68a93d5f3427029c06167eee43d3cc3302d642851163fbc9baac507f30e0178a",
       "raw_size_bytes": 4096,
-      "source_files": [
-        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10},
-        {"mode": 420, "path": "sys", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16},
-        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21}
+      "source_entries": [
+        {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
+        {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c", "size_bytes": 8640, "type": "file"},
+        {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
+        {"mode": 493, "path": "proof", "type": "directory"},
+        {"mode": 493, "path": "proof/workdir", "type": "directory"},
+        {"mode": 420, "path": "proof/workdir/.__palimpsest_workdir_v1", "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d", "size_bytes": 22, "type": "file"},
+        {"mode": 420, "path": "sys", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"}
       ],
       "source_root": "inputs/transition-sys"
     }
@@ -74,7 +94,7 @@
     "size_bytes": 10,
     "top_ordinal": 1
   },
-  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v3",
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v4",
   "provenance": {
     "lower_builder": {
       "argv_policy": "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress",
@@ -87,7 +107,17 @@
       "container_image": "ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
       "lazy_initialization": false,
       "version": "mke2fs 1.47.0"
+    },
+    "workload_proof": {
+      "build_script": "scripts/build_oci_guest_workload_proof.sh",
+      "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
+      "elf_mode": 493,
+      "elf_sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c",
+      "elf_size_bytes": 8640,
+      "source": "guest/workload-proof/proof.c",
+      "source_sha256": "b8a5ebbdb984e344d9f35267af95e6bd381210b42761c3f3f74402ce5f489a0a",
+      "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     }
   },
-  "schema": "palimpsest.kvm-filesystem-fixtures.v3"
+  "schema": "palimpsest.kvm-filesystem-fixtures.v4"
 }

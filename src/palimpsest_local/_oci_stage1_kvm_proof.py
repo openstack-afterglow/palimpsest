@@ -2,8 +2,8 @@
 
 This private module is test support for the packaged bootstrap boundary. It
 does not define or start a production VM. It proves authenticated filesystem
-mounts and an initramfs-safe move-mount/chroot root transition, then stops
-before workload execution.
+mounts, an initramfs-safe move-mount/chroot root transition, and the narrow
+first-party PID 1 workload supervisor contract.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from .oci_guest_filesystems import (
 from .oci_initramfs import (
     OCI_BOOTSTRAP_STAGE1_CONTRACT,
     OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
+    OCI_STAGE1_SUPERVISOR_CONTRACT,
     build_bootstrap_initramfs,
 )
 from .oci_process import OCIProcessSpec, OCIUserSpec
@@ -47,7 +48,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v8"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v9"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -57,9 +58,13 @@ MAX_CONSOLE_BYTES = 4 * 1024 * 1024
 DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # Do not include the line ending: a real 8250 console commonly maps LF to
 # CRLF, while the pipe-based pure test preserves LF exactly.
-SUCCESS_MARKER = (
-    b"palimpsest guest stage1: root transition complete; root is slash; workload disabled; waiting fail-closed"
+ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
+WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
+WORKLOAD_TERMINAL_MARKER = (
+    b"palimpsest guest stage1: workload terminal; main_status=42; descendant_status=43; reaped=2; "
+    b"forwarded=15; waiting fail-closed"
 )
+SUCCESS_MARKER = WORKLOAD_TERMINAL_MARKER
 REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
 FILESYSTEM_REJECTION_MARKER = (
     b"palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed"
@@ -73,6 +78,20 @@ ROOT_TRANSITION_REJECTION_MARKER = (
     b"palimpsest guest stage1: root transition rejected; root state is indeterminate; "
     b"workload disabled; waiting fail-closed"
 )
+WORKLOAD_REJECTION_PREFIX = b"palimpsest guest stage1: workload launch rejected; stage="
+WORKLOAD_NEGATIVE_CONTROL_NAMES = (
+    "workload_missing_executable",
+    "workload_non_executable",
+    "workload_missing_cwd",
+)
+WORKLOAD_NEGATIVE_REJECTION_MARKERS = {
+    "workload_missing_executable": WORKLOAD_REJECTION_PREFIX
+    + b"7; errno=2; started and terminal disabled; waiting fail-closed",
+    "workload_non_executable": WORKLOAD_REJECTION_PREFIX
+    + b"7; errno=13; started and terminal disabled; waiting fail-closed",
+    "workload_missing_cwd": WORKLOAD_REJECTION_PREFIX
+    + b"6; errno=2; started and terminal disabled; waiting fail-closed",
+}
 
 KERNEL_ENV = "PALIMPSEST_KVM_KERNEL"
 KERNEL_CONFIG_ENV = "PALIMPSEST_KVM_KERNEL_CONFIG"
@@ -114,6 +133,14 @@ ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES = (
     "transition_sys_not_directory",
     "transition_proc_not_directory",
 )
+KVM_PROOF_BOOT_COUNT = (
+    2
+    + len(NEGATIVE_CONTROL_NAMES)
+    + len(FILESYSTEM_NEGATIVE_CONTROL_NAMES)
+    + len(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+    + len(ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES)
+    + len(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+)
 EVIDENCE_FILE_NAMES = (
     "console.bin",
     "retained-console.bin",
@@ -122,6 +149,7 @@ EVIDENCE_FILE_NAMES = (
     *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
     *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
     *(f"root-transition-negative-{name}.bin" for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES),
+    *(f"workload-negative-{name}.bin" for name in WORKLOAD_NEGATIVE_CONTROL_NAMES),
 )
 _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_64BIT",
@@ -169,202 +197,113 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST = {
-    "artifacts": {
-        "lower0": {
-            "base64_file": "lower0.squashfs.b64",
-            "compression_id": 6,
-            "raw_sha256": "7a7d9c3b0bcdbde58c2cd2af250ffd52fa52cb9d96ce8e86ccfd1713da86ca3b",
-            "raw_size_bytes": 4096,
-            "source_files": [
-                {
-                    "mode": 420,
-                    "path": ".__palimpsest_overlay_order_probe_v1",
-                    "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06",
-                    "size_bytes": 11,
-                },
-                {
-                    "mode": 420,
-                    "path": "layer.txt",
-                    "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0",
-                    "size_bytes": 22,
-                },
-            ],
-            "source_root": "inputs/lower0",
-        },
-        "lower1": {
-            "base64_file": "lower1.squashfs.b64",
-            "compression_id": 6,
-            "raw_sha256": "81babe432de10fc4157a9cdde6929d6f96dbcaf352d66a25f6b15bd16a49fb64",
-            "raw_size_bytes": 4096,
-            "source_files": [
-                {
-                    "mode": 420,
-                    "path": ".__palimpsest_overlay_order_probe_v1",
-                    "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
-                    "size_bytes": 10,
-                },
-                {
-                    "mode": 420,
-                    "path": "layer.txt",
-                    "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
-                    "size_bytes": 21,
-                },
-            ],
-            "source_root": "inputs/lower1",
-        },
-        "root": {
-            "base64_file": "root-ext4.raw.gz.b64",
-            "compression": "gzip",
-            "compressed_sha256": "29f0a7f99f27546bed35e4e681a45ffe847e0a7b3316136f50ea73404162168d",
-            "filesystem_label": "pali-root-e3f97d",
-            "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
-            "raw_sha256": "ef607002f63f445491b659898009ff1322affe8a8ff6ef980b6b30af34ca6cf7",
-            "raw_size_bytes": 16777216,
-        },
-        "transition_dev": {
-            "base64_file": "transition-dev.squashfs.b64",
-            "compression_id": 6,
-            "raw_sha256": "d1570b817bde5bca5a8250dab6a6f7733ca6df12068293beaba414d2a53f1aae",
-            "raw_size_bytes": 4096,
-            "source_files": [
-                {
-                    "mode": 420,
-                    "path": ".__palimpsest_overlay_order_probe_v1",
-                    "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
-                    "size_bytes": 10,
-                },
-                {
-                    "mode": 420,
-                    "path": "dev",
-                    "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
-                    "size_bytes": 16,
-                },
-                {
-                    "mode": 420,
-                    "path": "layer.txt",
-                    "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
-                    "size_bytes": 21,
-                },
-            ],
-            "source_root": "inputs/transition-dev",
-        },
-        "transition_proc": {
-            "base64_file": "transition-proc.squashfs.b64",
-            "compression_id": 6,
-            "raw_sha256": "b0344088410bed455d75f973dacdd1e4fe84d461f21bc0d4a67e537f54c4906a",
-            "raw_size_bytes": 4096,
-            "source_files": [
-                {
-                    "mode": 420,
-                    "path": ".__palimpsest_overlay_order_probe_v1",
-                    "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
-                    "size_bytes": 10,
-                },
-                {
-                    "mode": 420,
-                    "path": "proc",
-                    "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
-                    "size_bytes": 16,
-                },
-                {
-                    "mode": 420,
-                    "path": "layer.txt",
-                    "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
-                    "size_bytes": 21,
-                },
-            ],
-            "source_root": "inputs/transition-proc",
-        },
-        "transition_sys": {
-            "base64_file": "transition-sys.squashfs.b64",
-            "compression_id": 6,
-            "raw_sha256": "f19f8e5253cde2ae361e557a7aa9d0909d019ddfae53691bc4aa7a96300634e0",
-            "raw_size_bytes": 4096,
-            "source_files": [
-                {
-                    "mode": 420,
-                    "path": ".__palimpsest_overlay_order_probe_v1",
-                    "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
-                    "size_bytes": 10,
-                },
-                {
-                    "mode": 420,
-                    "path": "sys",
-                    "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
-                    "size_bytes": 16,
-                },
-                {
-                    "mode": 420,
-                    "path": "layer.txt",
-                    "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
-                    "size_bytes": 21,
-                },
-            ],
-            "source_root": "inputs/transition-sys",
-        },
-    },
-    "assembly_probe": {
-        "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
-        "path": "/.__palimpsest_overlay_order_probe_v1",
-        "size_bytes": 10,
-        "top_ordinal": 1,
-    },
-    "policy": "palimpsest.kvm-actual-filesystem-fixtures.v3",
-    "provenance": {
-        "lower_builder": {
-            "argv_policy": (
-                "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 "
-                "-noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root "
-                "-processors 1 -no-progress"
-            ),
-            "compression": "zstd",
-            "compression_id": 6,
-            "executable_sha256": "0e2bc38611d42bd385112d4f72e5030a7b79df59d34079c9b00dec7109237c30",
-            "version": "mksquashfs 4.7.5",
-        },
-        "root_builder": {
-            "container_image": ("ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"),
-            "lazy_initialization": False,
-            "version": "mke2fs 1.47.0",
-        },
-    },
-    "schema": "palimpsest.kvm-filesystem-fixtures.v3",
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:bb5fe2047adcc1307c29faee72c5e5d7ef4db28b6e832d0fb5e42d13b016ec01"
+_PROOF_ASSEMBLY_PROBE = {
+    "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+    "path": "/.__palimpsest_overlay_order_probe_v1",
+    "size_bytes": 10,
+    "top_ordinal": 1,
 }
 
 
 def verify_proof_filesystem_manifest(value: Any) -> str:
-    if not isinstance(value, Mapping) or dict(value) != _PROOF_FILESYSTEM_MANIFEST:
+    if not isinstance(value, Mapping):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
-    return _digest(canonical_json_bytes(value))
+    digest = _digest(canonical_json_bytes(value))
+    if (
+        digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v4"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v4"
+        or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
+    ):
+        raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
+    return digest
+
+
+def _verify_workload_proof_provenance(
+    repository: Path,
+    fixture_directory: Path,
+    provenance: Mapping[str, Any],
+) -> None:
+    expected = {
+        "build_script": "scripts/build_oci_guest_workload_proof.sh",
+        "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
+        "elf_mode": 0o755,
+        "elf_sha256": "480bd089a318f01f68c8d047629a0531fb87579fddf70179540deb6e03b9b25c",
+        "elf_size_bytes": 8640,
+        "source": "guest/workload-proof/proof.c",
+        "source_sha256": "b8a5ebbdb984e344d9f35267af95e6bd381210b42761c3f3f74402ce5f489a0a",
+        "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
+    }
+    if not isinstance(provenance, Mapping) or dict(provenance) != expected:
+        raise ArtifactValidationError("KVM workload proof provenance is invalid")
+    for path, digest, mode, size in (
+        (
+            repository / expected["source"],
+            f"sha256:{expected['source_sha256']}",
+            0o644,
+            None,
+        ),
+        (
+            repository / expected["build_script"],
+            f"sha256:{expected['build_script_sha256']}",
+            0o755,
+            None,
+        ),
+        (
+            fixture_directory / "workload-proof.x86_64",
+            f"sha256:{expected['elf_sha256']}",
+            expected["elf_mode"],
+            expected["elf_size_bytes"],
+        ),
+    ):
+        verified = _read_pinned_regular_file(path.absolute(), maximum=65 * 1024, label="KVM workload proof")
+        if verified.digest != digest or stat.S_IMODE(verified.mode) != mode or (size and verified.size_bytes != size):
+            raise ArtifactValidationError("KVM workload proof provenance binding is invalid")
 
 
 def _verify_fixture_source_tree(source_root: Path, sources: list[dict[str, Any]]) -> None:
     expected_source_names = {source["path"] for source in sources}
     try:
         source_root_stat = source_root.lstat()
-        actual_source_names = {entry.name for entry in os.scandir(source_root)}
+        actual_source_names = {entry.relative_to(source_root).as_posix() for entry in source_root.rglob("*")}
     except OSError:
         raise ArtifactValidationError("KVM SquashFS fixture source root is unavailable") from None
-    if not stat.S_ISDIR(source_root_stat.st_mode) or actual_source_names != expected_source_names:
+    if (
+        not stat.S_ISDIR(source_root_stat.st_mode)
+        or stat.S_IMODE(source_root_stat.st_mode) != 0o755
+        or actual_source_names != expected_source_names
+    ):
         raise ArtifactValidationError("KVM SquashFS fixture source tree is invalid")
     for source in sources:
         source_path = source_root / source["path"]
+        expected_type = source.get("type")
         try:
             visible = source_path.lstat()
-            with source_path.open("rb") as opened:
-                source_stat = os.fstat(opened.fileno())
-                source_payload = opened.read(65 * 1024)
         except OSError:
             raise ArtifactValidationError("KVM SquashFS fixture source is unavailable") from None
-        if (
-            not stat.S_ISREG(source_stat.st_mode)
-            or (visible.st_dev, visible.st_ino) != (source_stat.st_dev, source_stat.st_ino)
-            or source_stat.st_nlink != 1
-            or stat.S_IMODE(source_stat.st_mode) != source["mode"]
-            or len(source_payload) != source["size_bytes"]
-            or hashlib.sha256(source_payload).hexdigest() != source["sha256"]
-        ):
+        if expected_type == "directory":
+            if set(source) != {"mode", "path", "type"} or not stat.S_ISDIR(visible.st_mode):
+                raise ArtifactValidationError("KVM SquashFS fixture source binding is invalid")
+            source_stat = visible
+        elif expected_type == "file" and set(source) == {"mode", "path", "sha256", "size_bytes", "type"}:
+            try:
+                with source_path.open("rb") as opened:
+                    source_stat = os.fstat(opened.fileno())
+                    source_payload = opened.read(65 * 1024)
+            except OSError:
+                raise ArtifactValidationError("KVM SquashFS fixture source is unavailable") from None
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or (visible.st_dev, visible.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+                or source_stat.st_nlink != 1
+                or len(source_payload) != source["size_bytes"]
+                or hashlib.sha256(source_payload).hexdigest() != source["sha256"]
+            ):
+                raise ArtifactValidationError("KVM SquashFS fixture source binding is invalid")
+        else:
+            raise ArtifactValidationError("KVM SquashFS fixture source binding is invalid")
+        if stat.S_IMODE(source_stat.st_mode) != source["mode"]:
             raise ArtifactValidationError("KVM SquashFS fixture source binding is invalid")
 
 
@@ -372,7 +311,8 @@ def _verify_fixture_source_tree(source_root: Path, sources: list[dict[str, Any]]
 def load_proof_filesystems() -> ProofFilesystemSet:
     """Load exact source-controlled outputs from real mkfs tools."""
 
-    directory = Path(__file__).resolve().parents[2] / "tests" / "kvm" / "assets"
+    repository = Path(__file__).resolve().parents[2]
+    directory = repository / "tests" / "kvm" / "assets"
     try:
         metadata = json.loads((directory / "filesystem-fixtures.json").read_text(encoding="ascii"))
         artifacts = metadata["artifacts"]
@@ -398,6 +338,7 @@ def load_proof_filesystems() -> ProofFilesystemSet:
     except (OSError, ValueError, KeyError, TypeError, gzip.BadGzipFile, json.JSONDecodeError):
         raise ArtifactValidationError("KVM filesystem fixtures are unavailable") from None
     manifest_digest = verify_proof_filesystem_manifest(metadata)
+    _verify_workload_proof_provenance(repository, directory, metadata["provenance"]["workload_proof"])
     root_meta = artifacts["root"]
     if (
         _digest(compressed_root) != f"sha256:{root_meta['compressed_sha256']}"
@@ -425,7 +366,7 @@ def load_proof_filesystems() -> ProofFilesystemSet:
         if identity.compression != item["compression_id"]:
             raise ArtifactValidationError("KVM SquashFS fixture compression is invalid")
         source_root = directory / item["source_root"]
-        _verify_fixture_source_tree(source_root, item["source_files"])
+        _verify_fixture_source_tree(source_root, item["source_entries"])
         lower_digests.append(digest)
     transition_lower_digests: dict[str, str] = {}
     for role, payload in transition_lowers.items():
@@ -437,7 +378,7 @@ def load_proof_filesystems() -> ProofFilesystemSet:
         identity = verify_lower_device(payload, expected_digest=digest)
         if identity.compression != item["compression_id"]:
             raise ArtifactValidationError("KVM transition SquashFS compression is invalid")
-        _verify_fixture_source_tree(directory / item["source_root"], item["source_files"])
+        _verify_fixture_source_tree(directory / item["source_root"], item["source_entries"])
         transition_lower_digests[role] = digest
     return ProofFilesystemSet(
         root,
@@ -471,6 +412,23 @@ def _logical_line_count(payload: bytes, marker: bytes) -> int:
     return sum(line == marker for line in normalized.split(b"\n")[:-1])
 
 
+def _logical_prefix_count(payload: bytes, prefix: bytes) -> int:
+    normalized = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return sum(line.startswith(prefix) for line in normalized.split(b"\n")[:-1])
+
+
+def _logical_lines_in_order(payload: bytes, *markers: bytes) -> bool:
+    """Require exact complete console lines to occur in the given order."""
+
+    normalized = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    lines = normalized.split(b"\n")[:-1]
+    try:
+        positions = [lines.index(marker) for marker in markers]
+    except ValueError:
+        return False
+    return all(left < right for left, right in zip(positions, positions[1:], strict=False))
+
+
 def _validate_digest(value: Any, field: str) -> str:
     if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
         raise ArtifactValidationError(f"{field} is invalid")
@@ -483,6 +441,7 @@ class VerifiedHostFile:
     payload: bytes
     digest: str
     size_bytes: int
+    mode: int
 
     def __post_init__(self) -> None:
         if (
@@ -491,6 +450,8 @@ class VerifiedHostFile:
             or not isinstance(self.payload, bytes)
             or self.size_bytes != len(self.payload)
             or self.digest != _digest(self.payload)
+            or type(self.mode) is not int
+            or not stat.S_ISREG(self.mode)
         ):
             raise ArtifactValidationError("verified host file is invalid")
 
@@ -498,6 +459,12 @@ class VerifiedHostFile:
 def _read_pinned_regular_file(path: Path, *, maximum: int, label: str) -> VerifiedHostFile:
     if not isinstance(path, Path) or not path.is_absolute() or "\0" in os.fspath(path):
         raise ArtifactValidationError(f"{label} path is invalid")
+    try:
+        visible_before = path.lstat()
+    except OSError:
+        raise ArtifactValidationError(f"{label} cannot be opened safely") from None
+    if not stat.S_ISREG(visible_before.st_mode):
+        raise ArtifactValidationError(f"{label} cannot be opened safely")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -507,6 +474,7 @@ def _read_pinned_regular_file(path: Path, *, maximum: int, label: str) -> Verifi
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
+            or (visible_before.st_dev, visible_before.st_ino) != (before.st_dev, before.st_ino)
             or before.st_nlink != 1
             or before.st_uid not in {0, os.getuid()}
             or before.st_mode & 0o022
@@ -542,8 +510,27 @@ def _read_pinned_regular_file(path: Path, *, maximum: int, label: str) -> Verifi
             after.st_mtime_ns,
         ):
             raise ArtifactValidationError(f"{label} changed while reading")
+        visible_after = path.lstat()
+        if (
+            visible_before.st_dev,
+            visible_before.st_ino,
+            visible_before.st_mode,
+            visible_before.st_uid,
+            visible_before.st_nlink,
+            visible_before.st_size,
+            visible_before.st_mtime_ns,
+        ) != (
+            visible_after.st_dev,
+            visible_after.st_ino,
+            visible_after.st_mode,
+            visible_after.st_uid,
+            visible_after.st_nlink,
+            visible_after.st_size,
+            visible_after.st_mtime_ns,
+        ):
+            raise ArtifactValidationError(f"{label} changed while reading")
         payload = b"".join(chunks)
-        return VerifiedHostFile(path, payload, _digest(payload), len(payload))
+        return VerifiedHostFile(path, payload, _digest(payload), len(payload), before.st_mode)
     except OSError:
         raise ArtifactValidationError(f"{label} cannot be read safely") from None
     finally:
@@ -729,8 +716,22 @@ def build_proof_plan() -> OCIStage1Plan:
                 "size_bytes": len(filesystems.lowers[1]),
             },
         ),
-        process=OCIProcessSpec(("/sbin/init",), (("LANG", "C.UTF-8"),), "/", OCIUserSpec("0", "0"), 15),
-        assembly_probes=(dict(_PROOF_FILESYSTEM_MANIFEST["assembly_probe"]),),
+        process=OCIProcessSpec(
+            (
+                "/.__palimpsest_workload_proof_v1",
+                "palimpsest-argv-one",
+                "",
+                "line\nbreak",
+            ),
+            (
+                ("PALIMPSEST_PROOF_ENV", "value with spaces"),
+                ("PALIMPSEST_PROOF_EMPTY", ""),
+            ),
+            "/proof/workdir",
+            OCIUserSpec("65534", "65534"),
+            15,
+        ),
+        assembly_probes=(dict(_PROOF_ASSEMBLY_PROBE),),
     )
 
 
@@ -875,7 +876,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v3",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v4",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1380,6 +1381,141 @@ def verify_root_transition_negative_control_contract(name: str, value: Any) -> d
     return expected
 
 
+def _workload_negative_context(name: str) -> tuple[OCIStage1Plan, BuiltOCIStage1Transport]:
+    if name not in WORKLOAD_NEGATIVE_CONTROL_NAMES:
+        raise ArtifactValidationError("KVM workload control input is invalid")
+    base = build_proof_plan()
+    process = base.process
+    if name == "workload_missing_executable":
+        process = OCIProcessSpec(
+            ("/.__palimpsest_missing_workload_v1", *process.argv[1:]),
+            process.environment,
+            process.cwd,
+            process.user,
+            process.stop_signal,
+        )
+    elif name == "workload_non_executable":
+        process = OCIProcessSpec(
+            ("/layer.txt", *process.argv[1:]),
+            process.environment,
+            process.cwd,
+            process.user,
+            process.stop_signal,
+        )
+    else:
+        process = OCIProcessSpec(
+            process.argv,
+            process.environment,
+            "/proof/missing",
+            process.user,
+            process.stop_signal,
+        )
+    plan = OCIStage1Plan(
+        base.run_id,
+        base.run_name,
+        base.boot_plan_digest,
+        base.domain_core_digest,
+        dict(base.root),
+        tuple(dict(layer) for layer in base.layers),
+        process,
+        tuple(dict(probe) for probe in base.assembly_probes),
+    )
+    return plan, build_stage1_transport(plan)
+
+
+def workload_negative_control_contract(name: str) -> dict[str, Any]:
+    """Bind one valid root transition followed by an exact workload launch rejection."""
+
+    plan, transport = _workload_negative_context(name)
+    filesystems = load_proof_filesystems()
+    serial = transport_serial(transport.receipt.artifact_digest)
+    attachments = [
+        {
+            "backing": "lower0",
+            "drive_id": "lower0",
+            "ordinal": 0,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[0]["serial"],
+        },
+        {
+            "backing": "transport",
+            "drive_id": "stage1",
+            "ordinal": None,
+            "read_only": True,
+            "role": "transport",
+            "serial": serial,
+        },
+        {
+            "backing": "root",
+            "drive_id": "root",
+            "ordinal": None,
+            "read_only": False,
+            "role": "root",
+            "serial": plan.root["serial"],
+        },
+        {
+            "backing": "lower1",
+            "drive_id": "lower1",
+            "ordinal": 1,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[1]["serial"],
+        },
+    ]
+    backings = {
+        "lower0": {
+            "artifact_digest": filesystems.lower_digests[0],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[0]),
+        },
+        "lower1": {
+            "artifact_digest": filesystems.lower_digests[1],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[1]),
+        },
+        "root": {
+            "artifact_digest": filesystems.root_digest,
+            "mode": 0o600,
+            "size_bytes": len(filesystems.root),
+        },
+        "transport": {
+            "artifact_digest": transport.receipt.artifact_digest,
+            "mode": 0o400,
+            "size_bytes": transport.receipt.artifact_size_bytes,
+        },
+    }
+    expected_stage = 6 if name == "workload_missing_cwd" else 7
+    expected_errno = 13 if name == "workload_non_executable" else 2
+    contract: dict[str, Any] = {
+        "attachments": attachments,
+        "backings": backings,
+        "cmdline": build_kernel_cmdline(plan, transport),
+        "expected_errno": expected_errno,
+        "expected_stage": expected_stage,
+        "name": name,
+        "policy": "palimpsest.stage1-kvm-workload-negative-control.v1",
+        "rejection_marker": WORKLOAD_NEGATIVE_REJECTION_MARKERS[name].decode("ascii"),
+        "root_transition_marker": ROOT_TRANSITION_MARKER.decode("ascii"),
+        "stage": "post-root-transition-workload-launch",
+        "stage1_plan": plan.to_dict(),
+        "stage1_transport": {**transport.receipt.to_dict(), "serial": serial},
+    }
+    contract["digest"] = _digest(canonical_json_bytes(contract))
+    return contract
+
+
+def workload_negative_control_contracts() -> dict[str, dict[str, Any]]:
+    return {name: workload_negative_control_contract(name) for name in WORKLOAD_NEGATIVE_CONTROL_NAMES}
+
+
+def verify_workload_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
+    expected = workload_negative_control_contract(name)
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ArtifactValidationError("KVM workload negative control contract is invalid")
+    return expected
+
+
 def verify_filesystem_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
     expected = filesystem_negative_control_contract(name)
     if not isinstance(value, Mapping) or dict(value) != expected:
@@ -1484,6 +1620,29 @@ def build_root_transition_negative_qemu_command(
     )
 
 
+def build_workload_negative_qemu_command(
+    *,
+    qemu_path: Path,
+    kernel_path: Path,
+    initramfs_path: Path,
+    backing_paths: Mapping[str, Path],
+    cmdline: str,
+    control: Mapping[str, Any],
+) -> tuple[str, ...]:
+    name = control.get("name") if isinstance(control, Mapping) else None
+    contract = verify_workload_negative_control_contract(name, control)
+    if cmdline != contract["cmdline"]:
+        raise ArtifactValidationError("KVM workload control cmdline is invalid")
+    return _build_control_qemu_command(
+        qemu_path=qemu_path,
+        kernel_path=kernel_path,
+        initramfs_path=initramfs_path,
+        backing_paths=backing_paths,
+        cmdline=cmdline,
+        contract=contract,
+    )
+
+
 def _build_control_qemu_command(
     *,
     qemu_path: Path,
@@ -1570,6 +1729,8 @@ class OCIStage1KVMProofReceipt:
     assembly_negative_root_post_digests: Mapping[str, str]
     root_transition_negative_consoles: Mapping[str, bytes]
     root_transition_negative_root_post_digests: Mapping[str, str]
+    workload_negative_consoles: Mapping[str, bytes]
+    workload_negative_root_post_digests: Mapping[str, str]
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -1620,6 +1781,12 @@ class OCIStage1KVMProofReceipt:
             or not isinstance(self.console, bytes)
             or not 1 <= len(self.console) <= MAX_CONSOLE_BYTES
             or _logical_line_count(self.console, SUCCESS_MARKER) != 1
+            or _logical_line_count(self.console, ROOT_TRANSITION_MARKER) != 1
+            or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
+            or not _logical_lines_in_order(
+                self.console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
+            )
+            or _logical_prefix_count(self.console, WORKLOAD_REJECTION_PREFIX) != 0
             or _logical_line_count(self.console, REJECTION_MARKER) != 0
             or _logical_line_count(self.console, FILESYSTEM_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, ASSEMBLY_REJECTION_MARKER) != 0
@@ -1628,6 +1795,12 @@ class OCIStage1KVMProofReceipt:
             or not isinstance(self.retained_console, bytes)
             or not 1 <= len(self.retained_console) <= MAX_CONSOLE_BYTES
             or _logical_line_count(self.retained_console, SUCCESS_MARKER) != 1
+            or _logical_line_count(self.retained_console, ROOT_TRANSITION_MARKER) != 1
+            or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
+            or not _logical_lines_in_order(
+                self.retained_console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
+            )
+            or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
             or any(
                 _logical_line_count(self.retained_console, marker) != 0
                 for marker in (
@@ -1645,6 +1818,9 @@ class OCIStage1KVMProofReceipt:
                 or not 1 <= len(control_console) <= MAX_CONSOLE_BYTES
                 or _logical_line_count(control_console, REJECTION_MARKER) != 1
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
+                or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
@@ -1658,6 +1834,9 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, FILESYSTEM_REJECTION_MARKER) != 1
                 or _logical_line_count(control_console, REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
+                or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
@@ -1672,6 +1851,9 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, FILESYSTEM_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
+                or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.assembly_negative_consoles.values()
@@ -1692,6 +1874,9 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, FILESYSTEM_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
+                or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.root_transition_negative_consoles.values()
             )
@@ -1700,6 +1885,40 @@ class OCIStage1KVMProofReceipt:
             or any(
                 not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
                 for value in self.root_transition_negative_root_post_digests.values()
+            )
+            or not isinstance(self.workload_negative_consoles, Mapping)
+            or set(self.workload_negative_consoles) != set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(self.workload_negative_consoles[name], bytes)
+                or not 1 <= len(self.workload_negative_consoles[name]) <= MAX_CONSOLE_BYTES
+                or _logical_line_count(self.workload_negative_consoles[name], ROOT_TRANSITION_MARKER) != 1
+                or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_NEGATIVE_REJECTION_MARKERS[name])
+                != 1
+                or not _logical_lines_in_order(
+                    self.workload_negative_consoles[name],
+                    ROOT_TRANSITION_MARKER,
+                    WORKLOAD_NEGATIVE_REJECTION_MARKERS[name],
+                )
+                or _logical_prefix_count(self.workload_negative_consoles[name], WORKLOAD_REJECTION_PREFIX) != 1
+                or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_STARTED_MARKER) != 0
+                or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_TERMINAL_MARKER) != 0
+                or any(
+                    _logical_line_count(self.workload_negative_consoles[name], marker) != 0
+                    for marker in (
+                        REJECTION_MARKER,
+                        FILESYSTEM_REJECTION_MARKER,
+                        ASSEMBLY_REJECTION_MARKER,
+                        ROOT_TRANSITION_REJECTION_MARKER,
+                        PREPARATION_FAILURE_MARKER,
+                    )
+                )
+                for name in WORKLOAD_NEGATIVE_CONTROL_NAMES
+            )
+            or not isinstance(self.workload_negative_root_post_digests, Mapping)
+            or set(self.workload_negative_root_post_digests) != set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
+                for value in self.workload_negative_root_post_digests.values()
             )
         ):
             raise ArtifactValidationError("KVM proof receipt value is invalid")
@@ -1756,6 +1975,7 @@ class OCIStage1KVMProofReceipt:
                 }
                 for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES
             },
+            "executed_boots": KVM_PROOF_BOOT_COUNT,
             "assembly_negative_controls": {
                 name: {
                     "contract": assembly_negative_control_contract(name),
@@ -1789,6 +2009,21 @@ class OCIStage1KVMProofReceipt:
                     "success_marker_count": 0,
                 }
                 for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES
+            },
+            "workload_negative_controls": {
+                name: {
+                    "contract": workload_negative_control_contract(name),
+                    "console_digest": _digest(self.workload_negative_consoles[name]),
+                    "console_size_bytes": len(self.workload_negative_consoles[name]),
+                    "pid1_alive_after_marker": True,
+                    "rejection_marker_count": 1,
+                    "root_post_digest": self.workload_negative_root_post_digests[name],
+                    "root_seed_digest": workload_negative_control_contract(name)["backings"]["root"]["artifact_digest"],
+                    "root_transition_marker_count": 1,
+                    "terminal_marker_count": 0,
+                    "workload_started_marker_count": 0,
+                }
+                for name in WORKLOAD_NEGATIVE_CONTROL_NAMES
             },
             "pre_mount_devices": True,
             "filesystem_verified": True,
@@ -1835,10 +2070,19 @@ class OCIStage1KVMProofReceipt:
             },
             "schema": OCI_STAGE1_KVM_PROOF_SCHEMA,
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
+            "supervisor": {
+                "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
+                "descendant_status": 43,
+                "forwarded_signal": 15,
+                "main_status": 42,
+                "process_group": True,
+                "reaped_children": 2,
+                "terminal_state": "parent-marker-then-fail-closed-wait",
+            },
             "switch_root": True,
             "topology": pre_mount_topology(build_proof_plan()),
             "transport": {**dict(self.transport), "serial": self.transport_serial},
-            "workload_started": False,
+            "workload_started": True,
         }
 
     @property
@@ -1858,6 +2102,8 @@ class OCIStage1KVMProofReceipt:
         assembly_negative_root_post_digests: Mapping[str, str],
         root_transition_negative_consoles: Mapping[str, bytes],
         root_transition_negative_root_post_digests: Mapping[str, str],
+        workload_negative_consoles: Mapping[str, bytes],
+        workload_negative_root_post_digests: Mapping[str, str],
     ) -> OCIStage1KVMProofReceipt:
         if not isinstance(value, Mapping) or set(value) != {
             "assembly_negative_controls",
@@ -1867,6 +2113,7 @@ class OCIStage1KVMProofReceipt:
             "kernel",
             "negative_controls",
             "filesystem_negative_controls",
+            "executed_boots",
             "pre_mount_devices",
             "filesystem_verified",
             "root_filesystem_verified",
@@ -1888,9 +2135,11 @@ class OCIStage1KVMProofReceipt:
             "root_volume",
             "schema",
             "stage1",
+            "supervisor",
             "switch_root",
             "topology",
             "transport",
+            "workload_negative_controls",
             "workload_started",
         }:
             raise ArtifactValidationError("KVM proof receipt fields are invalid")
@@ -1907,14 +2156,17 @@ class OCIStage1KVMProofReceipt:
         filesystem_negative_controls = value.get("filesystem_negative_controls")
         assembly_negative_controls = value.get("assembly_negative_controls")
         root_transition_negative_controls = value.get("root_transition_negative_controls")
+        workload_negative_controls = value.get("workload_negative_controls")
+        supervisor = value.get("supervisor")
         root_volume = value.get("root_volume")
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
+            or value.get("executed_boots") != KVM_PROOF_BOOT_COUNT
             or value.get("root_assembly") is not True
             or value.get("root_is_slash") is not True
             or value.get("pivot_root") is not False
             or value.get("switch_root") is not True
-            or value.get("workload_started") is not False
+            or value.get("workload_started") is not True
             or value.get("root_transition")
             != {
                 "contract": OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
@@ -1925,6 +2177,16 @@ class OCIStage1KVMProofReceipt:
                 "root_filesystem": "overlay",
                 "switch_root": True,
                 "workload_started": False,
+            }
+            or supervisor
+            != {
+                "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
+                "descendant_status": 43,
+                "forwarded_signal": 15,
+                "main_status": 42,
+                "process_group": True,
+                "reaped_children": 2,
+                "terminal_state": "parent-marker-then-fail-closed-wait",
             }
             or value.get("pre_mount_devices") is not True
             or value.get("filesystem_verified") is not True
@@ -2048,6 +2310,26 @@ class OCIStage1KVMProofReceipt:
                 != root_transition_negative_control_contract(name)
                 for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES
             )
+            or not isinstance(workload_negative_controls, Mapping)
+            or set(workload_negative_controls) != set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(workload_negative_controls.get(name), Mapping)
+                or set(workload_negative_controls[name])
+                != {
+                    "console_digest",
+                    "console_size_bytes",
+                    "contract",
+                    "pid1_alive_after_marker",
+                    "rejection_marker_count",
+                    "root_post_digest",
+                    "root_seed_digest",
+                    "root_transition_marker_count",
+                    "terminal_marker_count",
+                    "workload_started_marker_count",
+                }
+                or workload_negative_controls[name].get("contract") != workload_negative_control_contract(name)
+                for name in WORKLOAD_NEGATIVE_CONTROL_NAMES
+            )
             or not isinstance(qemu, Mapping)
             or set(qemu) != {"artifact_digest", "artifact_size_bytes", "version_digest", "version_text"}
             or not isinstance(stage1, Mapping)
@@ -2083,6 +2365,8 @@ class OCIStage1KVMProofReceipt:
             assembly_negative_root_post_digests,
             root_transition_negative_consoles,
             root_transition_negative_root_post_digests,
+            workload_negative_consoles,
+            workload_negative_root_post_digests,
         )
         if receipt.to_dict() != dict(value):
             raise ArtifactValidationError("KVM proof receipt is not canonical")
@@ -2098,6 +2382,7 @@ class OCIStage1KVMProofResult:
     filesystem_negative_consoles: Mapping[str, bytes]
     assembly_negative_consoles: Mapping[str, bytes]
     root_transition_negative_consoles: Mapping[str, bytes]
+    workload_negative_consoles: Mapping[str, bytes]
     evidence_directory: Path | None
 
 
@@ -2469,6 +2754,63 @@ def _verify_root_transition_negative_backings(
     return root_digest
 
 
+def _materialize_workload_negative_backings(
+    directory: Path,
+    contracts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Path]]:
+    filesystems = load_proof_filesystems()
+    result: dict[str, dict[str, Path]] = {}
+    for control_name in WORKLOAD_NEGATIVE_CONTROL_NAMES:
+        contract = verify_workload_negative_control_contract(control_name, contracts.get(control_name))
+        _control_plan, control_transport = _workload_negative_context(control_name)
+        payloads = {
+            "transport": control_transport.artifact,
+            "root": filesystems.root,
+            "lower0": filesystems.lowers[0],
+            "lower1": filesystems.lowers[1],
+        }
+        paths: dict[str, Path] = {}
+        for backing_name, backing in contract["backings"].items():
+            payload = payloads[backing_name]
+            if len(payload) != backing["size_bytes"] or _digest(payload) != backing["artifact_digest"]:
+                raise KVMProofFailure("KVM workload negative backing contract is invalid")
+            paths[backing_name] = _secure_write(
+                directory,
+                f"workload-negative-{control_name}-{backing_name}.raw",
+                payload,
+                mode=backing["mode"],
+            )
+        result[control_name] = paths
+    return result
+
+
+def _verify_workload_negative_backings(
+    control_name: str,
+    paths: Mapping[str, Path],
+    contract: Mapping[str, Any],
+    *,
+    after_boot: bool = False,
+) -> str:
+    verified = verify_workload_negative_control_contract(control_name, contract)
+    if set(paths) != set(verified["backings"]):
+        raise KVMProofFailure("KVM workload negative backing set changed")
+    root_digest = verified["backings"]["root"]["artifact_digest"]
+    for backing_name, backing in verified["backings"].items():
+        path = paths[backing_name]
+        if backing_name == "root" and after_boot:
+            opened = _read_pinned_regular_file(
+                path, maximum=MAX_KERNEL_BYTES, label="KVM workload control mutable root"
+            )
+            if stat.S_IMODE(path.stat().st_mode) != backing["mode"]:
+                raise KVMProofFailure("KVM workload control root mode changed")
+            root_digest = opened.digest
+        else:
+            _verify_file_digest(path, backing["artifact_digest"], backing["mode"])
+        if path.stat().st_size != backing["size_bytes"]:
+            raise KVMProofFailure("KVM workload negative backing size changed")
+    return root_digest
+
+
 def _verify_pinned_boot_files(
     *,
     qemu_path: Path,
@@ -2568,6 +2910,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         root_transition_negative_backings = _materialize_root_transition_negative_backings(
             root, root_transition_contracts
         )
+        workload_contracts = workload_negative_control_contracts()
+        workload_negative_backings = _materialize_workload_negative_backings(root, workload_contracts)
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
             qemu=qemu,
@@ -2598,6 +2942,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 ASSEMBLY_REJECTION_MARKER,
                 ROOT_TRANSITION_REJECTION_MARKER,
                 PREPARATION_FAILURE_MARKER,
+                *WORKLOAD_NEGATIVE_REJECTION_MARKERS.values(),
             ),
             timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
             require_alive_after_marker=True,
@@ -2624,6 +2969,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 ASSEMBLY_REJECTION_MARKER,
                 ROOT_TRANSITION_REJECTION_MARKER,
                 PREPARATION_FAILURE_MARKER,
+                *WORKLOAD_NEGATIVE_REJECTION_MARKERS.values(),
             ),
             timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
             require_alive_after_marker=True,
@@ -2816,6 +3162,54 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             root_transition_negative_root_post_digests[control_name] = _verify_root_transition_negative_backings(
                 control_name, backing_paths, contract, after_boot=True
             )
+        workload_negative_consoles: dict[str, bytes] = {}
+        workload_negative_root_post_digests: dict[str, str] = {}
+        for control_name in WORKLOAD_NEGATIVE_CONTROL_NAMES:
+            contract = workload_contracts[control_name]
+            backing_paths = workload_negative_backings[control_name]
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            _verify_workload_negative_backings(control_name, backing_paths, contract)
+            control_command = build_workload_negative_qemu_command(
+                qemu_path=qemu_path,
+                kernel_path=kernel_path,
+                initramfs_path=initramfs_path,
+                backing_paths=backing_paths,
+                cmdline=contract["cmdline"],
+                control=contract,
+            )
+            workload_negative_consoles[control_name] = _read_console_until(
+                control_command,
+                expected=WORKLOAD_NEGATIVE_REJECTION_MARKERS[control_name],
+                forbidden=(
+                    WORKLOAD_STARTED_MARKER,
+                    WORKLOAD_TERMINAL_MARKER,
+                    REJECTION_MARKER,
+                    FILESYSTEM_REJECTION_MARKER,
+                    ASSEMBLY_REJECTION_MARKER,
+                    ROOT_TRANSITION_REJECTION_MARKER,
+                    PREPARATION_FAILURE_MARKER,
+                ),
+                timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+                require_alive_after_marker=True,
+            )
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            workload_negative_root_post_digests[control_name] = _verify_workload_negative_backings(
+                control_name, backing_paths, contract, after_boot=True
+            )
 
     receipt = OCIStage1KVMProofReceipt(
         kernel.digest,
@@ -2842,6 +3236,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         assembly_negative_root_post_digests,
         root_transition_negative_consoles,
         root_transition_negative_root_post_digests,
+        workload_negative_consoles,
+        workload_negative_root_post_digests,
     )
     if evidence is not None:
         _secure_write(evidence, "console.bin", console, mode=0o400)
@@ -2874,6 +3270,13 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 root_transition_negative_consoles[control_name],
                 mode=0o400,
             )
+        for control_name in WORKLOAD_NEGATIVE_CONTROL_NAMES:
+            _secure_write(
+                evidence,
+                f"workload-negative-{control_name}.bin",
+                workload_negative_consoles[control_name],
+                mode=0o400,
+            )
         _secure_write(evidence, "receipt.json", receipt.canonical_bytes, mode=0o400)
     return OCIStage1KVMProofResult(
         receipt,
@@ -2883,5 +3286,6 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         filesystem_negative_consoles,
         assembly_negative_consoles,
         root_transition_negative_consoles,
+        workload_negative_consoles,
         evidence,
     )

@@ -29,14 +29,15 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import (
     OCI_STAGE1_DEVICE_POLICY,
     OCI_STAGE1_PLAN_SCHEMA,
+    OCI_STAGE1_PROCESS_POLICY,
     OCI_STAGE1_PROTOCOL,
     OCI_STAGE1_ROOT_LAYOUT,
     OCIStage1Plan,
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v7"
-OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-fail-closed"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v8"
+OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-pid1-supervisor"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64
@@ -459,6 +460,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         "handoff",
         "phase",
         "process",
+        "process_policy",
         "protocol",
         "run",
         "schema",
@@ -470,7 +472,8 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         value.get("schema") != OCI_STAGE1_PLAN_SCHEMA
         or value.get("protocol") != OCI_STAGE1_PROTOCOL
         or value.get("phase") != "stage1-contract"
-        or value.get("handoff") != "first-party-pid1-supervisor-required"
+        or value.get("handoff") != "first-party-pid1-supervisor.v1"
+        or value.get("process_policy") != OCI_STAGE1_PROCESS_POLICY
         or not isinstance(run, Mapping)
         or set(run) != {"name", "run_id"}
         or not isinstance(assembly, Mapping)

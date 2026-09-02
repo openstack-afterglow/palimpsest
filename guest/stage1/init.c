@@ -4,8 +4,8 @@
  * Freestanding Linux x86_64: no libc and no system headers.  This program
  * authenticates the stage-1 plan, mounts its filesystems, assembles an
  * OverlayFS root, moves that mount onto / with an initramfs-safe switch-root
- * choreography, and then waits fail-closed.  It deliberately performs no
- * pivot_root syscall, workload execution, or supervision.
+ * choreography, then executes and supervises the admitted OCI workload.  It
+ * deliberately performs no pivot_root syscall or production host lifecycle.
  */
 
 typedef unsigned char u8;
@@ -23,14 +23,26 @@ struct span { const char *p; usize n; };
 #define SYS_fstat 5
 #define SYS_pread64 17
 #define SYS_ioctl 16
+#define SYS_poll 7
+#define SYS_rt_sigprocmask 14
 #define SYS_pause 34
 #define SYS_getpid 39
+#define SYS_fork 57
+#define SYS_execve 59
 #define SYS_exit 60
+#define SYS_wait4 61
+#define SYS_kill 62
 #define SYS_chdir 80
 #define SYS_mkdir 83
 #define SYS_readlink 89
+#define SYS_setuid 105
+#define SYS_setgid 106
+#define SYS_setpgid 109
+#define SYS_setgroups 116
 #define SYS_mount 165
 #define SYS_chroot 161
+#define SYS_signalfd4 289
+#define SYS_pipe2 293
 #define SYS_syncfs 306
 #define SYS_statfs 137
 #define SYS_fstatfs 138
@@ -41,6 +53,13 @@ struct span { const char *p; usize n; };
 #define O_CLOEXEC 02000000
 #define O_NOFOLLOW 0400000
 #define O_DIRECTORY 0200000
+#define POLLIN 1
+#define SIG_BLOCK 0
+#define SIG_SETMASK 2
+#define SIGKILL 9
+#define SIGCHLD 17
+#define SIGSTOP 19
+#define WNOHANG 1
 #define S_IFMT 0170000
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
@@ -54,6 +73,10 @@ struct span { const char *p; usize n; };
 #define MS_MOVE 8192
 #define EEXIST 17
 #define EBUSY 16
+#define EIO 5
+#define EINTR 4
+#define ECHILD 10
+#define EINVAL 22
 #define BLKROGET 0x125e
 #define BLKGETSIZE64 0x80081272
 
@@ -80,6 +103,13 @@ struct span { const char *p; usize n; };
 #define EXIT_FILESYSTEM 69
 #define EXIT_ASSEMBLY 70
 #define EXIT_ROOT_TRANSITION 71
+#define EXIT_WORKLOAD 72
+
+#define WORKLOAD_STARTED_MARKER "palimpsest guest stage1: workload started; root is slash; supervisor active\n"
+#define ROOT_TRANSITION_MARKER "palimpsest guest stage1: root transition complete; root is slash; workload pending\n"
+#define WORKLOAD_TERMINAL_PREFIX "palimpsest guest stage1: workload terminal; main_status="
+#define WORKLOAD_REJECTED_PREFIX "palimpsest guest stage1: workload launch rejected; stage="
+#define WORKLOAD_STATUS_NONE 4294967295U
 
 struct timespec_local {
     i64 sec;
@@ -117,6 +147,29 @@ struct statfs_local {
     i64 fragment_size;
     i64 flags;
     i64 spare[4];
+};
+
+struct pollfd_local {
+    int fd;
+    short events;
+    short revents;
+};
+
+struct signalfd_siginfo_local {
+    u32 signo;
+    u8 rest[124];
+};
+
+struct child_error_local {
+    u32 stage;
+    u32 error;
+};
+
+struct supervisor_result {
+    u32 main_status;
+    u32 last_nonmain_status;
+    u32 reaped;
+    u32 forwarded;
 };
 
 static inline i64 sc0(i64 n) {
@@ -204,6 +257,39 @@ static void write_all(int fd, const char *s) {
         s += n;
         left -= (usize)n;
     }
+}
+
+static void write_u32(int fd, u32 value) {
+    char digits[10];
+    usize used = 0;
+    do {
+        digits[used++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value && used < sizeof(digits));
+    while (used) {
+        char byte[2] = {digits[--used], 0};
+        write_all(fd, byte);
+    }
+}
+
+static void workload_rejected(u32 stage, u32 error) {
+    write_all(2, WORKLOAD_REJECTED_PREFIX);
+    write_u32(2, stage);
+    write_all(2, "; errno=");
+    write_u32(2, error);
+    write_all(2, "; started and terminal disabled; waiting fail-closed\n");
+}
+
+static void workload_terminal(const struct supervisor_result *result) {
+    write_all(1, WORKLOAD_TERMINAL_PREFIX);
+    write_u32(1, result->main_status);
+    write_all(1, "; descendant_status=");
+    write_u32(1, result->last_nonmain_status);
+    write_all(1, "; reaped=");
+    write_u32(1, result->reaped);
+    write_all(1, "; forwarded=");
+    write_u32(1, result->forwarded);
+    write_all(1, "; waiting fail-closed\n");
 }
 
 static __attribute__((noreturn)) void exit_now(int code) {
@@ -526,6 +612,19 @@ struct parser {
     u32 env_count;
 };
 
+struct guest_process {
+    char *argv[ARG_MAX_LOCAL + 1];
+    char *envp[ENV_MAX_LOCAL + 1];
+    char *cwd;
+    u32 argc;
+    u32 envc;
+    u32 uid;
+    u32 gid;
+    u32 stop_signal;
+    usize used;
+    char arena[PROCESS_MAX_LOCAL + 1];
+};
+
 struct expected_device {
     char serial[21];
     u64 size;
@@ -704,25 +803,6 @@ static int valid_run_name(struct span s) {
     return 1;
 }
 
-static int valid_account(struct span s) {
-    usize i = 0;
-    if (!s.n || s.n > 32) return 0;
-    while (i < s.n && s.p[i] >= '0' && s.p[i] <= '9') i++;
-    if (i == s.n) {
-        u64 value = 0;
-        usize j;
-        if (s.n > 1 && s.p[0] == '0') return 0;
-        if (s.n > 10) return 0;
-        for (j = 0; j < s.n; j++) value = value * 10 + (u64)(s.p[j] - '0');
-        return value <= 4294967294ULL;
-    }
-    if (!((s.p[0] >= 'A' && s.p[0] <= 'Z') || (s.p[0] >= 'a' && s.p[0] <= 'z') || s.p[0] == '_')) return 0;
-    for (i = 1; i < s.n; i++) if (!((s.p[i] >= 'A' && s.p[i] <= 'Z') ||
-        (s.p[i] >= 'a' && s.p[i] <= 'z') || (s.p[i] >= '0' && s.p[i] <= '9') ||
-        s.p[i] == '_' || s.p[i] == '.' || s.p[i] == '-')) return 0;
-    return 1;
-}
-
 static int valid_env_name(struct span s) {
     usize i;
     if (!s.n || !((s.p[0] >= 'A' && s.p[0] <= 'Z') || (s.p[0] >= 'a' && s.p[0] <= 'z') || s.p[0] == '_')) return 0;
@@ -743,16 +823,79 @@ static int valid_cwd(struct span s) {
     return 1;
 }
 
-static int parse_process(struct parser *j) {
+static int decode_process_string(struct guest_process *process, struct span raw, char **result) {
+    usize i = 0, start = process->used;
+    if (start > PROCESS_MAX_LOCAL) return 0;
+    while (i < raw.n) {
+        u8 value = (u8)raw.p[i++];
+        if (value == '\\') {
+            u8 escaped;
+            if (i >= raw.n) return 0;
+            escaped = (u8)raw.p[i++];
+            if (escaped == '"' || escaped == '\\') value = escaped;
+            else if (escaped == 'b') value = 8;
+            else if (escaped == 'f') value = 12;
+            else if (escaped == 'n') value = 10;
+            else if (escaped == 'r') value = 13;
+            else if (escaped == 't') value = 9;
+            else if (escaped == 'u') {
+                if (raw.n - i < 4 || raw.p[i] != '0' || raw.p[i + 1] != '0' ||
+                    !is_hex(raw.p[i + 2]) || !is_hex(raw.p[i + 3])) return 0;
+                value = (u8)((raw.p[i + 2] <= '9' ? raw.p[i + 2] - '0' : raw.p[i + 2] - 'a' + 10) * 16 +
+                             (raw.p[i + 3] <= '9' ? raw.p[i + 3] - '0' : raw.p[i + 3] - 'a' + 10));
+                i += 4;
+            } else return 0;
+        }
+        if (!value || process->used >= PROCESS_MAX_LOCAL) return 0;
+        process->arena[process->used++] = (char)value;
+    }
+    if (process->used >= sizeof(process->arena)) return 0;
+    process->arena[process->used++] = 0;
+    *result = process->arena + start;
+    return 1;
+}
+
+static int numeric_account(struct span s, u32 *result) {
+    u64 value = 0;
+    usize i;
+    if (!s.n || s.n > 10 || (s.n > 1 && s.p[0] == '0')) return 0;
+    for (i = 0; i < s.n; i++) {
+        if (s.p[i] < '0' || s.p[i] > '9') return 0;
+        if (value > (4294967294ULL - (u64)(s.p[i] - '0')) / 10ULL) return 0;
+        value = value * 10 + (u64)(s.p[i] - '0');
+    }
+    *result = (u32)value;
+    return 1;
+}
+
+static int append_environment(struct guest_process *process, struct span name, struct span value, char **result) {
+    usize i, start = process->used;
+    char *decoded;
+    for (i = 0; i < name.n; i++) {
+        if (process->used >= PROCESS_MAX_LOCAL) return 0;
+        process->arena[process->used++] = name.p[i];
+    }
+    if (process->used >= PROCESS_MAX_LOCAL) return 0;
+    process->arena[process->used++] = '=';
+    if (!decode_process_string(process, value, &decoded)) return 0;
+    (void)decoded;
+    *result = process->arena + start;
+    return 1;
+}
+
+static int parse_process(struct parser *j, struct guest_process *process) {
     u32 argc = 0, i;
     u64 number;
     struct span s;
     usize decoded;
+    memset(process, 0, sizeof(*process));
     if (!take_char(j, '{') || !key(j, "argv") || !take_char(j, '[')) return 0;
     if (!take_char(j, ']')) {
         for (;;) {
             if (argc >= ARG_MAX_LOCAL || !json_string(j, &s, &decoded, 0) || decoded > STRING_MAX_LOCAL) return 0;
             if (argc == 0 && decoded == 0) return 0;
+            if (!decode_process_string(process, s, &process->argv[argc])) return 0;
+            if (argc == 0 && process->argv[0][0] != '/') return 0;
             j->process_bytes += decoded + 1;
             argc++;
             if (take_char(j, ']')) break;
@@ -761,6 +904,7 @@ static int parse_process(struct parser *j) {
     }
     if (!argc || !take_char(j, ',') || !key(j, "cwd") || !json_string(j, &s, &decoded, 0) ||
         decoded > STRING_MAX_LOCAL || !valid_cwd(s)) return 0;
+    if (!decode_process_string(process, s, &process->cwd)) return 0;
     j->process_bytes += decoded;
     if (!take_char(j, ',') || !key(j, "environment") || !take_char(j, '[')) return 0;
     if (!take_char(j, ']')) {
@@ -774,6 +918,8 @@ static int parse_process(struct parser *j) {
             for (i = 0; i < j->env_count; i++)
                 if (j->env_names[i].n == name.n && bytes_equal(j->env_names[i].p, name.p, name.n)) return 0;
             j->env_names[j->env_count++] = name;
+            if (!append_environment(process, name, value, &process->envp[process->envc])) return 0;
+            process->envc++;
             j->process_bytes += decoded + value_decoded + 2;
             if (take_char(j, ']')) break;
             if (!take_char(j, ',')) return 0;
@@ -781,20 +927,21 @@ static int parse_process(struct parser *j) {
     }
     if (!take_char(j, ',') || !key(j, "stop_signal") || !uint_value(j, &number) || number < 1 || number > 64 ||
         !take_char(j, ',') || !key(j, "user") || !take_char(j, '{') || !key(j, "group")) return 0;
-    if (j->end - j->p >= 4 && bytes_equal(j->p, "null", 4)) {
-        j->p += 4;
-        j->process_bytes += 27;
-    } else {
-        if (!plain_string(j, &s, &decoded) || !valid_account(s)) return 0;
-        j->process_bytes += decoded + 25;
-    }
-    if (!take_char(j, ',') || !key(j, "user") || !plain_string(j, &s, &decoded) || !valid_account(s) ||
+    process->stop_signal = (u32)number;
+    if (!plain_string(j, &s, &decoded) || !numeric_account(s, &process->gid)) return 0;
+    j->process_bytes += decoded + 25;
+    if (!take_char(j, ',') || !key(j, "user") || !plain_string(j, &s, &decoded) ||
+        !numeric_account(s, &process->uid) ||
         !take_char(j, '}') || !take_char(j, '}')) return 0;
     j->process_bytes += decoded;
-    return j->process_bytes <= PROCESS_MAX_LOCAL;
+    process->argc = argc;
+    process->argv[argc] = 0;
+    process->envp[process->envc] = 0;
+    return j->process_bytes <= PROCESS_MAX_LOCAL && process->used <= PROCESS_MAX_LOCAL + 1;
 }
 
-static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices) {
+static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices,
+                      struct guest_process *process) {
     struct parser j;
     u32 layer_count = 0, i;
     u64 verification_bytes = 0;
@@ -894,14 +1041,15 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v1") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
-        !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
-        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v6") ||
+        !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
+        !key(&j, "process_policy") || !exact_string(&j, "absolute-argv0-numeric-explicit-user-group.v1") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v7") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v6") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v7") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     devices->lower_count = layer_count;
     return 1;
@@ -911,6 +1059,7 @@ static u8 artifact[ARTIFACT_MAX];
 static char cmdline[CMDLINE_MAX + 1];
 static u8 attribute[128];
 static u8 filesystem_io[FILESYSTEM_IO_BYTES];
+static struct guest_process workload;
 
 static u32 little16(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8); }
 static u32 little32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
@@ -1367,7 +1516,7 @@ static int exact_vd_disk_count(u32 expected) {
 }
 
 static int verify_transport(const struct discovered *device, const struct bindings *b,
-                            struct expected_device_set *devices, int *kept_fd) {
+                            struct expected_device_set *devices, struct guest_process *process, int *kept_fd) {
     struct stat_local st;
     i64 fd = open_read(device->path, 1), n;
     u64 payload_size, total, offset = 0;
@@ -1439,7 +1588,7 @@ static int verify_transport(const struct discovered *device, const struct bindin
     for (offset = 64 + payload_size; offset < total; offset++) if (artifact[offset]) {
         sc1(SYS_close, fd); return EXIT_TRANSPORT;
     }
-    if (!parse_plan(artifact + 64, payload_size, b, devices)) { sc1(SYS_close, fd); return EXIT_PLAN; }
+    if (!parse_plan(artifact + 64, payload_size, b, devices, process)) { sc1(SYS_close, fd); return EXIT_PLAN; }
     if (device->fixture) sc1(SYS_close, fd); else *kept_fd = (int)fd;
     return 0;
 }
@@ -1898,6 +2047,174 @@ rejected:
     return 0;
 }
 
+static u64 supervised_signal_mask(void) {
+    return ((u64)1 << (1 - 1)) | ((u64)1 << (2 - 1)) | ((u64)1 << (3 - 1)) |
+           ((u64)1 << (10 - 1)) | ((u64)1 << (12 - 1)) | ((u64)1 << (15 - 1)) |
+           ((u64)1 << (SIGCHLD - 1));
+}
+
+static u32 workload_status(int status) {
+    u32 signal_number = (u32)status & 0x7f;
+    return signal_number ? 128 + signal_number : ((u32)status >> 8) & 0xff;
+}
+
+static void set_workload_failure(struct child_error_local *failure, u32 stage, i64 error) {
+    failure->stage = stage;
+    failure->error = error < 0 ? (u32)(-error) : (u32)error;
+}
+
+static void record_reaped_child(struct supervisor_result *result, i64 reaped, i64 main_pid, int status) {
+    result->reaped++;
+    if (reaped != main_pid) result->last_nonmain_status = workload_status(status);
+}
+
+static __attribute__((noreturn)) void child_fail(int fd, u32 stage, i64 error) {
+    struct child_error_local failure;
+    set_workload_failure(&failure, stage, error);
+    sc3(SYS_write, fd, (i64)&failure, sizeof(failure));
+    exit_now(127);
+}
+
+static void terminate_and_reap(i64 main_pid, int signal_fd, struct supervisor_result *result) {
+    int status;
+    u32 grace_polls = 0;
+    struct pollfd_local pollfd;
+    struct signalfd_siginfo_local info;
+    /* Allow children already handling the forwarded signal to report their
+     * own terminal status before enforcing the bounded teardown policy. */
+    pollfd.fd = signal_fd;
+    pollfd.events = POLLIN;
+    while (grace_polls++ < 16) {
+        i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
+        if (reaped > 0) { record_reaped_child(result, reaped, main_pid, status); continue; }
+        if (reaped == -ECHILD) return;
+        if (reaped < 0 && reaped != -EINTR) break;
+        pollfd.revents = 0;
+        if (sc3(SYS_poll, (i64)&pollfd, 1, 250) <= 0) break;
+        if (pollfd.revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
+        else break;
+    }
+    sc2(SYS_kill, -main_pid, SIGKILL);
+    sc2(SYS_kill, -1, SIGKILL);
+    for (;;) {
+        i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
+        if (reaped > 0) { record_reaped_child(result, reaped, main_pid, status); continue; }
+        if (reaped == -ECHILD) return;
+        if (reaped < 0 && reaped != -EINTR) return;
+        pollfd.revents = 0;
+        if (sc3(SYS_poll, (i64)&pollfd, 1, -1) < 0) continue;
+        if (pollfd.revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
+        sc2(SYS_kill, -main_pid, SIGKILL);
+        sc2(SYS_kill, -1, SIGKILL);
+    }
+}
+
+static int supervise_workload(struct guest_process *process, struct child_error_local *failure,
+                              struct supervisor_result *result) {
+    u64 mask = supervised_signal_mask(), empty_mask = 0;
+    int error_pipe[2], status = 0, main_done = 0;
+    i64 signal_fd, main_pid, n;
+    struct pollfd_local pollfd;
+    struct signalfd_siginfo_local info;
+    usize error_bytes = 0;
+    i64 error_read = 0;
+    memset(failure, 0, sizeof(*failure));
+    memset(result, 0, sizeof(*result));
+    result->last_nonmain_status = WORKLOAD_STATUS_NONE;
+    if (!process || !process->argc || !process->argv[0] || process->argv[0][0] != '/' || !process->cwd) {
+        set_workload_failure(failure, 8, EINVAL);
+        return 0;
+    }
+    n = sc4(SYS_rt_sigprocmask, SIG_BLOCK, (i64)&mask, 0, 8);
+    if (n != 0) {
+        set_workload_failure(failure, 8, n);
+        return 0;
+    }
+    signal_fd = sc4(SYS_signalfd4, -1, (i64)&mask, 8, O_CLOEXEC);
+    if (signal_fd < 0) {
+        set_workload_failure(failure, 9, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
+    n = sc2(SYS_pipe2, (i64)error_pipe, O_CLOEXEC);
+    if (n != 0) {
+        set_workload_failure(failure, 10, n);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
+    main_pid = sc0(SYS_fork);
+    if (main_pid == 0) {
+        i64 operation;
+        sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, signal_fd);
+        operation = sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        if (operation != 0) child_fail(error_pipe[1], 1, operation);
+        operation = sc2(SYS_setpgid, 0, 0);
+        if (operation != 0) child_fail(error_pipe[1], 2, operation);
+        operation = sc2(SYS_setgroups, 0, 0);
+        if (operation != 0) child_fail(error_pipe[1], 3, operation);
+        operation = sc1(SYS_setgid, process->gid);
+        if (operation != 0) child_fail(error_pipe[1], 4, operation);
+        operation = sc1(SYS_setuid, process->uid);
+        if (operation != 0) child_fail(error_pipe[1], 5, operation);
+        operation = sc1(SYS_chdir, (i64)process->cwd);
+        if (operation != 0) child_fail(error_pipe[1], 6, operation);
+        operation = sc3(SYS_execve, (i64)process->argv[0], (i64)process->argv, (i64)process->envp);
+        child_fail(error_pipe[1], 7, operation);
+    }
+    sc1(SYS_close, error_pipe[1]);
+    if (main_pid < 0) {
+        set_workload_failure(failure, 11, main_pid);
+        sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
+    sc2(SYS_setpgid, main_pid, main_pid);
+    while (error_bytes < sizeof(*failure)) {
+        n = sc3(SYS_read, error_pipe[0], (i64)((u8 *)failure + error_bytes), sizeof(*failure) - error_bytes);
+        if (n <= 0) { error_read = n; break; }
+        error_bytes += (usize)n;
+    }
+    sc1(SYS_close, error_pipe[0]);
+    if (error_bytes != 0 || error_read < 0) {
+        terminate_and_reap(main_pid, (int)signal_fd, result);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        if (error_bytes != sizeof(*failure))
+            set_workload_failure(failure, 12, error_read < 0 ? error_read : EIO);
+        return 0;
+    }
+    write_all(1, WORKLOAD_STARTED_MARKER);
+    pollfd.fd = (int)signal_fd;
+    pollfd.events = POLLIN;
+    while (!main_done) {
+        for (;;) {
+            i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
+            if (reaped > 0) record_reaped_child(result, reaped, main_pid, status);
+            if (reaped == main_pid) { main_done = 1; result->main_status = workload_status(status); }
+            if (reaped <= 0) break;
+        }
+        if (main_done) break;
+        pollfd.revents = 0;
+        n = sc3(SYS_poll, (i64)&pollfd, 1, -1);
+        if (n < 0) continue;
+        if (!(pollfd.revents & POLLIN)) continue;
+        n = sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
+        if (n != sizeof(info) || info.signo == SIGCHLD || info.signo < 1 || info.signo > 64) continue;
+        {
+            u32 forwarded = info.signo == 15 ? process->stop_signal : info.signo;
+            sc2(SYS_kill, -main_pid, forwarded);
+            result->forwarded = forwarded;
+        }
+    }
+    terminate_and_reap(main_pid, (int)signal_fd, result);
+    sc1(SYS_close, signal_fd);
+    sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+    return 1;
+}
+
 static int run_consumer(const char *fixture_root, int fixture_mode) {
     struct bindings b;
     struct discovered device;
@@ -1921,7 +2238,7 @@ static int run_consumer(const char *fixture_root, int fixture_mode) {
     if (n <= 0 || !parse_cmdline(cmdline, (usize)n, &b)) return EXIT_CMDLINE;
     if (!discover(fixture_root, fixture, &b, &device)) return EXIT_DISCOVERY;
     {
-        int code = verify_transport(&device, &b, &expected, &transport_fd);
+        int code = verify_transport(&device, &b, &expected, &workload, &transport_fd);
         if (code) return code;
         if (fixture_mode == 1) return 0;
         if (fixture_mode == 2) return verify_fixture_filesystems(fixture_root, &expected) ? 0 : EXIT_FILESYSTEM;
@@ -1970,6 +2287,8 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     i64 pid = sc0(SYS_getpid);
     int fixture_mode = 0;
     int code;
+    struct child_error_local workload_failure;
+    struct supervisor_result workload_result;
     if (argc == 3 && pid != 1) {
         if (text_equal(argv[1], "--fixture-v1")) fixture_mode = 1;
         else if (text_equal(argv[1], "--fixture-v2")) fixture_mode = 2;
@@ -1987,7 +2306,13 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     if (code == EXIT_ASSEMBLY) wait_closed("palimpsest guest stage1: mount or staging assembly rejected; root is not slash; pivot and workload disabled; waiting fail-closed\n");
     if (code == EXIT_ROOT_TRANSITION) wait_closed("palimpsest guest stage1: root transition rejected; root state is indeterminate; workload disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
-    wait_closed("palimpsest guest stage1: root transition complete; root is slash; workload disabled; waiting fail-closed\n");
+    write_all(1, ROOT_TRANSITION_MARKER);
+    if (!supervise_workload(&workload, &workload_failure, &workload_result)) {
+        workload_rejected(workload_failure.stage, workload_failure.error);
+        for (;;) sc0(SYS_pause);
+    }
+    workload_terminal(&workload_result);
+    for (;;) sc0(SYS_pause);
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {
