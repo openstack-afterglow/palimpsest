@@ -2,9 +2,9 @@
  * Palimpsest OCI guest stage-1 transport consumer.
  *
  * Freestanding Linux x86_64: no libc and no system headers.  This program
- * authenticates the stage-1 plan and then waits fail-closed.  It deliberately
- * performs no root/lower mount, OverlayFS assembly, pivot_root, or workload
- * execution.
+ * authenticates the stage-1 plan, mounts its filesystems, assembles a staging
+ * OverlayFS root, and then waits fail-closed.  It deliberately performs no
+ * pivot_root, chroot, workload execution, or supervision.
  */
 
 typedef unsigned char u8;
@@ -29,6 +29,7 @@ struct span { const char *p; usize n; };
 #define SYS_readlink 89
 #define SYS_mount 165
 #define SYS_statfs 137
+#define SYS_fstatfs 138
 #define SYS_getdents64 217
 
 #define O_RDONLY 0
@@ -39,9 +40,13 @@ struct span { const char *p; usize n; };
 #define S_IFMT 0170000
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
+#define S_IFDIR 0040000
+#define MS_RDONLY 1
 #define MS_NOSUID 2
 #define MS_NODEV 4
 #define MS_NOEXEC 8
+#define MS_REC 16384
+#define MS_PRIVATE 262144
 #define EEXIST 17
 #define EBUSY 16
 #define BLKROGET 0x125e
@@ -66,6 +71,7 @@ struct span { const char *p; usize n; };
 #define EXIT_TRANSPORT 67
 #define EXIT_PLAN 68
 #define EXIT_FILESYSTEM 69
+#define EXIT_ASSEMBLY 70
 
 struct timespec_local {
     i64 sec;
@@ -825,8 +831,9 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
     devices->root.size = number;
     if (!take_char(&j, ',') ||
         !key(&j, "volume_id") || !plain_string(&j, &s, 0) || !valid_uuid_span(s) ||
-        !derived_serial_matches("root", s, root_serial) ||
-        !take_char(&j, '}') || !take_char(&j, '}')) return 0;
+        !derived_serial_matches("root", s, root_serial) || !take_char(&j, '}') ||
+        !take_char(&j, ',') || !key(&j, "root_layout") ||
+        !exact_string(&j, "overlay-upper-work.v1") || !take_char(&j, '}')) return 0;
     root_label(s, devices->root.label);
     for (i = 0; i < layer_count; i++) if (!text_equal(layer_serials[i], b->lowers[i])) return 0;
     if (!take_char(&j, ',') || !key(&j, "boot_plan_digest") || !plain_string(&j, &s, 0) ||
@@ -836,11 +843,11 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
-        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v4") ||
+        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v5") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v4") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v5") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     devices->lower_count = layer_count;
     return 1;
@@ -1402,6 +1409,260 @@ static int prepare_live(void) {
            mount_ok("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, 0x01021994);
 }
 
+#define MOUNTINFO_MAX (64 * 1024)
+#define EXT4_MAGIC 0xef53
+#define SQUASHFS_MAGIC 0x73717368
+#define OVERLAYFS_MAGIC 0x794c7630
+
+static u8 mountinfo[MOUNTINFO_MAX + 1];
+
+static int append_u32(char *out, usize *used, u32 value) {
+    char digits[10];
+    usize count = 0, i;
+    do { digits[count++] = (char)('0' + value % 10); value /= 10; } while (value);
+    if (*used + count + 1 > PATH_MAX_LOCAL) return 0;
+    for (i = 0; i < count; i++) out[(*used)++] = digits[count - 1 - i];
+    out[*used] = 0;
+    return 1;
+}
+
+static int safe_dir(const char *path, int create, int require_empty, int expected_mode, int *kept_fd) {
+    struct stat_local st;
+    i64 fd, r;
+    if (create) {
+        r = sc2(SYS_mkdir, (i64)path, expected_mode ? expected_mode : 0755);
+        if (r != 0 && r != -EEXIST) return 0;
+    }
+    fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFDIR ||
+        (expected_mode && (st.uid != 0 || st.gid != 0 || (st.mode & 0777) != (u32)expected_mode))) {
+        if (fd >= 0) sc1(SYS_close, fd);
+        return 0;
+    }
+    if (require_empty) {
+        u8 entries[1024];
+        for (;;) {
+            i64 n = sc3(SYS_getdents64, fd, (i64)entries, sizeof(entries));
+            usize offset = 0;
+            if (n < 0) { sc1(SYS_close, fd); return 0; }
+            if (!n) break;
+            while (offset < (usize)n) {
+                const u8 *entry = entries + offset;
+                usize name_bytes, i;
+                u32 reclen;
+                if ((usize)n - offset < 20) { sc1(SYS_close, fd); return 0; }
+                reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+                if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, fd); return 0; }
+                name_bytes = reclen - 19;
+                for (i = 0; i < name_bytes && entry[19 + i]; i++) {}
+                if (i == name_bytes || !((i == 1 && entry[19] == '.') ||
+                    (i == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                    sc1(SYS_close, fd); return 0;
+                }
+                offset += reclen;
+            }
+        }
+    }
+    *kept_fd = (int)fd;
+    return 1;
+}
+
+static int stable_dir(const char *path, int fd, i64 magic) {
+    struct stat_local before, after;
+    struct statfs_local fs;
+    i64 check;
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&before) < 0 || (before.mode & S_IFMT) != S_IFDIR ||
+        sc2(SYS_fstatfs, fd, (i64)&fs) < 0 || fs.type != magic) return 0;
+    check = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (check < 0 || sc2(SYS_fstat, check, (i64)&after) < 0 ||
+        before.dev != after.dev || before.ino != after.ino || before.mode != after.mode) {
+        if (check >= 0) sc1(SYS_close, check);
+        return 0;
+    }
+    sc1(SYS_close, check);
+    return 1;
+}
+
+static int proc_fd_path(char out[PATH_MAX_LOCAL], int fd) {
+    usize used = 0;
+    out[0] = 0;
+    return fd >= 0 && append_text(out, &used, "/proc/self/fd/") && append_u32(out, &used, (u32)fd);
+}
+
+static int proc_fd_binds_role(const char *path, const struct opened_role *role) {
+    struct stat_local opened, original;
+    i64 fd = open_read(path, 0);
+    int valid;
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&opened) < 0 ||
+        sc2(SYS_fstat, role->fd, (i64)&original) < 0) {
+        if (fd >= 0) sc1(SYS_close, fd);
+        return 0;
+    }
+    valid = (opened.mode & S_IFMT) == S_IFBLK && opened.dev == original.dev &&
+            opened.ino == original.ino && opened.rdev == original.rdev;
+    sc1(SYS_close, fd);
+    return valid;
+}
+
+static int mount_open_role(const struct opened_role *role, const char *target, const char *type,
+                           u64 flags, i64 magic, int *mount_fd) {
+    char source[PATH_MAX_LOCAL];
+    int covered = -1;
+    if (!safe_dir(target, 1, 1, 0, &covered) || !proc_fd_path(source, role->fd) ||
+        !proc_fd_binds_role(source, role) ||
+        !recheck_open_role(role)) {
+        if (covered >= 0) sc1(SYS_close, covered);
+        return 0;
+    }
+    if (sc5(SYS_mount, (i64)source, (i64)target, (i64)type, flags, 0) != 0) {
+        sc1(SYS_close, covered);
+        return 0;
+    }
+    sc1(SYS_close, covered);
+    if (!recheck_open_role(role) || !proc_fd_binds_role(source, role) ||
+        !safe_dir(target, 0, 0, 0, mount_fd) ||
+        !stable_dir(target, *mount_fd, magic)) {
+        if (*mount_fd >= 0) sc1(SYS_close, *mount_fd);
+        *mount_fd = -1;
+        return 0;
+    }
+    return 1;
+}
+
+static int span_equal(struct span s, const char *text) {
+    usize n = slen(text);
+    return s.n == n && bytes_equal(s.p, text, n);
+}
+
+static int comma_option(struct span options, const char *wanted) {
+    usize start = 0, n = slen(wanted);
+    while (start < options.n) {
+        usize end = start;
+        while (end < options.n && options.p[end] != ',') end++;
+        if (end - start == n && bytes_equal(options.p + start, wanted, n)) return 1;
+        start = end + 1;
+    }
+    return 0;
+}
+
+static int verify_mountinfo(const char *mountpoint, const char *filesystem, int read_only,
+                            int bind_device, u32 major, u32 minor, const char *overlay_data) {
+    i64 bytes = read_bounded_file("/proc/self/mountinfo", mountinfo, MOUNTINFO_MAX, 1, 0);
+    usize pos = 0;
+    u32 matches = 0;
+    if (bytes <= 0) return 0;
+    while (pos < (usize)bytes) {
+        struct span fields[64];
+        usize end = pos, count = 0, cursor, dash = 64;
+        while (end < (usize)bytes && mountinfo[end] != '\n') end++;
+        if (end == (usize)bytes) return 0;
+        cursor = pos;
+        while (cursor < end) {
+            usize start;
+            while (cursor < end && mountinfo[cursor] == ' ') cursor++;
+            if (cursor == end) break;
+            start = cursor;
+            while (cursor < end && mountinfo[cursor] != ' ') cursor++;
+            if (count >= 64) return 0;
+            fields[count++] = (struct span){(const char *)mountinfo + start, cursor - start};
+        }
+        if (count < 10) return 0;
+        if (span_equal(fields[4], mountpoint)) {
+            usize i, colon = 0;
+            u32 found_major, found_minor;
+            matches++;
+            while (colon < fields[2].n && fields[2].p[colon] != ':') colon++;
+            if (colon == fields[2].n || !parse_u32_decimal((const u8 *)fields[2].p, colon, &found_major) ||
+                !parse_u32_decimal((const u8 *)fields[2].p + colon + 1, fields[2].n - colon - 1, &found_minor) ||
+                (bind_device && (found_major != major || found_minor != minor)) ||
+                !comma_option(fields[5], read_only ? "ro" : "rw") ||
+                comma_option(fields[5], read_only ? "rw" : "ro") ||
+                !comma_option(fields[5], "nodev") || !comma_option(fields[5], "nosuid")) return 0;
+            for (i = 6; i < count; i++) if (span_equal(fields[i], "-")) { dash = i; break; }
+            if (dash == 64 || dash + 3 >= count || !span_equal(fields[dash + 1], filesystem)) return 0;
+            if (overlay_data) {
+                struct span super = fields[dash + 3];
+                usize wanted = slen(overlay_data), at;
+                int found = 0;
+                for (at = 0; at + wanted <= super.n; at++)
+                    if ((at == 0 || super.p[at - 1] == ',') && bytes_equal(super.p + at, overlay_data, wanted) &&
+                        (at + wanted == super.n || super.p[at + wanted] == ',')) { found = 1; break; }
+                if (!found) return 0;
+            }
+        }
+        pos = end + 1;
+    }
+    return matches == 1;
+}
+
+static int lower_path(char out[PATH_MAX_LOCAL], u32 ordinal) {
+    usize used = 0;
+    out[0] = 0;
+    return ordinal < LOWER_MAX && append_text(out, &used, "/run/palimpsest/lowers/") &&
+           append_u32(out, &used, ordinal);
+}
+
+static int build_overlay_data(char out[PATH_MAX_LOCAL], u32 lower_count) {
+    usize used = 0;
+    u32 i;
+    out[0] = 0;
+    if (!lower_count || !append_text(out, &used, "lowerdir=")) return 0;
+    for (i = lower_count; i > 0; i--) {
+        char path[PATH_MAX_LOCAL];
+        if (i != lower_count && !append_text(out, &used, ":")) return 0;
+        if (!lower_path(path, i - 1) || !append_text(out, &used, path)) return 0;
+    }
+    return append_text(out, &used, ",upperdir=/run/palimpsest/root/.palimpsest/upper") &&
+           append_text(out, &used, ",workdir=/run/palimpsest/root/.palimpsest/work");
+}
+
+static int assemble_staging_root(const struct expected_device_set *expected, struct opened_role *roles,
+                                 const struct opened_role *transport) {
+    static const char *base_dirs[] = {"/run", "/run/palimpsest", "/run/palimpsest/root",
+                                      "/run/palimpsest/lowers", "/run/palimpsest/merged"};
+    int base_fds[5] = {-1, -1, -1, -1, -1};
+    int root_fd = -1, lower_fds[LOWER_MAX], state_fd = -1, upper_fd = -1, work_fd = -1, merged_fd = -1;
+    char path[PATH_MAX_LOCAL], overlay_data[PATH_MAX_LOCAL];
+    u32 i;
+    for (i = 0; i < LOWER_MAX; i++) lower_fds[i] = -1;
+    if (sc5(SYS_mount, 0, (i64)"/", 0, MS_REC | MS_PRIVATE, 0) != 0) return 0;
+    for (i = 0; i < 5; i++) if (!safe_dir(base_dirs[i], 1, i >= 2, 0, &base_fds[i])) return 0;
+    for (i = 0; i < 5; i++) sc1(SYS_close, base_fds[i]);
+    if (!mount_open_role(&roles[0], "/run/palimpsest/root", "ext4", MS_NODEV | MS_NOSUID,
+                         EXT4_MAGIC, &root_fd) ||
+        !verify_mountinfo("/run/palimpsest/root", "ext4", 0, 1,
+                          roles[0].device.major, roles[0].device.minor, 0)) return 0;
+    if (!safe_dir("/run/palimpsest/root/.palimpsest", 1, 0, 0700, &state_fd) ||
+        !safe_dir("/run/palimpsest/root/.palimpsest/upper", 1, 0, 0755, &upper_fd) ||
+        /* A prior OverlayFS mount may leave its kernel-owned work/ entry. */
+        !safe_dir("/run/palimpsest/root/.palimpsest/work", 1, 0, 0700, &work_fd)) return 0;
+    for (i = 0; i < expected->lower_count; i++) {
+        if (!lower_path(path, i) || !mount_open_role(&roles[i + 1], path, "squashfs",
+                MS_RDONLY | MS_NODEV | MS_NOSUID, SQUASHFS_MAGIC, &lower_fds[i]) ||
+            !verify_mountinfo(path, "squashfs", 1, 1, roles[i + 1].device.major,
+                              roles[i + 1].device.minor, 0)) return 0;
+    }
+    if (!build_overlay_data(overlay_data, expected->lower_count) ||
+        !recheck_open_role(transport) || !recheck_open_role(&roles[0])) return 0;
+    for (i = 0; i < expected->lower_count; i++) if (!recheck_open_role(&roles[i + 1])) return 0;
+    if (!stable_dir("/run/palimpsest/root", root_fd, EXT4_MAGIC) ||
+        !stable_dir("/run/palimpsest/root/.palimpsest", state_fd, EXT4_MAGIC) ||
+        !stable_dir("/run/palimpsest/root/.palimpsest/upper", upper_fd, EXT4_MAGIC) ||
+        !stable_dir("/run/palimpsest/root/.palimpsest/work", work_fd, EXT4_MAGIC) ||
+        sc5(SYS_mount, (i64)"overlay", (i64)"/run/palimpsest/merged", (i64)"overlay",
+            MS_NODEV | MS_NOSUID, (i64)overlay_data) != 0 ||
+        !safe_dir("/run/palimpsest/merged", 0, 0, 0, &merged_fd) ||
+        !stable_dir("/run/palimpsest/merged", merged_fd, OVERLAYFS_MAGIC) ||
+        !verify_mountinfo("/run/palimpsest/merged", "overlay", 0, 0, 0, 0, overlay_data)) return 0;
+    if (!recheck_open_role(transport) || !recheck_open_role(&roles[0]) ||
+        !exact_vd_disk_count(expected->lower_count + 2)) return 0;
+    for (i = 0; i < expected->lower_count; i++)
+        if (!recheck_open_role(&roles[i + 1]) || !lower_path(path, i) ||
+            !stable_dir(path, lower_fds[i], SQUASHFS_MAGIC)) return 0;
+    return stable_dir("/run/palimpsest/root", root_fd, EXT4_MAGIC) &&
+           stable_dir("/run/palimpsest/merged", merged_fd, OVERLAYFS_MAGIC);
+}
+
 static int run_consumer(const char *fixture_root, int fixture_mode) {
     struct bindings b;
     struct discovered device;
@@ -1463,7 +1724,7 @@ static int run_consumer(const char *fixture_root, int fixture_mode) {
     for (i = 0; i < expected.lower_count + 1; i++)
         if (!recheck_open_role(&roles[i])) return EXIT_DISCOVERY;
     if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
-    return 0;
+    return assemble_staging_root(&expected, roles, &transport_role) ? 0 : EXIT_ASSEMBLY;
 }
 
 static __attribute__((noreturn, used)) void start_c(u64 *stack) {
@@ -1486,8 +1747,9 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
     code = run_consumer(0, 0);
     if (code == EXIT_FILESYSTEM) wait_closed("palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed\n");
+    if (code == EXIT_ASSEMBLY) wait_closed("palimpsest guest stage1: mount or staging assembly rejected; root is not slash; pivot and workload disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
-    wait_closed("palimpsest guest stage1: filesystem set verified; mount disabled; waiting fail-closed\n");
+    wait_closed("palimpsest guest stage1: staging overlay assembled; root is not slash; pivot and workload disabled; waiting fail-closed\n");
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {

@@ -1,8 +1,9 @@
 """Qualified native-KVM proof for the fail-closed OCI stage-1 consumer.
 
 This private module is test support for the packaged bootstrap boundary.  It
-does not define or start a production VM and deliberately stops before any
-root filesystem mount, pivot, or workload execution.
+does not define or start a production VM. It proves authenticated filesystem
+mounts and a staging OverlayFS root, then stops before pivot or workload
+execution.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v4"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v5"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -52,12 +53,19 @@ MAX_CONSOLE_BYTES = 4 * 1024 * 1024
 DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # Do not include the line ending: a real 8250 console commonly maps LF to
 # CRLF, while the pipe-based pure test preserves LF exactly.
-SUCCESS_MARKER = b"palimpsest guest stage1: filesystem set verified; mount disabled; waiting fail-closed"
+SUCCESS_MARKER = (
+    b"palimpsest guest stage1: staging overlay assembled; root is not slash; "
+    b"pivot and workload disabled; waiting fail-closed"
+)
 REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
 FILESYSTEM_REJECTION_MARKER = (
     b"palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed"
 )
 PREPARATION_FAILURE_MARKER = b"palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed"
+ASSEMBLY_REJECTION_MARKER = (
+    b"palimpsest guest stage1: mount or staging assembly rejected; root is not slash; "
+    b"pivot and workload disabled; waiting fail-closed"
+)
 
 KERNEL_ENV = "PALIMPSEST_KVM_KERNEL"
 KERNEL_CONFIG_ENV = "PALIMPSEST_KVM_KERNEL_CONFIG"
@@ -100,10 +108,16 @@ _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_BINFMT_ELF",
     "CONFIG_BLK_DEV_INITRD",
     "CONFIG_DEVTMPFS",
+    "CONFIG_EXT4_FS",
+    "CONFIG_OVERLAY_FS",
     "CONFIG_PCI",
     "CONFIG_PROC_FS",
     "CONFIG_SERIAL_8250",
     "CONFIG_SERIAL_8250_CONSOLE",
+    "CONFIG_SQUASHFS",
+    "CONFIG_SQUASHFS_XATTR",
+    "CONFIG_SQUASHFS_ZLIB",
+    "CONFIG_SQUASHFS_ZSTD",
     "CONFIG_SYSFS",
     "CONFIG_VIRTIO",
     "CONFIG_VIRTIO_BLK",
@@ -1085,6 +1099,8 @@ class OCIStage1KVMProofReceipt:
     qemu_digest: str
     qemu_size_bytes: int
     qemu_version_bytes: bytes
+    root_seed_digest: str
+    root_post_run_digest: str
     console: bytes
     negative_consoles: Mapping[str, bytes]
     filesystem_negative_consoles: Mapping[str, bytes]
@@ -1097,6 +1113,8 @@ class OCIStage1KVMProofReceipt:
             (self.initramfs_manifest_digest, "initramfs manifest digest"),
             (self.stage1_elf_digest, "stage-1 ELF digest"),
             (self.qemu_digest, "QEMU digest"),
+            (self.root_seed_digest, "root seed digest"),
+            (self.root_post_run_digest, "root post-run digest"),
         ):
             _validate_digest(value, field)
         try:
@@ -1123,6 +1141,7 @@ class OCIStage1KVMProofReceipt:
             or self.initramfs_size_bytes != expected_initramfs.artifact_size_bytes
             or self.initramfs_manifest_digest != expected_initramfs.digest
             or self.stage1_elf_digest != expected_initramfs.stage1_binary_digest
+            or self.root_seed_digest != load_proof_filesystems().root_digest
             or not isinstance(self.cmdline, str)
             or not 1 <= len(cmdline_bytes) <= 4096
             or "\n" in self.cmdline
@@ -1136,6 +1155,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, SUCCESS_MARKER) != 1
             or _logical_line_count(self.console, REJECTION_MARKER) != 0
             or _logical_line_count(self.console, FILESYSTEM_REJECTION_MARKER) != 0
+            or _logical_line_count(self.console, ASSEMBLY_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, PREPARATION_FAILURE_MARKER) != 0
             or not isinstance(self.negative_consoles, Mapping)
             or set(self.negative_consoles) != set(NEGATIVE_CONTROL_NAMES)
@@ -1144,6 +1164,7 @@ class OCIStage1KVMProofReceipt:
                 or not 1 <= len(control_console) <= MAX_CONSOLE_BYTES
                 or _logical_line_count(control_console, REJECTION_MARKER) != 1
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.negative_consoles.values()
             )
@@ -1155,6 +1176,7 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, FILESYSTEM_REJECTION_MARKER) != 1
                 or _logical_line_count(control_console, REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, SUCCESS_MARKER) != 0
+                or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.filesystem_negative_consoles.values()
             )
@@ -1212,7 +1234,11 @@ class OCIStage1KVMProofReceipt:
             "root_content_verified": False,
             "lower_filesystem_verified": True,
             "lower_content_verified": True,
-            "mount_attempted": False,
+            "mount_attempted": True,
+            "root_filesystem_mounted": True,
+            "lower_filesystems_mounted": True,
+            "overlay_assembled": True,
+            "pivot_root": False,
             "qualification": {
                 "accelerator": "kvm",
                 "architecture": "x86_64",
@@ -1226,11 +1252,18 @@ class OCIStage1KVMProofReceipt:
                 "version_digest": _digest(self.qemu_version_bytes),
                 "version_text": self.qemu_version_bytes.decode("utf-8"),
             },
-            "root_assembly": False,
+            "root_assembly": True,
+            "root_is_slash": False,
+            "root_volume": {
+                "content_verified": False,
+                "post_run_digest": self.root_post_run_digest,
+                "seed_digest": self.root_seed_digest,
+            },
             "schema": OCI_STAGE1_KVM_PROOF_SCHEMA,
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
             "topology": pre_mount_topology(build_proof_plan()),
             "transport": {**dict(self.transport), "serial": self.transport_serial},
+            "workload_started": False,
         }
 
     @property
@@ -1260,13 +1293,20 @@ class OCIStage1KVMProofReceipt:
             "lower_filesystem_verified",
             "lower_content_verified",
             "mount_attempted",
+            "root_filesystem_mounted",
+            "lower_filesystems_mounted",
+            "overlay_assembled",
+            "pivot_root",
             "qualification",
             "qemu",
             "root_assembly",
+            "root_is_slash",
+            "root_volume",
             "schema",
             "stage1",
             "topology",
             "transport",
+            "workload_started",
         }:
             raise ArtifactValidationError("KVM proof receipt fields are invalid")
         cmdline = value.get("cmdline")
@@ -1279,16 +1319,26 @@ class OCIStage1KVMProofReceipt:
         qualification = value.get("qualification")
         negative_controls = value.get("negative_controls")
         filesystem_negative_controls = value.get("filesystem_negative_controls")
+        root_volume = value.get("root_volume")
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
-            or value.get("root_assembly") is not False
+            or value.get("root_assembly") is not True
+            or value.get("root_is_slash") is not False
+            or value.get("pivot_root") is not False
+            or value.get("workload_started") is not False
             or value.get("pre_mount_devices") is not True
             or value.get("filesystem_verified") is not True
             or value.get("root_filesystem_verified") is not True
             or value.get("root_content_verified") is not False
             or value.get("lower_filesystem_verified") is not True
             or value.get("lower_content_verified") is not True
-            or value.get("mount_attempted") is not False
+            or value.get("mount_attempted") is not True
+            or value.get("root_filesystem_mounted") is not True
+            or value.get("lower_filesystems_mounted") is not True
+            or value.get("overlay_assembled") is not True
+            or not isinstance(root_volume, Mapping)
+            or set(root_volume) != {"content_verified", "post_run_digest", "seed_digest"}
+            or root_volume.get("content_verified") is not False
             or value.get("topology") != pre_mount_topology(build_proof_plan())
             or qualification
             != {
@@ -1367,6 +1417,8 @@ class OCIStage1KVMProofReceipt:
             qemu["artifact_digest"],
             qemu["artifact_size_bytes"],
             qemu["version_text"].encode("utf-8"),
+            root_volume["seed_digest"],
+            root_volume["post_run_digest"],
             console,
             negative_consoles,
             filesystem_negative_consoles,
@@ -1680,6 +1732,22 @@ def _verify_pre_mount_topology(root_path: Path, lower_paths: tuple[Path, ...], p
         _verify_file_digest(path, layer["artifact_digest"], 0o400)
 
 
+def _verify_post_run_topology(root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan) -> str:
+    """Bind the mutable root's post-run bytes while retaining immutable lower equality."""
+
+    verified_root = _read_pinned_regular_file(
+        root_path,
+        maximum=MAX_KERNEL_BYTES,
+        label="KVM proof mutable root",
+    )
+    if verified_root.size_bytes != plan.root["size_bytes"] or stat.S_IMODE(root_path.stat().st_mode) != 0o600:
+        raise KVMProofFailure("KVM proof mutable root identity changed")
+    devices = pre_mount_topology(plan)["devices"]
+    for path, layer in zip(lower_paths, devices[1:], strict=True):
+        _verify_file_digest(path, layer["artifact_digest"], 0o400)
+    return verified_root.digest
+
+
 def _actual_evidence_directory() -> Path | None:
     configured = os.environ.get(EVIDENCE_ENV)
     if configured is None:
@@ -1740,7 +1808,12 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         console = _read_console_until(
             command,
             expected=SUCCESS_MARKER,
-            forbidden=(REJECTION_MARKER, FILESYSTEM_REJECTION_MARKER, PREPARATION_FAILURE_MARKER),
+            forbidden=(
+                REJECTION_MARKER,
+                FILESYSTEM_REJECTION_MARKER,
+                ASSEMBLY_REJECTION_MARKER,
+                PREPARATION_FAILURE_MARKER,
+            ),
             timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
             require_alive_after_marker=True,
         )
@@ -1753,7 +1826,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             initramfs_digest=initramfs.manifest.artifact_digest,
         )
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
-        _verify_pre_mount_topology(root_path, lower_paths, plan)
+        root_post_run_digest = _verify_post_run_topology(root_path, lower_paths, plan)
         negative_consoles: dict[str, bytes] = {}
         for control_name in NEGATIVE_CONTROL_NAMES:
             contract = contracts[control_name]
@@ -1778,7 +1851,12 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             negative_consoles[control_name] = _read_console_until(
                 control_command,
                 expected=REJECTION_MARKER,
-                forbidden=(SUCCESS_MARKER, FILESYSTEM_REJECTION_MARKER, PREPARATION_FAILURE_MARKER),
+                forbidden=(
+                    SUCCESS_MARKER,
+                    FILESYSTEM_REJECTION_MARKER,
+                    ASSEMBLY_REJECTION_MARKER,
+                    PREPARATION_FAILURE_MARKER,
+                ),
                 timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
                 require_alive_after_marker=True,
             )
@@ -1815,7 +1893,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             filesystem_negative_consoles[control_name] = _read_console_until(
                 control_command,
                 expected=FILESYSTEM_REJECTION_MARKER,
-                forbidden=(SUCCESS_MARKER, REJECTION_MARKER, PREPARATION_FAILURE_MARKER),
+                forbidden=(SUCCESS_MARKER, REJECTION_MARKER, ASSEMBLY_REJECTION_MARKER, PREPARATION_FAILURE_MARKER),
                 timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
                 require_alive_after_marker=True,
             )
@@ -1843,6 +1921,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         qemu.digest,
         qemu.size_bytes,
         version,
+        load_proof_filesystems().root_digest,
+        root_post_run_digest,
         console,
         negative_consoles,
         filesystem_negative_consoles,

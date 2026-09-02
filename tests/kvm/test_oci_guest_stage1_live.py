@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local._oci_stage1_kvm_proof import (
+    ASSEMBLY_REJECTION_MARKER,
     EVIDENCE_ENV,
     EVIDENCE_FILE_NAMES,
     FILESYSTEM_NEGATIVE_CONTROL_NAMES,
@@ -37,16 +38,23 @@ def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesyste
         "kvm_api_version": 12,
         "live_pid1": True,
     }
-    assert receipt["root_assembly"] is False
+    assert receipt["root_assembly"] is True
+    assert receipt["root_is_slash"] is False
+    assert receipt["pivot_root"] is False
+    assert receipt["workload_started"] is False
     assert receipt["pre_mount_devices"] is True
     assert receipt["filesystem_verified"] is True
     assert receipt["root_filesystem_verified"] is True
     assert receipt["root_content_verified"] is False
     assert receipt["lower_filesystem_verified"] is True
     assert receipt["lower_content_verified"] is True
-    assert receipt["mount_attempted"] is False
+    assert receipt["mount_attempted"] is True
+    assert receipt["root_filesystem_mounted"] is True
+    assert receipt["lower_filesystems_mounted"] is True
+    assert receipt["overlay_assembled"] is True
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
+    assert _logical_line_count(result.console, ASSEMBLY_REJECTION_MARKER) == 0
     assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
     for console in result.negative_consoles.values():
         assert _logical_line_count(console, REJECTION_MARKER) == 1

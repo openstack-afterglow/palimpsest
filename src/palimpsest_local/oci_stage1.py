@@ -29,9 +29,10 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v4"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v4"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v5"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v5"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
+OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
 
@@ -238,6 +239,7 @@ class OCIStage1Plan:
                 "lowerdir_ordinals": list(reversed(range(len(self.layers)))),
                 "overlay_mount_options": ["rw", "nodev", "nosuid"],
                 "root": _plain(self.root),
+                "root_layout": OCI_STAGE1_ROOT_LAYOUT,
             },
             "boot_plan_digest": self.boot_plan_digest,
             "domain_core_digest": self.domain_core_digest,
@@ -282,9 +284,11 @@ class OCIStage1Plan:
             or not isinstance(run, dict)
             or set(run) != {"name", "run_id"}
             or not isinstance(assembly, dict)
-            or set(assembly) != {"device_policy", "layers", "lowerdir_ordinals", "overlay_mount_options", "root"}
+            or set(assembly)
+            != {"device_policy", "layers", "lowerdir_ordinals", "overlay_mount_options", "root", "root_layout"}
             or assembly.get("device_policy") != OCI_STAGE1_DEVICE_POLICY
             or assembly.get("overlay_mount_options") != ["rw", "nodev", "nosuid"]
+            or assembly.get("root_layout") != OCI_STAGE1_ROOT_LAYOUT
             or not isinstance(assembly.get("layers"), list)
             or assembly.get("lowerdir_ordinals") != list(reversed(range(len(assembly["layers"]))))
         ):
@@ -313,6 +317,7 @@ __all__ = [
     "OCI_STAGE1_DEVICE_POLICY",
     "OCI_STAGE1_PLAN_SCHEMA",
     "OCI_STAGE1_PROTOCOL",
+    "OCI_STAGE1_ROOT_LAYOUT",
     "OCIStage1Plan",
     "oci_stage1_device_serial",
 ]

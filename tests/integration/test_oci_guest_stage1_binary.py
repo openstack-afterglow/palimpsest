@@ -524,3 +524,18 @@ def test_freestanding_binary_rejects_device_identity_and_size_semantic_drift(
         verify_guest_stage1_transport(artifact, bindings)
 
     assert _run(scratch_image, tmp_path).returncode == 68
+
+
+def test_freestanding_binary_rejects_noncanonical_root_layout(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    changed = copy.deepcopy(plan.to_dict())
+    changed["assembly"]["root_layout"] = "whole-device-root.v1"
+    artifact = _envelope(canonical_json_bytes(changed))
+    _write_fixture(tmp_path, plan, artifact)
+    bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    with pytest.raises(ArtifactValidationError, match="policy"):
+        verify_guest_stage1_transport(artifact, bindings)
+    assert _run(scratch_image, tmp_path).returncode == 68

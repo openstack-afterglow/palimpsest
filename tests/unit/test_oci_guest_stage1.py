@@ -269,6 +269,13 @@ def test_guest_consumer_rejects_cmdline_replay_and_self_consistent_semantic_drif
     with pytest.raises(ArtifactValidationError, match="policy"):
         verify_guest_stage1_transport(artifact, bindings)
 
+    value = plan.to_dict()
+    value["assembly"]["root_layout"] = "whole-device-root.v1"
+    artifact = _envelope(canonical_json_bytes(value))
+    bindings = parse_guest_kernel_cmdline(_cmdline(f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    with pytest.raises(ArtifactValidationError, match="policy"):
+        verify_guest_stage1_transport(artifact, bindings)
+
 
 def test_guest_consumer_rejects_duplicate_keys_noncanonical_bytes_and_padding() -> None:
     built = build_stage1_transport(_plan())

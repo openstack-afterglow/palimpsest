@@ -86,6 +86,11 @@ def test_bootstrap_initramfs_is_byte_deterministic_and_independently_well_formed
         "etc/palimpsest/stage1-abi.json",
         "init",
         "proc",
+        "run",
+        "run/palimpsest",
+        "run/palimpsest/lowers",
+        "run/palimpsest/merged",
+        "run/palimpsest/root",
         "sys",
         "TRAILER!!!",
     ]
@@ -96,6 +101,11 @@ def test_bootstrap_initramfs_is_byte_deterministic_and_independently_well_formed
         stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o644,
         stat.S_IFREG | 0o755,
+        stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
+        stat.S_IFDIR | 0o755,
         stat.S_IFDIR | 0o755,
         stat.S_IFDIR | 0o755,
     ]
@@ -124,17 +134,20 @@ print(json.dumps({"manifest": built.manifest.to_dict(), "payload": built.payload
     assert fresh["manifest"] == built.manifest.to_dict()
 
 
-def test_bootstrap_manifest_is_canonical_path_free_and_explicitly_not_root_assembly() -> None:
+def test_bootstrap_manifest_is_canonical_path_free_staging_assembly_only() -> None:
     built = build_bootstrap_initramfs()
     value = built.manifest.to_dict()
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "pre-mount-filesystem-set-consumer-fail-closed"
+    assert value["stage1"]["capability"] == "staging-overlay-root-assembly-fail-closed"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v3"
-    assert value["stage1"]["root_assembly"] is False
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v4"
+    assert value["stage1"]["root_assembly"] is True
+    assert value["stage1"]["root_is_slash"] is False
+    assert value["stage1"]["pivot_root"] is False
+    assert value["stage1"]["workload_started"] is False
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
     assert "run_id" not in rendered and "domain_plan" not in rendered
@@ -245,7 +258,7 @@ def test_manifest_and_artifact_tampering_fail_closed() -> None:
         verify_bootstrap_initramfs(bytes(changed), built.manifest)
 
     value = deepcopy(built.manifest.to_dict())
-    value["stage1"]["root_assembly"] = True
+    value["stage1"]["root_assembly"] = False
     with pytest.raises(ArtifactValidationError, match="policy"):
         OCIInitramfsManifest.from_dict(value)
 

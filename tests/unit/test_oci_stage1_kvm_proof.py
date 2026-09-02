@@ -13,6 +13,7 @@ import pytest
 
 from palimpsest_local._oci_stage1_kvm_proof import (
     _REQUIRED_KERNEL_CONFIG,
+    ASSEMBLY_REJECTION_MARKER,
     EVIDENCE_FILE_NAMES,
     FILESYSTEM_NEGATIVE_CONTROL_NAMES,
     FILESYSTEM_REJECTION_MARKER,
@@ -78,6 +79,8 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         "sha256:" + "3" * 64,
         8192,
         b"QEMU emulator version 9.2.0\n",
+        pre_mount_topology(plan)["devices"][0]["artifact_digest"],
+        "sha256:" + "4" * 64,
         b"kernel boot\r\n" + SUCCESS_MARKER + b"\r\n",
         _negative_consoles(),
         _filesystem_negative_consoles(),
@@ -342,14 +345,25 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["root_assembly"] is False
+    assert decoded["root_assembly"] is True
+    assert decoded["root_is_slash"] is False
+    assert decoded["pivot_root"] is False
+    assert decoded["workload_started"] is False
     assert decoded["pre_mount_devices"] is True
     assert decoded["filesystem_verified"] is True
     assert decoded["root_filesystem_verified"] is True
     assert decoded["root_content_verified"] is False
     assert decoded["lower_filesystem_verified"] is True
     assert decoded["lower_content_verified"] is True
-    assert decoded["mount_attempted"] is False
+    assert decoded["mount_attempted"] is True
+    assert decoded["root_filesystem_mounted"] is True
+    assert decoded["lower_filesystems_mounted"] is True
+    assert decoded["overlay_assembled"] is True
+    assert decoded["root_volume"] == {
+        "content_verified": False,
+        "post_run_digest": "sha256:" + "4" * 64,
+        "seed_digest": pre_mount_topology(build_proof_plan())["devices"][0]["artifact_digest"],
+    }
     assert decoded["topology"] == pre_mount_topology(build_proof_plan())
     assert tuple(decoded["negative_controls"]) == tuple(sorted(NEGATIVE_CONTROL_NAMES))
     for name in NEGATIVE_CONTROL_NAMES:
@@ -465,7 +479,9 @@ def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> Non
         )
 
 
-@pytest.mark.parametrize("marker", [REJECTION_MARKER, SUCCESS_MARKER, PREPARATION_FAILURE_MARKER])
+@pytest.mark.parametrize(
+    "marker", [REJECTION_MARKER, SUCCESS_MARKER, ASSEMBLY_REJECTION_MARKER, PREPARATION_FAILURE_MARKER]
+)
 def test_receipt_requires_exactly_one_rejection_and_no_other_marker(marker: bytes) -> None:
     receipt = _receipt()
     consoles = dict(receipt.negative_consoles)
@@ -480,7 +496,13 @@ def test_receipt_requires_exactly_one_rejection_and_no_other_marker(marker: byte
 
 @pytest.mark.parametrize(
     "marker",
-    [FILESYSTEM_REJECTION_MARKER, REJECTION_MARKER, SUCCESS_MARKER, PREPARATION_FAILURE_MARKER],
+    [
+        FILESYSTEM_REJECTION_MARKER,
+        REJECTION_MARKER,
+        SUCCESS_MARKER,
+        ASSEMBLY_REJECTION_MARKER,
+        PREPARATION_FAILURE_MARKER,
+    ],
 )
 def test_receipt_requires_one_filesystem_rejection_and_no_other_marker(marker: bytes) -> None:
     receipt = _receipt()

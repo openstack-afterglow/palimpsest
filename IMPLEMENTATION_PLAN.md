@@ -513,6 +513,18 @@ Scope boundary: no root/lower `mount(2)`, filesystem magic through a mounted vie
 
 Qualification state: proof v4 and both negative matrices are source-controlled and portable-policy/Docker-fixture tested. This macOS arm64 host cannot run native x86_64 KVM, so it makes no actual positive or negative v4 KVM receipt claim; the required self-hosted runner must collect that evidence.
 
+### PR 4 slice 21: authenticated staging OverlayFS assembly
+
+Implemented:
+
+- Stage-1 plan/protocol v5 binds the path-free `overlay-upper-work.v1` root layout. Live PID 1 uses the already authenticated open block descriptors as `/proc/self/fd/<fd>` mount sources, makes `/` recursively private, mounts the ext4 root rw and every SquashFS lower ro at deterministic `/run/palimpsest` staging paths, and preserves highest-layer-first OverlayFS ordering.
+- The writable root stores persistent overlay state in `.palimpsest/upper` (0755 so the merged root remains traversable) and `.palimpsest/work` (0700). Existing non-directory or wrong-mode state is rejected without cleanup; kernel-owned workdir contents left by a prior mount are preserved and OverlayFS decides whether they are reusable. Staging and mounted directory descriptors remain open and are checked with no-follow identity, `statfs`, bounded mountinfo role/flags/order validation, and final block FD/sysfs/ioctl revalidation.
+- Initramfs ABI/consumer and KVM receipt v5 distinguish successful staging assembly from making it `/`: mount and overlay flags are true while `root_is_slash`, `pivot_root`, and `workload_started` remain false. The mutable root has separate seed and post-run digests; immutable transport/lower equality remains required.
+
+Scope boundary: the assembled OCI tree remains `/run/palimpsest/merged`. No pivot/chroot, image process execution, PID 1 supervision, production libvirt launch, foreground/`-d`, or Gate 2 activation is included.
+
+Qualification state: portable policy, packaged ELF fixture, and proof-harness tests can run on this macOS host, but actual mount/OverlayFS evidence still requires the qualified Linux x86_64 native-KVM runner. No local KVM success is claimed.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -534,6 +546,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 ### Next implementation order
 
 1. Collect a qualified v4 positive plus topology and filesystem negative-matrix receipt on a connected Linux x86_64 KVM runner.
-2. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
-3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+2. Collect the qualified v5 staging-mount/OverlayFS receipt and add targeted mount/assembly rejection evidence.
+3. Implement pivot_root plus the first-party PID 1 supervisor as a separate checkpoint.
+4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

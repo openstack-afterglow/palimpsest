@@ -28,20 +28,20 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v5"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v6"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v3"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v5"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v4"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v6"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:4a26a728c7a56bfdcb392327cf91cc1208138741c8dfbb2736d5d02357b940b8"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:2abf465d359d4c68382465e36bb299e1eafe6c2a6d3a16fe9a05ca7826544bf1"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:033e36da44b02332072be42cf7830f65e16fbd7e292a0bda30c6f50c98f7de9a"
+OCI_STAGE1_BINARY_DIGEST = "sha256:df40478cf52ea0067ddfaffc27a37ba9147f05659348ea4bb1f3bf737211cf3f"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -58,6 +58,11 @@ _REQUIRED_LAYOUT = (
     ("etc/palimpsest/stage1-abi.json", stat.S_IFREG | 0o644),
     ("init", stat.S_IFREG | 0o755),
     ("proc", stat.S_IFDIR | 0o755),
+    ("run", stat.S_IFDIR | 0o755),
+    ("run/palimpsest", stat.S_IFDIR | 0o755),
+    ("run/palimpsest/lowers", stat.S_IFDIR | 0o755),
+    ("run/palimpsest/merged", stat.S_IFDIR | 0o755),
+    ("run/palimpsest/root", stat.S_IFDIR | 0o755),
     ("sys", stat.S_IFDIR | 0o755),
 )
 _REQUIRED_PATHS = tuple(path for path, _mode in _REQUIRED_LAYOUT)
@@ -359,7 +364,9 @@ def _guest_consumer_contract_bytes() -> bytes:
             "contract": OCI_GUEST_STAGE1_CONTRACT,
             "embedded_in_init": True,
             "plan_transport": OCI_GUEST_STAGE1_PLAN_TRANSPORT,
-            "root_assembly": False,
+            "pivot_root": False,
+            "root_assembly": True,
+            "root_is_slash": False,
             "validation": [
                 "bounded-closed-world-kernel-cmdline",
                 "proc-sysfs-devtmpfs-pseudo-filesystems",
@@ -370,7 +377,11 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "root-lower-role-size-readonly-open-fd-final-recheck",
                 "ext4-primary-superblock-uuid-label-geometry-features-checksum",
                 "squashfs-v4-structure-whole-device-sha256-byte-budget",
+                "proc-fd-bound-ext4-squashfs-mount-source",
+                "nofollow-staging-directories-mountinfo-statfs-final-recheck",
+                "highest-ordinal-leftmost-overlay-upper-work-assembly",
             ],
+            "workload_started": False,
         }
     )
 
@@ -384,8 +395,11 @@ def _stage1_abi_bytes() -> bytes:
             "consumer_contract_digest": _digest(consumer),
             "embedded_consumer": True,
             "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
-            "root_assembly": False,
+            "pivot_root": False,
+            "root_assembly": True,
+            "root_is_slash": False,
             "schema": OCI_STAGE1_ABI,
+            "workload_started": False,
         }
     )
 
@@ -482,7 +496,10 @@ class OCIInitramfsManifest:
                 "embedded_consumer": True,
                 "linkage": "static",
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
-                "root_assembly": False,
+                "pivot_root": False,
+                "root_assembly": True,
+                "root_is_slash": False,
+                "workload_started": False,
             },
         }
 
@@ -531,7 +548,10 @@ class OCIInitramfsManifest:
                 "embedded_consumer": True,
                 "linkage": "static",
                 "plan_transport": OCI_STAGE1_PLAN_TRANSPORT,
-                "root_assembly": False,
+                "pivot_root": False,
+                "root_assembly": True,
+                "root_is_slash": False,
+                "workload_started": False,
             }
             or not isinstance(entries, list)
             or len(entries) != len(_REQUIRED_LAYOUT)
@@ -579,6 +599,11 @@ def build_bootstrap_initramfs() -> BuiltOCIInitramfs:
         NewcEntry("etc/palimpsest/stage1-abi.json", stat.S_IFREG | 0o644, abi),
         NewcEntry("init", stat.S_IFREG | 0o755, stage1),
         NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("run", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("run/palimpsest", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("run/palimpsest/lowers", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("run/palimpsest/merged", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("run/palimpsest/root", stat.S_IFDIR | 0o755, b""),
         NewcEntry("sys", stat.S_IFDIR | 0o755, b""),
     )
     payload = build_newc(entries)
