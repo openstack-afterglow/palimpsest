@@ -499,6 +499,20 @@ Scope boundary: this remains a block-identity proof. It does not inspect filesys
 
 Qualification state: the v3 harness and CI gate are source-controlled and locally policy-tested. This macOS arm64 host cannot execute native x86_64 KVM, so no actual v3 positive or negative runtime receipt is claimed locally; collection requires the qualified self-hosted Linux x86_64/KVM runner.
 
+### PR 4 slice 20: mount-free filesystem-set authentication
+
+Implemented:
+
+- Root-volume loading now preserves the ext4 filesystem UUID actually stored in the volume and projects it through domain planning into stage-1 plan v4. Newly created OCI-root volumes use an explicit `none,<allow-list>` feature set, fixed block/inode/group geometry, disabled lazy initialization, deterministic UUID, and zero reserved-block percentage instead of host `mke2fs.conf` defaults; the complete policy is verified on one pinned no-follow FD before publication. Retained legacy volumes keep their existing UUID and may omit `metadata_csum` when their bounded feature policy is otherwise valid. When `metadata_csum` is present, Python and PID 1 require checksum type 1 (CRC32C) and a valid primary-superblock checksum. The guest also requires primary magic/dynamic revision, exact derived label, exact block/device geometry, bounded extents-capable features, and sane group/inode/descriptor geometry. Mutable root content is deliberately not hashed or claimed verified.
+- Each lower retains its OCI image digest in the plan. PID 1 ports the host SquashFS v4 superblock policy, including encoding/table/root-inode/fragment/export/padding checks, and streams SHA-256 over the complete read-only device under an aggregate 32 GiB verification budget. All already-open device descriptors and identities are rechecked after filesystem reads.
+- Positive KVM proof backings are source-controlled, digest-bound outputs from real `mkfs.ext4` 1.47.0 and `mksquashfs` 4.7.5, not synthetic headers or zero disks. Proof receipt v4 distinguishes `root_filesystem_verified=true`, `root_content_verified=false`, and lower filesystem/content verification, while keeping `mount_attempted=false` and `root_assembly=false`.
+- The existing thirteen block-topology negative boots remain required. Six additional same-topology KVM boots independently corrupt root magic/label/geometry or lower magic/structure/content digest. Root controls recompute a valid `metadata_csum` after the targeted change. Lower magic/structure controls use a per-control plan, transport serial and cmdline whose image digest matches the mutated whole device; only the digest-mismatch control retains the original plan digest. Each must emit exactly the filesystem rejection marker, emit no topology/success/preparation marker, and remain alive in the permanent PID 1 wait. Exclusive owner-only evidence retains every console and is written receipt-last.
+- Portable tests parse the committed actual filesystems on macOS without mkfs tools. The packaged ELF's non-PID1 `--fixture-v2` mode reuses its exact filesystem parsers against regular-file fixtures and explicit exit status; it is differential parser evidence and does not replace the live block ioctl/KVM proof.
+
+Scope boundary: no root/lower `mount(2)`, filesystem magic through a mounted view, OverlayFS, pivot, workload process, production libvirt launch, foreground/`-d` lifecycle, or Gate 2 activation is implemented here.
+
+Qualification state: proof v4 and both negative matrices are source-controlled and portable-policy/Docker-fixture tested. This macOS arm64 host cannot run native x86_64 KVM, so it makes no actual positive or negative v4 KVM receipt claim; the required self-hosted runner must collect that evidence.
+
 ### Local image build-to-run acceptance gates
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
@@ -519,8 +533,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect a qualified v3 positive plus full negative-matrix receipt on a connected Linux x86_64 KVM runner.
-2. Add fail-closed ext4/SquashFS filesystem-magic and structural/content verification evidence without mounting.
-3. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
-4. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
-5. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.
+1. Collect a qualified v4 positive plus topology and filesystem negative-matrix receipt on a connected Linux x86_64 KVM runner.
+2. Implement ext4/SquashFS mounting, writable-root OverlayFS assembly, pivot, and the first-party PID 1 supervisor.
+3. Implement foreground-default `run` and detached `run -d`, then lifecycle/exec/log readiness for OCI-root/KVM.
+4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux KVM runner and require it before claiming that an OCI image becomes VM root `/`.

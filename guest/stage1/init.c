@@ -13,6 +13,8 @@ typedef unsigned long u64;
 typedef signed long i64;
 typedef unsigned long usize;
 
+struct span { const char *p; usize n; };
+
 #define SYS_read 0
 #define SYS_write 1
 #define SYS_open 2
@@ -55,12 +57,15 @@ typedef unsigned long usize;
 #define STRING_MAX_LOCAL (32 * 1024)
 #define PROCESS_MAX_LOCAL (256 * 1024)
 #define GENERATION_DIGITS_MAX 4096
+#define FILESYSTEM_VERIFY_BYTES_MAX 34359738368ul
+#define FILESYSTEM_IO_BYTES (1024 * 1024)
 
 #define EXIT_USAGE 64
 #define EXIT_CMDLINE 65
 #define EXIT_DISCOVERY 66
 #define EXIT_TRANSPORT 67
 #define EXIT_PLAN 68
+#define EXIT_FILESYSTEM 69
 
 struct timespec_local {
     i64 sec;
@@ -316,6 +321,39 @@ static int valid_digest(const char *s, usize n) {
     return 1;
 }
 
+static u8 hex_value(char c) { return (u8)(c <= '9' ? c - '0' : c - 'a' + 10); }
+
+static int valid_uuid_span(struct span s);
+
+static int digest_bytes(struct span s, u8 out[32]) {
+    usize i;
+    if (!valid_digest(s.p, s.n)) return 0;
+    for (i = 0; i < 32; i++) out[i] = (u8)((hex_value(s.p[7 + i * 2]) << 4) | hex_value(s.p[8 + i * 2]));
+    return 1;
+}
+
+static int uuid_bytes(struct span s, u8 out[16]) {
+    usize i, used = 0;
+    if (!valid_uuid_span(s)) return 0;
+    for (i = 0; i < s.n;) {
+        if (s.p[i] == '-') { i++; continue; }
+        out[used++] = (u8)((hex_value(s.p[i]) << 4) | hex_value(s.p[i + 1]));
+        i += 2;
+    }
+    return used == 16;
+}
+
+static void root_label(struct span volume_id, char out[17]) {
+    struct sha256_ctx c;
+    u8 digest[32];
+    usize i;
+    const char prefix[] = "palimpsest-oci-root-volume-v1\0";
+    memcpy(out, "pali-root-", 10);
+    sha_init(&c); sha_update(&c, prefix, sizeof(prefix) - 1); sha_update(&c, volume_id.p, volume_id.n); sha_final(&c, digest);
+    for (i = 0; i < 3; i++) { out[10 + i * 2] = hex_digit(digest[i] >> 4); out[11 + i * 2] = hex_digit(digest[i] & 15); }
+    out[16] = 0;
+}
+
 static int valid_serial(const char *s, usize n) {
     usize i;
     if (n != 20) return 0;
@@ -376,8 +414,6 @@ struct bindings {
     char lowers[LOWER_MAX][21];
     u32 lower_count;
 };
-
-struct span { const char *p; usize n; };
 
 static int starts(const char *p, usize n, const char *prefix) {
     usize pn = slen(prefix);
@@ -480,6 +516,10 @@ struct expected_device {
     char serial[21];
     u64 size;
     int read_only;
+    u8 digest[32];
+    int has_digest;
+    u8 filesystem_uuid[16];
+    char label[17];
 };
 
 struct expected_device_set {
@@ -724,6 +764,7 @@ static int parse_process(struct parser *j) {
 static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices) {
     struct parser j;
     u32 layer_count = 0, i;
+    u64 verification_bytes = 0;
     char layer_serials[LOWER_MAX][21];
     char occurrence_digest[72];
     char root_serial[21];
@@ -738,7 +779,8 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
             if (layer_count >= LOWER_MAX || !take_char(&j, '{') || !key(&j, "filesystem") ||
                 !exact_string(&j, "squashfs")) return 0;
             if (!take_char(&j, ',') || !key(&j, "image_digest") || !plain_string(&j, &s, 0) ||
-                !valid_digest(s.p, s.n) || !take_char(&j, ',') || !key(&j, "mount_options") ||
+                !digest_bytes(s, devices->lowers[layer_count].digest) || !take_char(&j, ',') ||
+                !key(&j, "mount_options") ||
                 !exact_string_array3(&j, "ro", "nodev", "nosuid") || !take_char(&j, ',') ||
                 !key(&j, "occurrence_digest") || !plain_string(&j, &s, 0) || !valid_digest(s.p, s.n) ||
                 !copy_span(occurrence_digest, sizeof(occurrence_digest), s) || !take_char(&j, ',') ||
@@ -750,9 +792,12 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
             if (!derived_serial_matches("lower", (struct span){occurrence_digest, 71},
                                         devices->lowers[layer_count].serial)) return 0;
             devices->lowers[layer_count].read_only = 1;
+            devices->lowers[layer_count].has_digest = 1;
             if (!take_char(&j, ',') || !key(&j, "size_bytes") || !uint_value(&j, &number) ||
                 number < 512 || number > 34359738368ul || number % 512 || !take_char(&j, '}')) return 0;
             devices->lowers[layer_count].size = number;
+            if (verification_bytes > FILESYSTEM_VERIFY_BYTES_MAX - number) return 0;
+            verification_bytes += number;
             layer_count++;
             if (take_char(&j, ']')) break;
             if (!take_char(&j, ',')) return 0;
@@ -767,6 +812,8 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
     if (!take_char(&j, ']') || !take_char(&j, ',') || !key(&j, "overlay_mount_options") ||
         !exact_string_array3(&j, "rw", "nodev", "nosuid") || !take_char(&j, ',') ||
         !key(&j, "root") || !take_char(&j, '{') || !key(&j, "filesystem") || !exact_string(&j, "ext4") ||
+        !take_char(&j, ',') || !key(&j, "filesystem_uuid") || !plain_string(&j, &s, 0) ||
+        !uuid_bytes(s, devices->root.filesystem_uuid) ||
         !take_char(&j, ',') || !key(&j, "generation") || !positive_decimal(&j) ||
         !take_char(&j, ',') || !key(&j, "mount_options") || !exact_string_array3(&j, "rw", "nodev", "nosuid") ||
         !take_char(&j, ',') || !key(&j, "serial") || !plain_string(&j, &s, 0) || !valid_serial(s.p, s.n) ||
@@ -780,6 +827,7 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         !key(&j, "volume_id") || !plain_string(&j, &s, 0) || !valid_uuid_span(s) ||
         !derived_serial_matches("root", s, root_serial) ||
         !take_char(&j, '}') || !take_char(&j, '}')) return 0;
+    root_label(s, devices->root.label);
     for (i = 0; i < layer_count; i++) if (!text_equal(layer_serials[i], b->lowers[i])) return 0;
     if (!take_char(&j, ',') || !key(&j, "boot_plan_digest") || !plain_string(&j, &s, 0) ||
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
@@ -788,11 +836,11 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         !exact_string(&j, "first-party-pid1-supervisor-required") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j) || !take_char(&j, ',') ||
-        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v3") ||
+        !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v4") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v3") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v4") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     devices->lower_count = layer_count;
     return 1;
@@ -801,9 +849,169 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
 static u8 artifact[ARTIFACT_MAX];
 static char cmdline[CMDLINE_MAX + 1];
 static u8 attribute[128];
+static u8 filesystem_io[FILESYSTEM_IO_BYTES];
 
+static u32 little16(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8); }
 static u32 little32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
 static u64 little64(const u8 *p) { return (u64)little32(p) | ((u64)little32(p + 4) << 32); }
+
+static int pread_exact(int fd, u8 *out, usize size, u64 offset) {
+    usize used = 0;
+    while (used < size) {
+        i64 n = sc4(SYS_pread64, fd, (i64)(out + used), (i64)(size - used), (i64)(offset + used));
+        if (n <= 0 || (usize)n > size - used) return 0;
+        used += (usize)n;
+    }
+    return 1;
+}
+
+static u32 crc32c(u32 value, const u8 *payload, usize size) {
+    usize i;
+    for (i = 0; i < size; i++) {
+        u32 bit;
+        value ^= payload[i];
+        for (bit = 0; bit < 8; bit++) value = (value >> 1) ^ (value & 1 ? 0x82f63b78u : 0);
+    }
+    return value;
+}
+
+static u64 ceil_div_u64(u64 value, u64 divisor) { return value ? 1 + (value - 1) / divisor : 0; }
+
+static int verify_ext4_fd(int fd, const struct expected_device *expected) {
+    const u8 *s = filesystem_io;
+    u32 log_block, block_size, compat, incompat, ro_compat, blocks_high, first_data;
+    u32 blocks_per_group, inodes, inodes_per_group, inode_size, descriptor_size;
+    u64 blocks, groups, inode_groups;
+    if (!pread_exact(fd, filesystem_io, 1024, 1024)) return 0;
+    if (little16(s + 56) != 0xef53 || little32(s + 76) != 1) return 0;
+    log_block = little32(s + 24);
+    if (log_block > 6) return 0;
+    block_size = 1024u << log_block;
+    compat = little32(s + 92); incompat = little32(s + 96); ro_compat = little32(s + 100);
+    if ((incompat & 0x42) != 0x42 || (compat & ~0x3fu) || (incompat & ~0x2c6u) || (ro_compat & ~0x47bu)) return 0;
+    blocks_high = little32(s + 336);
+    if (!(incompat & 0x80) && blocks_high) return 0;
+    blocks = little32(s + 4) | ((incompat & 0x80) ? ((u64)blocks_high << 32) : 0);
+    if (!blocks || blocks > ~(u64)0 / block_size || blocks * block_size != expected->size) return 0;
+    first_data = little32(s + 20); blocks_per_group = little32(s + 32);
+    inodes = little32(s); inodes_per_group = little32(s + 40);
+    if (first_data >= blocks || first_data != (block_size == 1024 ? 1u : 0u) ||
+        !blocks_per_group || blocks_per_group > block_size * 8u || !inodes || !inodes_per_group) return 0;
+    groups = ceil_div_u64(blocks - first_data, blocks_per_group);
+    inode_groups = ceil_div_u64(inodes, inodes_per_group);
+    if (!groups || groups != inode_groups) return 0;
+    inode_size = little16(s + 88);
+    if (inode_size < 128 || inode_size > block_size || (inode_size & (inode_size - 1))) return 0;
+    if (incompat & 0x80) {
+        descriptor_size = little16(s + 254);
+        if (descriptor_size < 64 || descriptor_size > block_size || (descriptor_size & 7)) return 0;
+    }
+    if (!bytes_equal(s + 104, expected->filesystem_uuid, 16)) return 0;
+    if (!bytes_equal(s + 120, expected->label, 16)) return 0;
+    if (ro_compat & 0x400) {
+        if (s[0x175] != 1) return 0;
+        if (crc32c(0xffffffffu, s, 1020) != little32(s + 1020)) return 0;
+    }
+    return 1;
+}
+
+static int verify_squashfs_structure_fd(int fd, const struct expected_device *expected) {
+    const u8 *s = filesystem_io;
+    u32 inodes, block_size, fragments, compression, block_log, flags, id_count, i;
+    u64 root_inode, bytes_used, offsets[6], required[3], padding, root_offset;
+    if (!pread_exact(fd, filesystem_io, 96, 0)) return 0;
+    inodes = little32(s + 4); block_size = little32(s + 12); fragments = little32(s + 16);
+    compression = little16(s + 20); block_log = little16(s + 22); flags = little16(s + 24);
+    id_count = little16(s + 26);
+    if (little32(s) != 0x73717368u || !inodes || little32(s + 8) ||
+        little16(s + 28) != 4 || little16(s + 30) != 0) return 0;
+    if (block_size < 4096 || block_size > 1024 * 1024 || (block_size & (block_size - 1))) return 0;
+    for (i = 0; (1u << i) != block_size && i < 31; i++) {}
+    if (i != block_log || compression < 1 || compression > 6 || !id_count) return 0;
+    root_inode = little64(s + 32); bytes_used = little64(s + 40);
+    for (i = 0; i < 6; i++) offsets[i] = little64(s + 48 + i * 8);
+    if (bytes_used < 96 || bytes_used > expected->size) return 0;
+    for (i = 0; i < 6; i++) if (offsets[i] != ~(u64)0 && (offsets[i] < 96 || offsets[i] >= bytes_used)) return 0;
+    required[0] = offsets[0]; required[1] = offsets[2]; required[2] = offsets[3];
+    if (required[0] == ~(u64)0 || required[1] == ~(u64)0 || required[2] == ~(u64)0 ||
+        required[0] == required[1] || required[0] == required[2] || required[1] == required[2]) return 0;
+    if (required[1] >= required[2] || (root_inode >> 16) >= bytes_used - required[1]) return 0;
+    root_offset = required[1] + (root_inode >> 16);
+    if (root_offset >= bytes_used) return 0;
+    if ((fragments == 0) != (offsets[4] == ~(u64)0)) return 0;
+    if (!!(flags & 0x80) != (offsets[5] != ~(u64)0)) return 0;
+    padding = expected->size - bytes_used;
+    if (padding >= block_size) return 0;
+    while (padding) {
+        usize chunk = padding > FILESYSTEM_IO_BYTES ? FILESYSTEM_IO_BYTES : (usize)padding;
+        if (!pread_exact(fd, filesystem_io, chunk, bytes_used)) return 0;
+        for (i = 0; i < chunk; i++) if (filesystem_io[i]) return 0;
+        bytes_used += chunk; padding -= chunk;
+    }
+    return 1;
+}
+
+static int verify_lower_digest_fd(int fd, const struct expected_device *expected) {
+    struct sha256_ctx c;
+    u8 digest[32];
+    u64 offset = 0;
+    if (!expected->has_digest || expected->size > FILESYSTEM_VERIFY_BYTES_MAX) return 0;
+    sha_init(&c);
+    while (offset < expected->size) {
+        usize chunk = expected->size - offset > FILESYSTEM_IO_BYTES ? FILESYSTEM_IO_BYTES : (usize)(expected->size - offset);
+        if (!pread_exact(fd, filesystem_io, chunk, offset)) return 0;
+        sha_update(&c, filesystem_io, chunk); offset += chunk;
+    }
+    sha_final(&c, digest);
+    return bytes_equal(digest, expected->digest, 32);
+}
+
+static int open_fixture_role(const char *root, const char *suffix, const struct expected_device *expected,
+                             int require_nonwritable) {
+    char path[PATH_MAX_LOCAL];
+    struct stat_local before, after;
+    i64 fd;
+    int verified;
+    if (!fixture_path(path, root, suffix)) return 0;
+    fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&before) < 0 || (before.mode & S_IFMT) != S_IFREG ||
+        before.nlink != 1 || before.size < 0 || (u64)before.size != expected->size || (before.mode & 0022) ||
+        (require_nonwritable && (before.mode & 0222))) {
+        if (fd >= 0) sc1(SYS_close, fd);
+        return 0;
+    }
+    verified = require_nonwritable ?
+        (verify_squashfs_structure_fd((int)fd, expected) && verify_lower_digest_fd((int)fd, expected)) :
+        verify_ext4_fd((int)fd, expected);
+    if (!verified || sc2(SYS_fstat, fd, (i64)&after) < 0 || before.dev != after.dev ||
+        before.ino != after.ino || before.mode != after.mode || before.nlink != after.nlink ||
+        before.size != after.size) {
+        sc1(SYS_close, fd);
+        return 0;
+    }
+    sc1(SYS_close, fd);
+    return 1;
+}
+
+static int verify_fixture_filesystems(const char *root, const struct expected_device_set *expected) {
+    char suffix[16];
+    u32 i;
+    if (!open_fixture_role(root, "/root.raw", &expected->root, 0)) return 0;
+    for (i = 0; i < expected->lower_count; i++) {
+        memset(suffix, 0, sizeof(suffix));
+        memcpy(suffix, "/lower-", 7);
+        if (i < 10) {
+            suffix[7] = (char)('0' + i);
+            memcpy(suffix + 8, ".raw", 5);
+        } else {
+            suffix[7] = (char)('0' + i / 10);
+            suffix[8] = (char)('0' + i % 10);
+            memcpy(suffix + 9, ".raw", 5);
+        }
+        if (!open_fixture_role(root, suffix, &expected->lowers[i], 1)) return 0;
+    }
+    return 1;
+}
 
 static int parse_u32_decimal(const u8 *p, usize n, u32 *value) {
     u64 v = 0;
@@ -1194,7 +1402,7 @@ static int prepare_live(void) {
            mount_ok("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, 0x01021994);
 }
 
-static int run_consumer(const char *fixture_root) {
+static int run_consumer(const char *fixture_root, int fixture_mode) {
     struct bindings b;
     struct discovered device;
     struct expected_device_set expected;
@@ -1203,7 +1411,7 @@ static int run_consumer(const char *fixture_root) {
     i64 n;
     u32 i, j;
     int transport_fd = -1;
-    int fixture = fixture_root != 0;
+    int fixture = fixture_mode != 0;
     memset(&b, 0, sizeof(b));
     memset(&device, 0, sizeof(device));
     memset(&expected, 0, sizeof(expected));
@@ -1217,7 +1425,9 @@ static int run_consumer(const char *fixture_root) {
     if (!discover(fixture_root, fixture, &b, &device)) return EXIT_DISCOVERY;
     {
         int code = verify_transport(&device, &b, &expected, &transport_fd);
-        if (code || fixture) return code;
+        if (code) return code;
+        if (fixture_mode == 1) return 0;
+        if (fixture_mode == 2) return verify_fixture_filesystems(fixture_root, &expected) ? 0 : EXIT_FILESYSTEM;
     }
     if (!discover_live_role(&expected.root, &roles[0])) return EXIT_DISCOVERY;
     for (i = 0; i < expected.lower_count; i++)
@@ -1245,6 +1455,14 @@ static int run_consumer(const char *fixture_root) {
     for (i = 0; i < expected.lower_count + 1; i++)
         if (!recheck_open_role(&roles[i])) return EXIT_DISCOVERY;
     if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
+    if (!verify_ext4_fd(roles[0].fd, &expected.root)) return EXIT_FILESYSTEM;
+    for (i = 0; i < expected.lower_count; i++)
+        if (!verify_squashfs_structure_fd(roles[i + 1].fd, &expected.lowers[i]) ||
+            !verify_lower_digest_fd(roles[i + 1].fd, &expected.lowers[i])) return EXIT_FILESYSTEM;
+    if (!recheck_open_role(&transport_role)) return EXIT_DISCOVERY;
+    for (i = 0; i < expected.lower_count + 1; i++)
+        if (!recheck_open_role(&roles[i])) return EXIT_DISCOVERY;
+    if (!exact_vd_disk_count(expected.lower_count + 2)) return EXIT_DISCOVERY;
     return 0;
 }
 
@@ -1252,19 +1470,24 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     u64 argc = stack[0];
     char **argv = (char **)(stack + 1);
     i64 pid = sc0(SYS_getpid);
-    int fixture = argc == 3 && text_equal(argv[1], "--fixture-v1") && pid != 1;
+    int fixture_mode = 0;
     int code;
-    if (fixture) {
-        code = run_consumer(argv[2]);
+    if (argc == 3 && pid != 1) {
+        if (text_equal(argv[1], "--fixture-v1")) fixture_mode = 1;
+        else if (text_equal(argv[1], "--fixture-v2")) fixture_mode = 2;
+    }
+    if (fixture_mode) {
+        code = run_consumer(argv[2], fixture_mode);
         if (!code) write_all(1, "palimpsest guest stage1 fixture: verified\n");
         else write_all(2, "palimpsest guest stage1 fixture: rejected\n");
         exit_now(code);
     }
     if (pid != 1) exit_now(EXIT_USAGE);
     if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
-    code = run_consumer(0);
+    code = run_consumer(0, 0);
+    if (code == EXIT_FILESYSTEM) wait_closed("palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
-    wait_closed("palimpsest guest stage1: pre-mount device set verified; root assembly disabled; waiting fail-closed\n");
+    wait_closed("palimpsest guest stage1: filesystem set verified; mount disabled; waiting fail-closed\n");
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {

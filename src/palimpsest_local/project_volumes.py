@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from . import state
-from .errors import LifecycleError, StateError
+from .errors import ArtifactValidationError, LifecycleError, StateError
+from .oci_guest_filesystems import (
+    EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+    EXT4_SUPERBLOCK_BYTES,
+    EXT4_SUPERBLOCK_OFFSET,
+    verify_ext4_superblock,
+)
 from .state import StatePaths
 
 _LOGICAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
@@ -33,6 +39,11 @@ _LIMA_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?\b")
 _MIB = 1024 * 1024
 MIN_VOLUME_BYTES = 16 * _MIB
 MAX_VOLUME_BYTES = 16 * 1024 * 1024 * 1024 * 1024
+OCI_ROOT_EXT4_FEATURES = (
+    "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,"
+    "sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum"
+)
+OCI_ROOT_EXT4_EXTENDED_OPTIONS = "lazy_itable_init=0,lazy_journal_init=0"
 _EXT_SUPERBLOCK_MAGIC_OFFSET = 1024 + 56
 _EXT_SUPERBLOCK_MAGIC = b"\x53\xef"
 _EXT_SUPERBLOCK_INCOMPAT_OFFSET = 1024 + 96
@@ -303,6 +314,62 @@ def _fsync_file(path: Path) -> None:
         raise StateError(f"cannot durably sync volume file: {path}") from exc
 
 
+def _verify_new_oci_root_ext4(path: Path, size_bytes: int, filesystem_uuid: str) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        visible = path.stat(follow_symlinks=False)
+        superblock = os.pread(descriptor, EXT4_SUPERBLOCK_BYTES, EXT4_SUPERBLOCK_OFFSET)
+        identity = verify_ext4_superblock(
+            superblock,
+            device_size=size_bytes,
+            volume_id=filesystem_uuid,
+            filesystem_uuid=filesystem_uuid,
+        )
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        metadata = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != size_bytes
+            or not identity.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM
+            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            != metadata
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise StateError("created OCI-root ext4 volume changed during verification")
+    except ArtifactValidationError:
+        raise StateError("created OCI-root ext4 volume violates the pinned policy") from None
+    except OSError:
+        raise StateError("created OCI-root ext4 volume cannot be pinned") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _ensure_ext4_raw_file_locked(
     path: Path,
     size_bytes: int,
@@ -310,6 +377,7 @@ def _ensure_ext4_raw_file_locked(
     logical_name: str,
     runner: CommandRunner,
     creation_temp_path: Path | None = None,
+    filesystem_uuid: str | None = None,
 ) -> bool:
     """Create or verify one locked raw ext4 artifact at an owner-bound path."""
     if creation_temp_path is not None:
@@ -329,6 +397,8 @@ def _ensure_ext4_raw_file_locked(
             creation_temp_path.unlink()
             state.fsync_directory(path.parent)
             _verify_kvm_path(path, size_bytes, label, runner)
+            if filesystem_uuid is not None:
+                _verify_new_oci_root_ext4(path, size_bytes, filesystem_uuid)
             return True
         if temporary_exists:
             temporary_entry = creation_temp_path.stat(follow_symlinks=False)
@@ -342,6 +412,8 @@ def _ensure_ext4_raw_file_locked(
             state.fsync_directory(path.parent)
     if path.exists() or path.is_symlink():
         _verify_kvm_path(path, size_bytes, label, runner)
+        if filesystem_uuid is not None:
+            _verify_new_oci_root_ext4(path, size_bytes, filesystem_uuid)
         return False
 
     _preflight_kvm_tools(runner)
@@ -371,13 +443,44 @@ def _ensure_ext4_raw_file_locked(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
+        mkfs_command = ["mkfs.ext4", "-F", "-q", "-L", label]
+        if filesystem_uuid is not None:
+            try:
+                canonical_uuid = str(uuid.UUID(filesystem_uuid))
+            except (AttributeError, TypeError, ValueError):
+                raise StateError("KVM volume filesystem UUID is invalid") from None
+            if canonical_uuid != filesystem_uuid:
+                raise StateError("KVM volume filesystem UUID is not canonical")
+            mkfs_command.extend(
+                (
+                    "-U",
+                    canonical_uuid,
+                    "-b",
+                    "4096",
+                    "-I",
+                    "256",
+                    "-g",
+                    "32768",
+                    "-i",
+                    "16384",
+                    "-m",
+                    "0",
+                    "-O",
+                    OCI_ROOT_EXT4_FEATURES,
+                    "-E",
+                    OCI_ROOT_EXT4_EXTENDED_OPTIONS,
+                )
+            )
+        mkfs_command.append(str(temporary))
         _run_required(
             runner,
-            ["mkfs.ext4", "-F", "-q", "-L", label, str(temporary)],
+            mkfs_command,
             f"format KVM volume {logical_name}",
         )
         _fsync_file(temporary)
         _verify_kvm_path(temporary, size_bytes, label, runner)
+        if filesystem_uuid is not None:
+            _verify_new_oci_root_ext4(temporary, size_bytes, filesystem_uuid)
 
         try:
             os.link(temporary, path, follow_symlinks=False)

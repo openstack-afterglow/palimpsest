@@ -21,6 +21,7 @@ from typing import Any
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
+from .oci_guest_filesystems import EXT4_SUPERBLOCK_BYTES, EXT4_SUPERBLOCK_OFFSET, verify_ext4_superblock
 from .oci_store import ArtifactLeaseOwner
 from .project_volumes import (
     CommandRunner,
@@ -223,9 +224,14 @@ class ClaimedOCIRootVolume:
 class VerifiedOCIRootVolume:
     record: OCIRootVolumeRecord
     path: Path
+    filesystem_uuid: str
 
     def __post_init__(self) -> None:
-        if not self.path.is_absolute():
+        try:
+            canonical_uuid = str(uuid.UUID(self.filesystem_uuid))
+        except (AttributeError, TypeError, ValueError):
+            raise StateError("verified OCI-root filesystem UUID is invalid") from None
+        if not self.path.is_absolute() or canonical_uuid != self.filesystem_uuid:
             raise StateError("verified OCI-root volume path is invalid")
 
 
@@ -413,6 +419,7 @@ def claim_oci_root_volume(
                     volume_id,
                     runner,
                     creation_temp_path=_creation_temporary(roots, volume_id),
+                    filesystem_uuid=volume_id,
                 )
                 attached = OCIRootVolumeRecord(
                     volume_id,
@@ -470,6 +477,7 @@ def claim_oci_root_volume(
                 volume_id,
                 runner,
                 creation_temp_path=_creation_temporary(roots, volume_id),
+                filesystem_uuid=volume_id,
             )
             if not created:
                 raise StateError("OCI-root volume appeared without an owner record")
@@ -512,8 +520,63 @@ def load_oci_root_volume(
         record = _read_record(directory_fd, record_path)
         if record.status in {"creating", "deleting"}:
             raise StateError("OCI-root volume lifecycle is incomplete")
-        _verify_kvm_path(path, record.size_bytes, oci_root_volume_label(volume_id), runner)
-        return VerifiedOCIRootVolume(record, path)
+        file_fd: int | None = None
+        try:
+            entry = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            file_fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+            opened = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or not stat.S_ISREG(opened.st_mode)
+                or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+                or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_size != record.size_bytes
+            ):
+                raise StateError("OCI-root volume data file is unsafe")
+            _verify_kvm_path(path, record.size_bytes, oci_root_volume_label(volume_id), runner)
+            visible = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            if (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
+                raise StateError("OCI-root volume data file changed during verification")
+            superblock = os.pread(file_fd, EXT4_SUPERBLOCK_BYTES, EXT4_SUPERBLOCK_OFFSET)
+            filesystem_uuid = str(uuid.UUID(bytes=superblock[104:120]))
+            verify_ext4_superblock(
+                superblock,
+                device_size=record.size_bytes,
+                volume_id=record.volume_id,
+                filesystem_uuid=filesystem_uuid,
+            )
+            after = os.fstat(file_fd)
+            current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise StateError("OCI-root volume data file changed during verification")
+        except StateError:
+            raise
+        except (OSError, ValueError, ArtifactValidationError):
+            raise StateError("OCI-root volume ext4 identity is invalid") from None
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+        return VerifiedOCIRootVolume(record, path, filesystem_uuid)
 
 
 def release_oci_root_volume(

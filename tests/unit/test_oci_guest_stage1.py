@@ -38,6 +38,7 @@ def _plan() -> OCIStage1Plan:
         domain_core_digest="sha256:" + "b" * 64,
         root={
             "filesystem": "ext4",
+            "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
             "generation": 3,
             "mount_options": ["rw", "nodev", "nosuid"],
             "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),

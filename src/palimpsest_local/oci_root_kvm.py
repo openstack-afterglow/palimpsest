@@ -48,8 +48,8 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v3"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v1"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v4"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v2"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
@@ -376,6 +376,7 @@ class OCIRootDomainPlan:
         root = dict(self.root_volume) if isinstance(self.root_volume, Mapping) else {}
         if set(root) != {
             "filesystem",
+            "filesystem_uuid",
             "generation",
             "serial",
             "size_bytes",
@@ -385,10 +386,12 @@ class OCIRootDomainPlan:
             raise StateError("OCI-root domain root volume fields are invalid")
         try:
             volume_id = str(uuid.UUID(root.get("volume_id", "")))
+            filesystem_uuid = str(uuid.UUID(root.get("filesystem_uuid", "")))
         except (AttributeError, TypeError, ValueError):
             raise StateError("OCI-root domain root volume ID is invalid") from None
         if (
             volume_id != root["volume_id"]
+            or filesystem_uuid != root["filesystem_uuid"]
             or root["filesystem"] != "ext4"
             or root["target"] != "vda"
             or _SERIAL_RE.fullmatch(root["serial"] if isinstance(root["serial"], str) else "") is None
@@ -677,6 +680,7 @@ def build_oci_root_domain_plan(
     root_serial = _serial("root", root.volume_id)
     root_contract = {
         "filesystem": "ext4",
+        "filesystem_uuid": verified_root.filesystem_uuid,
         "generation": root.generation,
         "serial": root_serial,
         "size_bytes": root.size_bytes,
@@ -860,6 +864,7 @@ def commit_oci_root_domain_plan(
     root = verified_root.record
     expected_root = {
         "filesystem": "ext4",
+        "filesystem_uuid": verified_root.filesystem_uuid,
         "generation": root.generation,
         "serial": _serial("root", root.volume_id),
         "size_bytes": root.size_bytes,

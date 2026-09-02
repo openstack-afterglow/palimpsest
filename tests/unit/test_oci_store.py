@@ -40,6 +40,7 @@ from palimpsest_local.oci_converter import (
     LAYER_INTAKE_POLICY_ID,
     LayerIntakeReceipt,
 )
+from palimpsest_local.oci_guest_filesystems import ext4_primary_superblock_checksum
 from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
 from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
@@ -1586,13 +1587,25 @@ class _RootVolumeTools:
         if argv[0] == "mkfs.ext4":
             path = Path(argv[-1])
             label = argv[argv.index("-L") + 1]
+            filesystem_uuid = argv[argv.index("-U") + 1] if "-U" in argv else str(uuid.UUID(int=0))
+            superblock = bytearray(1024)
+            superblock[0:4] = (4096).to_bytes(4, "little")
+            superblock[4:8] = (_ROOT_VOLUME_SIZE // 4096).to_bytes(4, "little")
+            superblock[24:28] = (2).to_bytes(4, "little")
+            superblock[32:36] = (32768).to_bytes(4, "little")
+            superblock[40:44] = (4096).to_bytes(4, "little")
+            superblock[56:58] = b"\x53\xef"
+            superblock[76:80] = (1).to_bytes(4, "little")
+            superblock[88:90] = (256).to_bytes(2, "little")
+            superblock[96:100] = (0x42).to_bytes(4, "little")
+            superblock[100:104] = (0x400).to_bytes(4, "little")
+            superblock[104:120] = uuid.UUID(filesystem_uuid).bytes
+            superblock[120:136] = label.encode("ascii").ljust(16, b"\0")
+            superblock[0x175] = 1
+            superblock[1020:1024] = ext4_primary_superblock_checksum(bytes(superblock)).to_bytes(4, "little")
             with path.open("r+b") as stream:
-                stream.seek(1024 + 56)
-                stream.write(b"\x53\xef")
-                stream.seek(1024 + 96)
-                stream.write((0x40).to_bytes(4, "little"))
-                stream.seek(1024 + 120)
-                stream.write(label.encode("ascii").ljust(16, b"\0"))
+                stream.seek(1024)
+                stream.write(superblock)
                 stream.flush()
                 os.fsync(stream.fileno())
             return subprocess.CompletedProcess(argv, 0, "", "")

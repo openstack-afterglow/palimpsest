@@ -26,7 +26,7 @@ packages = ["src/palimpsest_local"]
 markers = [
     "buildkit_e2e: requires Docker Buildx and a running docker-container builder",
     "guest_stage1_binary: executes the packaged freestanding x86_64 stage-1 ELF under Docker",
-    "stage1_kvm: requires native Linux x86_64 KVM for the actual PID1 pre-mount device-set proof",
+    "stage1_kvm: requires native Linux x86_64 KVM for actual PID1 block/filesystem proof matrices",
     "oci_root_e2e: requires Linux KVM and an OCI-root capable Palimpsest runtime",
     "kvm: requires a Linux host with KVM, libvirt, and guest fixtures",
     "oci_fs: requires Linux root and filesystem tools for privileged OverlayFS testing",

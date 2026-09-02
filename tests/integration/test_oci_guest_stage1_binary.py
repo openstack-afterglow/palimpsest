@@ -11,7 +11,21 @@ from pathlib import Path
 
 import pytest
 
+from palimpsest_local._oci_stage1_kvm_proof import (
+    FILESYSTEM_NEGATIVE_CONTROL_NAMES,
+    _filesystem_negative_context,
+    _mutated_filesystem_payload,
+    build_proof_plan,
+    load_proof_filesystems,
+)
 from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.oci_guest_filesystems import (
+    EXT4_SUPERBLOCK_BYTES,
+    EXT4_SUPERBLOCK_OFFSET,
+    ext4_primary_superblock_checksum,
+    verify_ext4_superblock,
+    verify_lower_device,
+)
 from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import canonical_json_bytes
@@ -67,6 +81,7 @@ def _plan(*, environment_name: str = "LANG") -> OCIStage1Plan:
         domain_core_digest="sha256:" + "b" * 64,
         root={
             "filesystem": "ext4",
+            "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
             "generation": 10**80,
             "mount_options": ["rw", "nodev", "nosuid"],
             "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
@@ -133,6 +148,22 @@ def _write_fixture(root: Path, plan: OCIStage1Plan, artifact: bytes) -> None:
         directory.chmod(0o755)
 
 
+def _write_filesystem_fixture(
+    root: Path, plan: OCIStage1Plan | None = None
+) -> tuple[OCIStage1Plan, bytes, tuple[bytes, bytes]]:
+    plan = build_proof_plan() if plan is None else plan
+    filesystems = load_proof_filesystems()
+    built = build_stage1_transport(plan)
+    _write_fixture(root, plan, built.artifact)
+    (root / "root.raw").write_bytes(filesystems.root)
+    (root / "root.raw").chmod(0o644)
+    for index, payload in enumerate(filesystems.lowers):
+        path = root / f"lower-{index}.raw"
+        path.write_bytes(payload)
+        path.chmod(0o444)
+    return plan, filesystems.root, filesystems.lowers
+
+
 @pytest.fixture(scope="module")
 def scratch_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     context = tmp_path_factory.mktemp("guest-stage1-image")
@@ -154,7 +185,7 @@ def scratch_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     subprocess.run(["docker", "image", "rm", "--force", image], check=False, capture_output=True)
 
 
-def _run(image: str, fixture: Path) -> subprocess.CompletedProcess[str]:
+def _run(image: str, fixture: Path, *, mode: str = "--fixture-v1") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "docker",
@@ -175,7 +206,7 @@ def _run(image: str, fixture: Path) -> subprocess.CompletedProcess[str]:
             "--mount",
             f"type=bind,src={fixture.resolve()},dst=/fixture,readonly",
             image,
-            "--fixture-v1",
+            mode,
             "/fixture",
         ],
         check=False,
@@ -217,6 +248,143 @@ def test_freestanding_binary_matches_python_reference_for_canonical_unicode_fixt
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == "palimpsest guest stage1 fixture: verified\n"
+
+
+def test_freestanding_binary_fixture_v2_matches_portable_filesystem_verifiers(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    plan, root, lowers = _write_filesystem_fixture(tmp_path)
+    for index, payload in enumerate(lowers):
+        verify_lower_device(payload, expected_digest=plan.layers[index]["image_digest"])
+    verify_ext4_superblock(
+        root[EXT4_SUPERBLOCK_OFFSET : EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_BYTES],
+        device_size=len(root),
+        volume_id=plan.root["volume_id"],
+        filesystem_uuid=plan.root["filesystem_uuid"],
+    )
+
+    completed = _run(scratch_image, tmp_path, mode="--fixture-v2")
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "palimpsest guest stage1 fixture: verified\n"
+
+    negative = tmp_path.with_name(tmp_path.name + "-digest-mismatch")
+    shutil.copytree(tmp_path, negative)
+    lower = negative / "lower-0.raw"
+    changed = bytearray(lower.read_bytes())
+    changed[128] ^= 1
+    lower.chmod(0o644)
+    lower.write_bytes(changed)
+    lower.chmod(0o444)
+    with pytest.raises(ArtifactValidationError, match="digest"):
+        verify_lower_device(bytes(changed), expected_digest=plan.layers[0]["image_digest"])
+    assert _run(scratch_image, negative, mode="--fixture-v2").returncode == 69
+
+    writable_root = tmp_path.with_name(tmp_path.name + "-writable-root")
+    shutil.copytree(tmp_path, writable_root)
+    (writable_root / "root.raw").chmod(0o666)
+    assert _run(scratch_image, writable_root, mode="--fixture-v2").returncode == 69
+
+    writable_lower = tmp_path.with_name(tmp_path.name + "-writable-lower")
+    shutil.copytree(tmp_path, writable_lower)
+    (writable_lower / "lower-0.raw").chmod(0o644)
+    assert _run(scratch_image, writable_lower, mode="--fixture-v2").returncode == 69
+
+
+@pytest.mark.parametrize("control_name", FILESYSTEM_NEGATIVE_CONTROL_NAMES)
+def test_fixture_v2_python_and_elf_reject_the_same_filesystem_negative_matrix(
+    scratch_image: str,
+    tmp_path: Path,
+    control_name: str,
+) -> None:
+    control_plan, _control_transport = _filesystem_negative_context(control_name)
+    plan, root, _lowers = _write_filesystem_fixture(tmp_path, control_plan)
+    backing_name, mutation = _mutated_filesystem_payload(control_name)
+    path = tmp_path / ("root.raw" if backing_name == "root" else "lower-0.raw")
+    path.chmod(0o644)
+    path.write_bytes(mutation)
+    path.chmod(0o644 if backing_name == "root" else 0o444)
+
+    if backing_name == "root":
+        with pytest.raises(ArtifactValidationError):
+            verify_ext4_superblock(
+                mutation[EXT4_SUPERBLOCK_OFFSET : EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_BYTES],
+                device_size=len(root),
+                volume_id=plan.root["volume_id"],
+                filesystem_uuid=plan.root["filesystem_uuid"],
+            )
+    else:
+        with pytest.raises(ArtifactValidationError):
+            verify_lower_device(mutation, expected_digest=plan.layers[0]["image_digest"])
+
+    completed = _run(scratch_image, tmp_path, mode="--fixture-v2")
+    assert completed.returncode == 69, (completed.stdout, completed.stderr)
+
+
+def test_fixture_v2_python_and_elf_require_ext4_crc32c_checksum_type(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    plan, root, _lowers = _write_filesystem_fixture(tmp_path)
+    changed = bytearray(root)
+    superblock = bytearray(changed[EXT4_SUPERBLOCK_OFFSET : EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_BYTES])
+    superblock[0x175] = 0
+    superblock[1020:1024] = ext4_primary_superblock_checksum(bytes(superblock)).to_bytes(4, "little")
+    changed[EXT4_SUPERBLOCK_OFFSET : EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_BYTES] = superblock
+    root_path = tmp_path / "root.raw"
+    root_path.write_bytes(changed)
+    root_path.chmod(0o644)
+
+    with pytest.raises(ArtifactValidationError, match="checksum type"):
+        verify_ext4_superblock(
+            bytes(superblock),
+            device_size=len(changed),
+            volume_id=plan.root["volume_id"],
+            filesystem_uuid=plan.root["filesystem_uuid"],
+        )
+    assert _run(scratch_image, tmp_path, mode="--fixture-v2").returncode == 69
+
+
+def test_freestanding_binary_fixture_v2_supports_all_two_digit_lower_ordinals(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    base = build_proof_plan()
+    filesystems = load_proof_filesystems()
+    layers = tuple(
+        {
+            "filesystem": "squashfs",
+            "image_digest": base.layers[0]["image_digest"],
+            "mount_options": ["ro", "nodev", "nosuid"],
+            "occurrence_digest": f"sha256:{ordinal + 1:064x}",
+            "ordinal": ordinal,
+            "serial": oci_stage1_device_serial("lower", f"sha256:{ordinal + 1:064x}"),
+            "size_bytes": len(filesystems.lowers[0]),
+        }
+        for ordinal in range(24)
+    )
+    plan = OCIStage1Plan(
+        base.run_id,
+        base.run_name,
+        base.boot_plan_digest,
+        base.domain_core_digest,
+        base.root,
+        layers,
+        base.process,
+    )
+    built = build_stage1_transport(plan)
+    _write_fixture(tmp_path, plan, built.artifact)
+    (tmp_path / "root.raw").write_bytes(filesystems.root)
+    (tmp_path / "root.raw").chmod(0o644)
+    for ordinal in range(24):
+        path = tmp_path / f"lower-{ordinal}.raw"
+        path.write_bytes(filesystems.lowers[0])
+        path.chmod(0o444)
+
+    completed = _run(scratch_image, tmp_path, mode="--fixture-v2")
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_freestanding_binary_matches_reference_for_large_valid_environment_name(

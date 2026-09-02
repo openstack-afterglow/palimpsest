@@ -1,9 +1,9 @@
 """First-party guest consumer for the OCI stage-1 plan transport.
 
-This module is the portable reference contract shared with the packaged
-freestanding x86_64 ``/init`` implementation.  Both deliberately stop after
-validating the plan against trusted kernel-command-line bindings: no OCI
-filesystem is mounted and no process from the image is executed.
+This module is the portable transport and block-role reference shared with the
+packaged freestanding x86_64 ``/init`` implementation. Filesystem byte parsing
+lives in :mod:`oci_guest_filesystems`; neither boundary mounts a filesystem or
+executes a process from the image.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCI_STAGE1_DEVICE_POLICY, OCI_STAGE1_PLAN_SCHEMA, OCI_STAGE1_PROTOCOL, OCIStage1Plan
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v2"
-OCI_GUEST_STAGE1_CAPABILITY = "pre-mount-device-set-consumer-fail-closed"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v3"
+OCI_GUEST_STAGE1_CAPABILITY = "pre-mount-filesystem-set-consumer-fail-closed"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64
@@ -376,8 +376,8 @@ def discover_stage1_block_device(
     """Discover one read-only ``vd*`` candidate through canonical sysfs links.
 
     This portable boundary validates the libvirt virtio target-name convention,
-    serial and sysfs read-only bit.  Driver-chain and opened block-node ioctl
-    identity remain requirements of the future freestanding Linux consumer.
+    serial and sysfs read-only bit. Driver-chain and opened block-node ioctl
+    identity are enforced by the freestanding Linux consumer and its KVM gate.
     """
 
     if (

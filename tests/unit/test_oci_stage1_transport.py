@@ -40,6 +40,7 @@ def _plan(*, run_name: str = "transport-demo", layers: int = 2) -> OCIStage1Plan
         domain_core_digest="sha256:" + "b" * 64,
         root={
             "filesystem": "ext4",
+            "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
             "generation": 3,
             "mount_options": ["rw", "nodev", "nosuid"],
             "serial": oci_stage1_device_serial("root", "1fd7a60e-fdb2-4877-91d3-148bbca3884f"),
@@ -111,7 +112,8 @@ from palimpsest_local.oci_stage1_transport import build_stage1_transport
 plan = OCIStage1Plan(
     run_id="f6f546e2-e734-4920-9eff-1762b348a249", run_name="transport-demo",
     boot_plan_digest="sha256:" + "a" * 64, domain_core_digest="sha256:" + "b" * 64,
-    root={"filesystem":"ext4","generation":3,"mount_options":["rw","nodev","nosuid"],
+    root={"filesystem":"ext4","filesystem_uuid":"1fd7a60e-fdb2-4877-91d3-148bbca3884f",
+          "generation":3,"mount_options":["rw","nodev","nosuid"],
           "serial":oci_stage1_device_serial("root","1fd7a60e-fdb2-4877-91d3-148bbca3884f"),"size_bytes":16777216,
           "volume_id":"1fd7a60e-fdb2-4877-91d3-148bbca3884f"},
     layers=tuple({"filesystem":"squashfs","image_digest":f"sha256:{i+2:064x}",

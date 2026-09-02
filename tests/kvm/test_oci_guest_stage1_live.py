@@ -10,6 +10,8 @@ import pytest
 from palimpsest_local._oci_stage1_kvm_proof import (
     EVIDENCE_ENV,
     EVIDENCE_FILE_NAMES,
+    FILESYSTEM_NEGATIVE_CONTROL_NAMES,
+    FILESYSTEM_REJECTION_MARKER,
     NEGATIVE_CONTROL_NAMES,
     PREPARATION_FAILURE_MARKER,
     REJECTION_MARKER,
@@ -21,7 +23,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
 pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
 
 
-def test_packaged_stage1_runs_as_pid1_and_rejects_the_full_premount_device_matrix() -> None:
+def test_packaged_stage1_verifies_filesystems_and_rejects_topology_and_filesystem_matrices() -> None:
     if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
         pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
 
@@ -37,14 +39,23 @@ def test_packaged_stage1_runs_as_pid1_and_rejects_the_full_premount_device_matri
     }
     assert receipt["root_assembly"] is False
     assert receipt["pre_mount_devices"] is True
-    assert receipt["filesystem_verified"] is False
-    assert receipt["content_verified"] is False
+    assert receipt["filesystem_verified"] is True
+    assert receipt["root_filesystem_verified"] is True
+    assert receipt["root_content_verified"] is False
+    assert receipt["lower_filesystem_verified"] is True
+    assert receipt["lower_content_verified"] is True
     assert receipt["mount_attempted"] is False
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
     assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
     for console in result.negative_consoles.values():
         assert _logical_line_count(console, REJECTION_MARKER) == 1
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+    assert set(result.filesystem_negative_consoles) == set(FILESYSTEM_NEGATIVE_CONTROL_NAMES)
+    for console in result.filesystem_negative_consoles.values():
+        assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, REJECTION_MARKER) == 0
         assert _logical_line_count(console, SUCCESS_MARKER) == 0
         assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
 

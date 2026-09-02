@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import uuid
 from dataclasses import replace
@@ -11,16 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from palimpsest_local import oci_root_volume, state
+from palimpsest_local import oci_root_volume, project_volumes, state
 from palimpsest_local.errors import StateError
+from palimpsest_local.oci_guest_filesystems import ext4_primary_superblock_checksum
 from palimpsest_local.oci_store import ArtifactLeaseOwner
 
 MIB = 1024 * 1024
 VOLUME_SIZE = 16 * MIB
 GRAPH_A = "sha256:" + "a" * 64
 GRAPH_B = "sha256:" + "b" * 64
-EXT4_MAGIC_OFFSET = 1024 + 56
-EXT4_INCOMPAT_OFFSET = 1024 + 96
 
 
 @pytest.fixture
@@ -41,14 +41,25 @@ def _completed(argv: list[str], stdout: str = "") -> subprocess.CompletedProcess
     return subprocess.CompletedProcess(argv, 0, stdout, "")
 
 
-def _write_ext4_magic(path: Path, label: str) -> None:
+def _write_ext4_magic(path: Path, label: str, filesystem_uuid: str) -> None:
+    superblock = bytearray(1024)
+    superblock[0:4] = (4096).to_bytes(4, "little")
+    superblock[4:8] = (VOLUME_SIZE // 4096).to_bytes(4, "little")
+    superblock[24:28] = (2).to_bytes(4, "little")
+    superblock[32:36] = (32768).to_bytes(4, "little")
+    superblock[40:44] = (4096).to_bytes(4, "little")
+    superblock[56:58] = b"\x53\xef"
+    superblock[76:80] = (1).to_bytes(4, "little")
+    superblock[88:90] = (256).to_bytes(2, "little")
+    superblock[96:100] = (0x42).to_bytes(4, "little")
+    superblock[100:104] = (0x400).to_bytes(4, "little")
+    superblock[104:120] = uuid.UUID(filesystem_uuid).bytes
+    superblock[120:136] = label.encode("ascii").ljust(16, b"\0")
+    superblock[0x175] = 1
+    superblock[1020:1024] = ext4_primary_superblock_checksum(bytes(superblock)).to_bytes(4, "little")
     with path.open("r+b") as stream:
-        stream.seek(EXT4_MAGIC_OFFSET)
-        stream.write(b"\x53\xef")
-        stream.seek(EXT4_INCOMPAT_OFFSET)
-        stream.write((0x40).to_bytes(4, byteorder="little"))
-        stream.seek(1024 + 120)
-        stream.write(label.encode("ascii").ljust(16, b"\0"))
+        stream.seek(1024)
+        stream.write(superblock)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -58,6 +69,7 @@ class FakeKvmTools:
         self.calls: list[list[str]] = []
         self.info_format = "raw"
         self.backing_file: str | None = None
+        self.bad_checksum_type = False
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
@@ -66,7 +78,16 @@ class FakeKvmTools:
         if argv == ["mkfs.ext4", "-V"]:
             return _completed(argv, "mke2fs 1.47\n")
         if argv[0] == "mkfs.ext4":
-            _write_ext4_magic(Path(argv[-1]), argv[argv.index("-L") + 1])
+            path = Path(argv[-1])
+            _write_ext4_magic(path, argv[argv.index("-L") + 1], argv[argv.index("-U") + 1])
+            if self.bad_checksum_type:
+                with path.open("r+b") as stream:
+                    stream.seek(1024)
+                    superblock = bytearray(stream.read(1024))
+                    superblock[0x175] = 0
+                    superblock[1020:1024] = ext4_primary_superblock_checksum(bytes(superblock)).to_bytes(4, "little")
+                    stream.seek(1024)
+                    stream.write(superblock)
             return _completed(argv)
         if argv[:3] == ["qemu-img", "info", "--output=json"]:
             path = Path(argv[-1])
@@ -113,10 +134,65 @@ def test_new_root_volume_is_formatted_owned_and_idempotently_claimed(roots: stat
     assert second.record == first.record
     assert state.permission_bits(first.path) == 0o600
     assert first.path.stat().st_size == VOLUME_SIZE
+    mkfs_call = next(call for call in tools.calls if call[0] == "mkfs.ext4" and "-U" in call)
+    assert mkfs_call[mkfs_call.index("-U") + 1] == volume_id
+    assert [mkfs_call[index + 1] for index, item in enumerate(mkfs_call) if item == "-O"] == [
+        project_volumes.OCI_ROOT_EXT4_FEATURES
+    ]
+    assert mkfs_call[mkfs_call.index("-E") + 1] == project_volumes.OCI_ROOT_EXT4_EXTENDED_OPTIONS
+    assert mkfs_call[mkfs_call.index("-b") + 1] == "4096"
+    assert mkfs_call[mkfs_call.index("-I") + 1] == "256"
+    assert mkfs_call[mkfs_call.index("-g") + 1] == "32768"
+    assert mkfs_call[mkfs_call.index("-i") + 1] == "16384"
     assert oci_root_volume.load_oci_root_volume(roots, volume_id, runner=tools).record == first.record
     assert oci_root_volume.list_oci_root_volume_records(roots) == (first.record,)
     with pytest.raises(StateError, match="generation"):
         replace(first.record, generation=oci_root_volume.MAX_OCI_ROOT_VOLUME_GENERATION + 1)
+
+
+@pytest.mark.parametrize("swap_kind", ["rename", "symlink"])
+def test_root_volume_load_rejects_same_uid_path_swap_after_external_probe(
+    roots: state.StatePaths,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_kind: str,
+) -> None:
+    tools = FakeKvmTools()
+    claimed = _claim(roots, tools, _owner())
+    path = claimed.path
+    saved = path.with_name(path.name + ".original")
+    replacement = path.with_name(path.name + ".replacement")
+    shutil.copyfile(path, replacement)
+    replacement.chmod(0o600)
+    original_verify = oci_root_volume._verify_kvm_path
+
+    def swap_after_probe(*args: object, **kwargs: object) -> None:
+        original_verify(*args, **kwargs)  # type: ignore[arg-type]
+        os.replace(path, saved)
+        if swap_kind == "rename":
+            os.replace(replacement, path)
+        else:
+            path.symlink_to(saved.name)
+
+    monkeypatch.setattr(oci_root_volume, "_verify_kvm_path", swap_after_probe)
+    with pytest.raises(StateError, match="changed during verification"):
+        oci_root_volume.load_oci_root_volume(roots, claimed.record.volume_id, runner=tools)
+
+    if path.is_symlink() or path.exists():
+        path.unlink()
+    os.replace(saved, path)
+    replacement.unlink(missing_ok=True)
+
+
+def test_new_root_policy_failure_rolls_back_record_and_unpublished_data(roots: state.StatePaths) -> None:
+    tools = FakeKvmTools()
+    tools.bad_checksum_type = True
+    volume_id = str(uuid.uuid4())
+
+    with pytest.raises(StateError, match="pinned policy"):
+        _claim(roots, tools, _owner(), volume_id=volume_id)
+
+    assert oci_root_volume.list_oci_root_volume_records(roots) == ()
+    assert not any(path.name.endswith(".raw") for path in roots.oci_root_volumes.iterdir())
 
 
 def test_new_root_owner_intent_is_durable_before_raw_creation(

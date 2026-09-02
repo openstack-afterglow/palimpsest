@@ -1,0 +1,37 @@
+{
+  "artifacts": {
+    "lower0": {
+      "base64_file": "lower0.squashfs.b64",
+      "raw_sha256": "496c4af5e04571966cc8c66762ce95db84f291197e9ac3df5d37e9b7256413c6",
+      "raw_size_bytes": 4096
+    },
+    "lower1": {
+      "base64_file": "lower1.squashfs.b64",
+      "raw_sha256": "5f9899075df21604a8402da6d1c4bde1cdabc78d8d525a0ab910e82dd89b94af",
+      "raw_size_bytes": 4096
+    },
+    "root": {
+      "base64_file": "root-ext4.raw.gz.b64",
+      "compression": "gzip",
+      "compressed_sha256": "29f0a7f99f27546bed35e4e681a45ffe847e0a7b3316136f50ea73404162168d",
+      "filesystem_label": "pali-root-e3f97d",
+      "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
+      "raw_sha256": "ef607002f63f445491b659898009ff1322affe8a8ff6ef980b6b30af34ca6cf7",
+      "raw_size_bytes": 16777216
+    }
+  },
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v1",
+  "provenance": {
+    "lower_builder": {
+      "argv_policy": "mksquashfs source output -noappend -xattrs -mkfs-time 0 -all-time 0 -all-root -processors 1 -no-progress",
+      "executable_sha256": "0e2bc38611d42bd385112d4f72e5030a7b79df59d34079c9b00dec7109237c30",
+      "version": "mksquashfs 4.7.5"
+    },
+    "root_builder": {
+      "container_image": "ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
+      "lazy_initialization": false,
+      "version": "mke2fs 1.47.0"
+    }
+  },
+  "schema": "palimpsest.kvm-filesystem-fixtures.v1"
+}

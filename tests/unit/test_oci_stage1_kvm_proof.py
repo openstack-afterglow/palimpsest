@@ -14,6 +14,8 @@ import pytest
 from palimpsest_local._oci_stage1_kvm_proof import (
     _REQUIRED_KERNEL_CONFIG,
     EVIDENCE_FILE_NAMES,
+    FILESYSTEM_NEGATIVE_CONTROL_NAMES,
+    FILESYSTEM_REJECTION_MARKER,
     NEGATIVE_CONTROL_NAMES,
     PREPARATION_FAILURE_MARKER,
     REJECTION_MARKER,
@@ -24,10 +26,12 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     _logical_line_count,
     _read_console_until,
     _secure_write,
+    build_filesystem_negative_qemu_command,
     build_kernel_cmdline,
     build_negative_qemu_command,
     build_proof_plan,
     build_qemu_command,
+    filesystem_negative_control_contract,
     negative_control_contract,
     pre_mount_topology,
     transport_serial,
@@ -35,6 +39,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     verify_kernel_config,
     verify_kernel_configuration_selection,
     verify_linux_bzimage,
+    verify_proof_filesystem_manifest,
 )
 from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_initramfs import build_bootstrap_initramfs
@@ -49,6 +54,10 @@ def _write(path: Path, payload: bytes, mode: int = 0o644) -> Path:
 
 def _negative_consoles() -> dict[str, bytes]:
     return {name: b"kernel boot\n" + REJECTION_MARKER + b"\n" for name in NEGATIVE_CONTROL_NAMES}
+
+
+def _filesystem_negative_consoles() -> dict[str, bytes]:
+    return {name: b"kernel boot\n" + FILESYSTEM_REJECTION_MARKER + b"\n" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES}
 
 
 def _receipt() -> OCIStage1KVMProofReceipt:
@@ -71,6 +80,7 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         b"QEMU emulator version 9.2.0\n",
         b"kernel boot\r\n" + SUCCESS_MARKER + b"\r\n",
         _negative_consoles(),
+        _filesystem_negative_consoles(),
     )
 
 
@@ -158,6 +168,15 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
     )
 
 
+def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
+    topology = pre_mount_topology(build_proof_plan())
+    manifest_digest = topology["fixture_manifest_digest"]
+    assert manifest_digest == "sha256:d8a754816989d50339d47f11b84b2839b337903dcda86762099ef4f00a68c04f"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v1"
+    with pytest.raises(ArtifactValidationError, match="fixture policy"):
+        verify_proof_filesystem_manifest({"schema": "palimpsest.kvm-filesystem-fixtures.v1"})
+
+
 @pytest.mark.parametrize("control_name", NEGATIVE_CONTROL_NAMES)
 def test_each_negative_control_has_exact_path_free_contract_and_qemu_mutation(
     tmp_path: Path,
@@ -214,6 +233,70 @@ def test_negative_controls_cover_every_required_topology_mutation() -> None:
     assert by_name["writable_transport"][("transport", None)]["read_only"] is False
 
 
+@pytest.mark.parametrize("control_name", FILESYSTEM_NEGATIVE_CONTROL_NAMES)
+def test_each_filesystem_negative_has_same_topology_and_one_exact_byte_contract(
+    tmp_path: Path,
+    control_name: str,
+) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    contract = filesystem_negative_control_contract(control_name)
+    backing_paths = {name: (tmp_path / name).resolve() for name in contract["backings"]}
+    command = build_filesystem_negative_qemu_command(
+        qemu_path=(tmp_path / "qemu").resolve(),
+        kernel_path=(tmp_path / "kernel").resolve(),
+        initramfs_path=(tmp_path / "initrd").resolve(),
+        backing_paths=backing_paths,
+        cmdline=contract["cmdline"],
+        control=contract,
+    )
+
+    assert contract["policy"] == "palimpsest.stage1-kvm-filesystem-negative-control.v1"
+    assert set(contract) == {
+        "attachments",
+        "backings",
+        "cmdline",
+        "digest",
+        "name",
+        "policy",
+        "stage1_plan",
+        "stage1_transport",
+    }
+    assert len(contract["attachments"]) == 4
+    assert all(item["read_only"] is (item["role"] != "root") for item in contract["attachments"])
+    assert tuple(item["role"] for item in contract["attachments"]) == (
+        "lower",
+        "transport",
+        "root",
+        "lower",
+    )
+    assert command[command.index("-accel") + 1] == "kvm"
+    assert command[command.index("-append") + 1] == contract["cmdline"]
+    assert "accel=tcg" not in " ".join(command)
+    transport_attachment = next(item for item in contract["attachments"] if item["role"] == "transport")
+    assert transport_attachment["serial"] == contract["stage1_transport"]["serial"]
+    assert contract["backings"]["transport"]["artifact_digest"] == contract["stage1_transport"]["artifact_digest"]
+    if control_name in {"lower_bad_magic", "lower_bad_structure"}:
+        assert contract["stage1_plan"] != plan.to_dict()
+        assert contract["cmdline"] != build_kernel_cmdline(plan, transport)
+        assert (
+            contract["stage1_plan"]["assembly"]["layers"][0]["image_digest"]
+            == contract["backings"]["lower0"]["artifact_digest"]
+        )
+    else:
+        assert contract["stage1_plan"] == plan.to_dict()
+
+    with pytest.raises(ArtifactValidationError, match="cmdline"):
+        build_filesystem_negative_qemu_command(
+            qemu_path=(tmp_path / "qemu").resolve(),
+            kernel_path=(tmp_path / "kernel").resolve(),
+            initramfs_path=(tmp_path / "initrd").resolve(),
+            backing_paths=backing_paths,
+            cmdline=build_kernel_cmdline(plan, transport) + " drift",
+            control=contract,
+        )
+
+
 def test_console_reader_requires_one_marker_and_a_live_process() -> None:
     terminated_marker = SUCCESS_MARKER + b"\n"
     program = f"import sys,time;sys.stdout.buffer.write({terminated_marker!r});sys.stdout.flush();time.sleep(10)"
@@ -254,19 +337,25 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
             decoded,
             console=console,
             negative_consoles=negative_consoles,
+            filesystem_negative_consoles=receipt.filesystem_negative_consoles,
         )
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
     assert decoded["root_assembly"] is False
     assert decoded["pre_mount_devices"] is True
-    assert decoded["filesystem_verified"] is False
-    assert decoded["content_verified"] is False
+    assert decoded["filesystem_verified"] is True
+    assert decoded["root_filesystem_verified"] is True
+    assert decoded["root_content_verified"] is False
+    assert decoded["lower_filesystem_verified"] is True
+    assert decoded["lower_content_verified"] is True
     assert decoded["mount_attempted"] is False
     assert decoded["topology"] == pre_mount_topology(build_proof_plan())
     assert tuple(decoded["negative_controls"]) == tuple(sorted(NEGATIVE_CONTROL_NAMES))
     for name in NEGATIVE_CONTROL_NAMES:
         assert decoded["negative_controls"][name]["contract"] == negative_control_contract(name)
+    for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES:
+        assert decoded["filesystem_negative_controls"][name]["contract"] == filesystem_negative_control_contract(name)
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, transport_serial="f" * 20)
     with pytest.raises(ArtifactValidationError, match="receipt value"):
@@ -304,6 +393,7 @@ def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topolog
             changed,
             console=console,
             negative_consoles=negative_consoles,
+            filesystem_negative_consoles=receipt.filesystem_negative_consoles,
         )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(
@@ -339,7 +429,40 @@ def test_receipt_rejects_negative_control_mapping_tamper(mutation: str) -> None:
         value["negative_controls"][NEGATIVE_CONTROL_NAMES[0]]["pid1_alive_after_marker"] = False
 
     with pytest.raises(ArtifactValidationError, match="policy|canonical"):
-        OCIStage1KVMProofReceipt.from_dict(value, console=receipt.console, negative_consoles=consoles)
+        OCIStage1KVMProofReceipt.from_dict(
+            value,
+            console=receipt.console,
+            negative_consoles=consoles,
+            filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "contract", "console_digest", "marker_count", "liveness"])
+def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> None:
+    receipt = _receipt()
+    value = copy.deepcopy(receipt.to_dict())
+    controls = value["filesystem_negative_controls"]
+    name = FILESYSTEM_NEGATIVE_CONTROL_NAMES[0]
+    if mutation == "missing":
+        del controls[name]
+    elif mutation == "extra":
+        controls["unexpected"] = copy.deepcopy(controls[name])
+    elif mutation == "contract":
+        controls[name]["contract"]["name"] = "root_geometry"
+    elif mutation == "console_digest":
+        controls[name]["console_digest"] = "sha256:" + "f" * 64
+    elif mutation == "marker_count":
+        controls[name]["rejection_marker_count"] = 2
+    else:
+        controls[name]["pid1_alive_after_marker"] = False
+
+    with pytest.raises(ArtifactValidationError, match="policy|canonical"):
+        OCIStage1KVMProofReceipt.from_dict(
+            value,
+            console=receipt.console,
+            negative_consoles=receipt.negative_consoles,
+            filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+        )
 
 
 @pytest.mark.parametrize("marker", [REJECTION_MARKER, SUCCESS_MARKER, PREPARATION_FAILURE_MARKER])
@@ -353,6 +476,19 @@ def test_receipt_requires_exactly_one_rejection_and_no_other_marker(marker: byte
         consoles[name] += marker + b"\n"
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, negative_consoles=consoles)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [FILESYSTEM_REJECTION_MARKER, REJECTION_MARKER, SUCCESS_MARKER, PREPARATION_FAILURE_MARKER],
+)
+def test_receipt_requires_one_filesystem_rejection_and_no_other_marker(marker: bytes) -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.filesystem_negative_consoles)
+    name = FILESYSTEM_NEGATIVE_CONTROL_NAMES[0]
+    consoles[name] += marker + b"\n"
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, filesystem_negative_consoles=consoles)
 
 
 def test_empty_owner_only_evidence_directory_is_required(tmp_path: Path) -> None:
@@ -386,6 +522,7 @@ def test_evidence_names_and_owner_only_publication_are_exact(tmp_path: Path) -> 
         "console.bin",
         "receipt.json",
         *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
+        *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
     )
     evidence = tmp_path / "evidence"
     evidence.mkdir(mode=0o700)

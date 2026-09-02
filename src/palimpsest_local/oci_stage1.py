@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, InvalidDigestError, StateError
 from .kvm import MAX_OCI_ROOT_LAYER_DISKS
+from .oci_guest_filesystems import MAX_STAGE1_FILESYSTEM_VERIFY_BYTES
 from .oci_packer import SQUASHFS_BLOCK_DEVICE_ALIGNMENT
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
@@ -28,8 +29,8 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v3"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v3"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v4"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v4"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -96,6 +97,7 @@ class OCIStage1Plan:
         root = _plain(self.root)
         if not isinstance(root, dict) or set(root) != {
             "filesystem",
+            "filesystem_uuid",
             "generation",
             "mount_options",
             "serial",
@@ -105,12 +107,14 @@ class OCIStage1Plan:
             raise StateError("stage-1 root contract fields are invalid")
         try:
             volume_id = str(uuid.UUID(root["volume_id"]))
+            filesystem_uuid = str(uuid.UUID(root["filesystem_uuid"]))
         except (AttributeError, TypeError, ValueError):
             raise StateError("stage-1 root identity is invalid") from None
         if (
             root["filesystem"] != "ext4"
             or root["mount_options"] != ["rw", "nodev", "nosuid"]
             or volume_id != root["volume_id"]
+            or filesystem_uuid != root["filesystem_uuid"]
             or type(root["generation"]) is not int
             or root["generation"] < 1
             or root["generation"] > MAX_OCI_ROOT_VOLUME_GENERATION
@@ -125,6 +129,7 @@ class OCIStage1Plan:
             raise StateError("stage-1 lower contract is invalid")
         layers = tuple(_plain(layer) for layer in self.layers)
         serials = {root["serial"]}
+        verification_bytes = 0
         for ordinal, layer in enumerate(layers):
             if not isinstance(layer, dict) or set(layer) != {
                 "filesystem",
@@ -150,6 +155,9 @@ class OCIStage1Plan:
                 or layer["serial"] != oci_stage1_device_serial("lower", layer["occurrence_digest"])
             ):
                 raise StateError("stage-1 lower mount policy is invalid")
+            verification_bytes += layer["size_bytes"]
+            if verification_bytes > MAX_STAGE1_FILESYSTEM_VERIFY_BYTES:
+                raise StateError("stage-1 lower verification byte budget is exceeded")
             serials.add(layer["serial"])
         if not isinstance(self.process, OCIProcessSpec):
             raise StateError("stage-1 process contract is invalid")
@@ -182,6 +190,7 @@ class OCIStage1Plan:
                 domain_core_digest=domain_core_digest,
                 root={
                     "filesystem": root_volume["filesystem"],
+                    "filesystem_uuid": root_volume["filesystem_uuid"],
                     "generation": root_volume["generation"],
                     "mount_options": ["rw", "nodev", "nosuid"],
                     "serial": root_volume["serial"],
