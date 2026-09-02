@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-pid1-supervisor"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v8"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v9"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -161,10 +161,12 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["workload_started"] is True
     assert value["stage1"]["supervisor"] == {
         "cleanup_scope": "dedicated-qualification-guest-whole-guest",
-        "contract": "palimpsest.guest-pid1-supervisor.v1",
-        "credentials": "numeric-explicit-user-group-empty-supplementary-groups",
+        "contract": "palimpsest.guest-pid1-supervisor.v2",
+        "credential_transition": "setgroups-setresgid-setresuid-verified-before-fork",
+        "credentials": "pid1-and-workload-same-numeric-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-execve-cloexec-error-pipe",
+        "privilege_after_fork": "no-more-than-authenticated-workload-identity",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
         "terminal_state": "parent-marker-then-fail-closed-wait",
@@ -205,6 +207,9 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"; descendant_status=" in stage1
     assert b"; reaped=" in stage1
     assert b"; forwarded=" in stage1
+    assert b"; pid1_uid=" in stage1
+    assert b"; pid1_gid=" in stage1
+    assert b"; pid1_groups=" in stage1
 
 
 @pytest.mark.parametrize(

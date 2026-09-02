@@ -608,32 +608,37 @@ Implemented:
 - The freestanding PID 1 decodes authenticated JSON strings into a bounded
   256 KiB arena, constructs null-terminated argv and `name=value` environment
   vectors, and never inherits bootstrap environment. After root transition it
-  blocks the supervised signals, creates a `signalfd`, forks a new workload
-  process group, clears supplementary groups, applies gid/uid/cwd, and calls
-  `execve`. A close-on-exec pipe reports exact setup stage and errno; only EOF
-  confirms that exec succeeded.
+  blocks the supervised signals and creates a `signalfd` and error pipe while
+  privileged. PID 1 then clears supplementary groups, permanently applies and
+  verifies the workload's real/effective/saved gid and uid, and only then
+  forks a new workload process group. The child inherits that exact identity,
+  applies cwd, and calls `execve`. A close-on-exec pipe reports exact setup
+  stage and errno; only EOF confirms that exec succeeded.
 - PID 1 forwards the allow-listed signals to the workload process group,
   translating external SIGTERM to the image stop signal, and uses
   `wait4(-1)` for the main process and adopted descendants. The trusted
-  terminal marker records main status, last non-main status, reap count, and
-  last forwarded signal before permanent terminal fail-closed wait.
+  terminal marker records main status, last non-main status, reap count, last
+  forwarded signal, and PID 1's verified uid/gid/empty-group state before
+  permanent terminal fail-closed wait.
 - The qualification workload is a separately reproducible pinned static
   x86_64 ELF stored in the highest real zstd SquashFS lower. It validates the
   exact argv/environment/cwd/65534:65534/no-supplementary-group contract,
   parent PID 1, process group, and OCI-root sentinel through both `/` and
   `/proc/self/root`. Using the workload's own procfs root link avoids requiring
   ptrace permission to dereference PID 1 after dropping to UID/GID 65534; PID 1
-  independently verifies its own root before launch. The helper creates one
-  descendant, self-stimulates PID 1 with
+  independently verifies its own root before launch. The helper also boundedly
+  parses `/proc/1/status` and requires all four PID 1 UID/GID values to be
+  65534 with no supplementary groups. It creates one descendant and
+  self-stimulates PID 1 with
   SIGTERM, and preserves descendant exit 43 with `waitid(WNOWAIT)` before main
   exit 42 so PID 1 must establish both statuses itself.
-- KVM receipt v9 and fixture policy/schema v4 retain positive and second-boot
+- KVM receipt v10 and fixture policy/schema v5 retain positive and second-boot
   terminal consoles plus all prior controls. Three new independent writable
   roots/plans/transports/cmdlines isolate missing executable, non-executable
   target, and missing cwd; each proves root transition completed, exact
   stage/errno launch rejection occurred once, no started/terminal marker was
   emitted, and PID 1 remained alive.
-- Initramfs manifest/bootstrap ABI v10 and consumer/init contract v8 bind
+- Initramfs manifest/bootstrap ABI v11 and consumer/init contract v9 bind
   `workload_started=true` only after confirmed exec. The nested root-transition
   contract remains `workload_started=false` because that checkpoint precedes
   launch.
@@ -645,10 +650,14 @@ service. Cgroup-scoped cleanup is mandatory before those features. Named
 user/group resolution, omitted group semantics, PATH search, host stop/control
 transport, VM poweroff and exit mapping, production libvirt define/start,
 foreground/`-d`, exec/log readiness, and Gate 2 remain disabled.
+The permanent PID 1 credential drop is valid only for this single-workload
+qualification boundary. Detached stop, multi-user exec, and agent lifecycle
+require a separate narrowly privileged broker plus an authenticated
+host-to-guest lifecycle channel.
 
 Qualification state: all contracts, fixtures, reproducible ELFs, portable
-tests, and the v9 receipt collector are source-controlled. This macOS host
-cannot run native Linux x86_64 KVM, so no actual 30-boot v9 receipt is claimed.
+tests, and the v10 receipt collector are source-controlled. This macOS host
+cannot run native Linux x86_64 KVM, so no actual 30-boot v10 receipt is claimed.
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
@@ -668,7 +677,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v9 supervisor receipt and all retained-root plus
+1. Collect the qualified v10 supervisor receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH

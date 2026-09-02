@@ -40,6 +40,8 @@ typedef unsigned long usize;
 #define WEXITED 4
 #define WNOWAIT 0x01000000
 #define SIGNALLFD_INFO_BYTES 128
+#define PID1_STATUS_MAX 8192
+#define EINTR 4
 
 #define MAIN_SUCCESS 42
 #define DESCENDANT_SUCCESS 43
@@ -132,6 +134,64 @@ static int read_exact_file(const char *path, const char *expected) {
     return same_text(buffer, expected);
 }
 
+static int exact_line_count(const char *payload, usize payload_size, const char *expected) {
+    usize expected_size = slen(expected);
+    usize start = 0;
+    usize index;
+    int count = 0;
+    for (index = 0; index < payload_size; index++) {
+        usize line_size;
+        usize offset;
+        u8 difference = 0;
+        if (payload[index] != '\n') continue;
+        line_size = index - start + 1;
+        if (line_size == expected_size) {
+            for (offset = 0; offset < line_size; offset++)
+                difference |= (u8)payload[start + offset] ^ (u8)expected[offset];
+            if (difference == 0) count++;
+        }
+        start = index + 1;
+    }
+    return count;
+}
+
+static int verify_pid1_credentials(void) {
+    static const char uid_line[] = "Uid:\t65534\t65534\t65534\t65534\n";
+    static const char gid_line[] = "Gid:\t65534\t65534\t65534\t65534\n";
+    static const char groups_line[] = "Groups:\t \n";
+    char status[PID1_STATUS_MAX];
+    usize used = 0;
+    int descriptor = (int)sc3(SYS_open, (i64)"/proc/1/status", O_RDONLY | O_CLOEXEC, 0);
+    int eof = 0;
+    if (descriptor < 0) return 0;
+    while (used < sizeof(status)) {
+        i64 count = sc3(SYS_read, descriptor, (i64)(status + used), (i64)(sizeof(status) - used));
+        if (count == -EINTR) continue;
+        if (count < 0 || (usize)count > sizeof(status) - used) {
+            sc1(SYS_close, descriptor);
+            return 0;
+        }
+        if (count == 0) {
+            eof = 1;
+            break;
+        }
+        used += (usize)count;
+    }
+    if (!eof) {
+        char extra;
+        i64 count;
+        do count = sc3(SYS_read, descriptor, (i64)&extra, 1); while (count == -EINTR);
+        if (count != 0) {
+            sc1(SYS_close, descriptor);
+            return 0;
+        }
+    }
+    if (sc1(SYS_close, descriptor) != 0) return 0;
+    return exact_line_count(status, used, uid_line) == 1 &&
+           exact_line_count(status, used, gid_line) == 1 &&
+           exact_line_count(status, used, groups_line) == 1;
+}
+
 static int block_sigterm(void) {
     u64 mask = 1ul << (SIGTERM - 1);
     return sc4(SYS_rt_sigprocmask, SIG_BLOCK, (i64)&mask, 0, sizeof(mask)) == 0;
@@ -172,7 +232,8 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
     cwd_size = sc2(SYS_getcwd, (i64)cwd, sizeof(cwd));
     if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 0;
     return read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
-           read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel);
+           read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
+           verify_pid1_credentials();
 }
 
 static __attribute__((noreturn)) void run_descendant(int ready_writer, int completion_writer,

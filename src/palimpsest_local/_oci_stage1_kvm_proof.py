@@ -48,7 +48,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v9"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v10"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -60,9 +60,10 @@ DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # CRLF, while the pipe-based pure test preserves LF exactly.
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
+WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
 WORKLOAD_TERMINAL_MARKER = (
     b"palimpsest guest stage1: workload terminal; main_status=42; descendant_status=43; reaped=2; "
-    b"forwarded=15; waiting fail-closed"
+    b"forwarded=15; pid1_uid=65534; pid1_gid=65534; pid1_groups=0; waiting fail-closed"
 )
 SUCCESS_MARKER = WORKLOAD_TERMINAL_MARKER
 REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
@@ -197,7 +198,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:ac3143f21e4d564ae9ec2c8de94fcd74fe44db8e19bdd76bb426f7ca1e8c8437"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:e1be01323ad54e782ef6134dc97a535c58bd625bf47e2de047e82bdbff2cfa82"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -212,8 +213,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v4"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v4"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v5"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v5"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -229,10 +230,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583",
-        "elf_size_bytes": 8640,
+        "elf_sha256": "91585af8b30ea7412ea4eda21ec5e5631801796ed6cd43442db21484a20f94df",
+        "elf_size_bytes": 8808,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "75bb832903979faac69f80865dcdb20b7440160bb6c7dda371ed8264fa98ae90",
+        "source_sha256": "a1a06c3caf4b81638a771872406a32ca759cb872d05500685c0e89da91ac597d",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -876,7 +877,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v4",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v5",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1781,6 +1782,7 @@ class OCIStage1KVMProofReceipt:
             or not isinstance(self.console, bytes)
             or not 1 <= len(self.console) <= MAX_CONSOLE_BYTES
             or _logical_line_count(self.console, SUCCESS_MARKER) != 1
+            or _logical_prefix_count(self.console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
             or not _logical_lines_in_order(
@@ -1795,6 +1797,7 @@ class OCIStage1KVMProofReceipt:
             or not isinstance(self.retained_console, bytes)
             or not 1 <= len(self.retained_console) <= MAX_CONSOLE_BYTES
             or _logical_line_count(self.retained_console, SUCCESS_MARKER) != 1
+            or _logical_prefix_count(self.retained_console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.retained_console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
             or not _logical_lines_in_order(
@@ -2072,9 +2075,12 @@ class OCIStage1KVMProofReceipt:
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
             "supervisor": {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
+                "credential_timing": "permanent-before-fork",
                 "descendant_status": 43,
                 "forwarded_signal": 15,
                 "main_status": 42,
+                "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+                "privileged_after_fork": False,
                 "process_group": True,
                 "reaped_children": 2,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
@@ -2181,9 +2187,12 @@ class OCIStage1KVMProofReceipt:
             or supervisor
             != {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
+                "credential_timing": "permanent-before-fork",
                 "descendant_status": 43,
                 "forwarded_signal": 15,
                 "main_status": 42,
+                "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+                "privileged_after_fork": False,
                 "process_group": True,
                 "reaped_children": 2,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
@@ -2472,6 +2481,12 @@ def _read_console_until(
             current = bytes(console)
             if any(_logical_line_count(current, marker) for marker in forbidden):
                 raise KVMProofFailure("QEMU emitted a forbidden stage-1 marker")
+            terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
+            successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
+            if terminal_count > successful_terminal_count:
+                raise KVMProofFailure("QEMU emitted an unexpected workload terminal marker")
+            if terminal_count > 1:
+                raise KVMProofFailure("QEMU emitted the workload terminal marker more than once")
             count = _logical_line_count(current, expected)
             if count > 1:
                 raise KVMProofFailure("QEMU emitted the proof marker more than once")

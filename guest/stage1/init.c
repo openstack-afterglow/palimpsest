@@ -35,10 +35,13 @@ struct span { const char *p; usize n; };
 #define SYS_chdir 80
 #define SYS_mkdir 83
 #define SYS_readlink 89
-#define SYS_setuid 105
-#define SYS_setgid 106
 #define SYS_setpgid 109
+#define SYS_getgroups 115
 #define SYS_setgroups 116
+#define SYS_setresuid 117
+#define SYS_getresuid 118
+#define SYS_setresgid 119
+#define SYS_getresgid 120
 #define SYS_mount 165
 #define SYS_chroot 161
 #define SYS_signalfd4 289
@@ -170,6 +173,9 @@ struct supervisor_result {
     u32 last_nonmain_status;
     u32 reaped;
     u32 forwarded;
+    u32 pid1_uid;
+    u32 pid1_gid;
+    u32 pid1_groups;
 };
 
 static inline i64 sc0(i64 n) {
@@ -289,6 +295,12 @@ static void workload_terminal(const struct supervisor_result *result) {
     write_u32(1, result->reaped);
     write_all(1, "; forwarded=");
     write_u32(1, result->forwarded);
+    write_all(1, "; pid1_uid=");
+    write_u32(1, result->pid1_uid);
+    write_all(1, "; pid1_gid=");
+    write_u32(1, result->pid1_gid);
+    write_all(1, "; pid1_groups=");
+    write_u32(1, result->pid1_groups);
     write_all(1, "; waiting fail-closed\n");
 }
 
@@ -2063,6 +2075,47 @@ static void set_workload_failure(struct child_error_local *failure, u32 stage, i
     failure->error = error < 0 ? (u32)(-error) : (u32)error;
 }
 
+static int drop_supervisor_credentials(struct guest_process *process,
+                                       struct child_error_local *failure,
+                                       struct supervisor_result *result) {
+    u32 real_id = 0, effective_id = 0, saved_id = 0;
+    i64 operation = sc2(SYS_setgroups, 0, 0);
+    if (operation != 0) {
+        set_workload_failure(failure, 3, operation);
+        return 0;
+    }
+    operation = sc2(SYS_getgroups, 0, 0);
+    if (operation != 0) {
+        set_workload_failure(failure, 3, operation < 0 ? operation : EIO);
+        return 0;
+    }
+    operation = sc3(SYS_setresgid, process->gid, process->gid, process->gid);
+    if (operation != 0) {
+        set_workload_failure(failure, 4, operation);
+        return 0;
+    }
+    operation = sc3(SYS_getresgid, (i64)&real_id, (i64)&effective_id, (i64)&saved_id);
+    if (operation != 0 || real_id != process->gid || effective_id != process->gid || saved_id != process->gid) {
+        set_workload_failure(failure, 4, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    operation = sc3(SYS_setresuid, process->uid, process->uid, process->uid);
+    if (operation != 0) {
+        set_workload_failure(failure, 5, operation);
+        return 0;
+    }
+    real_id = effective_id = saved_id = 0;
+    operation = sc3(SYS_getresuid, (i64)&real_id, (i64)&effective_id, (i64)&saved_id);
+    if (operation != 0 || real_id != process->uid || effective_id != process->uid || saved_id != process->uid) {
+        set_workload_failure(failure, 5, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    result->pid1_uid = real_id;
+    result->pid1_gid = process->gid;
+    result->pid1_groups = 0;
+    return 1;
+}
+
 static void record_reaped_child(struct supervisor_result *result, i64 reaped, i64 main_pid, int status) {
     result->reaped++;
     if (reaped != main_pid) result->last_nonmain_status = workload_status(status);
@@ -2143,6 +2196,13 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return 0;
     }
+    if (!drop_supervisor_credentials(process, failure, result)) {
+        sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, error_pipe[1]);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
     main_pid = sc0(SYS_fork);
     if (main_pid == 0) {
         i64 operation;
@@ -2152,12 +2212,6 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         if (operation != 0) child_fail(error_pipe[1], 1, operation);
         operation = sc2(SYS_setpgid, 0, 0);
         if (operation != 0) child_fail(error_pipe[1], 2, operation);
-        operation = sc2(SYS_setgroups, 0, 0);
-        if (operation != 0) child_fail(error_pipe[1], 3, operation);
-        operation = sc1(SYS_setgid, process->gid);
-        if (operation != 0) child_fail(error_pipe[1], 4, operation);
-        operation = sc1(SYS_setuid, process->uid);
-        if (operation != 0) child_fail(error_pipe[1], 5, operation);
         operation = sc1(SYS_chdir, (i64)process->cwd);
         if (operation != 0) child_fail(error_pipe[1], 6, operation);
         operation = sc3(SYS_execve, (i64)process->argv[0], (i64)process->argv, (i64)process->envp);

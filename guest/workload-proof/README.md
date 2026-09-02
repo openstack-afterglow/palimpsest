@@ -35,11 +35,16 @@ The workload deliberately uses its own procfs root link. The proof runs as
 UID/GID 65534 and must not depend on ptrace permission to dereference PID 1's
 `/proc/1/root`. PID 1 independently verifies `/proc/self/root` against the
 moved OCI root before dropping credentials and launching this helper.
+It also parses `/proc/1/status` within a fixed 8 KiB bound and requires exactly
+one `Uid`, `Gid`, and `Groups` line. All real, effective, saved, and filesystem
+UID/GID values must be 65534 and the supplementary-group list must be empty.
 
 After validating the contract, the main process blocks SIGTERM, creates a
 `signalfd`, forks one same-process-group descendant, and waits for the
 descendant to become ready. The main then sends SIGTERM to PID 1. A conforming
-supervisor forwards that signal to the workload process group. Both workload
+supervisor has already dropped permanently to the same numeric identity, so
+the signal is permitted without `CAP_KILL`, and forwards it to the workload
+process group. Both workload
 processes require the observed SIGTERM sender PID to be 1. The descendant
 writes a private completion byte and exits 43. The main uses `waitid` with
 `WNOWAIT` to prove that the descendant is already a zombie without consuming

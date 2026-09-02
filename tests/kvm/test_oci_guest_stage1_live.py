@@ -62,10 +62,13 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v1",
+        "contract": "palimpsest.guest-pid1-supervisor.v2",
+        "credential_timing": "permanent-before-fork",
         "descendant_status": 43,
         "forwarded_signal": 15,
         "main_status": 42,
+        "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+        "privileged_after_fork": False,
         "process_group": True,
         "reaped_children": 2,
         "terminal_state": "parent-marker-then-fail-closed-wait",

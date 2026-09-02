@@ -31,22 +31,22 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v10"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v11"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v8"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v10"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v9"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v11"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v1"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v2"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:75ab451eb75528c6f6c911e39b1699f98a08e1b68aa9434858538001b243e02a"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:bc29bf7990f814f1d4ae3267dd261cff54f9a52cb9fa4a91caf31253161c00cb"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:456c0b75d814429c58c2ccf83837fea271e50776f5ae2d6493fb1ef2cd6398f8"
+OCI_STAGE1_BINARY_DIGEST = "sha256:23c6c455b2d650cdcbdd1838596d5ff3244c711e5eb3b8d4f0dc329f8ca18505"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -366,9 +366,11 @@ def _supervisor_contract_dict() -> dict[str, Any]:
     return {
         "cleanup_scope": "dedicated-qualification-guest-whole-guest",
         "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-        "credentials": "numeric-explicit-user-group-empty-supplementary-groups",
+        "credential_transition": "setgroups-setresgid-setresuid-verified-before-fork",
+        "credentials": "pid1-and-workload-same-numeric-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-execve-cloexec-error-pipe",
+        "privilege_after_fork": "no-more-than-authenticated-workload-identity",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
         "terminal_state": "parent-marker-then-fail-closed-wait",

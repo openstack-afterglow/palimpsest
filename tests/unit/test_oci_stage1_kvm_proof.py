@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     WORKLOAD_NEGATIVE_CONTROL_NAMES,
     WORKLOAD_NEGATIVE_REJECTION_MARKERS,
     WORKLOAD_STARTED_MARKER,
+    WORKLOAD_TERMINAL_PREFIX,
     KVMProofFailure,
     KVMProofUnavailable,
     OCIStage1KVMProofReceipt,
@@ -238,21 +240,25 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:ac3143f21e4d564ae9ec2c8de94fcd74fe44db8e19bdd76bb426f7ca1e8c8437"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v4"
+    assert manifest_digest == "sha256:e1be01323ad54e782ef6134dc97a535c58bd625bf47e2de047e82bdbff2cfa82"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v5"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
     assert b"/proc/self/root/.__palimpsest_oci_root_workload_proof_v1" in helper_source
     assert b"/proc/1/root/.__palimpsest_oci_root_workload_proof_v1" not in helper_source
+    assert b'"/proc/1/status"' in helper_source
+    assert b'"Uid:\\t65534\\t65534\\t65534\\t65534\\n"' in helper_source
+    assert b'"Gid:\\t65534\\t65534\\t65534\\t65534\\n"' in helper_source
+    assert b'"Groups:\\t \\n"' in helper_source
     assert helper == {
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "7c557e494b81a7081a1fd8fd0e75f32409c409fec219a9224a9b69198e8ed583",
-        "elf_size_bytes": 8640,
+        "elf_sha256": "91585af8b30ea7412ea4eda21ec5e5631801796ed6cd43442db21484a20f94df",
+        "elf_size_bytes": 8808,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "75bb832903979faac69f80865dcdb20b7440160bb6c7dda371ed8264fa98ae90",
+        "source_sha256": "a1a06c3caf4b81638a771872406a32ca759cb872d05500685c0e89da91ac597d",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
@@ -532,6 +538,21 @@ def test_console_reader_rejects_marker_embedded_in_a_forged_line() -> None:
         )
 
 
+def test_console_reader_rejects_an_unexpected_terminal_without_waiting_for_timeout() -> None:
+    unexpected = WORKLOAD_TERMINAL_PREFIX + b"109; descendant_status=137; reaped=2; forwarded=0\n"
+    program = f"import sys,time;sys.stdout.buffer.write({unexpected!r});sys.stdout.flush();time.sleep(10)"
+    started = time.monotonic()
+    with pytest.raises(KVMProofFailure, match="unexpected workload terminal"):
+        _read_console_until(
+            (sys.executable, "-c", program),
+            expected=SUCCESS_MARKER,
+            forbidden=(REJECTION_MARKER,),
+            timeout_seconds=3,
+            require_alive_after_marker=True,
+        )
+    assert time.monotonic() - started < 2
+
+
 def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     receipt = _receipt()
     console = receipt.console
@@ -572,10 +593,13 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v1",
+        "contract": "palimpsest.guest-pid1-supervisor.v2",
+        "credential_timing": "permanent-before-fork",
         "descendant_status": 43,
         "forwarded_signal": 15,
         "main_status": 42,
+        "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+        "privileged_after_fork": False,
         "process_group": True,
         "reaped_children": 2,
         "terminal_state": "parent-marker-then-fail-closed-wait",

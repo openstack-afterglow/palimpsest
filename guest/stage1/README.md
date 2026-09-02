@@ -92,8 +92,9 @@ OverlayFS requirements as built-ins (`=y`). A successful boot
 attaches an actual ext4 writable root and two actual SquashFS read-only lowers
 in deliberately permuted QEMU order. A successful boot must emit the
 root-transition and workload-started markers, then a PID-1-authored terminal
-marker binding main status 42, adopted descendant status 43, two reaps, and
-forwarded signal 15. It remains alive in the terminal fail-closed wait. Before
+marker binding main status 42, adopted descendant status 43, two reaps,
+forwarded signal 15, and PID 1 UID/GID 65534 with no supplementary groups. It
+remains alive in the terminal fail-closed wait. Before
 the root-transition marker, PID 1 proves `/` is the same authenticated OverlayFS
 inode previously mounted at staging, `/proc/self/root` matches `/`, the moved
 pseudo-filesystems retain their pre-transition identities, probes still pass
@@ -108,14 +109,14 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v9 proof retains owner-only positive and per-control consoles plus a
+The v10 proof retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v1` execution checkpoint.
+the `palimpsest.guest-pid1-supervisor.v2` execution checkpoint.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
 and production VM launch remains disabled. Stage-1 plan/protocol v7 admits
@@ -123,8 +124,10 @@ only the explicit absolute/numeric process subset.
 
 The positive highest lower contains the separately reproducible proof workload
 and its OCI-root sentinel. That workload validates argv, environment, cwd,
-credentials, parent PID, process group, and its own `/proc/self/root`, creates
-one child, and sends SIGTERM to PID 1. Both processes require the signal to be
+credentials, parent PID, process group, its own `/proc/self/root`, and PID 1's
+four UID/GID values and empty supplementary-group list through bounded
+`/proc/1/status` parsing. It creates one child and sends SIGTERM to PID 1. Both
+processes require the signal to be
 forwarded by PID 1; `waitid(WNOWAIT)` preserves descendant exit 43 for PID 1
 to reap after main exit 42. Three additional launch controls independently
 bind a
@@ -135,6 +138,11 @@ After the main process exits, this qualification-only guest uses a whole-guest
 cleanup because no agent, exec session, or unrelated service exists. A
 cgroup-scoped workload boundary is required before production agent/exec or
 lifecycle readiness; the current cleanup must not be treated as that feature.
+PID 1 permanently drops to the single workload's numeric identity before
+forking. Future detached stop, multi-user exec, or agent lifecycle support
+therefore requires a separate narrowly privileged broker and authenticated
+host-to-guest lifecycle channel; this qualification supervisor is not that
+production boundary.
 
 Proof v6 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
