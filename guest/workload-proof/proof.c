@@ -3,8 +3,8 @@
  *
  * This freestanding Linux x86_64 program deliberately emits no qualification
  * marker.  The supervising PID 1 must establish execution, signal forwarding,
- * and child status itself.  A successful main process exits 42 and its orphaned
- * process-group member exits 43 after both observe SIGTERM sent by PID 1.
+ * and child status itself. A successful main process exits 42, its cooperative
+ * process-group member exits 43, and its stubborn member requires cgroup.kill.
  */
 
 typedef unsigned char u8;
@@ -15,6 +15,7 @@ typedef unsigned long usize;
 
 #define SYS_read 0
 #define SYS_write 1
+#define SYS_pause 34
 #define SYS_open 2
 #define SYS_close 3
 #define SYS_rt_sigprocmask 14
@@ -28,20 +29,19 @@ typedef unsigned long usize;
 #define SYS_getppid 110
 #define SYS_getpgrp 111
 #define SYS_getgroups 115
-#define SYS_waitid 247
 #define SYS_signalfd4 289
 #define SYS_pipe2 293
 
 #define O_RDONLY 0
+#define O_WRONLY 1
 #define O_CLOEXEC 02000000
 #define SIG_BLOCK 0
 #define SIGTERM 15
-#define P_PID 1
-#define WEXITED 4
-#define WNOWAIT 0x01000000
 #define SIGNALLFD_INFO_BYTES 128
 #define PID1_STATUS_MAX 8192
 #define EINTR 4
+#define EACCES 13
+#define EPERM 1
 
 #define MAIN_SUCCESS 42
 #define DESCENDANT_SUCCESS 43
@@ -77,17 +77,6 @@ static inline i64 sc4(i64 n, i64 a, i64 b, i64 c, i64 d) {
     __asm__ volatile("syscall"
                      : "=a"(r)
                      : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10)
-                     : "rcx", "r11", "memory");
-    return r;
-}
-
-static inline i64 sc5(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e) {
-    register i64 r10 __asm__("r10") = d;
-    register i64 r8 __asm__("r8") = e;
-    i64 r;
-    __asm__ volatile("syscall"
-                     : "=a"(r)
-                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
                      : "rcx", "r11", "memory");
     return r;
 }
@@ -155,9 +144,9 @@ static int exact_line_count(const char *payload, usize payload_size, const char 
     return count;
 }
 
-static int verify_pid1_credentials(void) {
-    static const char uid_line[] = "Uid:\t65534\t65534\t65534\t65534\n";
-    static const char gid_line[] = "Gid:\t65534\t65534\t65534\t65534\n";
+static int verify_pid1_root_credentials(void) {
+    static const char uid_line[] = "Uid:\t0\t0\t0\t0\n";
+    static const char gid_line[] = "Gid:\t0\t0\t0\t0\n";
     static const char groups_line[] = "Groups:\t \n";
     char status[PID1_STATUS_MAX];
     usize used = 0;
@@ -190,6 +179,15 @@ static int verify_pid1_credentials(void) {
     return exact_line_count(status, used, uid_line) == 1 &&
            exact_line_count(status, used, gid_line) == 1 &&
            exact_line_count(status, used, groups_line) == 1;
+}
+
+static int verify_cgroup_escape_denied(const char *path) {
+    i64 descriptor = sc3(SYS_open, (i64)path, O_WRONLY | O_CLOEXEC, 0);
+    if (descriptor >= 0) {
+        sc1(SYS_close, descriptor);
+        return 0;
+    }
+    return descriptor == -EACCES || descriptor == -EPERM;
 }
 
 static int block_sigterm(void) {
@@ -233,58 +231,67 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
     if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 0;
     return read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
            read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
-           verify_pid1_credentials();
+           read_exact_file("/proc/self/cgroup", "0::/palimpsest.workload\n") &&
+           verify_cgroup_escape_denied("/sys/fs/cgroup/cgroup.procs") &&
+           verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs") &&
+           verify_pid1_root_credentials();
 }
 
-static __attribute__((noreturn)) void run_descendant(int ready_writer, int completion_writer,
-                                                     i64 expected_group) {
+static __attribute__((noreturn)) void run_cooperative_descendant(int ready_writer,
+                                                                 i64 expected_group) {
     int signal_fd;
     u8 ready = 1;
-    u8 completed = 1;
     if (sc0(SYS_getppid) <= 1 || sc0(SYS_getpgrp) != expected_group) exit_now(FAILURE_BASE + 5);
     signal_fd = new_sigterm_fd();
     if (signal_fd < 0 || sc3(SYS_write, ready_writer, (i64)&ready, 1) != 1 ||
         sc1(SYS_close, ready_writer) != 0) exit_now(FAILURE_BASE + 6);
-    if (!wait_for_pid1_sigterm(signal_fd) || sc1(SYS_close, signal_fd) != 0 ||
-        sc3(SYS_write, completion_writer, (i64)&completed, 1) != 1 ||
-        sc1(SYS_close, completion_writer) != 0) exit_now(FAILURE_BASE + 7);
+    if (!wait_for_pid1_sigterm(signal_fd) || sc1(SYS_close, signal_fd) != 0)
+        exit_now(FAILURE_BASE + 7);
     exit_now(DESCENDANT_SUCCESS);
+}
+
+static __attribute__((noreturn)) void run_stubborn_descendant(int ready_writer,
+                                                              i64 expected_group) {
+    u8 ready = 1;
+    if (sc0(SYS_getppid) <= 1 || sc0(SYS_getpgrp) != expected_group ||
+        sc3(SYS_write, ready_writer, (i64)&ready, 1) != 1 || sc1(SYS_close, ready_writer) != 0)
+        exit_now(FAILURE_BASE + 11);
+    for (;;) (void)sc0(SYS_pause);
 }
 
 static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     u64 argc = stack[0];
     char **argv = (char **)(stack + 1);
     char **environment = argv + argc + 1;
-    int ready_pipe[2], completion_pipe[2];
-    int signal_fd;
+    int ready_pipe[2];
     i64 main_pid;
-    i64 child;
-    u8 ready = 0;
-    u8 child_info[128];
+    i64 cooperative, stubborn;
+    u8 ready[2];
+    usize ready_bytes = 0;
     if (!verify_invocation(argc, argv, environment)) exit_now(FAILURE_BASE + 1);
     if (!block_sigterm()) exit_now(FAILURE_BASE + 2);
-    signal_fd = new_sigterm_fd();
-    if (signal_fd < 0 || sc2(SYS_pipe2, (i64)ready_pipe, O_CLOEXEC) != 0 ||
-        sc2(SYS_pipe2, (i64)completion_pipe, O_CLOEXEC) != 0) exit_now(FAILURE_BASE + 3);
+    if (sc2(SYS_pipe2, (i64)ready_pipe, O_CLOEXEC) != 0) exit_now(FAILURE_BASE + 3);
     main_pid = sc0(SYS_getpid);
-    child = sc0(SYS_fork);
-    if (child < 0) exit_now(FAILURE_BASE + 4);
-    if (child == 0) {
+    cooperative = sc0(SYS_fork);
+    if (cooperative < 0) exit_now(FAILURE_BASE + 4);
+    if (cooperative == 0) {
         sc1(SYS_close, ready_pipe[0]);
-        sc1(SYS_close, completion_pipe[0]);
-        sc1(SYS_close, signal_fd);
-        run_descendant(ready_pipe[1], completion_pipe[1], main_pid);
+        run_cooperative_descendant(ready_pipe[1], main_pid);
     }
-    if (sc1(SYS_close, ready_pipe[1]) != 0 || sc1(SYS_close, completion_pipe[1]) != 0 ||
-        sc3(SYS_read, ready_pipe[0], (i64)&ready, 1) != 1 ||
-        ready != 1 || sc1(SYS_close, ready_pipe[0]) != 0) exit_now(FAILURE_BASE + 8);
-    if (sc2(SYS_kill, 1, SIGTERM) != 0) exit_now(FAILURE_BASE + 9);
-    ready = 0;
-    if (!wait_for_pid1_sigterm(signal_fd) || sc1(SYS_close, signal_fd) != 0 ||
-        sc3(SYS_read, completion_pipe[0], (i64)&ready, 1) != 1 || ready != 1 ||
-        sc1(SYS_close, completion_pipe[0]) != 0 ||
-        sc5(SYS_waitid, P_PID, child, (i64)child_info, WEXITED | WNOWAIT, 0) != 0)
-        exit_now(FAILURE_BASE + 10);
+    stubborn = sc0(SYS_fork);
+    if (stubborn < 0) exit_now(FAILURE_BASE + 4);
+    if (stubborn == 0) {
+        sc1(SYS_close, ready_pipe[0]);
+        run_stubborn_descendant(ready_pipe[1], main_pid);
+    }
+    if (sc1(SYS_close, ready_pipe[1]) != 0) exit_now(FAILURE_BASE + 8);
+    while (ready_bytes < sizeof(ready)) {
+        i64 count = sc3(SYS_read, ready_pipe[0], (i64)(ready + ready_bytes), sizeof(ready) - ready_bytes);
+        if (count <= 0 || (usize)count > sizeof(ready) - ready_bytes) exit_now(FAILURE_BASE + 8);
+        ready_bytes += (usize)count;
+    }
+    if (ready[0] != 1 || ready[1] != 1 || sc1(SYS_close, ready_pipe[0]) != 0)
+        exit_now(FAILURE_BASE + 8);
     exit_now(MAIN_SUCCESS);
 }
 

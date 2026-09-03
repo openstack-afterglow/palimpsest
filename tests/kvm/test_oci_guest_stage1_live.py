@@ -62,16 +62,22 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v2",
-        "credential_timing": "permanent-before-fork",
-        "descendant_status": 43,
+        "contract": "palimpsest.guest-pid1-supervisor.v3",
+        "cgroup": "/palimpsest.workload",
+        "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+        "cgroup_write_escape_denied": ["parent", "own"],
+        "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+        "cooperative_status": 43,
+        "credential_timing": "child-after-parent-cgroup-attach-release",
+        "forced_status": 137,
         "forwarded_signal": 15,
         "main_status": 42,
-        "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
-        "privileged_after_fork": False,
+        "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+        "privileged_broker_after_fork": True,
         "process_group": True,
-        "reaped_children": 2,
+        "reaped_children": 3,
         "terminal_state": "parent-marker-then-fail-closed-wait",
+        "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
     }
     assert set(receipt["workload_negative_controls"]) == set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
     assert receipt["pre_mount_devices"] is True

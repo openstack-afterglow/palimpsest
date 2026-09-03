@@ -49,7 +49,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v5"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v6"
 OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v3"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
@@ -543,8 +543,12 @@ class OCIRootDomainPlan:
 
     @classmethod
     def from_dict(cls, value: Any) -> OCIRootDomainPlan:
-        if isinstance(value, Mapping) and value.get("schema") == "palimpsest.oci-root-domain-plan.v4":
-            raise StateError("pre-production OCI-root domain plan v4 is invalidated; rebuild it before launch")
+        if isinstance(value, Mapping) and value.get("schema") in {
+            "palimpsest.oci-root-domain-plan.v4",
+            "palimpsest.oci-root-domain-plan.v5",
+        }:
+            version = str(value["schema"]).rsplit(".", 1)[-1]
+            raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")
         expected = {
             "boot_artifacts",
             "domain_core_digest",

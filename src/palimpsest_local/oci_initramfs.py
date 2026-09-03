@@ -31,22 +31,22 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v11"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v12"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v9"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v11"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v10"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v12"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v2"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v3"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:bc29bf7990f814f1d4ae3267dd261cff54f9a52cb9fa4a91caf31253161c00cb"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:c674884ad36a241d974dd6fac5b4dcfa091ac508c2cf5a73f98b59af6acb5b6a"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:23c6c455b2d650cdcbdd1838596d5ff3244c711e5eb3b8d4f0dc329f8ca18505"
+OCI_STAGE1_BINARY_DIGEST = "sha256:c21d5a5c129861eb6b197ed43e2b221bd8399484f7220ac4bea041b60c62cdd5"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -364,17 +364,19 @@ def _bootstrap_stage1_binary() -> bytes:
 
 def _supervisor_contract_dict() -> dict[str, Any]:
     return {
-        "cleanup_scope": "dedicated-qualification-guest-whole-guest",
+        "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
+        "cgroup_security": "workload-containment-and-cleanup-not-hostile-root-sandbox",
+        "cleanup_scope": "dedicated-workload-cgroup",
         "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-        "credential_transition": "setgroups-setresgid-setresuid-verified-before-fork",
-        "credentials": "pid1-and-workload-same-numeric-identity-empty-supplementary-groups",
+        "credential_transition": "release-after-cgroup-attach-then-setgroups-setresgid-setresuid-verified",
+        "credentials": "root-pid1-broker-and-admitted-numeric-workload-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
-        "execution": "fork-execve-cloexec-error-pipe",
-        "privilege_after_fork": "no-more-than-authenticated-workload-identity",
+        "execution": "fork-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "privilege_after_fork": "root-pid1-narrow-broker-workload-identity-only",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
-        "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
+        "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "terminal_state": "parent-marker-then-fail-closed-wait",
-        "wait": "wait4-all-adopted-descendants",
+        "wait": "wait4-to-echild-with-empty-cgroup-proof",
     }
 
 

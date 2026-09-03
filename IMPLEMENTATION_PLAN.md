@@ -599,8 +599,8 @@ qualified Linux x86_64 native-KVM runner. No local v8 KVM success is claimed.
 
 Implemented:
 
-- Stage-1 plan/protocol v7 replaces the pending handoff with
-  `first-party-pid1-supervisor.v1` and binds the first executable process
+- Stage-1 plan/protocol v8 replaces the pending handoff with
+  `first-party-pid1-supervisor.v2` and binds the first executable process
   policy: absolute `argv[0]`, canonical numeric user, and explicit canonical
   numeric group. General OCI image parsing still preserves named identities,
   omitted groups, and relative commands, but OCI-root boot preparation rejects
@@ -643,17 +643,15 @@ Implemented:
   contract remains `workload_started=false` because that checkpoint precedes
   launch.
 
-Scope boundary: this is a dedicated qualification guest, not production
-lifecycle. After main exit it may kill every remaining non-PID1 guest process;
-that is safe only because this checkpoint has no agent, exec session, or other
-service. Cgroup-scoped cleanup is mandatory before those features. Named
+Scope boundary at slice 24: this was a dedicated qualification guest, not
+production lifecycle. Slice 26 below supersedes its whole-guest cleanup and
+permanent PID 1 credential drop with a root broker and dedicated cgroup. Named
 user/group resolution, omitted group semantics, PATH search, host stop/control
 transport, VM poweroff and exit mapping, production libvirt define/start,
 foreground/`-d`, exec/log readiness, and Gate 2 remain disabled.
-The permanent PID 1 credential drop is valid only for this single-workload
-qualification boundary. Detached stop, multi-user exec, and agent lifecycle
-require a separate narrowly privileged broker plus an owned, peer-authenticated
-host-to-guest lifecycle channel.
+Detached stop, multi-user exec, and agent lifecycle require a separate
+production broker plus an owned, peer-authenticated host-to-guest lifecycle
+channel.
 
 Qualification state: all contracts, fixtures, reproducible ELFs, portable
 tests, and the v10 receipt collector are source-controlled. Native Linux
@@ -703,9 +701,9 @@ Implemented:
   lifecycle channel and one explicit virtio-serial controller. Libvirt chooses
   the backing endpoint because no user-controlled socket path is emitted. The
   fixed channel name, protocol, and transport are bound into domain metadata,
-  domain-core v3, and domain-plan v5. Existing cloud/build domain XML is
+  domain-core v3, and domain-plan v6. Existing cloud/build domain XML is
   unchanged.
-- Pre-production domain-plan v4 and domain-core v2 lack the lifecycle-channel
+- Pre-production domain-plan v4/v5 and domain-core v2 lack current lifecycle/supervisor
   binding and are intentionally invalidated rather than migrated. They must be
   rebuilt before any future launch boundary. Decode/load rejection is
   read-only and does not rewrite or delete run state or transport artifacts;
@@ -721,6 +719,41 @@ channel and cryptographic peer authentication (or an equivalent MAC-bound
 channel), and the final host/libvirt handoff before this contract can become
 lifecycle authority. The nonce is only a correlation and replay challenge; it
 does not cryptographically authenticate either peer.
+
+### PR 4 slice 26: root PID 1 cgroup-v2 workload broker
+
+- PID 1 now remains root as a narrow single-workload broker. After the OCI-root
+  transition it mounts and verifies cgroup v2, creates the fixed
+  `/sys/fs/cgroup/palimpsest.workload` subtree, and pins its directory plus
+  `cgroup.procs`, `cgroup.kill`, and `cgroup.events` file descriptors before
+  forking. `CONFIG_CGROUPS=y` is a native-KVM admission requirement.
+- A release pipe prevents the child from dropping credentials, executing, or
+  creating descendants until root PID 1 has attached its PID through the
+  pinned `cgroup.procs` descriptor and independently verified membership.
+  Only the child then applies and verifies empty supplementary groups and the
+  admitted numeric GID/UID; PID 1 retains verified root credentials. The proof
+  additionally requires UID 65534 write-open attempts against parent and own
+  `cgroup.procs` to fail with `EACCES` or `EPERM`.
+- The proof workload exits its main process naturally with status 42 after
+  starting one cooperative and one stubborn descendant. PID 1 sends the OCI
+  stop signal to the process group, records cooperative exit 43, waits the
+  grace interval, and uses pinned `cgroup.kill` to force the stubborn status
+  137. It then reaps with `wait4` through `ECHILD`, proves `populated 0` and
+  empty `cgroup.procs`, and removes the subtree. Cleanup uncertainty emits an
+  explicit rejection and cannot publish the terminal success marker.
+- Initramfs manifest v12, bootstrap ABI v12, init/consumer v10, supervisor v3,
+  stage-1 plan v8, OCI-root domain plan v6, KVM receipt v11, and filesystem
+  fixture policy/schema v6 bind the new gate, credentials, cgroup path,
+  deterministic statuses, cleanup proof, reproducible ELFs, and four rebuilt
+  SquashFS fixtures. Native v11 receipt collection remains pending.
+
+Scope boundary: this broker qualifies one workload only. The committed
+virtio-serial lifecycle protocol/channel remains unopened and production-inert;
+`runtime_dispatch` and CLI launch remain unavailable. Detached stop, exec, and
+agent lifecycle still require a separate production privileged broker plus an
+  owned, authenticated host lifecycle channel. The cgroup is a containment and
+  cleanup boundary, not a security sandbox against an admitted hostile root or
+  capability-bearing workload.
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
@@ -740,12 +773,12 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v10 supervisor receipt and all retained-root plus
+1. Collect the qualified v11 supervisor receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH
-   search semantics, then replace whole-guest cleanup with a cgroup-scoped
-   workload boundary suitable for an agent and exec sessions.
+   search semantics, then generalize the qualified single-workload cgroup
+   broker for agent and exec-session ownership.
 3. Connect production final handoff, host stop/control and exit mapping,
    foreground-default `run` and detached `run -d`, then lifecycle/exec/log
    readiness for OCI-root/KVM.

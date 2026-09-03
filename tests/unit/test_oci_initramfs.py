@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-pid1-supervisor"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v9"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v10"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -160,17 +160,19 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     }
     assert value["stage1"]["workload_started"] is True
     assert value["stage1"]["supervisor"] == {
-        "cleanup_scope": "dedicated-qualification-guest-whole-guest",
-        "contract": "palimpsest.guest-pid1-supervisor.v2",
-        "credential_transition": "setgroups-setresgid-setresuid-verified-before-fork",
-        "credentials": "pid1-and-workload-same-numeric-identity-empty-supplementary-groups",
+        "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
+        "cgroup_security": "workload-containment-and-cleanup-not-hostile-root-sandbox",
+        "cleanup_scope": "dedicated-workload-cgroup",
+        "contract": "palimpsest.guest-pid1-supervisor.v3",
+        "credential_transition": "release-after-cgroup-attach-then-setgroups-setresgid-setresuid-verified",
+        "credentials": "root-pid1-broker-and-admitted-numeric-workload-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
-        "execution": "fork-execve-cloexec-error-pipe",
-        "privilege_after_fork": "no-more-than-authenticated-workload-identity",
+        "execution": "fork-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "privilege_after_fork": "root-pid1-narrow-broker-workload-identity-only",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
-        "production_cleanup": "cgroup-scoped-required-before-agent-or-exec",
+        "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "terminal_state": "parent-marker-then-fail-closed-wait",
-        "wait": "wait4-all-adopted-descendants",
+        "wait": "wait4-to-echild-with-empty-cgroup-proof",
     }
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
@@ -204,12 +206,28 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert stat.S_IMODE(paths[OCI_STAGE1_BINARY_DIGEST].stat().st_mode) == 0o644
     stage1 = paths[OCI_STAGE1_BINARY_DIGEST].read_bytes()
     assert b"workload terminal; main_status=" in stage1
-    assert b"; descendant_status=" in stage1
+    assert b"; cooperative_status=" in stage1
+    assert b"; forced_status=" in stage1
     assert b"; reaped=" in stage1
     assert b"; forwarded=" in stage1
     assert b"; pid1_uid=" in stage1
     assert b"; pid1_gid=" in stage1
     assert b"; pid1_groups=" in stage1
+    assert b"; cleanup=cgroup.kill; cgroup_populated=0" in stage1
+
+
+def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    source = (repository / "guest" / "stage1" / "init.c").read_text()
+    packaged = (repository / "src" / "palimpsest_local" / "assets" / "oci-stage1-init.x86_64").read_bytes()
+
+    assert source.count("return n ? 0 : -1;") == 3
+    assert "sc2(SYS_kill, main_pid, SIGKILL)" not in source
+    assert "SYS_kill, -1" not in source
+    assert b"kill(-1" not in packaged
+    assert b"whole-guest" not in packaged
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v8")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v2")' in source
 
 
 @pytest.mark.parametrize(

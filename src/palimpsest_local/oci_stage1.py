@@ -29,8 +29,9 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v7"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v7"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v8"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v8"
+OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v2"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
 OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-explicit-user-group.v1"
@@ -281,7 +282,7 @@ class OCIStage1Plan:
             },
             "boot_plan_digest": self.boot_plan_digest,
             "domain_core_digest": self.domain_core_digest,
-            "handoff": "first-party-pid1-supervisor.v1",
+            "handoff": OCI_STAGE1_HANDOFF,
             "phase": "stage1-contract",
             "process": self.process.to_dict(),
             "process_policy": OCI_STAGE1_PROCESS_POLICY,
@@ -320,7 +321,7 @@ class OCIStage1Plan:
             value.get("schema") != OCI_STAGE1_PLAN_SCHEMA
             or value.get("protocol") != OCI_STAGE1_PROTOCOL
             or value.get("phase") != "stage1-contract"
-            or value.get("handoff") != "first-party-pid1-supervisor.v1"
+            or value.get("handoff") != OCI_STAGE1_HANDOFF
             or value.get("process_policy") != OCI_STAGE1_PROCESS_POLICY
             or not isinstance(run, dict)
             or set(run) != {"name", "run_id"}
@@ -369,6 +370,7 @@ __all__ = [
     "MAX_OCI_STAGE1_ASSEMBLY_PROBES",
     "MAX_OCI_STAGE1_PROBE_BYTES",
     "OCI_STAGE1_PLAN_SCHEMA",
+    "OCI_STAGE1_HANDOFF",
     "OCI_STAGE1_PROTOCOL",
     "OCI_STAGE1_PROCESS_POLICY",
     "OCI_STAGE1_ROOT_LAYOUT",

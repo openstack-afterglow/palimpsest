@@ -48,7 +48,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v10"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v11"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -62,8 +62,9 @@ ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; ro
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
 WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
 WORKLOAD_TERMINAL_MARKER = (
-    b"palimpsest guest stage1: workload terminal; main_status=42; descendant_status=43; reaped=2; "
-    b"forwarded=15; pid1_uid=65534; pid1_gid=65534; pid1_groups=0; waiting fail-closed"
+    b"palimpsest guest stage1: workload terminal; main_status=42; cooperative_status=43; "
+    b"forced_status=137; reaped=3; forwarded=15; pid1_uid=0; pid1_gid=0; pid1_groups=0; "
+    b"cleanup=cgroup.kill; cgroup_populated=0; waiting fail-closed"
 )
 SUCCESS_MARKER = WORKLOAD_TERMINAL_MARKER
 REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
@@ -80,6 +81,7 @@ ROOT_TRANSITION_REJECTION_MARKER = (
     b"workload disabled; waiting fail-closed"
 )
 WORKLOAD_REJECTION_PREFIX = b"palimpsest guest stage1: workload launch rejected; stage="
+WORKLOAD_CLEANUP_REJECTION_PREFIX = b"palimpsest guest stage1: workload cleanup rejected; stage="
 WORKLOAD_NEGATIVE_CONTROL_NAMES = (
     "workload_missing_executable",
     "workload_non_executable",
@@ -156,6 +158,7 @@ _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_64BIT",
     "CONFIG_BINFMT_ELF",
     "CONFIG_BLK_DEV_INITRD",
+    "CONFIG_CGROUPS",
     "CONFIG_DEVTMPFS",
     "CONFIG_EXT4_FS",
     "CONFIG_OVERLAY_FS",
@@ -198,7 +201,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:e1be01323ad54e782ef6134dc97a535c58bd625bf47e2de047e82bdbff2cfa82"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:cf8581a0cd52181b106a4a5e9ad309e4afc0a4d3b10d3aa076a3982e5eb420d3"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -213,8 +216,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v5"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v5"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v6"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v6"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -230,10 +233,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "91585af8b30ea7412ea4eda21ec5e5631801796ed6cd43442db21484a20f94df",
-        "elf_size_bytes": 8808,
+        "elf_sha256": "a6e01df36852388f219414f1b08f10f9de3116983fcef119e067f8ad04f64145",
+        "elf_size_bytes": 8860,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "a1a06c3caf4b81638a771872406a32ca759cb872d05500685c0e89da91ac597d",
+        "source_sha256": "bd4bedea3e8a300071a706e174061e74cabb6aaa34fdbfed23d5b4ec14080cdf",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -877,7 +880,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v5",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v6",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1789,6 +1792,7 @@ class OCIStage1KVMProofReceipt:
                 self.console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
             )
             or _logical_prefix_count(self.console, WORKLOAD_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
             or _logical_line_count(self.console, REJECTION_MARKER) != 0
             or _logical_line_count(self.console, FILESYSTEM_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, ASSEMBLY_REJECTION_MARKER) != 0
@@ -1804,6 +1808,7 @@ class OCIStage1KVMProofReceipt:
                 self.retained_console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
             )
             or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.retained_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
             or any(
                 _logical_line_count(self.retained_console, marker) != 0
                 for marker in (
@@ -1824,6 +1829,7 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
                 or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
                 or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
@@ -1840,6 +1846,7 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
                 or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
                 or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ASSEMBLY_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
@@ -1857,6 +1864,7 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
                 or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
                 or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, ROOT_TRANSITION_REJECTION_MARKER) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.assembly_negative_consoles.values()
@@ -1880,6 +1888,7 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(control_console, ROOT_TRANSITION_MARKER) != 0
                 or _logical_line_count(control_console, WORKLOAD_STARTED_MARKER) != 0
                 or _logical_prefix_count(control_console, WORKLOAD_REJECTION_PREFIX) != 0
+                or _logical_prefix_count(control_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
                 or _logical_line_count(control_console, PREPARATION_FAILURE_MARKER) != 0
                 for control_console in self.root_transition_negative_consoles.values()
             )
@@ -1903,6 +1912,7 @@ class OCIStage1KVMProofReceipt:
                     WORKLOAD_NEGATIVE_REJECTION_MARKERS[name],
                 )
                 or _logical_prefix_count(self.workload_negative_consoles[name], WORKLOAD_REJECTION_PREFIX) != 1
+                or _logical_prefix_count(self.workload_negative_consoles[name], WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
                 or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_STARTED_MARKER) != 0
                 or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_TERMINAL_MARKER) != 0
                 or any(
@@ -2075,15 +2085,21 @@ class OCIStage1KVMProofReceipt:
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
             "supervisor": {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-                "credential_timing": "permanent-before-fork",
-                "descendant_status": 43,
+                "cgroup": "/palimpsest.workload",
+                "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+                "cgroup_write_escape_denied": ["parent", "own"],
+                "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+                "cooperative_status": 43,
+                "credential_timing": "child-after-parent-cgroup-attach-release",
+                "forced_status": 137,
                 "forwarded_signal": 15,
                 "main_status": 42,
-                "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
-                "privileged_after_fork": False,
+                "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+                "privileged_broker_after_fork": True,
                 "process_group": True,
-                "reaped_children": 2,
+                "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
+                "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
             },
             "switch_root": True,
             "topology": pre_mount_topology(build_proof_plan()),
@@ -2187,15 +2203,21 @@ class OCIStage1KVMProofReceipt:
             or supervisor
             != {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-                "credential_timing": "permanent-before-fork",
-                "descendant_status": 43,
+                "cgroup": "/palimpsest.workload",
+                "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+                "cgroup_write_escape_denied": ["parent", "own"],
+                "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+                "cooperative_status": 43,
+                "credential_timing": "child-after-parent-cgroup-attach-release",
+                "forced_status": 137,
                 "forwarded_signal": 15,
                 "main_status": 42,
-                "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
-                "privileged_after_fork": False,
+                "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+                "privileged_broker_after_fork": True,
                 "process_group": True,
-                "reaped_children": 2,
+                "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
+                "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
             }
             or value.get("pre_mount_devices") is not True
             or value.get("filesystem_verified") is not True
@@ -2481,6 +2503,8 @@ def _read_console_until(
             current = bytes(console)
             if any(_logical_line_count(current, marker) for marker in forbidden):
                 raise KVMProofFailure("QEMU emitted a forbidden stage-1 marker")
+            if _logical_prefix_count(current, WORKLOAD_CLEANUP_REJECTION_PREFIX):
+                raise KVMProofFailure("QEMU emitted a workload cleanup rejection marker")
             terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
             successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
             if terminal_count > successful_terminal_count:

@@ -33,25 +33,30 @@ palimpsest-oci-root-workload-proof-v1
 
 The workload deliberately uses its own procfs root link. The proof runs as
 UID/GID 65534 and must not depend on ptrace permission to dereference PID 1's
-`/proc/1/root`. PID 1 independently verifies `/proc/self/root` against the
-moved OCI root before dropping credentials and launching this helper.
+`/proc/1/root`. Root PID 1 independently verifies `/proc/self/root` against the
+moved OCI root before launching this helper.
 It also parses `/proc/1/status` within a fixed 8 KiB bound and requires exactly
 one `Uid`, `Gid`, and `Groups` line. All real, effective, saved, and filesystem
-UID/GID values must be 65534 and the supplementary-group list must be empty.
+UID/GID values must be zero and the supplementary-group list must be empty.
+The helper independently requires its own `/proc/self/cgroup` to contain the
+exact unified-v2 membership `0::/palimpsest.workload`. It also requires
+write-only opens of both the parent and its own `cgroup.procs` to fail with
+exactly `EACCES` or `EPERM`, proving the admitted UID 65534 cannot move itself
+out of the subtree through those controls.
 
-After validating the contract, the main process blocks SIGTERM, creates a
-`signalfd`, forks one same-process-group descendant, and waits for the
-descendant to become ready. The main then sends SIGTERM to PID 1. A conforming
-supervisor has already dropped permanently to the same numeric identity, so
-the signal is permitted without `CAP_KILL`, and forwards it to the workload
-process group. Both workload
-processes require the observed SIGTERM sender PID to be 1. The descendant
-writes a private completion byte and exits 43. The main uses `waitid` with
-`WNOWAIT` to prove that the descendant is already a zombie without consuming
-its status, then exits 42. This removes the race where PID 1 cleanup could
-replace the descendant status with SIGKILL while leaving PID 1 responsible for
-the final `wait4` reap. PID 1 must establish both statuses itself; workload
-output cannot prove execution, forwarding, or reaping.
+After validating the contract, the main process blocks SIGTERM and forks two
+same-process-group descendants. The cooperative descendant consumes PID 1's
+forwarded SIGTERM through `signalfd` and exits 43. The stubborn descendant
+keeps SIGTERM blocked and remains until the broker uses the pinned
+`cgroup.kill` descriptor, producing status 137. Once both descendants report
+ready, the main exits 42 naturally. Root PID 1 must then send the configured
+OCI stop signal, observe the cooperative grace result, kill the remaining
+cgroup, reap to `ECHILD`, prove `populated 0` and empty `cgroup.procs`, and
+remove the cgroup before it may publish terminal success.
+
+This cgroup is a workload containment and cleanup boundary, not a security
+sandbox against a hostile workload admitted as root or with powerful
+capabilities.
 
 Build the packaged test ELF with the same digest-pinned GCC image and ELF
 sealer used by stage 1:

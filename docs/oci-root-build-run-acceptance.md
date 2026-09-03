@@ -86,8 +86,8 @@ retransmitted with the same logical request ID, generation, and payload. The
 future guest broker must handle that exact retransmission idempotently and
 reject conflicting reuse.
 
-The lifecycle binding bumps the pre-production OCI-root domain plan to v5 and
-domain core to v3. Earlier v4/core-v2 previews are rejected and must be rebuilt
+The lifecycle and supervisor bindings use pre-production OCI-root domain plan
+v6 and domain core v3. Earlier v4/v5 and core-v2 previews are rejected and must be rebuilt
 before a future launch; loading one never migrates, deletes, or otherwise
 changes its run state or transport artifact.
 

@@ -27,6 +27,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
     ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
+    WORKLOAD_CLEANUP_REJECTION_PREFIX,
     WORKLOAD_NEGATIVE_CONTROL_NAMES,
     WORKLOAD_NEGATIVE_REJECTION_MARKERS,
     WORKLOAD_STARTED_MARKER,
@@ -164,6 +165,7 @@ def test_kernel_and_config_are_secure_bounded_built_in_fixtures(tmp_path: Path) 
 
 
 def test_kernel_config_rejects_modules_missing_and_duplicate_keys(tmp_path: Path) -> None:
+    assert "CONFIG_CGROUPS" in _REQUIRED_KERNEL_CONFIG
     complete = {key: "y" for key in _REQUIRED_KERNEL_CONFIG}
     for key, replacement in (("CONFIG_VIRTIO_BLK", "m"), ("CONFIG_PCI", None)):
         changed = dict(complete)
@@ -240,25 +242,28 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:e1be01323ad54e782ef6134dc97a535c58bd625bf47e2de047e82bdbff2cfa82"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v5"
+    assert manifest_digest == "sha256:cf8581a0cd52181b106a4a5e9ad309e4afc0a4d3b10d3aa076a3982e5eb420d3"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v6"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
     assert b"/proc/self/root/.__palimpsest_oci_root_workload_proof_v1" in helper_source
     assert b"/proc/1/root/.__palimpsest_oci_root_workload_proof_v1" not in helper_source
     assert b'"/proc/1/status"' in helper_source
-    assert b'"Uid:\\t65534\\t65534\\t65534\\t65534\\n"' in helper_source
-    assert b'"Gid:\\t65534\\t65534\\t65534\\t65534\\n"' in helper_source
+    assert b'"Uid:\\t0\\t0\\t0\\t0\\n"' in helper_source
+    assert b'"Gid:\\t0\\t0\\t0\\t0\\n"' in helper_source
     assert b'"Groups:\\t \\n"' in helper_source
+    assert b'"0::/palimpsest.workload\\n"' in helper_source
+    assert b'"/sys/fs/cgroup/cgroup.procs"' in helper_source
+    assert b'"/sys/fs/cgroup/palimpsest.workload/cgroup.procs"' in helper_source
     assert helper == {
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "91585af8b30ea7412ea4eda21ec5e5631801796ed6cd43442db21484a20f94df",
-        "elf_size_bytes": 8808,
+        "elf_sha256": "a6e01df36852388f219414f1b08f10f9de3116983fcef119e067f8ad04f64145",
+        "elf_size_bytes": 8860,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "a1a06c3caf4b81638a771872406a32ca759cb872d05500685c0e89da91ac597d",
+        "source_sha256": "bd4bedea3e8a300071a706e174061e74cabb6aaa34fdbfed23d5b4ec14080cdf",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
@@ -539,10 +544,25 @@ def test_console_reader_rejects_marker_embedded_in_a_forged_line() -> None:
 
 
 def test_console_reader_rejects_an_unexpected_terminal_without_waiting_for_timeout() -> None:
-    unexpected = WORKLOAD_TERMINAL_PREFIX + b"109; descendant_status=137; reaped=2; forwarded=0\n"
+    unexpected = WORKLOAD_TERMINAL_PREFIX + b"109; cooperative_status=137; forced_status=-1; reaped=2\n"
     program = f"import sys,time;sys.stdout.buffer.write({unexpected!r});sys.stdout.flush();time.sleep(10)"
     started = time.monotonic()
     with pytest.raises(KVMProofFailure, match="unexpected workload terminal"):
+        _read_console_until(
+            (sys.executable, "-c", program),
+            expected=SUCCESS_MARKER,
+            forbidden=(REJECTION_MARKER,),
+            timeout_seconds=3,
+            require_alive_after_marker=True,
+        )
+    assert time.monotonic() - started < 2
+
+
+def test_console_reader_rejects_cleanup_uncertainty_without_waiting_for_timeout() -> None:
+    rejected = WORKLOAD_CLEANUP_REJECTION_PREFIX + b"18; errno=16; terminal disabled; waiting fail-closed\n"
+    program = f"import sys,time;sys.stdout.buffer.write({rejected!r});sys.stdout.flush();time.sleep(10)"
+    started = time.monotonic()
+    with pytest.raises(KVMProofFailure, match="cleanup rejection"):
         _read_console_until(
             (sys.executable, "-c", program),
             expected=SUCCESS_MARKER,
@@ -593,16 +613,22 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v2",
-        "credential_timing": "permanent-before-fork",
-        "descendant_status": 43,
+        "contract": "palimpsest.guest-pid1-supervisor.v3",
+        "cgroup": "/palimpsest.workload",
+        "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+        "cgroup_write_escape_denied": ["parent", "own"],
+        "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+        "cooperative_status": 43,
+        "credential_timing": "child-after-parent-cgroup-attach-release",
+        "forced_status": 137,
         "forwarded_signal": 15,
         "main_status": 42,
-        "pid1_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
-        "privileged_after_fork": False,
+        "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+        "privileged_broker_after_fork": True,
         "process_group": True,
-        "reaped_children": 2,
+        "reaped_children": 3,
         "terminal_state": "parent-marker-then-fail-closed-wait",
+        "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
     }
     assert decoded["pre_mount_devices"] is True
     assert decoded["filesystem_verified"] is True
