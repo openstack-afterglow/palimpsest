@@ -249,6 +249,11 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "if (session->state == LIFECYCLE_TERMINAL)" in source
     assert "session->natural_late_stop_allowed = 0;" in source
     assert "lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;" in source
+    assert "session->connection == LIFECYCLE_CONNECTED && session->connection_has_hello" in source
+    assert "write_all(1, LIFECYCLE_PEER_BOUNDARY_MARKER);" in source
+    assert "session->payload_used + 1 == session->payload_expected" in source
+    assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
+    assert source.count("lifecycle_rejected(21, EIO);") >= 2
     assert "else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);" in source
 
 

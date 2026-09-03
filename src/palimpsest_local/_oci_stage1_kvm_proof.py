@@ -63,7 +63,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v13"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v14"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -78,6 +78,8 @@ WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is s
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
 LIFECYCLE_READY_COMMITTED_MARKER = b"palimpsest guest stage1: lifecycle ready committed"
+LIFECYCLE_PEER_BOUNDARY_MARKER = b"palimpsest guest stage1: lifecycle peer boundary observed"
+LIFECYCLE_PARTIAL_BUFFERED_MARKER = b"palimpsest guest stage1: lifecycle partial frame buffered"
 LIFECYCLE_STOP_DISPATCHED_MARKER = b"palimpsest guest stage1: lifecycle stop dispatched"
 LIFECYCLE_STOP_DUPLICATE_MARKER = b"palimpsest guest stage1: lifecycle stop duplicate accepted"
 WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
@@ -473,11 +475,13 @@ def _logical_lines_in_order(payload: bytes, *markers: bytes) -> bool:
 
     normalized = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     lines = normalized.split(b"\n")[:-1]
-    try:
-        positions = [lines.index(marker) for marker in markers]
-    except ValueError:
-        return False
-    return all(left < right for left, right in zip(positions, positions[1:], strict=False))
+    cursor = -1
+    for marker in markers:
+        try:
+            cursor = lines.index(marker, cursor + 1)
+        except ValueError:
+            return False
+    return True
 
 
 def _validate_digest(value: Any, field: str) -> str:
@@ -2043,9 +2047,12 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         "nonce_semantics",
         "negative_input_proven",
         "peer_identity",
+        "production_reconnect_requirement",
         "protocol",
         "qemu_duplicate_name_rejected",
+        "reconnect_boundary",
         "reconnect_proven",
+        "rapid_reconnect_proven",
         "session_profile",
         "single_connection_proven",
         "transport",
@@ -2070,9 +2077,14 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         or value.get("negative_input_proven") is not True
         or value.get("natural_terminal_proven") is not False
         or value.get("peer_identity") != "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1"
+        or value.get("reconnect_boundary") != "proof-only-known-workload-console-eof-barrier.v1"
+        or value.get("production_reconnect_requirement")
+        != "privileged-in-band-boundary-ack-or-equivalent-barrier"
+        or value.get("rapid_reconnect_proven") is not False
         or value.get("single_connection_proven") is not True
         or value.get("reconnect_proven") is not True
-        or value.get("session_profile") != "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1"
+        or value.get("session_profile")
+        != "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1"
         or value.get("connection_limit") != 16
     ):
         return False
@@ -2099,6 +2111,7 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                 "contract",
                 "immutable_backings_verified",
                 "lifecycle_rejection_marker_count",
+                "peer_boundary_marker_count",
                 "pid1_alive_after_marker",
                 "root_post_digest",
                 "root_seed_digest",
@@ -2112,6 +2125,7 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                 or item.get("contract") != lifecycle_negative_control_contract(name)
                 or item.get("immutable_backings_verified") is not True
                 or item.get("lifecycle_rejection_marker_count") != 1
+                or item.get("peer_boundary_marker_count") != (1 if name == "hello_reused_nonce" else 0)
                 or item.get("pid1_alive_after_marker") is not True
                 or item.get("success_marker_count") != 0
                 or item.get("terminal_marker_count") != 0
@@ -2208,6 +2222,8 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
             "initial_ready_host_observed",
             "logical_attempts",
             "pid1_alive_after_terminal",
+            "peer_boundary_marker_count",
+            "partial_frame_buffered_marker_count",
             "profile",
             "ready",
             "reopen_count",
@@ -2221,6 +2237,8 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
             or boot.get("terminal") != {"exit_code": 42, "signal": None}
             or boot.get("reopen_count") != 0
             or boot.get("stop_signal_dispatch_count") != 1
+            or boot.get("peer_boundary_marker_count") != (0 if boot_index == 0 else 5)
+            or boot.get("partial_frame_buffered_marker_count") != (0 if boot_index == 0 else 1)
         ):
             return False
         frames = boot.get("frames")
@@ -2471,6 +2489,9 @@ def _lifecycle_receipt(
             "contract": contract,
             "immutable_backings_verified": True,
             "lifecycle_rejection_marker_count": 1,
+            "peer_boundary_marker_count": _logical_line_count(
+                negative_consoles[name], LIFECYCLE_PEER_BOUNDARY_MARKER
+            ),
             "pid1_alive_after_marker": True,
             "root_post_digest": negative_root_post_digests[name],
             "root_seed_digest": contract["backings"]["root"]["artifact_digest"],
@@ -2492,6 +2513,10 @@ def _lifecycle_receipt(
                 "initial_ready_host_observed": True,
                 "logical_attempts": [],
                 "pid1_alive_after_terminal": True,
+                "peer_boundary_marker_count": _logical_line_count(first_console, LIFECYCLE_PEER_BOUNDARY_MARKER),
+                "partial_frame_buffered_marker_count": _logical_line_count(
+                    first_console, LIFECYCLE_PARTIAL_BUFFERED_MARKER
+                ),
                 "profile": "single-connection",
                 "ready": True,
                 "reopen_count": 0,
@@ -2504,6 +2529,12 @@ def _lifecycle_receipt(
                 "initial_ready_host_observed": False,
                 "logical_attempts": retained_attempts,
                 "pid1_alive_after_terminal": True,
+                "peer_boundary_marker_count": _logical_line_count(
+                    retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER
+                ),
+                "partial_frame_buffered_marker_count": _logical_line_count(
+                    retained_console, LIFECYCLE_PARTIAL_BUFFERED_MARKER
+                ),
                 "profile": "six-connection-partial-retry-committed-dedupe-composite",
                 "ready": True,
                 "reopen_count": 0,
@@ -2521,6 +2552,7 @@ def _lifecycle_receipt(
         "natural_terminal_proven": False,
         "negative_input_proven": True,
         "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
+        "production_reconnect_requirement": "privileged-in-band-boundary-ack-or-equivalent-barrier",
         "protocol": OCI_CONTROL_PROTOCOL,
         "qemu_duplicate_name_rejected": {
             "exit_code": duplicate_name_exit_code,
@@ -2533,8 +2565,10 @@ def _lifecycle_receipt(
             "rejection_marker_count": duplicate_name_output.count(QEMU_DUPLICATE_NAME_REJECTION_MARKER),
             "stage1_marker_count": duplicate_name_output.count(b"palimpsest guest stage1:"),
         },
+        "reconnect_boundary": "proof-only-known-workload-console-eof-barrier.v1",
         "reconnect_proven": True,
-        "session_profile": "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1",
+        "rapid_reconnect_proven": False,
+        "session_profile": "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
         "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
@@ -2629,6 +2663,8 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or _logical_line_count(self.console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
             or _logical_line_count(self.console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
+            or _logical_line_count(self.console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 0
+            or _logical_line_count(self.console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) != 0
             or not _logical_lines_in_order(
                 self.console,
                 ROOT_TRANSITION_MARKER,
@@ -2654,14 +2690,22 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.retained_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 5
+            or _logical_line_count(self.retained_console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) != 1
             or not _logical_lines_in_order(
                 self.retained_console,
                 ROOT_TRANSITION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
+                LIFECYCLE_PEER_BOUNDARY_MARKER,
+                LIFECYCLE_PEER_BOUNDARY_MARKER,
+                LIFECYCLE_PARTIAL_BUFFERED_MARKER,
+                LIFECYCLE_PEER_BOUNDARY_MARKER,
                 LIFECYCLE_STOP_DISPATCHED_MARKER,
                 LIFECYCLE_STOP_DUPLICATE_MARKER,
+                LIFECYCLE_PEER_BOUNDARY_MARKER,
                 SUCCESS_MARKER,
+                LIFECYCLE_PEER_BOUNDARY_MARKER,
             )
             or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
             or _logical_prefix_count(self.retained_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
@@ -2807,6 +2851,9 @@ class OCIStage1KVMProofReceipt:
                 or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DISPATCHED_MARKER)
                 != (1 if name == "second_distinct_stop" else 0)
                 or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
+                or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_PEER_BOUNDARY_MARKER)
+                != (1 if name == "hello_reused_nonce" else 0)
+                or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_PARTIAL_BUFFERED_MARKER) != 0
                 or _logical_line_count(self.lifecycle_negative_consoles[name], WORKLOAD_STARTED_MARKER)
                 != (1 if lifecycle_negative_control_contract(name)["phase"] == "post-workload" else 0)
                 or not _logical_lines_in_order(
@@ -2815,6 +2862,8 @@ class OCIStage1KVMProofReceipt:
                     *(
                         (WORKLOAD_STARTED_MARKER, LIFECYCLE_STOP_DISPATCHED_MARKER)
                         if name == "second_distinct_stop"
+                        else (WORKLOAD_STARTED_MARKER, LIFECYCLE_PEER_BOUNDARY_MARKER)
+                        if name == "hello_reused_nonce"
                         else (WORKLOAD_STARTED_MARKER,)
                         if lifecycle_negative_control_contract(name)["phase"] == "post-workload"
                         else ()
@@ -3491,12 +3540,17 @@ def _read_console_until(
     deadline = time.monotonic() + timeout_seconds
     marker_seen_at: float | None = None
     channel: socket.socket | None = None
-    if lifecycle_scenario not in {"normal", "composite", "negative"}:
+    if lifecycle_scenario not in {"normal", "composite", "negative", "discovery-negative"}:
         raise ArtifactValidationError("KVM lifecycle scenario is invalid")
-    if (lifecycle_scenario == "negative") != (lifecycle_negative_name is not None):
+    if (lifecycle_scenario in {"negative", "discovery-negative"}) != (lifecycle_negative_name is not None):
         raise ArtifactValidationError("KVM lifecycle negative scenario is invalid")
-    if lifecycle_negative_name is not None and lifecycle_negative_name not in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+    if lifecycle_scenario == "negative" and lifecycle_negative_name not in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
         raise ArtifactValidationError("KVM lifecycle negative scenario name is invalid")
+    if (
+        lifecycle_scenario == "discovery-negative"
+        and lifecycle_negative_name not in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
+    ):
+        raise ArtifactValidationError("KVM lifecycle discovery-negative scenario name is invalid")
     channel_finished = False
     channel_connected = False
     channel_pending = bytearray()
@@ -3514,6 +3568,7 @@ def _read_console_until(
     negative_input_written = False
     negative_reconnect_pending = False
     committed_stop: OCIControlMessage | None = None
+    required_peer_boundaries = 0
 
     def record_frame(direction: str, frame: bytes, message: Any) -> None:
         if lifecycle_transcript is not None:
@@ -3556,10 +3611,12 @@ def _read_console_until(
         if channel is not None:
             selector.modify(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
 
-    def close_channel() -> None:
-        nonlocal channel, channel_connected, decoder
+    def close_channel(*, require_peer_boundary: bool = False) -> None:
+        nonlocal channel, channel_connected, decoder, required_peer_boundaries
         if channel is None:
             return
+        if require_peer_boundary:
+            required_peer_boundaries += 1
         try:
             selector.unregister(channel)
         except (KeyError, OSError):
@@ -3599,12 +3656,28 @@ def _read_console_until(
         while True:
             now = time.monotonic()
             if now >= deadline:
-                raise KVMProofFailure("QEMU console proof timed out")
+                current = bytes(console)
+                session_state = session.state if session is not None else "none"
+                raise KVMProofFailure(
+                    "QEMU console proof timed out "
+                    f"(connection={connection_ordinal}; stage={composite_stage}; "
+                    f"session={session_state}; pending={len(channel_pending)}; "
+                    f"frames={len(lifecycle_transcript or ())}; "
+                    f"ready={_logical_line_count(current, LIFECYCLE_READY_COMMITTED_MARKER)}; "
+                    f"boundaries={_logical_line_count(current, LIFECYCLE_PEER_BOUNDARY_MARKER)}; "
+                    f"partial={_logical_line_count(current, LIFECYCLE_PARTIAL_BUFFERED_MARKER)}; "
+                    f"stop={_logical_line_count(current, LIFECYCLE_STOP_DISPATCHED_MARKER)}; "
+                    f"duplicate={_logical_line_count(current, LIFECYCLE_STOP_DUPLICATE_MARKER)}; "
+                    f"terminal={_logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)}; "
+                    f"console_tail={current[-512:]!r})"
+                )
             if (
                 channel is None
                 and not channel_finished
                 and lifecycle_socket_path is not None
                 and lifecycle_socket_path.exists()
+                and _logical_line_count(bytes(console), LIFECYCLE_PEER_BOUNDARY_MARKER)
+                >= required_peer_boundaries
             ):
                 try:
                     metadata = lifecycle_socket_path.lstat()
@@ -3739,8 +3812,8 @@ def _read_console_until(
                                     )
                                 pending_frame = None
                                 pending_message = None
-                                close_channel()
-                                composite_stage = "connect-4"
+                                selector.modify(channel, selectors.EVENT_READ, "channel")
+                                composite_stage = "await-partial-buffered-3"
                                 continue
                             pending_frame = None
                             pending_message = None
@@ -3833,7 +3906,7 @@ def _read_console_until(
                                 if lifecycle_scenario == "composite" and message.kind == "SNAPSHOT":
                                     state = message.payload["state"]
                                     if connection_ordinal == 2 and state == "ready":
-                                        close_channel()
+                                        close_channel(require_peer_boundary=True)
                                         composite_stage = "connect-3"
                                     elif connection_ordinal == 3 and state == "ready":
                                         stop = session.stop()
@@ -3856,18 +3929,29 @@ def _read_console_until(
             ready_committed = _logical_line_count(current, LIFECYCLE_READY_COMMITTED_MARKER)
             stop_dispatched = _logical_line_count(current, LIFECYCLE_STOP_DISPATCHED_MARKER)
             stop_duplicate = _logical_line_count(current, LIFECYCLE_STOP_DUPLICATE_MARKER)
+            partial_buffered = _logical_line_count(current, LIFECYCLE_PARTIAL_BUFFERED_MARKER)
+            if partial_buffered > 1:
+                raise KVMProofFailure("lifecycle partial-frame marker was emitted more than once")
             if lifecycle_scenario == "negative" and negative_reconnect_pending and ready_committed == 1:
-                close_channel()
+                close_channel(require_peer_boundary=True)
                 negative_reconnect_pending = False
             if lifecycle_scenario == "composite" and connection_ordinal == 1 and ready_committed == 1:
                 if channel_pending:
                     raise KVMProofFailure("initial lifecycle HELLO was not fully written")
-                close_channel()
+                close_channel(require_peer_boundary=True)
                 composite_stage = "connect-2"
             if lifecycle_scenario == "composite" and stop_dispatched > 1:
                 raise KVMProofFailure("lifecycle STOP was dispatched more than once")
             if lifecycle_scenario == "composite" and stop_duplicate > 1:
                 raise KVMProofFailure("lifecycle duplicate STOP was accepted more than once")
+            if (
+                lifecycle_scenario == "composite"
+                and connection_ordinal == 3
+                and composite_stage == "await-partial-buffered-3"
+                and partial_buffered == 1
+            ):
+                close_channel(require_peer_boundary=True)
+                composite_stage = "connect-4"
             if (
                 lifecycle_scenario == "negative"
                 and lifecycle_negative_name == "second_distinct_stop"
@@ -3906,7 +3990,7 @@ def _read_console_until(
             ):
                 if channel_pending:
                     raise KVMProofFailure("duplicate lifecycle STOP was not fully written")
-                close_channel()
+                close_channel(require_peer_boundary=True)
                 composite_stage = "connect-5"
             if (
                 lifecycle_scenario == "composite"
@@ -3914,7 +3998,7 @@ def _read_console_until(
                 and session is not None
                 and session.state == "terminal"
             ):
-                close_channel()
+                close_channel(require_peer_boundary=True)
                 composite_stage = "connect-6"
             if (
                 lifecycle_scenario == "normal"
@@ -3928,9 +4012,13 @@ def _read_console_until(
                 raise KVMProofFailure("QEMU emitted a forbidden stage-1 marker")
             if _logical_prefix_count(current, WORKLOAD_CLEANUP_REJECTION_PREFIX):
                 raise KVMProofFailure("QEMU emitted a workload cleanup rejection marker")
-            if lifecycle_scenario != "negative" and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX):
+            if lifecycle_scenario not in {"negative", "discovery-negative"} and _logical_prefix_count(
+                current, LIFECYCLE_REJECTION_PREFIX
+            ):
                 raise KVMProofFailure("QEMU emitted a lifecycle rejection marker")
-            if lifecycle_scenario == "negative" and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX) > 1:
+            if lifecycle_scenario in {"negative", "discovery-negative"} and _logical_prefix_count(
+                current, LIFECYCLE_REJECTION_PREFIX
+            ) > 1:
                 raise KVMProofFailure("QEMU emitted lifecycle rejection more than once")
             terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
             successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
@@ -4878,6 +4966,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                     forbidden=forbidden,
                     timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
                     require_alive_after_marker=True,
+                    lifecycle_scenario="discovery-negative",
+                    lifecycle_negative_name=control_name,
                 )
             _verify_pinned_boot_files(
                 qemu_path=qemu_path,

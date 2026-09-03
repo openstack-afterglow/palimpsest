@@ -145,6 +145,8 @@ struct span { const char *p; usize n; };
 #define LIFECYCLE_STOPPING 2
 #define LIFECYCLE_TERMINAL 3
 #define LIFECYCLE_READY_COMMITTED_MARKER "palimpsest guest stage1: lifecycle ready committed\n"
+#define LIFECYCLE_PEER_BOUNDARY_MARKER "palimpsest guest stage1: lifecycle peer boundary observed\n"
+#define LIFECYCLE_PARTIAL_BUFFERED_MARKER "palimpsest guest stage1: lifecycle partial frame buffered\n"
 #define LIFECYCLE_STOP_DISPATCHED_MARKER "palimpsest guest stage1: lifecycle stop dispatched\n"
 #define LIFECYCLE_STOP_DUPLICATE_MARKER "palimpsest guest stage1: lifecycle stop duplicate accepted\n"
 #define WORKLOAD_STATUS_NONE 4294967295U
@@ -229,6 +231,7 @@ struct lifecycle_session {
     int connection_has_hello;
     int state;
     int natural_late_stop_allowed;
+    int partial_frame_marker_emitted;
     u32 nonce_count;
     u32 request_count;
     u32 header_used;
@@ -1893,16 +1896,20 @@ static int generate_boot_generation(char out[37]) {
 }
 
 static void lifecycle_connection_lost(struct lifecycle_session *session) {
+    int admitted_peer_boundary =
+        session->connection == LIFECYCLE_CONNECTED && session->connection_has_hello;
     session->connection = LIFECYCLE_DISCONNECTED;
     session->connection_has_hello = 0;
     session->natural_late_stop_allowed = 0;
     session->header_used = 0;
     session->payload_expected = 0;
     session->payload_used = 0;
+    session->partial_frame_marker_emitted = 0;
     session->frame_deadline = 0;
     session->outbound_failed = 0;
     session->outbound_deadline = 0;
     session->host_nonce[0] = 0;
+    if (admitted_peer_boundary) write_all(1, LIFECYCLE_PEER_BOUNDARY_MARKER);
 }
 
 /* Never let a connected peer make the outer supervisor wait past the
@@ -1953,6 +1960,7 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
                     session->header_used = 0;
                     session->payload_expected = 0;
                     session->payload_used = 0;
+                    session->partial_frame_marker_emitted = 0;
                     session->frame_deadline = 0;
                     return 1;
                 }
@@ -1969,8 +1977,14 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
             continue;
         }
         if (n == -EINTR) continue;
-        if (n == -EAGAIN)
+        if (n == -EAGAIN) {
+            if (session->payload_expected && session->payload_used + 1 == session->payload_expected &&
+                !session->partial_frame_marker_emitted) {
+                write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);
+                session->partial_frame_marker_emitted = 1;
+            }
             return session->frame_deadline && monotonic_millis() >= session->frame_deadline ? -1 : 0;
+        }
         if (n == 0) {
             lifecycle_connection_lost(session);
             return -2;
@@ -2237,10 +2251,15 @@ static __attribute__((noreturn)) void service_terminal_lifecycle(
         } else {
             i64 n = sc3(SYS_poll, (i64)&pollfd, 1,
                         lifecycle_poll_timeout(session, -1));
-            if (n < 0 && n != -EINTR) for (;;) sc0(SYS_pause);
+            if (n < 0 && n != -EINTR) {
+                lifecycle_rejected(21, EIO);
+                for (;;) sc0(SYS_pause);
+            }
         }
-        if (!lifecycle_pump(session, result, &dispatch_stop) || dispatch_stop)
+        if (!lifecycle_pump(session, result, &dispatch_stop) || dispatch_stop) {
+            lifecycle_rejected(21, EIO);
             for (;;) sc0(SYS_pause);
+        }
         if (was_disconnected && session->connection == LIFECYCLE_DISCONNECTED &&
             session->reconnect_backoff_ms < 100) {
             session->reconnect_backoff_ms *= 2;

@@ -31,14 +31,15 @@ from palimpsest_local._oci_stage1_kvm_proof import (
 pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
 
 
-def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_matrices() -> None:
+def test_packaged_stage1_supervises_workload_and_rejects_all_40_boot_control_matrices() -> None:
     if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
         pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
 
     result = run_oci_stage1_kvm_proof()
 
     receipt = result.receipt.to_dict()
-    assert receipt["executed_boots"] == 30
+    assert receipt["executed_boots"] == 40
+    assert receipt["qemu_invocations"] == 41
     assert receipt["qualification"] == {
         "accelerator": "kvm",
         "architecture": "x86_64",

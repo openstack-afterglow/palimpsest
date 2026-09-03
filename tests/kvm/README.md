@@ -31,12 +31,18 @@ Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
 drives canonical lifecycle frames with partial nonblocking I/O and records
 path-free frame digests plus nonce/generation/request/sequence correlation.
-Receipt v13 covers a single connection and an exact six-connection retained-
+Receipt v14 covers a single connection and an exact six-connection retained-
 root session. The latter proves lost initial READY recovery; ready, stopping,
 and terminal SNAPSHOTs; a connection-local partial STOP; complete same-ID
 retry; and an already-committed same-ID duplicate accepted without a second
 signal dispatch. Linux connects pin socket dev/inode/uid/type and require
 `SO_PEERCRED` to identify the spawned QEMU PID and current UID.
+Every intended close-to-reconnect transition waits for the exact admitted-peer
+EOF marker, and the partial STOP is closed only after its frame-minus-one
+buffer marker. Both are proof-only console coordination with the known
+workload, not production authority. A production host needs a privileged
+in-band boundary acknowledgement or equivalent barrier; this receipt records
+`rapid_reconnect_proven=false`.
 
 Ten lifecycle-negative guest boots cover missing/wrong named ports,
 zero/oversized lengths, a non-canonical duplicate JSON key, wrong binding,
@@ -59,7 +65,7 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-receipt v13 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v14 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact argv, two-entry environment, cwd, numeric uid/gid,
@@ -70,7 +76,7 @@ removal. The workload also proves UID 65534 cannot write-open either the parent
 or its own `cgroup.procs`. Production define/start remains
 disabled.
 
-The v13 canonical receipt binds all 40 native-KVM guest boots: two positive boots
+The v14 canonical receipt binds all 40 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and three
 workload-launch controls, plus ten lifecycle controls. One additional QEMU
@@ -113,7 +119,7 @@ filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v13 receipt on the qualified runner; this source update and
+must still produce a v14 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while only the admitted

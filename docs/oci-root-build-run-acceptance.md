@@ -91,13 +91,19 @@ v8 and domain core v3. Earlier v4/v5/v6/v7 and core-v2 previews are rejected and
 before a future launch; loading one never migrates, deletes, or otherwise
 changes its run state or transport artifact.
 
-The v13 native qualification harness now exercises both a single connection
+The v14 native qualification harness now exercises both a single connection
 and a six-connection retained-root session. The latter loses the initial READY,
 reconnects through READY/stopping/terminal snapshots, writes a partial STOP,
 retries the complete same logical STOP, and then proves already-committed
 same-ID deduplication without a second signal dispatch. Linux connects pin the
 QEMU socket identity and require `SO_PEERCRED` to identify the spawned QEMU PID
-and current UID. Ten separate lifecycle-negative guest boots cover two channel
+and current UID. The qualified reconnect waits for an exact guest EOF-observed
+console marker before opening each next connection, and the partial-STOP case
+also waits until the guest reports the exact frame-minus-one buffer state.
+These markers are proof-only coordination with the known workload and are not
+production lifecycle authority. Production must provide a privileged in-band
+boundary acknowledgement or equivalent barrier; arbitrary rapid reconnect is
+not qualified. Ten separate lifecycle-negative guest boots cover two channel
 discovery failures and eight exact malformed, stale, replayed, or conflicting
 wire inputs; a separate non-boot QEMU invocation proves duplicate named ports
 are rejected before stage 1 starts. Thus `reconnect_proven=true` and

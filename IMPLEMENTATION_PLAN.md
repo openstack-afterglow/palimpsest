@@ -792,6 +792,13 @@ correlation is not cryptographic peer authentication.
   already-committed duplicate without dispatching the signal twice. Host
   request allocation remains monotonic while an outstanding STOP retains its
   earlier ID across a later reconnect HELLO.
+- The proof host opens the next connection only after an exact admitted-peer
+  EOF marker, and closes the partial STOP connection only after the guest has
+  reported its exact frame-minus-one buffered state. These stdout markers are
+  proof-only coordination with the controlled workload, not production
+  authority. Production reconnect requires a privileged in-band boundary ACK
+  or equivalent barrier; arbitrary rapid reconnect remains explicitly
+  unqualified.
 - Input parsing has a five-second connection-local partial-frame deadline even
   when no further readiness event arrives. Outbound partial/write loss commits
   its sequence attempt but preserves the old input parser, HELLO, and nonce
@@ -809,14 +816,14 @@ correlation is not cryptographic peer authentication.
   at most once on the already-active connection without changing null
   `reply_to`; EOF, reconnect, malformed input, or a second STOP closes that
   exception. This code path is not an additional native proof boot, so receipt
-  v13 says `natural_terminal_proven=false`.
+  v14 says `natural_terminal_proven=false`.
 - Stage-1 plan/protocol v10, handoff v4, init/consumer v12, initramfs
   manifest/ABI v14, supervisor v5, lifecycle broker v2, fixture policy/schema
-  v8, domain plan v8, and KVM receipt v13 bind this checkpoint.
+  v8, domain plan v8, and KVM receipt v14 bind this checkpoint.
 
 Scope boundary: the production libvirt/runtime dispatch and CLI still do not
 own or open this lifecycle channel, and Gate 2 remains inactive. The nonce is
-correlation/replay state, not cryptographic peer authentication. Native v13
+correlation/replay state, not cryptographic peer authentication. Native v14
 evidence must be collected on the qualified Linux x86_64 KVM runner; local
 policy tests and reproducible binaries are not a substitute.
 
@@ -838,7 +845,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v13 lifecycle receipt and all retained-root plus
+1. Collect the qualified v14 lifecycle receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH

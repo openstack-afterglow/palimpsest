@@ -23,6 +23,8 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     FILESYSTEM_REJECTION_MARKER,
     LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES,
     LIFECYCLE_NEGATIVE_CONTROL_NAMES,
+    LIFECYCLE_PARTIAL_BUFFERED_MARKER,
+    LIFECYCLE_PEER_BOUNDARY_MARKER,
     LIFECYCLE_READY_COMMITTED_MARKER,
     LIFECYCLE_REJECTION_PREFIX,
     LIFECYCLE_STOP_DISPATCHED_MARKER,
@@ -114,11 +116,28 @@ def _positive_console(*, retained: bool = False) -> bytes:
         + b"\r\n"
         + WORKLOAD_SIGNAL_ARMED_MARKER
         + b"\r\n"
-        + LIFECYCLE_STOP_DISPATCHED_MARKER
-        + b"\r\n"
     )
     if retained:
-        payload += LIFECYCLE_STOP_DUPLICATE_MARKER + b"\r\n"
+        payload += (
+            (LIFECYCLE_PEER_BOUNDARY_MARKER + b"\r\n") * 2
+            + LIFECYCLE_PARTIAL_BUFFERED_MARKER
+            + b"\r\n"
+            + LIFECYCLE_PEER_BOUNDARY_MARKER
+            + b"\r\n"
+        )
+    payload += LIFECYCLE_STOP_DISPATCHED_MARKER + b"\r\n"
+    if retained:
+        payload += (
+            LIFECYCLE_STOP_DUPLICATE_MARKER
+            + b"\r\n"
+            + LIFECYCLE_PEER_BOUNDARY_MARKER
+            + b"\r\n"
+            + SUCCESS_MARKER
+            + b"\r\n"
+            + LIFECYCLE_PEER_BOUNDARY_MARKER
+            + b"\r\n"
+        )
+        return payload
     return payload + SUCCESS_MARKER + b"\r\n"
 
 
@@ -136,6 +155,8 @@ def _lifecycle_negative_consoles() -> dict[str, bytes]:
         payload = b"kernel boot\n" + ROOT_TRANSITION_MARKER + b"\n"
         if contract["phase"] == "post-workload":
             payload += WORKLOAD_STARTED_MARKER + b"\n"
+        if name == "hello_reused_nonce":
+            payload += LIFECYCLE_PEER_BOUNDARY_MARKER + b"\n"
         if name == "second_distinct_stop":
             payload += LIFECYCLE_STOP_DISPATCHED_MARKER + b"\n"
         result[name] = payload + contract["rejection_marker"].encode("ascii") + b"\n"
@@ -324,6 +345,8 @@ def _lifecycle() -> dict[str, object]:
             "frames": frames(normal_messages),
             "initial_ready_host_observed": True,
             "logical_attempts": [],
+            "peer_boundary_marker_count": 0,
+            "partial_frame_buffered_marker_count": 0,
             "pid1_alive_after_terminal": True,
             "profile": "single-connection",
             "ready": True,
@@ -345,6 +368,8 @@ def _lifecycle() -> dict[str, object]:
                     "request_id": 4,
                 }
             ],
+            "peer_boundary_marker_count": 5,
+            "partial_frame_buffered_marker_count": 1,
             "pid1_alive_after_terminal": True,
             "profile": "six-connection-partial-retry-committed-dedupe-composite",
             "ready": True,
@@ -364,6 +389,7 @@ def _lifecycle() -> dict[str, object]:
             "contract": contract,
             "immutable_backings_verified": True,
             "lifecycle_rejection_marker_count": 1,
+            "peer_boundary_marker_count": 1 if name == "hello_reused_nonce" else 0,
             "pid1_alive_after_marker": True,
             "root_post_digest": "sha256:" + "9" * 64,
             "root_seed_digest": contract["backings"]["root"]["artifact_digest"],
@@ -390,6 +416,7 @@ def _lifecycle() -> dict[str, object]:
         "natural_terminal_proven": False,
         "negative_input_proven": True,
         "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
+        "production_reconnect_requirement": "privileged-in-band-boundary-ack-or-equivalent-barrier",
         "protocol": "palimpsest.oci-lifecycle-control.v1",
         "qemu_duplicate_name_rejected": {
             "exit_code": 1,
@@ -402,8 +429,10 @@ def _lifecycle() -> dict[str, object]:
             "rejection_marker_count": 1,
             "stage1_marker_count": 0,
         },
+        "reconnect_boundary": "proof-only-known-workload-console-eof-barrier.v1",
         "reconnect_proven": True,
-        "session_profile": "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1",
+        "rapid_reconnect_proven": False,
+        "session_profile": "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
         "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
@@ -913,6 +942,22 @@ def test_console_reader_rejects_lifecycle_failure_without_waiting_for_timeout() 
     assert time.monotonic() - started < 2
 
 
+def test_console_reader_accepts_only_expected_discovery_negative_rejection() -> None:
+    name = "lifecycle_missing_port"
+    rejected = lifecycle_negative_control_contract(name)["rejection_marker"].encode("ascii")
+    program = f"import sys,time;sys.stdout.buffer.write({rejected!r}+b'\\n');sys.stdout.flush();time.sleep(2)"
+    console = _read_console_until(
+        (sys.executable, "-c", program),
+        expected=rejected,
+        forbidden=(SUCCESS_MARKER,),
+        timeout_seconds=3,
+        require_alive_after_marker=True,
+        lifecycle_scenario="discovery-negative",
+        lifecycle_negative_name=name,
+    )
+    assert _logical_line_count(console, rejected) == 1
+
+
 def test_console_reader_drives_fragmented_single_connection_lifecycle(tmp_path: Path) -> None:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
@@ -996,11 +1041,19 @@ def receive(connection, partial=False):
         if not chunk: return None
         data += chunk
     size = struct.unpack('>I', data)[0]
-    while len(data) < size + 4:
-        try: chunk = connection.recv(size + 4 - len(data))
+    expected = size + 4 - (1 if partial else 0)
+    while len(data) < expected:
+        try: chunk = connection.recv(expected - len(data))
         except ConnectionResetError: return None
         if not chunk: return None
         data += chunk
+    if partial:
+        sys.stdout.buffer.write({LIFECYCLE_PARTIAL_BUFFERED_MARKER!r} + b'\\n'); sys.stdout.flush()
+        try:
+            while connection.recv(4096): pass
+        except ConnectionResetError:
+            pass
+        return None
     return decode_frame(data)
 
 def drain(connection):
@@ -1008,6 +1061,7 @@ def drain(connection):
         while connection.recv(4096): pass
     except ConnectionResetError:
         pass
+    sys.stdout.buffer.write({LIFECYCLE_PEER_BOUNDARY_MARKER!r} + b'\\n'); sys.stdout.flush()
 
 def snapshot(hello, sequence, state, stop_id=None, terminal=None):
     return OCIControlMessage(kind='SNAPSHOT', binding=hello.binding, host_nonce=hello.host_nonce,
@@ -1027,7 +1081,8 @@ drain(c)
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 2, 'ready')))
 drain(c)
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 3, 'ready')))
-assert receive(c) is None
+assert receive(c, partial=True) is None
+sys.stdout.buffer.write({LIFECYCLE_PEER_BOUNDARY_MARKER!r} + b'\\n'); sys.stdout.flush()
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 4, 'ready')))
 stop = receive(c); assert stop.request_id == 4
 sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdout.flush()
@@ -1063,6 +1118,8 @@ time.sleep(2)
     assert _logical_line_count(console, WORKLOAD_STOP_OBSERVED_MARKER) == 1
     assert _logical_line_count(console, LIFECYCLE_STOP_DISPATCHED_MARKER) == 1
     assert _logical_line_count(console, LIFECYCLE_STOP_DUPLICATE_MARKER) == 1
+    assert _logical_line_count(console, LIFECYCLE_PEER_BOUNDARY_MARKER) == 5
+    assert _logical_line_count(console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) == 1
     assert [frame["connection"] for frame in transcript] == [1, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 6, 6]
     assert [frame["sequence"] for frame in transcript if frame["sequence"] is not None] == [2, 3, 4, 5, 6, 7]
     assert attempts[0]["request_id"] == transcript[7]["request_id"] == 4
@@ -1191,7 +1248,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v13"
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v14"
     assert decoded["executed_boots"] == 40
     assert decoded["qemu_invocations"] == 41
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
@@ -1617,6 +1674,40 @@ def test_receipt_rejects_valid_looking_lifecycle_root_seed_tamper() -> None:
 
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, lifecycle=lifecycle)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reconnect_boundary", "uncoordinated"),
+        ("production_reconnect_requirement", "none"),
+        ("rapid_reconnect_proven", True),
+    ],
+)
+def test_receipt_rejects_reconnect_boundary_claim_tamper(field: str, value: object) -> None:
+    receipt = _receipt()
+    lifecycle = copy.deepcopy(receipt.lifecycle)
+    lifecycle[field] = value
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle=lifecycle)
+
+
+def test_receipt_rejects_peer_boundary_count_tamper() -> None:
+    receipt = _receipt()
+    lifecycle = copy.deepcopy(receipt.lifecycle)
+    lifecycle["boots"][1]["peer_boundary_marker_count"] = 4
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle=lifecycle)
+
+
+def test_receipt_rejects_partial_buffer_and_boundary_reordering() -> None:
+    receipt = _receipt()
+    needle = LIFECYCLE_PEER_BOUNDARY_MARKER + b"\r\n" + LIFECYCLE_PARTIAL_BUFFERED_MARKER
+    replacement = LIFECYCLE_PARTIAL_BUFFERED_MARKER + b"\r\n" + LIFECYCLE_PEER_BOUNDARY_MARKER
+    reordered = receipt.retained_console.replace(needle, replacement, 1)
+    assert reordered != receipt.retained_console
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, retained_console=reordered)
 
 
 @pytest.mark.parametrize(
