@@ -991,15 +991,23 @@ from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_fram
 def receive(connection, partial=False):
     data = b''
     while len(data) < 4:
-        chunk = connection.recv(4-len(data))
+        try: chunk = connection.recv(4-len(data))
+        except ConnectionResetError: return None
         if not chunk: return None
         data += chunk
     size = struct.unpack('>I', data)[0]
     while len(data) < size + 4:
-        chunk = connection.recv(size + 4 - len(data))
+        try: chunk = connection.recv(size + 4 - len(data))
+        except ConnectionResetError: return None
         if not chunk: return None
         data += chunk
     return decode_frame(data)
+
+def drain(connection):
+    try:
+        while connection.recv(4096): pass
+    except ConnectionResetError:
+        pass
 
 def snapshot(hello, sequence, state, stop_id=None, terminal=None):
     return OCIControlMessage(kind='SNAPSHOT', binding=hello.binding, host_nonce=hello.host_nonce,
@@ -1015,9 +1023,9 @@ c.sendall(encode_frame(OCIControlMessage(kind='READY', binding=hello.binding, ho
 for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r},
                {LIFECYCLE_READY_COMMITTED_MARKER!r}):
     sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
-while c.recv(4096): pass
+drain(c)
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 2, 'ready')))
-while c.recv(4096): pass
+drain(c)
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 3, 'ready')))
 assert receive(c) is None
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 4, 'ready')))
@@ -1026,13 +1034,13 @@ sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdo
 duplicate = receive(c); assert encode_frame(duplicate) == encode_frame(stop)
 sys.stdout.buffer.write({LIFECYCLE_STOP_DUPLICATE_MARKER!r} + b'\\n'); sys.stdout.flush()
 sys.stdout.buffer.write({WORKLOAD_STOP_OBSERVED_MARKER!r} + b'\\n'); sys.stdout.flush()
-while c.recv(4096): pass
+drain(c)
 c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 5, 'stopping', 4)))
 c.sendall(encode_frame(OCIControlMessage(kind='TERMINAL', binding=hello.binding, host_nonce=hello.host_nonce,
     payload={{'terminal': {{'exit_code': 42, 'signal': None}}}}, sequence=6,
     boot_generation=generation, reply_to=4)))
 sys.stdout.buffer.write({SUCCESS_MARKER!r} + b'\\n'); sys.stdout.flush()
-while c.recv(4096): pass
+drain(c)
 c, _ = listener.accept(); hello = receive(c)
 c.sendall(encode_frame(snapshot(hello, 7, 'terminal', 4, {{'exit_code': 42, 'signal': None}})))
 time.sleep(2)
