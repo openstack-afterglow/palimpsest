@@ -755,6 +755,34 @@ agent lifecycle still require a separate production privileged broker plus an
   cleanup boundary, not a security sandbox against an admitted hostile root or
   capability-bearing workload.
 
+### PR 4 slice 27A: native single-connection lifecycle qualification
+
+- The qualification PID 1 now opens exactly one uniquely discovered
+  `org.palimpsest.oci.lifecycle.0` virtio port, verifies its sysfs and character
+  device identity, and runs the bounded canonical v1 `HELLO → READY → STOP →
+  TERMINAL` exchange. Boot generation is a kernel-random RFC 4122 v4 UUID.
+  The implementation is fail-closed for malformed, stale-binding, duplicate,
+  truncated, or oversized input, but the native receipt currently exercises
+  only the valid exchange; its exact `negative_input_proven=false` field keeps
+  the corresponding guest-C negative runtime matrix explicitly unproven.
+- The native proof uses a private owner-bound QEMU Unix socket with `wait=off`,
+  virtio-serial, and virtio RNG. The host performs partial nonblocking I/O with
+  the shared decoder/session, waits for both READY and the proof-only
+  signal-armed scheduling marker before STOP, and requires TERMINAL before the
+  parent console marker while QEMU/PID 1 remain alive. Receipt v12 retains
+  path-free frame digests/sizes/directions plus nonce, boot generation,
+  request/reply, and sequence evidence for two distinct positive boots.
+- Stage-1 plan/protocol v9, handoff v3, init/consumer v11, initramfs manifest
+  and ABI v13, supervisor v4, lifecycle broker v1, fixture policy/schema v7,
+  domain plan v7, and receipt v12 bind this checkpoint. Domain plan v6 is a
+  pre-production invalidated input and is rejected read-only with a rebuild
+  instruction; domain core remains v3.
+
+Scope boundary: this proves one native connection only. `reconnect_proven` is
+false; SNAPSHOT and STOP retransmission are not guest-runtime claims. The
+production libvirt/runtime dispatch and CLI remain disabled, and nonce
+correlation is not cryptographic peer authentication.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -773,7 +801,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v11 supervisor receipt and all retained-root plus
+1. Collect the qualified v12 lifecycle receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH

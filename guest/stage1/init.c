@@ -54,15 +54,21 @@ struct span { const char *p; usize n; };
 #define SYS_openat 257
 #define SYS_mkdirat 258
 #define SYS_unlinkat 263
+#define SYS_clock_gettime 228
+#define SYS_getrandom 318
 
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_RDWR 2
 #define O_NONBLOCK 04000
+#define O_NOCTTY 0400
 #define O_CLOEXEC 02000000
 #define O_NOFOLLOW 0400000
 #define O_DIRECTORY 0200000
 #define POLLIN 1
+#define POLLOUT 4
+#define POLLERR 8
+#define POLLHUP 16
 #define SIG_BLOCK 0
 #define SIG_SETMASK 2
 #define SIGKILL 9
@@ -74,6 +80,7 @@ struct span { const char *p; usize n; };
 #define S_IFMT 0170000
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
+#define S_IFCHR 0020000
 #define S_IFDIR 0040000
 #define MS_RDONLY 1
 #define MS_NOSUID 2
@@ -85,9 +92,12 @@ struct span { const char *p; usize n; };
 #define EEXIST 17
 #define EBUSY 16
 #define EIO 5
+#define EAGAIN 11
 #define EINTR 4
 #define ECHILD 10
 #define EINVAL 22
+#define CLOCK_MONOTONIC 1
+#define GRND_NONBLOCK 1
 #define BLKROGET 0x125e
 #define BLKGETSIZE64 0x80081272
 
@@ -121,6 +131,10 @@ struct span { const char *p; usize n; };
 #define WORKLOAD_TERMINAL_PREFIX "palimpsest guest stage1: workload terminal; main_status="
 #define WORKLOAD_REJECTED_PREFIX "palimpsest guest stage1: workload launch rejected; stage="
 #define WORKLOAD_CLEANUP_REJECTED_PREFIX "palimpsest guest stage1: workload cleanup rejected; stage="
+#define LIFECYCLE_REJECTED_PREFIX "palimpsest guest stage1: lifecycle rejected; stage="
+#define LIFECYCLE_CHANNEL_NAME "org.palimpsest.oci.lifecycle.0"
+#define LIFECYCLE_PROTOCOL "palimpsest.oci-lifecycle-control.v1"
+#define CONTROL_PAYLOAD_MAX 65532
 #define WORKLOAD_STATUS_NONE 4294967295U
 
 struct timespec_local {
@@ -186,7 +200,26 @@ struct supervisor_result {
     u32 pid1_uid;
     u32 pid1_gid;
     u32 pid1_groups;
+    u32 main_exit_code;
+    u32 main_signal;
 };
+
+struct lifecycle_binding {
+    char run_id[37];
+    char core[72];
+    char stage1[72];
+};
+
+struct lifecycle_session {
+    int fd;
+    int poisoned;
+    u64 hello_request_id;
+    u64 stop_request_id;
+    char host_nonce[65];
+    char boot_generation[37];
+};
+
+static struct lifecycle_binding lifecycle_binding;
 
 struct workload_cgroup {
     int root_fd;
@@ -327,6 +360,14 @@ static void workload_terminal(const struct supervisor_result *result) {
 
 static void workload_cleanup_rejected(u32 stage, u32 error) {
     write_all(2, WORKLOAD_CLEANUP_REJECTED_PREFIX);
+    write_u32(2, stage);
+    write_all(2, "; errno=");
+    write_u32(2, error);
+    write_all(2, "; terminal disabled; waiting fail-closed\n");
+}
+
+static void lifecycle_rejected(u32 stage, u32 error) {
+    write_all(2, LIFECYCLE_REJECTED_PREFIX);
     write_u32(2, stage);
     write_all(2, "; errno=");
     write_u32(2, error);
@@ -1082,16 +1123,19 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v2") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v3") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") || !exact_string(&j, "absolute-argv0-numeric-explicit-user-group.v1") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v8") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v9") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v8") || !take_char(&j, '}') ||
+        !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v9") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
+    memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
+    memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
     devices->lower_count = layer_count;
     return 1;
 }
@@ -1668,6 +1712,268 @@ static int append_u32(char *out, usize *used, u32 value) {
     if (*used + count + 1 > PATH_MAX_LOCAL) return 0;
     for (i = 0; i < count; i++) out[(*used)++] = digits[count - 1 - i];
     out[*used] = 0;
+    return 1;
+}
+
+static u8 control_payload[CONTROL_PAYLOAD_MAX];
+static u8 control_output[1024];
+static struct parser control_parser;
+
+static u64 monotonic_millis(void) {
+    struct timespec_local now;
+    if (sc2(SYS_clock_gettime, CLOCK_MONOTONIC, (i64)&now) != 0 || now.sec < 0 || now.nsec < 0)
+        return 0;
+    return (u64)now.sec * 1000 + (u64)now.nsec / 1000000;
+}
+
+static int wait_control_fd(int fd, short events, u64 deadline) {
+    struct pollfd_local item;
+    for (;;) {
+        u64 now = monotonic_millis();
+        int timeout;
+        i64 n;
+        if (!now || now >= deadline) return 0;
+        timeout = (int)(deadline - now > 100 ? 100 : deadline - now);
+        item.fd = fd; item.events = events; item.revents = 0;
+        n = sc3(SYS_poll, (i64)&item, 1, timeout);
+        if (n == -EINTR) continue;
+        if (n < 0 || (item.revents & (POLLERR | POLLHUP))) return 0;
+        if (n > 0 && (item.revents & events)) return 1;
+    }
+}
+
+static int control_io_exact(int fd, u8 *buffer, usize size, int writing) {
+    usize used = 0;
+    u64 now = monotonic_millis();
+    u64 deadline = now ? now + 5000 : 0;
+    if (!deadline) return 0;
+    while (used < size) {
+        i64 n = writing ? sc3(SYS_write, fd, (i64)(buffer + used), size - used)
+                        : sc3(SYS_read, fd, (i64)(buffer + used), size - used);
+        if (n > 0 && (usize)n <= size - used) { used += (usize)n; continue; }
+        if (n == -EINTR) continue;
+        if (n == -EAGAIN && wait_control_fd(fd, writing ? POLLOUT : POLLIN, deadline)) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int vport_name(const u8 *name, usize size) {
+    usize i = 5;
+    if (size < 8 || !bytes_equal(name, "vport", 5)) return 0;
+    if (name[i] < '0' || name[i] > '9') return 0;
+    while (i < size && name[i] >= '0' && name[i] <= '9') i++;
+    if (i >= size || name[i++] != 'p' || i >= size) return 0;
+    while (i < size && name[i] >= '0' && name[i] <= '9') i++;
+    return i == size;
+}
+
+static int discover_lifecycle_channel(void) {
+    u8 entries[4096];
+    char selected[64] = {0};
+    char name_path[128], dev_path[128], node_path[80];
+    u32 matches = 0, major = 0, minor = 0;
+    i64 directory = sc3(SYS_open, (i64)"/sys/class/virtio-ports",
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory < 0) return -1;
+    for (;;) {
+        i64 n = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (n < 0) { sc1(SYS_close, directory); return -1; }
+        if (!n) break;
+        while (offset < (usize)n) {
+            const u8 *entry = entries + offset;
+            usize length, used;
+            u32 reclen;
+            if ((usize)n - offset < 20) { sc1(SYS_close, directory); return -1; }
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, directory); return -1; }
+            for (length = 0; length < reclen - 19 && entry[19 + length]; length++) {}
+            if (length == reclen - 19) { sc1(SYS_close, directory); return -1; }
+            if (vport_name(entry + 19, length)) {
+                if (length + 32 >= sizeof(name_path)) { sc1(SYS_close, directory); return -1; }
+                memcpy(name_path, "/sys/class/virtio-ports/", 24); used = 24;
+                memcpy(name_path + used, entry + 19, length); used += length;
+                memcpy(name_path + used, "/name", 6);
+                if (read_exact_attr(name_path, LIFECYCLE_CHANNEL_NAME "\n")) {
+                    matches++;
+                    if (matches > 1 || length + 1 > sizeof(selected)) { sc1(SYS_close, directory); return -1; }
+                    memcpy(selected, entry + 19, length); selected[length] = 0;
+                }
+            }
+            offset += reclen;
+        }
+    }
+    sc1(SYS_close, directory);
+    if (matches != 1) return -1;
+    memcpy(name_path, "/sys/class/virtio-ports/", 24);
+    memcpy(name_path + 24, selected, slen(selected));
+    memcpy(name_path + 24 + slen(selected), "/name", 6);
+    memcpy(dev_path, "/sys/class/virtio-ports/", 24);
+    memcpy(dev_path + 24, selected, slen(selected));
+    memcpy(dev_path + 24 + slen(selected), "/dev", 5);
+    if (!parse_dev_attribute(dev_path, &major, &minor)) return -1;
+    memcpy(node_path, "/dev/", 5); memcpy(node_path + 5, selected, slen(selected) + 1);
+    {
+        struct stat_local st;
+        i64 fd = sc3(SYS_open, (i64)node_path,
+                     O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY, 0);
+        if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFCHR ||
+            dev_major(st.rdev) != major || dev_minor(st.rdev) != minor ||
+            !read_exact_attr(name_path, LIFECYCLE_CHANNEL_NAME "\n") ||
+            !parse_dev_attribute(dev_path, &major, &minor) || dev_major(st.rdev) != major ||
+            dev_minor(st.rdev) != minor) {
+            if (fd >= 0) sc1(SYS_close, fd);
+            return -1;
+        }
+        return (int)fd;
+    }
+}
+
+static int generate_boot_generation(char out[37]) {
+    u8 bytes[16];
+    usize used = 0, i, text = 0;
+    u64 now = monotonic_millis();
+    u64 deadline = now ? now + 5000 : 0;
+    while (used < sizeof(bytes)) {
+        i64 n = sc3(SYS_getrandom, (i64)(bytes + used), sizeof(bytes) - used, GRND_NONBLOCK);
+        if (n > 0 && (usize)n <= sizeof(bytes) - used) { used += (usize)n; continue; }
+        if (n == -EINTR) continue;
+        if (n == -EAGAIN) {
+            struct pollfd_local none;
+            if (!deadline || monotonic_millis() >= deadline) return 0;
+            none.fd = -1; none.events = 0; none.revents = 0;
+            sc3(SYS_poll, (i64)&none, 0, 10);
+            continue;
+        }
+        return 0;
+    }
+    bytes[6] = (u8)((bytes[6] & 15) | 0x40);
+    bytes[8] = (u8)((bytes[8] & 63) | 0x80);
+    for (i = 0; i < sizeof(bytes); i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[text++] = '-';
+        out[text++] = hex_digit(bytes[i] >> 4);
+        out[text++] = hex_digit(bytes[i] & 15);
+    }
+    out[text] = 0;
+    return text == 36;
+}
+
+static int read_control_frame(int fd, usize *payload_size) {
+    u8 header[4];
+    u32 size;
+    if (!control_io_exact(fd, header, sizeof(header), 0)) return 0;
+    size = ((u32)header[0] << 24) | ((u32)header[1] << 16) | ((u32)header[2] << 8) | header[3];
+    if (!size || size > CONTROL_PAYLOAD_MAX || !control_io_exact(fd, control_payload, size, 0)) return 0;
+    *payload_size = size;
+    return 1;
+}
+
+static int parse_control_binding(struct parser *j, struct lifecycle_session *session, const char *kind,
+                                 int stop, u64 *request_id) {
+    struct span value;
+    u64 number;
+    if (!take_char(j, '{')) return 0;
+    if (stop && (!key(j, "boot_generation") || !plain_string(j, &value, 0) || value.n != 36 ||
+                 !bytes_equal(value.p, session->boot_generation, 36) || !take_char(j, ','))) return 0;
+    if (!key(j, "domain_core_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
+        !bytes_equal(value.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
+        !key(j, "host_nonce") || !plain_string(j, &value, 0) || value.n != 64 ||
+        !bytes_equal(value.p, session->host_nonce, 64) || !take_char(j, ',') ||
+        !key(j, "kind") || !exact_string(j, kind) || !take_char(j, ',') || !key(j, "payload") ||
+        !take_char(j, '{')) return 0;
+    if (stop && (!key(j, "signal") || !uint_value(j, &number) || number != 15)) return 0;
+    if (!take_char(j, '}') || !take_char(j, ',') || !key(j, "request_id") || !uint_value(j, request_id) ||
+        !*request_id || *request_id > 0x7fffffffffffffffULL || !take_char(j, ',') ||
+        !key(j, "run_id") || !plain_string(j, &value, 0) || value.n != 36 ||
+        !bytes_equal(value.p, lifecycle_binding.run_id, 36) || !take_char(j, ',') ||
+        !key(j, "schema") || !exact_string(j, LIFECYCLE_PROTOCOL) || !take_char(j, ',') ||
+        !key(j, "stage1_artifact_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
+        !bytes_equal(value.p, lifecycle_binding.stage1, 71) || !take_char(j, '}') || j->p != j->end) return 0;
+    return 1;
+}
+
+static int parse_hello(struct lifecycle_session *session, usize size) {
+    struct span nonce;
+    u64 request_id;
+    usize i;
+    struct parser *j = &control_parser;
+    memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
+    if (!take_char(j, '{') || !key(j, "domain_core_digest") || !plain_string(j, &nonce, 0) || nonce.n != 71 ||
+        !bytes_equal(nonce.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
+        !key(j, "host_nonce") || !plain_string(j, &nonce, 0) || nonce.n != 64) return 0;
+    for (i = 0; i < nonce.n; i++) if (!is_hex((char)nonce.p[i])) return 0;
+    memcpy(session->host_nonce, nonce.p, 64); session->host_nonce[64] = 0;
+    j->p = control_payload; j->end = control_payload + size;
+    if (!parse_control_binding(j, session, "HELLO", 0, &request_id)) return 0;
+    session->hello_request_id = request_id;
+    return 1;
+}
+
+static int parse_stop(struct lifecycle_session *session, usize size) {
+    u64 request_id;
+    struct parser *j = &control_parser;
+    memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
+    if (!parse_control_binding(j, session, "STOP", 1, &request_id) ||
+        request_id <= session->hello_request_id || session->stop_request_id) return 0;
+    session->stop_request_id = request_id;
+    return 1;
+}
+
+static int append_control(u8 *out, usize cap, usize *used, const char *value) {
+    usize size = slen(value);
+    if (*used + size > cap) return 0;
+    memcpy(out + *used, value, size); *used += size; return 1;
+}
+
+static int append_control_u64(u8 *out, usize cap, usize *used, u64 value) {
+    char digits[20]; usize count = 0;
+    do { digits[count++] = (char)('0' + value % 10); value /= 10; } while (value && count < sizeof(digits));
+    if (*used + count > cap) return 0;
+    while (count) out[(*used)++] = (u8)digits[--count];
+    return 1;
+}
+
+static int send_control_message(struct lifecycle_session *session, int terminal,
+                                const struct supervisor_result *result) {
+    usize used = 4;
+#define CONTROL_TEXT(value) do { if (!append_control(control_output, sizeof(control_output), &used, value)) return 0; } while (0)
+    CONTROL_TEXT("{\"boot_generation\":\""); CONTROL_TEXT(session->boot_generation);
+    CONTROL_TEXT("\",\"domain_core_digest\":\""); CONTROL_TEXT(lifecycle_binding.core);
+    CONTROL_TEXT("\",\"host_nonce\":\""); CONTROL_TEXT(session->host_nonce);
+    CONTROL_TEXT(terminal ? "\",\"kind\":\"TERMINAL\",\"payload\":{\"terminal\":{" : "\",\"kind\":\"READY\",\"payload\":{}");
+    if (terminal) {
+        if (result->main_signal) { CONTROL_TEXT("\"exit_code\":null,\"signal\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_signal)) return 0; }
+        else { CONTROL_TEXT("\"exit_code\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_exit_code)) return 0; CONTROL_TEXT(",\"signal\":null"); }
+        CONTROL_TEXT("}}");
+    }
+    CONTROL_TEXT(",\"reply_to\":");
+    if (!append_control_u64(control_output, sizeof(control_output), &used,
+                            terminal ? session->stop_request_id : session->hello_request_id)) return 0;
+    CONTROL_TEXT(",\"run_id\":\""); CONTROL_TEXT(lifecycle_binding.run_id);
+    CONTROL_TEXT("\",\"schema\":\""); CONTROL_TEXT(LIFECYCLE_PROTOCOL);
+    CONTROL_TEXT("\",\"sequence\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, terminal ? 2 : 1)) return 0;
+    CONTROL_TEXT(",\"stage1_artifact_digest\":\""); CONTROL_TEXT(lifecycle_binding.stage1); CONTROL_TEXT("\"}");
+#undef CONTROL_TEXT
+    {
+        u32 payload = (u32)(used - 4);
+        control_output[0] = (u8)(payload >> 24); control_output[1] = (u8)(payload >> 16);
+        control_output[2] = (u8)(payload >> 8); control_output[3] = (u8)payload;
+    }
+    return control_io_exact(session->fd, control_output, used, 1);
+}
+
+static int prepare_lifecycle(struct lifecycle_session *session) {
+    usize size;
+    memset(session, 0, sizeof(*session)); session->fd = -1;
+    session->fd = discover_lifecycle_channel();
+    if (session->fd < 0 || !generate_boot_generation(session->boot_generation) ||
+        !read_control_frame(session->fd, &size) || !parse_hello(session, size)) {
+        session->poisoned = 1;
+        if (session->fd >= 0) sc1(SYS_close, session->fd);
+        session->fd = -1;
+        return 0;
+    }
     return 1;
 }
 
@@ -2320,12 +2626,13 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_cgrou
 }
 
 static int supervise_workload(struct guest_process *process, struct child_error_local *failure,
-                              struct supervisor_result *result) {
+                              struct supervisor_result *result,
+                              struct lifecycle_session *lifecycle) {
     u64 mask = supervised_signal_mask(), empty_mask = 0;
     int error_pipe[2], release_pipe[2], status = 0, main_done = 0;
     struct workload_cgroup cgroup;
     i64 signal_fd, main_pid, n;
-    struct pollfd_local pollfd;
+    struct pollfd_local pollfds[2];
     struct signalfd_siginfo_local info;
     usize error_bytes = 0;
     i64 error_read = 0;
@@ -2464,31 +2771,87 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         return n ? 0 : -1;
     }
     write_all(1, WORKLOAD_STARTED_MARKER);
-    pollfd.fd = (int)signal_fd;
-    pollfd.events = POLLIN;
+    if (!send_control_message(lifecycle, 0, result)) {
+        set_workload_failure(failure, 22, EIO);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+        if (!n) set_workload_failure(failure, 18, EIO);
+        close_workload_cgroup(&cgroup);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return n ? -2 : -1;
+    }
+    pollfds[0].fd = (int)signal_fd;
+    pollfds[0].events = POLLIN;
+    pollfds[1].fd = lifecycle->fd;
+    pollfds[1].events = POLLIN;
     while (!main_done) {
         for (;;) {
             i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
             if (reaped > 0) record_reaped_child(result, reaped, main_pid, status);
-            if (reaped == main_pid) { main_done = 1; result->main_status = workload_status(status); }
+            if (reaped == main_pid) {
+                main_done = 1;
+                result->main_status = workload_status(status);
+                if ((status & 0x7f) == 0) result->main_exit_code = (u32)((status >> 8) & 0xff);
+                else result->main_signal = (u32)(status & 0x7f);
+            }
             if (reaped <= 0) break;
         }
-        if (main_done) {
-            sc2(SYS_kill, -main_pid, process->stop_signal);
+        if (main_done) break;
+        pollfds[0].revents = 0;
+        pollfds[1].revents = 0;
+        n = sc3(SYS_poll, (i64)pollfds, 2, -1);
+        if (n == -EINTR) continue;
+        if (n < 0) {
+            set_workload_failure(failure, 21, n);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+            if (!n) set_workload_failure(failure, 18, EIO);
+            close_workload_cgroup(&cgroup);
+            sc1(SYS_close, signal_fd);
+            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+            return n ? -2 : -1;
+        }
+        if (pollfds[1].revents & (POLLERR | POLLHUP)) {
+            set_workload_failure(failure, 21, EIO);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+            if (!n) set_workload_failure(failure, 18, EIO);
+            close_workload_cgroup(&cgroup);
+            sc1(SYS_close, signal_fd);
+            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+            return n ? -2 : -1;
+        }
+        if (pollfds[1].revents & POLLIN) {
+            usize frame_size = 0;
+            if (!read_control_frame(lifecycle->fd, &frame_size) || !parse_stop(lifecycle, frame_size) ||
+                sc2(SYS_kill, -main_pid, process->stop_signal) != 0) {
+                lifecycle->poisoned = 1;
+                set_workload_failure(failure, 21, EIO);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+                if (!n) set_workload_failure(failure, 18, EIO);
+                close_workload_cgroup(&cgroup);
+                sc1(SYS_close, signal_fd);
+                sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+                return n ? -2 : -1;
+            }
             result->forwarded = process->stop_signal;
-            break;
         }
-        pollfd.revents = 0;
-        n = sc3(SYS_poll, (i64)&pollfd, 1, -1);
-        if (n < 0) continue;
-        if (!(pollfd.revents & POLLIN)) continue;
-        n = sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
-        if (n != sizeof(info) || info.signo == SIGCHLD || info.signo < 1 || info.signo > 64) continue;
-        {
-            u32 forwarded = info.signo == 15 ? process->stop_signal : info.signo;
-            sc2(SYS_kill, -main_pid, forwarded);
-            result->forwarded = forwarded;
+        if (pollfds[0].revents & POLLIN) {
+            n = sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
+            if (n != sizeof(info) || info.signo == SIGCHLD || info.signo < 1 || info.signo > 64) continue;
+            {
+                u32 forwarded = info.signo == 15 ? process->stop_signal : info.signo;
+                sc2(SYS_kill, -main_pid, forwarded);
+                result->forwarded = forwarded;
+            }
         }
+    }
+    if (!lifecycle->stop_request_id) {
+        set_workload_failure(failure, 21, EIO);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+        if (!n) set_workload_failure(failure, 18, EIO);
+        close_workload_cgroup(&cgroup);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return n ? -2 : -1;
     }
     if (!terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result)) {
         set_workload_failure(failure, 18, EIO);
@@ -2503,6 +2866,13 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
+    }
+    if (!send_control_message(lifecycle, 1, result)) {
+        set_workload_failure(failure, 22, EIO);
+        close_workload_cgroup(&cgroup);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return -2;
     }
     close_workload_cgroup(&cgroup);
     sc1(SYS_close, signal_fd);
@@ -2584,6 +2954,7 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     int code;
     struct child_error_local workload_failure;
     struct supervisor_result workload_result;
+    struct lifecycle_session lifecycle;
     if (argc == 3 && pid != 1) {
         if (text_equal(argv[1], "--fixture-v1")) fixture_mode = 1;
         else if (text_equal(argv[1], "--fixture-v2")) fixture_mode = 2;
@@ -2602,13 +2973,24 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     if (code == EXIT_ROOT_TRANSITION) wait_closed("palimpsest guest stage1: root transition rejected; root state is indeterminate; workload disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
     write_all(1, ROOT_TRANSITION_MARKER);
-    code = supervise_workload(&workload, &workload_failure, &workload_result);
+    if (!prepare_lifecycle(&lifecycle)) {
+        lifecycle_rejected(20, EIO);
+        for (;;) sc0(SYS_pause);
+    }
+    code = supervise_workload(&workload, &workload_failure, &workload_result, &lifecycle);
     if (!code) {
+        sc1(SYS_close, lifecycle.fd);
         workload_rejected(workload_failure.stage, workload_failure.error);
         for (;;) sc0(SYS_pause);
     }
-    if (code < 0) {
+    if (code == -1) {
+        sc1(SYS_close, lifecycle.fd);
         workload_cleanup_rejected(workload_failure.stage, workload_failure.error);
+        for (;;) sc0(SYS_pause);
+    }
+    if (code == -2) {
+        sc1(SYS_close, lifecycle.fd);
+        lifecycle_rejected(workload_failure.stage, workload_failure.error);
         for (;;) sc0(SYS_pause);
     }
     workload_terminal(&workload_result);

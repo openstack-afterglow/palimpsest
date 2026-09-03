@@ -46,6 +46,7 @@ typedef unsigned long usize;
 #define MAIN_SUCCESS 42
 #define DESCENDANT_SUCCESS 43
 #define FAILURE_BASE 100
+#define SIGNAL_ARMED_MARKER "palimpsest workload proof: signal handlers armed\n"
 
 static inline i64 sc0(i64 n) {
     i64 r;
@@ -85,6 +86,17 @@ static usize slen(const char *value) {
     usize size = 0;
     while (value[size]) size++;
     return size;
+}
+
+static int write_all(int descriptor, const char *value) {
+    usize size = slen(value), used = 0;
+    while (used < size) {
+        i64 count = sc3(SYS_write, descriptor, (i64)(value + used), size - used);
+        if (count == -EINTR) continue;
+        if (count <= 0 || (usize)count > size - used) return 0;
+        used += (usize)count;
+    }
+    return 1;
 }
 
 static int same_text(const char *actual, const char *expected) {
@@ -266,6 +278,7 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     int ready_pipe[2];
     i64 main_pid;
     i64 cooperative, stubborn;
+    int main_signal_fd;
     u8 ready[2];
     usize ready_bytes = 0;
     if (!verify_invocation(argc, argv, environment)) exit_now(FAILURE_BASE + 1);
@@ -292,6 +305,11 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     }
     if (ready[0] != 1 || ready[1] != 1 || sc1(SYS_close, ready_pipe[0]) != 0)
         exit_now(FAILURE_BASE + 8);
+    main_signal_fd = new_sigterm_fd();
+    if (main_signal_fd < 0 || !write_all(1, SIGNAL_ARMED_MARKER) ||
+        !wait_for_pid1_sigterm(main_signal_fd) ||
+        sc1(SYS_close, main_signal_fd) != 0)
+        exit_now(FAILURE_BASE + 9);
     exit_now(MAIN_SUCCESS);
 }
 

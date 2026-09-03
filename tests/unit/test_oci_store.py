@@ -1721,8 +1721,8 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
-    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v8"
-    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v2"
+    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v9"
+    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v3"
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
     tampered = deepcopy(plan.to_dict())
@@ -1746,6 +1746,10 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     obsolete["schema"] = "palimpsest.oci-root-domain-plan.v5"
     with pytest.raises(StateError, match="pre-production.*v5.*rebuild"):
         type(plan).from_dict(obsolete)
+    lifecycle_obsolete = deepcopy(plan.to_dict())
+    lifecycle_obsolete["schema"] = "palimpsest.oci-root-domain-plan.v6"
+    with pytest.raises(StateError, match="pre-production.*v6.*rebuild"):
+        type(plan).from_dict(lifecycle_obsolete)
     state_path = roots.runs / "domain-plan" / "state.json"
     state_before = state_path.read_bytes()
     transport_before = transport_path.read_bytes()
@@ -1754,12 +1758,15 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
         snapshot,
         state={
             **snapshot.state,
-            "oci_root_domain": {"digest": snapshot.state["oci_root_domain"]["digest"], "plan": obsolete},
+            "oci_root_domain": {
+                "digest": snapshot.state["oci_root_domain"]["digest"],
+                "plan": lifecycle_obsolete,
+            },
         },
     )
     with monkeypatch.context() as isolated:
         isolated.setattr(oci_root_kvm_module, "read_run_ledger_snapshot", lambda *_args: legacy_snapshot)
-        with pytest.raises(StateError, match="pre-production.*v5.*rebuild"):
+        with pytest.raises(StateError, match="pre-production.*v6.*rebuild"):
             load_oci_root_domain_plan(roots, "domain-plan")
     assert state_path.read_bytes() == state_before
     assert transport_path.read_bytes() == transport_before

@@ -62,7 +62,7 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v3",
+        "contract": "palimpsest.guest-pid1-supervisor.v4",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
         "cgroup_write_escape_denied": ["parent", "own"],
@@ -71,14 +71,30 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
         "credential_timing": "child-after-parent-cgroup-attach-release",
         "forced_status": 137,
         "forwarded_signal": 15,
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v1",
+        "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
         "process_group": True,
         "reaped_children": 3,
         "terminal_state": "parent-marker-then-fail-closed-wait",
+        "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
     }
+    assert receipt["lifecycle"]["single_connection_proven"] is True
+    assert receipt["lifecycle"]["reconnect_proven"] is False
+    assert receipt["lifecycle"]["negative_input_proven"] is False
+    assert [frame["kind"] for frame in receipt["lifecycle"]["boots"][0]["frames"]] == [
+        "HELLO",
+        "READY",
+        "STOP",
+        "TERMINAL",
+    ]
+    assert (
+        receipt["lifecycle"]["boots"][0]["frames"][1]["boot_generation"]
+        != receipt["lifecycle"]["boots"][1]["frames"][1]["boot_generation"]
+    )
     assert set(receipt["workload_negative_controls"]) == set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
     assert receipt["pre_mount_devices"] is True
     assert receipt["filesystem_verified"] is True

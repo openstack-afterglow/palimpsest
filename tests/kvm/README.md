@@ -20,11 +20,22 @@ rejection marker, no success/preparation marker, and remain alive as PID 1.
 The kernel and its config are selected together from `PALIMPSEST_KVM_KERNEL`
 and `PALIMPSEST_KVM_KERNEL_CONFIG`, or together from the running Linux release's standard
 boot paths. All required cgroup, initrd, devtmpfs, proc/sysfs, PCI, serial console,
-virtio block, ext4, SquashFS xattr plus gzip/zstd codecs, and OverlayFS options
+virtio block/console/random, hardware random, ext4, SquashFS xattr plus
+gzip/zstd codecs, and OverlayFS options
 must be built in (`=y`); modules do not qualify because this initramfs has no
 module loader. `PALIMPSEST_KVM_QEMU` can select an explicit
 QEMU binary. The runner must be native Linux x86_64 with read/write access to a
 KVM character device reporting API version 12.
+
+Positive boots also use one private owner-bound QEMU Unix socket with
+`server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
+drives canonical HELLO/READY/STOP/TERMINAL frames with partial nonblocking I/O,
+and records path-free frame digests plus nonce/generation/request/sequence
+correlation. This is a single-connection checkpoint only:
+`reconnect_proven=false`; no guest SNAPSHOT or STOP retransmission is claimed.
+It also records `negative_input_proven=false`; the malformed, stale-binding,
+duplicate, truncated, and oversized guest-C runtime control matrix remains
+uncollected rather than inferred from the positive boots.
 
 Run on the qualified host:
 
@@ -37,7 +48,7 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-Receipt v11 records the authenticated OverlayFS moved onto `/`, exact root and moved
+Receipt v12 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact argv, two-entry environment, cwd, numeric uid/gid,
@@ -48,7 +59,7 @@ removal. The workload also proves UID 65534 cannot write-open either the parent
 or its own `cgroup.procs`. Production define/start remains
 disabled.
 
-The v11 canonical receipt binds all 30 native-KVM boots: two positive boots
+The v12 canonical receipt binds all 30 native-KVM boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and three
 workload-launch controls. It binds every path-free negative topology contract and
@@ -69,7 +80,7 @@ markers and must remain alive fail-closed.
 
 The highest lower and every transition fixture include the exact `0755`
 `/.__palimpsest_workload_proof_v1`, the root sentinel, and
-`/proof/workdir`. Fixture policy v6 binds the recursive source entry types and
+`/proof/workdir`. Fixture policy v7 binds the recursive source entry types and
 modes, proof source/build-script/ELF hashes, digest-pinned GCC image, and the
 pinned mksquashfs 4.7.5 zstd-level-3 build policy.
 Evidence contains positive and retained-boot consoles plus
@@ -81,13 +92,13 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v8, OCI-root domain plan is v6, and the init
-contract is v10. Pre-mount,
+The stage-1 plan/protocol is v9, OCI-root domain plan is v7, and the init
+contract is v11. Pre-mount,
 filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v11 receipt on the qualified runner; this source update and
+must still produce a v12 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while only the admitted

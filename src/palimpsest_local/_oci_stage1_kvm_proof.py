@@ -9,6 +9,7 @@ first-party PID 1 workload supervisor contract.
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -19,10 +20,12 @@ import re
 import selectors
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -30,6 +33,16 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ArtifactValidationError, StateError
+from .oci_control_protocol import (
+    OCI_CONTROL_CHANNEL_NAME,
+    OCI_CONTROL_PROTOCOL,
+    HostOCIControlSession,
+    OCIControlBinding,
+    OCIControlFrameDecoder,
+    OCIControlMessage,
+    OCIControlProtocolError,
+    encode_frame,
+)
 from .oci_guest_filesystems import (
     EXT4_SUPERBLOCK_BYTES,
     EXT4_SUPERBLOCK_OFFSET,
@@ -39,6 +52,7 @@ from .oci_guest_filesystems import (
 )
 from .oci_initramfs import (
     OCI_BOOTSTRAP_STAGE1_CONTRACT,
+    OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
     OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
     OCI_STAGE1_SUPERVISOR_CONTRACT,
     build_bootstrap_initramfs,
@@ -48,7 +62,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v11"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v12"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -60,6 +74,7 @@ DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # CRLF, while the pipe-based pure test preserves LF exactly.
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
+WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
 WORKLOAD_TERMINAL_MARKER = (
     b"palimpsest guest stage1: workload terminal; main_status=42; cooperative_status=43; "
@@ -82,6 +97,7 @@ ROOT_TRANSITION_REJECTION_MARKER = (
 )
 WORKLOAD_REJECTION_PREFIX = b"palimpsest guest stage1: workload launch rejected; stage="
 WORKLOAD_CLEANUP_REJECTION_PREFIX = b"palimpsest guest stage1: workload cleanup rejected; stage="
+LIFECYCLE_REJECTION_PREFIX = b"palimpsest guest stage1: lifecycle rejected; stage="
 WORKLOAD_NEGATIVE_CONTROL_NAMES = (
     "workload_missing_executable",
     "workload_non_executable",
@@ -173,6 +189,9 @@ _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_SYSFS",
     "CONFIG_VIRTIO",
     "CONFIG_VIRTIO_BLK",
+    "CONFIG_VIRTIO_CONSOLE",
+    "CONFIG_HW_RANDOM",
+    "CONFIG_HW_RANDOM_VIRTIO",
     "CONFIG_VIRTIO_PCI",
 )
 
@@ -201,7 +220,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:cf8581a0cd52181b106a4a5e9ad309e4afc0a4d3b10d3aa076a3982e5eb420d3"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:dbca92880316d4a142480d28ddea00bb862f3fc61bed3182c2d26156d0f0493a"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -216,8 +235,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v6"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v6"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v7"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v7"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -233,10 +252,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "a6e01df36852388f219414f1b08f10f9de3116983fcef119e067f8ad04f64145",
-        "elf_size_bytes": 8860,
+        "elf_sha256": "0adcb6bf3a77d6ee6e59fbb8083e7a995091c8f0f51b416830280cc2ba7fecc4",
+        "elf_size_bytes": 8952,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "bd4bedea3e8a300071a706e174061e74cabb6aaa34fdbfed23d5b4ec14080cdf",
+        "source_sha256": "d57abd8c6e27ac4ab740aa0956626695774fe825eb965c31db7ba3cccd66c6a3",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -777,6 +796,7 @@ def build_qemu_command(
     cmdline: str,
     serial: str,
     transport_readonly: bool = True,
+    lifecycle_socket_path: Path | None = None,
 ) -> tuple[str, ...]:
     paths = (qemu_path, kernel_path, initramfs_path, transport_path, root_path, *lower_paths)
     if any(not isinstance(path, Path) or not path.is_absolute() for path in paths):
@@ -847,7 +867,27 @@ def build_qemu_command(
             "-device",
             f"virtio-blk-pci,drive=lower{index},serial={layer['serial']}",
         )
+    if lifecycle_socket_path is not None:
+        command += _lifecycle_qemu_arguments(lifecycle_socket_path)
     return command
+
+
+def _lifecycle_qemu_arguments(path: Path) -> tuple[str, ...]:
+    if not isinstance(path, Path) or not path.is_absolute() or "\0" in os.fspath(path):
+        raise ArtifactValidationError("KVM lifecycle socket path is invalid")
+    return (
+        "-object",
+        "rng-random,id=palimpsest-rng,filename=/dev/urandom",
+        "-device",
+        "virtio-rng-pci,rng=palimpsest-rng",
+        "-chardev",
+        f"socket,id=palimpsest-lifecycle,path={path},server=on,wait=off",
+        "-device",
+        "virtio-serial-pci,id=palimpsest-lifecycle-serial",
+        "-device",
+        "virtserialport,bus=palimpsest-lifecycle-serial.0,nr=1,chardev=palimpsest-lifecycle,"
+        f"name={OCI_CONTROL_CHANNEL_NAME}",
+    )
 
 
 def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
@@ -880,7 +920,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v6",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v7",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1632,6 +1672,7 @@ def build_workload_negative_qemu_command(
     backing_paths: Mapping[str, Path],
     cmdline: str,
     control: Mapping[str, Any],
+    lifecycle_socket_path: Path | None = None,
 ) -> tuple[str, ...]:
     name = control.get("name") if isinstance(control, Mapping) else None
     contract = verify_workload_negative_control_contract(name, control)
@@ -1644,6 +1685,7 @@ def build_workload_negative_qemu_command(
         backing_paths=backing_paths,
         cmdline=cmdline,
         contract=contract,
+        lifecycle_socket_path=lifecycle_socket_path,
     )
 
 
@@ -1655,6 +1697,7 @@ def _build_control_qemu_command(
     backing_paths: Mapping[str, Path],
     cmdline: str,
     contract: Mapping[str, Any],
+    lifecycle_socket_path: Path | None = None,
 ) -> tuple[str, ...]:
     if (
         not isinstance(backing_paths, Mapping)
@@ -1704,7 +1747,209 @@ def _build_control_qemu_command(
             "-device",
             f"virtio-blk-pci,drive={drive_id},serial={attachment['serial']}",
         )
+    if lifecycle_socket_path is not None:
+        command += _lifecycle_qemu_arguments(lifecycle_socket_path)
     return command
+
+
+def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOCIStage1Transport) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "binding",
+        "boots",
+        "broker_contract",
+        "channel_name",
+        "nonce_semantics",
+        "negative_input_proven",
+        "protocol",
+        "reconnect_proven",
+        "single_connection_proven",
+        "transport",
+    }:
+        return False
+    if (
+        value.get("binding")
+        != {
+            "domain_core_digest": plan.domain_core_digest,
+            "run_id": plan.run_id,
+            "stage1_artifact_digest": transport.receipt.artifact_digest,
+        }
+        or value.get("broker_contract") != OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT
+    ):
+        return False
+    if (
+        value.get("channel_name") != OCI_CONTROL_CHANNEL_NAME
+        or value.get("protocol") != OCI_CONTROL_PROTOCOL
+        or value.get("transport") != "qemu-private-unix-socket-to-virtio-serial"
+        or value.get("nonce_semantics") != "correlation-and-replay-challenge-not-peer-authentication"
+        or value.get("negative_input_proven") is not False
+        or value.get("single_connection_proven") is not True
+        or value.get("reconnect_proven") is not False
+    ):
+        return False
+    boots = value.get("boots")
+    expected = (
+        ("host-to-guest", "HELLO"),
+        ("guest-to-host", "READY"),
+        ("host-to-guest", "STOP"),
+        ("guest-to-host", "TERMINAL"),
+    )
+    if not isinstance(boots, list) or len(boots) != 2:
+        return False
+    generations: list[str] = []
+    nonces: list[str] = []
+    for boot in boots:
+        if not isinstance(boot, Mapping) or set(boot) != {
+            "frames",
+            "pid1_alive_after_terminal",
+            "ready",
+            "terminal",
+        }:
+            return False
+        if (
+            boot.get("pid1_alive_after_terminal") is not True
+            or boot.get("ready") is not True
+            or boot.get("terminal") != {"exit_code": 42, "signal": None}
+        ):
+            return False
+        frames = boot.get("frames")
+        if not isinstance(frames, list) or len(frames) != len(expected):
+            return False
+        for frame, (direction, kind) in zip(frames, expected, strict=True):
+            if (
+                not isinstance(frame, Mapping)
+                or set(frame)
+                != {
+                    "boot_generation",
+                    "digest",
+                    "direction",
+                    "host_nonce",
+                    "kind",
+                    "reply_to",
+                    "request_id",
+                    "sequence",
+                    "size_bytes",
+                }
+                or frame.get("direction") != direction
+                or frame.get("kind") != kind
+                or not isinstance(frame.get("digest"), str)
+                or _DIGEST_RE.fullmatch(frame["digest"]) is None
+                or type(frame.get("size_bytes")) is not int
+                or not 5 <= frame["size_bytes"] <= 64 * 1024
+            ):
+                return False
+        hello, ready, stop, terminal = frames
+        nonce = hello["host_nonce"]
+        generation = ready["boot_generation"]
+        try:
+            parsed_generation = uuid.UUID(generation)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(nonce, str)
+            or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
+            or any(frame["host_nonce"] != nonce for frame in frames)
+            or str(parsed_generation) != generation
+            or parsed_generation.version != 4
+            or hello["boot_generation"] is not None
+            or hello["request_id"] != 1
+            or hello["reply_to"] is not None
+            or hello["sequence"] is not None
+            or ready["request_id"] is not None
+            or ready["reply_to"] != 1
+            or ready["sequence"] != 1
+            or stop["boot_generation"] != generation
+            or stop["request_id"] != 2
+            or stop["reply_to"] is not None
+            or stop["sequence"] is not None
+            or terminal["boot_generation"] != generation
+            or terminal["request_id"] is not None
+            or terminal["reply_to"] != 2
+            or terminal["sequence"] != 2
+        ):
+            return False
+        try:
+            binding = OCIControlBinding(
+                run_id=plan.run_id,
+                domain_core_digest=plan.domain_core_digest,
+                stage1_artifact_digest=transport.receipt.artifact_digest,
+            )
+            expected_messages = (
+                OCIControlMessage(
+                    kind="HELLO",
+                    binding=binding,
+                    host_nonce=nonce,
+                    payload={},
+                    request_id=hello["request_id"],
+                ),
+                OCIControlMessage(
+                    kind="READY",
+                    binding=binding,
+                    host_nonce=nonce,
+                    payload={},
+                    boot_generation=generation,
+                    reply_to=ready["reply_to"],
+                    sequence=ready["sequence"],
+                ),
+                OCIControlMessage(
+                    kind="STOP",
+                    binding=binding,
+                    host_nonce=nonce,
+                    payload={"signal": 15},
+                    boot_generation=generation,
+                    request_id=stop["request_id"],
+                ),
+                OCIControlMessage(
+                    kind="TERMINAL",
+                    binding=binding,
+                    host_nonce=nonce,
+                    payload={"terminal": {"exit_code": 42, "signal": None}},
+                    boot_generation=generation,
+                    reply_to=terminal["reply_to"],
+                    sequence=terminal["sequence"],
+                ),
+            )
+            encoded_frames = tuple(encode_frame(message) for message in expected_messages)
+        except OCIControlProtocolError:
+            return False
+        if any(
+            frame["size_bytes"] != len(encoded) or frame["digest"] != f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+            for frame, encoded in zip(frames, encoded_frames, strict=True)
+        ):
+            return False
+        generations.append(generation)
+        nonces.append(nonce)
+    return len(set(generations)) == 2 and len(set(nonces)) == 2
+
+
+def _lifecycle_receipt(
+    binding: OCIControlBinding,
+    first: list[dict[str, Any]],
+    retained: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "binding": {
+            "domain_core_digest": binding.domain_core_digest,
+            "run_id": binding.run_id,
+            "stage1_artifact_digest": binding.stage1_artifact_digest,
+        },
+        "boots": [
+            {
+                "frames": frames,
+                "pid1_alive_after_terminal": True,
+                "ready": True,
+                "terminal": {"exit_code": 42, "signal": None},
+            }
+            for frames in (first, retained)
+        ],
+        "broker_contract": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+        "channel_name": OCI_CONTROL_CHANNEL_NAME,
+        "nonce_semantics": "correlation-and-replay-challenge-not-peer-authentication",
+        "negative_input_proven": False,
+        "protocol": OCI_CONTROL_PROTOCOL,
+        "reconnect_proven": False,
+        "single_connection_proven": True,
+        "transport": "qemu-private-unix-socket-to-virtio-serial",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1735,6 +1980,7 @@ class OCIStage1KVMProofReceipt:
     root_transition_negative_root_post_digests: Mapping[str, str]
     workload_negative_consoles: Mapping[str, bytes]
     workload_negative_root_post_digests: Mapping[str, str]
+    lifecycle: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -1788,11 +2034,17 @@ class OCIStage1KVMProofReceipt:
             or _logical_prefix_count(self.console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
+            or _logical_line_count(self.console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or not _logical_lines_in_order(
-                self.console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
+                self.console,
+                ROOT_TRANSITION_MARKER,
+                WORKLOAD_STARTED_MARKER,
+                WORKLOAD_SIGNAL_ARMED_MARKER,
+                SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.console, WORKLOAD_REJECTION_PREFIX) != 0
             or _logical_prefix_count(self.console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.console, LIFECYCLE_REJECTION_PREFIX) != 0
             or _logical_line_count(self.console, REJECTION_MARKER) != 0
             or _logical_line_count(self.console, FILESYSTEM_REJECTION_MARKER) != 0
             or _logical_line_count(self.console, ASSEMBLY_REJECTION_MARKER) != 0
@@ -1804,11 +2056,17 @@ class OCIStage1KVMProofReceipt:
             or _logical_prefix_count(self.retained_console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.retained_console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
+            or _logical_line_count(self.retained_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or not _logical_lines_in_order(
-                self.retained_console, ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, SUCCESS_MARKER
+                self.retained_console,
+                ROOT_TRANSITION_MARKER,
+                WORKLOAD_STARTED_MARKER,
+                WORKLOAD_SIGNAL_ARMED_MARKER,
+                SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
             or _logical_prefix_count(self.retained_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.retained_console, LIFECYCLE_REJECTION_PREFIX) != 0
             or any(
                 _logical_line_count(self.retained_console, marker) != 0
                 for marker in (
@@ -1933,6 +2191,7 @@ class OCIStage1KVMProofReceipt:
                 not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
                 for value in self.workload_negative_root_post_digests.values()
             )
+            or not _valid_lifecycle_receipt(self.lifecycle, expected_plan, expected_transport)
         ):
             raise ArtifactValidationError("KVM proof receipt value is invalid")
 
@@ -1959,6 +2218,7 @@ class OCIStage1KVMProofReceipt:
                 "artifact_size_bytes": self.kernel_size_bytes,
                 "config_digest": self.kernel_config_digest,
             },
+            "lifecycle": dict(self.lifecycle),
             "negative_controls": {
                 name: {
                     "contract": negative_control_contract(name),
@@ -2093,12 +2353,15 @@ class OCIStage1KVMProofReceipt:
                 "credential_timing": "child-after-parent-cgroup-attach-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
+                "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+                "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "main_status": 42,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
+                "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
             },
             "switch_root": True,
@@ -2133,6 +2396,7 @@ class OCIStage1KVMProofReceipt:
             "console",
             "initramfs",
             "kernel",
+            "lifecycle",
             "negative_controls",
             "filesystem_negative_controls",
             "executed_boots",
@@ -2179,6 +2443,7 @@ class OCIStage1KVMProofReceipt:
         assembly_negative_controls = value.get("assembly_negative_controls")
         root_transition_negative_controls = value.get("root_transition_negative_controls")
         workload_negative_controls = value.get("workload_negative_controls")
+        lifecycle = value.get("lifecycle")
         supervisor = value.get("supervisor")
         root_volume = value.get("root_volume")
         if (
@@ -2211,12 +2476,15 @@ class OCIStage1KVMProofReceipt:
                 "credential_timing": "child-after-parent-cgroup-attach-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
+                "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+                "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "main_status": 42,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
+                "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
             }
             or value.get("pre_mount_devices") is not True
@@ -2398,6 +2666,7 @@ class OCIStage1KVMProofReceipt:
             root_transition_negative_root_post_digests,
             workload_negative_consoles,
             workload_negative_root_post_digests,
+            lifecycle,
         )
         if receipt.to_dict() != dict(value):
             raise ArtifactValidationError("KVM proof receipt is not canonical")
@@ -2465,7 +2734,15 @@ def _read_console_until(
     forbidden: tuple[bytes, ...],
     timeout_seconds: float,
     require_alive_after_marker: bool,
+    lifecycle_socket_path: Path | None = None,
+    lifecycle_binding: OCIControlBinding | None = None,
+    lifecycle_success: bool | None = None,
+    lifecycle_transcript: list[dict[str, Any]] | None = None,
 ) -> bytes:
+    if (lifecycle_socket_path is None) != (lifecycle_binding is None) or (
+        lifecycle_binding is None and lifecycle_success is not None
+    ):
+        raise ArtifactValidationError("KVM lifecycle driver configuration is invalid")
     try:
         process = subprocess.Popen(
             command,
@@ -2481,30 +2758,142 @@ def _read_console_until(
     descriptor = process.stdout.fileno()
     os.set_blocking(descriptor, False)
     selector = selectors.DefaultSelector()
-    selector.register(descriptor, selectors.EVENT_READ)
+    selector.register(descriptor, selectors.EVENT_READ, "console")
     console = bytearray()
     deadline = time.monotonic() + timeout_seconds
     marker_seen_at: float | None = None
+    channel: socket.socket | None = None
+    channel_finished = False
+    channel_connected = False
+    channel_pending = bytearray()
+    decoder = OCIControlFrameDecoder()
+    session = HostOCIControlSession(lifecycle_binding) if lifecycle_binding is not None else None
+    lifecycle_ready = False
+
+    def record_frame(direction: str, frame: bytes, message: Any) -> None:
+        if lifecycle_transcript is not None:
+            lifecycle_transcript.append(
+                {
+                    "boot_generation": message.boot_generation,
+                    "digest": f"sha256:{hashlib.sha256(frame).hexdigest()}",
+                    "direction": direction,
+                    "host_nonce": message.host_nonce,
+                    "kind": message.kind,
+                    "reply_to": message.reply_to,
+                    "request_id": message.request_id,
+                    "sequence": message.sequence,
+                    "size_bytes": len(frame),
+                }
+            )
+
+    def queue_message(message: Any) -> None:
+        if channel_pending:
+            raise KVMProofFailure("KVM lifecycle host write overlapped")
+        frame = encode_frame(message)
+        channel_pending.extend(frame)
+        record_frame("host-to-guest", frame, message)
+        if channel is not None:
+            selector.modify(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
+
     try:
         while True:
             now = time.monotonic()
             if now >= deadline:
                 raise KVMProofFailure("QEMU console proof timed out")
-            events = selector.select(min(0.1, deadline - now))
-            for _key, _mask in events:
+            if (
+                channel is None
+                and not channel_finished
+                and lifecycle_socket_path is not None
+                and lifecycle_socket_path.exists()
+            ):
                 try:
-                    chunk = os.read(descriptor, 65536)
-                except BlockingIOError:
+                    metadata = lifecycle_socket_path.lstat()
+                except OSError:
+                    raise KVMProofFailure("KVM lifecycle socket metadata is unavailable") from None
+                if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+                    raise KVMProofFailure("KVM lifecycle socket identity is invalid")
+                channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                channel.setblocking(False)
+                result = channel.connect_ex(os.fspath(lifecycle_socket_path))
+                if result not in {0, errno.EINPROGRESS, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise KVMProofFailure("KVM lifecycle socket connection failed")
+                channel_connected = result == 0
+                selector.register(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
+                if channel_connected:
+                    assert session is not None
+                    queue_message(session.hello())
+            events = selector.select(min(0.1, deadline - now))
+            for key, mask in events:
+                if key.data == "console":
+                    try:
+                        chunk = os.read(descriptor, 65536)
+                    except BlockingIOError:
+                        continue
+                    if chunk:
+                        console.extend(chunk)
+                        if len(console) > MAX_CONSOLE_BYTES:
+                            raise KVMProofFailure("QEMU console exceeds proof bound")
                     continue
-                if chunk:
-                    console.extend(chunk)
-                    if len(console) > MAX_CONSOLE_BYTES:
-                        raise KVMProofFailure("QEMU console exceeds proof bound")
+                assert channel is not None and session is not None
+                if mask & selectors.EVENT_WRITE:
+                    if not channel_connected:
+                        if channel.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
+                            raise KVMProofFailure("KVM lifecycle socket connection failed")
+                        channel_connected = True
+                        queue_message(session.hello())
+                    if channel_pending:
+                        try:
+                            sent = channel.send(channel_pending)
+                        except BlockingIOError:
+                            sent = 0
+                        if sent > 0:
+                            del channel_pending[:sent]
+                        if not channel_pending:
+                            selector.modify(channel, selectors.EVENT_READ, "channel")
+                if mask & selectors.EVENT_READ:
+                    try:
+                        chunk = channel.recv(65536)
+                    except BlockingIOError:
+                        chunk = None
+                    if chunk == b"":
+                        decoder.finish()
+                        if lifecycle_success is False and session.state == "hello-sent":
+                            selector.unregister(channel)
+                            channel.close()
+                            channel = None
+                            channel_finished = True
+                            continue
+                        raise KVMProofFailure("KVM lifecycle channel closed before proof completion")
+                    if chunk:
+                        try:
+                            messages = decoder.feed(chunk)
+                            for message in messages:
+                                frame = encode_frame(message)
+                                record_frame("guest-to-host", frame, message)
+                                session.accept(message)
+                                if message.kind == "READY":
+                                    if lifecycle_success is not True:
+                                        raise KVMProofFailure("workload-negative boot emitted lifecycle READY")
+                                    lifecycle_ready = True
+                                elif message.kind == "TERMINAL":
+                                    if lifecycle_success is not True or message.payload != {
+                                        "terminal": {"exit_code": 42, "signal": None}
+                                    }:
+                                        raise KVMProofFailure("KVM lifecycle terminal status is invalid")
+                        except OCIControlProtocolError:
+                            raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
             current = bytes(console)
+            armed_count = _logical_line_count(current, WORKLOAD_SIGNAL_ARMED_MARKER)
+            if armed_count > 1:
+                raise KVMProofFailure("workload signal synchronization marker was emitted more than once")
+            if lifecycle_ready and armed_count == 1 and session is not None and session.state == "ready":
+                queue_message(session.stop())
             if any(_logical_line_count(current, marker) for marker in forbidden):
                 raise KVMProofFailure("QEMU emitted a forbidden stage-1 marker")
             if _logical_prefix_count(current, WORKLOAD_CLEANUP_REJECTION_PREFIX):
                 raise KVMProofFailure("QEMU emitted a workload cleanup rejection marker")
+            if _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX):
+                raise KVMProofFailure("QEMU emitted a lifecycle rejection marker")
             terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
             successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
             if terminal_count > successful_terminal_count:
@@ -2518,7 +2907,16 @@ def _read_console_until(
                 if process.poll() is not None:
                     raise KVMProofFailure("QEMU exited at the proof marker")
                 marker_seen_at = now
-            if marker_seen_at is not None and (not require_alive_after_marker or now - marker_seen_at >= 0.25):
+            lifecycle_complete = (
+                session is None
+                or (lifecycle_success is True and session.state == "terminal")
+                or (lifecycle_success is False and session.state == "hello-sent")
+            )
+            if (
+                marker_seen_at is not None
+                and lifecycle_complete
+                and (not require_alive_after_marker or now - marker_seen_at >= 0.25)
+            ):
                 if process.poll() is not None:
                     raise KVMProofFailure("QEMU did not remain alive after the proof marker")
                 return bytes(console)
@@ -2533,6 +2931,9 @@ def _read_console_until(
                     console.extend(chunk)
                 raise KVMProofFailure(f"QEMU exited before the proof marker ({process.returncode})")
     finally:
+        if channel is not None:
+            selector.unregister(channel)
+            channel.close()
         selector.close()
         if process.poll() is None:
             try:
@@ -2930,6 +3331,11 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
     transport = build_stage1_transport(plan)
     cmdline = build_kernel_cmdline(plan, transport)
     serial = transport_serial(transport.receipt.artifact_digest)
+    lifecycle_binding = OCIControlBinding(
+        run_id=plan.run_id,
+        domain_core_digest=plan.domain_core_digest,
+        stage1_artifact_digest=transport.receipt.artifact_digest,
+    )
     evidence = _actual_evidence_directory()
 
     with _temp_root() as temporary_name:
@@ -2961,6 +3367,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         )
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
 
+        first_lifecycle_socket = root / "lifecycle-first.sock"
         command = build_qemu_command(
             qemu_path=qemu_path,
             kernel_path=kernel_path,
@@ -2971,7 +3378,9 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             plan=plan,
             cmdline=cmdline,
             serial=serial,
+            lifecycle_socket_path=first_lifecycle_socket,
         )
+        lifecycle_transcript: list[dict[str, Any]] = []
         console = _read_console_until(
             command,
             expected=SUCCESS_MARKER,
@@ -2985,6 +3394,10 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             ),
             timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
             require_alive_after_marker=True,
+            lifecycle_socket_path=first_lifecycle_socket,
+            lifecycle_binding=lifecycle_binding,
+            lifecycle_success=True,
+            lifecycle_transcript=lifecycle_transcript,
         )
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
@@ -2999,8 +3412,22 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         # The second boot consumes the exact mutable backing left by boot one.
         if _verify_post_run_topology(root_path, lower_paths, plan) != root_post_run_digest:
             raise KVMProofFailure("KVM retained root changed between boots")
+        second_lifecycle_socket = root / "lifecycle-second.sock"
+        retained_command = build_qemu_command(
+            qemu_path=qemu_path,
+            kernel_path=kernel_path,
+            initramfs_path=initramfs_path,
+            transport_path=transport_path,
+            root_path=root_path,
+            lower_paths=lower_paths,
+            plan=plan,
+            cmdline=cmdline,
+            serial=serial,
+            lifecycle_socket_path=second_lifecycle_socket,
+        )
+        retained_lifecycle_transcript: list[dict[str, Any]] = []
         retained_console = _read_console_until(
-            command,
+            retained_command,
             expected=SUCCESS_MARKER,
             forbidden=(
                 REJECTION_MARKER,
@@ -3012,6 +3439,10 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             ),
             timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
             require_alive_after_marker=True,
+            lifecycle_socket_path=second_lifecycle_socket,
+            lifecycle_binding=lifecycle_binding,
+            lifecycle_success=True,
+            lifecycle_transcript=retained_lifecycle_transcript,
         )
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
@@ -3206,6 +3637,13 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         for control_name in WORKLOAD_NEGATIVE_CONTROL_NAMES:
             contract = workload_contracts[control_name]
             backing_paths = workload_negative_backings[control_name]
+            control_plan, _control_transport = _workload_negative_context(control_name)
+            control_binding = OCIControlBinding(
+                run_id=control_plan.run_id,
+                domain_core_digest=control_plan.domain_core_digest,
+                stage1_artifact_digest=contract["stage1_transport"]["artifact_digest"],
+            )
+            control_lifecycle_socket = root / f"lifecycle-{control_name}.sock"
             _verify_pinned_boot_files(
                 qemu_path=qemu_path,
                 qemu=qemu,
@@ -3222,6 +3660,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 backing_paths=backing_paths,
                 cmdline=contract["cmdline"],
                 control=contract,
+                lifecycle_socket_path=control_lifecycle_socket,
             )
             workload_negative_consoles[control_name] = _read_console_until(
                 control_command,
@@ -3237,6 +3676,9 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 ),
                 timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
                 require_alive_after_marker=True,
+                lifecycle_socket_path=control_lifecycle_socket,
+                lifecycle_binding=control_binding,
+                lifecycle_success=False,
             )
             _verify_pinned_boot_files(
                 qemu_path=qemu_path,
@@ -3277,6 +3719,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         root_transition_negative_root_post_digests,
         workload_negative_consoles,
         workload_negative_root_post_digests,
+        _lifecycle_receipt(lifecycle_binding, lifecycle_transcript, retained_lifecycle_transcript),
     )
     if evidence is not None:
         _secure_write(evidence, "console.bin", console, mode=0o400)

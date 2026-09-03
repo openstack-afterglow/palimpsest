@@ -1,8 +1,9 @@
 """Transport-neutral OCI-root lifecycle control wire contract.
 
-The protocol is intentionally production-inert: it defines bounded frames and
-the host-side replay/order checks needed by a future virtio-serial consumer,
-but it does not open a channel or dispatch lifecycle operations.
+The protocol is production-inert: it defines bounded frames and the host-side
+replay/order checks shared by the native-KVM qualification driver and a future
+production libvirt consumer. This module itself does not open a channel or
+dispatch lifecycle operations.
 """
 
 from __future__ import annotations

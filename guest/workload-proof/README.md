@@ -49,8 +49,10 @@ same-process-group descendants. The cooperative descendant consumes PID 1's
 forwarded SIGTERM through `signalfd` and exits 43. The stubborn descendant
 keeps SIGTERM blocked and remains until the broker uses the pinned
 `cgroup.kill` descriptor, producing status 137. Once both descendants report
-ready, the main exits 42 naturally. Root PID 1 must then send the configured
-OCI stop signal, observe the cooperative grace result, kill the remaining
+ready, the main arms its own signalfd, emits the proof-only scheduling marker,
+and waits. The host sends STOP only after broker READY and that marker; root
+PID 1 forwards the configured OCI stop signal, after which the main exits 42.
+PID 1 observes the cooperative grace result and kills the remaining
 cgroup, reap to `ECHILD`, prove `populated 0` and empty `cgroup.procs`, and
 remove the cgroup before it may publish terminal success.
 

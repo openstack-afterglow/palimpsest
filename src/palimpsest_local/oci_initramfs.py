@@ -31,22 +31,23 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v12"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v13"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v10"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v12"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v11"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v13"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v3"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v4"
+OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v1"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:c674884ad36a241d974dd6fac5b4dcfa091ac508c2cf5a73f98b59af6acb5b6a"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:d4ac9fb67717ff5c92a03e8e2f9aff32858f22af7cf61aac105629146981a549"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:c21d5a5c129861eb6b197ed43e2b221bd8399484f7220ac4bea041b60c62cdd5"
+OCI_STAGE1_BINARY_DIGEST = "sha256:dd6fcc7866fdc7db098120cdb718baa58ea914d081a29f0fc526aa81fa49babf"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -372,6 +373,8 @@ def _supervisor_contract_dict() -> dict[str, Any]:
         "credentials": "root-pid1-broker-and-admitted-numeric-workload-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+        "lifecycle_delivery": "single-connection-ready-stop-terminal-reconnect-unproven",
         "privilege_after_fork": "root-pid1-narrow-broker-workload-identity-only",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
@@ -741,6 +744,7 @@ __all__ = [
     "OCI_STAGE1_BINARY_DIGEST",
     "OCI_STAGE1_BUILD_CONTRACT",
     "OCI_STAGE1_BUILD_RECIPE_DIGEST",
+    "OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT",
     "OCI_STAGE1_PLAN_TRANSPORT",
     "OCI_STAGE1_ROOT_TRANSITION_CONTRACT",
     "OCI_STAGE1_SEAL_RECIPE_DIGEST",

@@ -87,13 +87,19 @@ future guest broker must handle that exact retransmission idempotently and
 reject conflicting reuse.
 
 The lifecycle and supervisor bindings use pre-production OCI-root domain plan
-v6 and domain core v3. Earlier v4/v5 and core-v2 previews are rejected and must be rebuilt
+v7 and domain core v3. Earlier v4/v5/v6 and core-v2 previews are rejected and must be rebuilt
 before a future launch; loading one never migrates, deletes, or otherwise
 changes its run state or transport artifact.
 
-This is topology and validation only. Palimpsest does not yet call libvirt
-`openChannel`, run a guest lifecycle broker, dispatch `STOP`, reconnect a real
-domain, or expose the protocol through `run`, `stop`, or `-d`. Gate 2 therefore
+The native qualification harness now exercises a guest lifecycle broker over
+one private QEMU connection and records READY/STOP/TERMINAL. Production still
+does not call libvirt `openChannel`, dispatch runtime `STOP`, or expose the
+protocol through `run`, `stop`, or `-d`. Reconnect, SNAPSHOT, and retransmission
+remain unproven by the guest (`reconnect_proven=false`). Gate 2 therefore
 remains opt-in and skipped. The host nonce provides correlation and a replay
 challenge, not cryptographic peer authentication; that requires a future
 owned libvirt channel plus a MAC or equivalent authenticated transport.
+The v12 native receipt also records `negative_input_proven=false`: malformed,
+stale-binding, duplicate, truncated, and oversized guest-C runtime controls
+remain a separate qualification matrix rather than an implied result of the
+positive exchange.

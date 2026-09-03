@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-pid1-supervisor"
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v10"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v11"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -163,11 +163,13 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
         "cgroup_security": "workload-containment-and-cleanup-not-hostile-root-sandbox",
         "cleanup_scope": "dedicated-workload-cgroup",
-        "contract": "palimpsest.guest-pid1-supervisor.v3",
+        "contract": "palimpsest.guest-pid1-supervisor.v4",
         "credential_transition": "release-after-cgroup-attach-then-setgroups-setresgid-setresuid-verified",
         "credentials": "root-pid1-broker-and-admitted-numeric-workload-identity-empty-supplementary-groups",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v1",
+        "lifecycle_delivery": "single-connection-ready-stop-terminal-reconnect-unproven",
         "privilege_after_fork": "root-pid1-narrow-broker-workload-identity-only",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
@@ -214,6 +216,9 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"; pid1_gid=" in stage1
     assert b"; pid1_groups=" in stage1
     assert b"; cleanup=cgroup.kill; cgroup_populated=0" in stage1
+    assert b"org.palimpsest.oci.lifecycle.0" in stage1
+    assert b"palimpsest.oci-lifecycle-control.v1" in stage1
+    assert b"lifecycle rejected; stage=" in stage1
 
 
 def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
@@ -226,8 +231,15 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v8")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v2")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v9")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v3")' in source
+    assert '"org.palimpsest.oci.lifecycle.0"' in source
+    assert '"palimpsest.oci-lifecycle-control.v1"' in source
+    assert "SYS_getrandom 318" in source
+    assert "O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY" in source
+    assert "value.n != 36" in source
+    assert "for (i = 0; i < nonce.n; i++) if (!is_hex" in source
+    assert 'memcpy(name_path + 24 + slen(selected), "/name", 6)' in source
 
 
 @pytest.mark.parametrize(

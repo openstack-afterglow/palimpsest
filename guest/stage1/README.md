@@ -109,17 +109,18 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v11 proof retains owner-only positive and per-control consoles plus a
+The v12 proof retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v3` execution checkpoint.
+the `palimpsest.guest-pid1-supervisor.v4` execution checkpoint and the
+single-connection `palimpsest.guest-lifecycle-broker.v1` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v8 admits
+and production VM launch remains disabled. Stage-1 plan/protocol v9 admits
 only the explicit absolute/numeric process subset.
 
 The positive highest lower contains the separately reproducible proof workload
@@ -148,7 +149,17 @@ The cgroup provides workload containment and deterministic cleanup; it is not
 a hostile-root security sandbox. The child executes the admitted numeric OCI
 identity, which need not be unprivileged for every valid image.
 
-Proof v6 uses two real zstd SquashFS images built from the committed
+The native proof now opens the uniquely named lifecycle virtio port and runs a
+strict bounded HELLO/READY/STOP/TERMINAL exchange. TERMINAL is sent only after
+cgroup cleanup certainty and before the console terminal marker. This is one
+connection only (`reconnect_proven=false`); the production libvirt path,
+SNAPSHOT, retransmission, and cryptographic peer authentication remain future
+work.
+Receipt v12 records `negative_input_proven=false`; the guest-C malformed,
+stale-binding, duplicate, truncated, and oversized runtime matrix has not yet
+been collected on native KVM.
+
+Proof v7 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
 sentinel with different bytes; an optional authenticated plan probe (empty for
 normal production plans) verifies that the highest ordinal is visible through
