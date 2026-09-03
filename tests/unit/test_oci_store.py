@@ -1961,6 +1961,38 @@ def test_oci_root_define_revalidates_and_durably_records_inactive_domain(
     }
 
 
+def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "safe-defaults")
+
+    def safe_defaults(xml: str) -> str:
+        root = ET.fromstring(xml)
+        ET.SubElement(root, "clock", {"offset": "utc"})
+        ET.SubElement(root, "on_poweroff").text = "destroy"
+        ET.SubElement(root, "on_reboot").text = "restart"
+        ET.SubElement(root, "on_crash").text = "destroy"
+        pm = ET.SubElement(root, "pm")
+        ET.SubElement(pm, "suspend-to-mem", {"enabled": "no"})
+        ET.SubElement(pm, "suspend-to-disk", {"enabled": "no"})
+        devices = root.find("./devices")
+        ET.SubElement(devices, "controller", {"type": "pci", "index": "0", "model": "pcie-root"})
+        serial = ET.SubElement(devices, "serial", {"type": "pty"})
+        ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+        ET.SubElement(devices, "input", {"type": "keyboard", "bus": "ps2"})
+        ET.SubElement(devices, "memballoon", {"model": "virtio"})
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=safe_defaults)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    receipt = define_committed_oci_root_domain(roots, "safe-defaults", store, boot, profile, conn=conn, runner=tools)
+
+    assert receipt.domain_uuid == conn.domains["safe-defaults"].UUIDString()
+    assert read_run_ledger_snapshot(roots, "safe-defaults").state["status"] == "defined"
+
+
 @pytest.mark.parametrize("tamper", ["lower", "root", "transport", "kernel", "socket", "profile"])
 def test_oci_root_define_rejects_live_authority_tamper_before_libvirt_mutation(
     tmp_path: Path,
@@ -2046,7 +2078,23 @@ def test_oci_root_define_fails_closed_for_ambiguous_lookup_and_foreign_domain(
 
 @pytest.mark.parametrize(
     "failure",
-    ["disk", "lifecycle", "channel-source", "cpu", "features", "console", "direct-boot"],
+    [
+        "disk",
+        "lifecycle",
+        "channel-source",
+        "cpu",
+        "features",
+        "console",
+        "direct-boot",
+        "filesystem",
+        "hostdev",
+        "shmem",
+        "unknown-device",
+        "disk-backing-store",
+        "interface-script",
+        "qemu-commandline",
+        "xml-uuid",
+    ],
 )
 def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
     tmp_path: Path,
@@ -2075,6 +2123,26 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
             root.find("./devices/console/target").set("port", "1")
         elif failure == "direct-boot":
             ET.SubElement(root.find("./os"), "boot", {"dev": "hd"})
+        elif failure == "filesystem":
+            filesystem = ET.SubElement(root.find("./devices"), "filesystem", {"type": "mount"})
+            ET.SubElement(filesystem, "source", {"dir": "/"})
+            ET.SubElement(filesystem, "target", {"dir": "host"})
+        elif failure == "hostdev":
+            ET.SubElement(root.find("./devices"), "hostdev", {"mode": "subsystem", "type": "pci"})
+        elif failure == "shmem":
+            ET.SubElement(root.find("./devices"), "shmem", {"name": "attacker"})
+        elif failure == "unknown-device":
+            ET.SubElement(root.find("./devices"), "attacker-device")
+        elif failure == "disk-backing-store":
+            backing = ET.SubElement(root.find("./devices/disk"), "backingStore")
+            ET.SubElement(backing, "source", {"file": "/etc/passwd"})
+        elif failure == "interface-script":
+            ET.SubElement(root.find("./devices/interface"), "script", {"path": "/tmp/attacker"})
+        elif failure == "qemu-commandline":
+            commandline = ET.SubElement(root, "{http://libvirt.org/schemas/domain/qemu/1.0}commandline")
+            ET.SubElement(commandline, "{http://libvirt.org/schemas/domain/qemu/1.0}arg", {"value": "-S"})
+        elif failure == "xml-uuid":
+            ET.SubElement(root, "uuid").text = str(uuid.uuid4())
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=transform)

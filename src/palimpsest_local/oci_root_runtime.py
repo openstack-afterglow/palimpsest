@@ -6,6 +6,7 @@ dispatch remains disabled until the privileged lifecycle handshake is ready.
 
 from __future__ import annotations
 
+import re
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .state import StatePaths, locked_existing_run
 
 OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v1"
+_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,17 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
         serials = disk.findall("./serial")
         readonly_count = len(disk.findall("./readonly"))
         shareable_count = len(disk.findall("./shareable"))
+        backing_stores = disk.findall("./backingStore")
+        if any(
+            child.tag
+            not in {"address", "alias", "backingStore", "driver", "readonly", "serial", "shareable", "source", "target"}
+            for child in disk
+        ):
+            raise StateError("defined OCI-root disk contains an unapproved child")
+        if len(backing_stores) > 1 or any(
+            backing.attrib or list(backing) or (backing.text or "").strip() for backing in backing_stores
+        ):
+            raise StateError("defined OCI-root disk backing store is invalid")
         target_name = target.get("dev")
         if (
             disk.attrib != {"type": "file", "device": "disk"}
@@ -75,6 +88,13 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
             or not isinstance(serials[0].text, str)
             or readonly_count > 1
             or shareable_count > 1
+            or list(source)
+            or list(target)
+            or list(driver)
+            or serials[0].attrib
+            or list(serials[0])
+            or len(disk.findall("./alias")) > 1
+            or len(disk.findall("./address")) > 1
         ):
             raise StateError("defined OCI-root disk projection is invalid")
         seen_targets.add(target_name)
@@ -91,11 +111,141 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
     return tuple(sorted(projected))
 
 
+def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...]:
+    """Reject host-resource devices; admit only bounded inert normalization.
+
+    Libvirt may synthesize bus controllers, a PTY serial peer, legacy input
+    devices, a panic notifier, or a virtio balloon in inactive XML.  Those
+    classes have no host path/source selector and are bounded here.  Every
+    authored OCI-root device remains part of the exact projection below.
+    """
+
+    authored = {"channel", "console", "disk", "emulator", "interface"}
+    safe_generated = {"input", "memballoon", "panic", "serial"}
+    counts: dict[str, int] = {}
+    generated_counts: dict[str, int] = {}
+    safe_controller_ids: set[tuple[str, str]] = set()
+    for child in list(devices):
+        if not isinstance(child.tag, str) or "}" in child.tag:
+            raise StateError("defined OCI-root device class is invalid")
+        tag = child.tag
+        if tag in authored:
+            counts[tag] = counts.get(tag, 0) + 1
+            continue
+        if tag == "controller":
+            controller_type = child.get("type")
+            if controller_type == "virtio-serial":
+                counts[tag] = counts.get(tag, 0) + 1
+                continue
+            if (
+                controller_type not in {"pci", "sata", "usb"}
+                or set(child.attrib) - {"index", "model", "ports", "type"}
+                or any(grandchild.tag not in {"address", "alias", "driver", "model", "target"} for grandchild in child)
+                or child.find(".//source") is not None
+            ):
+                raise StateError("defined OCI-root generated controller is invalid")
+            identity = (controller_type, child.get("index", ""))
+            if identity in safe_controller_ids or len(safe_controller_ids) >= 32:
+                raise StateError("defined OCI-root generated controller set is invalid")
+            safe_controller_ids.add(identity)
+            continue
+        if tag not in safe_generated:
+            raise StateError(f"defined OCI-root device class is forbidden: {tag}")
+        generated_counts[tag] = generated_counts.get(tag, 0) + 1
+        limits = {"input": 2, "memballoon": 1, "panic": 1, "serial": 1}
+        if generated_counts[tag] > limits[tag] or child.find(".//source") is not None:
+            raise StateError("defined OCI-root generated device set is invalid")
+        if tag == "input" and (
+            child.get("type") not in {"keyboard", "mouse", "tablet"}
+            or child.get("bus") not in {"ps2", "usb"}
+            or any(grandchild.tag not in {"address", "alias"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated input device is invalid")
+        if tag == "memballoon" and (
+            child.get("model") not in {"none", "virtio"}
+            or any(grandchild.tag not in {"address", "alias", "driver", "stats"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated balloon device is invalid")
+        if tag == "panic" and (
+            child.get("model") not in {"hyperv", "isa", "pseries", "s390"}
+            or any(grandchild.tag not in {"address", "alias"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated panic device is invalid")
+        if tag == "serial":
+            targets = child.findall("./target")
+            if (
+                child.attrib != {"type": "pty"}
+                or len(targets) != 1
+                or targets[0].get("port") != "0"
+                or targets[0].get("type") not in {"isa-serial", "serial"}
+                or any(grandchild.tag not in {"address", "alias", "target"} for grandchild in child)
+            ):
+                raise StateError("defined OCI-root generated serial device is invalid")
+    required = {"channel": 1, "console": 1, "emulator": 1}
+    if any(counts.get(tag, 0) != count for tag, count in required.items()):
+        raise StateError("defined OCI-root authored device multiplicity is invalid")
+    if counts.get("disk", 0) < 3 or counts.get("controller", 0) != 1 or counts.get("interface", 0) > 1:
+        raise StateError("defined OCI-root authored device multiplicity is invalid")
+    return tuple(sorted(counts.items()))
+
+
+def _validate_top_level_surface(root: ET.Element) -> None:
+    authored = {"cpu", "devices", "features", "memory", "metadata", "name", "os", "vcpu"}
+    safe_defaults = {"clock", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
+    counts: dict[str, int] = {}
+    for child in list(root):
+        if not isinstance(child.tag, str) or "}" in child.tag:
+            raise StateError("defined OCI-root top-level extension is forbidden")
+        if child.tag in authored:
+            counts[child.tag] = counts.get(child.tag, 0) + 1
+            continue
+        if child.tag not in safe_defaults:
+            raise StateError(f"defined OCI-root top-level element is forbidden: {child.tag}")
+        counts[child.tag] = counts.get(child.tag, 0) + 1
+        if counts[child.tag] > 1:
+            raise StateError("defined OCI-root generated top-level defaults are invalid")
+        if child.tag == "uuid":
+            try:
+                value = str(uuid.UUID(child.text or ""))
+            except ValueError:
+                raise StateError("defined OCI-root generated UUID element is invalid") from None
+            if value != child.text or child.attrib or list(child):
+                raise StateError("defined OCI-root generated UUID element is invalid")
+        elif child.tag == "clock":
+            if child.attrib != {"offset": "utc"} or any(grandchild.tag != "timer" for grandchild in child):
+                raise StateError("defined OCI-root generated clock is invalid")
+        elif child.tag in {"on_crash", "on_poweroff", "on_reboot"}:
+            expected = {"on_crash": "destroy", "on_poweroff": "destroy", "on_reboot": "restart"}[child.tag]
+            if child.text != expected or child.attrib or list(child):
+                raise StateError("defined OCI-root generated lifecycle default is invalid")
+        elif child.tag == "pm":
+            expected_pm = {"suspend-to-disk": "no", "suspend-to-mem": "no"}
+            found_pm: dict[str, str | None] = {}
+            for setting in child:
+                if setting.tag not in expected_pm or set(setting.attrib) != {"enabled"} or list(setting):
+                    raise StateError("defined OCI-root generated power-management default is invalid")
+                found_pm[setting.tag] = setting.get("enabled")
+            if child.attrib or found_pm != expected_pm:
+                raise StateError("defined OCI-root generated power-management default is invalid")
+    if any(counts.get(tag, 0) != 1 for tag in authored):
+        raise StateError("defined OCI-root authored top-level multiplicity is invalid")
+
+
 def _domain_projection(xml: str) -> dict[str, Any]:
     try:
         root = ET.fromstring(xml)
     except (ET.ParseError, TypeError, ValueError):
         raise StateError("defined OCI-root domain XML is invalid") from None
+    if root.tag != "domain" or root.attrib != {"type": "kvm"}:
+        raise StateError("defined OCI-root domain root is invalid")
+    _validate_top_level_surface(root)
+    metadata = _single(root, "./metadata", "defined OCI-root metadata contract is invalid")
+    expected_metadata_tags = {
+        f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle",
+        f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run",
+    }
+    if len(metadata) != 2 or {child.tag for child in metadata} != expected_metadata_tags:
+        raise StateError("defined OCI-root metadata contract is invalid")
     marker = _single(
         root,
         f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run",
@@ -117,12 +267,35 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     for interface in interfaces:
         source = _single(interface, "./source", "defined OCI-root network source is invalid")
         model = _single(interface, "./model", "defined OCI-root network model is invalid")
+        macs = interface.findall("./mac")
+        if (
+            any(child.tag not in {"address", "alias", "mac", "model", "source"} for child in interface)
+            or interface.attrib != {"type": "network"}
+            or set(source.attrib) != {"network"}
+            or set(model.attrib) != {"type"}
+            or list(source)
+            or list(model)
+            or len(macs) > 1
+            or len(interface.findall("./alias")) > 1
+            or len(interface.findall("./address")) > 1
+            or (macs and (set(macs[0].attrib) != {"address"} or _MAC_RE.fullmatch(macs[0].get("address", "")) is None))
+        ):
+            raise StateError("defined OCI-root network projection is invalid")
         network_projection.append((interface.get("type"), source.get("network"), model.get("type")))
     channel_projection: list[tuple[str | None, ...]] = []
     for channel in channels:
         source = _single(channel, "./source", "defined OCI-root lifecycle channel source is invalid")
         target = _single(channel, "./target", "defined OCI-root lifecycle channel is invalid")
-        if set(source.attrib) != {"mode", "path"} or set(target.attrib) != {"type", "name"}:
+        if (
+            any(child.tag not in {"address", "alias", "source", "target"} for child in channel)
+            or channel.attrib != {"type": "unix"}
+            or set(source.attrib) != {"mode", "path"}
+            or set(target.attrib) != {"type", "name"}
+            or list(source)
+            or list(target)
+            or len(channel.findall("./alias")) > 1
+            or len(channel.findall("./address")) > 1
+        ):
             raise StateError("defined OCI-root lifecycle channel source is invalid")
         channel_projection.append(
             (
@@ -135,7 +308,13 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         )
     os_type = _single(root, "./os/type", "defined OCI-root machine contract is invalid")
     os_element = _single(root, "./os", "defined OCI-root direct-boot contract is invalid")
-    if os_element.attrib or any(os_element.findall(path) for path in ("./boot", "./loader", "./nvram")):
+    expected_os_children = {"cmdline", "initrd", "kernel", "type"}
+    if (
+        os_element.attrib
+        or len(os_element) != 4
+        or {child.tag for child in os_element} != expected_os_children
+        or any(len(os_element.findall(f"./{tag}")) != 1 for tag in expected_os_children)
+    ):
         raise StateError("defined OCI-root direct-boot contract is invalid")
     memory = _single(root, "./memory", "defined OCI-root memory contract is invalid")
     cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
@@ -146,14 +325,26 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     console = consoles[0]
     console_targets = console.findall("./target")
     console_sources = console.findall("./source")
-    if len(console_targets) != 1 or len(console_sources) > 1:
+    if (
+        len(console_targets) != 1
+        or len(console_sources) > 1
+        or any(child.tag not in {"address", "alias", "source", "target"} for child in console)
+        or list(console_targets[0])
+        or any(list(source) for source in console_sources)
+        or len(console.findall("./alias")) > 1
+        or len(console.findall("./address")) > 1
+    ):
         raise StateError("defined OCI-root console contract is invalid")
+    emulator = _single(root, "./devices/emulator", "defined OCI-root emulator is invalid")
+    if emulator.attrib or list(emulator):
+        raise StateError("defined OCI-root emulator is invalid")
     return {
         "channels": tuple(channel_projection),
         "controllers": tuple(controllers),
         "disks": _disk_projection(root),
+        "device_counts": _validate_devices_surface(_single(root, "./devices", "defined OCI-root devices are invalid")),
         "domain_type": root.get("type"),
-        "emulator": _text(root, "./devices/emulator", "defined OCI-root emulator is invalid"),
+        "emulator": emulator.text,
         "features": tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(features)),
         "initramfs": _text(root, "./os/initrd", "defined OCI-root initramfs is invalid"),
         "interfaces": tuple(network_projection),
@@ -201,6 +392,10 @@ def _validate_defined_domain(
         raise StateError("defined OCI-root domain cannot be inspected") from exc
     if _domain_projection(actual_xml) != _domain_projection(resolved.xml):
         raise StateError("defined OCI-root domain does not match the committed contract")
+    actual_root = ET.fromstring(actual_xml)
+    xml_uuids = actual_root.findall("./uuid")
+    if xml_uuids and xml_uuids[0].text != expected_uuid:
+        raise StateError("defined OCI-root XML UUID does not match the libvirt domain UUID")
     try:
         active = domain.isActive()
     except Exception as exc:
