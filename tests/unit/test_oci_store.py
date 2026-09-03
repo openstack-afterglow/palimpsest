@@ -1655,7 +1655,7 @@ def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: 
     assert store.list_lease_set_intents(prepared.transaction.owner) == ()
 
 
-def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Path) -> None:
+def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Path, monkeypatch) -> None:
     roots, store = _store(tmp_path)
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
@@ -1702,6 +1702,11 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert f"palimpsest.core={plan.domain_core_digest}" in plan.kernel_cmdline
     assert f"palimpsest.stage1={plan.stage1_transport['artifact_digest']}" in plan.kernel_cmdline
     assert plan.stage1_transport["target"] == "vdb"
+    assert plan.to_dict()["lifecycle_control"] == {
+        "channel_name": "org.palimpsest.oci.lifecycle.0",
+        "protocol": "palimpsest.oci-lifecycle-control.v1",
+        "transport": "virtio-serial",
+    }
     transport_path = roots.runs / "domain-plan" / "stage1-plan.raw"
     assert transport_path.is_file()
     assert transport_path.stat().st_mode & 0o777 == 0o400
@@ -1726,6 +1731,32 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     tampered["stage1_transport"]["artifact_digest"] = "sha256:" + "0" * 64
     with pytest.raises(StateError, match="transport"):
         type(plan).from_dict(tampered)
+    tampered = deepcopy(plan.to_dict())
+    tampered["lifecycle_control"]["channel_name"] = "attacker.controlled"
+    with pytest.raises(StateError, match="dispatch"):
+        type(plan).from_dict(tampered)
+    legacy = deepcopy(plan.to_dict())
+    legacy["schema"] = "palimpsest.oci-root-domain-plan.v4"
+    legacy.pop("lifecycle_control")
+    with pytest.raises(StateError, match="pre-production.*v4.*rebuild"):
+        type(plan).from_dict(legacy)
+    state_path = roots.runs / "domain-plan" / "state.json"
+    state_before = state_path.read_bytes()
+    transport_before = transport_path.read_bytes()
+    snapshot = read_run_ledger_snapshot(roots, "domain-plan")
+    legacy_snapshot = replace(
+        snapshot,
+        state={
+            **snapshot.state,
+            "oci_root_domain": {"digest": snapshot.state["oci_root_domain"]["digest"], "plan": legacy},
+        },
+    )
+    with monkeypatch.context() as isolated:
+        isolated.setattr(oci_root_kvm_module, "read_run_ledger_snapshot", lambda *_args: legacy_snapshot)
+        with pytest.raises(StateError, match="pre-production.*v4.*rebuild"):
+            load_oci_root_domain_plan(roots, "domain-plan")
+    assert state_path.read_bytes() == state_before
+    assert transport_path.read_bytes() == transport_before
     with pytest.raises(TypeError):
         plan.layers[0]["serial"] = "0" * 20
     with pytest.raises(TypeError):
@@ -1761,6 +1792,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
         load_oci_root_domain_plan(roots, "domain-plan")
 
     release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+    assert read_run_ledger_snapshot(roots, "domain-plan").state["status"] == "removed"
 
 
 def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -> None:

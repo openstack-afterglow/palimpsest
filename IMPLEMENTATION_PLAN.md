@@ -652,12 +652,75 @@ transport, VM poweroff and exit mapping, production libvirt define/start,
 foreground/`-d`, exec/log readiness, and Gate 2 remain disabled.
 The permanent PID 1 credential drop is valid only for this single-workload
 qualification boundary. Detached stop, multi-user exec, and agent lifecycle
-require a separate narrowly privileged broker plus an authenticated
+require a separate narrowly privileged broker plus an owned, peer-authenticated
 host-to-guest lifecycle channel.
 
 Qualification state: all contracts, fixtures, reproducible ELFs, portable
-tests, and the v10 receipt collector are source-controlled. This macOS host
-cannot run native Linux x86_64 KVM, so no actual 30-boot v10 receipt is claimed.
+tests, and the v10 receipt collector are source-controlled. Native Linux
+x86_64 KVM qualification was collected remotely at commit `0dd47c7`: all 30
+boots passed and the receipt SHA-256 is
+`9e23fd9857338d16fae28e29cb344de3bf9c00911201f733bd38c7445adbc2e9`.
+
+### PR 4 slice 25: nonce-correlated reconnectable lifecycle wire contract
+
+Implemented:
+
+- A production-inert, transport-neutral lifecycle protocol defines canonical
+  JSON messages inside a four-byte big-endian length prefix, with the complete
+  frame bounded to 64 KiB. Duplicate keys, noncanonical UTF-8 JSON, unknown or
+  kind-inappropriate fields, invalid types, oversized declarations, truncated
+  streams, and trailing bytes fail closed; the incremental decoder has the
+  same acceptance language as one-shot decoding.
+- Every message binds the canonical run UUID, domain-core digest, stage-1
+  artifact digest, and a fresh 256-bit host nonce. The guest issues a canonical
+  boot-generation UUID in its first `READY`; the host then requires that exact
+  generation on `STOP`, `TERMINAL`, and reconnect `SNAPSHOT` messages. A
+  reconnect rotates the host nonce and accepts only an exact current ready,
+  stopping, or terminal snapshot. A stopping snapshot binds both the new
+  `HELLO` and the still-outstanding original `STOP`, so reconnect cannot issue
+  a second stop or lose terminal correlation.
+- If the first `HELLO` response is lost before the host learns a boot
+  generation, its fresh-nonce retry accepts either `READY` or a ready-only
+  snapshot correlated to the current request. Stopping and terminal snapshots
+  remain unavailable until READY authority exists. If a stop-sent reconnect
+  observes terminal, its stop binding must be either the exact original STOP
+  ID (delivered) or null (undelivered followed by natural exit); foreign IDs
+  are rejected and the observed cause is retained for later snapshots.
+- Newly created host request IDs increase across `HELLO`, reconnect, and
+  `STOP`; only the explicitly permitted retransmission reuses its existing
+  logical STOP ID. Guest event sequence numbers increase across the entire
+  boot, including reconnects. Solicited responses bind the triggering request
+  explicitly. Replayed nonces, generations, sequences, requests, cross-run
+  bindings, and invalid lifecycle transitions are rejected.
+- `STOP` is one stable logical operation. If a reconnect snapshot proves it
+  was not delivered by reporting ready, the host may retransmit the exact same
+  request ID, boot generation, and payload under the new connection nonce. A
+  guest broker must deduplicate that exact retransmission idempotently and
+  reject reuse of the request ID with different operation data. Once delivery
+  is observed, stopping and stop-caused terminal snapshots continue to bind
+  the original STOP request.
+- OCI-root domain XML alone now contains one fixed named virtio-serial
+  lifecycle channel and one explicit virtio-serial controller. Libvirt chooses
+  the backing endpoint because no user-controlled socket path is emitted. The
+  fixed channel name, protocol, and transport are bound into domain metadata,
+  domain-core v3, and domain-plan v5. Existing cloud/build domain XML is
+  unchanged.
+- Pre-production domain-plan v4 and domain-core v2 lack the lifecycle-channel
+  binding and are intentionally invalidated rather than migrated. They must be
+  rebuilt before any future launch boundary. Decode/load rejection is
+  read-only and does not rewrite or delete run state or transport artifacts;
+  the existing internal preparation release path remains independent of
+  domain-plan decoding.
+
+Scope boundary: no code opens the libvirt channel, sends or receives these
+frames, dispatches stop, maps exit status, or reconnects in production. The
+guest supervisor and `runtime_dispatch`/CLI are unchanged, OCI-root runtime
+dispatch remains typed-unavailable, and Gate 2 remains inactive. A future
+slice must implement a narrowly privileged guest broker, an owned libvirt
+channel and cryptographic peer authentication (or an equivalent MAC-bound
+channel), and the final host/libvirt handoff before this contract can become
+lifecycle authority. The nonce is only a correlation and replay challenge; it
+does not cryptographically authenticate either peer.
 
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 

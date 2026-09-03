@@ -30,6 +30,7 @@ from .kvm import (
     Stage1TransportDisk,
     build_oci_root_domain_xml,
 )
+from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
 from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
@@ -48,8 +49,8 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v4"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v2"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v5"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v3"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
@@ -131,6 +132,11 @@ def _domain_core_dict(
         "layers": _plain_json(layers),
         "lower_graph_digest": lower_graph_digest,
         "lower_lease_set_id": lower_lease_set_id,
+        "lifecycle_control": {
+            "channel_name": OCI_CONTROL_CHANNEL_NAME,
+            "protocol": OCI_CONTROL_PROTOCOL,
+            "transport": "virtio-serial",
+        },
         "machine": {"memory_mib": memory_mib, "network": network, "vcpus": vcpus},
         "process": process.to_dict(),
         "resource_plan_digest": resource_plan_digest,
@@ -516,6 +522,11 @@ class OCIRootDomainPlan:
             "layers": _plain_json(self.layers),
             "lower_graph_digest": self.lower_graph_digest,
             "lower_lease_set_id": self.lower_lease_set_id,
+            "lifecycle_control": {
+                "channel_name": OCI_CONTROL_CHANNEL_NAME,
+                "protocol": OCI_CONTROL_PROTOCOL,
+                "transport": "virtio-serial",
+            },
             "machine": {"memory_mib": self.memory_mib, "network": self.network, "vcpus": self.vcpus},
             "phase": "domain-planned",
             "process": self.process.to_dict(),
@@ -532,6 +543,8 @@ class OCIRootDomainPlan:
 
     @classmethod
     def from_dict(cls, value: Any) -> OCIRootDomainPlan:
+        if isinstance(value, Mapping) and value.get("schema") == "palimpsest.oci-root-domain-plan.v4":
+            raise StateError("pre-production OCI-root domain plan v4 is invalidated; rebuild it before launch")
         expected = {
             "boot_artifacts",
             "domain_core_digest",
@@ -539,6 +552,7 @@ class OCIRootDomainPlan:
             "layers",
             "lower_graph_digest",
             "lower_lease_set_id",
+            "lifecycle_control",
             "machine",
             "phase",
             "process",
@@ -555,6 +569,7 @@ class OCIRootDomainPlan:
             raise StateError("OCI-root domain plan schema is invalid")
         run = value.get("run")
         machine = value.get("machine")
+        lifecycle = value.get("lifecycle_control")
         if (
             not isinstance(run, Mapping)
             or set(run) != {"backend", "name", "run_id", "runtime_kind"}
@@ -562,6 +577,13 @@ class OCIRootDomainPlan:
             or run.get("runtime_kind") != "oci-root"
             or not isinstance(machine, Mapping)
             or set(machine) != {"memory_mib", "network", "vcpus"}
+            or not isinstance(lifecycle, Mapping)
+            or lifecycle
+            != {
+                "channel_name": OCI_CONTROL_CHANNEL_NAME,
+                "protocol": OCI_CONTROL_PROTOCOL,
+                "transport": "virtio-serial",
+            }
             or not isinstance(value.get("layers"), list)
         ):
             raise StateError("OCI-root domain plan dispatch is invalid")

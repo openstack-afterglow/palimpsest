@@ -14,6 +14,7 @@ from typing import Any
 
 from .cloudinit import BUILD_CHANNEL_NAME
 from .digest import normalize_digest
+from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
 from .platforms import DomainProfile
 
 _logger = logging.getLogger(__name__)
@@ -98,6 +99,8 @@ class OCIRootDomainSpec:
     console_log: Path | None = None
     run_id: str | None = None
     boot_contract_digest: str | None = None
+    lifecycle_channel_name: str = OCI_CONTROL_CHANNEL_NAME
+    lifecycle_protocol: str = OCI_CONTROL_PROTOCOL
 
 
 def _valid_name(name: str) -> bool:
@@ -302,6 +305,8 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root boot contract digest is invalid") from None
     if contract_digest != spec.boot_contract_digest:
         raise KvmError("OCI-root boot contract digest is not canonical")
+    if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL:
+        raise KvmError("OCI-root lifecycle channel contract is invalid")
 
     seen_serials = {spec.root_serial}
     for index, layer in enumerate(spec.layers):
@@ -359,6 +364,11 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
             "contract": contract_digest,
         },
     )
+    ET.SubElement(
+        metadata,
+        "{https://afterglow.dev/palimpsest-local/domain/v1}lifecycle",
+        {"channel": spec.lifecycle_channel_name, "protocol": spec.lifecycle_protocol},
+    )
     devices = ET.SubElement(domain, "devices")
     ET.SubElement(devices, "emulator").text = str(profile.emulator)
     root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False)
@@ -374,6 +384,13 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
     for layer in spec.layers:
         disk = _disk(devices, layer.host_path, layer.target_dev, "raw", readonly=True, shareable=True)
         ET.SubElement(disk, "serial").text = layer.serial
+    ET.SubElement(devices, "controller", {"type": "virtio-serial", "index": "0"})
+    lifecycle_channel = ET.SubElement(devices, "channel", {"type": "unix"})
+    ET.SubElement(
+        lifecycle_channel,
+        "target",
+        {"type": "virtio", "name": spec.lifecycle_channel_name},
+    )
     if profile.network_mode == "libvirt-network" and spec.network is not None:
         interface = ET.SubElement(devices, "interface", {"type": "network"})
         ET.SubElement(interface, "source", {"network": spec.network})

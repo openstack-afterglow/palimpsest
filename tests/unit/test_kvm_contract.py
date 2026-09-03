@@ -39,6 +39,7 @@ from palimpsest_local.kvm import (
     validate_domain_name_available,
     validate_network,
 )
+from palimpsest_local.oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
 from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
 
 _ROOT = Path("/var/lib/palimpsest/layers")
@@ -130,6 +131,17 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     assert all(disk.find("shareable") is not None for disk in disks[2:])
     marker = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
     assert marker is not None and marker.get("contract") == "sha256:" + "4" * 64
+    lifecycle = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}lifecycle")
+    assert lifecycle is not None
+    assert lifecycle.attrib == {"channel": OCI_CONTROL_CHANNEL_NAME, "protocol": OCI_CONTROL_PROTOCOL}
+    assert [controller.attrib for controller in xml.findall("./devices/controller")] == [
+        {"type": "virtio-serial", "index": "0"}
+    ]
+    channels = xml.findall("./devices/channel")
+    assert len(channels) == 1
+    assert channels[0].attrib == {"type": "unix"}
+    assert channels[0].find("source") is None
+    assert channels[0].find("target").attrib == {"type": "virtio", "name": OCI_CONTROL_CHANNEL_NAME}
 
 
 def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
@@ -150,6 +162,18 @@ def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
             OCIRootDomainSpec(**{**spec.__dict__, "stage1_transport": wrong_transport}),
             _X86_PROFILE,
         )
+    with pytest.raises(KvmError, match="lifecycle channel contract"):
+        build_oci_root_domain_xml(
+            OCIRootDomainSpec(**{**spec.__dict__, "lifecycle_channel_name": "user.controlled"}),
+            _X86_PROFILE,
+        )
+
+
+def test_cloud_domain_xml_does_not_gain_oci_lifecycle_topology():
+    xml = ET.fromstring(build_domain_xml(_spec(), _X86_PROFILE))
+    names = [target.get("name") for target in xml.findall("./devices/channel/target")]
+    assert OCI_CONTROL_CHANNEL_NAME not in names
+    assert xml.find("./devices/controller[@type='virtio-serial']") is None
 
 
 def test_host_boot_artifact_policy_hashes_valid_explicit_files(tmp_path: Path):
