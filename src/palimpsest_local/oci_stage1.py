@@ -29,9 +29,9 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v9"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v9"
-OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v3"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v10"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v10"
+OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v4"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
 OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-explicit-user-group.v1"

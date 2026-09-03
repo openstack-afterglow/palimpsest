@@ -94,6 +94,7 @@ struct span { const char *p; usize n; };
 #define EIO 5
 #define EAGAIN 11
 #define EINTR 4
+#define ESRCH 3
 #define ECHILD 10
 #define EINVAL 22
 #define CLOCK_MONOTONIC 1
@@ -135,6 +136,17 @@ struct span { const char *p; usize n; };
 #define LIFECYCLE_CHANNEL_NAME "org.palimpsest.oci.lifecycle.0"
 #define LIFECYCLE_PROTOCOL "palimpsest.oci-lifecycle-control.v1"
 #define CONTROL_PAYLOAD_MAX 65532
+#define LIFECYCLE_CONNECTION_MAX 16
+#define LIFECYCLE_REQUEST_LEDGER_MAX 17
+#define LIFECYCLE_DISCONNECTED 0
+#define LIFECYCLE_CONNECTED 1
+#define LIFECYCLE_NEW 0
+#define LIFECYCLE_READY 1
+#define LIFECYCLE_STOPPING 2
+#define LIFECYCLE_TERMINAL 3
+#define LIFECYCLE_READY_COMMITTED_MARKER "palimpsest guest stage1: lifecycle ready committed\n"
+#define LIFECYCLE_STOP_DISPATCHED_MARKER "palimpsest guest stage1: lifecycle stop dispatched\n"
+#define LIFECYCLE_STOP_DUPLICATE_MARKER "palimpsest guest stage1: lifecycle stop duplicate accepted\n"
 #define WORKLOAD_STATUS_NONE 4294967295U
 
 struct timespec_local {
@@ -213,10 +225,31 @@ struct lifecycle_binding {
 struct lifecycle_session {
     int fd;
     int poisoned;
+    int connection;
+    int connection_has_hello;
+    int state;
+    int natural_late_stop_allowed;
+    u32 nonce_count;
+    u32 request_count;
+    u32 header_used;
+    u32 payload_expected;
+    u32 payload_used;
+    u32 reconnect_backoff_ms;
+    int outbound_failed;
+    u32 stop_delivered_count;
+    u32 terminal_exit_code;
+    u32 terminal_signal;
+    u8 header[4];
+    u64 next_sequence;
+    u64 frame_deadline;
+    u64 outbound_deadline;
+    u64 last_hello_request_id;
     u64 hello_request_id;
     u64 stop_request_id;
     char host_nonce[65];
     char boot_generation[37];
+    char used_nonces[LIFECYCLE_CONNECTION_MAX][65];
+    u64 seen_request_ids[LIFECYCLE_REQUEST_LEDGER_MAX];
 };
 
 static struct lifecycle_binding lifecycle_binding;
@@ -1123,16 +1156,16 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v3") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v4") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") || !exact_string(&j, "absolute-argv0-numeric-explicit-user-group.v1") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v9") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v10") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v9") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v10") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -1737,8 +1770,8 @@ static int wait_control_fd(int fd, short events, u64 deadline) {
         item.fd = fd; item.events = events; item.revents = 0;
         n = sc3(SYS_poll, (i64)&item, 1, timeout);
         if (n == -EINTR) continue;
-        if (n < 0 || (item.revents & (POLLERR | POLLHUP))) return 0;
         if (n > 0 && (item.revents & events)) return 1;
+        if (n < 0 || (item.revents & (POLLERR | POLLHUP))) return 0;
     }
 }
 
@@ -1859,17 +1892,118 @@ static int generate_boot_generation(char out[37]) {
     return text == 36;
 }
 
-static int read_control_frame(int fd, usize *payload_size) {
-    u8 header[4];
-    u32 size;
-    if (!control_io_exact(fd, header, sizeof(header), 0)) return 0;
-    size = ((u32)header[0] << 24) | ((u32)header[1] << 16) | ((u32)header[2] << 8) | header[3];
-    if (!size || size > CONTROL_PAYLOAD_MAX || !control_io_exact(fd, control_payload, size, 0)) return 0;
-    *payload_size = size;
+static void lifecycle_connection_lost(struct lifecycle_session *session) {
+    session->connection = LIFECYCLE_DISCONNECTED;
+    session->connection_has_hello = 0;
+    session->natural_late_stop_allowed = 0;
+    session->header_used = 0;
+    session->payload_expected = 0;
+    session->payload_used = 0;
+    session->frame_deadline = 0;
+    session->outbound_failed = 0;
+    session->outbound_deadline = 0;
+    session->host_nonce[0] = 0;
+}
+
+/* Never let a connected peer make the outer supervisor wait past the
+ * connection-local partial-frame deadline.  read_control_frame() owns the
+ * actual rejection; this helper only guarantees that it is called again. */
+static int lifecycle_poll_timeout(const struct lifecycle_session *session, int fallback) {
+    u64 now, deadline = session->frame_deadline, remaining;
+    if (session->connection == LIFECYCLE_DISCONNECTED)
+        return (int)session->reconnect_backoff_ms;
+    if (session->outbound_failed && (!deadline || session->outbound_deadline < deadline))
+        deadline = session->outbound_deadline;
+    if (!deadline) return fallback;
+    now = monotonic_millis();
+    if (!now || now >= deadline) return 0;
+    remaining = deadline - now;
+    if (fallback >= 0 && remaining > (u64)fallback) return fallback;
+    return (int)remaining;
+}
+
+/* Return 1 for one complete frame, 0 for no data, -2 for a peer boundary,
+ * and -1 for a complete invalid length or I/O failure. An incomplete frame is
+ * connection-local and discarded only after read(2) reports the peer boundary. */
+static int read_control_frame(struct lifecycle_session *session, usize *payload_size) {
+    for (;;) {
+        u8 *target;
+        usize needed;
+        i64 n;
+        if (session->payload_expected) {
+            target = control_payload + session->payload_used;
+            needed = session->payload_expected - session->payload_used;
+        } else {
+            target = session->header + session->header_used;
+            needed = sizeof(session->header) - session->header_used;
+        }
+        n = sc3(SYS_read, session->fd, (i64)target, needed);
+        if (n > 0 && (usize)n <= needed) {
+            if (!session->frame_deadline) {
+                u64 now = monotonic_millis();
+                if (!now) return -1;
+                session->frame_deadline = now + 5000;
+            }
+            session->connection = LIFECYCLE_CONNECTED;
+            session->reconnect_backoff_ms = 10;
+            if (session->payload_expected) {
+                session->payload_used += (u32)n;
+                if (session->payload_used == session->payload_expected) {
+                    *payload_size = session->payload_expected;
+                    session->header_used = 0;
+                    session->payload_expected = 0;
+                    session->payload_used = 0;
+                    session->frame_deadline = 0;
+                    return 1;
+                }
+            } else {
+                session->header_used += (u32)n;
+                if (session->header_used == sizeof(session->header)) {
+                    u32 size = ((u32)session->header[0] << 24) | ((u32)session->header[1] << 16) |
+                               ((u32)session->header[2] << 8) | session->header[3];
+                    if (!size || size > CONTROL_PAYLOAD_MAX) return -1;
+                    session->payload_expected = size;
+                    session->payload_used = 0;
+                }
+            }
+            continue;
+        }
+        if (n == -EINTR) continue;
+        if (n == -EAGAIN)
+            return session->frame_deadline && monotonic_millis() >= session->frame_deadline ? -1 : 0;
+        if (n == 0) {
+            lifecycle_connection_lost(session);
+            return -2;
+        }
+        return -1;
+    }
+}
+
+static int nonce_seen(const struct lifecycle_session *session, const char nonce[65]) {
+    u32 i;
+    for (i = 0; i < session->nonce_count; i++)
+        if (bytes_equal(session->used_nonces[i], nonce, 64)) return 1;
+    return 0;
+}
+
+static int request_seen(const struct lifecycle_session *session, u64 request_id) {
+    u32 i;
+    for (i = 0; i < session->request_count; i++)
+        if (session->seen_request_ids[i] == request_id) return 1;
+    return 0;
+}
+
+static int remember_nonce_request(struct lifecycle_session *session, const char nonce[65], u64 request_id) {
+    if (session->nonce_count >= LIFECYCLE_CONNECTION_MAX ||
+        session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX ||
+        nonce_seen(session, nonce) || request_seen(session, request_id)) return 0;
+    memcpy(session->used_nonces[session->nonce_count++], nonce, 65);
+    session->seen_request_ids[session->request_count++] = request_id;
     return 1;
 }
 
-static int parse_control_binding(struct parser *j, struct lifecycle_session *session, const char *kind,
+static int parse_control_binding(struct parser *j, const struct lifecycle_session *session,
+                                 const char nonce[65], const char *kind,
                                  int stop, u64 *request_id) {
     struct span value;
     u64 number;
@@ -1879,7 +2013,7 @@ static int parse_control_binding(struct parser *j, struct lifecycle_session *ses
     if (!key(j, "domain_core_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
         !bytes_equal(value.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
         !key(j, "host_nonce") || !plain_string(j, &value, 0) || value.n != 64 ||
-        !bytes_equal(value.p, session->host_nonce, 64) || !take_char(j, ',') ||
+        !bytes_equal(value.p, nonce, 64) || !take_char(j, ',') ||
         !key(j, "kind") || !exact_string(j, kind) || !take_char(j, ',') || !key(j, "payload") ||
         !take_char(j, '{')) return 0;
     if (stop && (!key(j, "signal") || !uint_value(j, &number) || number != 15)) return 0;
@@ -1895,6 +2029,7 @@ static int parse_control_binding(struct parser *j, struct lifecycle_session *ses
 
 static int parse_hello(struct lifecycle_session *session, usize size) {
     struct span nonce;
+    char candidate[65];
     u64 request_id;
     usize i;
     struct parser *j = &control_parser;
@@ -1903,10 +2038,16 @@ static int parse_hello(struct lifecycle_session *session, usize size) {
         !bytes_equal(nonce.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
         !key(j, "host_nonce") || !plain_string(j, &nonce, 0) || nonce.n != 64) return 0;
     for (i = 0; i < nonce.n; i++) if (!is_hex((char)nonce.p[i])) return 0;
-    memcpy(session->host_nonce, nonce.p, 64); session->host_nonce[64] = 0;
+    memcpy(candidate, nonce.p, 64); candidate[64] = 0;
     j->p = control_payload; j->end = control_payload + size;
-    if (!parse_control_binding(j, session, "HELLO", 0, &request_id)) return 0;
+    if (!parse_control_binding(j, session, candidate, "HELLO", 0, &request_id) ||
+        session->connection_has_hello || request_id <= session->last_hello_request_id ||
+        !remember_nonce_request(session, candidate, request_id)) return 0;
+    memcpy(session->host_nonce, candidate, 65);
+    session->last_hello_request_id = request_id;
     session->hello_request_id = request_id;
+    session->connection_has_hello = 1;
+    session->connection = LIFECYCLE_CONNECTED;
     return 1;
 }
 
@@ -1914,9 +2055,28 @@ static int parse_stop(struct lifecycle_session *session, usize size) {
     u64 request_id;
     struct parser *j = &control_parser;
     memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
-    if (!parse_control_binding(j, session, "STOP", 1, &request_id) ||
-        request_id <= session->hello_request_id || session->stop_request_id) return 0;
+    if (!session->connection_has_hello ||
+        !parse_control_binding(j, session, session->host_nonce, "STOP", 1, &request_id)) return 0;
+    if (session->stop_request_id) {
+        if (request_id != session->stop_request_id || session->state != LIFECYCLE_STOPPING) return 0;
+        return 2;
+    }
+    /* A canonical STOP that lost the race with an already-reaped main process
+     * is drained without changing the frozen natural terminal cause.  Invalid
+     * or replayed input remains fail-closed. */
+    if (session->state == LIFECYCLE_TERMINAL) {
+        if (!session->natural_late_stop_allowed || request_seen(session, request_id) ||
+            session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX) return 0;
+        session->natural_late_stop_allowed = 0;
+        session->seen_request_ids[session->request_count++] = request_id;
+        return 3;
+    }
+    if (session->state != LIFECYCLE_READY || request_seen(session, request_id) ||
+        session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX) return 0;
+    session->seen_request_ids[session->request_count++] = request_id;
     session->stop_request_id = request_id;
+    session->state = LIFECYCLE_STOPPING;
+    session->stop_delivered_count++;
     return 1;
 }
 
@@ -1934,25 +2094,40 @@ static int append_control_u64(u8 *out, usize cap, usize *used, u64 value) {
     return 1;
 }
 
-static int send_control_message(struct lifecycle_session *session, int terminal,
+static int send_control_message(struct lifecycle_session *session, int kind,
                                 const struct supervisor_result *result) {
     usize used = 4;
+    u64 sequence = session->next_sequence++;
 #define CONTROL_TEXT(value) do { if (!append_control(control_output, sizeof(control_output), &used, value)) return 0; } while (0)
     CONTROL_TEXT("{\"boot_generation\":\""); CONTROL_TEXT(session->boot_generation);
     CONTROL_TEXT("\",\"domain_core_digest\":\""); CONTROL_TEXT(lifecycle_binding.core);
     CONTROL_TEXT("\",\"host_nonce\":\""); CONTROL_TEXT(session->host_nonce);
-    CONTROL_TEXT(terminal ? "\",\"kind\":\"TERMINAL\",\"payload\":{\"terminal\":{" : "\",\"kind\":\"READY\",\"payload\":{}");
-    if (terminal) {
+    if (kind == 0) CONTROL_TEXT("\",\"kind\":\"READY\",\"payload\":{}");
+    else if (kind == 1) CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"ready\",\"stop_request_id\":null,\"terminal\":null}");
+    else if (kind == 2) {
+        CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"stopping\",\"stop_request_id\":");
+        if (!append_control_u64(control_output, sizeof(control_output), &used, session->stop_request_id)) return 0;
+        CONTROL_TEXT(",\"terminal\":null}");
+    } else if (kind == 3) CONTROL_TEXT("\",\"kind\":\"TERMINAL\",\"payload\":{\"terminal\":{");
+    else CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"terminal\",\"stop_request_id\":");
+    if (kind == 4) {
+        if (session->stop_request_id) {
+            if (!append_control_u64(control_output, sizeof(control_output), &used, session->stop_request_id)) return 0;
+        } else CONTROL_TEXT("null");
+        CONTROL_TEXT(",\"terminal\":{");
+    }
+    if (kind == 3 || kind == 4) {
         if (result->main_signal) { CONTROL_TEXT("\"exit_code\":null,\"signal\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_signal)) return 0; }
         else { CONTROL_TEXT("\"exit_code\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_exit_code)) return 0; CONTROL_TEXT(",\"signal\":null"); }
-        CONTROL_TEXT("}}");
+        CONTROL_TEXT(kind == 3 ? "}}" : "}}");
     }
     CONTROL_TEXT(",\"reply_to\":");
-    if (!append_control_u64(control_output, sizeof(control_output), &used,
-                            terminal ? session->stop_request_id : session->hello_request_id)) return 0;
+    if (kind == 3 && !session->stop_request_id) CONTROL_TEXT("null");
+    else if (!append_control_u64(control_output, sizeof(control_output), &used,
+                                 kind == 3 ? session->stop_request_id : session->hello_request_id)) return 0;
     CONTROL_TEXT(",\"run_id\":\""); CONTROL_TEXT(lifecycle_binding.run_id);
     CONTROL_TEXT("\",\"schema\":\""); CONTROL_TEXT(LIFECYCLE_PROTOCOL);
-    CONTROL_TEXT("\",\"sequence\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, terminal ? 2 : 1)) return 0;
+    CONTROL_TEXT("\",\"sequence\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, sequence)) return 0;
     CONTROL_TEXT(",\"stage1_artifact_digest\":\""); CONTROL_TEXT(lifecycle_binding.stage1); CONTROL_TEXT("\"}");
 #undef CONTROL_TEXT
     {
@@ -1960,21 +2135,118 @@ static int send_control_message(struct lifecycle_session *session, int terminal,
         control_output[0] = (u8)(payload >> 24); control_output[1] = (u8)(payload >> 16);
         control_output[2] = (u8)(payload >> 8); control_output[3] = (u8)payload;
     }
-    return control_io_exact(session->fd, control_output, used, 1);
+    if (!session->connection_has_hello || !control_io_exact(session->fd, control_output, used, 1)) {
+        u64 now = monotonic_millis();
+        session->outbound_failed = 1;
+        session->outbound_deadline = now ? now + 5000 : 0;
+        return 0;
+    }
+    session->outbound_failed = 0;
+    session->outbound_deadline = 0;
+    return 1;
+}
+
+static int lifecycle_current_snapshot(struct lifecycle_session *session,
+                                      const struct supervisor_result *result) {
+    if (session->state == LIFECYCLE_READY) return send_control_message(session, 1, result) || !session->poisoned;
+    if (session->state == LIFECYCLE_STOPPING) return send_control_message(session, 2, result) || !session->poisoned;
+    if (session->state == LIFECYCLE_TERMINAL) return send_control_message(session, 4, result) || !session->poisoned;
+    return 1;
+}
+
+/* Pump every currently available complete frame.  Outbound loss commits the
+ * state/sequence attempt but is not an input boundary: only read(2)==0 may
+ * discard the current parser, HELLO, and nonce context. */
+static int lifecycle_pump(struct lifecycle_session *session,
+                          const struct supervisor_result *result, int *dispatch_stop) {
+    for (;;) {
+        usize size = 0;
+        int frame = read_control_frame(session, &size);
+        if (frame == -2) return 1;
+        if (frame == 0) {
+            if (session->outbound_failed && (!session->outbound_deadline ||
+                monotonic_millis() >= session->outbound_deadline)) {
+                session->poisoned = 1;
+                return 0;
+            }
+            return 1;
+        }
+        if (frame < 0) { session->poisoned = 1; return 0; }
+        if (session->outbound_failed) { session->poisoned = 1; return 0; }
+        if (!session->connection_has_hello) {
+            if (!parse_hello(session, size)) { session->poisoned = 1; return 0; }
+            if (!lifecycle_current_snapshot(session, result)) return 0;
+        } else {
+            int stop = parse_stop(session, size);
+            if (!stop) { session->poisoned = 1; return 0; }
+            if (stop == 1) *dispatch_stop = 1;
+            else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);
+        }
+    }
 }
 
 static int prepare_lifecycle(struct lifecycle_session *session) {
-    usize size;
+    usize size = 0;
+    u64 deadline;
     memset(session, 0, sizeof(*session)); session->fd = -1;
     session->fd = discover_lifecycle_channel();
-    if (session->fd < 0 || !generate_boot_generation(session->boot_generation) ||
-        !read_control_frame(session->fd, &size) || !parse_hello(session, size)) {
+    session->next_sequence = 1;
+    session->reconnect_backoff_ms = 10;
+    deadline = monotonic_millis() + 5000;
+    if (session->fd < 0 || !generate_boot_generation(session->boot_generation)) {
         session->poisoned = 1;
         if (session->fd >= 0) sc1(SYS_close, session->fd);
         session->fd = -1;
         return 0;
     }
-    return 1;
+    while (monotonic_millis() < deadline) {
+        int frame = read_control_frame(session, &size);
+        if (frame == 1) {
+            if (parse_hello(session, size)) return 1;
+            break;
+        }
+        if (frame == -1) break;
+        {
+            struct pollfd_local none;
+            int delay = (int)session->reconnect_backoff_ms;
+            none.fd = -1; none.events = 0; none.revents = 0;
+            sc3(SYS_poll, (i64)&none, 0, delay);
+            if (session->reconnect_backoff_ms < 100) {
+                session->reconnect_backoff_ms *= 2;
+                if (session->reconnect_backoff_ms > 100) session->reconnect_backoff_ms = 100;
+            }
+        }
+    }
+    session->poisoned = 1;
+    sc1(SYS_close, session->fd);
+    session->fd = -1;
+    return 0;
+}
+
+static __attribute__((noreturn)) void service_terminal_lifecycle(
+    struct lifecycle_session *session, const struct supervisor_result *result) {
+    for (;;) {
+        struct pollfd_local pollfd;
+        int dispatch_stop = 0;
+        int was_disconnected = session->connection == LIFECYCLE_DISCONNECTED;
+        pollfd.fd = session->fd; pollfd.events = POLLIN; pollfd.revents = 0;
+        if (was_disconnected) {
+            struct pollfd_local none;
+            none.fd = -1; none.events = 0; none.revents = 0;
+            sc3(SYS_poll, (i64)&none, 0, (int)session->reconnect_backoff_ms);
+        } else {
+            i64 n = sc3(SYS_poll, (i64)&pollfd, 1,
+                        lifecycle_poll_timeout(session, -1));
+            if (n < 0 && n != -EINTR) for (;;) sc0(SYS_pause);
+        }
+        if (!lifecycle_pump(session, result, &dispatch_stop) || dispatch_stop)
+            for (;;) sc0(SYS_pause);
+        if (was_disconnected && session->connection == LIFECYCLE_DISCONNECTED &&
+            session->reconnect_backoff_ms < 100) {
+            session->reconnect_backoff_ms *= 2;
+            if (session->reconnect_backoff_ms > 100) session->reconnect_backoff_ms = 100;
+        }
+    }
 }
 
 static int safe_dir(const char *path, int create, int require_empty, int expected_mode, int *kept_fd) {
@@ -2594,25 +2866,46 @@ static __attribute__((noreturn)) void child_fail(int fd, u32 stage, i64 error) {
 }
 
 static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_cgroup *cgroup,
-                              struct supervisor_result *result) {
+                              struct supervisor_result *result, struct lifecycle_session *lifecycle) {
     int status;
-    u32 grace_polls = 0;
-    struct pollfd_local pollfd;
+    int lifecycle_failed = 0;
+    u64 deadline = monotonic_millis() + 5000;
+    struct pollfd_local pollfds[2];
     struct signalfd_siginfo_local info;
     /* Allow children already handling the forwarded signal to report their
      * own terminal status before enforcing the bounded teardown policy. */
-    pollfd.fd = signal_fd;
-    pollfd.events = POLLIN;
-    while (grace_polls++ < 16) {
+    pollfds[0].fd = signal_fd; pollfds[0].events = POLLIN;
+    pollfds[1].fd = lifecycle ? lifecycle->fd : -1; pollfds[1].events = POLLIN;
+    while (monotonic_millis() < deadline) {
+        int dispatch_stop = 0;
         i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
         if (reaped > 0) { record_reaped_child(result, reaped, main_pid, status); continue; }
-        if (reaped == -ECHILD)
-            return kill_workload_cgroup(cgroup) && remove_empty_workload_cgroup(cgroup);
-        if (reaped < 0 && reaped != -EINTR) break;
-        pollfd.revents = 0;
-        if (sc3(SYS_poll, (i64)&pollfd, 1, 250) <= 0) break;
-        if (pollfd.revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
-        else break;
+        if (reaped == -ECHILD) {
+            int cleaned = kill_workload_cgroup(cgroup) && remove_empty_workload_cgroup(cgroup);
+            return cleaned ? (lifecycle_failed ? 2 : 1) : 0;
+        }
+        if (reaped < 0 && reaped != -EINTR) return 0;
+        pollfds[0].revents = 0; pollfds[1].revents = 0;
+        {
+            int count = lifecycle && lifecycle->state >= LIFECYCLE_READY &&
+                        lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1;
+            int timeout = lifecycle && lifecycle->state >= LIFECYCLE_READY &&
+                          lifecycle->connection == LIFECYCLE_DISCONNECTED
+                              ? (int)lifecycle->reconnect_backoff_ms : 100;
+            i64 polled = sc3(SYS_poll, (i64)pollfds, count, timeout);
+            if (polled < 0 && polled != -EINTR) return 0;
+        }
+        if (pollfds[0].revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
+        if (lifecycle && lifecycle->state >= LIFECYCLE_READY) {
+            int was_disconnected = lifecycle->connection == LIFECYCLE_DISCONNECTED;
+            if (!lifecycle_failed && !lifecycle_pump(lifecycle, result, &dispatch_stop))
+                lifecycle_failed = 1;
+            if (was_disconnected && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
+                lifecycle->reconnect_backoff_ms < 100) {
+                lifecycle->reconnect_backoff_ms *= 2;
+                if (lifecycle->reconnect_backoff_ms > 100) lifecycle->reconnect_backoff_ms = 100;
+            }
+        }
     }
     if (!kill_workload_cgroup(cgroup)) return 0;
     for (;;) {
@@ -2622,7 +2915,8 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_cgrou
         if (reaped == -ECHILD) break;
         return 0;
     }
-    return remove_empty_workload_cgroup(cgroup);
+    if (!remove_empty_workload_cgroup(cgroup)) return 0;
+    return lifecycle_failed ? 2 : 1;
 }
 
 static int supervise_workload(struct guest_process *process, struct child_error_local *failure,
@@ -2732,7 +3026,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (n != 0 || !move_pid_to_workload_cgroup(&cgroup, main_pid)) {
         set_workload_failure(failure, 16, n != 0 ? n : EIO);
         sc1(SYS_close, release_pipe[1]);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
         sc1(SYS_close, error_pipe[0]);
         if (!n) set_workload_failure(failure, 18, EIO);
         close_workload_cgroup(&cgroup);
@@ -2746,7 +3040,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     }
     if (sc1(SYS_close, release_pipe[1]) != 0 || n != 1) {
         set_workload_failure(failure, 17, n < 0 ? n : EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
         if (!n) set_workload_failure(failure, 18, EIO);
         sc1(SYS_close, error_pipe[0]);
         close_workload_cgroup(&cgroup);
@@ -2763,7 +3057,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (error_bytes != 0 || error_read < 0) {
         if (error_bytes != sizeof(*failure))
             set_workload_failure(failure, 12, error_read < 0 ? error_read : EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
         if (!n) set_workload_failure(failure, 18, EIO);
         close_workload_cgroup(&cgroup);
         sc1(SYS_close, signal_fd);
@@ -2771,20 +3065,15 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         return n ? 0 : -1;
     }
     write_all(1, WORKLOAD_STARTED_MARKER);
-    if (!send_control_message(lifecycle, 0, result)) {
-        set_workload_failure(failure, 22, EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
-        if (!n) set_workload_failure(failure, 18, EIO);
-        close_workload_cgroup(&cgroup);
-        sc1(SYS_close, signal_fd);
-        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
-        return n ? -2 : -1;
-    }
+    lifecycle->state = LIFECYCLE_READY;
+    (void)send_control_message(lifecycle, 0, result);
+    write_all(1, LIFECYCLE_READY_COMMITTED_MARKER);
     pollfds[0].fd = (int)signal_fd;
     pollfds[0].events = POLLIN;
     pollfds[1].fd = lifecycle->fd;
     pollfds[1].events = POLLIN;
     while (!main_done) {
+        int dispatch_stop = 0;
         for (;;) {
             i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
             if (reaped > 0) record_reaped_child(result, reaped, main_pid, status);
@@ -2797,35 +3086,42 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             if (reaped <= 0) break;
         }
         if (main_done) break;
-        pollfds[0].revents = 0;
-        pollfds[1].revents = 0;
-        n = sc3(SYS_poll, (i64)pollfds, 2, -1);
+        pollfds[0].revents = 0; pollfds[1].revents = 0;
+        n = sc3(SYS_poll, (i64)pollfds,
+                lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1,
+                lifecycle_poll_timeout(lifecycle, -1));
         if (n == -EINTR) continue;
         if (n < 0) {
             set_workload_failure(failure, 21, n);
-            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
             if (!n) set_workload_failure(failure, 18, EIO);
             close_workload_cgroup(&cgroup);
             sc1(SYS_close, signal_fd);
             sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
             return n ? -2 : -1;
         }
-        if (pollfds[1].revents & (POLLERR | POLLHUP)) {
-            set_workload_failure(failure, 21, EIO);
-            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
-            if (!n) set_workload_failure(failure, 18, EIO);
-            close_workload_cgroup(&cgroup);
-            sc1(SYS_close, signal_fd);
-            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
-            return n ? -2 : -1;
+        if (lifecycle->connection == LIFECYCLE_CONNECTED || n == 0) {
+            int was_disconnected = lifecycle->connection == LIFECYCLE_DISCONNECTED;
+            if (!lifecycle_pump(lifecycle, result, &dispatch_stop)) {
+                set_workload_failure(failure, 21, EIO);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
+                if (!n) set_workload_failure(failure, 18, EIO);
+                close_workload_cgroup(&cgroup);
+                sc1(SYS_close, signal_fd);
+                sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+                return n ? -2 : -1;
+            }
+            if (was_disconnected && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
+                lifecycle->reconnect_backoff_ms < 100) {
+                lifecycle->reconnect_backoff_ms *= 2;
+                if (lifecycle->reconnect_backoff_ms > 100) lifecycle->reconnect_backoff_ms = 100;
+            }
         }
-        if (pollfds[1].revents & POLLIN) {
-            usize frame_size = 0;
-            if (!read_control_frame(lifecycle->fd, &frame_size) || !parse_stop(lifecycle, frame_size) ||
-                sc2(SYS_kill, -main_pid, process->stop_signal) != 0) {
+        if (dispatch_stop) {
+            if (sc2(SYS_kill, -main_pid, process->stop_signal) != 0) {
                 lifecycle->poisoned = 1;
                 set_workload_failure(failure, 21, EIO);
-                n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
                 if (!n) set_workload_failure(failure, 18, EIO);
                 close_workload_cgroup(&cgroup);
                 sc1(SYS_close, signal_fd);
@@ -2833,6 +3129,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                 return n ? -2 : -1;
             }
             result->forwarded = process->stop_signal;
+            write_all(1, LIFECYCLE_STOP_DISPATCHED_MARKER);
         }
         if (pollfds[0].revents & POLLIN) {
             n = sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
@@ -2845,20 +3142,39 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         }
     }
     if (!lifecycle->stop_request_id) {
-        set_workload_failure(failure, 21, EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result);
-        if (!n) set_workload_failure(failure, 18, EIO);
-        close_workload_cgroup(&cgroup);
-        sc1(SYS_close, signal_fd);
-        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
-        return n ? -2 : -1;
+        /* The main workload won the natural-exit/late-STOP race.  Freeze that
+         * terminal cause before teardown and do not parse a STOP during the
+         * cleanup window; its terminal reply_to must remain null. */
+        lifecycle->state = LIFECYCLE_TERMINAL;
+        lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;
+        lifecycle->terminal_exit_code = result->main_exit_code;
+        lifecycle->terminal_signal = result->main_signal;
+        n = sc2(SYS_kill, -main_pid, process->stop_signal);
+        if (n != 0 && n != -ESRCH) {
+            set_workload_failure(failure, 21, EIO);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, 0);
+            if (!n) set_workload_failure(failure, 18, EIO);
+            close_workload_cgroup(&cgroup);
+            sc1(SYS_close, signal_fd);
+            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+            return n ? -2 : -1;
+        }
     }
-    if (!terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result)) {
+    n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result,
+                           lifecycle->stop_request_id ? lifecycle : 0);
+    if (!n) {
         set_workload_failure(failure, 18, EIO);
         close_workload_cgroup(&cgroup);
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
+    }
+    if (n == 2) {
+        set_workload_failure(failure, 21, EIO);
+        close_workload_cgroup(&cgroup);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return -2;
     }
     if (!verify_root_supervisor(result)) {
         set_workload_failure(failure, 19, EIO);
@@ -2867,13 +3183,12 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
     }
-    if (!send_control_message(lifecycle, 1, result)) {
-        set_workload_failure(failure, 22, EIO);
-        close_workload_cgroup(&cgroup);
-        sc1(SYS_close, signal_fd);
-        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
-        return -2;
+    if (lifecycle->stop_request_id) {
+        lifecycle->state = LIFECYCLE_TERMINAL;
+        lifecycle->terminal_exit_code = result->main_exit_code;
+        lifecycle->terminal_signal = result->main_signal;
     }
+    if (lifecycle->connection_has_hello) (void)send_control_message(lifecycle, 3, result);
     close_workload_cgroup(&cgroup);
     sc1(SYS_close, signal_fd);
     sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
@@ -2994,7 +3309,7 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
         for (;;) sc0(SYS_pause);
     }
     workload_terminal(&workload_result);
-    for (;;) sc0(SYS_pause);
+    service_terminal_lifecycle(&lifecycle, &workload_result);
 }
 
 __attribute__((naked, noreturn, visibility("default"))) void _start(void) {

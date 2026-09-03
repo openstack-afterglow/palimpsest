@@ -47,6 +47,7 @@ typedef unsigned long usize;
 #define DESCENDANT_SUCCESS 43
 #define FAILURE_BASE 100
 #define SIGNAL_ARMED_MARKER "palimpsest workload proof: signal handlers armed\n"
+#define STOP_OBSERVED_MARKER "palimpsest workload proof: stop observed\n"
 
 static inline i64 sc0(i64 n) {
     i64 r;
@@ -310,6 +311,7 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
         !wait_for_pid1_sigterm(main_signal_fd) ||
         sc1(SYS_close, main_signal_fd) != 0)
         exit_now(FAILURE_BASE + 9);
+    if (!write_all(1, STOP_OBSERVED_MARKER)) exit_now(FAILURE_BASE + 10);
     exit_now(MAIN_SUCCESS);
 }
 

@@ -22,6 +22,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -62,7 +63,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v12"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v13"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -75,6 +76,10 @@ DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
+WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
+LIFECYCLE_READY_COMMITTED_MARKER = b"palimpsest guest stage1: lifecycle ready committed"
+LIFECYCLE_STOP_DISPATCHED_MARKER = b"palimpsest guest stage1: lifecycle stop dispatched"
+LIFECYCLE_STOP_DUPLICATE_MARKER = b"palimpsest guest stage1: lifecycle stop duplicate accepted"
 WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
 WORKLOAD_TERMINAL_MARKER = (
     b"palimpsest guest stage1: workload terminal; main_status=42; cooperative_status=43; "
@@ -102,6 +107,26 @@ WORKLOAD_NEGATIVE_CONTROL_NAMES = (
     "workload_missing_executable",
     "workload_non_executable",
     "workload_missing_cwd",
+)
+LIFECYCLE_NEGATIVE_CONTROL_NAMES = (
+    "lifecycle_missing_port",
+    "lifecycle_wrong_name_only",
+    "hello_zero_length",
+    "hello_oversized_length",
+    "hello_duplicate_key_noncanonical",
+    "hello_wrong_domain_core_binding",
+    "hello_reused_nonce",
+    "stop_stale_generation",
+    "stop_request_id_collides_with_hello",
+    "second_distinct_stop",
+)
+LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES = LIFECYCLE_NEGATIVE_CONTROL_NAMES[:2]
+LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES = LIFECYCLE_NEGATIVE_CONTROL_NAMES[2:]
+LIFECYCLE_NEGATIVE_NONCE = "a" * 64
+LIFECYCLE_NEGATIVE_FRESH_NONCE = "b" * 64
+LIFECYCLE_WRONG_CHANNEL_NAME = "org.palimpsest.oci.lifecycle.wrong"
+QEMU_DUPLICATE_NAME_REJECTION_MARKER = (
+    b"virtio-serial-bus: A port already exists by name org.palimpsest.oci.lifecycle.0"
 )
 WORKLOAD_NEGATIVE_REJECTION_MARKERS = {
     "workload_missing_executable": WORKLOAD_REJECTION_PREFIX
@@ -159,6 +184,7 @@ KVM_PROOF_BOOT_COUNT = (
     + len(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
     + len(ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES)
     + len(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+    + len(LIFECYCLE_NEGATIVE_CONTROL_NAMES)
 )
 EVIDENCE_FILE_NAMES = (
     "console.bin",
@@ -169,6 +195,8 @@ EVIDENCE_FILE_NAMES = (
     *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
     *(f"root-transition-negative-{name}.bin" for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES),
     *(f"workload-negative-{name}.bin" for name in WORKLOAD_NEGATIVE_CONTROL_NAMES),
+    *(f"lifecycle-negative-{name}.bin" for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES),
+    "qemu-duplicate-lifecycle-name.bin",
 )
 _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_64BIT",
@@ -220,7 +248,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:dbca92880316d4a142480d28ddea00bb862f3fc61bed3182c2d26156d0f0493a"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:22994200aeb8559cdcb7eae9d4a47a813c4be6d82b32b82b0684ada8b81c695c"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -235,8 +263,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v7"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v7"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v8"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v8"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -252,10 +280,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "0adcb6bf3a77d6ee6e59fbb8083e7a995091c8f0f51b416830280cc2ba7fecc4",
-        "elf_size_bytes": 8952,
+        "elf_sha256": "d70514b6ea07ef566fb85503b1c858cf7292235434c6772b9c49ef7c69d8ac12",
+        "elf_size_bytes": 9044,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "d57abd8c6e27ac4ab740aa0956626695774fe825eb965c31db7ba3cccd66c6a3",
+        "source_sha256": "3276e256b16dc30d61d0c4a787b2e0a0ae9b669d493b0936bd97387043f60a00",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -872,9 +900,11 @@ def build_qemu_command(
     return command
 
 
-def _lifecycle_qemu_arguments(path: Path) -> tuple[str, ...]:
+def _lifecycle_qemu_arguments(path: Path, *, channel_name: str = OCI_CONTROL_CHANNEL_NAME) -> tuple[str, ...]:
     if not isinstance(path, Path) or not path.is_absolute() or "\0" in os.fspath(path):
         raise ArtifactValidationError("KVM lifecycle socket path is invalid")
+    if channel_name not in {OCI_CONTROL_CHANNEL_NAME, LIFECYCLE_WRONG_CHANNEL_NAME}:
+        raise ArtifactValidationError("KVM lifecycle channel name is invalid")
     return (
         "-object",
         "rng-random,id=palimpsest-rng,filename=/dev/urandom",
@@ -885,8 +915,20 @@ def _lifecycle_qemu_arguments(path: Path) -> tuple[str, ...]:
         "-device",
         "virtio-serial-pci,id=palimpsest-lifecycle-serial",
         "-device",
-        "virtserialport,bus=palimpsest-lifecycle-serial.0,nr=1,chardev=palimpsest-lifecycle,"
-        f"name={OCI_CONTROL_CHANNEL_NAME}",
+        f"virtserialport,bus=palimpsest-lifecycle-serial.0,nr=1,chardev=palimpsest-lifecycle,name={channel_name}",
+    )
+
+
+def _duplicate_lifecycle_qemu_arguments(first: Path, second: Path) -> tuple[str, ...]:
+    if first == second:
+        raise ArtifactValidationError("KVM duplicate lifecycle socket paths are invalid")
+    primary = _lifecycle_qemu_arguments(first)
+    return primary + (
+        "-chardev",
+        f"socket,id=palimpsest-lifecycle-duplicate,path={second},server=on,wait=off",
+        "-device",
+        "virtserialport,bus=palimpsest-lifecycle-serial.0,nr=2,"
+        f"chardev=palimpsest-lifecycle-duplicate,name={OCI_CONTROL_CHANNEL_NAME}",
     )
 
 
@@ -920,7 +962,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v7",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v8",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1560,6 +1602,180 @@ def verify_workload_negative_control_contract(name: str, value: Any) -> dict[str
     return expected
 
 
+def _base_lifecycle_control_artifacts() -> tuple[
+    OCIStage1Plan, BuiltOCIStage1Transport, list[dict[str, Any]], dict[str, dict[str, Any]]
+]:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    filesystems = load_proof_filesystems()
+    serial = transport_serial(transport.receipt.artifact_digest)
+    attachments = [
+        {
+            "backing": "lower0",
+            "drive_id": "lower0",
+            "ordinal": 0,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[0]["serial"],
+        },
+        {
+            "backing": "transport",
+            "drive_id": "stage1",
+            "ordinal": None,
+            "read_only": True,
+            "role": "transport",
+            "serial": serial,
+        },
+        {
+            "backing": "root",
+            "drive_id": "root",
+            "ordinal": None,
+            "read_only": False,
+            "role": "root",
+            "serial": plan.root["serial"],
+        },
+        {
+            "backing": "lower1",
+            "drive_id": "lower1",
+            "ordinal": 1,
+            "read_only": True,
+            "role": "lower",
+            "serial": plan.layers[1]["serial"],
+        },
+    ]
+    backings = {
+        "lower0": {
+            "artifact_digest": filesystems.lower_digests[0],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[0]),
+        },
+        "lower1": {
+            "artifact_digest": filesystems.lower_digests[1],
+            "mode": 0o400,
+            "size_bytes": len(filesystems.lowers[1]),
+        },
+        "root": {"artifact_digest": filesystems.root_digest, "mode": 0o600, "size_bytes": len(filesystems.root)},
+        "transport": {
+            "artifact_digest": transport.receipt.artifact_digest,
+            "mode": 0o400,
+            "size_bytes": transport.receipt.artifact_size_bytes,
+        },
+    }
+    return plan, transport, attachments, backings
+
+
+def _lifecycle_control_binding() -> OCIControlBinding:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    return OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+
+
+def _lifecycle_hello_frame(*, request_id: int = 1, nonce: str = LIFECYCLE_NEGATIVE_NONCE) -> bytes:
+    return encode_frame(OCIControlMessage("HELLO", _lifecycle_control_binding(), nonce, {}, request_id=request_id))
+
+
+def lifecycle_negative_control_contract(name: str) -> dict[str, Any]:
+    """Bind one native guest lifecycle discovery or canonical-wire rejection."""
+
+    if name not in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
+        raise ArtifactValidationError("KVM lifecycle control input is invalid")
+    plan, transport, attachments, backings = _base_lifecycle_control_artifacts()
+    phase = (
+        "pre-workload"
+        if name
+        in {
+            "lifecycle_missing_port",
+            "lifecycle_wrong_name_only",
+            "hello_zero_length",
+            "hello_oversized_length",
+            "hello_duplicate_key_noncanonical",
+            "hello_wrong_domain_core_binding",
+        }
+        else "post-workload"
+    )
+    hello = _lifecycle_hello_frame()
+    if name == "lifecycle_missing_port":
+        mutation: dict[str, Any] = {"channel_names": [], "operation": "omit-virtio-port"}
+    elif name == "lifecycle_wrong_name_only":
+        mutation = {"channel_names": [LIFECYCLE_WRONG_CHANNEL_NAME], "operation": "wrong-name-only"}
+    elif name == "hello_zero_length":
+        mutation = {"length_prefix_hex": "00000000", "operation": "raw-length-prefix"}
+    elif name == "hello_oversized_length":
+        mutation = {"length_prefix_hex": "0000fffd", "maximum_payload_bytes": 65532, "operation": "raw-length-prefix"}
+    elif name == "hello_duplicate_key_noncanonical":
+        mutation = {
+            "base_frame_digest": _digest(hello),
+            "duplicate_key": "domain_core_digest",
+            "operation": "insert-duplicate-sorted-key",
+        }
+    elif name == "hello_wrong_domain_core_binding":
+        mutation = {
+            "base_frame_digest": _digest(hello),
+            "field": "domain_core_digest",
+            "operation": "replace",
+            "value": "sha256:" + "f" * 64,
+        }
+    elif name == "hello_reused_nonce":
+        mutation = {
+            "base_frame_digest": _digest(hello),
+            "first_request_id": 1,
+            "operation": "reconnect-reuse-first-nonce",
+            "second_request_id": 2,
+        }
+    elif name == "stop_stale_generation":
+        mutation = {
+            "base": "canonical-stop-from-observed-ready",
+            "field": "boot_generation",
+            "operation": "replace",
+            "value": "00000000-0000-4000-8000-000000000000",
+        }
+    elif name == "stop_request_id_collides_with_hello":
+        mutation = {
+            "base": "canonical-stop-from-observed-ready",
+            "hello_request_id": 1,
+            "operation": "reuse-request-id",
+            "stop_request_id": 1,
+        }
+    else:
+        mutation = {
+            "base": "canonical-stop-from-observed-ready",
+            "first_request_id": 2,
+            "operation": "append-second-distinct-stop",
+            "second_request_id": 3,
+        }
+    contract: dict[str, Any] = {
+        "attachments": attachments,
+        "backings": backings,
+        "cmdline": build_kernel_cmdline(plan, transport),
+        "expected_errno": 5,
+        "expected_stage": 20 if phase == "pre-workload" else 21,
+        "immutable_backings": ["lower0", "lower1", "transport"],
+        "mutation": mutation,
+        "name": name,
+        "phase": phase,
+        "policy": "palimpsest.stage1-kvm-lifecycle-negative-control.v1",
+        "rejection_marker": f"{LIFECYCLE_REJECTION_PREFIX.decode('ascii')}{20 if phase == 'pre-workload' else 21}; errno=5; terminal disabled; waiting fail-closed",
+        "stage1_plan": plan.to_dict(),
+        "stage1_transport": {
+            **transport.receipt.to_dict(),
+            "serial": transport_serial(transport.receipt.artifact_digest),
+        },
+    }
+    contract["digest"] = _digest(canonical_json_bytes(contract))
+    return contract
+
+
+def lifecycle_negative_control_contracts() -> dict[str, dict[str, Any]]:
+    return {name: lifecycle_negative_control_contract(name) for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES}
+
+
+def verify_lifecycle_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
+    expected = lifecycle_negative_control_contract(name)
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ArtifactValidationError("KVM lifecycle negative control contract is invalid")
+    return expected
+
+
 def verify_filesystem_negative_control_contract(name: str, value: Any) -> dict[str, Any]:
     expected = filesystem_negative_control_contract(name)
     if not isinstance(value, Mapping) or dict(value) != expected:
@@ -1689,6 +1905,69 @@ def build_workload_negative_qemu_command(
     )
 
 
+def build_lifecycle_negative_qemu_command(
+    *,
+    qemu_path: Path,
+    kernel_path: Path,
+    initramfs_path: Path,
+    backing_paths: Mapping[str, Path],
+    cmdline: str,
+    control: Mapping[str, Any],
+    lifecycle_socket_path: Path | None,
+) -> tuple[str, ...]:
+    name = control.get("name") if isinstance(control, Mapping) else None
+    contract = verify_lifecycle_negative_control_contract(name, control)
+    if cmdline != contract["cmdline"]:
+        raise ArtifactValidationError("KVM lifecycle control cmdline is invalid")
+    if name == "lifecycle_missing_port":
+        if lifecycle_socket_path is not None:
+            raise ArtifactValidationError("KVM missing lifecycle port control has a socket")
+        return _build_control_qemu_command(
+            qemu_path=qemu_path,
+            kernel_path=kernel_path,
+            initramfs_path=initramfs_path,
+            backing_paths=backing_paths,
+            cmdline=cmdline,
+            contract=contract,
+        )
+    if lifecycle_socket_path is None:
+        raise ArtifactValidationError("KVM lifecycle control socket is missing")
+    command = _build_control_qemu_command(
+        qemu_path=qemu_path,
+        kernel_path=kernel_path,
+        initramfs_path=initramfs_path,
+        backing_paths=backing_paths,
+        cmdline=cmdline,
+        contract=contract,
+    )
+    return command + _lifecycle_qemu_arguments(
+        lifecycle_socket_path,
+        channel_name=LIFECYCLE_WRONG_CHANNEL_NAME if name == "lifecycle_wrong_name_only" else OCI_CONTROL_CHANNEL_NAME,
+    )
+
+
+def build_duplicate_lifecycle_name_qemu_command(
+    *,
+    qemu_path: Path,
+    kernel_path: Path,
+    initramfs_path: Path,
+    backing_paths: Mapping[str, Path],
+    cmdline: str,
+    first_socket_path: Path,
+    second_socket_path: Path,
+) -> tuple[str, ...]:
+    contract = lifecycle_negative_control_contract("lifecycle_missing_port")
+    command = _build_control_qemu_command(
+        qemu_path=qemu_path,
+        kernel_path=kernel_path,
+        initramfs_path=initramfs_path,
+        backing_paths=backing_paths,
+        cmdline=cmdline,
+        contract=contract,
+    )
+    return command + _duplicate_lifecycle_qemu_arguments(first_socket_path, second_socket_path)
+
+
 def _build_control_qemu_command(
     *,
     qemu_path: Path,
@@ -1757,13 +2036,20 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         "binding",
         "boots",
         "broker_contract",
+        "channel_discovery_negative_controls",
         "channel_name",
+        "connection_limit",
+        "natural_terminal_proven",
         "nonce_semantics",
         "negative_input_proven",
+        "peer_identity",
         "protocol",
+        "qemu_duplicate_name_rejected",
         "reconnect_proven",
+        "session_profile",
         "single_connection_proven",
         "transport",
+        "wire_negative_controls",
     }:
         return False
     if (
@@ -1781,13 +2067,131 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         or value.get("protocol") != OCI_CONTROL_PROTOCOL
         or value.get("transport") != "qemu-private-unix-socket-to-virtio-serial"
         or value.get("nonce_semantics") != "correlation-and-replay-challenge-not-peer-authentication"
-        or value.get("negative_input_proven") is not False
+        or value.get("negative_input_proven") is not True
+        or value.get("natural_terminal_proven") is not False
+        or value.get("peer_identity") != "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1"
         or value.get("single_connection_proven") is not True
-        or value.get("reconnect_proven") is not False
+        or value.get("reconnect_proven") is not True
+        or value.get("session_profile") != "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1"
+        or value.get("connection_limit") != 16
     ):
         return False
     boots = value.get("boots")
-    expected = (
+    discovery_controls = value.get("channel_discovery_negative_controls")
+    wire_controls = value.get("wire_negative_controls")
+    qemu_duplicate = value.get("qemu_duplicate_name_rejected")
+    if (
+        not isinstance(discovery_controls, Mapping)
+        or set(discovery_controls) != set(LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES)
+        or not isinstance(wire_controls, Mapping)
+        or set(wire_controls) != set(LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES)
+    ):
+        return False
+    for controls, names, wire in (
+        (discovery_controls, LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES, False),
+        (wire_controls, LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES, True),
+    ):
+        for name in names:
+            item = controls.get(name)
+            expected_fields = {
+                "console_digest",
+                "console_size_bytes",
+                "contract",
+                "immutable_backings_verified",
+                "lifecycle_rejection_marker_count",
+                "pid1_alive_after_marker",
+                "root_post_digest",
+                "root_seed_digest",
+                "success_marker_count",
+                "terminal_marker_count",
+                "wire_input",
+            }
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != expected_fields
+                or item.get("contract") != lifecycle_negative_control_contract(name)
+                or item.get("immutable_backings_verified") is not True
+                or item.get("lifecycle_rejection_marker_count") != 1
+                or item.get("pid1_alive_after_marker") is not True
+                or item.get("success_marker_count") != 0
+                or item.get("terminal_marker_count") != 0
+                or not isinstance(item.get("console_digest"), str)
+                or _DIGEST_RE.fullmatch(item["console_digest"]) is None
+                or type(item.get("console_size_bytes")) is not int
+                or not 1 <= item["console_size_bytes"] <= MAX_CONSOLE_BYTES
+                or not isinstance(item.get("root_seed_digest"), str)
+                or _DIGEST_RE.fullmatch(item["root_seed_digest"]) is None
+                or item["root_seed_digest"] != item["contract"]["backings"]["root"]["artifact_digest"]
+                or not isinstance(item.get("root_post_digest"), str)
+                or _DIGEST_RE.fullmatch(item["root_post_digest"]) is None
+            ):
+                return False
+            wire_input = item.get("wire_input")
+            if not wire and wire_input is not None:
+                return False
+            if wire and (
+                not isinstance(wire_input, Mapping)
+                or set(wire_input) != {"boot_generation", "bytes_written", "digest", "size_bytes"}
+                or type(wire_input.get("bytes_written")) is not int
+                or wire_input.get("bytes_written") != wire_input.get("size_bytes")
+                or type(wire_input.get("size_bytes")) is not int
+                or not 4 <= wire_input["size_bytes"] <= 2 * (65536 + 4)
+                or not isinstance(wire_input.get("digest"), str)
+                or _DIGEST_RE.fullmatch(wire_input["digest"]) is None
+            ):
+                return False
+            if wire:
+                generation = wire_input["boot_generation"]
+                if name.startswith("stop_") or name == "second_distinct_stop":
+                    try:
+                        parsed = uuid.UUID(generation)
+                    except (AttributeError, TypeError, ValueError):
+                        return False
+                    if str(parsed) != generation or parsed.version != 4:
+                        return False
+                elif generation is not None:
+                    return False
+                expected_input = _lifecycle_negative_wire_bytes(
+                    name,
+                    OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest),
+                    boot_generation=generation,
+                )
+                if wire_input != {
+                    "boot_generation": generation,
+                    "bytes_written": len(expected_input),
+                    "digest": _digest(expected_input),
+                    "size_bytes": len(expected_input),
+                }:
+                    return False
+    if (
+        not isinstance(qemu_duplicate, Mapping)
+        or set(qemu_duplicate)
+        != {
+            "exit_code",
+            "guest_boot_started",
+            "invocation_count",
+            "nonzero_exit",
+            "output_digest",
+            "output_size_bytes",
+            "rejection_marker",
+            "rejection_marker_count",
+            "stage1_marker_count",
+        }
+        or type(qemu_duplicate.get("exit_code")) is not int
+        or qemu_duplicate["exit_code"] <= 0
+        or qemu_duplicate.get("guest_boot_started") is not False
+        or qemu_duplicate.get("invocation_count") != 1
+        or qemu_duplicate.get("nonzero_exit") is not True
+        or not isinstance(qemu_duplicate.get("output_digest"), str)
+        or _DIGEST_RE.fullmatch(qemu_duplicate["output_digest"]) is None
+        or type(qemu_duplicate.get("output_size_bytes")) is not int
+        or not 1 <= qemu_duplicate["output_size_bytes"] <= MAX_QEMU_VERSION_BYTES
+        or qemu_duplicate.get("rejection_marker") != QEMU_DUPLICATE_NAME_REJECTION_MARKER.decode("ascii")
+        or qemu_duplicate.get("rejection_marker_count") != 1
+        or qemu_duplicate.get("stage1_marker_count") != 0
+    ):
+        return False
+    normal_expected = (
         ("host-to-guest", "HELLO"),
         ("guest-to-host", "READY"),
         ("host-to-guest", "STOP"),
@@ -1797,11 +2201,17 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         return False
     generations: list[str] = []
     nonces: list[str] = []
-    for boot in boots:
+    for boot_index, boot in enumerate(boots):
         if not isinstance(boot, Mapping) or set(boot) != {
+            "connection_count",
             "frames",
+            "initial_ready_host_observed",
+            "logical_attempts",
             "pid1_alive_after_terminal",
+            "profile",
             "ready",
+            "reopen_count",
+            "stop_signal_dispatch_count",
             "terminal",
         }:
             return False
@@ -1809,17 +2219,54 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
             boot.get("pid1_alive_after_terminal") is not True
             or boot.get("ready") is not True
             or boot.get("terminal") != {"exit_code": 42, "signal": None}
+            or boot.get("reopen_count") != 0
+            or boot.get("stop_signal_dispatch_count") != 1
         ):
             return False
         frames = boot.get("frames")
-        if not isinstance(frames, list) or len(frames) != len(expected):
+        if not isinstance(frames, list):
             return False
-        for frame, (direction, kind) in zip(frames, expected, strict=True):
+        if boot_index == 0:
+            expected = tuple((1, direction, kind) for direction, kind in normal_expected)
+            if (
+                boot.get("profile") != "single-connection"
+                or boot.get("connection_count") != 1
+                or boot.get("initial_ready_host_observed") is not True
+                or boot.get("logical_attempts") != []
+            ):
+                return False
+        else:
+            expected = (
+                (1, "host-to-guest", "HELLO"),
+                (2, "host-to-guest", "HELLO"),
+                (2, "guest-to-host", "SNAPSHOT"),
+                (3, "host-to-guest", "HELLO"),
+                (3, "guest-to-host", "SNAPSHOT"),
+                (4, "host-to-guest", "HELLO"),
+                (4, "guest-to-host", "SNAPSHOT"),
+                (4, "host-to-guest", "STOP"),
+                (4, "host-to-guest", "STOP"),
+                (5, "host-to-guest", "HELLO"),
+                (5, "guest-to-host", "SNAPSHOT"),
+                (5, "guest-to-host", "TERMINAL"),
+                (6, "host-to-guest", "HELLO"),
+                (6, "guest-to-host", "SNAPSHOT"),
+            )
+            if (
+                boot.get("profile") != "six-connection-partial-retry-committed-dedupe-composite"
+                or boot.get("connection_count") != 6
+                or boot.get("initial_ready_host_observed") is not False
+            ):
+                return False
+        if len(frames) != len(expected):
+            return False
+        for frame, (connection, direction, kind) in zip(frames, expected, strict=True):
             if (
                 not isinstance(frame, Mapping)
                 or set(frame)
                 != {
                     "boot_generation",
+                    "connection",
                     "digest",
                     "direction",
                     "host_nonce",
@@ -1829,6 +2276,7 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                     "sequence",
                     "size_bytes",
                 }
+                or frame.get("connection") != connection
                 or frame.get("direction") != direction
                 or frame.get("kind") != kind
                 or not isinstance(frame.get("digest"), str)
@@ -1837,9 +2285,9 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                 or not 5 <= frame["size_bytes"] <= 64 * 1024
             ):
                 return False
-        hello, ready, stop, terminal = frames
+        hello = frames[0]
         nonce = hello["host_nonce"]
-        generation = ready["boot_generation"]
+        generation = frames[1 if boot_index == 0 else 2]["boot_generation"]
         try:
             parsed_generation = uuid.UUID(generation)
         except (AttributeError, TypeError, ValueError):
@@ -1847,25 +2295,22 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         if (
             not isinstance(nonce, str)
             or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
-            or any(frame["host_nonce"] != nonce for frame in frames)
             or str(parsed_generation) != generation
             or parsed_generation.version != 4
-            or hello["boot_generation"] is not None
-            or hello["request_id"] != 1
-            or hello["reply_to"] is not None
-            or hello["sequence"] is not None
-            or ready["request_id"] is not None
-            or ready["reply_to"] != 1
-            or ready["sequence"] != 1
-            or stop["boot_generation"] != generation
-            or stop["request_id"] != 2
-            or stop["reply_to"] is not None
-            or stop["sequence"] is not None
-            or terminal["boot_generation"] != generation
-            or terminal["request_id"] is not None
-            or terminal["reply_to"] != 2
-            or terminal["sequence"] != 2
         ):
+            return False
+        by_connection: dict[int, str] = {}
+        for frame in frames:
+            connection = frame["connection"]
+            frame_nonce = frame["host_nonce"]
+            if not isinstance(frame_nonce, str) or re.fullmatch(r"[0-9a-f]{64}", frame_nonce) is None:
+                return False
+            if connection in by_connection and by_connection[connection] != frame_nonce:
+                return False
+            by_connection[connection] = frame_nonce
+            if frame["kind"] != "HELLO" and frame["boot_generation"] != generation:
+                return False
+        if len(set(by_connection.values())) != boot["connection_count"]:
             return False
         try:
             binding = OCIControlBinding(
@@ -1873,41 +2318,35 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                 domain_core_digest=plan.domain_core_digest,
                 stage1_artifact_digest=transport.receipt.artifact_digest,
             )
-            expected_messages = (
-                OCIControlMessage(
-                    kind="HELLO",
-                    binding=binding,
-                    host_nonce=nonce,
-                    payload={},
-                    request_id=hello["request_id"],
-                ),
-                OCIControlMessage(
-                    kind="READY",
-                    binding=binding,
-                    host_nonce=nonce,
-                    payload={},
-                    boot_generation=generation,
-                    reply_to=ready["reply_to"],
-                    sequence=ready["sequence"],
-                ),
-                OCIControlMessage(
-                    kind="STOP",
-                    binding=binding,
-                    host_nonce=nonce,
-                    payload={"signal": 15},
-                    boot_generation=generation,
-                    request_id=stop["request_id"],
-                ),
-                OCIControlMessage(
-                    kind="TERMINAL",
-                    binding=binding,
-                    host_nonce=nonce,
-                    payload={"terminal": {"exit_code": 42, "signal": None}},
-                    boot_generation=generation,
-                    reply_to=terminal["reply_to"],
-                    sequence=terminal["sequence"],
-                ),
-            )
+            expected_messages = []
+            for index, frame in enumerate(frames):
+                kind = frame["kind"]
+                payload: dict[str, Any]
+                if kind in {"HELLO", "READY"}:
+                    payload = {}
+                elif kind == "STOP":
+                    payload = {"signal": 15}
+                elif kind == "TERMINAL":
+                    payload = {"terminal": {"exit_code": 42, "signal": None}}
+                else:
+                    state = "ready" if index in {2, 4, 6} else "stopping" if index == 10 else "terminal"
+                    payload = {
+                        "state": state,
+                        "stop_request_id": 4 if state in {"stopping", "terminal"} else None,
+                        "terminal": {"exit_code": 42, "signal": None} if state == "terminal" else None,
+                    }
+                expected_messages.append(
+                    OCIControlMessage(
+                        kind=kind,
+                        binding=binding,
+                        host_nonce=frame["host_nonce"],
+                        payload=payload,
+                        request_id=frame["request_id"],
+                        sequence=frame["sequence"],
+                        boot_generation=frame["boot_generation"],
+                        reply_to=frame["reply_to"],
+                    )
+                )
             encoded_frames = tuple(encode_frame(message) for message in expected_messages)
         except OCIControlProtocolError:
             return False
@@ -1917,15 +2356,129 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         ):
             return False
         generations.append(generation)
-        nonces.append(nonce)
-    return len(set(generations)) == 2 and len(set(nonces)) == 2
+        nonces.extend(by_connection.values())
+        if boot_index == 0:
+            if (
+                [frame["request_id"] for frame in frames] != [1, None, 2, None]
+                or [frame["sequence"] for frame in frames] != [None, 1, None, 2]
+                or [frame["reply_to"] for frame in frames] != [None, 1, None, 2]
+            ):
+                return False
+        else:
+            if [frame["request_id"] for frame in frames] != [
+                1,
+                2,
+                None,
+                3,
+                None,
+                5,
+                None,
+                4,
+                4,
+                6,
+                None,
+                None,
+                7,
+                None,
+            ]:
+                return False
+            if [frame["sequence"] for frame in frames] != [
+                None,
+                None,
+                2,
+                None,
+                3,
+                None,
+                4,
+                None,
+                None,
+                None,
+                5,
+                6,
+                None,
+                7,
+            ]:
+                return False
+            if [frame["reply_to"] for frame in frames] != [
+                None,
+                None,
+                2,
+                None,
+                3,
+                None,
+                5,
+                None,
+                None,
+                None,
+                6,
+                4,
+                None,
+                7,
+            ]:
+                return False
+            attempts = boot["logical_attempts"]
+            if not isinstance(attempts, list) or len(attempts) != 1:
+                return False
+            attempt = attempts[0]
+            if not isinstance(attempt, Mapping) or set(attempt) != {
+                "bytes_sent",
+                "connection",
+                "digest",
+                "frame_size_bytes",
+                "kind",
+                "request_id",
+            }:
+                return False
+            partial = OCIControlMessage(
+                kind="STOP",
+                binding=binding,
+                host_nonce=by_connection[3],
+                payload={"signal": 15},
+                request_id=4,
+                boot_generation=generation,
+            )
+            encoded = encode_frame(partial)
+            if attempt != {
+                "bytes_sent": len(encoded) - 1,
+                "connection": 3,
+                "digest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+                "frame_size_bytes": len(encoded),
+                "kind": "STOP",
+                "request_id": 4,
+            }:
+                return False
+    return len(set(generations)) == 2 and len(set(nonces)) == 7
 
 
 def _lifecycle_receipt(
     binding: OCIControlBinding,
     first: list[dict[str, Any]],
     retained: list[dict[str, Any]],
+    retained_attempts: list[dict[str, Any]],
+    negative_consoles: Mapping[str, bytes],
+    negative_root_post_digests: Mapping[str, str],
+    negative_inputs: Mapping[str, Mapping[str, Any]],
+    duplicate_name_output: bytes,
+    duplicate_name_exit_code: int,
+    first_console: bytes,
+    retained_console: bytes,
 ) -> dict[str, Any]:
+    def negative_item(name: str) -> dict[str, Any]:
+        contract = lifecycle_negative_control_contract(name)
+        return {
+            "console_digest": _digest(negative_consoles[name]),
+            "console_size_bytes": len(negative_consoles[name]),
+            "contract": contract,
+            "immutable_backings_verified": True,
+            "lifecycle_rejection_marker_count": 1,
+            "pid1_alive_after_marker": True,
+            "root_post_digest": negative_root_post_digests[name],
+            "root_seed_digest": contract["backings"]["root"]["artifact_digest"],
+            "success_marker_count": 0,
+            "terminal_marker_count": 0,
+            "wire_input": dict(negative_inputs[name]) if name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES else None,
+        }
+
     return {
         "binding": {
             "domain_core_digest": binding.domain_core_digest,
@@ -1934,21 +2487,57 @@ def _lifecycle_receipt(
         },
         "boots": [
             {
-                "frames": frames,
+                "connection_count": 1,
+                "frames": first,
+                "initial_ready_host_observed": True,
+                "logical_attempts": [],
                 "pid1_alive_after_terminal": True,
+                "profile": "single-connection",
                 "ready": True,
+                "reopen_count": 0,
+                "stop_signal_dispatch_count": _logical_line_count(first_console, LIFECYCLE_STOP_DISPATCHED_MARKER),
                 "terminal": {"exit_code": 42, "signal": None},
-            }
-            for frames in (first, retained)
+            },
+            {
+                "connection_count": 6,
+                "frames": retained,
+                "initial_ready_host_observed": False,
+                "logical_attempts": retained_attempts,
+                "pid1_alive_after_terminal": True,
+                "profile": "six-connection-partial-retry-committed-dedupe-composite",
+                "ready": True,
+                "reopen_count": 0,
+                "stop_signal_dispatch_count": _logical_line_count(retained_console, LIFECYCLE_STOP_DISPATCHED_MARKER),
+                "terminal": {"exit_code": 42, "signal": None},
+            },
         ],
         "broker_contract": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+        "channel_discovery_negative_controls": {
+            name: negative_item(name) for name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
+        },
         "channel_name": OCI_CONTROL_CHANNEL_NAME,
         "nonce_semantics": "correlation-and-replay-challenge-not-peer-authentication",
-        "negative_input_proven": False,
+        "connection_limit": 16,
+        "natural_terminal_proven": False,
+        "negative_input_proven": True,
+        "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
         "protocol": OCI_CONTROL_PROTOCOL,
-        "reconnect_proven": False,
+        "qemu_duplicate_name_rejected": {
+            "exit_code": duplicate_name_exit_code,
+            "guest_boot_started": False,
+            "invocation_count": 1,
+            "nonzero_exit": True,
+            "output_digest": _digest(duplicate_name_output),
+            "output_size_bytes": len(duplicate_name_output),
+            "rejection_marker": QEMU_DUPLICATE_NAME_REJECTION_MARKER.decode("ascii"),
+            "rejection_marker_count": duplicate_name_output.count(QEMU_DUPLICATE_NAME_REJECTION_MARKER),
+            "stage1_marker_count": duplicate_name_output.count(b"palimpsest guest stage1:"),
+        },
+        "reconnect_proven": True,
+        "session_profile": "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
+        "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
     }
 
 
@@ -1980,6 +2569,9 @@ class OCIStage1KVMProofReceipt:
     root_transition_negative_root_post_digests: Mapping[str, str]
     workload_negative_consoles: Mapping[str, bytes]
     workload_negative_root_post_digests: Mapping[str, str]
+    lifecycle_negative_consoles: Mapping[str, bytes]
+    lifecycle_negative_root_post_digests: Mapping[str, str]
+    qemu_duplicate_name_output: bytes
     lifecycle: Mapping[str, Any]
 
     def __post_init__(self) -> None:
@@ -2035,11 +2627,14 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
             or not _logical_lines_in_order(
                 self.console,
                 ROOT_TRANSITION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
+                LIFECYCLE_STOP_DISPATCHED_MARKER,
                 SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.console, WORKLOAD_REJECTION_PREFIX) != 0
@@ -2057,11 +2652,15 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.retained_console, ROOT_TRANSITION_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 1
             or not _logical_lines_in_order(
                 self.retained_console,
                 ROOT_TRANSITION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
+                LIFECYCLE_STOP_DISPATCHED_MARKER,
+                LIFECYCLE_STOP_DUPLICATE_MARKER,
                 SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
@@ -2191,8 +2790,67 @@ class OCIStage1KVMProofReceipt:
                 not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
                 for value in self.workload_negative_root_post_digests.values()
             )
+            or not isinstance(self.lifecycle_negative_consoles, Mapping)
+            or set(self.lifecycle_negative_consoles) != set(LIFECYCLE_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(self.lifecycle_negative_consoles[name], bytes)
+                or not 1 <= len(self.lifecycle_negative_consoles[name]) <= MAX_CONSOLE_BYTES
+                or _logical_line_count(self.lifecycle_negative_consoles[name], ROOT_TRANSITION_MARKER) != 1
+                or _logical_line_count(
+                    self.lifecycle_negative_consoles[name],
+                    lifecycle_negative_control_contract(name)["rejection_marker"].encode("ascii"),
+                )
+                != 1
+                or _logical_prefix_count(self.lifecycle_negative_consoles[name], LIFECYCLE_REJECTION_PREFIX) != 1
+                or _logical_prefix_count(self.lifecycle_negative_consoles[name], WORKLOAD_TERMINAL_PREFIX) != 0
+                or _logical_line_count(self.lifecycle_negative_consoles[name], SUCCESS_MARKER) != 0
+                or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DISPATCHED_MARKER)
+                != (1 if name == "second_distinct_stop" else 0)
+                or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
+                or _logical_line_count(self.lifecycle_negative_consoles[name], WORKLOAD_STARTED_MARKER)
+                != (1 if lifecycle_negative_control_contract(name)["phase"] == "post-workload" else 0)
+                or not _logical_lines_in_order(
+                    self.lifecycle_negative_consoles[name],
+                    ROOT_TRANSITION_MARKER,
+                    *(
+                        (WORKLOAD_STARTED_MARKER, LIFECYCLE_STOP_DISPATCHED_MARKER)
+                        if name == "second_distinct_stop"
+                        else (WORKLOAD_STARTED_MARKER,)
+                        if lifecycle_negative_control_contract(name)["phase"] == "post-workload"
+                        else ()
+                    ),
+                    lifecycle_negative_control_contract(name)["rejection_marker"].encode("ascii"),
+                )
+                for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES
+            )
+            or not isinstance(self.lifecycle_negative_root_post_digests, Mapping)
+            or set(self.lifecycle_negative_root_post_digests) != set(LIFECYCLE_NEGATIVE_CONTROL_NAMES)
+            or any(
+                not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
+                for value in self.lifecycle_negative_root_post_digests.values()
+            )
+            or not isinstance(self.qemu_duplicate_name_output, bytes)
+            or not 1 <= len(self.qemu_duplicate_name_output) <= MAX_QEMU_VERSION_BYTES
+            or self.qemu_duplicate_name_output.count(QEMU_DUPLICATE_NAME_REJECTION_MARKER) != 1
+            or b"palimpsest guest stage1:" in self.qemu_duplicate_name_output
             or not _valid_lifecycle_receipt(self.lifecycle, expected_plan, expected_transport)
         ):
+            raise ArtifactValidationError("KVM proof receipt value is invalid")
+        lifecycle_controls = {
+            **self.lifecycle["channel_discovery_negative_controls"],
+            **self.lifecycle["wire_negative_controls"],
+        }
+        if any(
+            lifecycle_controls[name]["console_digest"] != _digest(self.lifecycle_negative_consoles[name])
+            or lifecycle_controls[name]["console_size_bytes"] != len(self.lifecycle_negative_consoles[name])
+            or lifecycle_controls[name]["root_post_digest"] != self.lifecycle_negative_root_post_digests[name]
+            for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES
+        ):
+            raise ArtifactValidationError("KVM proof receipt value is invalid")
+        duplicate = self.lifecycle["qemu_duplicate_name_rejected"]
+        if duplicate["output_digest"] != _digest(self.qemu_duplicate_name_output) or duplicate[
+            "output_size_bytes"
+        ] != len(self.qemu_duplicate_name_output):
             raise ArtifactValidationError("KVM proof receipt value is invalid")
 
     def to_dict(self) -> dict[str, Any]:
@@ -2249,6 +2907,7 @@ class OCIStage1KVMProofReceipt:
                 for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES
             },
             "executed_boots": KVM_PROOF_BOOT_COUNT,
+            "qemu_invocations": KVM_PROOF_BOOT_COUNT + 1,
             "assembly_negative_controls": {
                 name: {
                     "contract": assembly_negative_control_contract(name),
@@ -2389,6 +3048,9 @@ class OCIStage1KVMProofReceipt:
         root_transition_negative_root_post_digests: Mapping[str, str],
         workload_negative_consoles: Mapping[str, bytes],
         workload_negative_root_post_digests: Mapping[str, str],
+        lifecycle_negative_consoles: Mapping[str, bytes],
+        lifecycle_negative_root_post_digests: Mapping[str, str],
+        qemu_duplicate_name_output: bytes,
     ) -> OCIStage1KVMProofReceipt:
         if not isinstance(value, Mapping) or set(value) != {
             "assembly_negative_controls",
@@ -2413,6 +3075,7 @@ class OCIStage1KVMProofReceipt:
             "pivot_root",
             "qualification",
             "qemu",
+            "qemu_invocations",
             "retained_console",
             "root_assembly",
             "root_is_slash",
@@ -2449,6 +3112,7 @@ class OCIStage1KVMProofReceipt:
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
             or value.get("executed_boots") != KVM_PROOF_BOOT_COUNT
+            or value.get("qemu_invocations") != KVM_PROOF_BOOT_COUNT + 1
             or value.get("root_assembly") is not True
             or value.get("root_is_slash") is not True
             or value.get("pivot_root") is not False
@@ -2666,6 +3330,9 @@ class OCIStage1KVMProofReceipt:
             root_transition_negative_root_post_digests,
             workload_negative_consoles,
             workload_negative_root_post_digests,
+            lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output,
             lifecycle,
         )
         if receipt.to_dict() != dict(value):
@@ -2683,6 +3350,8 @@ class OCIStage1KVMProofResult:
     assembly_negative_consoles: Mapping[str, bytes]
     root_transition_negative_consoles: Mapping[str, bytes]
     workload_negative_consoles: Mapping[str, bytes]
+    lifecycle_negative_consoles: Mapping[str, bytes]
+    qemu_duplicate_name_output: bytes
     evidence_directory: Path | None
 
 
@@ -2727,6 +3396,61 @@ def verify_evidence_directory(path: Path) -> Path:
     return path
 
 
+def _lifecycle_negative_wire_bytes(
+    name: str,
+    binding: OCIControlBinding,
+    *,
+    boot_generation: str | None = None,
+) -> bytes:
+    if name not in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+        raise ArtifactValidationError("KVM lifecycle wire mutation name is invalid")
+    hello = encode_frame(OCIControlMessage("HELLO", binding, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=1))
+    if name == "hello_zero_length":
+        return b"\0\0\0\0"
+    if name == "hello_oversized_length":
+        return struct.pack(">I", 65533)
+    if name == "hello_duplicate_key_noncanonical":
+        payload = hello[4:]
+        domain = f'"domain_core_digest":"{binding.domain_core_digest}"'.encode("ascii")
+        needle = domain + b',"host_nonce"'
+        mutated = payload.replace(needle, domain + b"," + needle, 1)
+        if mutated == payload:
+            raise KVMProofFailure("KVM lifecycle duplicate-key mutation failed")
+        return struct.pack(">I", len(mutated)) + mutated
+    if name == "hello_wrong_domain_core_binding":
+        wrong = OCIControlBinding(binding.run_id, "sha256:" + "f" * 64, binding.stage1_artifact_digest)
+        return encode_frame(OCIControlMessage("HELLO", wrong, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=1))
+    if name == "hello_reused_nonce":
+        return encode_frame(OCIControlMessage("HELLO", binding, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=2))
+    if boot_generation is None:
+        raise ArtifactValidationError("KVM lifecycle STOP mutation has no boot generation")
+    request_id = 1 if name == "stop_request_id_collides_with_hello" else 2
+    first = encode_frame(
+        OCIControlMessage(
+            "STOP",
+            binding,
+            LIFECYCLE_NEGATIVE_NONCE,
+            {"signal": 15},
+            request_id=request_id,
+            boot_generation=(
+                "00000000-0000-4000-8000-000000000000" if name == "stop_stale_generation" else boot_generation
+            ),
+        )
+    )
+    if name != "second_distinct_stop":
+        return first
+    return encode_frame(
+        OCIControlMessage(
+            "STOP",
+            binding,
+            LIFECYCLE_NEGATIVE_NONCE,
+            {"signal": 15},
+            request_id=3,
+            boot_generation=boot_generation,
+        )
+    )
+
+
 def _read_console_until(
     command: tuple[str, ...],
     *,
@@ -2738,6 +3462,10 @@ def _read_console_until(
     lifecycle_binding: OCIControlBinding | None = None,
     lifecycle_success: bool | None = None,
     lifecycle_transcript: list[dict[str, Any]] | None = None,
+    lifecycle_scenario: str = "normal",
+    lifecycle_attempts: list[dict[str, Any]] | None = None,
+    lifecycle_negative_name: str | None = None,
+    lifecycle_negative_input: dict[str, Any] | None = None,
 ) -> bytes:
     if (lifecycle_socket_path is None) != (lifecycle_binding is None) or (
         lifecycle_binding is None and lifecycle_success is not None
@@ -2763,18 +3491,36 @@ def _read_console_until(
     deadline = time.monotonic() + timeout_seconds
     marker_seen_at: float | None = None
     channel: socket.socket | None = None
+    if lifecycle_scenario not in {"normal", "composite", "negative"}:
+        raise ArtifactValidationError("KVM lifecycle scenario is invalid")
+    if (lifecycle_scenario == "negative") != (lifecycle_negative_name is not None):
+        raise ArtifactValidationError("KVM lifecycle negative scenario is invalid")
+    if lifecycle_negative_name is not None and lifecycle_negative_name not in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+        raise ArtifactValidationError("KVM lifecycle negative scenario name is invalid")
     channel_finished = False
     channel_connected = False
     channel_pending = bytearray()
+    pending_frame: bytes | None = None
+    pending_message: OCIControlMessage | None = None
+    pending_full_frame = True
+    pending_negative_input = False
     decoder = OCIControlFrameDecoder()
     session = HostOCIControlSession(lifecycle_binding) if lifecycle_binding is not None else None
     lifecycle_ready = False
+    connection_ordinal = 0
+    socket_identity: tuple[int, int, int, int] | None = None
+    composite_stage = "connect-1" if lifecycle_scenario == "composite" else "normal"
+    composite_done = False
+    negative_input_written = False
+    negative_reconnect_pending = False
+    committed_stop: OCIControlMessage | None = None
 
     def record_frame(direction: str, frame: bytes, message: Any) -> None:
         if lifecycle_transcript is not None:
             lifecycle_transcript.append(
                 {
                     "boot_generation": message.boot_generation,
+                    "connection": connection_ordinal,
                     "digest": f"sha256:{hashlib.sha256(frame).hexdigest()}",
                     "direction": direction,
                     "host_nonce": message.host_nonce,
@@ -2786,14 +3532,68 @@ def _read_console_until(
                 }
             )
 
-    def queue_message(message: Any) -> None:
+    def queue_message(message: OCIControlMessage, *, complete: bool = True) -> None:
+        nonlocal pending_frame, pending_message, pending_full_frame
         if channel_pending:
             raise KVMProofFailure("KVM lifecycle host write overlapped")
         frame = encode_frame(message)
-        channel_pending.extend(frame)
-        record_frame("host-to-guest", frame, message)
+        channel_pending.extend(frame if complete else frame[:-1])
+        pending_frame = frame
+        pending_message = message
+        pending_full_frame = complete
         if channel is not None:
             selector.modify(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
+
+    def queue_raw(frame: bytes, *, negative_input: bool = False) -> None:
+        nonlocal pending_frame, pending_message, pending_full_frame, pending_negative_input
+        if channel_pending or not isinstance(frame, bytes) or not frame:
+            raise KVMProofFailure("KVM lifecycle raw write is invalid")
+        channel_pending.extend(frame)
+        pending_frame = frame
+        pending_message = None
+        pending_full_frame = True
+        pending_negative_input = negative_input
+        if channel is not None:
+            selector.modify(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
+
+    def close_channel() -> None:
+        nonlocal channel, channel_connected, decoder
+        if channel is None:
+            return
+        try:
+            selector.unregister(channel)
+        except (KeyError, OSError):
+            pass
+        try:
+            channel.close()
+        except OSError:
+            pass
+        channel = None
+        channel_connected = False
+        decoder = OCIControlFrameDecoder()
+
+    def verify_connected_peer() -> None:
+        if channel is None or lifecycle_socket_path is None or socket_identity is None:
+            raise KVMProofFailure("KVM lifecycle connected peer state is invalid")
+        try:
+            metadata = lifecycle_socket_path.lstat()
+        except OSError:
+            raise KVMProofFailure("KVM lifecycle socket vanished after connect") from None
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid, stat.S_IFMT(metadata.st_mode))
+        if identity != socket_identity:
+            raise KVMProofFailure("KVM lifecycle socket identity changed during connect")
+        if platform.system() == "Linux":
+            peercred = getattr(socket, "SO_PEERCRED", None)
+            if peercred is None:
+                raise KVMProofFailure("KVM lifecycle SO_PEERCRED is unavailable")
+            try:
+                peer_pid, peer_uid, _peer_gid = struct.unpack(
+                    "3i", channel.getsockopt(socket.SOL_SOCKET, peercred, struct.calcsize("3i"))
+                )
+            except (OSError, struct.error):
+                raise KVMProofFailure("KVM lifecycle peer credentials are unavailable") from None
+            if peer_pid != process.pid or peer_uid != os.getuid():
+                raise KVMProofFailure("KVM lifecycle peer credentials do not identify QEMU")
 
     try:
         while True:
@@ -2810,18 +3610,52 @@ def _read_console_until(
                     metadata = lifecycle_socket_path.lstat()
                 except OSError:
                     raise KVMProofFailure("KVM lifecycle socket metadata is unavailable") from None
+                identity = (metadata.st_dev, metadata.st_ino, metadata.st_uid, stat.S_IFMT(metadata.st_mode))
                 if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
                     raise KVMProofFailure("KVM lifecycle socket identity is invalid")
+                if socket_identity is None:
+                    socket_identity = identity
+                elif identity != socket_identity:
+                    raise KVMProofFailure("KVM lifecycle socket identity changed across reconnect")
                 channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 channel.setblocking(False)
                 result = channel.connect_ex(os.fspath(lifecycle_socket_path))
                 if result not in {0, errno.EINPROGRESS, errno.EAGAIN, errno.EWOULDBLOCK}:
                     raise KVMProofFailure("KVM lifecycle socket connection failed")
                 channel_connected = result == 0
+                connection_ordinal += 1
                 selector.register(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
                 if channel_connected:
+                    verify_connected_peer()
                     assert session is not None
-                    queue_message(session.hello())
+                    if lifecycle_scenario == "negative":
+                        assert lifecycle_negative_name is not None
+                        if connection_ordinal == 1:
+                            if (
+                                lifecycle_negative_name.startswith("hello_")
+                                and lifecycle_negative_name != "hello_reused_nonce"
+                            ):
+                                if lifecycle_negative_input is not None:
+                                    lifecycle_negative_input["boot_generation"] = None
+                                queue_raw(
+                                    _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
+                                    negative_input=True,
+                                )
+                            else:
+                                queue_raw(
+                                    _lifecycle_hello_frame(
+                                        request_id=1
+                                    )
+                                )
+                        else:
+                            if lifecycle_negative_input is not None:
+                                lifecycle_negative_input["boot_generation"] = None
+                            queue_raw(
+                                _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
+                                negative_input=True,
+                            )
+                    else:
+                        queue_message(session.hello(reconnect=connection_ordinal > 1))
             events = selector.select(min(0.1, deadline - now))
             for key, mask in events:
                 if key.data == "console":
@@ -2840,7 +3674,35 @@ def _read_console_until(
                         if channel.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
                             raise KVMProofFailure("KVM lifecycle socket connection failed")
                         channel_connected = True
-                        queue_message(session.hello())
+                        verify_connected_peer()
+                        if lifecycle_scenario == "negative":
+                            assert lifecycle_negative_name is not None
+                            if connection_ordinal == 1:
+                                if (
+                                    lifecycle_negative_name.startswith("hello_")
+                                    and lifecycle_negative_name != "hello_reused_nonce"
+                                ):
+                                    if lifecycle_negative_input is not None:
+                                        lifecycle_negative_input["boot_generation"] = None
+                                    queue_raw(
+                                        _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
+                                        negative_input=True,
+                                    )
+                                else:
+                                    queue_raw(
+                                        _lifecycle_hello_frame(
+                                            request_id=1
+                                        )
+                                    )
+                            else:
+                                if lifecycle_negative_input is not None:
+                                    lifecycle_negative_input["boot_generation"] = None
+                                queue_raw(
+                                    _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
+                                    negative_input=True,
+                                )
+                        else:
+                            queue_message(session.hello(reconnect=connection_ordinal > 1))
                     if channel_pending:
                         try:
                             sent = channel.send(channel_pending)
@@ -2849,18 +3711,66 @@ def _read_console_until(
                         if sent > 0:
                             del channel_pending[:sent]
                         if not channel_pending:
-                            selector.modify(channel, selectors.EVENT_READ, "channel")
+                            assert pending_frame is not None
+                            if pending_full_frame:
+                                if pending_message is not None:
+                                    record_frame("host-to-guest", pending_frame, pending_message)
+                                elif lifecycle_scenario == "negative" and pending_negative_input:
+                                    negative_input_written = True
+                                    if lifecycle_negative_input is not None:
+                                        lifecycle_negative_input.update(
+                                            {
+                                                "bytes_written": len(pending_frame),
+                                                "digest": _digest(pending_frame),
+                                                "size_bytes": len(pending_frame),
+                                            }
+                                        )
+                            else:
+                                if lifecycle_attempts is not None:
+                                    lifecycle_attempts.append(
+                                        {
+                                            "bytes_sent": len(pending_frame) - 1,
+                                            "connection": connection_ordinal,
+                                            "digest": f"sha256:{hashlib.sha256(pending_frame).hexdigest()}",
+                                            "frame_size_bytes": len(pending_frame),
+                                            "kind": pending_message.kind,
+                                            "request_id": pending_message.request_id,
+                                        }
+                                    )
+                                pending_frame = None
+                                pending_message = None
+                                close_channel()
+                                composite_stage = "connect-4"
+                                continue
+                            pending_frame = None
+                            pending_message = None
+                            pending_negative_input = False
+                            if lifecycle_scenario == "composite" and connection_ordinal == 1:
+                                selector.unregister(channel)
+                                # Do not consume a coalesced fast READY from this same
+                                # readiness event; connection one deliberately loses it.
+                                mask &= ~selectors.EVENT_READ
+                            elif lifecycle_scenario == "composite" and composite_stage == "duplicate-stop-4":
+                                selector.unregister(channel)
+                                mask &= ~selectors.EVENT_READ
+                            else:
+                                selector.modify(channel, selectors.EVENT_READ, "channel")
                 if mask & selectors.EVENT_READ:
                     try:
                         chunk = channel.recv(65536)
                     except BlockingIOError:
                         chunk = None
                     if chunk == b"":
-                        decoder.finish()
+                        try:
+                            decoder.finish()
+                        except OCIControlProtocolError:
+                            raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
+                        if lifecycle_scenario == "negative" and negative_input_written:
+                            close_channel()
+                            channel_finished = True
+                            continue
                         if lifecycle_success is False and session.state == "hello-sent":
-                            selector.unregister(channel)
-                            channel.close()
-                            channel = None
+                            close_channel()
                             channel_finished = True
                             continue
                         raise KVMProofFailure("KVM lifecycle channel closed before proof completion")
@@ -2870,30 +3780,158 @@ def _read_console_until(
                             for message in messages:
                                 frame = encode_frame(message)
                                 record_frame("guest-to-host", frame, message)
-                                session.accept(message)
+                                if lifecycle_scenario == "negative":
+                                    if (
+                                        message.kind != "READY"
+                                        or message.binding != lifecycle_binding
+                                        or message.host_nonce != LIFECYCLE_NEGATIVE_NONCE
+                                        or message.reply_to != 1
+                                        or message.sequence != 1
+                                    ):
+                                        raise KVMProofFailure("KVM lifecycle negative setup READY is invalid")
+                                else:
+                                    session.accept(message)
                                 if message.kind == "READY":
                                     if lifecycle_success is not True:
                                         raise KVMProofFailure("workload-negative boot emitted lifecycle READY")
                                     lifecycle_ready = True
+                                    if lifecycle_scenario == "negative":
+                                        assert lifecycle_negative_name is not None
+                                        if lifecycle_negative_name == "hello_reused_nonce":
+                                            negative_reconnect_pending = True
+                                        else:
+                                            if lifecycle_negative_input is not None:
+                                                lifecycle_negative_input["boot_generation"] = message.boot_generation
+                                            if lifecycle_negative_name == "second_distinct_stop":
+                                                queue_raw(
+                                                    encode_frame(
+                                                        OCIControlMessage(
+                                                            "STOP",
+                                                            lifecycle_binding,
+                                                            LIFECYCLE_NEGATIVE_NONCE,
+                                                            {"signal": 15},
+                                                            request_id=2,
+                                                            boot_generation=message.boot_generation,
+                                                        )
+                                                    )
+                                                )
+                                                composite_stage = "negative-await-stop-dispatched"
+                                            else:
+                                                queue_raw(
+                                                    _lifecycle_negative_wire_bytes(
+                                                        lifecycle_negative_name,
+                                                        lifecycle_binding,
+                                                        boot_generation=message.boot_generation,
+                                                    ),
+                                                    negative_input=True,
+                                                )
                                 elif message.kind == "TERMINAL":
                                     if lifecycle_success is not True or message.payload != {
                                         "terminal": {"exit_code": 42, "signal": None}
                                     }:
                                         raise KVMProofFailure("KVM lifecycle terminal status is invalid")
+                                if lifecycle_scenario == "composite" and message.kind == "SNAPSHOT":
+                                    state = message.payload["state"]
+                                    if connection_ordinal == 2 and state == "ready":
+                                        close_channel()
+                                        composite_stage = "connect-3"
+                                    elif connection_ordinal == 3 and state == "ready":
+                                        stop = session.stop()
+                                        queue_message(stop, complete=False)
+                                        composite_stage = "partial-stop-4"
+                                    elif connection_ordinal == 4 and state == "ready":
+                                        committed_stop = session.stop()
+                                        queue_message(committed_stop)
+                                        composite_stage = "await-stop-dispatched-4"
+                                    elif connection_ordinal == 5 and state == "stopping":
+                                        composite_stage = "await-terminal"
+                                    elif connection_ordinal == 6 and state == "terminal":
+                                        composite_done = True
                         except OCIControlProtocolError:
                             raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
             current = bytes(console)
             armed_count = _logical_line_count(current, WORKLOAD_SIGNAL_ARMED_MARKER)
             if armed_count > 1:
                 raise KVMProofFailure("workload signal synchronization marker was emitted more than once")
-            if lifecycle_ready and armed_count == 1 and session is not None and session.state == "ready":
+            ready_committed = _logical_line_count(current, LIFECYCLE_READY_COMMITTED_MARKER)
+            stop_dispatched = _logical_line_count(current, LIFECYCLE_STOP_DISPATCHED_MARKER)
+            stop_duplicate = _logical_line_count(current, LIFECYCLE_STOP_DUPLICATE_MARKER)
+            if lifecycle_scenario == "negative" and negative_reconnect_pending and ready_committed == 1:
+                close_channel()
+                negative_reconnect_pending = False
+            if lifecycle_scenario == "composite" and connection_ordinal == 1 and ready_committed == 1:
+                if channel_pending:
+                    raise KVMProofFailure("initial lifecycle HELLO was not fully written")
+                close_channel()
+                composite_stage = "connect-2"
+            if lifecycle_scenario == "composite" and stop_dispatched > 1:
+                raise KVMProofFailure("lifecycle STOP was dispatched more than once")
+            if lifecycle_scenario == "composite" and stop_duplicate > 1:
+                raise KVMProofFailure("lifecycle duplicate STOP was accepted more than once")
+            if (
+                lifecycle_scenario == "negative"
+                and lifecycle_negative_name == "second_distinct_stop"
+                and composite_stage == "negative-await-stop-dispatched"
+                and stop_dispatched == 1
+            ):
+                assert lifecycle_binding is not None and lifecycle_negative_input is not None
+                observed_generation = lifecycle_negative_input.get("boot_generation")
+                if not isinstance(observed_generation, str):
+                    raise KVMProofFailure("KVM lifecycle negative boot generation was not observed")
+                queue_raw(
+                    _lifecycle_negative_wire_bytes(
+                        lifecycle_negative_name,
+                        lifecycle_binding,
+                        boot_generation=observed_generation,
+                    ),
+                    negative_input=True,
+                )
+                composite_stage = "negative-second-stop-written"
+            if (
+                lifecycle_scenario == "composite"
+                and connection_ordinal == 4
+                and composite_stage == "await-stop-dispatched-4"
+                and stop_dispatched == 1
+            ):
+                if channel_pending:
+                    raise KVMProofFailure("retransmitted lifecycle STOP was not fully written")
+                assert committed_stop is not None
+                queue_message(committed_stop)
+                composite_stage = "duplicate-stop-4"
+            if (
+                lifecycle_scenario == "composite"
+                and connection_ordinal == 4
+                and composite_stage == "duplicate-stop-4"
+                and stop_duplicate == 1
+            ):
+                if channel_pending:
+                    raise KVMProofFailure("duplicate lifecycle STOP was not fully written")
+                close_channel()
+                composite_stage = "connect-5"
+            if (
+                lifecycle_scenario == "composite"
+                and connection_ordinal == 5
+                and session is not None
+                and session.state == "terminal"
+            ):
+                close_channel()
+                composite_stage = "connect-6"
+            if (
+                lifecycle_scenario == "normal"
+                and lifecycle_ready
+                and armed_count == 1
+                and session is not None
+                and session.state == "ready"
+            ):
                 queue_message(session.stop())
             if any(_logical_line_count(current, marker) for marker in forbidden):
                 raise KVMProofFailure("QEMU emitted a forbidden stage-1 marker")
             if _logical_prefix_count(current, WORKLOAD_CLEANUP_REJECTION_PREFIX):
                 raise KVMProofFailure("QEMU emitted a workload cleanup rejection marker")
-            if _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX):
+            if lifecycle_scenario != "negative" and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX):
                 raise KVMProofFailure("QEMU emitted a lifecycle rejection marker")
+            if lifecycle_scenario == "negative" and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX) > 1:
+                raise KVMProofFailure("QEMU emitted lifecycle rejection more than once")
             terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
             successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
             if terminal_count > successful_terminal_count:
@@ -2912,6 +3950,10 @@ def _read_console_until(
                 or (lifecycle_success is True and session.state == "terminal")
                 or (lifecycle_success is False and session.state == "hello-sent")
             )
+            if lifecycle_scenario == "composite":
+                lifecycle_complete = composite_done and connection_ordinal == 6
+            elif lifecycle_scenario == "negative":
+                lifecycle_complete = negative_input_written
             if (
                 marker_seen_at is not None
                 and lifecycle_complete
@@ -2930,10 +3972,10 @@ def _read_console_until(
                         break
                     console.extend(chunk)
                 raise KVMProofFailure(f"QEMU exited before the proof marker ({process.returncode})")
+    except OSError:
+        raise KVMProofFailure("KVM lifecycle or console I/O failed") from None
     finally:
-        if channel is not None:
-            selector.unregister(channel)
-            channel.close()
+        close_channel()
         selector.close()
         if process.poll() is None:
             try:
@@ -2949,6 +3991,30 @@ def _read_console_until(
                     pass
                 process.wait(timeout=5)
         process.stdout.close()
+
+
+def _read_qemu_duplicate_name_rejection(command: tuple[str, ...]) -> tuple[bytes, int]:
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise KVMProofFailure("QEMU duplicate lifecycle name control failed") from None
+    output = completed.stdout
+    if (
+        completed.returncode <= 0
+        or not isinstance(output, bytes)
+        or not 1 <= len(output) <= MAX_QEMU_VERSION_BYTES
+        or output.count(QEMU_DUPLICATE_NAME_REJECTION_MARKER) != 1
+        or b"palimpsest guest stage1:" in output
+    ):
+        raise KVMProofFailure("QEMU did not reject duplicate lifecycle names before guest boot")
+    return output, completed.returncode
 
 
 def _temp_root() -> tempfile.TemporaryDirectory[str]:
@@ -3251,6 +4317,63 @@ def _verify_workload_negative_backings(
     return root_digest
 
 
+def _materialize_lifecycle_negative_backings(
+    directory: Path,
+    contracts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Path]]:
+    filesystems = load_proof_filesystems()
+    _plan, transport, _attachments, _backings = _base_lifecycle_control_artifacts()
+    payloads = {
+        "transport": transport.artifact,
+        "root": filesystems.root,
+        "lower0": filesystems.lowers[0],
+        "lower1": filesystems.lowers[1],
+    }
+    result: dict[str, dict[str, Path]] = {}
+    for control_name in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
+        contract = verify_lifecycle_negative_control_contract(control_name, contracts.get(control_name))
+        paths: dict[str, Path] = {}
+        for backing_name, backing in contract["backings"].items():
+            payload = payloads[backing_name]
+            if len(payload) != backing["size_bytes"] or _digest(payload) != backing["artifact_digest"]:
+                raise KVMProofFailure("KVM lifecycle negative backing contract is invalid")
+            paths[backing_name] = _secure_write(
+                directory,
+                f"lifecycle-negative-{control_name}-{backing_name}.raw",
+                payload,
+                mode=backing["mode"],
+            )
+        result[control_name] = paths
+    return result
+
+
+def _verify_lifecycle_negative_backings(
+    control_name: str,
+    paths: Mapping[str, Path],
+    contract: Mapping[str, Any],
+    *,
+    after_boot: bool = False,
+) -> str:
+    verified = verify_lifecycle_negative_control_contract(control_name, contract)
+    if set(paths) != set(verified["backings"]):
+        raise KVMProofFailure("KVM lifecycle negative backing set changed")
+    root_digest = verified["backings"]["root"]["artifact_digest"]
+    for backing_name, backing in verified["backings"].items():
+        path = paths[backing_name]
+        if backing_name == "root" and after_boot:
+            opened = _read_pinned_regular_file(
+                path, maximum=MAX_KERNEL_BYTES, label="KVM lifecycle control mutable root"
+            )
+            if stat.S_IMODE(path.stat().st_mode) != backing["mode"]:
+                raise KVMProofFailure("KVM lifecycle control root mode changed")
+            root_digest = opened.digest
+        else:
+            _verify_file_digest(path, backing["artifact_digest"], backing["mode"])
+        if path.stat().st_size != backing["size_bytes"]:
+            raise KVMProofFailure("KVM lifecycle negative backing size changed")
+    return root_digest
+
+
 def _verify_pinned_boot_files(
     *,
     qemu_path: Path,
@@ -3357,6 +4480,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         )
         workload_contracts = workload_negative_control_contracts()
         workload_negative_backings = _materialize_workload_negative_backings(root, workload_contracts)
+        lifecycle_contracts = lifecycle_negative_control_contracts()
+        lifecycle_negative_backings = _materialize_lifecycle_negative_backings(root, lifecycle_contracts)
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
             qemu=qemu,
@@ -3426,6 +4551,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             lifecycle_socket_path=second_lifecycle_socket,
         )
         retained_lifecycle_transcript: list[dict[str, Any]] = []
+        retained_lifecycle_attempts: list[dict[str, Any]] = []
         retained_console = _read_console_until(
             retained_command,
             expected=SUCCESS_MARKER,
@@ -3443,6 +4569,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             lifecycle_binding=lifecycle_binding,
             lifecycle_success=True,
             lifecycle_transcript=retained_lifecycle_transcript,
+            lifecycle_scenario="composite",
+            lifecycle_attempts=retained_lifecycle_attempts,
         )
         _verify_pinned_boot_files(
             qemu_path=qemu_path,
@@ -3691,6 +4819,119 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             workload_negative_root_post_digests[control_name] = _verify_workload_negative_backings(
                 control_name, backing_paths, contract, after_boot=True
             )
+        lifecycle_negative_consoles: dict[str, bytes] = {}
+        lifecycle_negative_root_post_digests: dict[str, str] = {}
+        lifecycle_negative_inputs: dict[str, dict[str, Any]] = {}
+        for control_name in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
+            contract = lifecycle_contracts[control_name]
+            backing_paths = lifecycle_negative_backings[control_name]
+            socket_path = None if control_name == "lifecycle_missing_port" else root / f"lifecycle-{control_name}.sock"
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            _verify_lifecycle_negative_backings(control_name, backing_paths, contract)
+            control_command = build_lifecycle_negative_qemu_command(
+                qemu_path=qemu_path,
+                kernel_path=kernel_path,
+                initramfs_path=initramfs_path,
+                backing_paths=backing_paths,
+                cmdline=contract["cmdline"],
+                control=contract,
+                lifecycle_socket_path=socket_path,
+            )
+            exact_rejection = contract["rejection_marker"].encode("ascii")
+            forbidden = (
+                SUCCESS_MARKER,
+                WORKLOAD_TERMINAL_MARKER,
+                REJECTION_MARKER,
+                FILESYSTEM_REJECTION_MARKER,
+                ASSEMBLY_REJECTION_MARKER,
+                ROOT_TRANSITION_REJECTION_MARKER,
+                PREPARATION_FAILURE_MARKER,
+            )
+            wire_input: dict[str, Any] = {}
+            if control_name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+                assert socket_path is not None
+                lifecycle_negative_consoles[control_name] = _read_console_until(
+                    control_command,
+                    expected=exact_rejection,
+                    forbidden=forbidden,
+                    timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+                    require_alive_after_marker=True,
+                    lifecycle_socket_path=socket_path,
+                    lifecycle_binding=lifecycle_binding,
+                    lifecycle_success=True,
+                    lifecycle_scenario="negative",
+                    lifecycle_negative_name=control_name,
+                    lifecycle_negative_input=wire_input,
+                )
+                lifecycle_negative_inputs[control_name] = wire_input
+            else:
+                lifecycle_negative_consoles[control_name] = _read_console_until(
+                    control_command,
+                    expected=exact_rejection,
+                    forbidden=forbidden,
+                    timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+                    require_alive_after_marker=True,
+                )
+            _verify_pinned_boot_files(
+                qemu_path=qemu_path,
+                qemu=qemu,
+                kernel_path=kernel_path,
+                kernel=kernel,
+                initramfs_path=initramfs_path,
+                initramfs_digest=initramfs.manifest.artifact_digest,
+            )
+            lifecycle_negative_root_post_digests[control_name] = _verify_lifecycle_negative_backings(
+                control_name, backing_paths, contract, after_boot=True
+            )
+
+        duplicate_contract = lifecycle_contracts["lifecycle_missing_port"]
+        duplicate_payloads = {
+            "transport": transport.artifact,
+            "root": load_proof_filesystems().root,
+            "lower0": load_proof_filesystems().lowers[0],
+            "lower1": load_proof_filesystems().lowers[1],
+        }
+        duplicate_backings = {
+            name: _secure_write(root, f"duplicate-name-{name}.raw", duplicate_payloads[name], mode=backing["mode"])
+            for name, backing in duplicate_contract["backings"].items()
+        }
+        _verify_lifecycle_negative_backings(
+            "lifecycle_missing_port",
+            duplicate_backings,
+            duplicate_contract,
+        )
+        duplicate_command = build_duplicate_lifecycle_name_qemu_command(
+            qemu_path=qemu_path,
+            kernel_path=kernel_path,
+            initramfs_path=initramfs_path,
+            backing_paths=duplicate_backings,
+            cmdline=cmdline,
+            first_socket_path=root / "lifecycle-duplicate-first.sock",
+            second_socket_path=root / "lifecycle-duplicate-second.sock",
+        )
+        qemu_duplicate_name_output, qemu_duplicate_name_exit_code = _read_qemu_duplicate_name_rejection(
+            duplicate_command
+        )
+        _verify_pinned_boot_files(
+            qemu_path=qemu_path,
+            qemu=qemu,
+            kernel_path=kernel_path,
+            kernel=kernel,
+            initramfs_path=initramfs_path,
+            initramfs_digest=initramfs.manifest.artifact_digest,
+        )
+        _verify_lifecycle_negative_backings(
+            "lifecycle_missing_port",
+            duplicate_backings,
+            duplicate_contract,
+        )
 
     receipt = OCIStage1KVMProofReceipt(
         kernel.digest,
@@ -3719,7 +4960,22 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         root_transition_negative_root_post_digests,
         workload_negative_consoles,
         workload_negative_root_post_digests,
-        _lifecycle_receipt(lifecycle_binding, lifecycle_transcript, retained_lifecycle_transcript),
+        lifecycle_negative_consoles,
+        lifecycle_negative_root_post_digests,
+        qemu_duplicate_name_output,
+        _lifecycle_receipt(
+            lifecycle_binding,
+            lifecycle_transcript,
+            retained_lifecycle_transcript,
+            retained_lifecycle_attempts,
+            lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests,
+            lifecycle_negative_inputs,
+            qemu_duplicate_name_output,
+            qemu_duplicate_name_exit_code,
+            console,
+            retained_console,
+        ),
     )
     if evidence is not None:
         _secure_write(evidence, "console.bin", console, mode=0o400)
@@ -3759,6 +5015,14 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 workload_negative_consoles[control_name],
                 mode=0o400,
             )
+        for control_name in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
+            _secure_write(
+                evidence,
+                f"lifecycle-negative-{control_name}.bin",
+                lifecycle_negative_consoles[control_name],
+                mode=0o400,
+            )
+        _secure_write(evidence, "qemu-duplicate-lifecycle-name.bin", qemu_duplicate_name_output, mode=0o400)
         _secure_write(evidence, "receipt.json", receipt.canonical_bytes, mode=0o400)
     return OCIStage1KVMProofResult(
         receipt,
@@ -3769,5 +5033,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         assembly_negative_consoles,
         root_transition_negative_consoles,
         workload_negative_consoles,
+        lifecycle_negative_consoles,
+        qemu_duplicate_name_output,
         evidence,
     )

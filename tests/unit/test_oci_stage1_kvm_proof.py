@@ -21,9 +21,16 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     EVIDENCE_FILE_NAMES,
     FILESYSTEM_NEGATIVE_CONTROL_NAMES,
     FILESYSTEM_REJECTION_MARKER,
+    LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES,
+    LIFECYCLE_NEGATIVE_CONTROL_NAMES,
+    LIFECYCLE_READY_COMMITTED_MARKER,
     LIFECYCLE_REJECTION_PREFIX,
+    LIFECYCLE_STOP_DISPATCHED_MARKER,
+    LIFECYCLE_STOP_DUPLICATE_MARKER,
+    LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES,
     NEGATIVE_CONTROL_NAMES,
     PREPARATION_FAILURE_MARKER,
+    QEMU_DUPLICATE_NAME_REJECTION_MARKER,
     REJECTION_MARKER,
     ROOT_TRANSITION_MARKER,
     ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
@@ -34,10 +41,12 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     WORKLOAD_NEGATIVE_REJECTION_MARKERS,
     WORKLOAD_SIGNAL_ARMED_MARKER,
     WORKLOAD_STARTED_MARKER,
+    WORKLOAD_STOP_OBSERVED_MARKER,
     WORKLOAD_TERMINAL_PREFIX,
     KVMProofFailure,
     KVMProofUnavailable,
     OCIStage1KVMProofReceipt,
+    _lifecycle_negative_wire_bytes,
     _logical_line_count,
     _read_console_until,
     _secure_write,
@@ -53,6 +62,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     build_root_transition_negative_qemu_command,
     build_workload_negative_qemu_command,
     filesystem_negative_control_contract,
+    lifecycle_negative_control_contract,
     negative_control_contract,
     pre_mount_topology,
     root_transition_negative_control_contract,
@@ -95,8 +105,8 @@ def _root_transition_negative_consoles() -> dict[str, bytes]:
     }
 
 
-def _positive_console() -> bytes:
-    return (
+def _positive_console(*, retained: bool = False) -> bytes:
+    payload = (
         b"kernel boot\r\n"
         + ROOT_TRANSITION_MARKER
         + b"\r\n"
@@ -104,9 +114,12 @@ def _positive_console() -> bytes:
         + b"\r\n"
         + WORKLOAD_SIGNAL_ARMED_MARKER
         + b"\r\n"
-        + SUCCESS_MARKER
+        + LIFECYCLE_STOP_DISPATCHED_MARKER
         + b"\r\n"
     )
+    if retained:
+        payload += LIFECYCLE_STOP_DUPLICATE_MARKER + b"\r\n"
+    return payload + SUCCESS_MARKER + b"\r\n"
 
 
 def _workload_negative_consoles() -> dict[str, bytes]:
@@ -116,51 +129,54 @@ def _workload_negative_consoles() -> dict[str, bytes]:
     }
 
 
+def _lifecycle_negative_consoles() -> dict[str, bytes]:
+    result = {}
+    for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
+        contract = lifecycle_negative_control_contract(name)
+        payload = b"kernel boot\n" + ROOT_TRANSITION_MARKER + b"\n"
+        if contract["phase"] == "post-workload":
+            payload += WORKLOAD_STARTED_MARKER + b"\n"
+        if name == "second_distinct_stop":
+            payload += LIFECYCLE_STOP_DISPATCHED_MARKER + b"\n"
+        result[name] = payload + contract["rejection_marker"].encode("ascii") + b"\n"
+    return result
+
+
+def _lifecycle_negative_inputs() -> dict[str, dict[str, object]]:
+    binding = _lifecycle_control_binding_for_test()
+    generation = "33333333-3333-4333-8333-333333333333"
+    result = {}
+    for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+        selected_generation = generation if name.startswith("stop_") or name == "second_distinct_stop" else None
+        payload = _lifecycle_negative_wire_bytes(name, binding, boot_generation=selected_generation)
+        result[name] = {
+            "boot_generation": selected_generation,
+            "bytes_written": len(payload),
+            "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        }
+    return result
+
+
+def _lifecycle_control_binding_for_test() -> OCIControlBinding:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    return OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+
+
 def _lifecycle() -> dict[str, object]:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
     binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
-    boots = []
-    for boot_index in (1, 2):
-        nonce = str(boot_index) * 64
-        generation = f"{boot_index * 11111111:08d}-{boot_index * 1111:04d}-4{boot_index * 111:03d}-8{boot_index * 111:03d}-{boot_index * 111111111111:012d}"
-        messages = (
-            OCIControlMessage(kind="HELLO", binding=binding, host_nonce=nonce, payload={}, request_id=1),
-            OCIControlMessage(
-                kind="READY",
-                binding=binding,
-                host_nonce=nonce,
-                payload={},
-                sequence=1,
-                boot_generation=generation,
-                reply_to=1,
-            ),
-            OCIControlMessage(
-                kind="STOP",
-                binding=binding,
-                host_nonce=nonce,
-                payload={"signal": 15},
-                request_id=2,
-                boot_generation=generation,
-            ),
-            OCIControlMessage(
-                kind="TERMINAL",
-                binding=binding,
-                host_nonce=nonce,
-                payload={"terminal": {"exit_code": 42, "signal": None}},
-                sequence=2,
-                boot_generation=generation,
-                reply_to=2,
-            ),
-        )
-        frames = []
-        for direction, message in zip(
-            ("host-to-guest", "guest-to-host", "host-to-guest", "guest-to-host"), messages, strict=True
-        ):
+
+    def frames(values: tuple[tuple[int, str, OCIControlMessage], ...]) -> list[dict[str, object]]:
+        result = []
+        for connection, direction, message in values:
             encoded = encode_frame(message)
-            frames.append(
+            result.append(
                 {
                     "boot_generation": message.boot_generation,
+                    "connection": connection,
                     "digest": "sha256:" + hashlib.sha256(encoded).hexdigest(),
                     "direction": direction,
                     "host_nonce": message.host_nonce,
@@ -171,14 +187,192 @@ def _lifecycle() -> dict[str, object]:
                     "size_bytes": len(encoded),
                 }
             )
-        boots.append(
-            {
-                "frames": frames,
-                "pid1_alive_after_terminal": True,
-                "ready": True,
-                "terminal": {"exit_code": 42, "signal": None},
-            }
-        )
+        return result
+
+    generation1 = "11111111-1111-4111-8111-111111111111"
+    nonce1 = "1" * 64
+    normal_messages = (
+        (1, "host-to-guest", OCIControlMessage("HELLO", binding, nonce1, {}, request_id=1)),
+        (
+            1,
+            "guest-to-host",
+            OCIControlMessage("READY", binding, nonce1, {}, sequence=1, boot_generation=generation1, reply_to=1),
+        ),
+        (
+            1,
+            "host-to-guest",
+            OCIControlMessage("STOP", binding, nonce1, {"signal": 15}, request_id=2, boot_generation=generation1),
+        ),
+        (
+            1,
+            "guest-to-host",
+            OCIControlMessage(
+                "TERMINAL",
+                binding,
+                nonce1,
+                {"terminal": {"exit_code": 42, "signal": None}},
+                sequence=2,
+                boot_generation=generation1,
+                reply_to=2,
+            ),
+        ),
+    )
+    generation2 = "22222222-2222-4222-8222-222222222222"
+    nonces = {index: str(index + 1) * 64 for index in range(1, 7)}
+    composite_messages = (
+        (1, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[1], {}, request_id=1)),
+        (2, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[2], {}, request_id=2)),
+        (
+            2,
+            "guest-to-host",
+            OCIControlMessage(
+                "SNAPSHOT",
+                binding,
+                nonces[2],
+                {"state": "ready", "stop_request_id": None, "terminal": None},
+                sequence=2,
+                boot_generation=generation2,
+                reply_to=2,
+            ),
+        ),
+        (3, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[3], {}, request_id=3)),
+        (
+            3,
+            "guest-to-host",
+            OCIControlMessage(
+                "SNAPSHOT",
+                binding,
+                nonces[3],
+                {"state": "ready", "stop_request_id": None, "terminal": None},
+                sequence=3,
+                boot_generation=generation2,
+                reply_to=3,
+            ),
+        ),
+        (4, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[4], {}, request_id=5)),
+        (
+            4,
+            "guest-to-host",
+            OCIControlMessage(
+                "SNAPSHOT",
+                binding,
+                nonces[4],
+                {"state": "ready", "stop_request_id": None, "terminal": None},
+                sequence=4,
+                boot_generation=generation2,
+                reply_to=5,
+            ),
+        ),
+        (
+            4,
+            "host-to-guest",
+            OCIControlMessage("STOP", binding, nonces[4], {"signal": 15}, request_id=4, boot_generation=generation2),
+        ),
+        (
+            4,
+            "host-to-guest",
+            OCIControlMessage("STOP", binding, nonces[4], {"signal": 15}, request_id=4, boot_generation=generation2),
+        ),
+        (5, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[5], {}, request_id=6)),
+        (
+            5,
+            "guest-to-host",
+            OCIControlMessage(
+                "SNAPSHOT",
+                binding,
+                nonces[5],
+                {"state": "stopping", "stop_request_id": 4, "terminal": None},
+                sequence=5,
+                boot_generation=generation2,
+                reply_to=6,
+            ),
+        ),
+        (
+            5,
+            "guest-to-host",
+            OCIControlMessage(
+                "TERMINAL",
+                binding,
+                nonces[5],
+                {"terminal": {"exit_code": 42, "signal": None}},
+                sequence=6,
+                boot_generation=generation2,
+                reply_to=4,
+            ),
+        ),
+        (6, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[6], {}, request_id=7)),
+        (
+            6,
+            "guest-to-host",
+            OCIControlMessage(
+                "SNAPSHOT",
+                binding,
+                nonces[6],
+                {"state": "terminal", "stop_request_id": 4, "terminal": {"exit_code": 42, "signal": None}},
+                sequence=7,
+                boot_generation=generation2,
+                reply_to=7,
+            ),
+        ),
+    )
+    partial = encode_frame(
+        OCIControlMessage("STOP", binding, nonces[3], {"signal": 15}, request_id=4, boot_generation=generation2)
+    )
+    boots = [
+        {
+            "connection_count": 1,
+            "frames": frames(normal_messages),
+            "initial_ready_host_observed": True,
+            "logical_attempts": [],
+            "pid1_alive_after_terminal": True,
+            "profile": "single-connection",
+            "ready": True,
+            "reopen_count": 0,
+            "stop_signal_dispatch_count": 1,
+            "terminal": {"exit_code": 42, "signal": None},
+        },
+        {
+            "connection_count": 6,
+            "frames": frames(composite_messages),
+            "initial_ready_host_observed": False,
+            "logical_attempts": [
+                {
+                    "bytes_sent": len(partial) - 1,
+                    "connection": 3,
+                    "digest": "sha256:" + hashlib.sha256(partial).hexdigest(),
+                    "frame_size_bytes": len(partial),
+                    "kind": "STOP",
+                    "request_id": 4,
+                }
+            ],
+            "pid1_alive_after_terminal": True,
+            "profile": "six-connection-partial-retry-committed-dedupe-composite",
+            "ready": True,
+            "reopen_count": 0,
+            "stop_signal_dispatch_count": 1,
+            "terminal": {"exit_code": 42, "signal": None},
+        },
+    ]
+    negative_consoles = _lifecycle_negative_consoles()
+    negative_inputs = _lifecycle_negative_inputs()
+
+    def negative_item(name: str) -> dict[str, object]:
+        contract = lifecycle_negative_control_contract(name)
+        return {
+            "console_digest": "sha256:" + hashlib.sha256(negative_consoles[name]).hexdigest(),
+            "console_size_bytes": len(negative_consoles[name]),
+            "contract": contract,
+            "immutable_backings_verified": True,
+            "lifecycle_rejection_marker_count": 1,
+            "pid1_alive_after_marker": True,
+            "root_post_digest": "sha256:" + "9" * 64,
+            "root_seed_digest": contract["backings"]["root"]["artifact_digest"],
+            "success_marker_count": 0,
+            "terminal_marker_count": 0,
+            "wire_input": negative_inputs[name] if name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES else None,
+        }
+
+    duplicate_output = QEMU_DUPLICATE_NAME_REJECTION_MARKER + b"\n"
     return {
         "binding": {
             "domain_core_digest": plan.domain_core_digest,
@@ -186,14 +380,33 @@ def _lifecycle() -> dict[str, object]:
             "stage1_artifact_digest": transport.receipt.artifact_digest,
         },
         "boots": boots,
-        "broker_contract": "palimpsest.guest-lifecycle-broker.v1",
+        "broker_contract": "palimpsest.guest-lifecycle-broker.v2",
+        "channel_discovery_negative_controls": {
+            name: negative_item(name) for name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
+        },
         "channel_name": "org.palimpsest.oci.lifecycle.0",
         "nonce_semantics": "correlation-and-replay-challenge-not-peer-authentication",
-        "negative_input_proven": False,
+        "connection_limit": 16,
+        "natural_terminal_proven": False,
+        "negative_input_proven": True,
+        "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
         "protocol": "palimpsest.oci-lifecycle-control.v1",
-        "reconnect_proven": False,
+        "qemu_duplicate_name_rejected": {
+            "exit_code": 1,
+            "guest_boot_started": False,
+            "invocation_count": 1,
+            "nonzero_exit": True,
+            "output_digest": "sha256:" + hashlib.sha256(duplicate_output).hexdigest(),
+            "output_size_bytes": len(duplicate_output),
+            "rejection_marker": QEMU_DUPLICATE_NAME_REJECTION_MARKER.decode("ascii"),
+            "rejection_marker_count": 1,
+            "stage1_marker_count": 0,
+        },
+        "reconnect_proven": True,
+        "session_profile": "reconnect-snapshot-partial-retry-committed-same-id-dedupe.v1",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
+        "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
     }
 
 
@@ -219,7 +432,7 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         "sha256:" + "4" * 64,
         "sha256:" + "5" * 64,
         _positive_console(),
-        _positive_console(),
+        _positive_console(retained=True),
         _negative_consoles(),
         _filesystem_negative_consoles(),
         _assembly_negative_consoles(),
@@ -228,6 +441,9 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         {name: "sha256:" + "7" * 64 for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES},
         _workload_negative_consoles(),
         {name: "sha256:" + "8" * 64 for name in WORKLOAD_NEGATIVE_CONTROL_NAMES},
+        _lifecycle_negative_consoles(),
+        {name: "sha256:" + "9" * 64 for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES},
+        QEMU_DUPLICATE_NAME_REJECTION_MARKER + b"\n",
         _lifecycle(),
     )
 
@@ -351,8 +567,8 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:dbca92880316d4a142480d28ddea00bb862f3fc61bed3182c2d26156d0f0493a"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v7"
+    assert manifest_digest == "sha256:22994200aeb8559cdcb7eae9d4a47a813c4be6d82b32b82b0684ada8b81c695c"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v8"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
@@ -369,10 +585,10 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "0adcb6bf3a77d6ee6e59fbb8083e7a995091c8f0f51b416830280cc2ba7fecc4",
-        "elf_size_bytes": 8952,
+        "elf_sha256": "d70514b6ea07ef566fb85503b1c858cf7292235434c6772b9c49ef7c69d8ac12",
+        "elf_size_bytes": 9044,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "d57abd8c6e27ac4ab740aa0956626695774fe825eb965c31db7ba3cccd66c6a3",
+        "source_sha256": "3276e256b16dc30d61d0c4a787b2e0a0ae9b669d493b0936bd97387043f60a00",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
@@ -762,6 +978,184 @@ time.sleep(2)
     temporary.cleanup()
 
 
+def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path: Path) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-composite-", dir="/tmp")
+    channel = (Path(temporary.name) / "lifecycle.sock").resolve()
+    program = f"""
+import socket, struct, sys, time
+from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_frame, encode_frame
+
+def receive(connection, partial=False):
+    data = b''
+    while len(data) < 4:
+        chunk = connection.recv(4-len(data))
+        if not chunk: return None
+        data += chunk
+    size = struct.unpack('>I', data)[0]
+    while len(data) < size + 4:
+        chunk = connection.recv(size + 4 - len(data))
+        if not chunk: return None
+        data += chunk
+    return decode_frame(data)
+
+def snapshot(hello, sequence, state, stop_id=None, terminal=None):
+    return OCIControlMessage(kind='SNAPSHOT', binding=hello.binding, host_nonce=hello.host_nonce,
+        payload={{'state': state, 'stop_request_id': stop_id, 'terminal': terminal}}, sequence=sequence,
+        boot_generation=generation, reply_to=hello.request_id)
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1]); listener.listen(1)
+generation = '22222222-2222-4222-8222-222222222222'
+c, _ = listener.accept(); hello = receive(c)
+c.sendall(encode_frame(OCIControlMessage(kind='READY', binding=hello.binding, host_nonce=hello.host_nonce,
+    payload={{}}, sequence=1, boot_generation=generation, reply_to=hello.request_id)))
+for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r},
+               {LIFECYCLE_READY_COMMITTED_MARKER!r}):
+    sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
+while c.recv(4096): pass
+c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 2, 'ready')))
+while c.recv(4096): pass
+c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 3, 'ready')))
+assert receive(c) is None
+c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 4, 'ready')))
+stop = receive(c); assert stop.request_id == 4
+sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdout.flush()
+duplicate = receive(c); assert encode_frame(duplicate) == encode_frame(stop)
+sys.stdout.buffer.write({LIFECYCLE_STOP_DUPLICATE_MARKER!r} + b'\\n'); sys.stdout.flush()
+sys.stdout.buffer.write({WORKLOAD_STOP_OBSERVED_MARKER!r} + b'\\n'); sys.stdout.flush()
+while c.recv(4096): pass
+c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 5, 'stopping', 4)))
+c.sendall(encode_frame(OCIControlMessage(kind='TERMINAL', binding=hello.binding, host_nonce=hello.host_nonce,
+    payload={{'terminal': {{'exit_code': 42, 'signal': None}}}}, sequence=6,
+    boot_generation=generation, reply_to=4)))
+sys.stdout.buffer.write({SUCCESS_MARKER!r} + b'\\n'); sys.stdout.flush()
+while c.recv(4096): pass
+c, _ = listener.accept(); hello = receive(c)
+c.sendall(encode_frame(snapshot(hello, 7, 'terminal', 4, {{'exit_code': 42, 'signal': None}})))
+time.sleep(2)
+"""
+    transcript: list[dict[str, object]] = []
+    attempts: list[dict[str, object]] = []
+    console = _read_console_until(
+        (sys.executable, "-c", program, os.fspath(channel)),
+        expected=SUCCESS_MARKER,
+        forbidden=(REJECTION_MARKER,),
+        timeout_seconds=5,
+        require_alive_after_marker=True,
+        lifecycle_socket_path=channel,
+        lifecycle_binding=binding,
+        lifecycle_success=True,
+        lifecycle_transcript=transcript,
+        lifecycle_scenario="composite",
+        lifecycle_attempts=attempts,
+    )
+    assert _logical_line_count(console, WORKLOAD_STOP_OBSERVED_MARKER) == 1
+    assert _logical_line_count(console, LIFECYCLE_STOP_DISPATCHED_MARKER) == 1
+    assert _logical_line_count(console, LIFECYCLE_STOP_DUPLICATE_MARKER) == 1
+    assert [frame["connection"] for frame in transcript] == [1, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 6, 6]
+    assert [frame["sequence"] for frame in transcript if frame["sequence"] is not None] == [2, 3, 4, 5, 6, 7]
+    assert attempts[0]["request_id"] == transcript[7]["request_id"] == 4
+    assert transcript[7] == transcript[8]
+    temporary.cleanup()
+
+
+def test_console_reader_records_only_rejected_second_distinct_stop(tmp_path: Path) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-negative-", dir="/tmp")
+    channel = (Path(temporary.name) / "lifecycle.sock").resolve()
+    rejection = lifecycle_negative_control_contract("second_distinct_stop")["rejection_marker"].encode("ascii")
+    program = f"""
+import socket, struct, sys, time
+from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_frame, encode_frame
+
+def receive(connection):
+    header = connection.recv(4)
+    while len(header) < 4: header += connection.recv(4-len(header))
+    size = struct.unpack('>I', header)[0]
+    payload = b''
+    while len(payload) < size: payload += connection.recv(size-len(payload))
+    return decode_frame(header + payload)
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1]); listener.listen(1)
+connection, _ = listener.accept()
+hello = receive(connection)
+generation = '33333333-3333-4333-8333-333333333333'
+connection.sendall(encode_frame(OCIControlMessage(kind='READY', binding=hello.binding,
+    host_nonce=hello.host_nonce, payload={{}}, sequence=1, boot_generation=generation,
+    reply_to=hello.request_id)))
+for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
+    sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
+first = receive(connection); assert first.request_id == 2
+sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdout.flush()
+second = receive(connection); assert second.request_id == 3
+sys.stdout.buffer.write({rejection!r} + b'\\n'); sys.stdout.flush()
+time.sleep(2)
+"""
+    negative_input: dict[str, object] = {}
+    console = _read_console_until(
+        (sys.executable, "-c", program, os.fspath(channel)),
+        expected=rejection,
+        forbidden=(REJECTION_MARKER,),
+        timeout_seconds=4,
+        require_alive_after_marker=True,
+        lifecycle_socket_path=channel,
+        lifecycle_binding=binding,
+        lifecycle_success=True,
+        lifecycle_scenario="negative",
+        lifecycle_negative_name="second_distinct_stop",
+        lifecycle_negative_input=negative_input,
+    )
+    expected_input = _lifecycle_negative_wire_bytes(
+        "second_distinct_stop",
+        binding,
+        boot_generation="33333333-3333-4333-8333-333333333333",
+    )
+    assert negative_input == {
+        "boot_generation": "33333333-3333-4333-8333-333333333333",
+        "bytes_written": len(expected_input),
+        "digest": "sha256:" + hashlib.sha256(expected_input).hexdigest(),
+        "size_bytes": len(expected_input),
+    }
+    assert _logical_line_count(console, LIFECYCLE_STOP_DISPATCHED_MARKER) == 1
+    temporary.cleanup()
+
+
+def test_console_reader_normalizes_partial_guest_frame_eof(tmp_path: Path) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-eof-", dir="/tmp")
+    channel = (Path(temporary.name) / "lifecycle.sock").resolve()
+    program = """
+import socket, sys, time
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1]); listener.listen(1)
+connection, _ = listener.accept()
+connection.recv(65536)
+connection.sendall(b'\\x00\\x00')
+connection.close()
+time.sleep(1)
+"""
+    with pytest.raises(KVMProofFailure, match="lifecycle protocol was rejected"):
+        _read_console_until(
+            (sys.executable, "-c", program, os.fspath(channel)),
+            expected=SUCCESS_MARKER,
+            forbidden=(REJECTION_MARKER,),
+            timeout_seconds=3,
+            require_alive_after_marker=True,
+            lifecycle_socket_path=channel,
+            lifecycle_binding=binding,
+            lifecycle_success=True,
+        )
+    temporary.cleanup()
+
+
 def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     receipt = _receipt()
     console = receipt.console
@@ -782,10 +1176,34 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v13"
+    assert decoded["executed_boots"] == 40
+    assert decoded["qemu_invocations"] == 41
+    assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
+        "lifecycle_missing_port",
+        "lifecycle_wrong_name_only",
+    )
+    assert LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES == (
+        "hello_zero_length",
+        "hello_oversized_length",
+        "hello_duplicate_key_noncanonical",
+        "hello_wrong_domain_core_binding",
+        "hello_reused_nonce",
+        "stop_stale_generation",
+        "stop_request_id_collides_with_hello",
+        "second_distinct_stop",
+    )
+    assert set(decoded["lifecycle"]["channel_discovery_negative_controls"]) == set(
+        LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
+    )
+    assert set(decoded["lifecycle"]["wire_negative_controls"]) == set(LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES)
     assert decoded["root_assembly"] is True
     assert decoded["root_is_slash"] is True
     assert decoded["pivot_root"] is False
@@ -802,7 +1220,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v4",
+        "contract": "palimpsest.guest-pid1-supervisor.v5",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
         "cgroup_write_escape_denied": ["parent", "own"],
@@ -811,7 +1229,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         "credential_timing": "child-after-parent-cgroup-attach-release",
         "forced_status": 137,
         "forwarded_signal": 15,
-        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v1",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
@@ -901,6 +1319,9 @@ def test_receipt_rejects_root_transition_claim_tamper(mutation: str) -> None:
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
 
 
@@ -937,6 +1358,9 @@ def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topolog
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(
@@ -984,6 +1408,9 @@ def test_receipt_rejects_negative_control_mapping_tamper(mutation: str) -> None:
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
 
 
@@ -1019,6 +1446,9 @@ def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> Non
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
 
 
@@ -1165,7 +1595,20 @@ def test_receipt_rejects_workload_negative_control_mapping_tamper() -> None:
             root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
             workload_negative_consoles=receipt.workload_negative_consoles,
             workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+            lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+            lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+            qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
         )
+
+
+def test_receipt_rejects_valid_looking_lifecycle_root_seed_tamper() -> None:
+    receipt = _receipt()
+    lifecycle = copy.deepcopy(receipt.lifecycle)
+    name = LIFECYCLE_NEGATIVE_CONTROL_NAMES[0]
+    lifecycle["channel_discovery_negative_controls"][name]["root_seed_digest"] = "sha256:" + "f" * 64
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle=lifecycle)
 
 
 @pytest.mark.parametrize(
@@ -1192,9 +1635,9 @@ def test_receipt_rejects_lifecycle_evidence_tamper(mutation: str) -> None:
     receipt = _receipt()
     lifecycle = copy.deepcopy(receipt.lifecycle)
     if mutation == "reconnect":
-        lifecycle["reconnect_proven"] = True
+        lifecycle["reconnect_proven"] = False
     elif mutation == "negative-proven":
-        lifecycle["negative_input_proven"] = True
+        lifecycle["negative_input_proven"] = False
     elif mutation == "binding":
         lifecycle["binding"]["run_id"] = "00000000-0000-4000-8000-000000000000"
     elif mutation == "direction":
@@ -1261,6 +1704,8 @@ def test_evidence_names_and_owner_only_publication_are_exact(tmp_path: Path) -> 
         *(f"assembly-negative-{name}.bin" for name in ASSEMBLY_NEGATIVE_CONTROL_NAMES),
         *(f"root-transition-negative-{name}.bin" for name in ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES),
         *(f"workload-negative-{name}.bin" for name in WORKLOAD_NEGATIVE_CONTROL_NAMES),
+        *(f"lifecycle-negative-{name}.bin" for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES),
+        "qemu-duplicate-lifecycle-name.bin",
     )
     evidence = tmp_path / "evidence"
     evidence.mkdir(mode=0o700)

@@ -488,9 +488,15 @@ class HostOCIControlSession:
             self._terminal = message.payload["terminal"]
             self._terminal_stop_request_id = None
             self.state = "terminal"
-        elif self.state == "stop-sent" and message.kind == "TERMINAL" and message.reply_to == self._stop_request_id:
+        elif (
+            self.state == "stop-sent"
+            and message.kind == "TERMINAL"
+            and message.reply_to in {None, self._stop_request_id}
+        ):
             self._terminal = message.payload["terminal"]
-            self._terminal_stop_request_id = self._stop_request_id
+            # A direct null reply is the natural-exit/STOP race: the guest
+            # froze natural terminal state before this STOP could commit.
+            self._terminal_stop_request_id = message.reply_to
             self.state = "terminal"
         else:
             raise OCIControlProtocolError("guest lifecycle transition is invalid")

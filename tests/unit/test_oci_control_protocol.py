@@ -469,6 +469,35 @@ def test_terminal_snapshot_after_stop_accepts_only_undelivered_or_original_stop(
     assert session.terminal_stop_request_id == stop_request_id
 
 
+def test_direct_natural_terminal_may_win_the_stop_delivery_race() -> None:
+    session = HostOCIControlSession(_binding(), nonce_factory=lambda: _NONCE_1)
+    hello = session.hello()
+    session.accept(_message(reply_to=hello.request_id))
+    session.stop()
+
+    session.accept(
+        _message(
+            "TERMINAL",
+            sequence=2,
+            reply_to=None,
+            payload={"terminal": {"exit_code": 0, "signal": None}},
+        )
+    )
+
+    assert session.state == "terminal"
+    assert session.terminal_stop_request_id is None
+
+
+def test_direct_terminal_after_stop_rejects_unrelated_reply() -> None:
+    session = HostOCIControlSession(_binding(), nonce_factory=lambda: _NONCE_1)
+    hello = session.hello()
+    session.accept(_message(reply_to=hello.request_id))
+    stop = session.stop()
+
+    with pytest.raises(OCIControlProtocolError, match="transition"):
+        session.accept(_message("TERMINAL", sequence=2, reply_to=stop.request_id + 1))
+
+
 def test_message_value_objects_reject_stale_generation_and_are_immutable() -> None:
     message = _message()
     with pytest.raises(OCIControlProtocolError, match="generation"):

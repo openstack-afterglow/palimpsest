@@ -29,13 +29,24 @@ KVM character device reporting API version 12.
 
 Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
-drives canonical HELLO/READY/STOP/TERMINAL frames with partial nonblocking I/O,
-and records path-free frame digests plus nonce/generation/request/sequence
-correlation. This is a single-connection checkpoint only:
-`reconnect_proven=false`; no guest SNAPSHOT or STOP retransmission is claimed.
-It also records `negative_input_proven=false`; the malformed, stale-binding,
-duplicate, truncated, and oversized guest-C runtime control matrix remains
-uncollected rather than inferred from the positive boots.
+drives canonical lifecycle frames with partial nonblocking I/O and records
+path-free frame digests plus nonce/generation/request/sequence correlation.
+Receipt v13 covers a single connection and an exact six-connection retained-
+root session. The latter proves lost initial READY recovery; ready, stopping,
+and terminal SNAPSHOTs; a connection-local partial STOP; complete same-ID
+retry; and an already-committed same-ID duplicate accepted without a second
+signal dispatch. Linux connects pin socket dev/inode/uid/type and require
+`SO_PEERCRED` to identify the spawned QEMU PID and current UID.
+
+Ten lifecycle-negative guest boots cover missing/wrong named ports,
+zero/oversized lengths, a non-canonical duplicate JSON key, wrong binding,
+nonce reuse, stale generation, request-ID collision, and a distinct second
+STOP after the first was dispatched. A separate QEMU invocation proves a
+duplicate lifecycle port name is rejected before any guest stage-1 marker.
+The receipt therefore records `reconnect_proven=true` and
+`negative_input_proven=true`; natural terminal behavior is implemented but is
+not exercised by another native boot and remains
+`natural_terminal_proven=false`.
 
 Run on the qualified host:
 
@@ -48,7 +59,7 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-Receipt v12 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v13 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact argv, two-entry environment, cwd, numeric uid/gid,
@@ -59,10 +70,12 @@ removal. The workload also proves UID 65534 cannot write-open either the parent
 or its own `cgroup.procs`. Production define/start remains
 disabled.
 
-The v12 canonical receipt binds all 30 native-KVM boots: two positive boots
+The v13 canonical receipt binds all 40 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and three
-workload-launch controls. It binds every path-free negative topology contract and
+workload-launch controls, plus ten lifecycle controls. One additional QEMU
+invocation is the duplicate-name preboot rejection, for 41 invocations total.
+It binds every path-free negative topology contract and
 its console digest, records mutable-root seed/boot-one/boot-two digests, and
 keeps immutable transport/lower equality. The two committed real SquashFS
 fixtures use zstd level 3 and contain an ordinal-specific collision sentinel;
@@ -80,11 +93,12 @@ markers and must remain alive fail-closed.
 
 The highest lower and every transition fixture include the exact `0755`
 `/.__palimpsest_workload_proof_v1`, the root sentinel, and
-`/proof/workdir`. Fixture policy v7 binds the recursive source entry types and
+`/proof/workdir`. Fixture policy v8 binds the recursive source entry types and
 modes, proof source/build-script/ELF hashes, digest-pinned GCC image, and the
 pinned mksquashfs 4.7.5 zstd-level-3 build policy.
-Evidence contains positive and retained-boot consoles plus
-`negative-<case>.bin` for every named control; all evidence files are
+Evidence contains positive and retained-boot consoles plus every named
+negative console and the raw QEMU duplicate-name rejection output. All
+evidence files are
 exclusively created owner-readable (`0400`).
 
 The PR workflow also has an always-running `Required native KVM proof`
@@ -92,13 +106,14 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v9, OCI-root domain plan is v7, and the init
-contract is v11. Pre-mount,
+The stage-1 plan/protocol is v10, OCI-root domain plan is v8, and the init
+contract is v12. Initramfs manifest/ABI are v14, supervisor is v5, lifecycle
+broker is v2, and filesystem fixture policy/schema are v8. Pre-mount,
 filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v12 receipt on the qualified runner; this source update and
+must still produce a v13 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while only the admitted

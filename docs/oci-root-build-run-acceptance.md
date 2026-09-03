@@ -87,19 +87,25 @@ future guest broker must handle that exact retransmission idempotently and
 reject conflicting reuse.
 
 The lifecycle and supervisor bindings use pre-production OCI-root domain plan
-v7 and domain core v3. Earlier v4/v5/v6 and core-v2 previews are rejected and must be rebuilt
+v8 and domain core v3. Earlier v4/v5/v6/v7 and core-v2 previews are rejected and must be rebuilt
 before a future launch; loading one never migrates, deletes, or otherwise
 changes its run state or transport artifact.
 
-The native qualification harness now exercises a guest lifecycle broker over
-one private QEMU connection and records READY/STOP/TERMINAL. Production still
-does not call libvirt `openChannel`, dispatch runtime `STOP`, or expose the
-protocol through `run`, `stop`, or `-d`. Reconnect, SNAPSHOT, and retransmission
-remain unproven by the guest (`reconnect_proven=false`). Gate 2 therefore
-remains opt-in and skipped. The host nonce provides correlation and a replay
-challenge, not cryptographic peer authentication; that requires a future
-owned libvirt channel plus a MAC or equivalent authenticated transport.
-The v12 native receipt also records `negative_input_proven=false`: malformed,
-stale-binding, duplicate, truncated, and oversized guest-C runtime controls
-remain a separate qualification matrix rather than an implied result of the
-positive exchange.
+The v13 native qualification harness now exercises both a single connection
+and a six-connection retained-root session. The latter loses the initial READY,
+reconnects through READY/stopping/terminal snapshots, writes a partial STOP,
+retries the complete same logical STOP, and then proves already-committed
+same-ID deduplication without a second signal dispatch. Linux connects pin the
+QEMU socket identity and require `SO_PEERCRED` to identify the spawned QEMU PID
+and current UID. Ten separate lifecycle-negative guest boots cover two channel
+discovery failures and eight exact malformed, stale, replayed, or conflicting
+wire inputs; a separate non-boot QEMU invocation proves duplicate named ports
+are rejected before stage 1 starts. Thus `reconnect_proven=true` and
+`negative_input_proven=true`; natural workload terminal delivery remains
+implemented but explicitly unqualified (`natural_terminal_proven=false`).
+
+Production still does not call libvirt `openChannel`, dispatch runtime `STOP`,
+or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
+and skipped. The host nonce provides correlation and a replay challenge, not
+cryptographic peer authentication; that still requires a future owned libvirt
+channel plus a MAC or equivalent authenticated transport.

@@ -783,6 +783,43 @@ false; SNAPSHOT and STOP retransmission are not guest-runtime claims. The
 production libvirt/runtime dispatch and CLI remain disabled, and nonce
 correlation is not cryptographic peer authentication.
 
+### PR 4 slice 27B: reconnect and lifecycle-negative qualification
+
+- The qualification broker retains boot-wide lifecycle state across bounded
+  virtio-serial peer boundaries. A six-connection composite loses the initial
+  READY, proves ready/stopping/terminal SNAPSHOT recovery, discards a partial
+  STOP only at EOF, retries that complete logical STOP, and accepts one exact
+  already-committed duplicate without dispatching the signal twice. Host
+  request allocation remains monotonic while an outstanding STOP retains its
+  earlier ID across a later reconnect HELLO.
+- Input parsing has a five-second connection-local partial-frame deadline even
+  when no further readiness event arrives. Outbound partial/write loss commits
+  its sequence attempt but preserves the old input parser, HELLO, and nonce
+  until read EOF. Reconnect delay grows 10/20/40/80/100 ms, and bounded nonce
+  and request ledgers cover all 16 admitted connections plus one STOP.
+- Linux host connections revalidate the pinned Unix-socket dev/inode/uid/type
+  and require `SO_PEERCRED` to match the spawned QEMU PID and current UID.
+  Ten independent guest boots cover two channel-discovery and eight exact wire
+  negatives. Their raw consoles, actual offending bytes, mutable-root
+  seed/post digests, and immutable backing checks are receipt-bound. A separate
+  41st QEMU invocation proves duplicate lifecycle names fail before guest boot;
+  the 40 guest boots remain distinct from that preboot rejection.
+- Natural terminal cause is frozen if the main process wins a concurrent STOP,
+  including an empty process group (`ESRCH`). A canonical late STOP is drained
+  at most once on the already-active connection without changing null
+  `reply_to`; EOF, reconnect, malformed input, or a second STOP closes that
+  exception. This code path is not an additional native proof boot, so receipt
+  v13 says `natural_terminal_proven=false`.
+- Stage-1 plan/protocol v10, handoff v4, init/consumer v12, initramfs
+  manifest/ABI v14, supervisor v5, lifecycle broker v2, fixture policy/schema
+  v8, domain plan v8, and KVM receipt v13 bind this checkpoint.
+
+Scope boundary: the production libvirt/runtime dispatch and CLI still do not
+own or open this lifecycle channel, and Gate 2 remains inactive. The nonce is
+correlation/replay state, not cryptographic peer authentication. Native v13
+evidence must be collected on the qualified Linux x86_64 KVM runner; local
+policy tests and reproducible binaries are not a substitute.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -801,7 +838,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v12 lifecycle receipt and all retained-root plus
+1. Collect the qualified v13 lifecycle receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH

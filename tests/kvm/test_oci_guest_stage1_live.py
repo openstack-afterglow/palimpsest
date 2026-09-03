@@ -62,7 +62,7 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v4",
+        "contract": "palimpsest.guest-pid1-supervisor.v5",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
         "cgroup_write_escape_denied": ["parent", "own"],
@@ -71,7 +71,7 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
         "credential_timing": "child-after-parent-cgroup-attach-release",
         "forced_status": 137,
         "forwarded_signal": 15,
-        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v1",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
@@ -83,8 +83,8 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_30_boot_control_mat
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
     }
     assert receipt["lifecycle"]["single_connection_proven"] is True
-    assert receipt["lifecycle"]["reconnect_proven"] is False
-    assert receipt["lifecycle"]["negative_input_proven"] is False
+    assert receipt["lifecycle"]["reconnect_proven"] is True
+    assert receipt["lifecycle"]["negative_input_proven"] is True
     assert [frame["kind"] for frame in receipt["lifecycle"]["boots"][0]["frames"]] == [
         "HELLO",
         "READY",
