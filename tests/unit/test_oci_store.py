@@ -12,17 +12,20 @@ import subprocess
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import palimpsest_local.artifact_store as artifact_store_module
 import palimpsest_local.oci_root_kvm as oci_root_kvm_module
 import palimpsest_local.oci_root_prepare as oci_root_prepare_module
+import palimpsest_local.oci_root_runtime as oci_root_runtime_module
 import palimpsest_local.oci_store as oci_store_module
 import palimpsest_local.platforms as platforms
 import palimpsest_local.state as state_module
@@ -72,6 +75,7 @@ from palimpsest_local.oci_root_prepare import (
     reconcile_oci_root_preparation,
     release_prepared_oci_root_run,
 )
+from palimpsest_local.oci_root_runtime import define_committed_oci_root_domain
 from palimpsest_local.oci_root_volume import (
     OCIRootVolumeRecord,
     claim_oci_root_volume,
@@ -1624,6 +1628,90 @@ def _oci_dispatch() -> DispatchKey:
     return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
 
 
+class _FakeLibvirtError(RuntimeError):
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self._code = code
+
+    def get_error_code(self) -> int:
+        return self._code
+
+
+_FAKE_LIBVIRT = SimpleNamespace(libvirtError=_FakeLibvirtError, VIR_ERR_NO_DOMAIN=42)
+
+
+class _DefinedDomain:
+    def __init__(self, connection, name: str, xml: str):
+        self.connection = connection
+        self.name = name
+        self.xml = xml
+        self.undefine_calls = 0
+
+    def XMLDesc(self) -> str:
+        return self.xml
+
+    def isActive(self) -> int:
+        return 0
+
+    def undefine(self) -> None:
+        self.undefine_calls += 1
+        if self.connection.domains.get(self.name) is self:
+            del self.connection.domains[self.name]
+
+
+class _DefinitionConnection:
+    def __init__(self, *, transform=None, define_error: Exception | None = None):
+        self.domains: dict[str, _DefinedDomain] = {}
+        self.transform = transform
+        self.define_error = define_error
+        self.lookup_error: Exception | None = None
+        self.define_calls = 0
+
+    def lookupByName(self, name: str) -> _DefinedDomain:
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        try:
+            return self.domains[name]
+        except KeyError:
+            raise _FakeLibvirtError("missing", 42) from None
+
+    def defineXML(self, xml: str) -> _DefinedDomain:
+        self.define_calls += 1
+        root = ET.fromstring(xml)
+        name = root.findtext("./name")
+        assert name is not None
+        actual = self.transform(xml) if self.transform is not None else xml
+        domain = _DefinedDomain(self, name, actual)
+        self.domains[name] = domain
+        if self.define_error is not None:
+            raise self.define_error
+        return domain
+
+
+def _committed_oci_domain(tmp_path: Path, name: str):
+    roots, store = _store(tmp_path)
+    tools = _RootVolumeTools()
+    kernel = tmp_path / "vmlinuz"
+    kernel_bytes = bytearray(0x206)
+    kernel_bytes[0x202:0x206] = b"HdrS"
+    kernel.write_bytes(kernel_bytes)
+    initramfs = tmp_path / "initramfs"
+    initramfs.write_bytes(b"070701payload")
+    boot = verify_host_boot_artifacts(kernel.resolve(), initramfs.resolve())
+    profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64")
+    with reserve_new_run(roots, name, _oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            _image_materialization(store),
+            store,
+            root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+    preview = build_oci_root_domain_plan(roots, prepared, store, boot, profile, runner=tools)
+    plan = commit_oci_root_domain_plan(roots, preview, store, runner=tools)
+    return roots, store, tools, boot, profile, prepared, plan
+
+
 def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: Path) -> None:
     roots, store = _store(tmp_path)
     materialization = _image_materialization(store)
@@ -1806,6 +1894,170 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
 
     release_prepared_oci_root_run(roots, prepared, store, runner=tools)
     assert read_run_ledger_snapshot(roots, "domain-plan").state["status"] == "removed"
+
+
+def test_oci_root_define_revalidates_and_durably_records_inactive_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, "define-ready")
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    receipt = define_committed_oci_root_domain(
+        roots,
+        "define-ready",
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+    )
+
+    assert receipt.run_id == plan.run_id
+    assert receipt.run_name == "define-ready"
+    assert receipt.plan_digest == plan.digest
+    assert conn.define_calls == 1
+    assert conn.domains["define-ready"].isActive() == 0
+    snapshot = read_run_ledger_snapshot(roots, "define-ready")
+    assert snapshot.state["status"] == "defined"
+    assert snapshot.state["oci_root_domain"]["digest"] == plan.digest
+
+
+@pytest.mark.parametrize("tamper", ["lower", "root", "transport", "kernel", "profile"])
+def test_oci_root_define_rejects_live_authority_tamper_before_libvirt_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    roots, store, tools, boot, profile, prepared, plan = _committed_oci_domain(tmp_path, f"tamper-{tamper}")
+    selected_profile = profile
+    if tamper == "lower":
+        lower = roots.store / "blobs" / "sha256" / str(plan.layers[0]["image_digest"]).removeprefix("sha256:")
+        payload = bytearray(lower.read_bytes())
+        payload[-1] ^= 1
+        lower.chmod(0o600)
+        lower.write_bytes(payload)
+        lower.chmod(0o400)
+    elif tamper == "root":
+        with prepared.root_volume.path.open("r+b") as stream:
+            stream.seek(1024 + 104)
+            byte = stream.read(1)
+            stream.seek(1024 + 104)
+            stream.write(bytes([byte[0] ^ 1]))
+            stream.flush()
+            os.fsync(stream.fileno())
+    elif tamper == "transport":
+        transport = roots.runs / f"tamper-{tamper}" / "stage1-plan.raw"
+        payload = bytearray(transport.read_bytes())
+        payload[-1] ^= 1
+        transport.chmod(0o600)
+        transport.write_bytes(payload)
+        transport.chmod(0o400)
+    elif tamper == "kernel":
+        payload = bytearray(boot.kernel.path.read_bytes())
+        payload[0] ^= 1
+        boot.kernel.path.write_bytes(payload)
+    else:
+        selected_profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "aarch64")
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises((StateError, OCIStoreError)):
+        define_committed_oci_root_domain(
+            roots,
+            f"tamper-{tamper}",
+            store,
+            boot,
+            selected_profile,
+            conn=conn,
+            runner=tools,
+        )
+
+    assert conn.define_calls == 0
+    assert read_run_ledger_snapshot(roots, f"tamper-{tamper}").state["status"] == "creating"
+
+
+def test_oci_root_define_fails_closed_for_ambiguous_lookup_and_foreign_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "lookup-guard")
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    ambiguous = _DefinitionConnection()
+    ambiguous.lookup_error = _FakeLibvirtError("transport failure", 99)
+    with pytest.raises(StateError, match="cannot determine"):
+        define_committed_oci_root_domain(roots, "lookup-guard", store, boot, profile, conn=ambiguous, runner=tools)
+    assert ambiguous.define_calls == 0
+
+    foreign = _DefinitionConnection()
+    foreign_domain = _DefinedDomain(foreign, "lookup-guard", "<domain><name>lookup-guard</name></domain>")
+    foreign.domains["lookup-guard"] = foreign_domain
+    with pytest.raises(StateError, match="already reserved"):
+        define_committed_oci_root_domain(roots, "lookup-guard", store, boot, profile, conn=foreign, runner=tools)
+    assert foreign.define_calls == 0
+    assert foreign.domains["lookup-guard"] is foreign_domain
+    assert foreign_domain.undefine_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["define", "disk", "lifecycle"])
+def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    name = f"cleanup-{failure}"
+    roots, store, tools, boot, profile, prepared, _plan = _committed_oci_domain(tmp_path, name)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    def transform(xml: str) -> str:
+        root = ET.fromstring(xml)
+        if failure == "disk":
+            root.find("./devices/disk/source").set("file", "/foreign/root.raw")
+        elif failure == "lifecycle":
+            root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle").set(
+                "channel", "attacker.control"
+            )
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(
+        transform=None if failure == "define" else transform,
+        define_error=RuntimeError("partial define failure") if failure == "define" else None,
+    )
+    with pytest.raises((RuntimeError, StateError)):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
+    assert prepared.root_volume.path.is_file()
+    assert store.load_lease_set(
+        prepared.transaction.lower_lease_set_id,
+        prepared.transaction.owner,
+        plan_digest=prepared.transaction.boot_plan_digest,
+    ).members
+    assert (roots.runs / name / "stage1-plan.raw").is_file()
+
+
+def test_oci_root_define_does_not_cleanup_foreign_post_define_rebinding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "foreign-rebind"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    def foreign_marker(xml: str) -> str:
+        root = ET.fromstring(xml)
+        marker = root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}run")
+        marker.set("id", str(uuid.uuid4()))
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=foreign_marker)
+    with pytest.raises(StateError, match="committed contract"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name].undefine_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
 
 
 def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -> None:

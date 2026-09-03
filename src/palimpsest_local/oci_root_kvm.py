@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .artifact_store import ArtifactStoreError
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
 from .kvm import (
@@ -43,11 +44,11 @@ from .oci_stage1_transport import (
     build_stage1_transport,
     verify_stage1_transport_file,
 )
-from .oci_store import OCIStore
-from .platforms import DomainProfile
+from .oci_store import OCIStore, OCIStoreError
+from .platforms import BACKEND_KVM, DomainProfile, resolve_domain_profile
 from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
-from .state import StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
+from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
 OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v8"
 OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v3"
@@ -640,20 +641,64 @@ class ResolvedOCIRootDomainPlan:
 
 def _verified_lower_path(roots: StatePaths, digest: str, size: int) -> Path:
     path = roots.store / "blobs" / "sha256" / digest.removeprefix("sha256:")
+    fd: int | None = None
     try:
         entry = path.stat(follow_symlinks=False)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        opened = os.fstat(fd)
+        if (
+            not path.is_absolute()
+            or not stat.S_ISREG(entry.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+            or entry.st_uid != os.geteuid()
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) not in {0o400, 0o444}
+            or opened.st_size != size
+        ):
+            raise StateError("OCI-root lower artifact path is unsafe")
+        hasher = hashlib.sha256()
+        offset = 0
+        while offset < opened.st_size:
+            chunk = os.pread(fd, min(1024 * 1024, opened.st_size - offset), offset)
+            if not chunk:
+                raise StateError("OCI-root lower artifact changed during verification")
+            hasher.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(fd)
+        visible = path.stat(follow_symlinks=False)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
+            raise StateError("OCI-root lower artifact changed during verification")
+        actual = f"sha256:{hasher.hexdigest()}"
+        if actual != digest:
+            raise StateError("OCI-root lower artifact digest is invalid")
+        return path
+    except StateError:
+        raise
     except OSError:
         raise StateError("OCI-root lower artifact path is unavailable") from None
-    if (
-        not path.is_absolute()
-        or not stat.S_ISREG(entry.st_mode)
-        or entry.st_uid != os.geteuid()
-        or entry.st_nlink != 1
-        or stat.S_IMODE(entry.st_mode) not in {0o400, 0o444}
-        or entry.st_size != size
-    ):
-        raise StateError("OCI-root lower artifact path is unsafe")
-    return path
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def build_oci_root_domain_plan(
@@ -1007,6 +1052,167 @@ def load_oci_root_domain_plan(roots: StatePaths, name: str) -> OCIRootDomainPlan
     return plan
 
 
+def resolve_committed_oci_root_domain_plan(
+    roots: StatePaths,
+    snapshot: RunLedgerSnapshot,
+    store: OCIStore,
+    boot_artifacts: VerifiedHostBootArtifacts,
+    profile: DomainProfile,
+    *,
+    runner: CommandRunner = _default_runner,
+) -> ResolvedOCIRootDomainPlan:
+    """Re-resolve a committed plan from live authorities at a mutation boundary.
+
+    The caller is responsible for holding the run's pinned mutation lock for the
+    complete lifetime of this call and for consuming the returned paths before
+    releasing that lock.  The returned object is deliberately not durable.
+    """
+
+    if not isinstance(snapshot, RunLedgerSnapshot) or not isinstance(store, OCIStore):
+        raise StateError("OCI-root domain resolution authorities are invalid")
+    if not isinstance(boot_artifacts, VerifiedHostBootArtifacts) or not isinstance(profile, DomainProfile):
+        raise StateError("OCI-root domain resolution inputs are invalid")
+    if profile != resolve_domain_profile(BACKEND_KVM, "x86_64"):
+        raise StateError("OCI-root domain profile is not the qualified x86_64 KVM profile")
+    if (
+        snapshot.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT
+        or snapshot.record.dispatch_key.backend is not RuntimeBackend.KVM
+        or snapshot.state.get("status") != "creating"
+    ):
+        raise StateError("OCI-root domain definition requires a creating OCI-root/KVM run")
+
+    value = snapshot.state.get("oci_root_domain")
+    if not isinstance(value, Mapping) or set(value) != {"digest", "plan"}:
+        raise StateError("OCI-root domain plan ledger is missing or invalid")
+    plan = OCIRootDomainPlan.from_dict(value.get("plan"))
+    digest = _canonical_digest(value.get("digest"), "OCI-root domain plan ledger digest is invalid")
+    if digest != plan.digest or plan.run_id != snapshot.record.run_id or plan.run_name != snapshot.record.name:
+        raise StateError("OCI-root domain plan ledger binding is invalid")
+
+    transaction = OCIRootPreparationTransaction.from_dict(snapshot.state.get("oci_root"))
+    if transaction.phase != "resources-ready":
+        raise StateError("OCI-root resources are not ready for domain definition")
+    if (
+        transaction.boot_plan_digest != plan.resource_plan_digest
+        or transaction.lower_lease_set_id != plan.lower_lease_set_id
+        or transaction.lower_graph_digest != plan.lower_graph_digest
+        or transaction.volume_id != plan.root_volume["volume_id"]
+        or transaction.volume_size_bytes != plan.root_volume["size_bytes"]
+        or transaction.owner.run_id != plan.run_id
+        or transaction.owner.run_name != plan.run_name
+    ):
+        raise StateError("OCI-root domain plan resource binding is invalid")
+
+    try:
+        leases = store.load_lease_set(
+            transaction.lower_lease_set_id,
+            transaction.owner,
+            plan_digest=transaction.boot_plan_digest,
+        )
+    except (ArtifactStoreError, OCIStoreError) as exc:
+        raise StateError("OCI-root domain lower lease authority is invalid") from exc
+    if tuple(member.receipt for member in leases.members) != transaction.receipts:
+        raise StateError("OCI-root domain lower lease binding is invalid")
+    layers: list[dict[str, Any]] = []
+    disks: list[LayerDisk] = []
+    for member in leases.members:
+        receipt = member.receipt
+        serial = _serial("lower", receipt.occurrence_digest)
+        target = f"vd{chr(ord('c') + member.ordinal)}"
+        path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        layers.append(
+            {
+                "filesystem": receipt.filesystem,
+                "image_digest": receipt.image_digest,
+                "occurrence_digest": receipt.occurrence_digest,
+                "ordinal": member.ordinal,
+                "serial": serial,
+                "size_bytes": receipt.image_size,
+                "target": target,
+            }
+        )
+        disks.append(LayerDisk(receipt.image_digest, path, target, serial))
+    if _plain_json(plan.layers) != layers:
+        raise StateError("OCI-root domain plan lower lease binding is invalid")
+    if plan.process != OCIProcessSpec.from_dict(transaction.boot_plan["process"]):
+        raise StateError("OCI-root domain plan process binding is invalid")
+
+    verified_root = load_oci_root_volume(roots, transaction.volume_id, runner=runner)
+    root = verified_root.record
+    root_contract = {
+        "filesystem": "ext4",
+        "filesystem_uuid": verified_root.filesystem_uuid,
+        "generation": root.generation,
+        "serial": _serial("root", root.volume_id),
+        "size_bytes": root.size_bytes,
+        "target": "vda",
+        "volume_id": root.volume_id,
+    }
+    if (
+        _plain_json(plan.root_volume) != root_contract
+        or root.status != "attached"
+        or root.attached_run_id != transaction.owner.run_id
+        or root.attached_run_name != transaction.owner.run_name
+        or root.lower_graph_digest != transaction.lower_graph_digest
+        or root.retention_policy != transaction.retention_policy
+    ):
+        raise StateError("OCI-root domain plan root volume binding is invalid")
+
+    boot = verify_host_boot_artifacts(
+        boot_artifacts.kernel.path,
+        boot_artifacts.initramfs.path,
+        architecture=boot_artifacts.architecture,
+        expected_kernel_digest=str(plan.boot_artifacts["kernel"]["digest"]),
+        expected_initramfs_digest=str(plan.boot_artifacts["initramfs"]["digest"]),
+    )
+    if boot != boot_artifacts or boot.to_dict() != _plain_json(plan.boot_artifacts):
+        raise StateError("OCI-root domain plan boot artifact binding is invalid")
+
+    expected_stage1 = OCIStage1Plan.from_domain_plan(plan)
+    built_transport = build_stage1_transport(expected_stage1)
+    transport_contract = {
+        **built_transport.receipt.to_dict(),
+        "serial": _serial("stage1-transport", built_transport.receipt.artifact_digest),
+        "target": "vdb",
+    }
+    if _plain_json(plan.stage1_transport) != transport_contract:
+        raise StateError("OCI-root stage-1 transport projection is invalid")
+    transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
+    verified_transport = verify_stage1_transport_file(
+        transport_path,
+        built_transport.receipt,
+        expected_stage1_plan=expected_stage1,
+    )
+    if verified_transport.plan != expected_stage1:
+        raise StateError("OCI-root stage-1 transport changed before domain definition")
+
+    spec = OCIRootDomainSpec(
+        name=plan.run_name,
+        memory_mib=plan.memory_mib,
+        vcpus=plan.vcpus,
+        kernel=boot.kernel.path,
+        initramfs=boot.initramfs.path,
+        kernel_cmdline=plan.kernel_cmdline,
+        root_disk=verified_root.path,
+        root_serial=str(plan.root_volume["serial"]),
+        layers=tuple(disks),
+        stage1_transport=Stage1TransportDisk(
+            built_transport.receipt.artifact_digest,
+            transport_path,
+            "vdb",
+            str(plan.stage1_transport["serial"]),
+        ),
+        network=plan.network,
+        run_id=plan.run_id,
+        boot_contract_digest=plan.digest,
+    )
+    try:
+        xml = build_oci_root_domain_xml(spec, profile)
+    except KvmError as exc:
+        raise StateError("OCI-root domain profile is invalid at definition boundary") from exc
+    return ResolvedOCIRootDomainPlan(plan, spec, profile, xml)
+
+
 __all__ = [
     "OCI_ROOT_BOOT_ARTIFACT_POLICY",
     "OCI_ROOT_DOMAIN_PLAN_SCHEMA",
@@ -1017,6 +1223,7 @@ __all__ = [
     "build_oci_root_domain_plan",
     "commit_oci_root_domain_plan",
     "load_oci_root_domain_plan",
+    "resolve_committed_oci_root_domain_plan",
     "verify_host_boot_artifacts",
     "verify_first_party_bootstrap_initramfs",
 ]
