@@ -50,9 +50,11 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v8"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v3"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v9"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v4"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
+OCI_ROOT_LIFECYCLE_ENDPOINT = "run-private/lifecycle.sock"
+OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = "lifecycle.sock"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -135,6 +137,7 @@ def _domain_core_dict(
         "lower_lease_set_id": lower_lease_set_id,
         "lifecycle_control": {
             "channel_name": OCI_CONTROL_CHANNEL_NAME,
+            "endpoint": OCI_ROOT_LIFECYCLE_ENDPOINT,
             "protocol": OCI_CONTROL_PROTOCOL,
             "transport": "virtio-serial",
         },
@@ -525,6 +528,7 @@ class OCIRootDomainPlan:
             "lower_lease_set_id": self.lower_lease_set_id,
             "lifecycle_control": {
                 "channel_name": OCI_CONTROL_CHANNEL_NAME,
+                "endpoint": OCI_ROOT_LIFECYCLE_ENDPOINT,
                 "protocol": OCI_CONTROL_PROTOCOL,
                 "transport": "virtio-serial",
             },
@@ -549,6 +553,7 @@ class OCIRootDomainPlan:
             "palimpsest.oci-root-domain-plan.v5",
             "palimpsest.oci-root-domain-plan.v6",
             "palimpsest.oci-root-domain-plan.v7",
+            "palimpsest.oci-root-domain-plan.v8",
         }:
             version = str(value["schema"]).rsplit(".", 1)[-1]
             raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")
@@ -588,6 +593,7 @@ class OCIRootDomainPlan:
             or lifecycle
             != {
                 "channel_name": OCI_CONTROL_CHANNEL_NAME,
+                "endpoint": OCI_ROOT_LIFECYCLE_ENDPOINT,
                 "protocol": OCI_CONTROL_PROTOCOL,
                 "transport": "virtio-serial",
             }
@@ -861,6 +867,7 @@ def build_oci_root_domain_plan(
         network=network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
+        lifecycle_socket=run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME,
     )
     try:
         xml = build_oci_root_domain_xml(spec, profile)
@@ -1000,6 +1007,7 @@ def commit_oci_root_domain_plan(
         network=plan.network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
+        lifecycle_socket=run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME,
     )
     try:
         expected_xml = build_oci_root_domain_xml(expected_spec, resolved.profile)
@@ -1185,6 +1193,15 @@ def resolve_committed_oci_root_domain_plan(
     )
     if verified_transport.plan != expected_stage1:
         raise StateError("OCI-root stage-1 transport changed before domain definition")
+    lifecycle_socket = run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME
+    try:
+        lifecycle_socket.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise StateError("OCI-root lifecycle socket path is ambiguous") from None
+    else:
+        raise StateError("OCI-root lifecycle socket path is already reserved")
 
     spec = OCIRootDomainSpec(
         name=plan.run_name,
@@ -1205,6 +1222,7 @@ def resolve_committed_oci_root_domain_plan(
         network=plan.network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
+        lifecycle_socket=lifecycle_socket,
     )
     try:
         xml = build_oci_root_domain_xml(spec, profile)
@@ -1216,6 +1234,8 @@ def resolve_committed_oci_root_domain_plan(
 __all__ = [
     "OCI_ROOT_BOOT_ARTIFACT_POLICY",
     "OCI_ROOT_DOMAIN_PLAN_SCHEMA",
+    "OCI_ROOT_LIFECYCLE_ENDPOINT",
+    "OCI_ROOT_LIFECYCLE_SOCKET_FILENAME",
     "OCIRootDomainPlan",
     "ResolvedOCIRootDomainPlan",
     "VerifiedHostBootArtifact",

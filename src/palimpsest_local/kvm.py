@@ -99,6 +99,7 @@ class OCIRootDomainSpec:
     console_log: Path | None = None
     run_id: str | None = None
     boot_contract_digest: str | None = None
+    lifecycle_socket: Path | None = None
     lifecycle_channel_name: str = OCI_CONTROL_CHANNEL_NAME
     lifecycle_protocol: str = OCI_CONTROL_PROTOCOL
 
@@ -307,6 +308,12 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root boot contract digest is not canonical")
     if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL:
         raise KvmError("OCI-root lifecycle channel contract is invalid")
+    if (
+        not isinstance(spec.lifecycle_socket, Path)
+        or not spec.lifecycle_socket.is_absolute()
+        or spec.lifecycle_socket.name != "lifecycle.sock"
+    ):
+        raise KvmError("OCI-root lifecycle socket path is invalid")
 
     seen_serials = {spec.root_serial}
     for index, layer in enumerate(spec.layers):
@@ -386,6 +393,11 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         ET.SubElement(disk, "serial").text = layer.serial
     ET.SubElement(devices, "controller", {"type": "virtio-serial", "index": "0"})
     lifecycle_channel = ET.SubElement(devices, "channel", {"type": "unix"})
+    ET.SubElement(
+        lifecycle_channel,
+        "source",
+        {"mode": "bind", "path": str(spec.lifecycle_socket)},
+    )
     ET.SubElement(
         lifecycle_channel,
         "target",

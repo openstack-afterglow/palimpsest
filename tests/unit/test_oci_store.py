@@ -1641,10 +1641,11 @@ _FAKE_LIBVIRT = SimpleNamespace(libvirtError=_FakeLibvirtError, VIR_ERR_NO_DOMAI
 
 
 class _DefinedDomain:
-    def __init__(self, connection, name: str, xml: str):
+    def __init__(self, connection, name: str, xml: str, *, domain_uuid: str | None = None):
         self.connection = connection
         self.name = name
         self.xml = xml
+        self.domain_uuid = domain_uuid or str(uuid.uuid4())
         self.undefine_calls = 0
 
     def XMLDesc(self) -> str:
@@ -1653,19 +1654,38 @@ class _DefinedDomain:
     def isActive(self) -> int:
         return 0
 
+    def UUIDString(self) -> str:
+        return self.domain_uuid
+
     def undefine(self) -> None:
         self.undefine_calls += 1
+        if self.connection.undefine_error is not None:
+            raise self.connection.undefine_error
         if self.connection.domains.get(self.name) is self:
             del self.connection.domains[self.name]
 
 
 class _DefinitionConnection:
-    def __init__(self, *, transform=None, define_error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        transform=None,
+        define_error: Exception | None = None,
+        uri: str = "qemu:///system",
+        rebind_uuid: bool = False,
+        undefine_error: Exception | None = None,
+    ):
         self.domains: dict[str, _DefinedDomain] = {}
         self.transform = transform
         self.define_error = define_error
+        self.uri = uri
+        self.rebind_uuid = rebind_uuid
+        self.undefine_error = undefine_error
         self.lookup_error: Exception | None = None
         self.define_calls = 0
+
+    def getURI(self) -> str:
+        return self.uri
 
     def lookupByName(self, name: str) -> _DefinedDomain:
         if self.lookup_error is not None:
@@ -1685,6 +1705,8 @@ class _DefinitionConnection:
         self.domains[name] = domain
         if self.define_error is not None:
             raise self.define_error
+        if self.rebind_uuid:
+            self.domains[name] = _DefinedDomain(self, name, actual)
         return domain
 
 
@@ -1792,6 +1814,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert plan.stage1_transport["target"] == "vdb"
     assert plan.to_dict()["lifecycle_control"] == {
         "channel_name": "org.palimpsest.oci.lifecycle.0",
+        "endpoint": "run-private/lifecycle.sock",
         "protocol": "palimpsest.oci-lifecycle-control.v1",
         "transport": "virtio-serial",
     }
@@ -1838,6 +1861,11 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     lifecycle_obsolete["schema"] = "palimpsest.oci-root-domain-plan.v7"
     with pytest.raises(StateError, match="pre-production.*v7.*rebuild"):
         type(plan).from_dict(lifecycle_obsolete)
+    define_obsolete = deepcopy(plan.to_dict())
+    define_obsolete["schema"] = "palimpsest.oci-root-domain-plan.v8"
+    define_obsolete["lifecycle_control"].pop("endpoint")
+    with pytest.raises(StateError, match="pre-production.*v8.*rebuild"):
+        type(plan).from_dict(define_obsolete)
     state_path = roots.runs / "domain-plan" / "state.json"
     state_before = state_path.read_bytes()
     transport_before = transport_path.read_bytes()
@@ -1917,14 +1945,23 @@ def test_oci_root_define_revalidates_and_durably_records_inactive_domain(
     assert receipt.run_id == plan.run_id
     assert receipt.run_name == "define-ready"
     assert receipt.plan_digest == plan.digest
+    assert receipt.domain_uuid == conn.domains["define-ready"].UUIDString()
+    assert receipt.libvirt_uri == profile.uri
     assert conn.define_calls == 1
     assert conn.domains["define-ready"].isActive() == 0
     snapshot = read_run_ledger_snapshot(roots, "define-ready")
     assert snapshot.state["status"] == "defined"
     assert snapshot.state["oci_root_domain"]["digest"] == plan.digest
+    assert snapshot.state["oci_root_definition"] == {
+        "domain_uuid": receipt.domain_uuid,
+        "libvirt_uri": profile.uri,
+        "phase": "defined",
+        "plan_digest": plan.digest,
+        "schema": "palimpsest.oci-root-definition.v1",
+    }
 
 
-@pytest.mark.parametrize("tamper", ["lower", "root", "transport", "kernel", "profile"])
+@pytest.mark.parametrize("tamper", ["lower", "root", "transport", "kernel", "socket", "profile"])
 def test_oci_root_define_rejects_live_authority_tamper_before_libvirt_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1958,6 +1995,8 @@ def test_oci_root_define_rejects_live_authority_tamper_before_libvirt_mutation(
         payload = bytearray(boot.kernel.path.read_bytes())
         payload[0] ^= 1
         boot.kernel.path.write_bytes(payload)
+    elif tamper == "socket":
+        (roots.runs / f"tamper-{tamper}" / "lifecycle.sock").symlink_to(tmp_path / "foreign.sock")
     else:
         selected_profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "aarch64")
     conn = _DefinitionConnection()
@@ -1984,6 +2023,11 @@ def test_oci_root_define_fails_closed_for_ambiguous_lookup_and_foreign_domain(
 ) -> None:
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "lookup-guard")
     monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    wrong_uri = _DefinitionConnection(uri="qemu:///session")
+    with pytest.raises(StateError, match="URI does not match"):
+        define_committed_oci_root_domain(roots, "lookup-guard", store, boot, profile, conn=wrong_uri, runner=tools)
+    assert wrong_uri.define_calls == 0
+
     ambiguous = _DefinitionConnection()
     ambiguous.lookup_error = _FakeLibvirtError("transport failure", 99)
     with pytest.raises(StateError, match="cannot determine"):
@@ -2000,7 +2044,10 @@ def test_oci_root_define_fails_closed_for_ambiguous_lookup_and_foreign_domain(
     assert foreign_domain.undefine_calls == 0
 
 
-@pytest.mark.parametrize("failure", ["define", "disk", "lifecycle"])
+@pytest.mark.parametrize(
+    "failure",
+    ["disk", "lifecycle", "channel-source", "cpu", "features", "console", "direct-boot"],
+)
 def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2018,13 +2065,20 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
             root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle").set(
                 "channel", "attacker.control"
             )
+        elif failure == "channel-source":
+            root.find("./devices/channel/source").set("path", "/tmp/attacker.sock")
+        elif failure == "cpu":
+            root.find("./cpu").set("mode", "custom")
+        elif failure == "features":
+            root.find("./features").remove(root.find("./features/apic"))
+        elif failure == "console":
+            root.find("./devices/console/target").set("port", "1")
+        elif failure == "direct-boot":
+            ET.SubElement(root.find("./os"), "boot", {"dev": "hd"})
         return ET.tostring(root, encoding="unicode")
 
-    conn = _DefinitionConnection(
-        transform=None if failure == "define" else transform,
-        define_error=RuntimeError("partial define failure") if failure == "define" else None,
-    )
-    with pytest.raises((RuntimeError, StateError)):
+    conn = _DefinitionConnection(transform=transform)
+    with pytest.raises(StateError):
         define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     assert name not in conn.domains
@@ -2036,6 +2090,44 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
         plan_digest=prepared.transaction.boot_plan_digest,
     ).members
     assert (roots.runs / name / "stage1-plan.raw").is_file()
+
+
+@pytest.mark.parametrize("failure", ["partial-define", "uuid-rebind", "undefine"])
+def test_oci_root_define_records_cleanup_required_when_safe_cleanup_cannot_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    name = f"cleanup-required-{failure}"
+    roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    def bad_disk(xml: str) -> str:
+        root = ET.fromstring(xml)
+        root.find("./devices/disk/source").set("file", "/foreign/root.raw")
+        return ET.tostring(root, encoding="unicode")
+
+    if failure == "partial-define":
+        conn = _DefinitionConnection(define_error=RuntimeError("partial define failure"))
+    elif failure == "uuid-rebind":
+        conn = _DefinitionConnection(rebind_uuid=True)
+    else:
+        conn = _DefinitionConnection(transform=bad_disk, undefine_error=RuntimeError("undefine failed"))
+
+    with pytest.raises(StateError, match="cleanup.*required"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name in conn.domains
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    cleanup = snapshot.state["oci_root_definition"]
+    assert cleanup["phase"] == "cleanup-required"
+    assert cleanup["plan_digest"] == plan.digest
+    assert cleanup["libvirt_uri"] == profile.uri
+    if failure == "partial-define":
+        assert cleanup["domain_uuid"] is None
+    else:
+        assert isinstance(cleanup["domain_uuid"], str)
 
 
 def test_oci_root_define_does_not_cleanup_foreign_post_define_rebinding(
@@ -2053,11 +2145,13 @@ def test_oci_root_define_does_not_cleanup_foreign_post_define_rebinding(
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=foreign_marker)
-    with pytest.raises(StateError, match="committed contract"):
+    with pytest.raises(StateError, match="cleanup.*required"):
         define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     assert conn.domains[name].undefine_calls == 0
-    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root_definition"]["phase"] == "cleanup-required"
 
 
 def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -> None:

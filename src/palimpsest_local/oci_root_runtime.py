@@ -6,6 +6,7 @@ dispatch remains disabled until the privileged lifecycle handshake is ready.
 
 from __future__ import annotations
 
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +23,8 @@ from .platforms import DomainProfile
 from .project_volumes import CommandRunner, _default_runner
 from .state import StatePaths, locked_existing_run
 
+OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v1"
+
 
 @dataclass(frozen=True, slots=True)
 class DefinedOCIRootDomain:
@@ -30,6 +33,8 @@ class DefinedOCIRootDomain:
     run_id: str
     run_name: str
     plan_digest: str
+    domain_uuid: str
+    libvirt_uri: str
 
 
 def _single(parent: ET.Element, path: str, message: str) -> ET.Element:
@@ -113,18 +118,43 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         source = _single(interface, "./source", "defined OCI-root network source is invalid")
         model = _single(interface, "./model", "defined OCI-root network model is invalid")
         network_projection.append((interface.get("type"), source.get("network"), model.get("type")))
-    channel_projection: list[tuple[str | None, str | None, str | None]] = []
+    channel_projection: list[tuple[str | None, ...]] = []
     for channel in channels:
+        source = _single(channel, "./source", "defined OCI-root lifecycle channel source is invalid")
         target = _single(channel, "./target", "defined OCI-root lifecycle channel is invalid")
-        channel_projection.append((channel.get("type"), target.get("type"), target.get("name")))
+        if set(source.attrib) != {"mode", "path"} or set(target.attrib) != {"type", "name"}:
+            raise StateError("defined OCI-root lifecycle channel source is invalid")
+        channel_projection.append(
+            (
+                channel.get("type"),
+                source.get("mode"),
+                source.get("path"),
+                target.get("type"),
+                target.get("name"),
+            )
+        )
     os_type = _single(root, "./os/type", "defined OCI-root machine contract is invalid")
+    os_element = _single(root, "./os", "defined OCI-root direct-boot contract is invalid")
+    if os_element.attrib or any(os_element.findall(path) for path in ("./boot", "./loader", "./nvram")):
+        raise StateError("defined OCI-root direct-boot contract is invalid")
     memory = _single(root, "./memory", "defined OCI-root memory contract is invalid")
+    cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
+    features = _single(root, "./features", "defined OCI-root feature contract is invalid")
+    consoles = root.findall("./devices/console")
+    if len(consoles) != 1:
+        raise StateError("defined OCI-root console contract is invalid")
+    console = consoles[0]
+    console_targets = console.findall("./target")
+    console_sources = console.findall("./source")
+    if len(console_targets) != 1 or len(console_sources) > 1:
+        raise StateError("defined OCI-root console contract is invalid")
     return {
         "channels": tuple(channel_projection),
         "controllers": tuple(controllers),
         "disks": _disk_projection(root),
         "domain_type": root.get("type"),
         "emulator": _text(root, "./devices/emulator", "defined OCI-root emulator is invalid"),
+        "features": tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(features)),
         "initramfs": _text(root, "./os/initrd", "defined OCI-root initramfs is invalid"),
         "interfaces": tuple(network_projection),
         "kernel": _text(root, "./os/kernel", "defined OCI-root kernel is invalid"),
@@ -134,11 +164,37 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "marker": dict(marker.attrib),
         "memory": (memory.get("unit"), memory.text),
         "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
+        "cpu": (
+            tuple(sorted(cpu.attrib.items())),
+            tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(cpu)),
+        ),
+        "console": (
+            tuple(sorted(console.attrib.items())),
+            None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
+            tuple(sorted(console_targets[0].attrib.items())),
+        ),
         "vcpus": _text(root, "./vcpu", "defined OCI-root vCPU contract is invalid"),
     }
 
 
-def _validate_defined_domain(domain: Any, resolved: ResolvedOCIRootDomainPlan) -> None:
+def _domain_uuid(domain: Any) -> str:
+    try:
+        value = domain.UUIDString()
+        parsed = str(uuid.UUID(value))
+    except Exception as exc:
+        raise StateError("defined OCI-root domain UUID is invalid") from exc
+    if parsed != value:
+        raise StateError("defined OCI-root domain UUID is not canonical")
+    return value
+
+
+def _validate_defined_domain(
+    domain: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str,
+) -> None:
+    if _domain_uuid(domain) != expected_uuid:
+        raise StateError("defined OCI-root domain UUID changed after definition")
     try:
         actual_xml = domain.XMLDesc()
     except Exception as exc:
@@ -187,16 +243,58 @@ def _has_exact_owner(domain: Any, resolved: ResolvedOCIRootDomainPlan) -> bool:
     }
 
 
-def _cleanup_exact_new_domain(conn: Any, resolved: ResolvedOCIRootDomainPlan) -> None:
-    try:
-        domain = _lookup(conn, resolved.plan.run_name)
-        if domain is None or not _has_exact_owner(domain, resolved):
-            return
-        if domain.isActive() != 0:
-            return
-        domain.undefine()
-    except Exception:
+def _cleanup_exact_new_domain(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str | None,
+) -> None:
+    domain = _lookup(conn, resolved.plan.run_name)
+    if domain is None:
         return
+    if expected_uuid is None:
+        raise StateError("partially defined OCI-root domain has no captured UUID")
+    if _domain_uuid(domain) != expected_uuid or not _has_exact_owner(domain, resolved):
+        raise StateError("defined OCI-root domain identity changed before cleanup")
+    try:
+        active = domain.isActive()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain activity is ambiguous during cleanup") from exc
+    if active != 0:
+        raise StateError("defined OCI-root domain is unexpectedly active during cleanup")
+    try:
+        domain.undefine()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain cleanup failed") from exc
+    if _lookup(conn, resolved.plan.run_name) is not None:
+        raise StateError("defined OCI-root domain remains after cleanup")
+
+
+def _connection_uri(conn: Any, profile: DomainProfile) -> str:
+    try:
+        uri = conn.getURI()
+    except Exception as exc:
+        raise StateError("OCI-root libvirt connection URI cannot be inspected") from exc
+    if not isinstance(uri, str) or uri != profile.uri:
+        raise StateError("OCI-root libvirt connection URI does not match the qualified profile")
+    return uri
+
+
+def _record_cleanup_required(
+    mutation: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str | None,
+    libvirt_uri: str,
+) -> None:
+    data = mutation.mutable_state()
+    data["error"] = "OCI-root domain definition failed and cleanup is required"
+    data["oci_root_definition"] = {
+        "domain_uuid": domain_uuid,
+        "libvirt_uri": libvirt_uri,
+        "phase": "cleanup-required",
+        "plan_digest": resolved.plan.digest,
+        "schema": OCI_ROOT_DEFINITION_SCHEMA,
+    }
+    mutation.write_state("failed", data)
 
 
 def define_committed_oci_root_domain(
@@ -219,6 +317,7 @@ def define_committed_oci_root_domain(
     if conn is None:
         raise StateError("OCI-root domain definition requires an explicit libvirt connection")
     with locked_existing_run(roots, name) as mutation:
+        libvirt_uri = _connection_uri(conn, profile)
         resolved = resolve_committed_oci_root_domain_plan(
             roots,
             mutation.snapshot,
@@ -230,26 +329,50 @@ def define_committed_oci_root_domain(
         if _lookup(conn, name) is not None:
             raise StateError(f"libvirt domain name is already reserved: {name}")
         attempted = False
+        domain_uuid: str | None = None
         try:
             mutation.verify_binding()
             attempted = True
             domain = conn.defineXML(resolved.xml)
             if domain is None:
                 raise StateError("OCI-root domain definition failed")
+            domain_uuid = _domain_uuid(domain)
             current = _lookup(conn, name)
             if current is None:
                 raise StateError("defined OCI-root domain is missing")
-            _validate_defined_domain(current, resolved)
+            _validate_defined_domain(current, resolved, domain_uuid)
             mutation.verify_binding()
             data = mutation.mutable_state()
+            data["oci_root_definition"] = {
+                "domain_uuid": domain_uuid,
+                "libvirt_uri": libvirt_uri,
+                "phase": "defined",
+                "plan_digest": resolved.plan.digest,
+                "schema": OCI_ROOT_DEFINITION_SCHEMA,
+            }
             result = mutation.write_state("defined", data)
             if result.get("status") != "defined":
                 raise StateError("OCI-root domain definition was not durably recorded")
         except BaseException:
             if attempted:
-                _cleanup_exact_new_domain(conn, resolved)
+                try:
+                    _cleanup_exact_new_domain(conn, resolved, domain_uuid)
+                except Exception as cleanup_exc:
+                    try:
+                        _record_cleanup_required(mutation, resolved, domain_uuid, libvirt_uri)
+                    except Exception as ledger_exc:
+                        raise StateError(
+                            "OCI-root domain cleanup failed and cleanup-required state could not be recorded"
+                        ) from ledger_exc
+                    raise StateError("OCI-root domain cleanup failed; cleanup is required") from cleanup_exc
             raise
-        return DefinedOCIRootDomain(resolved.plan.run_id, resolved.plan.run_name, resolved.plan.digest)
+        return DefinedOCIRootDomain(
+            resolved.plan.run_id,
+            resolved.plan.run_name,
+            resolved.plan.digest,
+            domain_uuid,
+            libvirt_uri,
+        )
 
 
-__all__ = ["DefinedOCIRootDomain", "define_committed_oci_root_domain"]
+__all__ = ["OCI_ROOT_DEFINITION_SCHEMA", "DefinedOCIRootDomain", "define_committed_oci_root_domain"]

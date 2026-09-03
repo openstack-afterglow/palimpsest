@@ -103,6 +103,7 @@ def _oci_root_spec() -> OCIRootDomainSpec:
         ),
         run_id="f6f546e2-e734-4920-9eff-1762b348a249",
         boot_contract_digest="sha256:" + "4" * 64,
+        lifecycle_socket=Path("/var/lib/palimpsest/runs/oci-demo/lifecycle.sock"),
     )
 
 
@@ -140,7 +141,10 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     channels = xml.findall("./devices/channel")
     assert len(channels) == 1
     assert channels[0].attrib == {"type": "unix"}
-    assert channels[0].find("source") is None
+    assert channels[0].find("source").attrib == {
+        "mode": "bind",
+        "path": "/var/lib/palimpsest/runs/oci-demo/lifecycle.sock",
+    }
     assert channels[0].find("target").attrib == {"type": "virtio", "name": OCI_CONTROL_CHANNEL_NAME}
 
 
@@ -165,6 +169,11 @@ def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
     with pytest.raises(KvmError, match="lifecycle channel contract"):
         build_oci_root_domain_xml(
             OCIRootDomainSpec(**{**spec.__dict__, "lifecycle_channel_name": "user.controlled"}),
+            _X86_PROFILE,
+        )
+    with pytest.raises(KvmError, match="lifecycle socket path"):
+        build_oci_root_domain_xml(
+            OCIRootDomainSpec(**{**spec.__dict__, "lifecycle_socket": Path("relative/lifecycle.sock")}),
             _X86_PROFILE,
         )
 
