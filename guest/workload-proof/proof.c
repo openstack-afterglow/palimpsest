@@ -408,7 +408,7 @@ static int wait_for_pid1_sigterm(int descriptor) {
     return signal_number == SIGTERM && sender_pid == 1;
 }
 
-static int verify_invocation(u64 argc, char **argv, char **environment) {
+static int invocation_failure(u64 argc, char **argv, char **environment) {
     static const char sentinel[] = "palimpsest-oci-root-workload-proof-v1\n";
     char cwd[64];
     i64 cwd_size;
@@ -416,24 +416,26 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
     if ((argc != 4 && argc != 5) || !same_text(argv[0], "/.__palimpsest_workload_proof_v1") ||
         !same_text(argv[1], "palimpsest-argv-one") || !same_text(argv[2], "") ||
         !same_text(argv[3], "line\nbreak") ||
-        (argc == 5 && !same_text(argv[4], "palimpsest-uid0-isolation-v1"))) return 0;
+        (argc == 5 && !same_text(argv[4], "palimpsest-uid0-isolation-v1"))) return 1;
     uid0_mode = argc == 5;
     if (!environment[0] || !environment[1] || environment[2] ||
         !same_text(environment[0], "PALIMPSEST_PROOF_ENV=value with spaces") ||
-        !same_text(environment[1], "PALIMPSEST_PROOF_EMPTY=")) return 0;
-    if (sc0(SYS_getpid) <= 1 || sc0(SYS_getppid) != 1 || sc0(SYS_getpgrp) != sc0(SYS_getpid)) return 0;
+        !same_text(environment[1], "PALIMPSEST_PROOF_EMPTY=")) return 2;
+    if (sc0(SYS_getpid) <= 1 || sc0(SYS_getppid) != 1 || sc0(SYS_getpgrp) != sc0(SYS_getpid)) return 3;
     if (sc0(SYS_getuid) != (uid0_mode ? 0 : 65534) ||
-        sc0(SYS_getgid) != (uid0_mode ? 0 : 65534) || sc2(SYS_getgroups, 0, 0) != 0) return 0;
+        sc0(SYS_getgid) != (uid0_mode ? 0 : 65534) || sc2(SYS_getgroups, 0, 0) != 0) return 4;
     cwd_size = sc2(SYS_getcwd, (i64)cwd, sizeof(cwd));
-    if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 0;
-    return read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
-           read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
-           read_exact_file("/proc/self/cgroup", "0::/palimpsest.workload\n") &&
-           verify_cgroup_escape_denied("/sys/fs/cgroup/cgroup.procs") &&
-           verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs") &&
-           verify_capabilityless_boundary() && verify_private_devices() &&
-           verify_authority_escape_denied() &&
-           verify_pid1_root_credentials();
+    if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 5;
+    if (!read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel)) return 6;
+    if (!read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel)) return 7;
+    if (!read_exact_file("/proc/self/cgroup", "0::/palimpsest.workload\n")) return 8;
+    if (!verify_cgroup_escape_denied("/sys/fs/cgroup/cgroup.procs")) return 9;
+    if (!verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs")) return 10;
+    if (!verify_capabilityless_boundary()) return 11;
+    if (!verify_private_devices()) return 12;
+    if (!verify_authority_escape_denied()) return 13;
+    if (!verify_pid1_root_credentials()) return 14;
+    return 0;
 }
 
 static __attribute__((noreturn)) void run_cooperative_descendant(int ready_writer,
@@ -466,9 +468,11 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     i64 main_pid;
     i64 cooperative, stubborn;
     int main_signal_fd;
+    int invocation_error;
     u8 ready[2];
     usize ready_bytes = 0;
-    if (!verify_invocation(argc, argv, environment)) exit_now(FAILURE_BASE + 1);
+    invocation_error = invocation_failure(argc, argv, environment);
+    if (invocation_error) exit_now(FAILURE_BASE + invocation_error);
     if (!block_sigterm()) exit_now(FAILURE_BASE + 2);
     if (sc2(SYS_pipe2, (i64)ready_pipe, O_CLOEXEC) != 0) exit_now(FAILURE_BASE + 3);
     main_pid = sc0(SYS_getpid);
