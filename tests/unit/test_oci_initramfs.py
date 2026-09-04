@@ -140,12 +140,10 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == (
-        "authenticated-overlay-switch-root-pid1-supervisor-workload-isolation"
-    )
+    assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v13"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v14"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -165,22 +163,23 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cleanup_scope": "dedicated-workload-cgroup",
-        "contract": "palimpsest.guest-pid1-supervisor.v6",
-        "credential_transition": "isolate-drop-verify-handshake-cgroup-attach-release",
+        "contract": "palimpsest.guest-pid1-supervisor.v7",
+        "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "credentials": "root-pid1-broker-and-capabilityless-admitted-numeric-workload-identity",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
         "isolation": {
             "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
-            "contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
+            "contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
             "devices": ["full", "null", "random", "tty", "urandom", "zero"],
             "lifecycle_fd": "child-closed-before-isolation-ready",
+            "lifecycle_key": "pid1-generated-post-fork-post-isolation-never-inherited",
             "mounts": "private-dev-tmpfs-masked-virtio-ports-readonly-proc-sys-cgroup",
             "pid1_proc": "nondumpable-before-fork",
             "seccomp": "authority-escape-boundary-filter",
         },
-        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
-        "lifecycle_delivery": "reconnect-snapshot-same-id-stop-retry-v1",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
+        "lifecycle_delivery": "authenticated-v2-bootstrap-boundary-ack-reconnect-snapshot-same-id-stop-retry",
         "privilege_after_fork": "root-pid1-narrow-broker-capabilityless-workload",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
@@ -228,7 +227,7 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"; pid1_groups=" in stage1
     assert b"; cleanup=cgroup.kill; cgroup_populated=0" in stage1
     assert b"org.palimpsest.oci.lifecycle.0" in stage1
-    assert b"palimpsest.oci-lifecycle-control.v1" in stage1
+    assert b"palimpsest.oci-lifecycle-control.v2" in stage1
     assert b"lifecycle rejected; stage=" in stage1
 
 
@@ -242,18 +241,18 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v11")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v5")' in source
-    assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v1")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v12")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v6")' in source
+    assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v2")' in source
     assert '"org.palimpsest.oci.lifecycle.0"' in source
-    assert '"palimpsest.oci-lifecycle-control.v1"' in source
+    assert '"palimpsest.oci-lifecycle-control.v2"' in source
     assert "BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT" in source
     assert "X32_SYSCALL_BIT 0x40000000U" in source
     assert 'verify_mountinfo("/proc", "proc", 1' in source
     assert 'verify_mountinfo("/proc/1/fd", "tmpfs", 1' in source
     assert 'verify_mountinfo("/proc/1/fdinfo", "tmpfs", 1' in source
     assert "sc2(SYS_chmod, (i64)path, 0666)" in source
-    assert 'MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC' in source
+    assert "MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC" in source
     assert 'SYS_mount, (i64)staging, (i64)"/sys/fs/cgroup", 0, MS_MOVE' in source
     assert "child_failure_ready = early_error_bytes == sizeof(early_failure)" in source
     assert "SYS_getrandom 318" in source
@@ -270,8 +269,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "if (session->state == LIFECYCLE_TERMINAL)" in source
     assert "session->natural_late_stop_allowed = 0;" in source
     assert "lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;" in source
-    assert "session->connection == LIFECYCLE_CONNECTED && session->connection_has_hello" in source
-    assert "write_all(1, LIFECYCLE_PEER_BOUNDARY_MARKER);" in source
+    assert "session->connection == LIFECYCLE_CONNECTED" in source
+    assert "send_boundary_ack(session, discarded_header, discarded_payload, discarded_expected)" in source
     assert "session->payload_used + 1 == session->payload_expected" in source
     assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
     assert source.count("lifecycle_rejected(21, EIO);") >= 2

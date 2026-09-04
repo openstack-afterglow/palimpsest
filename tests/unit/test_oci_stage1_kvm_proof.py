@@ -52,6 +52,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     _lifecycle_negative_wire_bytes,
     _logical_line_count,
     _read_console_until,
+    _receipt_lifecycle_projection,
     _secure_write,
     _uid0_lifecycle_evidence,
     _verify_fixture_source_tree,
@@ -82,7 +83,8 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     workload_negative_control_contract,
 )
 from palimpsest_local.errors import ArtifactValidationError
-from palimpsest_local.oci_control_protocol import OCIControlBinding, OCIControlMessage, encode_frame
+from palimpsest_local.oci_control_protocol import OCIControlBinding
+from palimpsest_local.oci_control_protocol_v2 import HostOCIControlV2Session, OCIControlV2Binding, encode_frame
 from palimpsest_local.oci_initramfs import build_bootstrap_initramfs
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
 
@@ -175,7 +177,9 @@ def _lifecycle_negative_inputs() -> dict[str, dict[str, object]]:
     generation = "33333333-3333-4333-8333-333333333333"
     result = {}
     for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
-        selected_generation = generation if name.startswith("stop_") or name == "second_distinct_stop" else None
+        selected_generation = (
+            generation if name.startswith("stop_") or name in {"hello_reused_nonce", "second_distinct_stop"} else None
+        )
         payload = _lifecycle_negative_wire_bytes(name, binding, boot_generation=selected_generation)
         result[name] = {
             "boot_generation": selected_generation,
@@ -192,164 +196,119 @@ def _lifecycle_control_binding_for_test() -> OCIControlBinding:
     return OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
 
 
+def test_receipt_projection_rebinds_digest_after_adding_connection() -> None:
+    binding = OCIControlV2Binding(
+        "f6f546e2-e734-4920-9eff-1762b348a249",
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+    )
+    control = HostOCIControlV2Session(
+        binding,
+        nonce_factory=lambda: "1" * 64,
+        boot_attempt_factory=lambda: "aca88126-d991-4de8-b66b-90dc07904dff",
+    )
+    hello = control.hello()
+    projection = control.transcript_projection(hello, encode_frame(hello))
+    receipt_projection = _receipt_lifecycle_projection(1, projection)
+
+    assert receipt_projection["connection"] == 1
+    assert receipt_projection["projection_digest"] == (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in receipt_projection.items() if key != "projection_digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    assert receipt_projection["projection_digest"] != projection["projection_digest"]
+
+
 def _lifecycle() -> dict[str, object]:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
-    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
 
-    def frames(values: tuple[tuple[int, str, OCIControlMessage], ...]) -> list[dict[str, object]]:
-        result = []
-        for connection, direction, message in values:
-            encoded = encode_frame(message)
-            result.append(
-                {
-                    "boot_generation": message.boot_generation,
-                    "connection": connection,
-                    "digest": "sha256:" + hashlib.sha256(encoded).hexdigest(),
-                    "direction": direction,
-                    "host_nonce": message.host_nonce,
-                    "kind": message.kind,
-                    "reply_to": message.reply_to,
-                    "request_id": message.request_id,
-                    "sequence": message.sequence,
-                    "size_bytes": len(encoded),
-                }
-            )
-        return result
+    def frame(
+        connection: int,
+        direction: str,
+        kind: str,
+        nonce: str,
+        generation: str,
+        wire: int,
+        *,
+        request_id: int | None = None,
+        reply_to: int | None = None,
+    ) -> dict[str, object]:
+        carrier = "console-line" if kind == "BOUNDARY_ACK" else "channel-frame"
+        token = f"{connection}:{direction}:{kind}:{nonce}:{wire}".encode()
+        digest = "sha256:" + hashlib.sha256(token).hexdigest()
+        value: dict[str, object] = {
+            "authentication_verified": kind != "HELLO",
+            "body_digest": digest,
+            "boot_attempt_id": (
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                if generation.startswith("1")
+                else "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            ),
+            "boot_generation": None if kind == "HELLO" else generation,
+            "carrier": carrier,
+            "connection": connection,
+            "direction": direction,
+            "envelope_digest": digest,
+            "epoch": connection,
+            "host_nonce": nonce,
+            "key_id": None if kind == "HELLO" else "sha256:" + "c" * 64,
+            "kind": kind,
+            "reply_to": reply_to,
+            "request_id": request_id,
+            "size_bytes": 1336 if kind == "BOUNDARY_ACK" else 800,
+            "wire_sequence": wire,
+        }
+        value["projection_digest"] = (
+            "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        )
+        return value
 
     generation1 = "11111111-1111-4111-8111-111111111111"
     nonce1 = "1" * 64
-    normal_messages = (
-        (1, "host-to-guest", OCIControlMessage("HELLO", binding, nonce1, {}, request_id=1)),
-        (
-            1,
-            "guest-to-host",
-            OCIControlMessage("READY", binding, nonce1, {}, sequence=1, boot_generation=generation1, reply_to=1),
-        ),
-        (
-            1,
-            "host-to-guest",
-            OCIControlMessage("STOP", binding, nonce1, {"signal": 15}, request_id=2, boot_generation=generation1),
-        ),
-        (
-            1,
-            "guest-to-host",
-            OCIControlMessage(
-                "TERMINAL",
-                binding,
-                nonce1,
-                {"terminal": {"exit_code": 42, "signal": None}},
-                sequence=2,
-                boot_generation=generation1,
-                reply_to=2,
-            ),
-        ),
-    )
+    normal_frames = [
+        frame(1, "host-to-guest", "HELLO", nonce1, generation1, 1, request_id=1),
+        frame(1, "guest-to-host", "BOOTSTRAP", nonce1, generation1, 1, reply_to=1),
+        frame(1, "host-to-guest", "KEY_ACK", nonce1, generation1, 2, reply_to=1),
+        frame(1, "guest-to-host", "READY", nonce1, generation1, 2, reply_to=2),
+        frame(1, "host-to-guest", "STOP", nonce1, generation1, 3, request_id=2),
+        frame(1, "guest-to-host", "TERMINAL", nonce1, generation1, 3, reply_to=2),
+    ]
     generation2 = "22222222-2222-4222-8222-222222222222"
     nonces = {index: str(index + 1) * 64 for index in range(1, 7)}
-    composite_messages = (
-        (1, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[1], {}, request_id=1)),
-        (2, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[2], {}, request_id=2)),
-        (
-            2,
-            "guest-to-host",
-            OCIControlMessage(
-                "SNAPSHOT",
-                binding,
-                nonces[2],
-                {"state": "ready", "stop_request_id": None, "terminal": None},
-                sequence=2,
-                boot_generation=generation2,
-                reply_to=2,
-            ),
-        ),
-        (3, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[3], {}, request_id=3)),
-        (
-            3,
-            "guest-to-host",
-            OCIControlMessage(
-                "SNAPSHOT",
-                binding,
-                nonces[3],
-                {"state": "ready", "stop_request_id": None, "terminal": None},
-                sequence=3,
-                boot_generation=generation2,
-                reply_to=3,
-            ),
-        ),
-        (4, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[4], {}, request_id=5)),
-        (
-            4,
-            "guest-to-host",
-            OCIControlMessage(
-                "SNAPSHOT",
-                binding,
-                nonces[4],
-                {"state": "ready", "stop_request_id": None, "terminal": None},
-                sequence=4,
-                boot_generation=generation2,
-                reply_to=5,
-            ),
-        ),
-        (
-            4,
-            "host-to-guest",
-            OCIControlMessage("STOP", binding, nonces[4], {"signal": 15}, request_id=4, boot_generation=generation2),
-        ),
-        (
-            4,
-            "host-to-guest",
-            OCIControlMessage("STOP", binding, nonces[4], {"signal": 15}, request_id=4, boot_generation=generation2),
-        ),
-        (5, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[5], {}, request_id=6)),
-        (
-            5,
-            "guest-to-host",
-            OCIControlMessage(
-                "SNAPSHOT",
-                binding,
-                nonces[5],
-                {"state": "stopping", "stop_request_id": 4, "terminal": None},
-                sequence=5,
-                boot_generation=generation2,
-                reply_to=6,
-            ),
-        ),
-        (
-            5,
-            "guest-to-host",
-            OCIControlMessage(
-                "TERMINAL",
-                binding,
-                nonces[5],
-                {"terminal": {"exit_code": 42, "signal": None}},
-                sequence=6,
-                boot_generation=generation2,
-                reply_to=4,
-            ),
-        ),
-        (6, "host-to-guest", OCIControlMessage("HELLO", binding, nonces[6], {}, request_id=7)),
-        (
-            6,
-            "guest-to-host",
-            OCIControlMessage(
-                "SNAPSHOT",
-                binding,
-                nonces[6],
-                {"state": "terminal", "stop_request_id": 4, "terminal": {"exit_code": 42, "signal": None}},
-                sequence=7,
-                boot_generation=generation2,
-                reply_to=7,
-            ),
-        ),
-    )
-    partial = encode_frame(
-        OCIControlMessage("STOP", binding, nonces[3], {"signal": 15}, request_id=4, boot_generation=generation2)
-    )
+    composite_frames = [
+        frame(1, "host-to-guest", "HELLO", nonces[1], generation2, 1, request_id=1),
+        frame(1, "guest-to-host", "BOOTSTRAP", nonces[1], generation2, 1, reply_to=1),
+        frame(1, "host-to-guest", "KEY_ACK", nonces[1], generation2, 2, reply_to=1),
+        frame(1, "guest-to-host", "BOUNDARY_ACK", nonces[1], generation2, 3, reply_to=1),
+        frame(2, "host-to-guest", "RECONNECT", nonces[2], generation2, 3, request_id=2),
+        frame(2, "guest-to-host", "BOUNDARY_ACK", nonces[2], generation2, 5, reply_to=2),
+        frame(3, "host-to-guest", "RECONNECT", nonces[3], generation2, 4, request_id=3),
+        frame(3, "guest-to-host", "SNAPSHOT", nonces[3], generation2, 6, reply_to=3),
+        frame(3, "guest-to-host", "BOUNDARY_ACK", nonces[3], generation2, 7, reply_to=3),
+        frame(4, "host-to-guest", "RECONNECT", nonces[4], generation2, 6, request_id=5),
+        frame(4, "guest-to-host", "SNAPSHOT", nonces[4], generation2, 8, reply_to=5),
+        frame(4, "host-to-guest", "STOP", nonces[4], generation2, 7, request_id=4),
+        frame(4, "host-to-guest", "STOP", nonces[4], generation2, 8, request_id=4),
+        frame(4, "guest-to-host", "BOUNDARY_ACK", nonces[4], generation2, 9, reply_to=5),
+        frame(5, "host-to-guest", "RECONNECT", nonces[5], generation2, 9, request_id=6),
+        frame(5, "guest-to-host", "SNAPSHOT", nonces[5], generation2, 10, reply_to=6),
+        frame(5, "guest-to-host", "TERMINAL", nonces[5], generation2, 11, reply_to=4),
+        frame(5, "guest-to-host", "BOUNDARY_ACK", nonces[5], generation2, 12, reply_to=6),
+        frame(6, "host-to-guest", "RECONNECT", nonces[6], generation2, 10, request_id=7),
+        frame(6, "guest-to-host", "SNAPSHOT", nonces[6], generation2, 13, reply_to=7),
+    ]
+    partial_size = 800
     boots = [
         {
             "connection_count": 1,
-            "frames": frames(normal_messages),
+            "frames": normal_frames,
             "initial_ready_host_observed": True,
             "logical_attempts": [],
             "peer_boundary_marker_count": 0,
@@ -363,14 +322,14 @@ def _lifecycle() -> dict[str, object]:
         },
         {
             "connection_count": 6,
-            "frames": frames(composite_messages),
+            "frames": composite_frames,
             "initial_ready_host_observed": False,
             "logical_attempts": [
                 {
-                    "bytes_sent": len(partial) - 1,
+                    "bytes_sent": partial_size - 1,
                     "connection": 3,
-                    "digest": "sha256:" + hashlib.sha256(partial).hexdigest(),
-                    "frame_size_bytes": len(partial),
+                    "digest": "sha256:" + "d" * 64,
+                    "frame_size_bytes": partial_size,
                     "kind": "STOP",
                     "request_id": 4,
                 }
@@ -413,18 +372,18 @@ def _lifecycle() -> dict[str, object]:
             "stage1_artifact_digest": transport.receipt.artifact_digest,
         },
         "boots": boots,
-        "broker_contract": "palimpsest.guest-lifecycle-broker.v2",
+        "broker_contract": "palimpsest.guest-lifecycle-broker.v3",
         "channel_discovery_negative_controls": {
             name: negative_item(name) for name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
         },
         "channel_name": "org.palimpsest.oci.lifecycle.0",
-        "nonce_semantics": "correlation-and-replay-challenge-not-peer-authentication",
+        "nonce_semantics": "authenticated-epoch-challenge-and-replay-ledger",
         "connection_limit": 16,
         "natural_terminal_proven": False,
         "negative_input_proven": True,
         "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
-        "production_reconnect_requirement": "privileged-in-band-boundary-ack-or-equivalent-barrier",
-        "protocol": "palimpsest.oci-lifecycle-control.v1",
+        "production_reconnect_requirement": "authenticated-console-boundary-ack.v2",
+        "protocol": "palimpsest.oci-lifecycle-control.v2",
         "qemu_duplicate_name_rejected": {
             "exit_code": 1,
             "guest_boot_started": False,
@@ -436,10 +395,10 @@ def _lifecycle() -> dict[str, object]:
             "rejection_marker_count": 1,
             "stage1_marker_count": 0,
         },
-        "reconnect_boundary": "proof-only-known-workload-console-eof-barrier.v1",
+        "reconnect_boundary": "authenticated-console-boundary-ack.v2",
         "reconnect_proven": True,
         "rapid_reconnect_proven": False,
-        "session_profile": "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1",
+        "session_profile": "authenticated-bootstrap-boundary-reconnect-partial-retry-dedupe.v2",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
         "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
@@ -452,49 +411,7 @@ def _receipt() -> OCIStage1KVMProofReceipt:
     initramfs = build_bootstrap_initramfs()
     uid0_plan = build_uid0_isolation_proof_plan()
     uid0_transport = build_stage1_transport(uid0_plan)
-    binding = OCIControlBinding(uid0_plan.run_id, uid0_plan.domain_core_digest, uid0_transport.receipt.artifact_digest)
-    nonce = "a" * 64
-    generation = "33333333-3333-4333-8333-333333333333"
-    messages = (
-        ("host-to-guest", OCIControlMessage("HELLO", binding, nonce, {}, request_id=1)),
-        (
-            "guest-to-host",
-            OCIControlMessage("READY", binding, nonce, {}, sequence=1, boot_generation=generation, reply_to=1),
-        ),
-        (
-            "host-to-guest",
-            OCIControlMessage("STOP", binding, nonce, {"signal": 15}, request_id=2, boot_generation=generation),
-        ),
-        (
-            "guest-to-host",
-            OCIControlMessage(
-                "TERMINAL",
-                binding,
-                nonce,
-                {"terminal": {"exit_code": 42, "signal": None}},
-                sequence=2,
-                boot_generation=generation,
-                reply_to=2,
-            ),
-        ),
-    )
-    uid0_frames = []
-    for direction, message in messages:
-        frame = encode_frame(message)
-        uid0_frames.append(
-            {
-                "boot_generation": message.boot_generation,
-                "connection": 1,
-                "digest": "sha256:" + hashlib.sha256(frame).hexdigest(),
-                "direction": direction,
-                "host_nonce": message.host_nonce,
-                "kind": message.kind,
-                "reply_to": message.reply_to,
-                "request_id": message.request_id,
-                "sequence": message.sequence,
-                "size_bytes": len(frame),
-            }
-        )
+    uid0_frames = copy.deepcopy(_lifecycle()["boots"][0]["frames"])
     return OCIStage1KVMProofReceipt(
         "sha256:" + "1" * 64,
         4096,
@@ -1060,7 +977,7 @@ def test_console_reader_drives_fragmented_single_connection_lifecycle(tmp_path: 
     channel = (Path(temporary.name) / "lifecycle.sock").resolve()
     program = f"""
 import socket, struct, sys, time
-from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_frame, encode_frame
+from palimpsest_local.oci_control_protocol_v2 import OCIControlV2Message, decode_frame, encode_frame, sign_message, verify_message_authentication
 
 def receive(connection):
     header = b''
@@ -1078,16 +995,26 @@ listener.listen(1)
 connection, _ = listener.accept()
 hello = receive(connection)
 generation = '11111111-1111-4111-8111-111111111111'
-ready = OCIControlMessage(kind='READY', binding=hello.binding, host_nonce=hello.host_nonce,
-    payload={{}}, sequence=1, boot_generation=generation, reply_to=hello.request_id)
+key = bytes(range(32))
+bootstrap = sign_message(OCIControlV2Message(kind='BOOTSTRAP', binding=hello.body.binding,
+    boot_attempt_id=hello.body.boot_attempt_id, host_nonce=hello.body.host_nonce, epoch=1,
+    wire_sequence=1, payload={{'boot_key': key.hex()}}, boot_generation=generation,
+    reply_to=hello.body.request_id), key)
+connection.sendall(encode_frame(bootstrap))
+key_ack = receive(connection); verify_message_authentication(key_ack, key)
+ready = sign_message(OCIControlV2Message(kind='READY', binding=hello.body.binding,
+    boot_attempt_id=hello.body.boot_attempt_id, host_nonce=hello.body.host_nonce, epoch=1,
+    wire_sequence=2, payload={{}}, boot_generation=generation, reply_to=key_ack.body.wire_sequence), key)
 frame = encode_frame(ready)
 for part in (frame[:1], frame[1:3], frame[3:]): connection.sendall(part)
 for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
     sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
 stop = receive(connection)
-terminal = OCIControlMessage(kind='TERMINAL', binding=hello.binding, host_nonce=hello.host_nonce,
-    payload={{'terminal': {{'exit_code': 42, 'signal': None}}}}, sequence=2,
-    boot_generation=generation, reply_to=stop.request_id)
+verify_message_authentication(stop, key)
+terminal = sign_message(OCIControlV2Message(kind='TERMINAL', binding=hello.body.binding,
+    boot_attempt_id=hello.body.boot_attempt_id, host_nonce=hello.body.host_nonce, epoch=1,
+    wire_sequence=3, payload={{'terminal': {{'exit_code': 42, 'signal': None}}}},
+    boot_generation=generation, reply_to=stop.body.request_id), key)
 frame = encode_frame(terminal)
 for byte in frame: connection.sendall(bytes((byte,)))
 sys.stdout.buffer.write({SUCCESS_MARKER!r} + b'\\n'); sys.stdout.flush()
@@ -1106,14 +1033,16 @@ time.sleep(2)
         lifecycle_transcript=transcript,
     )
     assert _logical_line_count(console, WORKLOAD_SIGNAL_ARMED_MARKER) == 1
-    assert [frame["kind"] for frame in transcript] == ["HELLO", "READY", "STOP", "TERMINAL"]
+    assert [frame["kind"] for frame in transcript] == ["HELLO", "BOOTSTRAP", "KEY_ACK", "READY", "STOP", "TERMINAL"]
     assert [frame["direction"] for frame in transcript] == [
         "host-to-guest",
         "guest-to-host",
         "host-to-guest",
         "guest-to-host",
+        "host-to-guest",
+        "guest-to-host",
     ]
-    assert transcript[1]["boot_generation"] == transcript[2]["boot_generation"] == transcript[3]["boot_generation"]
+    assert len({frame["boot_generation"] for frame in transcript[1:]}) == 1
     temporary.cleanup()
 
 
@@ -1124,74 +1053,119 @@ def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path
     temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-composite-", dir="/tmp")
     channel = (Path(temporary.name) / "lifecycle.sock").resolve()
     program = f"""
-import socket, struct, sys, time
-from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_frame, encode_frame
+import hashlib, socket, struct, sys, time
+from palimpsest_local.oci_control_protocol_v2 import (OCIControlV2Message, OCIControlV2Envelope,
+    decode_frame, encode_boundary_line, encode_frame, lifecycle_state_digest, sign_message,
+    verify_message_authentication)
 
 def receive(connection, partial=False):
-    data = b''
-    while len(data) < 4:
-        try: chunk = connection.recv(4-len(data))
+    header = b''
+    while len(header) < 4:
+        try: chunk = connection.recv(4-len(header))
         except ConnectionResetError: return None
         if not chunk: return None
-        data += chunk
-    size = struct.unpack('>I', data)[0]
-    expected = size + 4 - (1 if partial else 0)
-    while len(data) < expected:
-        try: chunk = connection.recv(expected - len(data))
+        header += chunk
+    size = struct.unpack('>I', header)[0]
+    payload = b''
+    expected = size - (1 if partial else 0)
+    while len(payload) < expected:
+        try: chunk = connection.recv(expected - len(payload))
         except ConnectionResetError: return None
         if not chunk: return None
-        data += chunk
+        payload += chunk
     if partial:
         sys.stdout.buffer.write({LIFECYCLE_PARTIAL_BUFFERED_MARKER!r} + b'\\n'); sys.stdout.flush()
         try:
             while connection.recv(4096): pass
         except ConnectionResetError:
             pass
-        return None
-    return decode_frame(data)
+        return len(payload), size
+    return decode_frame(header + payload)
 
 def drain(connection):
     try:
         while connection.recv(4096): pass
     except ConnectionResetError:
         pass
-    sys.stdout.buffer.write({LIFECYCLE_PEER_BOUNDARY_MARKER!r} + b'\\n'); sys.stdout.flush()
 
-def snapshot(hello, sequence, state, stop_id=None, terminal=None):
-    return OCIControlMessage(kind='SNAPSHOT', binding=hello.binding, host_nonce=hello.host_nonce,
-        payload={{'state': state, 'stop_request_id': stop_id, 'terminal': terminal}}, sequence=sequence,
-        boot_generation=generation, reply_to=hello.request_id)
+def public_state(name, stop_id=None, terminal=None):
+    return {{'state': name, 'stop_request_id': stop_id, 'terminal': terminal}}
+
+def send_message(connection, kind, payload, reply_to):
+    global guest_wire
+    guest_wire += 1
+    message = OCIControlV2Message(kind, binding, attempt, nonce, epoch, guest_wire, payload,
+        boot_generation=generation, reply_to=reply_to)
+    connection.sendall(encode_frame(sign_message(message, key)))
+
+def send_boundary(state, last_host_wire, header_used=0, payload_used=0, payload_expected=0):
+    global epoch, guest_wire
+    previous = epoch; epoch += 1; guest_wire += 1
+    boundary_id = f'44444444-4444-4444-8444-{{epoch:012d}}'
+    digest = lifecycle_state_digest(state['state'], stop_request_id=state['stop_request_id'],
+        terminal=state['terminal'])
+    message = OCIControlV2Message('BOUNDARY_ACK', binding, attempt, nonce, epoch, guest_wire,
+        {{'boundary_id': boundary_id, 'discarded_header_bytes': header_used,
+         'discarded_payload_bytes': payload_used, 'discarded_payload_expected': payload_expected,
+         'last_accepted_h2g_wire_sequence': last_host_wire,
+         'last_attempted_g2h_wire_sequence': guest_wire, 'lifecycle_state': state,
+         'previous_epoch': previous, 'state_digest': digest}},
+        boot_generation=generation, reply_to=opener)
+    line = encode_boundary_line(sign_message(message, key, carrier='console-line'))
+    sys.stdout.buffer.write(line); sys.stdout.flush()
 
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(sys.argv[1]); listener.listen(1)
 generation = '22222222-2222-4222-8222-222222222222'
-c, _ = listener.accept(); hello = receive(c)
-c.sendall(encode_frame(OCIControlMessage(kind='READY', binding=hello.binding, host_nonce=hello.host_nonce,
-    payload={{}}, sequence=1, boot_generation=generation, reply_to=hello.request_id)))
+key = bytes(range(32)); epoch = 1; guest_wire = 0
+c, _ = listener.accept(); hello = receive(c); binding = hello.body.binding
+attempt = hello.body.boot_attempt_id; nonce = hello.body.host_nonce; opener = hello.body.request_id
+guest_wire += 1
+bootstrap = OCIControlV2Message('BOOTSTRAP', binding, attempt, nonce, epoch, guest_wire,
+    {{'boot_key': key.hex()}}, boot_generation=generation, reply_to=opener)
+c.sendall(encode_frame(sign_message(bootstrap, key)))
+key_ack = receive(c); verify_message_authentication(key_ack, key); last_host_wire = key_ack.body.wire_sequence
+send_message(c, 'READY', {{}}, last_host_wire)
 for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r},
                {LIFECYCLE_READY_COMMITTED_MARKER!r}):
     sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
 drain(c)
-c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 2, 'ready')))
+send_boundary(public_state('ready'), last_host_wire)
+c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)
+nonce = reconnect.body.host_nonce; opener = reconnect.body.request_id; last_host_wire = reconnect.body.wire_sequence
+try: send_message(c, 'SNAPSHOT', {{'state': 'ready', 'stop_request_id': None, 'terminal': None}}, opener)
+except BrokenPipeError: pass
 drain(c)
-c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 3, 'ready')))
-assert receive(c, partial=True) is None
-sys.stdout.buffer.write({LIFECYCLE_PEER_BOUNDARY_MARKER!r} + b'\\n'); sys.stdout.flush()
-c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 4, 'ready')))
-stop = receive(c); assert stop.request_id == 4
+send_boundary(public_state('ready'), last_host_wire)
+c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)
+nonce = reconnect.body.host_nonce; opener = reconnect.body.request_id; last_host_wire = reconnect.body.wire_sequence
+send_message(c, 'SNAPSHOT', {{'state': 'ready', 'stop_request_id': None, 'terminal': None}}, opener)
+payload_used, payload_expected = receive(c, partial=True)
+send_boundary(public_state('ready'), last_host_wire, payload_used=payload_used, payload_expected=payload_expected)
+c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)
+nonce = reconnect.body.host_nonce; opener = reconnect.body.request_id; last_host_wire = reconnect.body.wire_sequence
+send_message(c, 'SNAPSHOT', {{'state': 'ready', 'stop_request_id': None, 'terminal': None}}, opener)
+stop = receive(c); verify_message_authentication(stop, key); last_host_wire = stop.body.wire_sequence
 sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdout.flush()
-duplicate = receive(c); assert encode_frame(duplicate) == encode_frame(stop)
+duplicate = receive(c); verify_message_authentication(duplicate, key)
+assert duplicate.body.request_id == stop.body.request_id and duplicate.body.wire_sequence > stop.body.wire_sequence
+last_host_wire = duplicate.body.wire_sequence
 sys.stdout.buffer.write({LIFECYCLE_STOP_DUPLICATE_MARKER!r} + b'\\n'); sys.stdout.flush()
 sys.stdout.buffer.write({WORKLOAD_STOP_OBSERVED_MARKER!r} + b'\\n'); sys.stdout.flush()
 drain(c)
-c, _ = listener.accept(); hello = receive(c); c.sendall(encode_frame(snapshot(hello, 5, 'stopping', 4)))
-c.sendall(encode_frame(OCIControlMessage(kind='TERMINAL', binding=hello.binding, host_nonce=hello.host_nonce,
-    payload={{'terminal': {{'exit_code': 42, 'signal': None}}}}, sequence=6,
-    boot_generation=generation, reply_to=4)))
+send_boundary(public_state('stopping', stop.body.request_id), last_host_wire)
+c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)
+nonce = reconnect.body.host_nonce; opener = reconnect.body.request_id; last_host_wire = reconnect.body.wire_sequence
+send_message(c, 'SNAPSHOT', {{'state': 'stopping', 'stop_request_id': stop.body.request_id, 'terminal': None}}, opener)
+terminal = {{'exit_code': 42, 'signal': None}}
+send_message(c, 'TERMINAL', {{'terminal': terminal}}, stop.body.request_id)
 sys.stdout.buffer.write({SUCCESS_MARKER!r} + b'\\n'); sys.stdout.flush()
 drain(c)
-c, _ = listener.accept(); hello = receive(c)
-c.sendall(encode_frame(snapshot(hello, 7, 'terminal', 4, {{'exit_code': 42, 'signal': None}})))
+send_boundary(public_state('terminal', stop.body.request_id, terminal), last_host_wire)
+c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)
+nonce = reconnect.body.host_nonce; opener = reconnect.body.request_id
+send_message(c, 'SNAPSHOT', {{'state': 'terminal', 'stop_request_id': stop.body.request_id,
+    'terminal': terminal}}, opener)
 time.sleep(2)
 """
     transcript: list[dict[str, object]] = []
@@ -1214,10 +1188,12 @@ time.sleep(2)
     assert _logical_line_count(console, LIFECYCLE_STOP_DUPLICATE_MARKER) == 1
     assert _logical_line_count(console, LIFECYCLE_PEER_BOUNDARY_MARKER) == 5
     assert _logical_line_count(console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) == 1
-    assert [frame["connection"] for frame in transcript] == [1, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 6, 6]
-    assert [frame["sequence"] for frame in transcript if frame["sequence"] is not None] == [2, 3, 4, 5, 6, 7]
-    assert attempts[0]["request_id"] == transcript[7]["request_id"] == 4
-    assert transcript[7] == transcript[8]
+    assert [frame["kind"] for frame in transcript].count("BOUNDARY_ACK") == 5
+    assert [frame["kind"] for frame in transcript].count("RECONNECT") == 5
+    assert attempts[0]["kind"] == "STOP"
+    stops = [frame for frame in transcript if frame["kind"] == "STOP"]
+    assert len(stops) == 2 and stops[0]["request_id"] == stops[1]["request_id"]
+    assert stops[0]["wire_sequence"] < stops[1]["wire_sequence"]
     temporary.cleanup()
 
 
@@ -1230,7 +1206,8 @@ def test_console_reader_records_only_rejected_second_distinct_stop(tmp_path: Pat
     rejection = lifecycle_negative_control_contract("second_distinct_stop")["rejection_marker"].encode("ascii")
     program = f"""
 import socket, struct, sys, time
-from palimpsest_local.oci_control_protocol import OCIControlMessage, decode_frame, encode_frame
+from palimpsest_local.oci_control_protocol_v2 import (OCIControlV2Message, decode_frame, encode_frame,
+    sign_message, verify_message_authentication)
 
 def receive(connection):
     header = connection.recv(4)
@@ -1245,14 +1222,21 @@ listener.bind(sys.argv[1]); listener.listen(1)
 connection, _ = listener.accept()
 hello = receive(connection)
 generation = '33333333-3333-4333-8333-333333333333'
-connection.sendall(encode_frame(OCIControlMessage(kind='READY', binding=hello.binding,
-    host_nonce=hello.host_nonce, payload={{}}, sequence=1, boot_generation=generation,
-    reply_to=hello.request_id)))
+key = bytes(range(32))
+bootstrap = OCIControlV2Message('BOOTSTRAP', hello.body.binding, hello.body.boot_attempt_id,
+    hello.body.host_nonce, 1, 1, {{'boot_key': key.hex()}}, boot_generation=generation,
+    reply_to=hello.body.request_id)
+connection.sendall(encode_frame(sign_message(bootstrap, key)))
+key_ack = receive(connection); verify_message_authentication(key_ack, key)
+ready = OCIControlV2Message('READY', hello.body.binding, hello.body.boot_attempt_id,
+    hello.body.host_nonce, 1, 2, {{}}, boot_generation=generation,
+    reply_to=key_ack.body.wire_sequence)
+connection.sendall(encode_frame(sign_message(ready, key)))
 for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
     sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
-first = receive(connection); assert first.request_id == 2
+first = receive(connection); verify_message_authentication(first, key); assert first.body.request_id == 2
 sys.stdout.buffer.write({LIFECYCLE_STOP_DISPATCHED_MARKER!r} + b'\\n'); sys.stdout.flush()
-second = receive(connection); assert second.request_id == 3
+second = receive(connection); verify_message_authentication(second, key); assert second.body.request_id == 3
 sys.stdout.buffer.write({rejection!r} + b'\\n'); sys.stdout.flush()
 time.sleep(2)
 """
@@ -1270,17 +1254,11 @@ time.sleep(2)
         lifecycle_negative_name="second_distinct_stop",
         lifecycle_negative_input=negative_input,
     )
-    expected_input = _lifecycle_negative_wire_bytes(
-        "second_distinct_stop",
-        binding,
-        boot_generation="33333333-3333-4333-8333-333333333333",
-    )
-    assert negative_input == {
-        "boot_generation": "33333333-3333-4333-8333-333333333333",
-        "bytes_written": len(expected_input),
-        "digest": "sha256:" + hashlib.sha256(expected_input).hexdigest(),
-        "size_bytes": len(expected_input),
-    }
+    assert negative_input["boot_generation"] == "33333333-3333-4333-8333-333333333333"
+    assert isinstance(negative_input["bytes_written"], int) and negative_input["bytes_written"] > 0
+    assert negative_input["bytes_written"] == negative_input["size_bytes"]
+    assert isinstance(negative_input["digest"], str)
+    assert len(negative_input["digest"]) == 71 and negative_input["digest"].startswith("sha256:")
     assert _logical_line_count(console, LIFECYCLE_STOP_DISPATCHED_MARKER) == 1
     temporary.cleanup()
 
@@ -1343,7 +1321,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v15"
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v16"
     assert decoded["executed_boots"] == 41
     assert decoded["qemu_invocations"] == 42
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
@@ -1380,18 +1358,18 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v6",
+        "contract": "palimpsest.guest-pid1-supervisor.v7",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],
         "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "cooperative_status": 43,
-        "credential_timing": "child-isolate-drop-verify-parent-attach-release",
+        "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "forced_status": 137,
         "forwarded_signal": 15,
-        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
-        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
@@ -1477,7 +1455,7 @@ def test_uid0_receipt_evidence_is_exactly_bound(mutation: str) -> None:
     elif mutation == "lifecycle-request":
         evidence["lifecycle"]["frames"][0]["request_id"] = 9
     elif mutation == "lifecycle-sequence":
-        evidence["lifecycle"]["frames"][1]["sequence"] = 9
+        evidence["lifecycle"]["frames"][1]["wire_sequence"] = 9
     elif mutation == "lifecycle-reply":
         evidence["lifecycle"]["frames"][3]["reply_to"] = 9
     else:
@@ -1895,11 +1873,11 @@ def test_receipt_rejects_lifecycle_evidence_tamper(mutation: str) -> None:
     elif mutation == "reply":
         lifecycle["boots"][0]["frames"][3]["reply_to"] = 1
     elif mutation == "sequence":
-        lifecycle["boots"][0]["frames"][3]["sequence"] = 3
+        lifecycle["boots"][0]["frames"][3]["wire_sequence"] = 3
     elif mutation == "digest":
-        lifecycle["boots"][0]["frames"][0]["digest"] = "sha256:bad"
+        lifecycle["boots"][0]["frames"][0]["envelope_digest"] = "sha256:bad"
     elif mutation == "valid-looking-digest":
-        lifecycle["boots"][0]["frames"][0]["digest"] = "sha256:" + "f" * 64
+        lifecycle["boots"][0]["frames"][0]["envelope_digest"] = "sha256:" + "f" * 64
     elif mutation == "size":
         lifecycle["boots"][0]["frames"][0]["size_bytes"] = 65537
     elif mutation == "valid-looking-size":

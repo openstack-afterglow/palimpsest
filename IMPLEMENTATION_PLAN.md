@@ -903,6 +903,33 @@ the guest v2 codec/MAC/state machine and console boundary path, regenerated
 assets, negative native KVM cases, and the complete fail-closed version cascade
 as one atomic activation gate.
 
+### PR 4 slice 29B: authenticated lifecycle v2 guest/KVM activation
+
+- The first-party guest PID 1 now owns the complete v2 bootstrap and lifecycle
+  state machine. It creates the per-boot key only after the workload child has
+  completed isolation and PID 1 has attached it to the workload cgroup, proves
+  the child's copy-on-write key storage remains zero, and does not release the
+  workload until signed `KEY_ACK` has been verified.
+- Channel messages use the exact `{body,mac}` envelope and separated
+  HKDF-HMAC-SHA256 keys. Console `BOUNDARY_ACK` messages are authenticated and
+  bind parser discard state, the connection transition, accepted/attempted wire
+  sequences, and the exact lifecycle projection. Only read EOF creates a
+  boundary; HUP is advisory.
+- The native proof covers a lost initial READY, an accepted RECONNECT with a
+  lost SNAPSHOT, a partial STOP, same-logical STOP retry on a fresh wire,
+  same-ID deduplication without a second signal, and terminal reconnect.
+  Authenticated negative controls cover stale, replayed, cross-binding, and
+  conflicting messages. Evidence retains only verified safe projections and
+  recursively excludes raw boot keys and MAC tags.
+- Stage-1 plan/protocol v12, handoff v6, init/consumer v14, initramfs
+  manifest/ABI v16, supervisor v7, lifecycle broker v3, workload isolation v2,
+  domain plan v11/core v5, and KVM receipt v16 bind this checkpoint. The sealed
+  guest asset is rebuilt reproducibly from the pinned toolchain.
+
+Scope boundary: slice 29B activates v2 only in the pre-production guest/domain
+and native-KVM qualification path. Production create/start/run/`-d`, libvirt
+channel ownership, runtime STOP dispatch, and Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -921,17 +948,12 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Implement slice 29B: add PID 1-only boot-key custody, guest v2 framing/MAC
-   verification, authenticated console boundary ACKs, replay-safe reconnect,
-   negative native KVM cases, regenerated deterministic assets, and the full
-   protocol/broker/isolation/supervisor/plan/guest/initramfs/proof/domain
-   version cascade. Activate v2 only when that entire gate passes atomically.
-2. Implement image-root passwd/group lookup, omitted primary-group and PATH
+1. Implement image-root passwd/group lookup, omitted primary-group and PATH
    search semantics, then generalize the qualified single-workload cgroup
    broker for agent and exec-session ownership.
-3. Connect production final handoff, host stop/control and exit mapping,
+2. Connect production final handoff, host stop/control and exit mapping,
    foreground-default `run` and detached `run -d`, then lifecycle/exec/log
    readiness for OCI-root/KVM.
-4. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
+3. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
    KVM runner and require it before claiming production OCI-image-to-VM-root
    readiness.

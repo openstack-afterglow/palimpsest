@@ -14,7 +14,8 @@ from typing import Any
 
 from .cloudinit import BUILD_CHANNEL_NAME
 from .digest import normalize_digest
-from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
+from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
+from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
 from .platforms import DomainProfile
 
 _logger = logging.getLogger(__name__)
@@ -101,7 +102,7 @@ class OCIRootDomainSpec:
     boot_contract_digest: str | None = None
     lifecycle_socket: Path | None = None
     lifecycle_channel_name: str = OCI_CONTROL_CHANNEL_NAME
-    lifecycle_protocol: str = OCI_CONTROL_PROTOCOL
+    lifecycle_protocol: str = OCI_CONTROL_PROTOCOL_V2
 
 
 def _valid_name(name: str) -> bool:
@@ -306,7 +307,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root boot contract digest is invalid") from None
     if contract_digest != spec.boot_contract_digest:
         raise KvmError("OCI-root boot contract digest is not canonical")
-    if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL:
+    if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL_V2:
         raise KvmError("OCI-root lifecycle channel contract is invalid")
     if (
         not isinstance(spec.lifecycle_socket, Path)

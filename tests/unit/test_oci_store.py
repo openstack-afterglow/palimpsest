@@ -1815,7 +1815,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert plan.to_dict()["lifecycle_control"] == {
         "channel_name": "org.palimpsest.oci.lifecycle.0",
         "endpoint": "run-private/lifecycle.sock",
-        "protocol": "palimpsest.oci-lifecycle-control.v1",
+        "protocol": "palimpsest.oci-lifecycle-control.v2",
         "transport": "virtio-serial",
     }
     transport_path = roots.runs / "domain-plan" / "stage1-plan.raw"
@@ -1832,9 +1832,9 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
-    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v11"
-    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v5"
-    assert stage1.to_dict()["isolation"] == "palimpsest.workload-lifecycle-authority-isolation.v1"
+    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v12"
+    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v6"
+    assert stage1.to_dict()["isolation"] == "palimpsest.workload-lifecycle-authority-isolation.v2"
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
     tampered = deepcopy(plan.to_dict())

@@ -31,7 +31,8 @@ from .kvm import (
     Stage1TransportDisk,
     build_oci_root_domain_xml,
 )
-from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
+from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
+from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2 as OCI_CONTROL_PROTOCOL
 from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
@@ -50,8 +51,8 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v10"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v4"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v11"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v5"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 OCI_ROOT_LIFECYCLE_ENDPOINT = "run-private/lifecycle.sock"
 OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = "lifecycle.sock"
@@ -554,6 +555,8 @@ class OCIRootDomainPlan:
             "palimpsest.oci-root-domain-plan.v6",
             "palimpsest.oci-root-domain-plan.v7",
             "palimpsest.oci-root-domain-plan.v8",
+            "palimpsest.oci-root-domain-plan.v9",
+            "palimpsest.oci-root-domain-plan.v10",
         }:
             version = str(value["schema"]).rsplit(".", 1)[-1]
             raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")

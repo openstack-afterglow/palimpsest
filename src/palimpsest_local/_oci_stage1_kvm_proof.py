@@ -36,13 +36,24 @@ from typing import Any
 from .errors import ArtifactValidationError, StateError
 from .oci_control_protocol import (
     OCI_CONTROL_CHANNEL_NAME,
-    OCI_CONTROL_PROTOCOL,
-    HostOCIControlSession,
     OCIControlBinding,
-    OCIControlFrameDecoder,
-    OCIControlMessage,
-    OCIControlProtocolError,
-    encode_frame,
+)
+from .oci_control_protocol_v2 import (
+    OCI_CONTROL_BOUNDARY_PREFIX,
+    HostOCIControlV2Session,
+    OCIControlProtocolV2Error,
+    OCIControlV2Binding,
+    OCIControlV2Envelope,
+    OCIControlV2FrameDecoder,
+    OCIControlV2Message,
+    decode_boundary_line,
+    sign_message,
+)
+from .oci_control_protocol_v2 import (
+    OCI_CONTROL_PROTOCOL_V2 as OCI_CONTROL_PROTOCOL,
+)
+from .oci_control_protocol_v2 import (
+    encode_frame as encode_v2_frame,
 )
 from .oci_guest_filesystems import (
     EXT4_SUPERBLOCK_BYTES,
@@ -64,7 +75,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v15"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v16"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -82,7 +93,7 @@ WORKLOAD_ISOLATION_MARKER = (
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
 LIFECYCLE_READY_COMMITTED_MARKER = b"palimpsest guest stage1: lifecycle ready committed"
-LIFECYCLE_PEER_BOUNDARY_MARKER = b"palimpsest guest stage1: lifecycle peer boundary observed"
+LIFECYCLE_PEER_BOUNDARY_MARKER = OCI_CONTROL_BOUNDARY_PREFIX + b'{"redacted":true}'
 LIFECYCLE_PARTIAL_BUFFERED_MARKER = b"palimpsest guest stage1: lifecycle partial frame buffered"
 LIFECYCLE_STOP_DISPATCHED_MARKER = b"palimpsest guest stage1: lifecycle stop dispatched"
 LIFECYCLE_STOP_DUPLICATE_MARKER = b"palimpsest guest stage1: lifecycle stop duplicate accepted"
@@ -134,6 +145,31 @@ LIFECYCLE_WRONG_CHANNEL_NAME = "org.palimpsest.oci.lifecycle.wrong"
 QEMU_DUPLICATE_NAME_REJECTION_MARKER = (
     b"virtio-serial-bus: A port already exists by name org.palimpsest.oci.lifecycle.0"
 )
+
+
+def _redact_lifecycle_boundary_lines(payload: bytes) -> bytes:
+    lines: list[bytes] = []
+    for line in payload.splitlines(keepends=True):
+        normalized = line[:-2] + b"\n" if line.endswith(b"\r\n") else line
+        if normalized.startswith(OCI_CONTROL_BOUNDARY_PREFIX):
+            ending = b"\n" if normalized.endswith(b"\n") else b""
+            lines.append(LIFECYCLE_PEER_BOUNDARY_MARKER + ending)
+        else:
+            lines.append(line)
+    return b"".join(lines)
+
+
+def _receipt_lifecycle_projection(connection: int, projection: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the receipt-local connection ordinal into a verified safe projection."""
+
+    if type(connection) is not int or connection < 1 or not isinstance(projection, Mapping):
+        raise KVMProofFailure("KVM lifecycle receipt projection is invalid")
+    value = {"connection": connection, **dict(projection)}
+    value.pop("projection_digest", None)
+    value["projection_digest"] = _digest(canonical_json_bytes(value))
+    return value
+
+
 WORKLOAD_NEGATIVE_REJECTION_MARKERS = {
     "workload_missing_executable": WORKLOAD_REJECTION_PREFIX
     + b"7; errno=2; started and terminal disabled; waiting fail-closed",
@@ -1708,7 +1744,21 @@ def _lifecycle_control_binding() -> OCIControlBinding:
 
 
 def _lifecycle_hello_frame(*, request_id: int = 1, nonce: str = LIFECYCLE_NEGATIVE_NONCE) -> bytes:
-    return encode_frame(OCIControlMessage("HELLO", _lifecycle_control_binding(), nonce, {}, request_id=request_id))
+    binding = _lifecycle_control_binding()
+    return encode_v2_frame(
+        OCIControlV2Envelope(
+            OCIControlV2Message(
+                "HELLO",
+                OCIControlV2Binding(binding.run_id, binding.domain_core_digest, binding.stage1_artifact_digest),
+                "11111111-1111-4111-8111-111111111111",
+                nonce,
+                1,
+                1,
+                {},
+                request_id=request_id,
+            )
+        )
+    )
 
 
 def lifecycle_negative_control_contract(name: str) -> dict[str, Any]:
@@ -2068,6 +2118,189 @@ def _build_control_qemu_command(
     return command
 
 
+def _valid_lifecycle_boots_v2(boots: Any) -> bool:
+    normal = (
+        (1, "host-to-guest", "HELLO"),
+        (1, "guest-to-host", "BOOTSTRAP"),
+        (1, "host-to-guest", "KEY_ACK"),
+        (1, "guest-to-host", "READY"),
+        (1, "host-to-guest", "STOP"),
+        (1, "guest-to-host", "TERMINAL"),
+    )
+    composite = (
+        (1, "host-to-guest", "HELLO"),
+        (1, "guest-to-host", "BOOTSTRAP"),
+        (1, "host-to-guest", "KEY_ACK"),
+        (1, "guest-to-host", "BOUNDARY_ACK"),
+        (2, "host-to-guest", "RECONNECT"),
+        (2, "guest-to-host", "BOUNDARY_ACK"),
+        (3, "host-to-guest", "RECONNECT"),
+        (3, "guest-to-host", "SNAPSHOT"),
+        (3, "guest-to-host", "BOUNDARY_ACK"),
+        (4, "host-to-guest", "RECONNECT"),
+        (4, "guest-to-host", "SNAPSHOT"),
+        (4, "host-to-guest", "STOP"),
+        (4, "host-to-guest", "STOP"),
+        (4, "guest-to-host", "BOUNDARY_ACK"),
+        (5, "host-to-guest", "RECONNECT"),
+        (5, "guest-to-host", "SNAPSHOT"),
+        (5, "guest-to-host", "TERMINAL"),
+        (5, "guest-to-host", "BOUNDARY_ACK"),
+        (6, "host-to-guest", "RECONNECT"),
+        (6, "guest-to-host", "SNAPSHOT"),
+    )
+    if not isinstance(boots, list) or len(boots) != 2:
+        return False
+    generations: set[str] = set()
+    all_nonces: set[str] = set()
+    for index, (boot, expected) in enumerate(zip(boots, (normal, composite), strict=True)):
+        if not isinstance(boot, Mapping) or set(boot) != {
+            "connection_count",
+            "frames",
+            "initial_ready_host_observed",
+            "logical_attempts",
+            "pid1_alive_after_terminal",
+            "peer_boundary_marker_count",
+            "partial_frame_buffered_marker_count",
+            "profile",
+            "ready",
+            "reopen_count",
+            "stop_signal_dispatch_count",
+            "terminal",
+        }:
+            return False
+        if (
+            boot.get("connection_count") != (1 if index == 0 else 6)
+            or boot.get("initial_ready_host_observed") is not (index == 0)
+            or boot.get("peer_boundary_marker_count") != (0 if index == 0 else 5)
+            or boot.get("partial_frame_buffered_marker_count") != (0 if index == 0 else 1)
+            or boot.get("pid1_alive_after_terminal") is not True
+            or boot.get("ready") is not True
+            or boot.get("reopen_count") != 0
+            or boot.get("stop_signal_dispatch_count") != 1
+            or boot.get("terminal") != {"exit_code": 42, "signal": None}
+            or boot.get("profile")
+            != ("single-connection" if index == 0 else "six-connection-partial-retry-committed-dedupe-composite")
+        ):
+            return False
+        frames = boot.get("frames")
+        if not isinstance(frames, list) or len(frames) != len(expected):
+            return False
+        generation: str | None = None
+        attempt: str | None = None
+        connection_nonces: dict[int, str] = {}
+        last_wire = {"host-to-guest": 0, "guest-to-host": 0}
+        for frame, (connection, direction, kind) in zip(frames, expected, strict=True):
+            fields = {
+                "authentication_verified",
+                "body_digest",
+                "boot_attempt_id",
+                "boot_generation",
+                "carrier",
+                "connection",
+                "direction",
+                "envelope_digest",
+                "epoch",
+                "host_nonce",
+                "key_id",
+                "kind",
+                "projection_digest",
+                "reply_to",
+                "request_id",
+                "size_bytes",
+                "wire_sequence",
+            }
+            if not isinstance(frame, Mapping) or set(frame) != fields:
+                return False
+            nonce = frame.get("host_nonce")
+            wire = frame.get("wire_sequence")
+            if (
+                frame.get("connection") != connection
+                or frame.get("direction") != direction
+                or frame.get("kind") != kind
+                or frame.get("carrier") != ("console-line" if kind == "BOUNDARY_ACK" else "channel-frame")
+                or frame.get("authentication_verified") is not (kind != "HELLO")
+                or not isinstance(frame.get("body_digest"), str)
+                or _DIGEST_RE.fullmatch(frame["body_digest"]) is None
+                or not isinstance(frame.get("envelope_digest"), str)
+                or _DIGEST_RE.fullmatch(frame["envelope_digest"]) is None
+                or frame.get("projection_digest")
+                != _digest(
+                    canonical_json_bytes({key: item for key, item in frame.items() if key != "projection_digest"})
+                )
+                or not isinstance(nonce, str)
+                or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
+                or type(frame.get("epoch")) is not int
+                or frame["epoch"] < 1
+                or type(wire) is not int
+                or wire <= last_wire[direction]
+                or type(frame.get("size_bytes")) is not int
+                or not 5 <= frame["size_bytes"] <= 64 * 1024
+            ):
+                return False
+            last_wire[direction] = wire
+            connection_nonces.setdefault(connection, nonce)
+            if connection_nonces[connection] != nonce:
+                return False
+            if attempt is None:
+                attempt = frame["boot_attempt_id"]
+                try:
+                    parsed_attempt = uuid.UUID(attempt)
+                except (AttributeError, TypeError, ValueError):
+                    return False
+                if str(parsed_attempt) != attempt or parsed_attempt.version != 4:
+                    return False
+            elif frame["boot_attempt_id"] != attempt:
+                return False
+            if kind == "HELLO":
+                if frame["boot_generation"] is not None or frame["key_id"] is not None:
+                    return False
+            else:
+                if generation is None:
+                    generation = frame["boot_generation"]
+                    try:
+                        parsed_generation = uuid.UUID(generation)
+                    except (AttributeError, TypeError, ValueError):
+                        return False
+                    if str(parsed_generation) != generation or parsed_generation.version != 4:
+                        return False
+                if (
+                    frame["boot_generation"] != generation
+                    or not isinstance(frame["key_id"], str)
+                    or _DIGEST_RE.fullmatch(frame["key_id"]) is None
+                ):
+                    return False
+            if kind in {"HELLO", "RECONNECT", "STOP"}:
+                if type(frame["request_id"]) is not int or frame["request_id"] < 1 or frame["reply_to"] is not None:
+                    return False
+            elif frame["request_id"] is not None or type(frame["reply_to"]) is not int or frame["reply_to"] < 1:
+                return False
+        if generation is None or len(connection_nonces) != boot["connection_count"]:
+            return False
+        generations.add(generation)
+        all_nonces.update(connection_nonces.values())
+        attempts = boot["logical_attempts"]
+        if index == 0:
+            if attempts != []:
+                return False
+        elif (
+            not isinstance(attempts, list)
+            or len(attempts) != 1
+            or not isinstance(attempts[0], Mapping)
+            or set(attempts[0]) != {"bytes_sent", "connection", "digest", "frame_size_bytes", "kind", "request_id"}
+            or attempts[0].get("bytes_sent") != attempts[0].get("frame_size_bytes") - 1
+            or attempts[0].get("connection") != 3
+            or not isinstance(attempts[0].get("digest"), str)
+            or _DIGEST_RE.fullmatch(attempts[0]["digest"]) is None
+            or type(attempts[0].get("frame_size_bytes")) is not int
+            or not 5 <= attempts[0]["frame_size_bytes"] <= 64 * 1024
+            or attempts[0].get("kind") != "STOP"
+            or attempts[0].get("request_id") != 4
+        ):
+            return False
+    return len(generations) == 2 and len(all_nonces) == 7
+
+
 def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOCIStage1Transport) -> bool:
     if not isinstance(value, Mapping) or set(value) != {
         "binding",
@@ -2106,16 +2339,16 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         value.get("channel_name") != OCI_CONTROL_CHANNEL_NAME
         or value.get("protocol") != OCI_CONTROL_PROTOCOL
         or value.get("transport") != "qemu-private-unix-socket-to-virtio-serial"
-        or value.get("nonce_semantics") != "correlation-and-replay-challenge-not-peer-authentication"
+        or value.get("nonce_semantics") != "authenticated-epoch-challenge-and-replay-ledger"
         or value.get("negative_input_proven") is not True
         or value.get("natural_terminal_proven") is not False
         or value.get("peer_identity") != "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1"
-        or value.get("reconnect_boundary") != "proof-only-known-workload-console-eof-barrier.v1"
-        or value.get("production_reconnect_requirement") != "privileged-in-band-boundary-ack-or-equivalent-barrier"
+        or value.get("reconnect_boundary") != "authenticated-console-boundary-ack.v2"
+        or value.get("production_reconnect_requirement") != "authenticated-console-boundary-ack.v2"
         or value.get("rapid_reconnect_proven") is not False
         or value.get("single_connection_proven") is not True
         or value.get("reconnect_proven") is not True
-        or value.get("session_profile") != "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1"
+        or value.get("session_profile") != "authenticated-bootstrap-boundary-reconnect-partial-retry-dedupe.v2"
         or value.get("connection_limit") != 16
     ):
         return False
@@ -2187,7 +2420,11 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                 return False
             if wire:
                 generation = wire_input["boot_generation"]
-                if name.startswith("stop_") or name == "second_distinct_stop":
+                dynamic_signed = name.startswith("stop_") or name in {
+                    "hello_reused_nonce",
+                    "second_distinct_stop",
+                }
+                if dynamic_signed:
                     try:
                         parsed = uuid.UUID(generation)
                     except (AttributeError, TypeError, ValueError):
@@ -2196,18 +2433,18 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
                         return False
                 elif generation is not None:
                     return False
-                expected_input = _lifecycle_negative_wire_bytes(
-                    name,
-                    OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest),
-                    boot_generation=generation,
-                )
-                if wire_input != {
-                    "boot_generation": generation,
-                    "bytes_written": len(expected_input),
-                    "digest": _digest(expected_input),
-                    "size_bytes": len(expected_input),
-                }:
-                    return False
+                if not dynamic_signed:
+                    expected_input = _lifecycle_negative_wire_bytes(
+                        name,
+                        OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest),
+                    )
+                    if wire_input != {
+                        "boot_generation": None,
+                        "bytes_written": len(expected_input),
+                        "digest": _digest(expected_input),
+                        "size_bytes": len(expected_input),
+                    }:
+                        return False
     if (
         not isinstance(qemu_duplicate, Mapping)
         or set(qemu_duplicate)
@@ -2236,267 +2473,7 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         or qemu_duplicate.get("stage1_marker_count") != 0
     ):
         return False
-    normal_expected = (
-        ("host-to-guest", "HELLO"),
-        ("guest-to-host", "READY"),
-        ("host-to-guest", "STOP"),
-        ("guest-to-host", "TERMINAL"),
-    )
-    if not isinstance(boots, list) or len(boots) != 2:
-        return False
-    generations: list[str] = []
-    nonces: list[str] = []
-    for boot_index, boot in enumerate(boots):
-        if not isinstance(boot, Mapping) or set(boot) != {
-            "connection_count",
-            "frames",
-            "initial_ready_host_observed",
-            "logical_attempts",
-            "pid1_alive_after_terminal",
-            "peer_boundary_marker_count",
-            "partial_frame_buffered_marker_count",
-            "profile",
-            "ready",
-            "reopen_count",
-            "stop_signal_dispatch_count",
-            "terminal",
-        }:
-            return False
-        if (
-            boot.get("pid1_alive_after_terminal") is not True
-            or boot.get("ready") is not True
-            or boot.get("terminal") != {"exit_code": 42, "signal": None}
-            or boot.get("reopen_count") != 0
-            or boot.get("stop_signal_dispatch_count") != 1
-            or boot.get("peer_boundary_marker_count") != (0 if boot_index == 0 else 5)
-            or boot.get("partial_frame_buffered_marker_count") != (0 if boot_index == 0 else 1)
-        ):
-            return False
-        frames = boot.get("frames")
-        if not isinstance(frames, list):
-            return False
-        if boot_index == 0:
-            expected = tuple((1, direction, kind) for direction, kind in normal_expected)
-            if (
-                boot.get("profile") != "single-connection"
-                or boot.get("connection_count") != 1
-                or boot.get("initial_ready_host_observed") is not True
-                or boot.get("logical_attempts") != []
-            ):
-                return False
-        else:
-            expected = (
-                (1, "host-to-guest", "HELLO"),
-                (2, "host-to-guest", "HELLO"),
-                (2, "guest-to-host", "SNAPSHOT"),
-                (3, "host-to-guest", "HELLO"),
-                (3, "guest-to-host", "SNAPSHOT"),
-                (4, "host-to-guest", "HELLO"),
-                (4, "guest-to-host", "SNAPSHOT"),
-                (4, "host-to-guest", "STOP"),
-                (4, "host-to-guest", "STOP"),
-                (5, "host-to-guest", "HELLO"),
-                (5, "guest-to-host", "SNAPSHOT"),
-                (5, "guest-to-host", "TERMINAL"),
-                (6, "host-to-guest", "HELLO"),
-                (6, "guest-to-host", "SNAPSHOT"),
-            )
-            if (
-                boot.get("profile") != "six-connection-partial-retry-committed-dedupe-composite"
-                or boot.get("connection_count") != 6
-                or boot.get("initial_ready_host_observed") is not False
-            ):
-                return False
-        if len(frames) != len(expected):
-            return False
-        for frame, (connection, direction, kind) in zip(frames, expected, strict=True):
-            if (
-                not isinstance(frame, Mapping)
-                or set(frame)
-                != {
-                    "boot_generation",
-                    "connection",
-                    "digest",
-                    "direction",
-                    "host_nonce",
-                    "kind",
-                    "reply_to",
-                    "request_id",
-                    "sequence",
-                    "size_bytes",
-                }
-                or frame.get("connection") != connection
-                or frame.get("direction") != direction
-                or frame.get("kind") != kind
-                or not isinstance(frame.get("digest"), str)
-                or _DIGEST_RE.fullmatch(frame["digest"]) is None
-                or type(frame.get("size_bytes")) is not int
-                or not 5 <= frame["size_bytes"] <= 64 * 1024
-            ):
-                return False
-        hello = frames[0]
-        nonce = hello["host_nonce"]
-        generation = frames[1 if boot_index == 0 else 2]["boot_generation"]
-        try:
-            parsed_generation = uuid.UUID(generation)
-        except (AttributeError, TypeError, ValueError):
-            return False
-        if (
-            not isinstance(nonce, str)
-            or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
-            or str(parsed_generation) != generation
-            or parsed_generation.version != 4
-        ):
-            return False
-        by_connection: dict[int, str] = {}
-        for frame in frames:
-            connection = frame["connection"]
-            frame_nonce = frame["host_nonce"]
-            if not isinstance(frame_nonce, str) or re.fullmatch(r"[0-9a-f]{64}", frame_nonce) is None:
-                return False
-            if connection in by_connection and by_connection[connection] != frame_nonce:
-                return False
-            by_connection[connection] = frame_nonce
-            if frame["kind"] != "HELLO" and frame["boot_generation"] != generation:
-                return False
-        if len(set(by_connection.values())) != boot["connection_count"]:
-            return False
-        try:
-            binding = OCIControlBinding(
-                run_id=plan.run_id,
-                domain_core_digest=plan.domain_core_digest,
-                stage1_artifact_digest=transport.receipt.artifact_digest,
-            )
-            expected_messages = []
-            for index, frame in enumerate(frames):
-                kind = frame["kind"]
-                payload: dict[str, Any]
-                if kind in {"HELLO", "READY"}:
-                    payload = {}
-                elif kind == "STOP":
-                    payload = {"signal": 15}
-                elif kind == "TERMINAL":
-                    payload = {"terminal": {"exit_code": 42, "signal": None}}
-                else:
-                    state = "ready" if index in {2, 4, 6} else "stopping" if index == 10 else "terminal"
-                    payload = {
-                        "state": state,
-                        "stop_request_id": 4 if state in {"stopping", "terminal"} else None,
-                        "terminal": {"exit_code": 42, "signal": None} if state == "terminal" else None,
-                    }
-                expected_messages.append(
-                    OCIControlMessage(
-                        kind=kind,
-                        binding=binding,
-                        host_nonce=frame["host_nonce"],
-                        payload=payload,
-                        request_id=frame["request_id"],
-                        sequence=frame["sequence"],
-                        boot_generation=frame["boot_generation"],
-                        reply_to=frame["reply_to"],
-                    )
-                )
-            encoded_frames = tuple(encode_frame(message) for message in expected_messages)
-        except OCIControlProtocolError:
-            return False
-        if any(
-            frame["size_bytes"] != len(encoded) or frame["digest"] != f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-            for frame, encoded in zip(frames, encoded_frames, strict=True)
-        ):
-            return False
-        generations.append(generation)
-        nonces.extend(by_connection.values())
-        if boot_index == 0:
-            if (
-                [frame["request_id"] for frame in frames] != [1, None, 2, None]
-                or [frame["sequence"] for frame in frames] != [None, 1, None, 2]
-                or [frame["reply_to"] for frame in frames] != [None, 1, None, 2]
-            ):
-                return False
-        else:
-            if [frame["request_id"] for frame in frames] != [
-                1,
-                2,
-                None,
-                3,
-                None,
-                5,
-                None,
-                4,
-                4,
-                6,
-                None,
-                None,
-                7,
-                None,
-            ]:
-                return False
-            if [frame["sequence"] for frame in frames] != [
-                None,
-                None,
-                2,
-                None,
-                3,
-                None,
-                4,
-                None,
-                None,
-                None,
-                5,
-                6,
-                None,
-                7,
-            ]:
-                return False
-            if [frame["reply_to"] for frame in frames] != [
-                None,
-                None,
-                2,
-                None,
-                3,
-                None,
-                5,
-                None,
-                None,
-                None,
-                6,
-                4,
-                None,
-                7,
-            ]:
-                return False
-            attempts = boot["logical_attempts"]
-            if not isinstance(attempts, list) or len(attempts) != 1:
-                return False
-            attempt = attempts[0]
-            if not isinstance(attempt, Mapping) or set(attempt) != {
-                "bytes_sent",
-                "connection",
-                "digest",
-                "frame_size_bytes",
-                "kind",
-                "request_id",
-            }:
-                return False
-            partial = OCIControlMessage(
-                kind="STOP",
-                binding=binding,
-                host_nonce=by_connection[3],
-                payload={"signal": 15},
-                request_id=4,
-                boot_generation=generation,
-            )
-            encoded = encode_frame(partial)
-            if attempt != {
-                "bytes_sent": len(encoded) - 1,
-                "connection": 3,
-                "digest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
-                "frame_size_bytes": len(encoded),
-                "kind": "STOP",
-                "request_id": 4,
-            }:
-                return False
-    return len(set(generations)) == 2 and len(set(nonces)) == 7
+    return _valid_lifecycle_boots_v2(boots)
 
 
 def _lifecycle_receipt(
@@ -2574,12 +2551,12 @@ def _lifecycle_receipt(
             name: negative_item(name) for name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
         },
         "channel_name": OCI_CONTROL_CHANNEL_NAME,
-        "nonce_semantics": "correlation-and-replay-challenge-not-peer-authentication",
+        "nonce_semantics": "authenticated-epoch-challenge-and-replay-ledger",
         "connection_limit": 16,
         "natural_terminal_proven": False,
         "negative_input_proven": True,
         "peer_identity": "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1",
-        "production_reconnect_requirement": "privileged-in-band-boundary-ack-or-equivalent-barrier",
+        "production_reconnect_requirement": "authenticated-console-boundary-ack.v2",
         "protocol": OCI_CONTROL_PROTOCOL,
         "qemu_duplicate_name_rejected": {
             "exit_code": duplicate_name_exit_code,
@@ -2592,10 +2569,10 @@ def _lifecycle_receipt(
             "rejection_marker_count": duplicate_name_output.count(QEMU_DUPLICATE_NAME_REJECTION_MARKER),
             "stage1_marker_count": duplicate_name_output.count(b"palimpsest guest stage1:"),
         },
-        "reconnect_boundary": "proof-only-known-workload-console-eof-barrier.v1",
+        "reconnect_boundary": "authenticated-console-boundary-ack.v2",
         "reconnect_proven": True,
         "rapid_reconnect_proven": False,
-        "session_profile": "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1",
+        "session_profile": "authenticated-bootstrap-boundary-reconnect-partial-retry-dedupe.v2",
         "single_connection_proven": True,
         "transport": "qemu-private-unix-socket-to-virtio-serial",
         "wire_negative_controls": {name: negative_item(name) for name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES},
@@ -2635,85 +2612,80 @@ def _valid_uid0_lifecycle_evidence(value: Any, plan: OCIStage1Plan, transport: B
     if any(value.get(key) != expected for key, expected in expected_header.items() if key != "frames"):
         return False
     frames = value.get("frames")
-    expected = (
+    expected_v2 = (
         ("host-to-guest", "HELLO"),
+        ("guest-to-host", "BOOTSTRAP"),
+        ("host-to-guest", "KEY_ACK"),
         ("guest-to-host", "READY"),
         ("host-to-guest", "STOP"),
         ("guest-to-host", "TERMINAL"),
     )
-    if not isinstance(frames, list) or len(frames) != 4:
+    projection_fields = {
+        "authentication_verified",
+        "body_digest",
+        "boot_attempt_id",
+        "boot_generation",
+        "carrier",
+        "connection",
+        "direction",
+        "envelope_digest",
+        "epoch",
+        "host_nonce",
+        "key_id",
+        "kind",
+        "projection_digest",
+        "reply_to",
+        "request_id",
+        "size_bytes",
+        "wire_sequence",
+    }
+    if not isinstance(frames, list) or len(frames) != len(expected_v2):
         return False
+    attempt = frames[0].get("boot_attempt_id") if isinstance(frames[0], Mapping) else None
+    nonce = frames[0].get("host_nonce") if isinstance(frames[0], Mapping) else None
     generation = frames[1].get("boot_generation") if isinstance(frames[1], Mapping) else None
-    for frame, (direction, kind) in zip(frames, expected, strict=True):
-        if (
-            not isinstance(frame, Mapping)
-            or set(frame)
-            != {
-                "boot_generation",
-                "connection",
-                "digest",
-                "direction",
-                "host_nonce",
-                "kind",
-                "reply_to",
-                "request_id",
-                "sequence",
-                "size_bytes",
-            }
-            or frame.get("connection") != 1
-            or frame.get("direction") != direction
-            or frame.get("kind") != kind
-        ):
-            return False
-    hello, ready, stop, terminal = frames
-    nonce = hello["host_nonce"]
     try:
+        parsed_attempt = uuid.UUID(attempt)
         parsed_generation = uuid.UUID(generation)
     except (AttributeError, TypeError, ValueError):
         return False
     if (
-        re.fullmatch(r"[0-9a-f]{64}", nonce or "") is None
+        str(parsed_attempt) != attempt
+        or parsed_attempt.version != 4
         or str(parsed_generation) != generation
         or parsed_generation.version != 4
-        or any(frame["host_nonce"] != nonce for frame in frames)
-        or (hello["request_id"], hello["sequence"], hello["boot_generation"], hello["reply_to"])
-        != (1, None, None, None)
-        or (ready["request_id"], ready["sequence"], ready["boot_generation"], ready["reply_to"])
-        != (None, 1, generation, 1)
-        or (stop["request_id"], stop["sequence"], stop["boot_generation"], stop["reply_to"])
-        != (2, None, generation, None)
-        or (terminal["request_id"], terminal["sequence"], terminal["boot_generation"], terminal["reply_to"])
-        != (None, 2, generation, 2)
+        or not isinstance(nonce, str)
+        or re.fullmatch(r"[0-9a-f]{64}", nonce) is None
     ):
         return False
-    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
-    messages = (
-        OCIControlMessage("HELLO", binding, nonce, {}, request_id=hello["request_id"]),
-        OCIControlMessage(
-            "READY",
-            binding,
-            nonce,
-            {},
-            sequence=ready["sequence"],
-            boot_generation=generation,
-            reply_to=ready["reply_to"],
-        ),
-        OCIControlMessage(
-            "STOP", binding, nonce, {"signal": 15}, request_id=stop["request_id"], boot_generation=generation
-        ),
-        OCIControlMessage(
-            "TERMINAL",
-            binding,
-            nonce,
-            {"terminal": {"exit_code": 42, "signal": None}},
-            sequence=terminal["sequence"],
-            boot_generation=generation,
-            reply_to=terminal["reply_to"],
-        ),
-    )
-    return all(
-        frame["digest"] == _digest(encoded) and frame["size_bytes"] == len(encoded)
-        for frame, encoded in zip(frames, map(encode_frame, messages), strict=True)
+    for frame, (direction, kind) in zip(frames, expected_v2, strict=True):
+        if (
+            not isinstance(frame, Mapping)
+            or set(frame) != projection_fields
+            or frame.get("connection") != 1
+            or frame.get("direction") != direction
+            or frame.get("kind") != kind
+            or frame.get("carrier") != "channel-frame"
+            or frame.get("authentication_verified") is not (kind != "HELLO")
+            or frame.get("boot_attempt_id") != attempt
+            or frame.get("host_nonce") != nonce
+            or not isinstance(frame.get("body_digest"), str)
+            or _DIGEST_RE.fullmatch(frame["body_digest"]) is None
+            or not isinstance(frame.get("envelope_digest"), str)
+            or _DIGEST_RE.fullmatch(frame["envelope_digest"]) is None
+            or frame.get("projection_digest")
+            != _digest(canonical_json_bytes({key: item for key, item in frame.items() if key != "projection_digest"}))
+        ):
+            return False
+        if kind == "HELLO":
+            if frame.get("boot_generation") is not None or frame.get("key_id") is not None:
+                return False
+        elif frame.get("boot_generation") != generation or not isinstance(frame.get("key_id"), str):
+            return False
+    return (
+        [frame["request_id"] for frame in frames] == [1, None, None, None, 2, None]
+        and [frame["reply_to"] for frame in frames] == [None, 1, 1, 2, None, 2]
+        and [frame["wire_sequence"] for frame in frames] == [1, 1, 2, 2, 3, 3]
     )
 
 
@@ -3238,7 +3210,7 @@ class OCIStage1KVMProofReceipt:
                 "cgroup_write_escape_denied": ["parent", "own"],
                 "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
                 "cooperative_status": 43,
-                "credential_timing": "child-isolate-drop-verify-parent-attach-release",
+                "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
@@ -3408,7 +3380,7 @@ class OCIStage1KVMProofReceipt:
                 "cgroup_write_escape_denied": ["parent", "own"],
                 "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
                 "cooperative_status": 43,
-                "credential_timing": "child-isolate-drop-verify-parent-attach-release",
+                "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
@@ -3741,11 +3713,20 @@ def _lifecycle_negative_wire_bytes(
     name: str,
     binding: OCIControlBinding,
     *,
+    boot_attempt_id: str = "11111111-1111-4111-8111-111111111111",
     boot_generation: str | None = None,
+    host_nonce: str = LIFECYCLE_NEGATIVE_NONCE,
+    key: bytes = bytes(range(32)),
+    wire_sequence: int = 3,
 ) -> bytes:
     if name not in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
         raise ArtifactValidationError("KVM lifecycle wire mutation name is invalid")
-    hello = encode_frame(OCIControlMessage("HELLO", binding, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=1))
+    v2_binding = OCIControlV2Binding(binding.run_id, binding.domain_core_digest, binding.stage1_artifact_digest)
+    hello = encode_v2_frame(
+        OCIControlV2Envelope(
+            OCIControlV2Message("HELLO", v2_binding, boot_attempt_id, host_nonce, 1, 1, {}, request_id=1)
+        )
+    )
     if name == "hello_zero_length":
         return b"\0\0\0\0"
     if name == "hello_oversized_length":
@@ -3753,41 +3734,76 @@ def _lifecycle_negative_wire_bytes(
     if name == "hello_duplicate_key_noncanonical":
         payload = hello[4:]
         domain = f'"domain_core_digest":"{binding.domain_core_digest}"'.encode("ascii")
-        needle = domain + b',"host_nonce"'
+        needle = domain + b',"epoch"'
         mutated = payload.replace(needle, domain + b"," + needle, 1)
         if mutated == payload:
             raise KVMProofFailure("KVM lifecycle duplicate-key mutation failed")
         return struct.pack(">I", len(mutated)) + mutated
     if name == "hello_wrong_domain_core_binding":
-        wrong = OCIControlBinding(binding.run_id, "sha256:" + "f" * 64, binding.stage1_artifact_digest)
-        return encode_frame(OCIControlMessage("HELLO", wrong, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=1))
+        wrong = OCIControlV2Binding(binding.run_id, "sha256:" + "f" * 64, binding.stage1_artifact_digest)
+        return encode_v2_frame(
+            OCIControlV2Envelope(
+                OCIControlV2Message("HELLO", wrong, boot_attempt_id, host_nonce, 1, 1, {}, request_id=1)
+            )
+        )
     if name == "hello_reused_nonce":
-        return encode_frame(OCIControlMessage("HELLO", binding, LIFECYCLE_NEGATIVE_NONCE, {}, request_id=2))
+        generation = boot_generation or "33333333-3333-4333-8333-333333333333"
+        return encode_v2_frame(
+            sign_message(
+                OCIControlV2Message(
+                    "RECONNECT",
+                    v2_binding,
+                    boot_attempt_id,
+                    host_nonce,
+                    2,
+                    wire_sequence,
+                    {
+                        "boundary_ack_digest": "sha256:" + "b" * 64,
+                        "boundary_id": "44444444-4444-4444-8444-444444444444",
+                    },
+                    request_id=2,
+                    boot_generation=generation,
+                ),
+                key,
+            )
+        )
     if boot_generation is None:
         raise ArtifactValidationError("KVM lifecycle STOP mutation has no boot generation")
     request_id = 1 if name == "stop_request_id_collides_with_hello" else 2
-    first = encode_frame(
-        OCIControlMessage(
-            "STOP",
-            binding,
-            LIFECYCLE_NEGATIVE_NONCE,
-            {"signal": 15},
-            request_id=request_id,
-            boot_generation=(
-                "00000000-0000-4000-8000-000000000000" if name == "stop_stale_generation" else boot_generation
+    first = encode_v2_frame(
+        sign_message(
+            OCIControlV2Message(
+                "STOP",
+                v2_binding,
+                boot_attempt_id,
+                host_nonce,
+                1,
+                wire_sequence,
+                {"signal": 15},
+                request_id=request_id,
+                boot_generation=(
+                    "00000000-0000-4000-8000-000000000000" if name == "stop_stale_generation" else boot_generation
+                ),
             ),
+            key,
         )
     )
     if name != "second_distinct_stop":
         return first
-    return encode_frame(
-        OCIControlMessage(
-            "STOP",
-            binding,
-            LIFECYCLE_NEGATIVE_NONCE,
-            {"signal": 15},
-            request_id=3,
-            boot_generation=boot_generation,
+    return encode_v2_frame(
+        sign_message(
+            OCIControlV2Message(
+                "STOP",
+                v2_binding,
+                boot_attempt_id,
+                host_nonce,
+                1,
+                wire_sequence,
+                {"signal": 15},
+                request_id=3,
+                boot_generation=boot_generation,
+            ),
+            key,
         )
     )
 
@@ -3847,11 +3863,20 @@ def _read_console_until(
     channel_connected = False
     channel_pending = bytearray()
     pending_frame: bytes | None = None
-    pending_message: OCIControlMessage | None = None
+    pending_message: OCIControlV2Envelope | None = None
     pending_full_frame = True
     pending_negative_input = False
-    decoder = OCIControlFrameDecoder()
-    session = HostOCIControlSession(lifecycle_binding) if lifecycle_binding is not None else None
+    decoder = OCIControlV2FrameDecoder()
+    v2_binding = (
+        OCIControlV2Binding(
+            lifecycle_binding.run_id,
+            lifecycle_binding.domain_core_digest,
+            lifecycle_binding.stage1_artifact_digest,
+        )
+        if lifecycle_binding is not None
+        else None
+    )
+    session = HostOCIControlV2Session(v2_binding) if v2_binding is not None else None
     lifecycle_ready = False
     connection_ordinal = 0
     socket_identity: tuple[int, int, int, int] | None = None
@@ -3859,31 +3884,30 @@ def _read_console_until(
     composite_done = False
     negative_input_written = False
     negative_reconnect_pending = False
-    committed_stop: OCIControlMessage | None = None
+    committed_stop: OCIControlV2Envelope | None = None
     required_peer_boundaries = 0
+    admitted_boundaries = 0
+    console_scan_offset = 0
+    observed_tags: set[str] = set()
+    negative_key: bytes | None = None
+    initial_host_nonce: str | None = None
 
-    def record_frame(direction: str, frame: bytes, message: Any) -> None:
+    def record_frame(direction: str, frame: bytes, envelope: OCIControlV2Envelope) -> None:
+        if session is None:
+            raise KVMProofFailure("KVM lifecycle transcript has no authenticated session")
+        projection = session.transcript_projection(envelope, frame)
+        if envelope.tag is not None:
+            observed_tags.add(envelope.tag)
+        if projection["direction"] != direction:
+            raise KVMProofFailure("KVM lifecycle transcript direction is invalid")
         if lifecycle_transcript is not None:
-            lifecycle_transcript.append(
-                {
-                    "boot_generation": message.boot_generation,
-                    "connection": connection_ordinal,
-                    "digest": f"sha256:{hashlib.sha256(frame).hexdigest()}",
-                    "direction": direction,
-                    "host_nonce": message.host_nonce,
-                    "kind": message.kind,
-                    "reply_to": message.reply_to,
-                    "request_id": message.request_id,
-                    "sequence": message.sequence,
-                    "size_bytes": len(frame),
-                }
-            )
+            lifecycle_transcript.append(_receipt_lifecycle_projection(connection_ordinal, projection))
 
-    def queue_message(message: OCIControlMessage, *, complete: bool = True) -> None:
+    def queue_message(message: OCIControlV2Envelope, *, complete: bool = True) -> None:
         nonlocal pending_frame, pending_message, pending_full_frame
         if channel_pending:
             raise KVMProofFailure("KVM lifecycle host write overlapped")
-        frame = encode_frame(message)
+        frame = encode_v2_frame(message)
         channel_pending.extend(frame if complete else frame[:-1])
         pending_frame = frame
         pending_message = message
@@ -3919,7 +3943,7 @@ def _read_console_until(
             pass
         channel = None
         channel_connected = False
-        decoder = OCIControlFrameDecoder()
+        decoder = OCIControlV2FrameDecoder()
 
     def verify_connected_peer() -> None:
         if channel is None or lifecycle_socket_path is None or socket_identity is None:
@@ -3944,11 +3968,86 @@ def _read_console_until(
             if peer_pid != process.pid or peer_uid != os.getuid():
                 raise KVMProofFailure("KVM lifecycle peer credentials do not identify QEMU")
 
+    def queue_connection_opener() -> None:
+        nonlocal initial_host_nonce
+        assert session is not None and lifecycle_binding is not None
+        if lifecycle_scenario != "negative":
+            queue_message(session.hello() if connection_ordinal == 1 else session.reconnect())
+            return
+        assert lifecycle_negative_name is not None
+        if connection_ordinal == 1:
+            if lifecycle_negative_name.startswith("hello_") and lifecycle_negative_name != "hello_reused_nonce":
+                if lifecycle_negative_input is not None:
+                    lifecycle_negative_input["boot_generation"] = None
+                queue_raw(
+                    _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
+                    negative_input=True,
+                )
+                return
+            opener = session.hello()
+            initial_host_nonce = opener.body.host_nonce
+            queue_message(opener)
+            return
+        if lifecycle_negative_name != "hello_reused_nonce" or initial_host_nonce is None or negative_key is None:
+            raise KVMProofFailure("KVM lifecycle negative reconnect state is invalid")
+        reconnect = session.reconnect()
+        body = reconnect.body
+        reused = sign_message(
+            OCIControlV2Message(
+                body.kind,
+                body.binding,
+                body.boot_attempt_id,
+                initial_host_nonce,
+                body.epoch,
+                body.wire_sequence,
+                body.payload,
+                request_id=body.request_id,
+                boot_generation=body.boot_generation,
+                reply_to=body.reply_to,
+            ),
+            negative_key,
+        )
+        if lifecycle_negative_input is not None:
+            lifecycle_negative_input["boot_generation"] = body.boot_generation
+        queue_raw(encode_v2_frame(reused), negative_input=True)
+
+    def admit_console_boundaries() -> None:
+        nonlocal admitted_boundaries, console_scan_offset
+        if session is None:
+            console_scan_offset = len(console)
+            return
+        while True:
+            newline = console.find(b"\n", console_scan_offset)
+            if newline < 0:
+                return
+            line = bytes(console[console_scan_offset : newline + 1])
+            console_scan_offset = newline + 1
+            if line.endswith(b"\r\n"):
+                line = line[:-2] + b"\n"
+            if not line.startswith(OCI_CONTROL_BOUNDARY_PREFIX):
+                continue
+            try:
+                envelope = decode_boundary_line(line)
+                projection = session.transcript_projection(envelope, line, carrier="console-line")
+                session.admit_boundary(envelope, line)
+            except OCIControlProtocolV2Error as error:
+                raise KVMProofFailure(
+                    "KVM lifecycle boundary acknowledgement was rejected: "
+                    f"{error} (session={session.state}; epoch={envelope.body.epoch}; "
+                    f"last_h2g={envelope.body.payload['last_accepted_h2g_wire_sequence']})"
+                ) from None
+            if envelope.tag is not None:
+                observed_tags.add(envelope.tag)
+            if lifecycle_transcript is not None:
+                lifecycle_transcript.append(_receipt_lifecycle_projection(connection_ordinal, projection))
+            admitted_boundaries += 1
+
     try:
         while True:
             now = time.monotonic()
             if now >= deadline:
                 current = bytes(console)
+                redacted_tail = _redact_lifecycle_boundary_lines(current)[-512:]
                 session_state = session.state if session is not None else "none"
                 raise KVMProofFailure(
                     "QEMU console proof timed out "
@@ -3961,14 +4060,14 @@ def _read_console_until(
                     f"stop={_logical_line_count(current, LIFECYCLE_STOP_DISPATCHED_MARKER)}; "
                     f"duplicate={_logical_line_count(current, LIFECYCLE_STOP_DUPLICATE_MARKER)}; "
                     f"terminal={_logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)}; "
-                    f"console_tail={current[-512:]!r})"
+                    f"console_tail={redacted_tail!r})"
                 )
             if (
                 channel is None
                 and not channel_finished
                 and lifecycle_socket_path is not None
                 and lifecycle_socket_path.exists()
-                and _logical_line_count(bytes(console), LIFECYCLE_PEER_BOUNDARY_MARKER) >= required_peer_boundaries
+                and admitted_boundaries >= required_peer_boundaries
             ):
                 try:
                     metadata = lifecycle_socket_path.lstat()
@@ -3991,31 +4090,7 @@ def _read_console_until(
                 selector.register(channel, selectors.EVENT_READ | selectors.EVENT_WRITE, "channel")
                 if channel_connected:
                     verify_connected_peer()
-                    assert session is not None
-                    if lifecycle_scenario == "negative":
-                        assert lifecycle_negative_name is not None
-                        if connection_ordinal == 1:
-                            if (
-                                lifecycle_negative_name.startswith("hello_")
-                                and lifecycle_negative_name != "hello_reused_nonce"
-                            ):
-                                if lifecycle_negative_input is not None:
-                                    lifecycle_negative_input["boot_generation"] = None
-                                queue_raw(
-                                    _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
-                                    negative_input=True,
-                                )
-                            else:
-                                queue_raw(_lifecycle_hello_frame(request_id=1))
-                        else:
-                            if lifecycle_negative_input is not None:
-                                lifecycle_negative_input["boot_generation"] = None
-                            queue_raw(
-                                _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
-                                negative_input=True,
-                            )
-                    else:
-                        queue_message(session.hello(reconnect=connection_ordinal > 1))
+                    queue_connection_opener()
             events = selector.select(min(0.1, deadline - now))
             for key, mask in events:
                 if key.data == "console":
@@ -4025,6 +4100,7 @@ def _read_console_until(
                         continue
                     if chunk:
                         console.extend(chunk)
+                        admit_console_boundaries()
                         if len(console) > MAX_CONSOLE_BYTES:
                             raise KVMProofFailure("QEMU console exceeds proof bound")
                     continue
@@ -4035,30 +4111,7 @@ def _read_console_until(
                             raise KVMProofFailure("KVM lifecycle socket connection failed")
                         channel_connected = True
                         verify_connected_peer()
-                        if lifecycle_scenario == "negative":
-                            assert lifecycle_negative_name is not None
-                            if connection_ordinal == 1:
-                                if (
-                                    lifecycle_negative_name.startswith("hello_")
-                                    and lifecycle_negative_name != "hello_reused_nonce"
-                                ):
-                                    if lifecycle_negative_input is not None:
-                                        lifecycle_negative_input["boot_generation"] = None
-                                    queue_raw(
-                                        _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
-                                        negative_input=True,
-                                    )
-                                else:
-                                    queue_raw(_lifecycle_hello_frame(request_id=1))
-                            else:
-                                if lifecycle_negative_input is not None:
-                                    lifecycle_negative_input["boot_generation"] = None
-                                queue_raw(
-                                    _lifecycle_negative_wire_bytes(lifecycle_negative_name, lifecycle_binding),
-                                    negative_input=True,
-                                )
-                        else:
-                            queue_message(session.hello(reconnect=connection_ordinal > 1))
+                        queue_connection_opener()
                     if channel_pending:
                         try:
                             sent = channel.send(channel_pending)
@@ -4089,8 +4142,8 @@ def _read_console_until(
                                             "connection": connection_ordinal,
                                             "digest": f"sha256:{hashlib.sha256(pending_frame).hexdigest()}",
                                             "frame_size_bytes": len(pending_frame),
-                                            "kind": pending_message.kind,
-                                            "request_id": pending_message.request_id,
+                                            "kind": pending_message.body.kind,
+                                            "request_id": pending_message.body.request_id,
                                         }
                                     )
                                 pending_frame = None
@@ -4098,13 +4151,30 @@ def _read_console_until(
                                 selector.modify(channel, selectors.EVENT_READ, "channel")
                                 composite_stage = "await-partial-buffered-3"
                                 continue
+                            completed_kind = pending_message.body.kind if pending_message is not None else None
                             pending_frame = None
                             pending_message = None
                             pending_negative_input = False
-                            if lifecycle_scenario == "composite" and connection_ordinal == 1:
+                            if (
+                                lifecycle_scenario == "composite"
+                                and connection_ordinal == 1
+                                and completed_kind == "KEY_ACK"
+                            ):
                                 selector.unregister(channel)
                                 # Do not consume a coalesced fast READY from this same
                                 # readiness event; connection one deliberately loses it.
+                                mask &= ~selectors.EVENT_READ
+                            elif (
+                                lifecycle_scenario == "composite"
+                                and connection_ordinal == 2
+                                and completed_kind == "RECONNECT"
+                            ):
+                                # The complete RECONNECT is queued to the guest, but
+                                # its resulting SNAPSHOT is deliberately lost.  The
+                                # next authenticated boundary must disambiguate that
+                                # the opener was accepted before connection three.
+                                close_channel(require_peer_boundary=True)
+                                composite_stage = "connect-3"
                                 mask &= ~selectors.EVENT_READ
                             elif lifecycle_scenario == "composite" and composite_stage == "duplicate-stop-4":
                                 selector.unregister(channel)
@@ -4119,7 +4189,7 @@ def _read_console_until(
                     if chunk == b"":
                         try:
                             decoder.finish()
-                        except OCIControlProtocolError:
+                        except OCIControlProtocolV2Error:
                             raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
                         if lifecycle_scenario == "negative" and negative_input_written:
                             close_channel()
@@ -4133,20 +4203,16 @@ def _read_console_until(
                     if chunk:
                         try:
                             messages = decoder.feed(chunk)
-                            for message in messages:
-                                frame = encode_frame(message)
-                                record_frame("guest-to-host", frame, message)
-                                if lifecycle_scenario == "negative":
-                                    if (
-                                        message.kind != "READY"
-                                        or message.binding != lifecycle_binding
-                                        or message.host_nonce != LIFECYCLE_NEGATIVE_NONCE
-                                        or message.reply_to != 1
-                                        or message.sequence != 1
-                                    ):
-                                        raise KVMProofFailure("KVM lifecycle negative setup READY is invalid")
-                                else:
-                                    session.accept(message)
+                            for envelope in messages:
+                                message = envelope.body
+                                frame = encode_v2_frame(envelope)
+                                session.accept(envelope)
+                                record_frame("guest-to-host", frame, envelope)
+                                if message.kind == "BOOTSTRAP":
+                                    if lifecycle_scenario == "negative":
+                                        negative_key = bytes.fromhex(str(message.payload["boot_key"]))
+                                    queue_message(session.key_ack())
+                                    continue
                                 if message.kind == "READY":
                                     if lifecycle_success is not True:
                                         raise KVMProofFailure("workload-negative boot emitted lifecycle READY")
@@ -4159,25 +4225,21 @@ def _read_console_until(
                                             if lifecycle_negative_input is not None:
                                                 lifecycle_negative_input["boot_generation"] = message.boot_generation
                                             if lifecycle_negative_name == "second_distinct_stop":
-                                                queue_raw(
-                                                    encode_frame(
-                                                        OCIControlMessage(
-                                                            "STOP",
-                                                            lifecycle_binding,
-                                                            LIFECYCLE_NEGATIVE_NONCE,
-                                                            {"signal": 15},
-                                                            request_id=2,
-                                                            boot_generation=message.boot_generation,
-                                                        )
-                                                    )
-                                                )
+                                                queue_message(session.stop())
                                                 composite_stage = "negative-await-stop-dispatched"
                                             else:
+                                                if negative_key is None:
+                                                    raise KVMProofFailure(
+                                                        "KVM lifecycle negative signing key is unavailable"
+                                                    )
                                                 queue_raw(
                                                     _lifecycle_negative_wire_bytes(
                                                         lifecycle_negative_name,
                                                         lifecycle_binding,
+                                                        boot_attempt_id=session.boot_attempt_id,
                                                         boot_generation=message.boot_generation,
+                                                        host_nonce=message.host_nonce,
+                                                        key=negative_key,
                                                     ),
                                                     negative_input=True,
                                                 )
@@ -4190,10 +4252,7 @@ def _read_console_until(
                                         )
                                 if lifecycle_scenario == "composite" and message.kind == "SNAPSHOT":
                                     state = message.payload["state"]
-                                    if connection_ordinal == 2 and state == "ready":
-                                        close_channel(require_peer_boundary=True)
-                                        composite_stage = "connect-3"
-                                    elif connection_ordinal == 3 and state == "ready":
+                                    if connection_ordinal == 3 and state == "ready":
                                         stop = session.stop()
                                         queue_message(stop, complete=False)
                                         composite_stage = "partial-stop-4"
@@ -4205,7 +4264,7 @@ def _read_console_until(
                                         composite_stage = "await-terminal"
                                     elif connection_ordinal == 6 and state == "terminal":
                                         composite_done = True
-                        except OCIControlProtocolError:
+                        except OCIControlProtocolV2Error:
                             raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
             current = bytes(console)
             armed_count = _logical_line_count(current, WORKLOAD_SIGNAL_ARMED_MARKER)
@@ -4245,13 +4304,17 @@ def _read_console_until(
             ):
                 assert lifecycle_binding is not None and lifecycle_negative_input is not None
                 observed_generation = lifecycle_negative_input.get("boot_generation")
-                if not isinstance(observed_generation, str):
+                if not isinstance(observed_generation, str) or negative_key is None or session.host_nonce is None:
                     raise KVMProofFailure("KVM lifecycle negative boot generation was not observed")
                 queue_raw(
                     _lifecycle_negative_wire_bytes(
                         lifecycle_negative_name,
                         lifecycle_binding,
+                        boot_attempt_id=session.boot_attempt_id,
                         boot_generation=observed_generation,
+                        host_nonce=session.host_nonce,
+                        key=negative_key,
+                        wire_sequence=4,
                     ),
                     negative_input=True,
                 )
@@ -4265,7 +4328,7 @@ def _read_console_until(
                 if channel_pending:
                     raise KVMProofFailure("retransmitted lifecycle STOP was not fully written")
                 assert committed_stop is not None
-                queue_message(committed_stop)
+                queue_message(session.retry_stop())
                 composite_stage = "duplicate-stop-4"
             if (
                 lifecycle_scenario == "composite"
@@ -4335,7 +4398,21 @@ def _read_console_until(
             ):
                 if process.poll() is not None:
                     raise KVMProofFailure("QEMU did not remain alive after the proof marker")
-                return bytes(console)
+                redacted_console = _redact_lifecycle_boundary_lines(bytes(console))
+                if session is not None:
+                    try:
+                        session.assert_receipt_safe(
+                            canonical_json_bytes(
+                                {
+                                    "console_hex": redacted_console.hex(),
+                                    "transcript": lifecycle_transcript or [],
+                                }
+                            ),
+                            observed_tags,
+                        )
+                    except OCIControlProtocolV2Error:
+                        raise KVMProofFailure("KVM lifecycle evidence contains secret material") from None
+                return redacted_console
             if process.poll() is not None:
                 for _ in range(8):
                     try:
@@ -4345,7 +4422,10 @@ def _read_console_until(
                     if not chunk:
                         break
                     console.extend(chunk)
-                raise KVMProofFailure(f"QEMU exited before the proof marker ({process.returncode})")
+                tail = _redact_lifecycle_boundary_lines(bytes(console))[-512:]
+                raise KVMProofFailure(
+                    f"QEMU exited before the proof marker ({process.returncode}); console_tail={tail!r}"
+                )
     except OSError:
         raise KVMProofFailure("KVM lifecycle or console I/O failed") from None
     finally:

@@ -64,18 +64,18 @@ def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_41_boot_c
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v6",
+        "contract": "palimpsest.guest-pid1-supervisor.v7",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],
         "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "cooperative_status": 43,
-        "credential_timing": "child-isolate-drop-verify-parent-attach-release",
+        "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "forced_status": 137,
         "forwarded_signal": 15,
-        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
-        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
@@ -91,6 +91,8 @@ def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_41_boot_c
     assert receipt["lifecycle"]["negative_input_proven"] is True
     assert [frame["kind"] for frame in receipt["lifecycle"]["boots"][0]["frames"]] == [
         "HELLO",
+        "BOOTSTRAP",
+        "KEY_ACK",
         "READY",
         "STOP",
         "TERMINAL",

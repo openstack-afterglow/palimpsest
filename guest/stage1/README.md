@@ -109,19 +109,19 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v15 receipt retains owner-only positive and per-control consoles plus a
+The v16 receipt retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v6` execution checkpoint, the
-`palimpsest.workload-lifecycle-authority-isolation.v1` boundary, and the
-`palimpsest.guest-lifecycle-broker.v2` exchange.
+the `palimpsest.guest-pid1-supervisor.v7` execution checkpoint, the
+`palimpsest.workload-lifecycle-authority-isolation.v2` boundary, and the
+`palimpsest.guest-lifecycle-broker.v3` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v11 admits
+and production VM launch remains disabled. Stage-1 plan/protocol v12 admits
 only the explicit absolute/numeric process subset.
 
 Before release, PID 1 verifies that the workload child has closed the
@@ -153,25 +153,26 @@ After root transition, PID 1 mounts and verifies cgroup v2, pins the workload
 directory plus `cgroup.procs`, `cgroup.kill`, and `cgroup.events`, and forks a
 child held behind a release gate. The child first closes the lifecycle fd,
 installs and verifies its isolation boundary, and reports readiness. Only then
-does root PID 1 move it into the dedicated cgroup and send the release byte;
+does root PID 1 move it into the dedicated cgroup, generate the per-boot
+lifecycle key, complete authenticated BOOTSTRAP/KEY_ACK, and send the release byte;
 the child may subsequently change cwd and exec. Cleanup uses
 only the pinned controls and requires stop-signal grace, `cgroup.kill`,
 `wait4` to `ECHILD`, `populated 0`, empty procs, and successful removal before
 the terminal marker. This is still a single-workload qualification boundary;
-future detached stop, exec, and agent lifecycle need a separate privileged
-broker plus an authenticated host lifecycle channel.
+future detached stop, exec, and agent lifecycle need a separate production
+broker and runtime dispatch path.
 The cgroup provides workload containment and deterministic cleanup; it is not
 a complete hostile-root availability sandbox. Every admitted numeric identity,
 including UID 0, executes without capabilities behind the same boundary.
 
 The native proof opens the uniquely named lifecycle virtio port and runs the
-bounded HELLO/READY/STOP/TERMINAL exchange for both the base and distinct UID 0
-plans. It also qualifies retained-root reconnect/SNAPSHOT/same-ID retry and
-deduplication, plus the malformed, stale, replayed, and conflicting input
-matrix. TERMINAL is sent only after cgroup cleanup certainty and before the
-console terminal marker. Receipt v15 records `reconnect_proven=true` and
-`negative_input_proven=true`; arbitrary rapid reconnect and cryptographic peer
-authentication remain future production boundaries.
+bounded v2 HELLO/BOOTSTRAP/KEY_ACK/READY/STOP/TERMINAL exchange for both the
+base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
+retained-root reconnect/SNAPSHOT/same-ID retry and deduplication, plus the
+malformed, stale, replayed, and conflicting input matrix. TERMINAL is sent only
+after cgroup cleanup certainty and before the console terminal marker. Receipt
+v16 records `reconnect_proven=true` and `negative_input_proven=true`; production
+runtime dispatch and host-daemon recovery remain future boundaries.
 
 Proof v7 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level

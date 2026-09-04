@@ -39,7 +39,8 @@ from palimpsest_local.kvm import (
     validate_domain_name_available,
     validate_network,
 )
-from palimpsest_local.oci_control_protocol import OCI_CONTROL_CHANNEL_NAME, OCI_CONTROL_PROTOCOL
+from palimpsest_local.oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
+from palimpsest_local.oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
 from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
 
 _ROOT = Path("/var/lib/palimpsest/layers")
@@ -134,7 +135,7 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     assert marker is not None and marker.get("contract") == "sha256:" + "4" * 64
     lifecycle = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}lifecycle")
     assert lifecycle is not None
-    assert lifecycle.attrib == {"channel": OCI_CONTROL_CHANNEL_NAME, "protocol": OCI_CONTROL_PROTOCOL}
+    assert lifecycle.attrib == {"channel": OCI_CONTROL_CHANNEL_NAME, "protocol": OCI_CONTROL_PROTOCOL_V2}
     assert [controller.attrib for controller in xml.findall("./devices/controller")] == [
         {"type": "virtio-serial", "index": "0"}
     ]

@@ -1,9 +1,8 @@
-# OCI lifecycle control v2 candidate
+# OCI lifecycle control v2 guest/KVM activation
 
-This is a production-inert candidate. The active guest, domain plan, and
-native-KVM qualification continue to use v1 until guest support and the proof
-driver can switch in one fail-closed version cascade. Production
-`create/start/run/-d` remains disabled.
+This protocol is active in the pre-production guest PID 1, domain plan, and
+native-KVM qualification path. The production runtime still has no lifecycle
+owner, so `create/start/run/-d` remains disabled.
 
 ## Bootstrap trust boundary
 
@@ -13,8 +12,8 @@ check. It binds the run ID, domain-core digest, stage-1 artifact digest, a fresh
 host boot-attempt UUID, host nonce, epoch, and host wire sequence. Same-UID host
 or QEMU compromise and host-daemon restart recovery are outside this slice.
 
-After workload fork and isolation, but before workload release, PID 1 will
-generate a 32-byte key and return a self-MACed `BOOTSTRAP`. The host verifies it,
+After workload fork and isolation, but before workload release, PID 1
+generates a 32-byte key and returns a self-MACed `BOOTSTRAP`. The host verifies it,
 returns a signed `KEY_ACK`, and only then may PID 1 release the workload and
 return signed `READY`. The raw key is permitted only in the private bootstrap
 envelope; it is excluded from object representations and receipt projections.
@@ -98,11 +97,21 @@ carrier. The unsigned `HELLO` path explicitly requires no key. Every signed
 kind requires the boot key and is authenticated internally before a projection
 can be returned; callers cannot assert a verification boolean. The projection
 records body/envelope digests, key ID, bindings, counters, carrier, direction,
-and the derived result, but never the raw boot key or MAC tag.
+and the derived result, but never the raw boot key or MAC tag. A digest of the
+complete receipt-safe projection binds those fields against accidental
+rewrites. Console evidence replaces the authenticated envelope with a fixed
+redaction marker after verification; the transcript retains its authenticated
+digest projection. Final evidence is recursively checked against every
+observed boot key and tag before it is returned.
 
 ## Activation gate
 
-Activation is deferred to the next slice. It must add the post-fork PID 1 key
-lifecycle, guest codec/MAC verifier, console boundary emission, negative native
-KVM cases, regenerated deterministic assets, and the full protocol/broker/
-isolation/supervisor/plan/guest/initramfs/proof/domain version cascade together.
+Slice 29B activates the complete guest/KVM gate: post-fork PID 1 key custody,
+the C codec and HKDF-HMAC verifier, console boundary emission, authenticated
+negative controls, deterministic guest assets, and the fail-closed protocol/
+broker/isolation/supervisor/plan/guest/initramfs/proof/domain version cascade.
+The six-connection proof loses the initial READY, loses the first reconnect
+SNAPSHOT after the RECONNECT is accepted, discards a partial STOP, retries the
+same logical STOP on a fresh wire, deduplicates it without a second signal,
+and reconnects through terminal state. Native evidence remains mandatory;
+local policy tests and reproducible compilation are not a substitute.

@@ -224,8 +224,14 @@ struct span { const char *p; usize n; };
 #define WORKLOAD_CLEANUP_REJECTED_PREFIX "palimpsest guest stage1: workload cleanup rejected; stage="
 #define LIFECYCLE_REJECTED_PREFIX "palimpsest guest stage1: lifecycle rejected; stage="
 #define LIFECYCLE_CHANNEL_NAME "org.palimpsest.oci.lifecycle.0"
-#define LIFECYCLE_PROTOCOL "palimpsest.oci-lifecycle-control.v1"
+#define LIFECYCLE_PROTOCOL "palimpsest.oci-lifecycle-control.v2"
+#define LIFECYCLE_PUBLIC_STATE "palimpsest.oci-lifecycle-public-state.v1"
+#define LIFECYCLE_CHANNEL_CARRIER "channel-frame"
+#define LIFECYCLE_CONSOLE_CARRIER "console-line"
+#define LIFECYCLE_BOUNDARY_PREFIX "palimpsest guest stage1: lifecycle boundary ack "
 #define CONTROL_PAYLOAD_MAX 65532
+#define CONTROL_GUEST_BODY_MAX 2048
+#define CONTROL_GUEST_OUTPUT_MAX 4096
 #define LIFECYCLE_CONNECTION_MAX 16
 #define LIFECYCLE_REQUEST_LEDGER_MAX 17
 #define LIFECYCLE_DISCONNECTED 0
@@ -235,7 +241,6 @@ struct span { const char *p; usize n; };
 #define LIFECYCLE_STOPPING 2
 #define LIFECYCLE_TERMINAL 3
 #define LIFECYCLE_READY_COMMITTED_MARKER "palimpsest guest stage1: lifecycle ready committed\n"
-#define LIFECYCLE_PEER_BOUNDARY_MARKER "palimpsest guest stage1: lifecycle peer boundary observed\n"
 #define LIFECYCLE_PARTIAL_BUFFERED_MARKER "palimpsest guest stage1: lifecycle partial frame buffered\n"
 #define LIFECYCLE_STOP_DISPATCHED_MARKER "palimpsest guest stage1: lifecycle stop dispatched\n"
 #define LIFECYCLE_STOP_DUPLICATE_MARKER "palimpsest guest stage1: lifecycle stop duplicate accepted\n"
@@ -367,9 +372,21 @@ struct lifecycle_session {
     u64 last_hello_request_id;
     u64 hello_request_id;
     u64 stop_request_id;
+    u64 epoch;
+    u64 last_accepted_host_wire;
+    u64 connection_opener_request_id;
+    u64 bootstrap_wire_sequence;
+    u64 key_ack_wire_sequence;
     char host_nonce[65];
+    char boot_attempt_id[37];
     char boot_generation[37];
+    char boundary_id[37];
+    char boundary_digest[72];
+    u8 boot_key[32];
+    char key_id[72];
     char used_nonces[LIFECYCLE_CONNECTION_MAX][65];
+    char used_boundary_ids[LIFECYCLE_CONNECTION_MAX][37];
+    u32 boundary_count;
     u64 seen_request_ids[LIFECYCLE_REQUEST_LEDGER_MAX];
 };
 
@@ -457,6 +474,12 @@ static int bytes_equal(const void *a0, const void *b0, usize n) {
     u8 diff = 0;
     for (i = 0; i < n; i++) diff |= a[i] ^ b[i];
     return diff == 0;
+}
+
+static int bytes_all_zero(const void *p0, usize n) {
+    const u8 *p = (const u8 *)p0; usize i; u8 any = 0;
+    for (i = 0; i < n; i++) any |= p[i];
+    return any == 0;
 }
 
 static int text_equal(const char *a, const char *b) {
@@ -551,6 +574,8 @@ struct sha256_ctx {
     u32 used;
 };
 
+static char hex_digit(u8 value);
+
 static const u32 sha_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -636,6 +661,45 @@ static void sha_bytes(const void *p, usize n, u8 out[32]) {
     sha_init(&c);
     sha_update(&c, p, n);
     sha_final(&c, out);
+}
+
+static void secure_zero(void *p0, usize n) {
+    volatile u8 *p = (volatile u8 *)p0;
+    while (n--) *p++ = 0;
+}
+
+static void hmac_sha256_parts(const u8 key[32], const void *a, usize an,
+                              const void *b, usize bn, const void *d, usize dn,
+                              u8 out[32]) {
+    u8 inner_key[64], outer_key[64], inner[32];
+    struct sha256_ctx c;
+    usize i;
+    for (i = 0; i < 64; i++) {
+        u8 value = i < 32 ? key[i] : 0;
+        inner_key[i] = value ^ 0x36;
+        outer_key[i] = value ^ 0x5c;
+    }
+    sha_init(&c); sha_update(&c, inner_key, 64);
+    if (an) sha_update(&c, a, an);
+    if (bn) sha_update(&c, b, bn);
+    if (dn) sha_update(&c, d, dn);
+    sha_final(&c, inner);
+    sha_init(&c); sha_update(&c, outer_key, 64); sha_update(&c, inner, 32); sha_final(&c, out);
+    secure_zero(inner_key, sizeof(inner_key)); secure_zero(outer_key, sizeof(outer_key));
+    secure_zero(inner, sizeof(inner)); secure_zero(&c, sizeof(c));
+}
+
+static void hmac_sha256(const u8 key[32], const void *p, usize n, u8 out[32]) {
+    hmac_sha256_parts(key, p, n, 0, 0, 0, 0, out);
+}
+
+static void hex32(const u8 value[32], char out[65]) {
+    usize i;
+    for (i = 0; i < 32; i++) {
+        out[i * 2] = hex_digit(value[i] >> 4);
+        out[i * 2 + 1] = hex_digit(value[i] & 15);
+    }
+    out[64] = 0;
 }
 
 static char hex_digit(u8 value) { return (char)(value < 10 ? '0' + value : 'a' + value - 10); }
@@ -957,6 +1021,13 @@ static int exact_string(struct parser *j, const char *expected) {
     struct span s;
     usize n = slen(expected);
     return json_string(j, &s, 0, 0) && s.n == n && bytes_equal(s.p, expected, n);
+}
+
+static int exact_literal(struct parser *j, const char *expected) {
+    usize n = slen(expected);
+    if ((usize)(j->end - j->p) < n || !bytes_equal(j->p, expected, n)) return 0;
+    j->p += n;
+    return 1;
 }
 
 static int plain_string(struct parser *j, struct span *s, usize *decoded) {
@@ -1281,19 +1352,19 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v5") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v6") || !take_char(&j, ',') ||
         !key(&j, "isolation") ||
-        !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v1") || !take_char(&j, ',') ||
+        !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v2") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") ||
         !exact_string(&j, "absolute-argv0-numeric-capabilityless-isolated-user-group.v2") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v11") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v12") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v11") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v12") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -1877,7 +1948,7 @@ static int append_u32(char *out, usize *used, u32 value) {
 }
 
 static u8 control_payload[CONTROL_PAYLOAD_MAX];
-static u8 control_output[1024];
+static u8 control_output[CONTROL_GUEST_OUTPUT_MAX];
 static struct parser control_parser;
 
 static u64 monotonic_millis(void) {
@@ -2020,9 +2091,14 @@ static int generate_boot_generation(char out[37]) {
     return text == 36;
 }
 
+static int send_boundary_ack(struct lifecycle_session *session, u32 header_used,
+                             u32 payload_used, u32 payload_expected);
+
 static void lifecycle_connection_lost(struct lifecycle_session *session) {
-    int admitted_peer_boundary =
-        session->connection == LIFECYCLE_CONNECTED && session->connection_has_hello;
+    int admitted_peer_boundary = session->connection == LIFECYCLE_CONNECTED;
+    u32 discarded_header = session->header_used;
+    u32 discarded_payload = session->payload_used;
+    u32 discarded_expected = session->payload_expected;
     session->connection = LIFECYCLE_DISCONNECTED;
     session->connection_has_hello = 0;
     session->natural_late_stop_allowed = 0;
@@ -2033,8 +2109,11 @@ static void lifecycle_connection_lost(struct lifecycle_session *session) {
     session->frame_deadline = 0;
     session->outbound_failed = 0;
     session->outbound_deadline = 0;
-    session->host_nonce[0] = 0;
-    if (admitted_peer_boundary) write_all(1, LIFECYCLE_PEER_BOUNDARY_MARKER);
+    if (admitted_peer_boundary && session->key_ack_wire_sequence) {
+        session->epoch++;
+        if (!send_boundary_ack(session, discarded_header, discarded_payload, discarded_expected))
+            session->poisoned = 1;
+    }
 }
 
 /* Never let a connected peer make the outer supervisor wait past the
@@ -2097,6 +2176,7 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
                     if (!size || size > CONTROL_PAYLOAD_MAX) return -1;
                     session->payload_expected = size;
                     session->payload_used = 0;
+                    session->header_used = 0;
                 }
             }
             continue;
@@ -2141,63 +2221,141 @@ static int remember_nonce_request(struct lifecycle_session *session, const char 
     return 1;
 }
 
-static int parse_control_binding(struct parser *j, const struct lifecycle_session *session,
-                                 const char nonce[65], const char *kind,
-                                 int stop, u64 *request_id) {
-    struct span value;
-    u64 number;
-    if (!take_char(j, '{')) return 0;
-    if (stop && (!key(j, "boot_generation") || !plain_string(j, &value, 0) || value.n != 36 ||
-                 !bytes_equal(value.p, session->boot_generation, 36) || !take_char(j, ','))) return 0;
-    if (!key(j, "domain_core_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
-        !bytes_equal(value.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
-        !key(j, "host_nonce") || !plain_string(j, &value, 0) || value.n != 64 ||
-        !bytes_equal(value.p, nonce, 64) || !take_char(j, ',') ||
-        !key(j, "kind") || !exact_string(j, kind) || !take_char(j, ',') || !key(j, "payload") ||
-        !take_char(j, '{')) return 0;
-    if (stop && (!key(j, "signal") || !uint_value(j, &number) || number != 15)) return 0;
-    if (!take_char(j, '}') || !take_char(j, ',') || !key(j, "request_id") || !uint_value(j, request_id) ||
-        !*request_id || *request_id > 0x7fffffffffffffffULL || !take_char(j, ',') ||
+static int verify_lifecycle_mac(const struct lifecycle_session *session,
+                                const char *body, usize body_size,
+                                const struct span key_id, const struct span tag,
+                                const char *direction, const char *carrier);
+
+static int parse_hello(struct lifecycle_session *session, usize size) {
+    struct span value, nonce, attempt;
+    char candidate[65], attempt_text[37];
+    u64 request_id, epoch, wire;
+    usize i;
+    struct parser *j = &control_parser;
+    memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
+    if (!take_char(j, '{') || !key(j, "body") || !take_char(j, '{') ||
+        !key(j, "boot_attempt_id") || !plain_string(j, &attempt, 0) || !valid_uuid_span(attempt) ||
+        !take_char(j, ',') || !key(j, "domain_core_digest") || !plain_string(j, &value, 0) ||
+        value.n != 71 || !bytes_equal(value.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
+        !key(j, "epoch") || !uint_value(j, &epoch) || epoch != 1 || !take_char(j, ',') ||
+        !key(j, "host_nonce") || !plain_string(j, &nonce, 0) || nonce.n != 64) return 0;
+    for (i = 0; i < nonce.n; i++) if (!is_hex((char)nonce.p[i])) return 0;
+    memcpy(candidate, nonce.p, 64); candidate[64] = 0;
+    memcpy(attempt_text, attempt.p, 36); attempt_text[36] = 0;
+    if (!take_char(j, ',') || !key(j, "kind") || !exact_string(j, "HELLO") || !take_char(j, ',') ||
+        !key(j, "payload") || !take_char(j, '{') || !take_char(j, '}') || !take_char(j, ',') ||
+        !key(j, "request_id") || !uint_value(j, &request_id) || !request_id ||
+        request_id > 0x7fffffffffffffffULL || !take_char(j, ',') ||
         !key(j, "run_id") || !plain_string(j, &value, 0) || value.n != 36 ||
         !bytes_equal(value.p, lifecycle_binding.run_id, 36) || !take_char(j, ',') ||
         !key(j, "schema") || !exact_string(j, LIFECYCLE_PROTOCOL) || !take_char(j, ',') ||
         !key(j, "stage1_artifact_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
-        !bytes_equal(value.p, lifecycle_binding.stage1, 71) || !take_char(j, '}') || j->p != j->end) return 0;
-    return 1;
-}
-
-static int parse_hello(struct lifecycle_session *session, usize size) {
-    struct span nonce;
-    char candidate[65];
-    u64 request_id;
-    usize i;
-    struct parser *j = &control_parser;
-    memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
-    if (!take_char(j, '{') || !key(j, "domain_core_digest") || !plain_string(j, &nonce, 0) || nonce.n != 71 ||
-        !bytes_equal(nonce.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
-        !key(j, "host_nonce") || !plain_string(j, &nonce, 0) || nonce.n != 64) return 0;
-    for (i = 0; i < nonce.n; i++) if (!is_hex((char)nonce.p[i])) return 0;
-    memcpy(candidate, nonce.p, 64); candidate[64] = 0;
-    j->p = control_payload; j->end = control_payload + size;
-    if (!parse_control_binding(j, session, candidate, "HELLO", 0, &request_id) ||
-        session->connection_has_hello || request_id <= session->last_hello_request_id ||
+        !bytes_equal(value.p, lifecycle_binding.stage1, 71) || !take_char(j, ',') ||
+        !key(j, "wire_sequence") || !uint_value(j, &wire) || wire != 1 ||
+        !take_char(j, '}') || !take_char(j, ',') || !key(j, "mac") ||
+        !exact_literal(j, "null") || !take_char(j, '}') || j->p != j->end ||
+        session->connection_has_hello || session->last_hello_request_id ||
         !remember_nonce_request(session, candidate, request_id)) return 0;
     memcpy(session->host_nonce, candidate, 65);
+    memcpy(session->boot_attempt_id, attempt_text, 37);
     session->last_hello_request_id = request_id;
     session->hello_request_id = request_id;
+    session->connection_opener_request_id = request_id;
+    session->last_accepted_host_wire = wire;
+    session->epoch = 1;
     session->connection_has_hello = 1;
     session->connection = LIFECYCLE_CONNECTED;
     return 1;
 }
 
-static int parse_stop(struct lifecycle_session *session, usize size) {
-    u64 request_id;
+static int parse_signed_host(struct lifecycle_session *session, usize size, int expected_kind,
+                             u64 *request_id_out, u64 *wire_out) {
+    struct span value, key_id, tag, boundary_id, boundary_digest;
+    const u8 *body_start, *body_end;
+    char nonce_candidate[65];
+    u64 epoch, request_id = 0, reply_to, wire, signal_value = 0;
+    const char *kind = expected_kind == 0 ? "KEY_ACK" : (expected_kind == 1 ? "RECONNECT" : "STOP");
     struct parser *j = &control_parser;
     memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
-    if (!session->connection_has_hello ||
-        !parse_control_binding(j, session, session->host_nonce, "STOP", 1, &request_id)) return 0;
+    if ((expected_kind != 1 && !session->connection_has_hello) ||
+        !take_char(j, '{') || !key(j, "body")) return 0;
+    body_start = j->p;
+    if (!take_char(j, '{') || !key(j, "boot_attempt_id") || !plain_string(j, &value, 0) ||
+        value.n != 36 || !bytes_equal(value.p, session->boot_attempt_id, 36) || !take_char(j, ',') ||
+        !key(j, "boot_generation") || !plain_string(j, &value, 0) || value.n != 36 ||
+        !bytes_equal(value.p, session->boot_generation, 36) || !take_char(j, ',') ||
+        !key(j, "domain_core_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
+        !bytes_equal(value.p, lifecycle_binding.core, 71) || !take_char(j, ',') ||
+        !key(j, "epoch") || !uint_value(j, &epoch) || epoch != session->epoch || !take_char(j, ',') ||
+        !key(j, "host_nonce") || !plain_string(j, &value, 0) || value.n != 64) return 0;
+    memcpy(nonce_candidate, value.p, 64); nonce_candidate[64] = 0;
+    if ((expected_kind != 1 && !bytes_equal(nonce_candidate, session->host_nonce, 64)) ||
+        (expected_kind == 1 && nonce_seen(session, nonce_candidate)) || !take_char(j, ',') ||
+        !key(j, "kind") || !exact_string(j, kind) || !take_char(j, ',') || !key(j, "payload") ||
+        !take_char(j, '{')) return 0;
+    if (expected_kind == 1) {
+        if (!key(j, "boundary_ack_digest") || !plain_string(j, &boundary_digest, 0) ||
+            boundary_digest.n != 71 || !bytes_equal(boundary_digest.p, session->boundary_digest, 71) ||
+            !take_char(j, ',') ||
+            !key(j, "boundary_id") || !plain_string(j, &boundary_id, 0) ||
+            boundary_id.n != 36 || !bytes_equal(boundary_id.p, session->boundary_id, 36)) return 0;
+    } else if (expected_kind == 2) {
+        if (!key(j, "signal") || !uint_value(j, &signal_value) || signal_value != 15) return 0;
+    }
+    if (!take_char(j, '}')) return 0;
+    if (expected_kind != 0) {
+        if (!take_char(j, ',') || !key(j, "request_id") || !uint_value(j, &request_id) ||
+            !request_id || request_id > 0x7fffffffffffffffULL) return 0;
+    }
+    if (!take_char(j, ',') || !key(j, "reply_to")) return 0;
+    if (expected_kind == 0) {
+        if (!uint_value(j, &reply_to) || reply_to != session->bootstrap_wire_sequence) return 0;
+    } else if (!exact_literal(j, "null")) return 0;
+    if (!take_char(j, ',') || !key(j, "run_id") || !plain_string(j, &value, 0) || value.n != 36 ||
+        !bytes_equal(value.p, lifecycle_binding.run_id, 36) || !take_char(j, ',') ||
+        !key(j, "schema") || !exact_string(j, LIFECYCLE_PROTOCOL) || !take_char(j, ',') ||
+        !key(j, "stage1_artifact_digest") || !plain_string(j, &value, 0) || value.n != 71 ||
+        !bytes_equal(value.p, lifecycle_binding.stage1, 71) || !take_char(j, ',') ||
+        !key(j, "wire_sequence") || !uint_value(j, &wire) || !wire || wire > 0x7fffffffffffffffULL ||
+        !take_char(j, '}')) return 0;
+    body_end = j->p;
+    if (!take_char(j, ',') || !key(j, "mac") || !take_char(j, '{') ||
+        !key(j, "key_id") || !plain_string(j, &key_id, 0) || !take_char(j, ',') ||
+        !key(j, "tag") || !plain_string(j, &tag, 0) || !take_char(j, '}') ||
+        !take_char(j, '}') || j->p != j->end ||
+        !verify_lifecycle_mac(session, (const char *)body_start, (usize)(body_end - body_start), key_id, tag,
+                              "host-to-guest", LIFECYCLE_CHANNEL_CARRIER)) return 0;
+    if (wire <= session->last_accepted_host_wire) return 0;
+    if (expected_kind == 0) {
+        if (epoch != 1 || session->last_accepted_host_wire == 0x7fffffffffffffffULL ||
+            wire != session->last_accepted_host_wire + 1) return 0;
+    } else if (expected_kind == 1) {
+        /* The console BOUNDARY_ACK is the sole authority that opened this epoch.
+         * The exact digest/id are validated by the host-side v2 session and the
+         * MAC binds them here; a stale nonce/epoch cannot enter this branch. */
+        usize i;
+        for (i = 0; i < 64; i++) if (!is_hex(nonce_candidate[i])) return 0;
+        if (request_seen(session, request_id) ||
+            !remember_nonce_request(session, nonce_candidate, request_id)) return 0;
+        memcpy(session->host_nonce, nonce_candidate, 65);
+        session->connection_opener_request_id = request_id;
+        session->connection_has_hello = 1;
+        session->connection = LIFECYCLE_CONNECTED;
+        session->last_accepted_host_wire = wire;
+        session->boundary_id[0] = 0;
+        session->boundary_digest[0] = 0;
+    }
+    if (request_id_out) *request_id_out = request_id;
+    if (wire_out) *wire_out = wire;
+    return 1;
+}
+
+static int parse_stop(struct lifecycle_session *session, usize size) {
+    u64 request_id, wire;
+    if (!parse_signed_host(session, size, 2, &request_id, &wire)) return 0;
     if (session->stop_request_id) {
         if (request_id != session->stop_request_id || session->state != LIFECYCLE_STOPPING) return 0;
+        session->last_accepted_host_wire = wire;
         return 2;
     }
     /* A canonical STOP that lost the race with an already-reaped main process
@@ -2208,12 +2366,14 @@ static int parse_stop(struct lifecycle_session *session, usize size) {
             session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX) return 0;
         session->natural_late_stop_allowed = 0;
         session->seen_request_ids[session->request_count++] = request_id;
+        session->last_accepted_host_wire = wire;
         return 3;
     }
     if (session->state != LIFECYCLE_READY || request_seen(session, request_id) ||
         session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX) return 0;
     session->seen_request_ids[session->request_count++] = request_id;
     session->stop_request_id = request_id;
+    session->last_accepted_host_wire = wire;
     session->state = LIFECYCLE_STOPPING;
     session->stop_delivered_count++;
     return 1;
@@ -2233,42 +2393,122 @@ static int append_control_u64(u8 *out, usize cap, usize *used, u64 value) {
     return 1;
 }
 
-static int send_control_message(struct lifecycle_session *session, int kind,
-                                const struct supervisor_result *result) {
-    usize used = 4;
-    u64 sequence = session->next_sequence++;
-#define CONTROL_TEXT(value) do { if (!append_control(control_output, sizeof(control_output), &used, value)) return 0; } while (0)
-    CONTROL_TEXT("{\"boot_generation\":\""); CONTROL_TEXT(session->boot_generation);
-    CONTROL_TEXT("\",\"domain_core_digest\":\""); CONTROL_TEXT(lifecycle_binding.core);
-    CONTROL_TEXT("\",\"host_nonce\":\""); CONTROL_TEXT(session->host_nonce);
-    if (kind == 0) CONTROL_TEXT("\",\"kind\":\"READY\",\"payload\":{}");
-    else if (kind == 1) CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"ready\",\"stop_request_id\":null,\"terminal\":null}");
-    else if (kind == 2) {
-        CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"stopping\",\"stop_request_id\":");
-        if (!append_control_u64(control_output, sizeof(control_output), &used, session->stop_request_id)) return 0;
-        CONTROL_TEXT(",\"terminal\":null}");
-    } else if (kind == 3) CONTROL_TEXT("\",\"kind\":\"TERMINAL\",\"payload\":{\"terminal\":{");
-    else CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"terminal\",\"stop_request_id\":");
-    if (kind == 4) {
-        if (session->stop_request_id) {
-            if (!append_control_u64(control_output, sizeof(control_output), &used, session->stop_request_id)) return 0;
-        } else CONTROL_TEXT("null");
-        CONTROL_TEXT(",\"terminal\":{");
+/* V2 closed-world maxima: terminal BOUNDARY_ACK body <=1114 and console
+ * envelope <=1336 bytes; the compile-time slack is deliberate schema guard. */
+_Static_assert(CONTROL_GUEST_BODY_MAX >= 1114, "lifecycle body bound is too small");
+_Static_assert(CONTROL_GUEST_OUTPUT_MAX >= 1336, "lifecycle envelope bound is too small");
+static u8 control_body[CONTROL_GUEST_BODY_MAX];
+
+static int lifecycle_mac(const struct lifecycle_session *session, const char *body, usize body_size,
+                         const char *direction, const char *carrier, u8 tag[32]) {
+    static const char salt_input[] = LIFECYCLE_PROTOCOL "\0hkdf-salt\0";
+    u8 salt[32], prk[32], subkey[32], length[4];
+    u8 info[1024], input_prefix[256];
+    usize used = 0, prefix_used = 0;
+#define INFO_TEXT(value) do { if (!append_control(info, sizeof(info), &used, value)) return 0; } while (0)
+#define INFO_BYTES(value) do { usize n_ = sizeof(value) - 1; if (used + n_ > sizeof(info)) return 0; memcpy(info + used, value, n_); used += n_; } while (0)
+    sha_bytes(salt_input, sizeof(salt_input) - 1, salt);
+    hmac_sha256(salt, session->boot_key, sizeof(session->boot_key), prk);
+    INFO_BYTES(LIFECYCLE_PROTOCOL "\0subkey\0"); INFO_TEXT(direction); INFO_BYTES("\0");
+    INFO_TEXT(carrier); INFO_BYTES("\0"); INFO_TEXT("{\"boot_attempt_id\":\""); INFO_TEXT(session->boot_attempt_id);
+    INFO_TEXT("\",\"boot_generation\":\""); INFO_TEXT(session->boot_generation);
+    INFO_TEXT("\",\"domain_core_digest\":\""); INFO_TEXT(lifecycle_binding.core);
+    INFO_TEXT("\",\"run_id\":\""); INFO_TEXT(lifecycle_binding.run_id);
+    INFO_TEXT("\",\"stage1_artifact_digest\":\""); INFO_TEXT(lifecycle_binding.stage1);
+    INFO_TEXT("\"}");
+    if (used == sizeof(info)) return 0;
+    info[used++] = 1;
+    hmac_sha256(prk, info, used, subkey);
+#undef INFO_TEXT
+#undef INFO_BYTES
+#define PREFIX_TEXT(value) do { if (!append_control(input_prefix, sizeof(input_prefix), &prefix_used, value)) return 0; } while (0)
+#define PREFIX_BYTES(value) do { usize n_ = sizeof(value) - 1; if (prefix_used + n_ > sizeof(input_prefix)) return 0; memcpy(input_prefix + prefix_used, value, n_); prefix_used += n_; } while (0)
+    PREFIX_BYTES(LIFECYCLE_PROTOCOL "\0frame\0"); PREFIX_TEXT(direction); PREFIX_BYTES("\0");
+    PREFIX_TEXT(carrier); PREFIX_BYTES("\0");
+#undef PREFIX_TEXT
+#undef PREFIX_BYTES
+    length[0] = (u8)(body_size >> 24); length[1] = (u8)(body_size >> 16);
+    length[2] = (u8)(body_size >> 8); length[3] = (u8)body_size;
+    hmac_sha256_parts(subkey, input_prefix, prefix_used, length, 4, body, body_size, tag);
+    secure_zero(salt, sizeof(salt)); secure_zero(prk, sizeof(prk)); secure_zero(subkey, sizeof(subkey));
+    secure_zero(info, sizeof(info)); secure_zero(input_prefix, sizeof(input_prefix));
+    return 1;
+}
+
+static int lifecycle_crypto_kat(void) {
+    static const char body[] =
+        "{\"boot_attempt_id\":\"aca88126-d991-4de8-b66b-90dc07904dff\","
+        "\"boot_generation\":\"b22b1c81-dfa4-478a-b352-27b5b35fe5b7\","
+        "\"domain_core_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"epoch\":1,\"host_nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\","
+        "\"kind\":\"READY\",\"payload\":{},\"reply_to\":2,"
+        "\"run_id\":\"f6f546e2-e734-4920-9eff-1762b348a249\","
+        "\"schema\":\"palimpsest.oci-lifecycle-control.v2\","
+        "\"stage1_artifact_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"wire_sequence\":2}";
+    static const char expected_tag[] = "dcc930fbefed70f26cb33075a2c5d28d8c9d714357cd6267e8c8ed4209d72227";
+    struct lifecycle_binding saved = lifecycle_binding;
+    struct lifecycle_session session;
+    u8 tag[32], expected[32]; usize i; int valid;
+    memset(&session, 0, sizeof(session));
+    memcpy(session.boot_attempt_id, "aca88126-d991-4de8-b66b-90dc07904dff", 37);
+    memcpy(session.boot_generation, "b22b1c81-dfa4-478a-b352-27b5b35fe5b7", 37);
+    for (i = 0; i < 32; i++) session.boot_key[i] = (u8)i;
+    memcpy(lifecycle_binding.run_id, "f6f546e2-e734-4920-9eff-1762b348a249", 37);
+    memcpy(lifecycle_binding.core,
+           "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 72);
+    memcpy(lifecycle_binding.stage1,
+           "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 72);
+    for (i = 0; i < 32; i++) expected[i] = (u8)((hex_value(expected_tag[i * 2]) << 4) |
+                                                hex_value(expected_tag[i * 2 + 1]));
+    valid = lifecycle_mac(&session, body, sizeof(body) - 1, "guest-to-host",
+                          LIFECYCLE_CHANNEL_CARRIER, tag) && bytes_equal(tag, expected, 32);
+    lifecycle_binding = saved;
+    secure_zero(&session, sizeof(session)); secure_zero(tag, sizeof(tag)); secure_zero(expected, sizeof(expected));
+    return valid;
+}
+
+static int verify_lifecycle_mac(const struct lifecycle_session *session,
+                                const char *body, usize body_size,
+                                const struct span key_id, const struct span tag,
+                                const char *direction, const char *carrier) {
+    u8 expected[32], supplied[32];
+    usize i;
+    int key_ok, tag_ok;
+    if (key_id.n != 71 || tag.n != 64) return 0;
+    for (i = 0; i < 64; i++) if (!is_hex(tag.p[i])) return 0;
+    for (i = 0; i < 32; i++) supplied[i] = (u8)((hex_value(tag.p[i * 2]) << 4) | hex_value(tag.p[i * 2 + 1]));
+    if (!lifecycle_mac(session, body, body_size, direction, carrier, expected)) return 0;
+    key_ok = bytes_equal(key_id.p, session->key_id, 71);
+    tag_ok = bytes_equal(expected, supplied, 32);
+    secure_zero(expected, sizeof(expected)); secure_zero(supplied, sizeof(supplied));
+    return key_ok && tag_ok;
+}
+
+static int write_signed_message(struct lifecycle_session *session, const u8 *body, usize body_size,
+                                const char *direction, const char *carrier, int console) {
+    u8 tag[32]; char tag_text[65]; usize used = console ? 0 : 4;
+    if (!lifecycle_mac(session, (const char *)body, body_size, direction, carrier, tag)) return 0;
+    hex32(tag, tag_text);
+    if (console && !append_control(control_output, sizeof(control_output), &used, LIFECYCLE_BOUNDARY_PREFIX)) return 0;
+    if (!append_control(control_output, sizeof(control_output), &used, "{\"body\":") ||
+        used + body_size > sizeof(control_output)) return 0;
+    memcpy(control_output + used, body, body_size); used += body_size;
+    if (!append_control(control_output, sizeof(control_output), &used, ",\"mac\":{\"key_id\":\"") ||
+        !append_control(control_output, sizeof(control_output), &used, session->key_id) ||
+        !append_control(control_output, sizeof(control_output), &used, "\",\"tag\":\"") ||
+        !append_control(control_output, sizeof(control_output), &used, tag_text) ||
+        !append_control(control_output, sizeof(control_output), &used, "\"}}")) return 0;
+    secure_zero(tag, sizeof(tag)); secure_zero(tag_text, sizeof(tag_text));
+    if (console) {
+        i64 n;
+        usize prefix_size = slen(LIFECYCLE_BOUNDARY_PREFIX);
+        digest_text(control_output + prefix_size, used - prefix_size, session->boundary_digest);
+        if (!append_control(control_output, sizeof(control_output), &used, "\n")) return 0;
+        n = sc3(SYS_write, 1, (i64)control_output, used);
+        secure_zero(control_output, used);
+        return n == (i64)used;
     }
-    if (kind == 3 || kind == 4) {
-        if (result->main_signal) { CONTROL_TEXT("\"exit_code\":null,\"signal\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_signal)) return 0; }
-        else { CONTROL_TEXT("\"exit_code\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, result->main_exit_code)) return 0; CONTROL_TEXT(",\"signal\":null"); }
-        CONTROL_TEXT(kind == 3 ? "}}" : "}}");
-    }
-    CONTROL_TEXT(",\"reply_to\":");
-    if (kind == 3 && !session->stop_request_id) CONTROL_TEXT("null");
-    else if (!append_control_u64(control_output, sizeof(control_output), &used,
-                                 kind == 3 ? session->stop_request_id : session->hello_request_id)) return 0;
-    CONTROL_TEXT(",\"run_id\":\""); CONTROL_TEXT(lifecycle_binding.run_id);
-    CONTROL_TEXT("\",\"schema\":\""); CONTROL_TEXT(LIFECYCLE_PROTOCOL);
-    CONTROL_TEXT("\",\"sequence\":"); if (!append_control_u64(control_output, sizeof(control_output), &used, sequence)) return 0;
-    CONTROL_TEXT(",\"stage1_artifact_digest\":\""); CONTROL_TEXT(lifecycle_binding.stage1); CONTROL_TEXT("\"}");
-#undef CONTROL_TEXT
     {
         u32 payload = (u32)(used - 4);
         control_output[0] = (u8)(payload >> 24); control_output[1] = (u8)(payload >> 16);
@@ -2276,13 +2516,182 @@ static int send_control_message(struct lifecycle_session *session, int kind,
     }
     if (!session->connection_has_hello || !control_io_exact(session->fd, control_output, used, 1)) {
         u64 now = monotonic_millis();
-        session->outbound_failed = 1;
-        session->outbound_deadline = now ? now + 5000 : 0;
+        session->outbound_failed = 1; session->outbound_deadline = now ? now + 5000 : 0;
+        secure_zero(control_output, used);
         return 0;
     }
-    session->outbound_failed = 0;
-    session->outbound_deadline = 0;
+    secure_zero(control_output, used);
+    session->outbound_failed = 0; session->outbound_deadline = 0;
     return 1;
+}
+
+static int generate_boot_secret(struct lifecycle_session *session) {
+    static const char key_prefix[] = LIFECYCLE_PROTOCOL "\0key-id\0";
+    u8 digest[32]; struct sha256_ctx c; usize used = 0, i;
+    u64 now = monotonic_millis(), deadline = now ? now + 5000 : 0;
+    while (used < sizeof(session->boot_key)) {
+        i64 n = sc3(SYS_getrandom, (i64)(session->boot_key + used), sizeof(session->boot_key) - used, GRND_NONBLOCK);
+        if (n > 0 && (usize)n <= sizeof(session->boot_key) - used) { used += (usize)n; continue; }
+        if (n == -EINTR) continue;
+        if (n == -EAGAIN && deadline && monotonic_millis() < deadline) {
+            struct pollfd_local none; none.fd = -1; none.events = 0; none.revents = 0;
+            sc3(SYS_poll, (i64)&none, 0, 10); continue;
+        }
+        secure_zero(session->boot_key, sizeof(session->boot_key)); return 0;
+    }
+    sha_init(&c); sha_update(&c, key_prefix, sizeof(key_prefix) - 1);
+    sha_update(&c, session->boot_key, sizeof(session->boot_key)); sha_final(&c, digest);
+    memcpy(session->key_id, "sha256:", 7);
+    for (i = 0; i < 32; i++) { session->key_id[7 + i * 2] = hex_digit(digest[i] >> 4); session->key_id[8 + i * 2] = hex_digit(digest[i] & 15); }
+    session->key_id[71] = 0;
+    secure_zero(digest, sizeof(digest)); secure_zero(&c, sizeof(c));
+    if (!generate_boot_generation(session->boot_generation)) {
+        secure_zero(session->boot_key, sizeof(session->boot_key));
+        secure_zero(session->key_id, sizeof(session->key_id));
+        return 0;
+    }
+    return 1;
+}
+
+static int send_bootstrap(struct lifecycle_session *session) {
+    usize used = 0, i; u64 sequence = session->next_sequence++;
+    session->bootstrap_wire_sequence = sequence;
+#define BODY_TEXT(value) do { if (!append_control(control_body, sizeof(control_body), &used, value)) return 0; } while (0)
+    BODY_TEXT("{\"boot_attempt_id\":\""); BODY_TEXT(session->boot_attempt_id);
+    BODY_TEXT("\",\"boot_generation\":\""); BODY_TEXT(session->boot_generation);
+    BODY_TEXT("\",\"domain_core_digest\":\""); BODY_TEXT(lifecycle_binding.core);
+    BODY_TEXT("\",\"epoch\":1,\"host_nonce\":\""); BODY_TEXT(session->host_nonce);
+    BODY_TEXT("\",\"kind\":\"BOOTSTRAP\",\"payload\":{\"boot_key\":\"");
+    if (used + 64 > sizeof(control_body)) return 0;
+    for (i = 0; i < 32; i++) { control_body[used++] = (u8)hex_digit(session->boot_key[i] >> 4); control_body[used++] = (u8)hex_digit(session->boot_key[i] & 15); }
+    BODY_TEXT("\"},\"reply_to\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->hello_request_id)) return 0;
+    BODY_TEXT(",\"run_id\":\""); BODY_TEXT(lifecycle_binding.run_id); BODY_TEXT("\",\"schema\":\"");
+    BODY_TEXT(LIFECYCLE_PROTOCOL); BODY_TEXT("\",\"stage1_artifact_digest\":\""); BODY_TEXT(lifecycle_binding.stage1);
+    BODY_TEXT("\",\"wire_sequence\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, sequence)) return 0;
+    BODY_TEXT("}");
+#undef BODY_TEXT
+    i = (usize)write_signed_message(session, control_body, used, "guest-to-host", LIFECYCLE_CHANNEL_CARRIER, 0);
+    secure_zero(control_body, used); return (int)i;
+}
+
+static int send_control_message(struct lifecycle_session *session, int kind,
+                                const struct supervisor_result *result) {
+    usize used = 0;
+    u64 sequence = session->next_sequence++;
+#define CONTROL_TEXT(value) do { if (!append_control(control_body, sizeof(control_body), &used, value)) return 0; } while (0)
+    CONTROL_TEXT("{\"boot_attempt_id\":\""); CONTROL_TEXT(session->boot_attempt_id);
+    CONTROL_TEXT("\",\"boot_generation\":\""); CONTROL_TEXT(session->boot_generation);
+    CONTROL_TEXT("\",\"domain_core_digest\":\""); CONTROL_TEXT(lifecycle_binding.core);
+    CONTROL_TEXT("\",\"epoch\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->epoch)) return 0;
+    CONTROL_TEXT(",\"host_nonce\":\""); CONTROL_TEXT(session->host_nonce);
+    if (kind == 0) CONTROL_TEXT("\",\"kind\":\"READY\",\"payload\":{}");
+    else if (kind == 1) CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"ready\",\"stop_request_id\":null,\"terminal\":null}");
+    else if (kind == 2) {
+        CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"stopping\",\"stop_request_id\":");
+        if (!append_control_u64(control_body, sizeof(control_body), &used, session->stop_request_id)) return 0;
+        CONTROL_TEXT(",\"terminal\":null}");
+    } else if (kind == 3) CONTROL_TEXT("\",\"kind\":\"TERMINAL\",\"payload\":{\"terminal\":{");
+    else CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"terminal\",\"stop_request_id\":");
+    if (kind == 4) {
+        if (session->stop_request_id) {
+            if (!append_control_u64(control_body, sizeof(control_body), &used, session->stop_request_id)) return 0;
+        } else CONTROL_TEXT("null");
+        CONTROL_TEXT(",\"terminal\":{");
+    }
+    if (kind == 3 || kind == 4) {
+        if (result->main_signal) { CONTROL_TEXT("\"exit_code\":null,\"signal\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, result->main_signal)) return 0; }
+        else { CONTROL_TEXT("\"exit_code\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, result->main_exit_code)) return 0; CONTROL_TEXT(",\"signal\":null"); }
+        CONTROL_TEXT(kind == 3 ? "}}" : "}}");
+    }
+    CONTROL_TEXT(",\"reply_to\":");
+    if (kind == 3 && !session->stop_request_id) CONTROL_TEXT("null");
+    else if (!append_control_u64(control_body, sizeof(control_body), &used,
+                                 kind == 3 ? session->stop_request_id :
+                                 (kind == 0 ? session->key_ack_wire_sequence : session->connection_opener_request_id))) return 0;
+    CONTROL_TEXT(",\"run_id\":\""); CONTROL_TEXT(lifecycle_binding.run_id);
+    CONTROL_TEXT("\",\"schema\":\""); CONTROL_TEXT(LIFECYCLE_PROTOCOL);
+    CONTROL_TEXT("\",\"stage1_artifact_digest\":\""); CONTROL_TEXT(lifecycle_binding.stage1);
+    CONTROL_TEXT("\",\"wire_sequence\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, sequence)) return 0;
+    CONTROL_TEXT("}");
+#undef CONTROL_TEXT
+    kind = write_signed_message(session, control_body, used, "guest-to-host", LIFECYCLE_CHANNEL_CARRIER, 0);
+    secure_zero(control_body, used); return kind;
+}
+
+static int append_lifecycle_state(u8 *out, usize cap, usize *used,
+                                  const struct lifecycle_session *session, int with_schema) {
+    if (!append_control(out, cap, used, "{")) return 0;
+    if (with_schema && (!append_control(out, cap, used, "\"schema\":\"") ||
+        !append_control(out, cap, used, LIFECYCLE_PUBLIC_STATE) ||
+        !append_control(out, cap, used, "\","))) return 0;
+    if (!append_control(out, cap, used, "\"state\":\"")) return 0;
+    if (session->state == LIFECYCLE_READY) {
+        if (!append_control(out, cap, used, "ready\",\"stop_request_id\":null,\"terminal\":null}")) return 0;
+    } else if (session->state == LIFECYCLE_STOPPING) {
+        if (!append_control(out, cap, used, "stopping\",\"stop_request_id\":")) return 0;
+        if (!append_control_u64(out, cap, used, session->stop_request_id) ||
+            !append_control(out, cap, used, ",\"terminal\":null}")) return 0;
+    } else if (session->state == LIFECYCLE_TERMINAL) {
+        if (!append_control(out, cap, used, "terminal\",\"stop_request_id\":")) return 0;
+        if (session->stop_request_id) {
+            if (!append_control_u64(out, cap, used, session->stop_request_id)) return 0;
+        } else if (!append_control(out, cap, used, "null")) return 0;
+        if (!append_control(out, cap, used, ",\"terminal\":{")) return 0;
+        if (session->terminal_signal) {
+            if (!append_control(out, cap, used, "\"exit_code\":null,\"signal\":") ||
+                !append_control_u64(out, cap, used, session->terminal_signal)) return 0;
+        } else if (!append_control(out, cap, used, "\"exit_code\":") ||
+                   !append_control_u64(out, cap, used, session->terminal_exit_code) ||
+                   !append_control(out, cap, used, ",\"signal\":null")) return 0;
+        if (!append_control(out, cap, used, "}}")) return 0;
+    } else return 0;
+    return 1;
+}
+
+static int send_boundary_ack(struct lifecycle_session *session, u32 header_used,
+                             u32 payload_used, u32 payload_expected) {
+    u8 state[256]; char state_digest[72]; usize state_used = 0, used = 0;
+    u64 sequence = session->next_sequence++;
+    if (!((header_used == 0 && payload_used == 0 && payload_expected == 0) ||
+          (header_used >= 1 && header_used <= 3 && payload_used == 0 && payload_expected == 0) ||
+          (header_used == 0 && payload_expected >= 1 && payload_expected <= CONTROL_PAYLOAD_MAX &&
+           payload_used < payload_expected))) return 0;
+    if (session->boundary_count >= LIFECYCLE_CONNECTION_MAX) return 0;
+    for (;;) {
+        u32 i; int duplicate = 0;
+        if (!generate_boot_generation(session->boundary_id)) return 0;
+        for (i = 0; i < session->boundary_count; i++)
+            if (bytes_equal(session->used_boundary_ids[i], session->boundary_id, 36)) duplicate = 1;
+        if (!duplicate) break;
+    }
+    memcpy(session->used_boundary_ids[session->boundary_count++], session->boundary_id, 37);
+    if (!append_lifecycle_state(state, sizeof(state), &state_used, session, 1)) return 0;
+    digest_text(state, state_used, state_digest);
+#define BOUNDARY_TEXT(value) do { if (!append_control(control_body, sizeof(control_body), &used, value)) return 0; } while (0)
+    BOUNDARY_TEXT("{\"boot_attempt_id\":\""); BOUNDARY_TEXT(session->boot_attempt_id);
+    BOUNDARY_TEXT("\",\"boot_generation\":\""); BOUNDARY_TEXT(session->boot_generation);
+    BOUNDARY_TEXT("\",\"domain_core_digest\":\""); BOUNDARY_TEXT(lifecycle_binding.core);
+    BOUNDARY_TEXT("\",\"epoch\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->epoch)) return 0;
+    BOUNDARY_TEXT(",\"host_nonce\":\""); BOUNDARY_TEXT(session->host_nonce);
+    BOUNDARY_TEXT("\",\"kind\":\"BOUNDARY_ACK\",\"payload\":{\"boundary_id\":\"");
+    BOUNDARY_TEXT(session->boundary_id); BOUNDARY_TEXT("\",\"discarded_header_bytes\":");
+    if (!append_control_u64(control_body, sizeof(control_body), &used, header_used)) return 0;
+    BOUNDARY_TEXT(",\"discarded_payload_bytes\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, payload_used)) return 0;
+    BOUNDARY_TEXT(",\"discarded_payload_expected\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, payload_expected)) return 0;
+    BOUNDARY_TEXT(",\"last_accepted_h2g_wire_sequence\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->last_accepted_host_wire)) return 0;
+    BOUNDARY_TEXT(",\"last_attempted_g2h_wire_sequence\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, sequence)) return 0;
+    BOUNDARY_TEXT(",\"lifecycle_state\":"); if (!append_lifecycle_state(control_body, sizeof(control_body), &used, session, 0)) return 0;
+    BOUNDARY_TEXT(",\"previous_epoch\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->epoch - 1)) return 0;
+    BOUNDARY_TEXT(",\"state_digest\":\""); BOUNDARY_TEXT(state_digest); BOUNDARY_TEXT("\"},\"reply_to\":");
+    if (!append_control_u64(control_body, sizeof(control_body), &used, session->connection_opener_request_id)) return 0;
+    BOUNDARY_TEXT(",\"run_id\":\""); BOUNDARY_TEXT(lifecycle_binding.run_id); BOUNDARY_TEXT("\",\"schema\":\"");
+    BOUNDARY_TEXT(LIFECYCLE_PROTOCOL); BOUNDARY_TEXT("\",\"stage1_artifact_digest\":\""); BOUNDARY_TEXT(lifecycle_binding.stage1);
+    BOUNDARY_TEXT("\",\"wire_sequence\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, sequence)) return 0;
+    BOUNDARY_TEXT("}");
+#undef BOUNDARY_TEXT
+    header_used = (u32)write_signed_message(session, control_body, used, "guest-to-host", LIFECYCLE_CONSOLE_CARRIER, 1);
+    secure_zero(state, sizeof(state)); secure_zero(state_digest, sizeof(state_digest));
+    secure_zero(control_body, used); return (int)header_used;
 }
 
 static int lifecycle_current_snapshot(struct lifecycle_session *session,
@@ -2313,7 +2722,12 @@ static int lifecycle_pump(struct lifecycle_session *session,
         if (frame < 0) { session->poisoned = 1; return 0; }
         if (session->outbound_failed) { session->poisoned = 1; return 0; }
         if (!session->connection_has_hello) {
-            if (!parse_hello(session, size)) { session->poisoned = 1; return 0; }
+            if (session->key_ack_wire_sequence) {
+                u64 request_id, wire;
+                if (!parse_signed_host(session, size, 1, &request_id, &wire)) {
+                    session->poisoned = 1; return 0;
+                }
+            } else if (!parse_hello(session, size)) { session->poisoned = 1; return 0; }
             if (!lifecycle_current_snapshot(session, result)) return 0;
         } else {
             int stop = parse_stop(session, size);
@@ -2328,11 +2742,12 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
     usize size = 0;
     u64 deadline;
     memset(session, 0, sizeof(*session)); session->fd = -1;
+    if (!lifecycle_crypto_kat()) { session->poisoned = 1; return 0; }
     session->fd = discover_lifecycle_channel();
     session->next_sequence = 1;
     session->reconnect_backoff_ms = 10;
     deadline = monotonic_millis() + 5000;
-    if (session->fd < 0 || !generate_boot_generation(session->boot_generation)) {
+    if (session->fd < 0) {
         session->poisoned = 1;
         if (session->fd >= 0) sc1(SYS_close, session->fd);
         session->fd = -1;
@@ -2362,6 +2777,38 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
     return 0;
 }
 
+static int authenticate_lifecycle_bootstrap(struct lifecycle_session *session) {
+    usize size = 0; u64 deadline;
+    if (!generate_boot_secret(session) || !send_bootstrap(session)) goto rejected;
+    deadline = monotonic_millis() + 5000;
+    while (monotonic_millis() < deadline) {
+        int frame = read_control_frame(session, &size);
+        if (frame == 1) {
+            u64 request_id = 0, wire = 0;
+            if (!parse_signed_host(session, size, 0, &request_id, &wire)) break;
+            session->last_accepted_host_wire = wire;
+            session->key_ack_wire_sequence = wire;
+            return 1;
+        }
+        if (frame < 0) break;
+        {
+            struct pollfd_local item; item.fd = session->fd; item.events = POLLIN; item.revents = 0;
+            sc3(SYS_poll, (i64)&item, 1, 10);
+        }
+    }
+rejected:
+    secure_zero(session->boot_key, sizeof(session->boot_key));
+    secure_zero(session->key_id, sizeof(session->key_id));
+    secure_zero(session->boot_generation, sizeof(session->boot_generation));
+    return 0;
+}
+
+static void wipe_lifecycle_secret(struct lifecycle_session *session) {
+    secure_zero(session->boot_key, sizeof(session->boot_key));
+    secure_zero(session->key_id, sizeof(session->key_id));
+    secure_zero(session->boot_generation, sizeof(session->boot_generation));
+}
+
 static __attribute__((noreturn)) void service_terminal_lifecycle(
     struct lifecycle_session *session, const struct supervisor_result *result) {
     for (;;) {
@@ -2377,11 +2824,13 @@ static __attribute__((noreturn)) void service_terminal_lifecycle(
             i64 n = sc3(SYS_poll, (i64)&pollfd, 1,
                         lifecycle_poll_timeout(session, -1));
             if (n < 0 && n != -EINTR) {
+                wipe_lifecycle_secret(session);
                 lifecycle_rejected(21, EIO);
                 for (;;) sc0(SYS_pause);
             }
         }
         if (!lifecycle_pump(session, result, &dispatch_stop) || dispatch_stop) {
+            wipe_lifecycle_secret(session);
             lifecycle_rejected(21, EIO);
             for (;;) sc0(SYS_pause);
         }
@@ -3496,6 +3945,11 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             if (!prepare_workload_isolation(process, &isolation_failure))
                 child_fail(error_pipe[1], isolation_failure.stage, isolation_failure.error);
         }
+        if (!bytes_all_zero(lifecycle->boot_key, sizeof(lifecycle->boot_key)) ||
+            !bytes_all_zero(lifecycle->key_id, sizeof(lifecycle->key_id)) ||
+            !bytes_all_zero(lifecycle->boot_generation, sizeof(lifecycle->boot_generation)) ||
+            lifecycle->bootstrap_wire_sequence != 0 || lifecycle->key_ack_wire_sequence != 0)
+            child_fail(error_pipe[1], 35, EIO);
         operation = sc3(SYS_write, isolation_pipe[1], (i64)&isolation_ready, 1);
         if (operation != 1 || sc1(SYS_close, isolation_pipe[1]) != 0)
             child_fail(error_pipe[1], 33, operation < 0 ? operation : EIO);
@@ -3571,6 +4025,17 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return n ? 0 : -1;
+    }
+    if (!authenticate_lifecycle_bootstrap(lifecycle)) {
+        set_workload_failure(failure, 20, EIO);
+        sc1(SYS_close, release_pipe[1]);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, 0);
+        sc1(SYS_close, error_pipe[0]);
+        if (!n) set_workload_failure(failure, 18, EIO);
+        close_workload_cgroup(&cgroup);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return n ? -2 : -1;
     }
     write_all(1, WORKLOAD_ISOLATION_MARKER);
     {
@@ -3657,7 +4122,26 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             }
         }
         if (dispatch_stop) {
-            if (sc2(SYS_kill, -main_pid, process->stop_signal) != 0) {
+            n = sc2(SYS_kill, -main_pid, process->stop_signal);
+            if (n == -ESRCH) {
+                /* STOP was authenticated and committed, but the workload may
+                 * win the narrow race between the preceding WNOHANG probe and
+                 * signal delivery.  Confirm that exact main process is now
+                 * waitable before treating this as its natural terminal
+                 * status under the accepted STOP identity. */
+                do {
+                    n = sc4(SYS_wait4, main_pid, (i64)&status, 0, 0);
+                } while (n == -EINTR);
+                if (n == main_pid) {
+                    record_reaped_child(result, n, main_pid, status);
+                    main_done = 1;
+                    result->main_status = workload_status(status);
+                    if ((status & 0x7f) == 0) result->main_exit_code = (u32)((status >> 8) & 0xff);
+                    else result->main_signal = (u32)(status & 0x7f);
+                    continue;
+                }
+            }
+            if (n != 0) {
                 lifecycle->poisoned = 1;
                 set_workload_failure(failure, 21, EIO);
                 n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
@@ -3834,16 +4318,19 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     code = supervise_workload(&workload, &workload_failure, &workload_result, &lifecycle);
     if (!code) {
         sc1(SYS_close, lifecycle.fd);
+        wipe_lifecycle_secret(&lifecycle);
         workload_rejected(workload_failure.stage, workload_failure.error);
         for (;;) sc0(SYS_pause);
     }
     if (code == -1) {
         sc1(SYS_close, lifecycle.fd);
+        wipe_lifecycle_secret(&lifecycle);
         workload_cleanup_rejected(workload_failure.stage, workload_failure.error);
         for (;;) sc0(SYS_pause);
     }
     if (code == -2) {
         sc1(SYS_close, lifecycle.fd);
+        wipe_lifecycle_secret(&lifecycle);
         lifecycle_rejected(workload_failure.stage, workload_failure.error);
         for (;;) sc0(SYS_pause);
     }

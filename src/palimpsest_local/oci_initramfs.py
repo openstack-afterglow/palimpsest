@@ -31,24 +31,24 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v15"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v16"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v13"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v15"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v14"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v16"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v6"
-OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v2"
-OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v1"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v7"
+OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v3"
+OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v2"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:8a0d223e5bb619411487b78575b09b5d07ab184a34ed06f017f74c6edfb5f91f"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:57365d267e6a37b3cb9388693cae44429fb903d0c4d83c8f227db12762b5c1ce"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:1f76bde495cc452937a482685846eaadba7b56077732cd9f0d39c365833178bb"
+OCI_STAGE1_BINARY_DIGEST = "sha256:6bab80c8c6581e4a90c6418d762946ea188ba881bb6a2b3c885eeda05bc299c6"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -370,7 +370,7 @@ def _supervisor_contract_dict() -> dict[str, Any]:
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cleanup_scope": "dedicated-workload-cgroup",
         "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-        "credential_transition": "isolate-drop-verify-handshake-cgroup-attach-release",
+        "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "credentials": "root-pid1-broker-and-capabilityless-admitted-numeric-workload-identity",
         "environment": "authenticated-image-environment-only",
         "execution": "fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
@@ -379,12 +379,13 @@ def _supervisor_contract_dict() -> dict[str, Any]:
             "contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
             "devices": ["full", "null", "random", "tty", "urandom", "zero"],
             "lifecycle_fd": "child-closed-before-isolation-ready",
+            "lifecycle_key": "pid1-generated-post-fork-post-isolation-never-inherited",
             "mounts": "private-dev-tmpfs-masked-virtio-ports-readonly-proc-sys-cgroup",
             "pid1_proc": "nondumpable-before-fork",
             "seccomp": "authority-escape-boundary-filter",
         },
         "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
-        "lifecycle_delivery": "reconnect-snapshot-same-id-stop-retry-v1",
+        "lifecycle_delivery": "authenticated-v2-bootstrap-boundary-ack-reconnect-snapshot-same-id-stop-retry",
         "privilege_after_fork": "root-pid1-narrow-broker-capabilityless-workload",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",

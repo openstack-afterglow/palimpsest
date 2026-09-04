@@ -1,9 +1,8 @@
-"""Production-inert candidate for authenticated OCI lifecycle protocol v2.
+"""Authenticated OCI lifecycle protocol v2 for the pre-production OCI-root path.
 
-The active guest and KVM qualification remain on v1 until this candidate is
-implemented guest-side and activated atomically.  V2 anchors its one unsigned
-HELLO in the owner-pinned private QEMU Unix peer.  PID 1 then returns a
-self-authenticated per-boot key and all later traffic is authenticated.
+V2 anchors its one unsigned HELLO in the owner-pinned private QEMU Unix peer.
+PID 1 then returns a self-authenticated per-boot key and all later traffic is
+authenticated. Production runtime dispatch remains disabled.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ OCI_CONTROL_CHANNEL_CARRIER = "channel-frame"
 OCI_CONTROL_CONSOLE_CARRIER = "console-line"
 OCI_CONTROL_BOUNDARY_PREFIX = b"palimpsest guest stage1: lifecycle boundary ack "
 MAX_OCI_CONTROL_FRAME_BYTES = 64 * 1024
+MAX_OCI_CONTROL_CONNECTIONS = 16
 _MAX_PAYLOAD_BYTES = MAX_OCI_CONTROL_FRAME_BYTES - 4
 _MAX_COUNTER = (1 << 63) - 1
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -550,25 +550,25 @@ def transcript_projection(
         raise OCIControlProtocolV2Error("lifecycle transcript encoding is not canonical")
     message = envelope.body
     body_bytes = canonical_json_bytes(message.to_dict())
-    return MappingProxyType(
-        {
-            "authentication_verified": authentication_verified,
-            "body_digest": f"sha256:{hashlib.sha256(body_bytes).hexdigest()}",
-            "boot_attempt_id": message.boot_attempt_id,
-            "boot_generation": message.boot_generation,
-            "carrier": carrier,
-            "direction": message.direction,
-            "envelope_digest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
-            "epoch": message.epoch,
-            "host_nonce": message.host_nonce,
-            "key_id": envelope.key_id,
-            "kind": message.kind,
-            "reply_to": message.reply_to,
-            "request_id": message.request_id,
-            "size_bytes": len(encoded),
-            "wire_sequence": message.wire_sequence,
-        }
-    )
+    projection: dict[str, Any] = {
+        "authentication_verified": authentication_verified,
+        "body_digest": f"sha256:{hashlib.sha256(body_bytes).hexdigest()}",
+        "boot_attempt_id": message.boot_attempt_id,
+        "boot_generation": message.boot_generation,
+        "carrier": carrier,
+        "direction": message.direction,
+        "envelope_digest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+        "epoch": message.epoch,
+        "host_nonce": message.host_nonce,
+        "key_id": envelope.key_id,
+        "kind": message.kind,
+        "reply_to": message.reply_to,
+        "request_id": message.request_id,
+        "size_bytes": len(encoded),
+        "wire_sequence": message.wire_sequence,
+    }
+    projection["projection_digest"] = f"sha256:{hashlib.sha256(canonical_json_bytes(projection)).hexdigest()}"
+    return MappingProxyType(projection)
 
 
 class OCIControlV2FrameDecoder:
@@ -650,6 +650,7 @@ class HostOCIControlV2Session:
         self._accepted_nonce: str | None = None
         self._pending_host_wire: int | None = None
         self._stop_wire: int | None = None
+        self._stop_wire_candidates: set[int] = set()
         self._retry_reconnect_request: int | None = None
         self._reconnect_from: str | None = None
         self.state = "new"
@@ -670,7 +671,34 @@ class HostOCIControlV2Session:
     def epoch(self) -> int:
         return self._epoch
 
+    def transcript_projection(
+        self,
+        envelope: OCIControlV2Envelope,
+        encoded: bytes,
+        *,
+        carrier: str = OCI_CONTROL_CHANNEL_CARRIER,
+    ) -> Mapping[str, Any]:
+        """Project one admitted/sent frame without exposing its key or tag."""
+
+        key = None if envelope.body.kind == "HELLO" else self._key
+        return transcript_projection(envelope, encoded, carrier=carrier, key=key)
+
+    def assert_receipt_safe(self, serialized: bytes, observed_tags: set[str]) -> None:
+        """Fail if receipt material contains this session's raw key or a MAC tag."""
+
+        if not isinstance(serialized, bytes):
+            raise OCIControlProtocolV2Error("serialized lifecycle evidence is invalid")
+        if self._key is not None and self._key.hex().encode("ascii") in serialized:
+            raise OCIControlProtocolV2Error("serialized lifecycle evidence exposes the boot key")
+        for tag in observed_tags:
+            if not isinstance(tag, str) or _HEX32_RE.fullmatch(tag) is None:
+                raise OCIControlProtocolV2Error("observed lifecycle tag is invalid")
+            if tag.encode("ascii") in serialized:
+                raise OCIControlProtocolV2Error("serialized lifecycle evidence exposes a MAC tag")
+
     def _fresh_nonce(self) -> str:
+        if len(self._used_nonces) >= MAX_OCI_CONTROL_CONNECTIONS:
+            raise OCIControlProtocolV2Error("lifecycle connection limit was exhausted")
         nonce = self._nonce_factory()
         if not isinstance(nonce, str) or _HEX32_RE.fullmatch(nonce) is None or nonce in self._used_nonces:
             raise OCIControlProtocolV2Error("nonce factory did not produce a fresh canonical nonce")
@@ -740,13 +768,14 @@ class HostOCIControlV2Session:
             raise OCIControlProtocolV2Error("BOUNDARY_ACK guest sequence is stale")
         if payload["previous_epoch"] != self._epoch:
             raise OCIControlProtocolV2Error("BOUNDARY_ACK previous epoch is stale")
-        if self.state not in {"ready", "stop-sent", "terminal", "reconnect-sent"}:
+        if self.state not in {"key-ack-sent", "ready", "stop-sent", "terminal", "reconnect-sent"}:
             raise OCIControlProtocolV2Error("BOUNDARY_ACK transition is invalid")
         boundary_state = payload["lifecycle_state"]
         state_name = boundary_state["state"]
         state_stop = boundary_state["stop_request_id"]
         state_terminal = boundary_state["terminal"]
         reconnect_was_accepted: bool | None = None
+        boundary_from_key_ack = self.state == "key-ack-sent"
         if self.state == "reconnect-sent":
             previous_state = self._reconnect_expected_state
             if previous_state is None:
@@ -774,18 +803,28 @@ class HostOCIControlV2Session:
                 raise OCIControlProtocolV2Error("BOUNDARY_ACK reconnect commitment is stale")
             reconnect_was_accepted = accepted_identity
             expected_host_wire = self._pending_host_wire if accepted_identity else self._accepted_host_wire
+        elif boundary_from_key_ack:
+            expected_host_wires = {self._pending_host_wire or 0}
+            allowed = (state_name == "ready" and state_stop is None) or (
+                state_name == "terminal" and state_stop is None
+            )
         elif self.state == "ready":
             expected_host_wire = self._accepted_host_wire
             allowed = (state_name == "ready") or (state_name == "terminal" and state_stop is None)
         elif self.state == "stop-sent":
-            expected_host_wires = {self._accepted_host_wire}
+            expected_host_wires = {self._accepted_host_wire, *self._stop_wire_candidates}
             allowed = (
                 (state_name == "ready" and state_stop is None)
                 or (state_name == "stopping" and state_stop == self._stop_request)
                 or (state_name == "terminal" and state_stop in {None, self._stop_request})
             )
-            if state_stop == self._stop_request and state_name in {"stopping", "terminal"}:
-                expected_host_wires = {self._stop_wire or 0}
+            if state_stop is not None and state_stop == self._stop_request and state_name in {"stopping", "terminal"}:
+                expected_host_wires = set(self._stop_wire_candidates)
+                if self._stop_wire_candidates and self._accepted_host_wire > max(self._stop_wire_candidates):
+                    # A later authenticated RECONNECT may be the guest's most
+                    # recently accepted host wire while the lifecycle state is
+                    # still causally tied to the earlier STOP wire.
+                    expected_host_wires.add(self._accepted_host_wire)
             elif state_name == "terminal" and state_stop is None:
                 expected_host_wires.add(self._stop_wire or 0)
         else:
@@ -826,12 +865,30 @@ class HostOCIControlV2Session:
         self._guest_wire = message.wire_sequence
         self._accepted_host_wire = committed_host_wire
         self._accepted_host_wire_candidates = None
+        if state_name in {"stopping", "terminal"} and state_stop is not None and state_stop == self._stop_request:
+            if committed_host_wire in self._stop_wire_candidates:
+                self._stop_wire_candidates = {committed_host_wire}
+            elif not self._stop_wire_candidates or committed_host_wire <= max(self._stop_wire_candidates):
+                raise OCIControlProtocolV2Error("BOUNDARY_ACK STOP wire commitment is stale")
+            # A newer committed RECONNECT wire does not replace the older wire
+            # that actually carried the logical STOP.
+        else:
+            # A ready boundary proves every in-flight STOP wire was discarded;
+            # natural terminal similarly leaves no STOP delivery candidate.
+            self._stop_wire_candidates.clear()
         if reconnect_was_accepted:
             self._accepted_nonce = self._nonce
             self._accepted_connection_opener_request = self._connection_opener_request
         self._boundary = (boundary_id, boundary_digest)
         self._boundary_state = _freeze(boundary_state)
-        if self.state == "reconnect-sent":
+        if boundary_from_key_ack:
+            self.state = "ready" if state_name == "ready" else "terminal"
+            if state_name == "terminal":
+                self._terminal = state_terminal
+                self._terminal_stop_request = None
+            self._pending_request = None
+            self._pending_host_wire = None
+        elif self.state == "reconnect-sent":
             self.state = reconnect_state or ""
             if state_name == "terminal":
                 self._terminal = state_terminal
@@ -884,6 +941,7 @@ class HostOCIControlV2Session:
             raise OCIControlProtocolV2Error("STOP requires a current ready snapshot")
         self._host_wire += 1
         self._stop_wire = self._host_wire
+        self._stop_wire_candidates.add(self._host_wire)
         if self._stop_request is None:
             self._request += 1
             self._stop_request = self._request
@@ -903,6 +961,34 @@ class HostOCIControlV2Session:
         )
         self.state = "stop-sent"
         return envelope
+
+    def retry_stop(self) -> OCIControlV2Envelope:
+        """Retry one admitted logical STOP on a fresh authenticated wire."""
+
+        if (
+            self.state != "stop-sent"
+            or self._key is None
+            or self._boot_generation is None
+            or self._stop_request is None
+        ):
+            raise OCIControlProtocolV2Error("STOP retry requires an outstanding logical STOP")
+        self._host_wire += 1
+        self._stop_wire = self._host_wire
+        self._stop_wire_candidates.add(self._host_wire)
+        return sign_message(
+            OCIControlV2Message(
+                "STOP",
+                self.binding,
+                self.boot_attempt_id,
+                self._nonce or "",
+                self._epoch,
+                self._host_wire,
+                {"signal": 15},
+                request_id=self._stop_request,
+                boot_generation=self._boot_generation,
+            ),
+            self._key,
+        )
 
     def accept(self, envelope: OCIControlV2Envelope) -> None:
         if not isinstance(envelope, OCIControlV2Envelope) or envelope.body.binding != self.binding:
@@ -976,9 +1062,18 @@ class HostOCIControlV2Session:
             self.state == "stop-sent" and message.kind == "TERMINAL" and message.reply_to in {None, self._stop_request}
         ):
             next_state = "terminal"
-            accepted_host_wire = self._stop_wire if message.reply_to == self._stop_request else self._accepted_host_wire
             if message.reply_to is None:
+                accepted_host_wire = self._accepted_host_wire
                 accepted_host_wire_candidates = frozenset({self._accepted_host_wire, self._stop_wire or 0})
+            elif self._stop_wire_candidates and self._accepted_host_wire > max(self._stop_wire_candidates):
+                # An authenticated reconnect/SNAPSHOT accepted after STOP is
+                # necessarily the newest host wire, even though TERMINAL still
+                # replies to the logical STOP request ID.
+                accepted_host_wire = self._accepted_host_wire
+                accepted_host_wire_candidates = frozenset({self._accepted_host_wire})
+            else:
+                accepted_host_wire = self._stop_wire
+                accepted_host_wire_candidates = frozenset(self._stop_wire_candidates)
             self._terminal = message.payload["terminal"]
             self._terminal_stop_request = message.reply_to
         else:
@@ -989,6 +1084,8 @@ class HostOCIControlV2Session:
         if message.kind in {"READY", "SNAPSHOT"}:
             self._accepted_nonce = self._nonce
             self._accepted_connection_opener_request = self._connection_opener_request
+        if message.kind in {"READY", "SNAPSHOT"} and message.payload.get("state", "ready") == "ready":
+            self._stop_wire_candidates.clear()
         self._pending_request = None
         self._pending_host_wire = None
         self._reconnect_from = None
@@ -997,6 +1094,7 @@ class HostOCIControlV2Session:
 
 
 __all__ = [
+    "MAX_OCI_CONTROL_CONNECTIONS",
     "MAX_OCI_CONTROL_FRAME_BYTES",
     "OCI_CONTROL_BOUNDARY_PREFIX",
     "OCI_CONTROL_CHANNEL_CARRIER",

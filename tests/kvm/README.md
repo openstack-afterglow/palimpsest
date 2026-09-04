@@ -32,18 +32,19 @@ Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
 drives canonical lifecycle frames with partial nonblocking I/O and records
 path-free frame digests plus nonce/generation/request/sequence correlation.
-Receipt v15 covers a single connection and an exact six-connection retained-
-root session. The latter proves lost initial READY recovery; ready, stopping,
-and terminal SNAPSHOTs; a connection-local partial STOP; complete same-ID
-retry; and an already-committed same-ID duplicate accepted without a second
-signal dispatch. Linux connects pin socket dev/inode/uid/type and require
+Receipt v16 covers a single connection and an exact six-connection retained-
+root session. The latter proves a lost initial READY, an accepted RECONNECT
+whose SNAPSHOT is lost, a connection-local partial STOP, complete same-ID retry,
+an already-committed same-ID duplicate without a second signal dispatch, and a
+terminal reconnect. Linux connects pin socket dev/inode/uid/type and require
 `SO_PEERCRED` to identify the spawned QEMU PID and current UID.
-Every intended close-to-reconnect transition waits for the exact admitted-peer
-EOF marker, and the partial STOP is closed only after its frame-minus-one
-buffer marker. Both are proof-only console coordination with the known
-workload, not production authority. A production host needs a privileged
-in-band boundary acknowledgement or equivalent barrier; this receipt records
-`rapid_reconnect_proven=false`.
+Every close-to-reconnect transition admits a signed console-only
+`BOUNDARY_ACK` before opening or writing the replacement socket. It binds the
+fresh boundary ID, discarded parser counters, connection identity, wire
+sequences, and public lifecycle state. The partial STOP is closed only after
+its frame-minus-one buffer marker. The receipt records
+`rapid_reconnect_proven=false` because arbitrary reconnect without that
+authenticated boundary remains outside the contract.
 
 Ten lifecycle-negative guest boots cover missing/wrong named ports,
 zero/oversized lengths, a non-canonical duplicate JSON key, wrong binding,
@@ -66,7 +67,7 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-receipt v15 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v16 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact base and UID 0 mode argv, two-entry environment, cwd,
@@ -79,7 +80,7 @@ removal. The workload also proves UID 65534 cannot write-open either the parent
 or its own `cgroup.procs`. Production define/start remains
 disabled.
 
-The v15 canonical receipt binds all 41 native-KVM guest boots: two positive boots
+The v16 canonical receipt binds all 41 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and three
 workload-launch controls, ten lifecycle controls, and one UID 0 isolation
@@ -116,14 +117,15 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v11, OCI-root domain plan is v10, and the init
-contract is v13. Initramfs manifest/ABI are v15, supervisor is v6, lifecycle
-broker is v2, and filesystem fixture policy/schema are v9. Pre-mount,
+The stage-1 plan/protocol is v12, OCI-root domain plan/core are v11/v5, and the
+init contract is v14. Initramfs manifest/ABI are v16, supervisor is v7,
+lifecycle broker is v3, workload isolation is v2, and filesystem fixture
+policy/schema are v9. Pre-mount,
 filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v15 receipt on the qualified runner; this source update and
+must still produce a v16 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while the admitted
@@ -136,6 +138,6 @@ exact private safe-device set, read-only/masked control paths, inaccessible PID
 lifecycle-authority boundary, not a complete hostile-root availability
 sandbox: no PID or user namespace is introduced. The boundary remains
 single-workload: future detached stop, multi-user exec, and agent lifecycle
-require a separate production broker and authenticated host lifecycle channel.
+require a separate production broker and runtime dispatch path.
 The cgroup is a containment and cleanup mechanism; production policy must
 separately constrain denial-of-service behavior.

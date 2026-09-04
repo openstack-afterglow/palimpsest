@@ -1,4 +1,4 @@
-"""Closed-world qualification for the production-inert lifecycle v2 candidate."""
+"""Closed-world qualification for the pre-production lifecycle v2 contract."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import replace
 import pytest
 
 from palimpsest_local.oci_control_protocol_v2 import (
+    MAX_OCI_CONTROL_CONNECTIONS,
     MAX_OCI_CONTROL_FRAME_BYTES,
     OCI_CONTROL_CHANNEL_CARRIER,
     OCI_CONTROL_CONSOLE_CARRIER,
@@ -34,6 +35,7 @@ RUN = "f6f546e2-e734-4920-9eff-1762b348a249"
 ATTEMPT = "aca88126-d991-4de8-b66b-90dc07904dff"
 GENERATION = "b22b1c81-dfa4-478a-b352-27b5b35fe5b7"
 BOUNDARY = "f53b27c5-b2bc-49a3-8878-73d0b054f98f"
+BOUNDARY2 = "12aa4a92-b20c-4229-8158-b2bf5e22aa55"
 NONCE1, NONCE2 = "1" * 64, "2" * 64
 NONCE3 = "3" * 64
 KEY = bytes(range(32))
@@ -97,6 +99,17 @@ def signed(kind: str, **changes: object) -> OCIControlV2Envelope:
 def session() -> HostOCIControlV2Session:
     nonces = iter((NONCE1, NONCE2, NONCE3))
     return HostOCIControlV2Session(binding(), nonce_factory=lambda: next(nonces), boot_attempt_factory=lambda: ATTEMPT)
+
+
+def test_host_enforces_guest_connection_nonce_limit() -> None:
+    nonces = iter(f"{index:064x}" for index in range(1, MAX_OCI_CONTROL_CONNECTIONS + 2))
+    control = HostOCIControlV2Session(
+        binding(), nonce_factory=lambda: next(nonces), boot_attempt_factory=lambda: ATTEMPT
+    )
+    for _ in range(MAX_OCI_CONTROL_CONNECTIONS):
+        control._fresh_nonce()
+    with pytest.raises(OCIControlProtocolV2Error, match="connection limit"):
+        control._fresh_nonce()
 
 
 def bootstrap_ready(control: HostOCIControlV2Session) -> tuple[OCIControlV2Envelope, OCIControlV2Envelope]:
@@ -228,6 +241,19 @@ def test_bootstrap_is_self_authenticated_before_key_ack_and_ready() -> None:
     ready = signed("READY", wire=2, reply_to=ack.body.wire_sequence)
     control.accept(ready)
     assert control.state == "ready"
+
+
+def test_lost_initial_ready_recovers_only_through_authenticated_boundary() -> None:
+    control = session()
+    hello = control.hello()
+    bootstrap = signed("BOOTSTRAP", reply_to=hello.body.request_id)
+    control.accept(bootstrap)
+    control.key_ack()
+    ack, line = boundary_ack(wire=3, last_host_wire=2)
+    control.admit_boundary(ack, line)
+    assert control.state == "ready"
+    reconnect = control.reconnect()
+    assert reconnect.body.kind == "RECONNECT"
 
 
 def test_bootstrap_tamper_cross_boot_and_cross_binding_do_not_mutate_state() -> None:
@@ -512,6 +538,17 @@ def test_partial_stop_boundary_ready_retries_same_logical_stop_with_new_wire_seq
     assert retried_stop.tag != partial_stop.tag
 
 
+def test_same_stream_stop_retry_reuses_logical_id_on_fresh_authenticated_wire() -> None:
+    control = session()
+    bootstrap_ready(control)
+    first = control.stop()
+    retry = control.retry_stop()
+    assert retry.body.request_id == first.body.request_id
+    assert retry.body.wire_sequence == first.body.wire_sequence + 1
+    assert retry.tag != first.tag
+    verify_message_authentication(retry, KEY)
+
+
 def test_partial_reconnect_retries_same_logical_request_with_fresh_epoch_nonce_and_wire() -> None:
     control = session()
     bootstrap_ready(control)
@@ -756,6 +793,78 @@ def test_stop_caused_terminal_boundary_requires_exact_stop_wire_commitment() -> 
     assert control._accepted_host_wire == stop.body.wire_sequence
 
 
+def test_ready_boundary_discards_all_unaccepted_stop_wire_candidates() -> None:
+    control = session()
+    bootstrap_ready(control)
+    first = control.stop()
+    second = control.retry_stop()
+    ack, line = boundary_ack(last_host_wire=2, state=READY_STATE)
+    control.admit_boundary(ack, line)
+    assert control._stop_wire_candidates == set()
+
+    reconnect = control.reconnect()
+    control.accept(
+        signed(
+            "SNAPSHOT",
+            nonce=NONCE2,
+            epoch=2,
+            wire=4,
+            reply_to=reconnect.body.request_id,
+            payload=READY_STATE,
+        )
+    )
+    assert control._stop_wire_candidates == set()
+    assert {first.body.wire_sequence, second.body.wire_sequence} == {3, 4}
+
+
+def test_stopping_boundary_after_accepted_reconnect_preserves_stop_causality() -> None:
+    control = session()
+    bootstrap_ready(control)
+    stop = control.stop()
+    stopping = {"state": "stopping", "stop_request_id": stop.body.request_id, "terminal": None}
+    ack, line = boundary_ack(last_host_wire=stop.body.wire_sequence, state=stopping)
+    control.admit_boundary(ack, line)
+
+    reconnect = control.reconnect()
+    control.accept(
+        signed(
+            "SNAPSHOT",
+            nonce=NONCE2,
+            epoch=2,
+            wire=4,
+            reply_to=reconnect.body.request_id,
+            payload=stopping,
+        )
+    )
+    next_ack_body = body(
+        "BOUNDARY_ACK",
+        nonce=NONCE2,
+        epoch=3,
+        wire=5,
+        reply_to=reconnect.body.request_id,
+        payload={
+            "boundary_id": BOUNDARY2,
+            "discarded_header_bytes": 0,
+            "discarded_payload_bytes": 0,
+            "discarded_payload_expected": 0,
+            "last_accepted_h2g_wire_sequence": reconnect.body.wire_sequence,
+            "last_attempted_g2h_wire_sequence": 5,
+            "lifecycle_state": stopping,
+            "previous_epoch": 2,
+            "state_digest": lifecycle_state_digest(
+                "stopping", stop_request_id=stop.body.request_id, terminal=None
+            ),
+        },
+    )
+    next_ack = sign_message(next_ack_body, KEY, carrier=OCI_CONTROL_CONSOLE_CARRIER)
+    control.admit_boundary(next_ack, encode_boundary_line(next_ack))
+    assert control._accepted_host_wire == reconnect.body.wire_sequence
+    assert control._stop_wire_candidates == {stop.body.wire_sequence}
+
+    second_reconnect = control.reconnect()
+    assert second_reconnect.body.host_nonce == NONCE3
+
+
 def test_reconnect_snapshot_must_equal_boundary_committed_state() -> None:
     control = session()
     bootstrap_ready(control)
@@ -814,6 +923,7 @@ def test_receipt_projection_and_repr_never_expose_boot_key_or_tag() -> None:
         "host_nonce",
         "key_id",
         "kind",
+        "projection_digest",
         "reply_to",
         "request_id",
         "size_bytes",
