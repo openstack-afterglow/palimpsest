@@ -64,6 +64,8 @@ def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_43_boot_c
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
+        "account_resolution": "image-root-passwd-group",
+        "argv0": "shell-free-path-search-after-chdir",
         "contract": "palimpsest.guest-pid1-supervisor.v8",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
@@ -77,12 +79,14 @@ def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_43_boot_c
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
         "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
         "main_status": 42,
+        "omitted_primary_group": True,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
         "process_group": True,
         "reaped_children": 3,
         "terminal_state": "parent-marker-then-fail-closed-wait",
         "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+        "supplementary_groups": "empty-restricted-subset",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
         "uid0_capabilityless_proven": True,
     }
