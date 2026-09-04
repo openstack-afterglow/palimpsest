@@ -248,6 +248,10 @@ struct span { const char *p; usize n; };
 #define LIFECYCLE_STOPPING 2
 #define LIFECYCLE_TERMINAL 3
 #define LIFECYCLE_READY_COMMITTED_MARKER "palimpsest guest stage1: lifecycle ready committed\n"
+#define LIFECYCLE_CHANNEL_READY_MARKER "palimpsest guest stage1: lifecycle channel ready\n"
+#define LIFECYCLE_HELLO_ACCEPTED_MARKER "palimpsest guest stage1: lifecycle initial HELLO accepted\n"
+#define LIFECYCLE_BOOTSTRAP_SENT_MARKER "palimpsest guest stage1: lifecycle BOOTSTRAP sent\n"
+#define LIFECYCLE_KEY_ACK_ACCEPTED_MARKER "palimpsest guest stage1: lifecycle KEY_ACK accepted\n"
 #define LIFECYCLE_PARTIAL_BUFFERED_MARKER "palimpsest guest stage1: lifecycle partial frame buffered\n"
 #define LIFECYCLE_STOP_DISPATCHED_MARKER "palimpsest guest stage1: lifecycle stop dispatched\n"
 #define LIFECYCLE_STOP_DUPLICATE_MARKER "palimpsest guest stage1: lifecycle stop duplicate accepted\n"
@@ -2805,6 +2809,7 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
         session->fd = -1;
         return 0;
     }
+    write_all(1, LIFECYCLE_CHANNEL_READY_MARKER);
     /* The host owns the bounded activation timeout.  Stay fail-closed before
      * the first input byte instead of racing libvirt's post-create channel
      * attachment.  Once any byte arrives, read_control_frame() retains its
@@ -2813,7 +2818,10 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
     for (;;) {
         int frame = read_control_frame(session, &size);
         if (frame == 1) {
-            if (parse_hello(session, size)) return 1;
+            if (parse_hello(session, size)) {
+                write_all(1, LIFECYCLE_HELLO_ACCEPTED_MARKER);
+                return 1;
+            }
             break;
         }
         if (frame == -1 || (frame == -2 && session->initial_input_seen)) break;
@@ -2837,6 +2845,7 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
 static int authenticate_lifecycle_bootstrap(struct lifecycle_session *session) {
     usize size = 0; u64 deadline;
     if (!generate_boot_secret(session) || !send_bootstrap(session)) goto rejected;
+    write_all(1, LIFECYCLE_BOOTSTRAP_SENT_MARKER);
     deadline = monotonic_millis() + 5000;
     while (monotonic_millis() < deadline) {
         int frame = read_control_frame(session, &size);
@@ -2845,6 +2854,7 @@ static int authenticate_lifecycle_bootstrap(struct lifecycle_session *session) {
             if (!parse_signed_host(session, size, 0, &request_id, &wire)) break;
             session->last_accepted_host_wire = wire;
             session->key_ack_wire_sequence = wire;
+            write_all(1, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER);
             return 1;
         }
         if (frame < 0) break;

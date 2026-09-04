@@ -246,6 +246,13 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"org.palimpsest.oci.lifecycle.0" in stage1
     assert b"palimpsest.oci-lifecycle-control.v2" in stage1
     assert b"lifecycle rejected; stage=" in stage1
+    for marker in (
+        b"lifecycle channel ready",
+        b"lifecycle initial HELLO accepted",
+        b"lifecycle BOOTSTRAP sent",
+        b"lifecycle KEY_ACK accepted",
+    ):
+        assert marker in stage1
 
 
 def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() -> None:
@@ -268,6 +275,44 @@ def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() 
     assert "session->frame_deadline = now + 5000" in reader
     assert "session->frame_deadline && monotonic_millis() >= session->frame_deadline" in reader
     assert live_main.index("if (!prepare_lifecycle(&lifecycle))") < live_main.index("supervise_workload(&workload")
+
+
+def test_lifecycle_progress_markers_follow_only_committed_boundaries() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    source = (repository / "guest" / "stage1" / "init.c").read_text()
+    prepare = source[
+        source.index("static int prepare_lifecycle(") : source.index("static int authenticate_lifecycle_bootstrap(")
+    ]
+    send_bootstrap = source[
+        source.index("static int send_bootstrap(") : source.index("static int send_control_message(")
+    ]
+    authenticate = source[
+        source.index("static int authenticate_lifecycle_bootstrap(") : source.index(
+            "static void wipe_lifecycle_secret("
+        )
+    ]
+    supervisor = source[source.index("static int supervise_workload(") : source.index("static int run_consumer(")]
+
+    assert prepare.index("if (session->fd < 0)") < prepare.index("LIFECYCLE_CHANNEL_READY_MARKER")
+    assert prepare.index("if (parse_hello(session, size))") < prepare.index("LIFECYCLE_HELLO_ACCEPTED_MARKER")
+    assert (
+        send_bootstrap.index("write_signed_message(session, control_body")
+        < send_bootstrap.index("secure_zero(control_body, used)")
+        < send_bootstrap.index("return (int)i")
+    )
+    assert authenticate.index("!send_bootstrap(session)") < authenticate.index("LIFECYCLE_BOOTSTRAP_SENT_MARKER")
+    assert authenticate.index("if (!parse_signed_host(session, size, 0") < authenticate.index(
+        "LIFECYCLE_KEY_ACK_ACCEPTED_MARKER"
+    )
+    assert authenticate.index("session->key_ack_wire_sequence = wire") < authenticate.index(
+        "LIFECYCLE_KEY_ACK_ACCEPTED_MARKER"
+    )
+    assert supervisor.index("if (!resolve_workload_identity(process))") < supervisor.index(
+        "if (!authenticate_lifecycle_bootstrap(lifecycle))"
+    )
+    assert supervisor.index("if (!authenticate_lifecycle_bootstrap(lifecycle))") < supervisor.index(
+        "WORKLOAD_ISOLATION_MARKER"
+    )
 
 
 def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:

@@ -97,6 +97,10 @@ WORKLOAD_ISOLATION_MARKER = (
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
 LIFECYCLE_READY_COMMITTED_MARKER = b"palimpsest guest stage1: lifecycle ready committed"
+LIFECYCLE_CHANNEL_READY_MARKER = b"palimpsest guest stage1: lifecycle channel ready"
+LIFECYCLE_HELLO_ACCEPTED_MARKER = b"palimpsest guest stage1: lifecycle initial HELLO accepted"
+LIFECYCLE_BOOTSTRAP_SENT_MARKER = b"palimpsest guest stage1: lifecycle BOOTSTRAP sent"
+LIFECYCLE_KEY_ACK_ACCEPTED_MARKER = b"palimpsest guest stage1: lifecycle KEY_ACK accepted"
 LIFECYCLE_PEER_BOUNDARY_MARKER = OCI_CONTROL_BOUNDARY_PREFIX + b'{"redacted":true}'
 LIFECYCLE_PARTIAL_BUFFERED_MARKER = b"palimpsest guest stage1: lifecycle partial frame buffered"
 LIFECYCLE_STOP_DISPATCHED_MARKER = b"palimpsest guest stage1: lifecycle stop dispatched"
@@ -2816,6 +2820,10 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, WORKLOAD_ISOLATION_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_CHANNEL_READY_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_HELLO_ACCEPTED_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_BOOTSTRAP_SENT_MARKER) != 1
+            or _logical_line_count(self.console, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER) != 1
             or _logical_line_count(self.console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
             or _logical_line_count(self.console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
             or _logical_line_count(self.console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 0
@@ -2824,6 +2832,10 @@ class OCIStage1KVMProofReceipt:
             or not _logical_lines_in_order(
                 self.console,
                 ROOT_TRANSITION_MARKER,
+                LIFECYCLE_CHANNEL_READY_MARKER,
+                LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
                 WORKLOAD_ISOLATION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
@@ -2847,6 +2859,10 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.retained_console, WORKLOAD_ISOLATION_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_CHANNEL_READY_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_HELLO_ACCEPTED_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_BOOTSTRAP_SENT_MARKER) != 1
+            or _logical_line_count(self.retained_console, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 5
@@ -2855,6 +2871,10 @@ class OCIStage1KVMProofReceipt:
             or not _logical_lines_in_order(
                 self.retained_console,
                 ROOT_TRANSITION_MARKER,
+                LIFECYCLE_CHANNEL_READY_MARKER,
+                LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
                 WORKLOAD_ISOLATION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
@@ -2878,12 +2898,20 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.uid0_isolation_console, WORKLOAD_ISOLATION_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_CHANNEL_READY_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_HELLO_ACCEPTED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_BOOTSTRAP_SENT_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, TERMINAL_ROOT_QUIESCED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, SUCCESS_MARKER) != 1
             or not _logical_lines_in_order(
                 self.uid0_isolation_console,
                 ROOT_TRANSITION_MARKER,
+                LIFECYCLE_CHANNEL_READY_MARKER,
+                LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
                 WORKLOAD_ISOLATION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
@@ -2989,11 +3017,24 @@ class OCIStage1KVMProofReceipt:
                 not isinstance(self.workload_negative_consoles[name], bytes)
                 or not 1 <= len(self.workload_negative_consoles[name]) <= MAX_CONSOLE_BYTES
                 or _logical_line_count(self.workload_negative_consoles[name], ROOT_TRANSITION_MARKER) != 1
+                or _logical_line_count(self.workload_negative_consoles[name], LIFECYCLE_CHANNEL_READY_MARKER) != 1
+                or _logical_line_count(self.workload_negative_consoles[name], LIFECYCLE_HELLO_ACCEPTED_MARKER) != 1
+                or _logical_line_count(self.workload_negative_consoles[name], LIFECYCLE_BOOTSTRAP_SENT_MARKER)
+                != (0 if name in {"workload_missing_user", "workload_missing_group"} else 1)
+                or _logical_line_count(self.workload_negative_consoles[name], LIFECYCLE_KEY_ACK_ACCEPTED_MARKER)
+                != (0 if name in {"workload_missing_user", "workload_missing_group"} else 1)
                 or _logical_line_count(self.workload_negative_consoles[name], WORKLOAD_NEGATIVE_REJECTION_MARKERS[name])
                 != 1
                 or not _logical_lines_in_order(
                     self.workload_negative_consoles[name],
                     ROOT_TRANSITION_MARKER,
+                    LIFECYCLE_CHANNEL_READY_MARKER,
+                    LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                    *(
+                        ()
+                        if name in {"workload_missing_user", "workload_missing_group"}
+                        else (LIFECYCLE_BOOTSTRAP_SENT_MARKER, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER)
+                    ),
                     WORKLOAD_NEGATIVE_REJECTION_MARKERS[name],
                 )
                 or _logical_prefix_count(self.workload_negative_consoles[name], WORKLOAD_REJECTION_PREFIX) != 1
@@ -3032,6 +3073,17 @@ class OCIStage1KVMProofReceipt:
                 or _logical_prefix_count(self.lifecycle_negative_consoles[name], LIFECYCLE_REJECTION_PREFIX) != 1
                 or _logical_prefix_count(self.lifecycle_negative_consoles[name], WORKLOAD_TERMINAL_PREFIX) != 0
                 or _logical_line_count(self.lifecycle_negative_consoles[name], SUCCESS_MARKER) != 0
+                or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_CHANNEL_READY_MARKER)
+                != (0 if name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES else 1)
+                or any(
+                    _logical_line_count(self.lifecycle_negative_consoles[name], marker)
+                    != (1 if lifecycle_negative_control_contract(name)["phase"] == "post-workload" else 0)
+                    for marker in (
+                        LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                        LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                        LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
+                    )
+                )
                 or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DISPATCHED_MARKER)
                 != (1 if name == "second_distinct_stop" else 0)
                 or _logical_line_count(self.lifecycle_negative_consoles[name], LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
@@ -3044,11 +3096,33 @@ class OCIStage1KVMProofReceipt:
                     self.lifecycle_negative_consoles[name],
                     ROOT_TRANSITION_MARKER,
                     *(
-                        (WORKLOAD_STARTED_MARKER, LIFECYCLE_STOP_DISPATCHED_MARKER)
+                        ()
+                        if name in LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES
+                        else (LIFECYCLE_CHANNEL_READY_MARKER,)
+                    ),
+                    *(
+                        (
+                            LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                            LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                            LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
+                            WORKLOAD_STARTED_MARKER,
+                            LIFECYCLE_STOP_DISPATCHED_MARKER,
+                        )
                         if name == "second_distinct_stop"
-                        else (WORKLOAD_STARTED_MARKER, LIFECYCLE_PEER_BOUNDARY_MARKER)
+                        else (
+                            LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                            LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                            LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
+                            WORKLOAD_STARTED_MARKER,
+                            LIFECYCLE_PEER_BOUNDARY_MARKER,
+                        )
                         if name == "hello_reused_nonce"
-                        else (WORKLOAD_STARTED_MARKER,)
+                        else (
+                            LIFECYCLE_HELLO_ACCEPTED_MARKER,
+                            LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+                            LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
+                            WORKLOAD_STARTED_MARKER,
+                        )
                         if lifecycle_negative_control_contract(name)["phase"] == "post-workload"
                         else ()
                     ),
@@ -4196,6 +4270,10 @@ def _read_console_until(
                     f"session={session_state}; pending={len(channel_pending)}; "
                     f"frames={len(lifecycle_transcript or ())}; "
                     f"ready={_logical_line_count(current, LIFECYCLE_READY_COMMITTED_MARKER)}; "
+                    f"channel={_logical_line_count(current, LIFECYCLE_CHANNEL_READY_MARKER)}; "
+                    f"hello={_logical_line_count(current, LIFECYCLE_HELLO_ACCEPTED_MARKER)}; "
+                    f"bootstrap={_logical_line_count(current, LIFECYCLE_BOOTSTRAP_SENT_MARKER)}; "
+                    f"key_ack={_logical_line_count(current, LIFECYCLE_KEY_ACK_ACCEPTED_MARKER)}; "
                     f"boundaries={_logical_line_count(current, LIFECYCLE_PEER_BOUNDARY_MARKER)}; "
                     f"partial={_logical_line_count(current, LIFECYCLE_PARTIAL_BUFFERED_MARKER)}; "
                     f"stop={_logical_line_count(current, LIFECYCLE_STOP_DISPATCHED_MARKER)}; "

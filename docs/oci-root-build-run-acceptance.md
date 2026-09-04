@@ -78,6 +78,12 @@ observe it, returns a self-authenticated `BOOTSTRAP`, and waits for signed
 uses direction- and carrier-separated HKDF-HMAC-SHA256 over exact canonical
 bytes.
 
+For fail-closed diagnosis, PID 1 emits fixed non-secret console markers only
+after lifecycle channel readiness, valid initial `HELLO`, transmitted
+`BOOTSTRAP`, and valid `KEY_ACK`, respectively. Positive native receipts require
+each marker exactly once in that order before workload isolation/start. The
+markers contain no protocol secret or run identity and do not authorize state.
+
 Reconnect no longer depends on a proof-only plaintext EOF marker. PID 1 emits
 a signed console-only `BOUNDARY_ACK` after `read(2)` returns zero. It commits a
 boot-wide fresh boundary ID, the exact discarded parser counters, previous and

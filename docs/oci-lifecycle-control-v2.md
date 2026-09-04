@@ -18,6 +18,13 @@ returns a signed `KEY_ACK`, and only then may PID 1 release the workload and
 return signed `READY`. The raw key is permitted only in the private bootstrap
 envelope; it is excluded from object representations and receipt projections.
 
+The guest console exposes four fixed, non-secret progress lines after—and only
+after—the corresponding boundary commits: lifecycle channel discovery/open,
+canonical initial `HELLO` acceptance, complete `BOOTSTRAP` transmission, and
+authenticated `KEY_ACK` acceptance. Their exact order is part of positive
+native evidence. They contain no nonce, key, tag, UUID, digest, path, or other
+run-specific value, and do not replace authenticated channel receipts.
+
 ## Authentication
 
 Every signed envelope is exactly `{body,mac}`; initial `HELLO` has `mac:null`.

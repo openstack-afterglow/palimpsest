@@ -134,6 +134,10 @@ The first positive boot deliberately withholds its initial lifecycle HELLO
 until 5.25 seconds after PID 1's root-transition marker, proving that PID 1
 remains fail-closed past the removed five-second pre-input race while retaining
 its per-partial-frame deadline.
+Positive consoles must then contain exactly one fixed marker each for channel
+readiness, accepted initial HELLO, transmitted BOOTSTRAP, and accepted KEY_ACK,
+in that order before workload isolation/start. These are diagnostic progress
+lines, not lifecycle authority or a substitute for authenticated receipts.
 
 This qualification PID 1 remains a root, narrow broker while the admitted
 workload child enters a private mount namespace, closes the lifecycle fd,

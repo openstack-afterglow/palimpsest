@@ -192,6 +192,10 @@ still rejected immediately and no workload starts before authentication.
 The release-qualified native proof deliberately delays its first positive
 HELLO until more than five seconds after the root-transition marker to exercise
 this startup ordering.
+Four fixed console markers distinguish channel readiness, accepted initial
+HELLO, transmitted BOOTSTRAP, and accepted authenticated KEY_ACK. Each is
+emitted only after its boundary commits, contains no run-specific value or
+secret, and precedes workload release in positive native evidence.
 
 Proof v7 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level

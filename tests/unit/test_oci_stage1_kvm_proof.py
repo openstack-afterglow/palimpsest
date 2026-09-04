@@ -21,7 +21,11 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     EVIDENCE_FILE_NAMES,
     FILESYSTEM_NEGATIVE_CONTROL_NAMES,
     FILESYSTEM_REJECTION_MARKER,
+    LIFECYCLE_BOOTSTRAP_SENT_MARKER,
     LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES,
+    LIFECYCLE_CHANNEL_READY_MARKER,
+    LIFECYCLE_HELLO_ACCEPTED_MARKER,
+    LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
     LIFECYCLE_NEGATIVE_CONTROL_NAMES,
     LIFECYCLE_PARTIAL_BUFFERED_MARKER,
     LIFECYCLE_PEER_BOUNDARY_MARKER,
@@ -120,6 +124,14 @@ def _positive_console(*, retained: bool = False) -> bytes:
         b"kernel boot\r\n"
         + ROOT_TRANSITION_MARKER
         + b"\r\n"
+        + LIFECYCLE_CHANNEL_READY_MARKER
+        + b"\r\n"
+        + LIFECYCLE_HELLO_ACCEPTED_MARKER
+        + b"\r\n"
+        + LIFECYCLE_BOOTSTRAP_SENT_MARKER
+        + b"\r\n"
+        + LIFECYCLE_KEY_ACK_ACCEPTED_MARKER
+        + b"\r\n"
         + WORKLOAD_ISOLATION_MARKER
         + b"\r\n"
         + WORKLOAD_STARTED_MARKER
@@ -154,10 +166,21 @@ def _positive_console(*, retained: bool = False) -> bytes:
 
 
 def _workload_negative_consoles() -> dict[str, bytes]:
-    return {
-        name: b"kernel boot\n" + ROOT_TRANSITION_MARKER + b"\n" + marker + b"\n"
-        for name, marker in WORKLOAD_NEGATIVE_REJECTION_MARKERS.items()
-    }
+    result = {}
+    for name, marker in WORKLOAD_NEGATIVE_REJECTION_MARKERS.items():
+        payload = (
+            b"kernel boot\n"
+            + ROOT_TRANSITION_MARKER
+            + b"\n"
+            + LIFECYCLE_CHANNEL_READY_MARKER
+            + b"\n"
+            + LIFECYCLE_HELLO_ACCEPTED_MARKER
+            + b"\n"
+        )
+        if name not in {"workload_missing_user", "workload_missing_group"}:
+            payload += LIFECYCLE_BOOTSTRAP_SENT_MARKER + b"\n" + LIFECYCLE_KEY_ACK_ACCEPTED_MARKER + b"\n"
+        result[name] = payload + marker + b"\n"
+    return result
 
 
 def _lifecycle_negative_consoles() -> dict[str, bytes]:
@@ -165,8 +188,19 @@ def _lifecycle_negative_consoles() -> dict[str, bytes]:
     for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES:
         contract = lifecycle_negative_control_contract(name)
         payload = b"kernel boot\n" + ROOT_TRANSITION_MARKER + b"\n"
+        if name in LIFECYCLE_WIRE_NEGATIVE_CONTROL_NAMES:
+            payload += LIFECYCLE_CHANNEL_READY_MARKER + b"\n"
         if contract["phase"] == "post-workload":
-            payload += WORKLOAD_STARTED_MARKER + b"\n"
+            payload += (
+                LIFECYCLE_HELLO_ACCEPTED_MARKER
+                + b"\n"
+                + LIFECYCLE_BOOTSTRAP_SENT_MARKER
+                + b"\n"
+                + LIFECYCLE_KEY_ACK_ACCEPTED_MARKER
+                + b"\n"
+                + WORKLOAD_STARTED_MARKER
+                + b"\n"
+            )
         if name == "hello_reused_nonce":
             payload += LIFECYCLE_PEER_BOUNDARY_MARKER + b"\n"
         if name == "second_distinct_stop":
@@ -1918,6 +1952,87 @@ def test_receipt_rejects_reversed_positive_marker_order(field: str) -> None:
     )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, **{field: reversed_console})
+
+
+@pytest.mark.parametrize("field", ["console", "retained_console", "uid0_isolation_console"])
+@pytest.mark.parametrize(
+    "marker",
+    [
+        LIFECYCLE_CHANNEL_READY_MARKER,
+        LIFECYCLE_HELLO_ACCEPTED_MARKER,
+        LIFECYCLE_BOOTSTRAP_SENT_MARKER,
+        LIFECYCLE_KEY_ACK_ACCEPTED_MARKER,
+    ],
+)
+def test_receipt_requires_each_exact_lifecycle_progress_marker(field: str, marker: bytes) -> None:
+    receipt = _receipt()
+    console = getattr(receipt, field)
+    changed = console.replace(marker + b"\r\n", b"", 1)
+    assert changed != console
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, **{field: changed})
+
+
+@pytest.mark.parametrize("field", ["console", "retained_console", "uid0_isolation_console"])
+def test_receipt_rejects_lifecycle_progress_marker_reordering(field: str) -> None:
+    receipt = _receipt()
+    console = getattr(receipt, field)
+    ordered = LIFECYCLE_HELLO_ACCEPTED_MARKER + b"\r\n" + LIFECYCLE_BOOTSTRAP_SENT_MARKER
+    reversed_markers = LIFECYCLE_BOOTSTRAP_SENT_MARKER + b"\r\n" + LIFECYCLE_HELLO_ACCEPTED_MARKER
+    changed = console.replace(ordered, reversed_markers, 1)
+    assert changed != console
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, **{field: changed})
+
+
+@pytest.mark.parametrize(
+    ("name", "premature_marker"),
+    [
+        ("lifecycle_missing_port", LIFECYCLE_CHANNEL_READY_MARKER),
+        ("hello_zero_length", LIFECYCLE_HELLO_ACCEPTED_MARKER),
+    ],
+)
+def test_receipt_rejects_premature_lifecycle_progress_in_negative_control(name: str, premature_marker: bytes) -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.lifecycle_negative_consoles)
+    rejection = lifecycle_negative_control_contract(name)["rejection_marker"].encode("ascii")
+    consoles[name] = consoles[name].replace(rejection, premature_marker + b"\n" + rejection, 1)
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle_negative_consoles=consoles)
+
+
+def test_receipt_requires_key_ack_progress_before_post_workload_negative_control() -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.lifecycle_negative_consoles)
+    name = "stop_stale_generation"
+    consoles[name] = consoles[name].replace(LIFECYCLE_KEY_ACK_ACCEPTED_MARKER + b"\n", b"", 1)
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle_negative_consoles=consoles)
+
+
+def test_receipt_requires_key_ack_progress_before_workload_negative_control() -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.workload_negative_consoles)
+    name = WORKLOAD_NEGATIVE_CONTROL_NAMES[0]
+    consoles[name] = consoles[name].replace(LIFECYCLE_KEY_ACK_ACCEPTED_MARKER + b"\n", b"", 1)
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, workload_negative_consoles=consoles)
+
+
+def test_receipt_rejects_bootstrap_progress_before_workload_identity_failure() -> None:
+    receipt = _receipt()
+    consoles = dict(receipt.workload_negative_consoles)
+    name = "workload_missing_user"
+    rejection = WORKLOAD_NEGATIVE_REJECTION_MARKERS[name]
+    consoles[name] = consoles[name].replace(rejection, LIFECYCLE_BOOTSTRAP_SENT_MARKER + b"\n" + rejection, 1)
+
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, workload_negative_consoles=consoles)
 
 
 def test_receipt_rejects_workload_rejection_before_root_transition() -> None:
