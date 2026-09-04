@@ -271,6 +271,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;" in source
     assert "session->connection == LIFECYCLE_CONNECTED" in source
     assert "send_boundary_ack(session, discarded_header, discarded_payload, discarded_expected)" in source
+    signed_host_parser = source.split("static int parse_signed_host", 1)[1].split("static int parse_stop", 1)[0]
+    assert signed_host_parser.index('key(j, "reply_to")') < signed_host_parser.index('key(j, "request_id")')
     assert "session->payload_used + 1 == session->payload_expected" in source
     assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
     assert source.count("lifecycle_rejected(21, EIO);") >= 2

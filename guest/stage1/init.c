@@ -2303,14 +2303,14 @@ static int parse_signed_host(struct lifecycle_session *session, usize size, int 
         if (!key(j, "signal") || !uint_value(j, &signal_value) || signal_value != 15) return 0;
     }
     if (!take_char(j, '}')) return 0;
-    if (expected_kind != 0) {
-        if (!take_char(j, ',') || !key(j, "request_id") || !uint_value(j, &request_id) ||
-            !request_id || request_id > 0x7fffffffffffffffULL) return 0;
-    }
     if (!take_char(j, ',') || !key(j, "reply_to")) return 0;
     if (expected_kind == 0) {
         if (!uint_value(j, &reply_to) || reply_to != session->bootstrap_wire_sequence) return 0;
     } else if (!exact_literal(j, "null")) return 0;
+    if (expected_kind != 0) {
+        if (!take_char(j, ',') || !key(j, "request_id") || !uint_value(j, &request_id) ||
+            !request_id || request_id > 0x7fffffffffffffffULL) return 0;
+    }
     if (!take_char(j, ',') || !key(j, "run_id") || !plain_string(j, &value, 0) || value.n != 36 ||
         !bytes_equal(value.p, lifecycle_binding.run_id, 36) || !take_char(j, ',') ||
         !key(j, "schema") || !exact_string(j, LIFECYCLE_PROTOCOL) || !take_char(j, ',') ||
