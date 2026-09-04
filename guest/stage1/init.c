@@ -2945,10 +2945,12 @@ static int safe_workload_dev_entries(void) {
 
 static int prepare_workload_mount_boundary(struct child_error_local *failure) {
     int empty = -1;
+    u32 stage = 23;
     i64 operation = sc1(SYS_unshare, CLONE_NEWNS);
     if (operation != 0) goto rejected;
     operation = sc5(SYS_mount, 0, (i64)"/", 0, MS_REC | MS_PRIVATE, 0);
     if (operation != 0) goto rejected;
+    stage = 27;
     operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/dev", (i64)"tmpfs",
                     MS_NOSUID | MS_NOEXEC, (i64)"mode=0755,size=64k,nr_inodes=16");
     if (operation != 0 ||
@@ -2962,24 +2964,28 @@ static int prepare_workload_mount_boundary(struct child_error_local *failure) {
         operation = -EIO;
         goto rejected;
     }
+    stage = 28;
     operation = sc5(SYS_mount, 0, (i64)"/proc", 0,
                     MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
     if (operation != 0 || !verify_mountinfo("/proc", "proc", 1, 0, 0, 0, 0)) goto rejected;
+    stage = 29;
     operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/sys/class/virtio-ports", (i64)"tmpfs",
                     MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
                     (i64)"mode=0555,size=4k,nr_inodes=2");
     if (operation != 0 || !safe_dir("/sys/class/virtio-ports", 0, 1, 0, &empty)) goto rejected;
     sc1(SYS_close, empty); empty = -1;
+    stage = 30;
     operation = sc5(SYS_mount, 0, (i64)"/sys/fs/cgroup", 0,
                     MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
     if (operation != 0 || !verify_mountinfo("/sys/fs/cgroup", "cgroup2", 1, 0, 0, 0, 0)) goto rejected;
+    stage = 31;
     operation = sc5(SYS_mount, 0, (i64)"/sys", 0,
                     MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
     if (operation != 0 || !verify_mountinfo("/sys", "sysfs", 1, 0, 0, 0, 0)) goto rejected;
     return 1;
 rejected:
     if (empty >= 0) sc1(SYS_close, empty);
-    set_workload_failure(failure, 23, operation != 0 ? operation : EIO);
+    set_workload_failure(failure, stage, operation != 0 ? operation : EIO);
     return 0;
 }
 
@@ -3385,7 +3391,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     }
     n = sc2(SYS_pipe2, (i64)isolation_pipe, O_CLOEXEC);
     if (n != 0) {
-        set_workload_failure(failure, 23, n);
+        set_workload_failure(failure, 33, n);
         sc1(SYS_close, release_pipe[0]);
         sc1(SYS_close, release_pipe[1]);
         sc1(SYS_close, error_pipe[0]);
@@ -3437,7 +3443,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (main_pid == 0) {
         i64 operation;
         u8 isolation_ready = 1, release = 0;
-        if (sc1(SYS_close, lifecycle->fd) != 0) child_fail(error_pipe[1], 23, EIO);
+        if (sc1(SYS_close, lifecycle->fd) != 0) child_fail(error_pipe[1], 32, EIO);
         sc1(SYS_close, error_pipe[0]);
         sc1(SYS_close, isolation_pipe[0]);
         sc1(SYS_close, release_pipe[1]);
@@ -3454,7 +3460,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         }
         operation = sc3(SYS_write, isolation_pipe[1], (i64)&isolation_ready, 1);
         if (operation != 1 || sc1(SYS_close, isolation_pipe[1]) != 0)
-            child_fail(error_pipe[1], 23, operation < 0 ? operation : EIO);
+            child_fail(error_pipe[1], 33, operation < 0 ? operation : EIO);
         operation = sc3(SYS_read, release_pipe[0], (i64)&release, 1);
         if (operation != 1 || release != 1) child_fail(error_pipe[1], 13, operation < 0 ? operation : EIO);
         if (sc1(SYS_close, release_pipe[0]) != 0) child_fail(error_pipe[1], 13, EIO);
@@ -3478,10 +3484,17 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     }
     {
         u8 isolation_ready = 0;
+        u32 isolation_stage = 0;
+        i64 close_result;
         n = sc3(SYS_read, isolation_pipe[0], (i64)&isolation_ready, 1);
-        if (sc1(SYS_close, isolation_pipe[0]) != 0 || n != 1 || isolation_ready != 1 ||
-            !verify_workload_isolation_status(main_pid, process)) {
-            set_workload_failure(failure, 23, n < 0 ? n : EIO);
+        close_result = sc1(SYS_close, isolation_pipe[0]);
+        if (close_result != 0 || n != 1 || isolation_ready != 1)
+            isolation_stage = 33;
+        else if (!verify_workload_isolation_status(main_pid, process))
+            isolation_stage = 34;
+        if (isolation_stage) {
+            set_workload_failure(failure, isolation_stage,
+                                 n < 0 ? n : (close_result < 0 ? close_result : EIO));
             sc1(SYS_close, release_pipe[1]);
             n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
             sc1(SYS_close, error_pipe[0]);
