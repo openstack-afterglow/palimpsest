@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v16"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v17"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -164,7 +164,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "cgroup": "fd-pinned-cgroup-v2-agent-exec-session-hierarchy",
         "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
         "cleanup_scope": "exec-session-leaf-then-empty-agent-parent",
-        "contract": "palimpsest.guest-pid1-supervisor.v9",
+        "contract": "palimpsest.guest-pid1-supervisor.v10",
         "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "credentials": "root-pid1-broker-image-root-passwd-group-resolution-empty-supplementary-groups",
         "environment": "authenticated-image-environment-with-fixed-container-default-path",
@@ -190,7 +190,14 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "session_id_allocation": "guest-internal-monotonic-u32",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
-        "terminal_state": "parent-marker-then-fail-closed-wait",
+        "terminal_root_quiesce": {
+            "contract": "palimpsest.terminal-root-quiesce.v1",
+            "filesystem": "overlay",
+            "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+            "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+            "sync": "syncfs",
+        },
+        "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
         "wait": "wait4-to-echild-with-empty-leaf-and-parent-proof",
     }
     assert value["stage1"]["linkage"] == "static"
@@ -251,8 +258,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v14")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v8")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v15")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v9")' in source
     assert '"palimpsest.agent"' in source
     assert '"0::/palimpsest.agent/exec-00000001\\n"' in source
     assert "struct workload_agent" in source
@@ -315,6 +322,33 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
     assert source.count("lifecycle_rejected(21, EIO);") >= 2
     assert "else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);" in source
+
+
+def test_terminal_root_quiesce_failure_cannot_publish_terminal_state_or_frame() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    source = (repository / "guest" / "stage1" / "init.c").read_text()
+    quiesce = source.split("static int quiesce_terminal_root(void)", 1)[1].split("static int transition_root", 1)[0]
+    terminal_tail = source.rsplit("if (!lifecycle->stop_request_id)", 1)[1].split("static int run_consumer", 1)[0]
+
+    assert 'SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY' in quiesce
+    assert 'SYS_open, (i64)"/proc/self/root", O_RDONLY | O_CLOEXEC | O_DIRECTORY' in quiesce
+    assert "before_fs.type == OVERLAYFS_MAGIC" in quiesce
+    assert "before.dev == proc_root.dev && before.ino == proc_root.ino" in quiesce
+    assert "sc1(SYS_syncfs, root_fd) == 0" in quiesce
+    assert "after_fs.type == OVERLAYFS_MAGIC" in quiesce
+    assert "sc1(SYS_close, proc_root_fd) != 0" in quiesce
+    assert "sc1(SYS_close, root_fd) != 0" in quiesce
+
+    cleanup = terminal_tail.index("terminate_and_reap(")
+    cleanup_proof = terminal_tail.index("if (!verify_root_supervisor(result))")
+    quiesce_call = terminal_tail.index("if (!quiesce_terminal_root())")
+    quiesce_failure = terminal_tail.index("set_workload_failure(failure, 37, EIO)")
+    failure_return = terminal_tail.index("return -1;", quiesce_failure)
+    quiesce_marker = terminal_tail.index("write_all(1, TERMINAL_ROOT_QUIESCED_MARKER)")
+    terminal_state = terminal_tail.index("lifecycle->state = LIFECYCLE_TERMINAL")
+    terminal_frame = terminal_tail.index("send_control_message(lifecycle, 3, result)")
+    assert cleanup < cleanup_proof < quiesce_call < quiesce_failure < failure_return < quiesce_marker
+    assert quiesce_marker < terminal_state < terminal_frame
 
 
 @pytest.mark.parametrize(

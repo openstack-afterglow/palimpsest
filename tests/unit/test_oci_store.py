@@ -46,6 +46,7 @@ from palimpsest_local.oci_converter import (
 from palimpsest_local.oci_guest_filesystems import ext4_primary_superblock_checksum
 from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.oci_lifecycle_transport import OCILifecycleHandoffReceipt
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
@@ -75,7 +76,7 @@ from palimpsest_local.oci_root_prepare import (
     reconcile_oci_root_preparation,
     release_prepared_oci_root_run,
 )
-from palimpsest_local.oci_root_runtime import define_committed_oci_root_domain
+from palimpsest_local.oci_root_runtime import define_committed_oci_root_domain, launch_defined_oci_root_domain
 from palimpsest_local.oci_root_volume import (
     OCIRootVolumeRecord,
     claim_oci_root_volume,
@@ -92,7 +93,13 @@ from palimpsest_local.oci_store import (
     OCIStore,
     OCIStoreError,
 )
-from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from palimpsest_local.runtime_types import (
+    DispatchKey,
+    ProcessExit,
+    ProcessExitCategory,
+    RuntimeBackend,
+    RuntimeKind,
+)
 from palimpsest_local.state import StatePaths, init_resolved_roots, read_run_ledger_snapshot, reserve_new_run
 
 
@@ -1637,7 +1644,12 @@ class _FakeLibvirtError(RuntimeError):
         return self._code
 
 
-_FAKE_LIBVIRT = SimpleNamespace(libvirtError=_FakeLibvirtError, VIR_ERR_NO_DOMAIN=42)
+_FAKE_LIBVIRT = SimpleNamespace(
+    libvirtError=_FakeLibvirtError,
+    VIR_DOMAIN_XML_INACTIVE=2,
+    VIR_ERR_NO_DOMAIN=42,
+    VIR_STREAM_NONBLOCK=1,
+)
 
 
 class _DefinedDomain:
@@ -1646,16 +1658,42 @@ class _DefinedDomain:
         self.name = name
         self.xml = xml
         self.domain_uuid = domain_uuid or str(uuid.uuid4())
+        self.active = 0
+        self.domain_id = 7
+        self.create_calls = 0
+        self.destroy_calls = 0
+        self.open_channel_calls: list[tuple[str, object, int]] = []
+        self.xml_desc_flags: list[int | None] = []
         self.undefine_calls = 0
 
-    def XMLDesc(self) -> str:
+    def XMLDesc(self, flags: int | None = None) -> str:
+        self.xml_desc_flags.append(flags)
         return self.xml
 
     def isActive(self) -> int:
-        return 0
+        return self.active
 
     def UUIDString(self) -> str:
         return self.domain_uuid
+
+    def ID(self) -> int:
+        return self.domain_id if self.active == 1 else -1
+
+    def create(self) -> None:
+        self.create_calls += 1
+        self.active = 1
+
+    def destroy(self) -> None:
+        self.destroy_calls += 1
+        if self.connection.destroy_error is not None:
+            raise self.connection.destroy_error
+        self.active = 0
+
+    def openChannel(self, name: str, stream: object, flags: int) -> int | None:
+        self.open_channel_calls.append((name, stream, flags))
+        if self.connection.open_channel_error is not None:
+            raise self.connection.open_channel_error
+        return self.connection.open_channel_result
 
     def undefine(self) -> None:
         self.undefine_calls += 1
@@ -1674,6 +1712,9 @@ class _DefinitionConnection:
         uri: str = "qemu:///system",
         rebind_uuid: bool = False,
         undefine_error: Exception | None = None,
+        destroy_error: Exception | None = None,
+        open_channel_error: Exception | None = None,
+        open_channel_result: int | None = 0,
     ):
         self.domains: dict[str, _DefinedDomain] = {}
         self.transform = transform
@@ -1681,8 +1722,18 @@ class _DefinitionConnection:
         self.uri = uri
         self.rebind_uuid = rebind_uuid
         self.undefine_error = undefine_error
+        self.destroy_error = destroy_error
+        self.open_channel_error = open_channel_error
+        self.open_channel_result = open_channel_result
         self.lookup_error: Exception | None = None
         self.define_calls = 0
+        self.stream = SimpleNamespace(
+            send=lambda payload: len(payload),
+            recv=lambda _size: -2,
+            abort=lambda: None,
+            free=lambda: None,
+        )
+        self.stream_flags: list[int] = []
 
     def getURI(self) -> str:
         return self.uri
@@ -1694,6 +1745,16 @@ class _DefinitionConnection:
             return self.domains[name]
         except KeyError:
             raise _FakeLibvirtError("missing", 42) from None
+
+    def lookupByUUIDString(self, domain_uuid: str) -> _DefinedDomain:
+        for domain in self.domains.values():
+            if domain.UUIDString() == domain_uuid:
+                return domain
+        raise _FakeLibvirtError("missing", 42)
+
+    def newStream(self, flags: int) -> object:
+        self.stream_flags.append(flags)
+        return self.stream
 
     def defineXML(self, xml: str) -> _DefinedDomain:
         self.define_calls += 1
@@ -1832,8 +1893,8 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
-    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v14"
-    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v8"
+    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v15"
+    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v9"
     assert stage1.to_dict()["isolation"] == "palimpsest.workload-lifecycle-authority-isolation.v3"
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
@@ -2221,6 +2282,418 @@ def test_oci_root_define_does_not_cleanup_foreign_post_define_rebinding(
     snapshot = read_run_ledger_snapshot(roots, name)
     assert snapshot.state["status"] == "failed"
     assert snapshot.state["oci_root_definition"]["phase"] == "cleanup-required"
+
+
+def _handoff_receipt(
+    phase: str,
+    terminal: ProcessExit | None = None,
+    *,
+    boot_attempt_id: str = "aca88126-d991-4de8-b66b-90dc07904dff",
+) -> OCILifecycleHandoffReceipt:
+    return OCILifecycleHandoffReceipt(
+        boot_attempt_id,
+        "b22b1c81-dfa4-478a-b352-27b5b35fe5b7",
+        "sha256:" + "9" * 64,
+        phase,
+        (),
+        terminal,
+    )
+
+
+def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-complete"
+    roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    defined = define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    observed_statuses: list[str] = []
+    terminal = ProcessExit(17, 17, None, ProcessExitCategory.EXITED)
+
+    def handoff(_stream, binding, *, on_ready, timeout_seconds, terminal_timeout_seconds, session):
+        assert binding.run_id == plan.run_id
+        assert binding.domain_core_digest == plan.domain_core_digest
+        assert binding.stage1_artifact_digest == plan.stage1_transport["artifact_digest"]
+        assert timeout_seconds == 9
+        assert terminal_timeout_seconds is None
+        starting = read_run_ledger_snapshot(roots, name).state
+        observed_statuses.append(starting["status"])
+        assert set(starting["oci_root_handoff"]) == {
+            "boot_attempt_id",
+            "domain_id",
+            "domain_uuid",
+            "libvirt_uri",
+            "phase",
+            "plan_digest",
+            "schema",
+        }
+        assert starting["oci_root_handoff"]["domain_id"] == 7
+        on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+        observed_statuses.append(read_run_ledger_snapshot(roots, name).state["status"])
+        return _handoff_receipt("terminal", terminal, boot_attempt_id=session.boot_attempt_id)
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
+    result = launch_defined_oci_root_domain(
+        roots,
+        name,
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+        timeout_seconds=9,
+    )
+
+    domain = conn.domains[name]
+    assert observed_statuses == ["starting", "running"]
+    assert conn.stream_flags == [_FAKE_LIBVIRT.VIR_STREAM_NONBLOCK]
+    assert [(channel, flags) for channel, _stream, flags in domain.open_channel_calls] == [
+        ("org.palimpsest.oci.lifecycle.0", 0)
+    ]
+    assert domain.create_calls == domain.destroy_calls == 1
+    assert domain.isActive() == 0
+    assert _FAKE_LIBVIRT.VIR_DOMAIN_XML_INACTIVE in domain.xml_desc_flags
+    assert result.domain_uuid == defined.domain_uuid
+    assert result.domain_id == 7
+    assert result.terminal == terminal
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "exited"
+    handoff_ledger = snapshot.state["oci_root_handoff"]
+    assert handoff_ledger["schema"] == "palimpsest.oci-root-handoff.v1"
+    assert handoff_ledger["phase"] == "terminal"
+    assert handoff_ledger["plan_digest"] == plan.digest
+    assert handoff_ledger["domain_id"] == 7
+    assert handoff_ledger["boot_attempt_id"] == result.lifecycle.boot_attempt_id
+    assert handoff_ledger["lifecycle"]["terminal"] == {
+        "category": "exited",
+        "exit_code": 17,
+        "returncode": 17,
+        "signal_number": None,
+    }
+    assert "boot_key" not in repr(handoff_ledger)
+    assert "tag" not in repr(handoff_ledger)
+
+
+def test_oci_root_private_launch_rejects_name_uuid_disagreement_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-mismatch"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    original = conn.domains[name]
+    foreign = _DefinedDomain(conn, name, original.xml)
+    conn.lookupByUUIDString = lambda _domain_uuid: foreign  # type: ignore[method-assign]
+
+    with pytest.raises(StateError, match="name and UUID"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert original.create_calls == original.destroy_calls == original.undefine_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_oci_root_private_launch_failure_cleans_exact_domain_or_records_cleanup_required(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: bool,
+) -> None:
+    name = f"launch-failure-{'yes' if cleanup_failure else 'no'}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection(destroy_error=RuntimeError("SENSITIVE DESTROY FAILURE") if cleanup_failure else None)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+
+    def handoff_failure(*_args, **_kwargs):
+        raise RuntimeError("SENSITIVE LIFECYCLE FAILURE")
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff_failure)
+    message = "cleanup.*required" if cleanup_failure else "launch failed"
+    with pytest.raises(StateError, match=message):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root_handoff"]["phase"] == ("cleanup-required" if cleanup_failure else "failed")
+    assert "SENSITIVE" not in repr(snapshot.state)
+    if cleanup_failure:
+        assert conn.domains[name] is domain
+        assert domain.isActive() == 1
+        assert domain.undefine_calls == 0
+    else:
+        assert name not in conn.domains
+        assert domain.destroy_calls == domain.undefine_calls == 1
+
+
+def test_oci_root_private_launch_requires_libvirt_surface_before_starting_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-libvirt-surface"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    unsupported = SimpleNamespace(
+        libvirtError=_FakeLibvirtError,
+        VIR_ERR_NO_DOMAIN=42,
+        VIR_STREAM_NONBLOCK=1,
+    )
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: unsupported)
+
+    with pytest.raises(StateError, match="libvirt stream or inactive XML"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    domain = conn.domains[name]
+    assert domain.create_calls == domain.destroy_calls == domain.undefine_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+def test_oci_root_private_launch_preallocates_and_validates_stream_before_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-stream-preflight"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+    calls = {"abort": 0, "free": 0}
+
+    def close(operation: str) -> None:
+        calls[operation] += 1
+
+    conn.stream = SimpleNamespace(
+        send=lambda payload: len(payload),
+        abort=lambda: close("abort"),
+        free=lambda: close("free"),
+    )
+
+    with pytest.raises(StateError, match="stream surface is invalid"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert domain.create_calls == domain.destroy_calls == domain.undefine_calls == 0
+    assert calls == {"abort": 1, "free": 1}
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+@pytest.mark.parametrize("failure", ["definite-create", "partial-create", "id-inspection"])
+def test_oci_root_private_launch_create_boundary_uses_durable_activation_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    name = f"launch-{failure}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+    observed: list[tuple[str, str, bool]] = []
+
+    def fail_create() -> None:
+        domain.create_calls += 1
+        snapshot = read_run_ledger_snapshot(roots, name).state
+        observed.append(
+            (snapshot["status"], snapshot["oci_root_handoff"]["phase"], "domain_id" in snapshot["oci_root_handoff"])
+        )
+        if failure == "partial-create":
+            domain.active = 1
+        raise RuntimeError("create failed")
+
+    if failure in {"definite-create", "partial-create"}:
+        domain.create = fail_create  # type: ignore[method-assign]
+    else:
+        original_create = domain.create
+
+        def create_then_break_id() -> None:
+            original_create()
+            snapshot = read_run_ledger_snapshot(roots, name).state
+            observed.append(
+                (snapshot["status"], snapshot["oci_root_handoff"]["phase"], "domain_id" in snapshot["oci_root_handoff"])
+            )
+
+        domain.create = create_then_break_id  # type: ignore[method-assign]
+        domain.ID = lambda: (_ for _ in ()).throw(RuntimeError("ID failed"))  # type: ignore[method-assign]
+
+    message = "cleanup was not attempted" if failure != "definite-create" else "launch failed"
+    with pytest.raises(StateError, match=message):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert observed == [("starting", "activating", False)]
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    if failure == "definite-create":
+        assert name not in conn.domains
+        assert domain.undefine_calls == 1
+        assert snapshot.state["oci_root_handoff"]["phase"] == "failed"
+    else:
+        assert conn.domains[name] is domain
+        assert domain.destroy_calls == domain.undefine_calls == 0
+        assert snapshot.state["oci_root_handoff"]["phase"] == "cleanup-not-attempted"
+
+
+def test_oci_root_private_launch_rejects_nonzero_or_none_open_channel_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-open-result"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection(open_channel_result=None)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    monkeypatch.setattr(
+        oci_root_runtime_module,
+        "complete_initial_lifecycle_handoff",
+        lambda *_args, **_kwargs: pytest.fail("handoff must not start"),
+    )
+
+    with pytest.raises(StateError, match="launch failed"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root_handoff"]["phase"] == "failed"
+
+
+def test_oci_root_private_launch_does_not_cleanup_or_overwrite_changed_boot_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-concurrent-change"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+
+    def change_ledger_then_fail(*_args, **_kwargs):
+        with state_module.locked_existing_run(roots, name) as mutation:
+            data = mutation.mutable_state()
+            data["oci_root_handoff"]["boot_attempt_id"] = str(uuid.uuid4())
+            mutation.write_state("stopped", data)
+        raise RuntimeError("SENSITIVE FAILURE")
+
+    monkeypatch.setattr(
+        oci_root_runtime_module,
+        "complete_initial_lifecycle_handoff",
+        change_ledger_then_fail,
+    )
+    with pytest.raises(StateError, match="cleanup was not attempted"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name] is domain
+    assert domain.isActive() == 1
+    assert domain.destroy_calls == domain.undefine_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "stopped"
+
+
+def test_oci_root_private_launch_failure_retains_durable_ready_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-ready-failure"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    def ready_then_fail(_stream, _binding, *, on_ready, session, **_kwargs):
+        on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+        raise RuntimeError("SENSITIVE FAILURE")
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", ready_then_fail)
+    with pytest.raises(StateError, match="launch failed"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root_handoff"]["phase"] == "failed"
+    assert snapshot.state["oci_root_handoff"]["lifecycle"]["phase"] == "ready"
+
+
+@pytest.mark.parametrize("drift", ["domain-id", "xml"])
+def test_oci_root_private_launch_never_cleans_a_changed_boot_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    name = f"launch-drift-{drift}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+
+    def drift_then_fail(*_args, **_kwargs):
+        if drift == "domain-id":
+            domain.domain_id += 1
+        else:
+            root = ET.fromstring(domain.xml)
+            root.find("./devices/disk/source").set("file", "/foreign/new-boot.raw")
+            domain.xml = ET.tostring(root, encoding="unicode")
+        raise RuntimeError("SENSITIVE FAILURE")
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", drift_then_fail)
+    with pytest.raises(StateError, match="control is ambiguous; cleanup was not attempted"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name] is domain
+    assert domain.isActive() == 1
+    assert domain.destroy_calls == domain.undefine_calls == 0
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["status"] == "failed"
+    assert snapshot.state["oci_root_handoff"]["phase"] == "cleanup-not-attempted"
+
+
+@pytest.mark.parametrize("tamper", ["domain_uuid", "domain_id", "libvirt_uri", "plan_digest", "lifecycle"])
+def test_oci_root_private_launch_rejects_same_attempt_handoff_ledger_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    name = f"launch-ledger-{tamper.replace('_', '-')}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+
+    def tamper_then_fail(_stream, _binding, *, on_ready, session, **_kwargs):
+        if tamper == "lifecycle":
+            on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+        with state_module.locked_existing_run(roots, name) as mutation:
+            data = mutation.mutable_state()
+            handoff = data["oci_root_handoff"]
+            if tamper == "domain_uuid":
+                handoff[tamper] = str(uuid.uuid4())
+            elif tamper == "domain_id":
+                handoff[tamper] += 1
+            elif tamper in {"libvirt_uri", "plan_digest"}:
+                handoff[tamper] = "tampered"
+            else:
+                handoff["lifecycle"]["key_id"] = "sha256:" + "8" * 64
+            mutation.write_state("running" if tamper == "lifecycle" else "starting", data)
+        raise RuntimeError("SENSITIVE FAILURE")
+
+    monkeypatch.setattr(
+        oci_root_runtime_module,
+        "complete_initial_lifecycle_handoff",
+        tamper_then_fail,
+    )
+    with pytest.raises(StateError, match="cleanup was not attempted"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name] is domain
+    assert domain.isActive() == 1
+    assert domain.destroy_calls == domain.undefine_calls == 0
 
 
 def test_oci_root_kvm_domain_plan_rejects_foreign_root_binding(tmp_path: Path) -> None:

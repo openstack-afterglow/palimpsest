@@ -38,6 +38,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
     ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
+    TERMINAL_ROOT_QUIESCED_MARKER,
     WORKLOAD_CLEANUP_REJECTION_PREFIX,
     WORKLOAD_ISOLATION_MARKER,
     WORKLOAD_NEGATIVE_CONTROL_NAMES,
@@ -141,13 +142,15 @@ def _positive_console(*, retained: bool = False) -> bytes:
             + b"\r\n"
             + LIFECYCLE_PEER_BOUNDARY_MARKER
             + b"\r\n"
+            + TERMINAL_ROOT_QUIESCED_MARKER
+            + b"\r\n"
             + SUCCESS_MARKER
             + b"\r\n"
             + LIFECYCLE_PEER_BOUNDARY_MARKER
             + b"\r\n"
         )
         return payload
-    return payload + SUCCESS_MARKER + b"\r\n"
+    return payload + TERMINAL_ROOT_QUIESCED_MARKER + b"\r\n" + SUCCESS_MARKER + b"\r\n"
 
 
 def _workload_negative_consoles() -> dict[str, bytes]:
@@ -1413,7 +1416,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v18"
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v19"
     assert decoded["executed_boots"] == 43
     assert decoded["qemu_invocations"] == 44
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
@@ -1450,7 +1453,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v9",
+        "contract": "palimpsest.guest-pid1-supervisor.v10",
         "account_resolution": "image-root-passwd-group",
         "argv0": "shell-free-path-search-after-chdir",
         "agent_cgroup": "/palimpsest.agent",
@@ -1483,11 +1486,30 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         "reaped_children": 3,
         "session_id": 1,
         "session_id_allocation": "guest-internal-monotonic-u32",
-        "terminal_state": "parent-marker-then-fail-closed-wait",
-        "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+        "terminal_root_quiesce": {
+            "contract": "palimpsest.terminal-root-quiesce.v1",
+            "filesystem": "overlay",
+            "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+            "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+            "sync": "syncfs",
+        },
+        "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
+        "terminal_wire_order": "cleanup-certainty-then-root-quiesce-then-terminal-frame-then-console-marker",
         "supplementary_groups": "empty-restricted-subset",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
         "uid0_capabilityless_proven": True,
+    }
+    assert decoded["terminal_root_quiesce"] == {
+        "close_verified": True,
+        "contract": "palimpsest.terminal-root-quiesce.v1",
+        "filesystem": "overlay",
+        "marker": TERMINAL_ROOT_QUIESCED_MARKER.decode("ascii"),
+        "marker_count": 1,
+        "proc_self_root_matches_slash": True,
+        "root_reopened_nofollow_directory": True,
+        "stable_before_after": True,
+        "syncfs": True,
+        "terminal_after_quiesce": True,
     }
     assert decoded["pre_mount_devices"] is True
     assert decoded["filesystem_verified"] is True
@@ -1528,6 +1550,18 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
                 "sha256:" + "f" * 64,
             ),
         )
+
+
+def test_receipt_rejects_missing_terminal_root_quiesce_marker_and_claim_tamper() -> None:
+    receipt = _receipt()
+    without_marker = receipt.console.replace(TERMINAL_ROOT_QUIESCED_MARKER + b"\r\n", b"")
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, console=without_marker)
+
+    value = copy.deepcopy(receipt.to_dict())
+    value["terminal_root_quiesce"]["syncfs"] = False
+    with pytest.raises(ArtifactValidationError, match="policy"):
+        _decode_receipt(value, receipt)
 
 
 def test_uid0_console_rejection_marker_is_rejected() -> None:

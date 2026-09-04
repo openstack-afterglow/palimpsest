@@ -23,6 +23,7 @@ from .errors import ArtifactValidationError
 from .oci_provenance import canonical_json_bytes
 
 OCI_CONTROL_PROTOCOL_V2 = "palimpsest.oci-lifecycle-control.v2"
+OCI_CONTROL_CHANNEL_NAME = "org.palimpsest.oci.lifecycle.0"
 OCI_CONTROL_CHANNEL_CARRIER = "channel-frame"
 OCI_CONTROL_CONSOLE_CARRIER = "console-line"
 OCI_CONTROL_BOUNDARY_PREFIX = b"palimpsest guest stage1: lifecycle boundary ack "
@@ -1098,6 +1099,7 @@ __all__ = [
     "MAX_OCI_CONTROL_FRAME_BYTES",
     "OCI_CONTROL_BOUNDARY_PREFIX",
     "OCI_CONTROL_CHANNEL_CARRIER",
+    "OCI_CONTROL_CHANNEL_NAME",
     "OCI_CONTROL_CONSOLE_CARRIER",
     "OCI_CONTROL_PROTOCOL_V2",
     "HostOCIControlV2Session",

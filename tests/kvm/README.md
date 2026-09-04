@@ -32,7 +32,7 @@ Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
 drives canonical lifecycle frames with partial nonblocking I/O and records
 path-free frame digests plus nonce/generation/request/sequence correlation.
-Receipt v18 covers a single connection and an exact six-connection retained-
+Receipt v19 covers a single connection and an exact six-connection retained-
 root session. The latter proves a lost initial READY, an accepted RECONNECT
 whose SNAPSHOT is lost, a connection-local partial STOP, complete same-ID retry,
 an already-committed same-ID duplicate without a second signal dispatch, and a
@@ -67,7 +67,7 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-receipt v18 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v19 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact base and UID 0 mode argv, three-entry environment, cwd,
@@ -80,7 +80,7 @@ parent-second removal. The workload also proves UID 65534 cannot write-open
 the cgroup root, agent parent, or its own session `cgroup.procs`. Production define/start remains
 disabled.
 
-The v18 canonical receipt binds all 43 native-KVM guest boots: two positive boots
+The v19 canonical receipt binds all 43 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and five
 workload-launch controls, ten lifecycle controls, and one UID 0 isolation
@@ -118,8 +118,8 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v14, OCI-root domain plan/core are v13/v7, and the
-init contract is v16. Initramfs manifest/ABI are v18, supervisor is v9,
+The stage-1 plan/protocol is v15, OCI-root domain plan/core are v14/v8, and the
+init contract is v17. Initramfs manifest/ABI are v19, supervisor is v10,
 lifecycle broker is v3, workload isolation is v3, and filesystem fixture
 policy/schema are v11. The agent parent remains empty while the primary
 session uses guest-internal monotonic ID 1; only one active session is
@@ -128,7 +128,7 @@ filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v18 receipt on the qualified runner; this source update and
+must still produce a v19 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while the admitted

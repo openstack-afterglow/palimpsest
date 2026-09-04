@@ -226,6 +226,7 @@ struct span { const char *p; usize n; };
 #define WORKLOAD_ISOLATION_MARKER "palimpsest guest stage1: workload isolation committed; agent cgroup and exec session owned by pid1; lifecycle authority retained by pid1\n"
 #define ROOT_TRANSITION_MARKER "palimpsest guest stage1: root transition complete; root is slash; workload pending\n"
 #define WORKLOAD_TERMINAL_PREFIX "palimpsest guest stage1: workload terminal; main_status="
+#define TERMINAL_ROOT_QUIESCED_MARKER "palimpsest guest stage1: terminal root quiesced; overlay slash identity stable; syncfs committed\n"
 #define WORKLOAD_REJECTED_PREFIX "palimpsest guest stage1: workload launch rejected; stage="
 #define WORKLOAD_CLEANUP_REJECTED_PREFIX "palimpsest guest stage1: workload cleanup rejected; stage="
 #define LIFECYCLE_REJECTED_PREFIX "palimpsest guest stage1: lifecycle rejected; stage="
@@ -359,6 +360,7 @@ struct lifecycle_session {
     int connection;
     int connection_has_hello;
     int state;
+    int natural_terminal_frozen;
     int natural_late_stop_allowed;
     int partial_frame_marker_emitted;
     u32 nonce_count;
@@ -1402,19 +1404,19 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v8") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v9") || !take_char(&j, ',') ||
         !key(&j, "isolation") ||
         !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v3") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") ||
         !exact_string(&j, "image-root-account-path-capabilityless-isolated-user-group.v3") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v14") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v15") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v14") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v15") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -2411,7 +2413,7 @@ static int parse_stop(struct lifecycle_session *session, usize size) {
     /* A canonical STOP that lost the race with an already-reaped main process
      * is drained without changing the frozen natural terminal cause.  Invalid
      * or replayed input remains fail-closed. */
-    if (session->state == LIFECYCLE_TERMINAL) {
+    if (session->state == LIFECYCLE_TERMINAL || session->natural_terminal_frozen) {
         if (!session->natural_late_stop_allowed || request_seen(session, request_id) ||
             session->request_count >= LIFECYCLE_REQUEST_LEDGER_MAX) return 0;
         session->natural_late_stop_allowed = 0;
@@ -3253,6 +3255,35 @@ static int verify_root_identity(int merged_fd, const struct stat_local *merged_i
         sc1(SYS_syncfs, slash_fd) == 0;
     if (proc_root_fd >= 0) sc1(SYS_close, proc_root_fd);
     if (slash_fd >= 0) sc1(SYS_close, slash_fd);
+    return valid;
+}
+
+/* Terminal authority is not published until the writable OverlayFS backing
+ * has crossed an explicit sync boundary. Reopen slash without following a
+ * terminal path component, bind it to /proc/self/root and OverlayFS, then
+ * require both syncfs(2) and every close(2) to succeed. */
+static int quiesce_terminal_root(void) {
+    struct stat_local before, after, proc_root;
+    struct statfs_local before_fs, after_fs;
+    i64 root_fd = sc3(SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    i64 proc_root_fd = -1;
+    int valid = root_fd >= 0;
+    if (valid) {
+        proc_root_fd = sc3(SYS_open, (i64)"/proc/self/root", O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0);
+        valid = proc_root_fd >= 0 &&
+            sc2(SYS_fstat, root_fd, (i64)&before) == 0 &&
+            sc2(SYS_fstat, proc_root_fd, (i64)&proc_root) == 0 &&
+            (before.mode & S_IFMT) == S_IFDIR &&
+            before.dev == proc_root.dev && before.ino == proc_root.ino && before.mode == proc_root.mode &&
+            sc2(SYS_fstatfs, root_fd, (i64)&before_fs) == 0 && before_fs.type == OVERLAYFS_MAGIC &&
+            sc1(SYS_syncfs, root_fd) == 0 &&
+            sc2(SYS_fstat, root_fd, (i64)&after) == 0 &&
+            sc2(SYS_fstatfs, root_fd, (i64)&after_fs) == 0 && after_fs.type == OVERLAYFS_MAGIC &&
+            before.dev == after.dev && before.ino == after.ino && before.mode == after.mode &&
+            before.uid == after.uid && before.gid == after.gid;
+    }
+    if (proc_root_fd >= 0 && sc1(SYS_close, proc_root_fd) != 0) valid = 0;
+    if (root_fd >= 0 && sc1(SYS_close, root_fd) != 0) valid = 0;
     return valid;
 }
 
@@ -4456,7 +4487,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         /* The main workload won the natural-exit/late-STOP race.  Freeze that
          * terminal cause before teardown and do not parse a STOP during the
          * cleanup window; its terminal reply_to must remain null. */
-        lifecycle->state = LIFECYCLE_TERMINAL;
+        lifecycle->natural_terminal_frozen = 1;
         lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;
         lifecycle->terminal_exit_code = result->main_exit_code;
         lifecycle->terminal_signal = result->main_signal;
@@ -4494,11 +4525,17 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
     }
-    if (lifecycle->stop_request_id) {
-        lifecycle->state = LIFECYCLE_TERMINAL;
-        lifecycle->terminal_exit_code = result->main_exit_code;
-        lifecycle->terminal_signal = result->main_signal;
+    if (!quiesce_terminal_root()) {
+        set_workload_failure(failure, 37, EIO);
+        close_workload_agent(&agent, &session);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return -1;
     }
+    write_all(1, TERMINAL_ROOT_QUIESCED_MARKER);
+    lifecycle->state = LIFECYCLE_TERMINAL;
+    lifecycle->terminal_exit_code = result->main_exit_code;
+    lifecycle->terminal_signal = result->main_signal;
     if (lifecycle->connection_has_hello) (void)send_control_message(lifecycle, 3, result);
     close_workload_agent(&agent, &session);
     sc1(SYS_close, signal_fd);

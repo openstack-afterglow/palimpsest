@@ -995,6 +995,40 @@ Scope boundary: production create/start/run/`-d`, host runtime STOP, runtime
 exec/log readiness, parallel exec sessions, supplementary group expansion,
 and Gate 2 remain disabled.
 
+### PR 4 slice 30A: exact-domain libvirt lifecycle handoff and terminal root quiesce
+
+- A private, production-inert host launch boundary now allocates a nonblocking
+  libvirt stream, durably records an `activating` intent before `create()`,
+  captures the resulting domain ID, and opens only the committed named
+  virtio-serial lifecycle channel without `VIR_DOMAIN_CHANNEL_FORCE`.
+- The host drives the authenticated v2 `HELLO → BOOTSTRAP → KEY_ACK → READY →
+  TERMINAL` exchange. READY and terminal receipts are secret-free, and any
+  already-observed trailing or truncated wire after TERMINAL fails closed.
+- Every state transition revalidates the exact run, plan digest, libvirt URI,
+  UUID, active domain ID, ownership marker, and full persistent inactive XML.
+  Cleanup destroys or undefines only that exact boot instance; restart,
+  identity drift, or ambiguous creation leaves the domain untouched and records
+  cleanup as not attempted or required.
+- Guest PID 1 publishes TERMINAL only after workload and cgroup cleanup, stable
+  no-follow identity checks for OverlayFS `/` and `/proc/self/root`, successful
+  `syncfs`, and successful descriptor closes. KVM proof/receipt v19 binds the
+  exact quiesce marker ordering across all positive consoles and forbids it in
+  every negative console.
+- An opt-in `qemu:///system` qualification now exercises the real private
+  prepare, committed plan, collision rejection, define, launch, natural exit,
+  retained ext4 mutation, exact domain cleanup, and lease/volume release path.
+  Its cleanup independently requires matching name/UUID, owner marker, domain
+  ID, and inactive XML before any destructive libvirt call.
+- Stage-1 plan/protocol v15, handoff v9, init/consumer v17, initramfs
+  manifest/ABI v19, supervisor v10, domain plan/core v14/v8, and KVM
+  proof/receipt v19 bind this checkpoint. Lifecycle protocol v2, broker v3,
+  workload isolation v3, fixture policy/schema v11, and process policy v3 are
+  unchanged.
+
+Scope boundary: this launch path remains a synchronous private qualification
+surface. Public create/start/run/`-d`, a restart-safe monitor, runtime STOP,
+exec/log readiness, and Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1013,9 +1047,12 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Connect production final handoff, host stop/control and exit mapping,
-   foreground-default `run` and detached `run -d`, then lifecycle/exec/log
-   readiness for OCI-root/KVM.
-2. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
+1. Add the restart-safe long-lived host monitor and authenticated STOP/control
+   ownership, including recovery from durable `activating`, `starting`, and
+   `running` states.
+2. Connect foreground-default `run` and detached `run -d` to that monitor,
+   preserving public fail-closed behavior until both paths are qualified.
+3. Add lifecycle/exec/log readiness and activate the opt-in local build-to-run
+   gate on a qualified self-hosted Linux
    KVM runner and require it before claiming production OCI-image-to-VM-root
    readiness.

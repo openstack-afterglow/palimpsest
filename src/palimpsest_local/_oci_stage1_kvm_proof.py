@@ -67,6 +67,7 @@ from .oci_initramfs import (
     OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
     OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
     OCI_STAGE1_SUPERVISOR_CONTRACT,
+    OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
     OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
     build_bootstrap_initramfs,
 )
@@ -75,7 +76,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v18"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v19"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -98,6 +99,9 @@ LIFECYCLE_PEER_BOUNDARY_MARKER = OCI_CONTROL_BOUNDARY_PREFIX + b'{"redacted":tru
 LIFECYCLE_PARTIAL_BUFFERED_MARKER = b"palimpsest guest stage1: lifecycle partial frame buffered"
 LIFECYCLE_STOP_DISPATCHED_MARKER = b"palimpsest guest stage1: lifecycle stop dispatched"
 LIFECYCLE_STOP_DUPLICATE_MARKER = b"palimpsest guest stage1: lifecycle stop duplicate accepted"
+TERMINAL_ROOT_QUIESCED_MARKER = (
+    b"palimpsest guest stage1: terminal root quiesced; overlay slash identity stable; syncfs committed"
+)
 WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_status="
 WORKLOAD_TERMINAL_MARKER = (
     b"palimpsest guest stage1: workload terminal; main_status=42; cooperative_status=43; "
@@ -2814,6 +2818,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 0
             or _logical_line_count(self.console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 0
             or _logical_line_count(self.console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) != 0
+            or _logical_line_count(self.console, TERMINAL_ROOT_QUIESCED_MARKER) != 1
             or not _logical_lines_in_order(
                 self.console,
                 ROOT_TRANSITION_MARKER,
@@ -2821,6 +2826,7 @@ class OCIStage1KVMProofReceipt:
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
                 LIFECYCLE_STOP_DISPATCHED_MARKER,
+                TERMINAL_ROOT_QUIESCED_MARKER,
                 SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.console, WORKLOAD_REJECTION_PREFIX) != 0
@@ -2843,6 +2849,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DUPLICATE_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER) != 5
             or _logical_line_count(self.retained_console, LIFECYCLE_PARTIAL_BUFFERED_MARKER) != 1
+            or _logical_line_count(self.retained_console, TERMINAL_ROOT_QUIESCED_MARKER) != 1
             or not _logical_lines_in_order(
                 self.retained_console,
                 ROOT_TRANSITION_MARKER,
@@ -2856,6 +2863,7 @@ class OCIStage1KVMProofReceipt:
                 LIFECYCLE_STOP_DISPATCHED_MARKER,
                 LIFECYCLE_STOP_DUPLICATE_MARKER,
                 LIFECYCLE_PEER_BOUNDARY_MARKER,
+                TERMINAL_ROOT_QUIESCED_MARKER,
                 SUCCESS_MARKER,
                 LIFECYCLE_PEER_BOUNDARY_MARKER,
             )
@@ -2869,6 +2877,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.uid0_isolation_console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, TERMINAL_ROOT_QUIESCED_MARKER) != 1
             or _logical_line_count(self.uid0_isolation_console, SUCCESS_MARKER) != 1
             or not _logical_lines_in_order(
                 self.uid0_isolation_console,
@@ -2877,6 +2886,7 @@ class OCIStage1KVMProofReceipt:
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
                 LIFECYCLE_STOP_DISPATCHED_MARKER,
+                TERMINAL_ROOT_QUIESCED_MARKER,
                 SUCCESS_MARKER,
             )
             or _logical_prefix_count(self.uid0_isolation_console, WORKLOAD_REJECTION_PREFIX) != 0
@@ -3049,6 +3059,18 @@ class OCIStage1KVMProofReceipt:
             or any(
                 not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None
                 for value in self.lifecycle_negative_root_post_digests.values()
+            )
+            or any(
+                _logical_line_count(control_console, TERMINAL_ROOT_QUIESCED_MARKER) != 0
+                for controls in (
+                    self.negative_consoles,
+                    self.filesystem_negative_consoles,
+                    self.assembly_negative_consoles,
+                    self.root_transition_negative_consoles,
+                    self.workload_negative_consoles,
+                    self.lifecycle_negative_consoles,
+                )
+                for control_console in controls.values()
             )
             or not isinstance(self.qemu_duplicate_name_output, bytes)
             or not 1 <= len(self.qemu_duplicate_name_output) <= MAX_QEMU_VERSION_BYTES
@@ -3264,11 +3286,30 @@ class OCIStage1KVMProofReceipt:
                 "reaped_children": 3,
                 "session_id": 1,
                 "session_id_allocation": "guest-internal-monotonic-u32",
-                "terminal_state": "parent-marker-then-fail-closed-wait",
-                "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+                "terminal_root_quiesce": {
+                    "contract": OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
+                    "filesystem": "overlay",
+                    "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+                    "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+                    "sync": "syncfs",
+                },
+                "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
+                "terminal_wire_order": "cleanup-certainty-then-root-quiesce-then-terminal-frame-then-console-marker",
                 "supplementary_groups": "empty-restricted-subset",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
                 "uid0_capabilityless_proven": True,
+            },
+            "terminal_root_quiesce": {
+                "close_verified": True,
+                "contract": OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
+                "filesystem": "overlay",
+                "marker": TERMINAL_ROOT_QUIESCED_MARKER.decode("ascii"),
+                "marker_count": 1,
+                "proc_self_root_matches_slash": True,
+                "root_reopened_nofollow_directory": True,
+                "stable_before_after": True,
+                "syncfs": True,
+                "terminal_after_quiesce": True,
             },
             "switch_root": True,
             "topology": pre_mount_topology(build_proof_plan()),
@@ -3370,6 +3411,7 @@ class OCIStage1KVMProofReceipt:
             "stage1",
             "supervisor",
             "switch_root",
+            "terminal_root_quiesce",
             "topology",
             "transport",
             "workload_negative_controls",
@@ -3394,6 +3436,7 @@ class OCIStage1KVMProofReceipt:
         workload_negative_controls = value.get("workload_negative_controls")
         lifecycle = value.get("lifecycle")
         supervisor = value.get("supervisor")
+        terminal_root_quiesce = value.get("terminal_root_quiesce")
         root_volume = value.get("root_volume")
         workload_isolation = value.get("workload_isolation")
         if (
@@ -3451,11 +3494,31 @@ class OCIStage1KVMProofReceipt:
                 "reaped_children": 3,
                 "session_id": 1,
                 "session_id_allocation": "guest-internal-monotonic-u32",
-                "terminal_state": "parent-marker-then-fail-closed-wait",
-                "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+                "terminal_root_quiesce": {
+                    "contract": OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
+                    "filesystem": "overlay",
+                    "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+                    "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+                    "sync": "syncfs",
+                },
+                "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
+                "terminal_wire_order": "cleanup-certainty-then-root-quiesce-then-terminal-frame-then-console-marker",
                 "supplementary_groups": "empty-restricted-subset",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
                 "uid0_capabilityless_proven": True,
+            }
+            or terminal_root_quiesce
+            != {
+                "close_verified": True,
+                "contract": OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
+                "filesystem": "overlay",
+                "marker": TERMINAL_ROOT_QUIESCED_MARKER.decode("ascii"),
+                "marker_count": 1,
+                "proc_self_root_matches_slash": True,
+                "root_reopened_nofollow_directory": True,
+                "stable_before_after": True,
+                "syncfs": True,
+                "terminal_after_quiesce": True,
             }
             or value.get("pre_mount_devices") is not True
             or value.get("filesystem_verified") is not True

@@ -94,20 +94,24 @@ Natural-exit and STOP races retain only bounded authenticated wire candidates
 until a later boundary commits one exact value. Complete, mixed, oversized,
 stale, replayed, cross-carrier, or conflicting inputs fail closed.
 
-Receipt v18 binds 43 native guest boots and one duplicate-name preboot
-rejection (44 QEMU invocations), stage-1 plan/protocol v14, handoff v8,
-init/consumer v16, initramfs manifest/ABI v18, supervisor v9, lifecycle broker
+Receipt v19 binds 43 native guest boots and one duplicate-name preboot
+rejection (44 QEMU invocations), stage-1 plan/protocol v15, handoff v9,
+init/consumer v17, initramfs manifest/ABI v19, supervisor v10, lifecycle broker
 v3, workload isolation v3, lifecycle protocol v2, fixture policy/schema v11,
-domain plan v13/core v7, and KVM proof v18. It additionally binds bounded
+domain plan v14/core v8, and KVM proof v19. It additionally binds bounded
 image-root passwd/group lookup, omitted primary-GID resolution, empty
 supplementary groups, and shell-free PATH execution. Receipt projections verify the
 canonical envelope and MAC before retaining only safe digests and public
 bindings; raw boot keys and MAC tags are recursively excluded. The supervisor
 owns an empty agent cgroup and one monotonic-ID exec-session leaf, attaches the
 qualified process only to the leaf, and proves leaf-first then parent cleanup.
+Before terminal state or TERMINAL is published, PID 1 reopens `/` as a no-follow
+directory, verifies stable OverlayFS and `/proc/self/root` identity, completes
+`syncfs`, and successfully closes both descriptors.
 Parallel exec sessions remain explicitly unproven.
 
-Production still does not call libvirt `openChannel`, dispatch runtime `STOP`,
+Public production dispatch still does not call the new private libvirt
+`openChannel` handoff, dispatch runtime `STOP`,
 or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
 and skipped. Slice 29B activates lifecycle v2 only in the pre-production guest,
 domain-plan, and native-KVM qualification path.

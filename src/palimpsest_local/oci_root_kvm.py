@@ -31,7 +31,7 @@ from .kvm import (
     Stage1TransportDisk,
     build_oci_root_domain_xml,
 )
-from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
+from .oci_control_protocol_v2 import OCI_CONTROL_CHANNEL_NAME
 from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2 as OCI_CONTROL_PROTOCOL
 from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
 from .oci_process import OCIProcessSpec
@@ -51,8 +51,8 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v13"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v7"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v14"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v8"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 OCI_ROOT_LIFECYCLE_ENDPOINT = "run-private/lifecycle.sock"
 OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = "lifecycle.sock"
@@ -559,6 +559,7 @@ class OCIRootDomainPlan:
             "palimpsest.oci-root-domain-plan.v10",
             "palimpsest.oci-root-domain-plan.v11",
             "palimpsest.oci-root-domain-plan.v12",
+            "palimpsest.oci-root-domain-plan.v13",
         }:
             version = str(value["schema"]).rsplit(".", 1)[-1]
             raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")
@@ -1073,6 +1074,7 @@ def resolve_committed_oci_root_domain_plan(
     profile: DomainProfile,
     *,
     runner: CommandRunner = _default_runner,
+    expected_status: str = "creating",
 ) -> ResolvedOCIRootDomainPlan:
     """Re-resolve a committed plan from live authorities at a mutation boundary.
 
@@ -1090,9 +1092,10 @@ def resolve_committed_oci_root_domain_plan(
     if (
         snapshot.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT
         or snapshot.record.dispatch_key.backend is not RuntimeBackend.KVM
-        or snapshot.state.get("status") != "creating"
+        or expected_status not in {"creating", "defined"}
+        or snapshot.state.get("status") != expected_status
     ):
-        raise StateError("OCI-root domain definition requires a creating OCI-root/KVM run")
+        raise StateError("OCI-root domain resolution requires the expected OCI-root/KVM run state")
 
     value = snapshot.state.get("oci_root_domain")
     if not isinstance(value, Mapping) or set(value) != {"digest", "plan"}:

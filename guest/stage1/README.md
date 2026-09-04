@@ -114,19 +114,19 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v18 receipt retains owner-only positive and per-control consoles plus a
+The v19 receipt retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v9` execution checkpoint, the
+the `palimpsest.guest-pid1-supervisor.v10` execution checkpoint, the
 `palimpsest.workload-lifecycle-authority-isolation.v3` boundary, and the
 `palimpsest.guest-lifecycle-broker.v3` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v14 admits
+and production VM launch remains disabled. Stage-1 plan/protocol v15 admits
 the bounded image-root account and shell-free PATH process subset.
 
 Before release, PID 1 verifies that the workload child has closed the
@@ -177,8 +177,10 @@ bounded v2 HELLO/BOOTSTRAP/KEY_ACK/READY/STOP/TERMINAL exchange for both the
 base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
 retained-root reconnect/SNAPSHOT/same-ID retry and deduplication, plus the
 malformed, stale, replayed, and conflicting input matrix. TERMINAL is sent only
-after cgroup cleanup certainty and before the console terminal marker. Receipt
-v18 records `reconnect_proven=true` and `negative_input_proven=true`; production
+after cgroup cleanup certainty, an identity-stable no-follow reopen of OverlayFS
+`/`, successful `syncfs`, and successful descriptor close, and before the console
+terminal marker. Receipt v19 records `reconnect_proven=true` and
+`negative_input_proven=true`; production
 runtime dispatch and host-daemon recovery remain future boundaries.
 
 Proof v7 uses two real zstd SquashFS images built from the committed

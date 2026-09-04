@@ -31,12 +31,13 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v18"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v19"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v16"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v18"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v17"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v19"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v9"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v10"
+OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT = "palimpsest.terminal-root-quiesce.v1"
 OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v3"
 OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v3"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
@@ -45,10 +46,10 @@ OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:f4456d7e4922ddb713f5284e522e3e9919d6beddfe8b5736a713f6567c08dcbd"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:553b790b602da8590cf2fd81356d227100ef2660b4c57881aa7eb687c99c4dcf"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:c176626f70c981a45a2907d5b5e2e626de7d28307683b1fbeef2d30a343bcc26"
+OCI_STAGE1_BINARY_DIGEST = "sha256:cf2b445d80019a139376dba0513a902875b60aa15bb51a4c25e67e3c7e277ac9"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -396,7 +397,14 @@ def _supervisor_contract_dict() -> dict[str, Any]:
         "session_id_allocation": "guest-internal-monotonic-u32",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
-        "terminal_state": "parent-marker-then-fail-closed-wait",
+        "terminal_root_quiesce": {
+            "contract": OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT,
+            "filesystem": "overlay",
+            "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+            "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+            "sync": "syncfs",
+        },
+        "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
         "wait": "wait4-to-echild-with-empty-leaf-and-parent-proof",
     }
 
@@ -447,6 +455,7 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "empty-capability-sets-securebits-no-new-privs-seccomp",
                 "fork-execve-cloexec-launch-status",
                 "signalfd-process-group-forwarding-wait4-reaping",
+                "terminal-overlay-slash-identity-syncfs-close-before-terminal",
             ],
             "workload_started": True,
         }
@@ -772,6 +781,7 @@ __all__ = [
     "OCI_STAGE1_SEAL_RECIPE_DIGEST",
     "OCI_STAGE1_SOURCE_DIGEST",
     "OCI_STAGE1_SUPERVISOR_CONTRACT",
+    "OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT",
     "OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT",
     "OCI_STAGE1_TOOLCHAIN_IMAGE",
     "build_bootstrap_initramfs",
