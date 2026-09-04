@@ -6,8 +6,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import uuid
 import xml.etree.ElementTree as ET
@@ -77,6 +79,482 @@ pytestmark = [pytest.mark.kvm, pytest.mark.oci_root_libvirt]
 
 _ENABLE_ENV = "PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT"
 _ROOT_SIZE_BYTES = 16 * 1024 * 1024
+_DAC_BASELABEL_RE = re.compile(r"^\+((?:0|[1-9][0-9]*)):\+((?:0|[1-9][0-9]*))$")
+_MAX_DAC_ID = 2**32 - 2
+
+
+def _strict_scalar(element: ET.Element, *, attributes: dict[str, str] | None = None) -> str:
+    if (
+        element.attrib != (attributes or {})
+        or list(element)
+        or element.text is None
+        or element.text.strip() != element.text
+        or (element.tail is not None and element.tail.strip())
+    ):
+        raise ValueError("libvirt DAC capability is not canonical")
+    return element.text
+
+
+def _parse_qemu_dac_baselabel(capabilities: str) -> tuple[int, int]:
+    if not isinstance(capabilities, str):
+        raise ValueError("libvirt capabilities are invalid")
+    try:
+        root = ET.fromstring(capabilities)
+    except ET.ParseError:
+        raise ValueError("libvirt capabilities are invalid") from None
+    if root.tag != "capabilities" or root.attrib or (root.text is not None and root.text.strip()):
+        raise ValueError("libvirt capabilities root is invalid")
+    hosts = [child for child in root if child.tag == "host"]
+    if len(hosts) != 1:
+        raise ValueError("libvirt capabilities host is ambiguous")
+    host = hosts[0]
+    dac_models: list[ET.Element] = []
+    for secmodel in (child for child in host if child.tag == "secmodel"):
+        models = [child for child in secmodel if child.tag == "model"]
+        if any(model.text == "dac" for model in models):
+            dac_models.append(secmodel)
+    if len(dac_models) != 1:
+        raise ValueError("libvirt DAC capability is ambiguous")
+    secmodel = dac_models[0]
+    if secmodel.attrib or (secmodel.text is not None and secmodel.text.strip()):
+        raise ValueError("libvirt DAC capability is not canonical")
+    models = [child for child in secmodel if child.tag == "model"]
+    if len(models) != 1 or _strict_scalar(models[0]) != "dac":
+        raise ValueError("libvirt DAC capability is not canonical")
+    dois = [child for child in secmodel if child.tag == "doi"]
+    if len(dois) != 1 or _strict_scalar(dois[0]) != "0":
+        raise ValueError("libvirt DAC capability is not canonical")
+    labels = [child for child in secmodel if child.tag == "baselabel" and child.get("type") == "kvm"]
+    if len(labels) != 1:
+        raise ValueError("libvirt KVM DAC baselabel is ambiguous")
+    encoded = _strict_scalar(labels[0], attributes={"type": "kvm"})
+    match = _DAC_BASELABEL_RE.fullmatch(encoded)
+    if match is None:
+        raise ValueError("libvirt KVM DAC baselabel is invalid")
+    uid, gid = (int(value) for value in match.groups())
+    if uid > _MAX_DAC_ID or gid > _MAX_DAC_ID:
+        raise ValueError("libvirt KVM DAC baselabel is invalid")
+    return uid, gid
+
+
+def _stat_identity(item: os.stat_result) -> tuple[int, ...]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _validate_qualification_acl_target(root: Path, target: Path, *, kind: str) -> tuple[Path, os.stat_result]:
+    """Return a closed-FD identity snapshot, not an ACL mutation authority.
+
+    A future path-based ``setfacl`` call must repeat this walk immediately before
+    mutation and still cannot make the validation/mutation pair atomic.  Keeping
+    the final descriptor open and addressing ``/proc/self/fd/<n>`` narrows that
+    gap on Linux, but ``setfacl`` itself remains pathname-based.
+    """
+
+    if kind not in {"directory", "regular"} or not root.is_absolute() or not target.is_absolute():
+        raise ValueError("qualification ACL target is invalid")
+    try:
+        root_lexical = Path(os.path.abspath(root))
+        target_lexical = Path(os.path.abspath(target))
+        root_resolved = root.resolve(strict=True)
+        target_resolved = target.resolve(strict=True)
+        relative = target_lexical.relative_to(root_resolved)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("qualification ACL target escapes the test root") from None
+    if root_lexical != root_resolved or target_lexical != target_resolved:
+        raise ValueError("qualification ACL target contains a symlink")
+    descriptors: list[int] = []
+    try:
+        root_visible = root_resolved.lstat()
+        root_fd = os.open(root_resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+        descriptors.append(root_fd)
+        root_opened = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_visible.st_mode)
+            or not stat.S_ISDIR(root_opened.st_mode)
+            or (root_visible.st_dev, root_visible.st_ino) != (root_opened.st_dev, root_opened.st_ino)
+            or root_visible.st_uid != os.geteuid()
+            or root_opened.st_uid != os.geteuid()
+        ):
+            raise ValueError("qualification ACL root identity is unsafe")
+        opened = root_opened
+        parent_fd = root_fd
+        for index, component in enumerate(relative.parts):
+            expected_kind = kind if index == len(relative.parts) - 1 else "directory"
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+            if expected_kind == "directory":
+                flags |= os.O_DIRECTORY
+            visible = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            child_fd = os.open(component, flags, dir_fd=parent_fd)
+            descriptors.append(child_fd)
+            opened = os.fstat(child_fd)
+            predicate = stat.S_ISDIR if expected_kind == "directory" else stat.S_ISREG
+            if (
+                not predicate(visible.st_mode)
+                or not predicate(opened.st_mode)
+                or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
+                or visible.st_uid != os.geteuid()
+                or opened.st_uid != os.geteuid()
+            ):
+                raise ValueError("qualification ACL target identity is unsafe")
+            parent_fd = child_fd
+        final = target_resolved.lstat()
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("qualification ACL target cannot be securely opened") from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+    predicate = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if (
+        not predicate(opened.st_mode)
+        or not predicate(final.st_mode)
+        or (opened.st_dev, opened.st_ino) != (final.st_dev, final.st_ino)
+        or opened.st_uid != os.geteuid()
+        or final.st_uid != os.geteuid()
+    ):
+        raise ValueError("qualification ACL target identity is unsafe")
+    return target_resolved, opened
+
+
+def _remove_failed_kernel_copy(destination: Path, expected: os.stat_result) -> None:
+    try:
+        visible = destination.lstat()
+    except OSError:
+        raise ValueError("failed qualified kernel copy identity changed") from None
+    if (
+        not stat.S_ISREG(visible.st_mode)
+        or visible.st_uid != os.geteuid()
+        or (visible.st_dev, visible.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise ValueError("failed qualified kernel copy identity changed")
+    try:
+        destination.unlink()
+    except OSError:
+        raise ValueError("failed qualified kernel copy could not be removed") from None
+
+
+def _copy_qualified_kernel(source: Path, test_root: Path) -> Path:
+    try:
+        source = source.resolve(strict=True)
+        visible = source.lstat()
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        raise ValueError("qualified kernel cannot be securely opened") from None
+    destination = test_root / "k"
+    destination_fd: int | None = None
+    created: os.stat_result | None = None
+    try:
+        opened = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ValueError("qualified kernel identity is unsafe")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            try:
+                created = os.fstat(destination_fd)
+            except OSError:
+                raise ValueError(
+                    "qualified kernel copy identity is unavailable; partial destination was preserved"
+                ) from None
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    if written <= 0:
+                        raise ValueError("qualified kernel copy did not make progress")
+                    view = view[written:]
+            os.fchmod(destination_fd, 0o400)
+            os.fsync(destination_fd)
+            after = os.fstat(source_fd)
+            current = source.lstat()
+            if _stat_identity(after) != _stat_identity(opened) or _stat_identity(current) != _stat_identity(opened):
+                raise ValueError("qualified kernel changed while it was copied")
+            _, validated = _validate_qualification_acl_target(test_root, destination, kind="regular")
+            destination_current = os.fstat(destination_fd)
+            if not (
+                (validated.st_dev, validated.st_ino)
+                == (created.st_dev, created.st_ino)
+                == (destination_current.st_dev, destination_current.st_ino)
+            ):
+                raise ValueError("qualified kernel copy destination identity changed")
+            if stat.S_IMODE(destination_current.st_mode) != 0o400:
+                raise ValueError("qualified kernel copy mode is unsafe")
+        except (OSError, ValueError) as exc:
+            if created is None:
+                # O_EXCL proves that this call created some directory entry, but
+                # without an FD identity a same-UID replacement is
+                # indistinguishable.  Preserve the path instead of unlinking an
+                # inode that this call may not own.
+                if isinstance(exc, ValueError):
+                    raise
+                raise ValueError(
+                    "qualified kernel copy identity is unavailable; partial destination was preserved"
+                ) from None
+            try:
+                _remove_failed_kernel_copy(destination, created)
+            except ValueError as cleanup_error:
+                raise cleanup_error from exc
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError("qualified kernel cannot be securely copied") from None
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+    return destination
+
+
+_DAC_CAPABILITIES = """\
+<capabilities>
+  <host>
+    <secmodel>
+      <model>dac</model>
+      <doi>0</doi>
+      <baselabel type="qemu">+64055:+64055</baselabel>
+      <baselabel type="kvm">+107:+108</baselabel>
+    </secmodel>
+  </host>
+</capabilities>
+"""
+
+
+def test_qemu_dac_baselabel_parser_accepts_one_exact_kvm_identity() -> None:
+    assert _parse_qemu_dac_baselabel(_DAC_CAPABILITIES) == (107, 108)
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        _DAC_CAPABILITIES.replace("<capabilities>", "<domainCapabilities>", 1).replace(
+            "</capabilities>", "</domainCapabilities>", 1
+        ),
+        _DAC_CAPABILITIES.replace("</capabilities>", "<host /></capabilities>"),
+        _DAC_CAPABILITIES.replace("</host>", "<secmodel><model>dac</model></secmodel></host>"),
+        _DAC_CAPABILITIES.replace("<model>dac</model>", "<model>dac</model><model>dac</model>"),
+        _DAC_CAPABILITIES.replace("<doi>0</doi>", "<doi>1</doi>"),
+        _DAC_CAPABILITIES.replace('type="kvm"', 'type="kvm" extra="1"'),
+        _DAC_CAPABILITIES.replace("</secmodel>", '<baselabel type="kvm">+109:+110</baselabel></secmodel>'),
+        _DAC_CAPABILITIES.replace("+107:+108", "107:108"),
+        _DAC_CAPABILITIES.replace("+107:+108", "+0107:+108"),
+        _DAC_CAPABILITIES.replace("+107:+108", "+4294967295:+108"),
+        _DAC_CAPABILITIES.replace('type="kvm"', 'type="xen"'),
+    ],
+)
+def test_qemu_dac_baselabel_parser_rejects_ambiguous_or_noncanonical_input(capabilities: str) -> None:
+    with pytest.raises(ValueError, match="libvirt"):
+        _parse_qemu_dac_baselabel(capabilities)
+
+
+def test_qualification_acl_target_requires_owned_stable_tmp_descendant(tmp_path: Path) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    artifact = directory / "root.raw"
+    artifact.write_bytes(b"root")
+
+    resolved_directory, directory_identity = _validate_qualification_acl_target(tmp_path, directory, kind="directory")
+    resolved_artifact, artifact_identity = _validate_qualification_acl_target(tmp_path, artifact, kind="regular")
+
+    assert resolved_directory == directory.resolve()
+    assert stat.S_ISDIR(directory_identity.st_mode)
+    assert resolved_artifact == artifact.resolve()
+    assert stat.S_ISREG(artifact_identity.st_mode)
+
+
+def test_qualification_acl_target_rejects_escape_symlink_and_wrong_kind(tmp_path: Path) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    artifact = directory / "root.raw"
+    artifact.write_bytes(b"root")
+    alias = tmp_path / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        _validate_qualification_acl_target(tmp_path, tmp_path.parent, kind="directory")
+    with pytest.raises(ValueError, match="symlink"):
+        _validate_qualification_acl_target(tmp_path, alias / artifact.name, kind="regular")
+    with pytest.raises(ValueError, match="securely opened"):
+        _validate_qualification_acl_target(tmp_path, artifact, kind="directory")
+
+
+def test_qualification_acl_target_openat_walk_rejects_intermediate_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "run"
+    displaced = tmp_path / "displaced"
+    directory.mkdir()
+    artifact = directory / "root.raw"
+    artifact.write_bytes(b"root")
+    original_open = os.open
+    injected = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal injected
+        if path == "run" and kwargs.get("dir_fd") is not None and not injected:
+            injected = True
+            directory.rename(displaced)
+            directory.mkdir()
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+
+    with pytest.raises(ValueError, match="identity"):
+        _validate_qualification_acl_target(tmp_path, artifact, kind="regular")
+    assert injected is True
+
+
+def test_qualified_kernel_copy_is_owner_only_and_leaves_source_unchanged(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"kernel")
+    source.chmod(0o444)
+    source_before = source.stat()
+
+    copied = _copy_qualified_kernel(source, tmp_path)
+
+    source_after = source.stat()
+    assert copied.name == "k"
+    assert copied.read_bytes() == b"kernel"
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o400
+    assert (source_after.st_dev, source_after.st_ino, source_after.st_mode) == (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_mode,
+    )
+
+
+@pytest.mark.parametrize("failure", ["read", "write", "fsync", "source-recheck", "final-validation"])
+def test_qualified_kernel_copy_removes_exact_partial_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"kernel")
+    destination = tmp_path / "k"
+
+    def raise_oserror(*_args):
+        raise OSError(failure)
+
+    if failure == "read":
+        monkeypatch.setattr(os, "read", raise_oserror)
+    elif failure == "write":
+        monkeypatch.setattr(os, "write", raise_oserror)
+    elif failure == "fsync":
+        monkeypatch.setattr(os, "fsync", raise_oserror)
+    elif failure == "source-recheck":
+        original_lstat = Path.lstat
+        source_stats = 0
+
+        def mutate_source(path: Path):
+            nonlocal source_stats
+            if path == source:
+                source_stats += 1
+                if source_stats == 2:
+                    source.write_bytes(b"changed")
+            return original_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", mutate_source)
+    else:
+
+        def fail_validation(*_args, **_kwargs):
+            raise ValueError("injected final validation failure")
+
+        monkeypatch.setitem(globals(), "_validate_qualification_acl_target", fail_validation)
+
+    with pytest.raises(ValueError):
+        _copy_qualified_kernel(source, tmp_path)
+
+    assert not destination.exists()
+
+
+def test_qualified_kernel_copy_does_not_remove_replaced_destination_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"kernel")
+    destination = tmp_path / "k"
+
+    def replace_then_fail(_descriptor: int) -> None:
+        destination.unlink()
+        destination.write_bytes(b"replacement")
+        raise OSError("fsync")
+
+    monkeypatch.setattr(os, "fsync", replace_then_fail)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        _copy_qualified_kernel(source, tmp_path)
+
+    assert destination.read_bytes() == b"replacement"
+
+
+def test_qualified_kernel_copy_rejects_same_uid_replacement_on_success_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"kernel")
+    destination = tmp_path / "k"
+    original_validator = _validate_qualification_acl_target
+
+    def replace_during_validation(root: Path, target: Path, *, kind: str):
+        destination.unlink()
+        destination.write_bytes(b"replacement")
+        return original_validator(root, target, kind=kind)
+
+    monkeypatch.setitem(globals(), "_validate_qualification_acl_target", replace_during_validation)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        _copy_qualified_kernel(source, tmp_path)
+
+    assert destination.read_bytes() == b"replacement"
+
+
+def test_qualified_kernel_copy_preserves_partial_when_initial_fd_identity_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"kernel")
+    destination = tmp_path / "k"
+    original_fstat = os.fstat
+    calls = 0
+
+    def fail_destination_fstat(descriptor: int):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected destination fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_destination_fstat)
+
+    with pytest.raises(ValueError, match="identity is unavailable.*preserved"):
+        _copy_qualified_kernel(source, tmp_path)
+
+    assert destination.is_file()
+    assert destination.read_bytes() == b""
 
 
 def _digest(payload: bytes) -> str:
@@ -100,8 +578,9 @@ def _require_live_host(tmp_path: Path):
     initramfs_path.write_bytes(built.payload)
     initramfs_path.chmod(0o400)
     boot = verify_first_party_bootstrap_initramfs(initramfs_path.resolve(), built.manifest)
+    kernel_path = _copy_qualified_kernel(Path(kernel_value), tmp_path.resolve(strict=True))
     verified = verify_host_boot_artifacts(
-        Path(kernel_value).resolve(),
+        kernel_path,
         boot.path,
         expected_initramfs_digest=boot.digest,
     )
@@ -490,6 +969,9 @@ def test_live_oci_root(
     assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
     prepared: PreparedOCIRootRun | None = None
     conn = kvm.connect(profile.uri)
+    qemu_uid, qemu_gid = _parse_qemu_dac_baselabel(conn.getCapabilities())
+    assert 0 <= qemu_uid <= _MAX_DAC_ID
+    assert 0 <= qemu_gid <= _MAX_DAC_ID
     owned_uuid: str | None = None
     owned_domain_id: int | None = None
     plan_digest: str | None = None
@@ -565,6 +1047,11 @@ def test_live_oci_root(
             return original_connect(instance, address)  # type: ignore[arg-type]
 
         monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
+        # A future qualification-only DAC broker belongs in a conn/domain proxy
+        # around domain.create(): production revalidation must see original modes,
+        # and ambiguous activation must retain ACLs and backing files.  Effective
+        # POSIX ACLs cannot satisfy the former while they are installed because
+        # the ACL mask is exposed as the group mode bits.
         completed = launch_defined_oci_root_domain(
             roots,
             name,

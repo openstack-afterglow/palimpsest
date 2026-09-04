@@ -115,3 +115,15 @@ SNAPSHOT after the RECONNECT is accepted, discards a partial STOP, retries the
 same logical STOP on a fresh wire, deduplicates it without a second signal,
 and reconnects through terminal state. Native evidence remains mandatory;
 local policy tests and reproducible compilation are not a substitute.
+
+The native live harness still lacks the test-only DAC access boundary needed
+when `qemu:///system` runs QEMU under a different UID. Production dispatch and
+its owner-only path validators remain unchanged and disabled. The harness may
+eventually derive only the exact KVM `+uid:+gid` baselabel from libvirt
+capabilities and validate ACL targets beneath its resolved temporary root, but
+effective POSIX ACLs on current `0700`/`0600`/`0400` authorities necessarily
+change group mode bits via the ACL mask. ACL installation therefore remains
+blocked until a create-boundary apply/restore design can preserve production
+revalidation and retain access/backing state whenever domain activation is
+ambiguous. AppArmor policy remains an external per-domain qualification input,
+not something this test edits.

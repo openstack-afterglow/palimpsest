@@ -115,3 +115,42 @@ Public production dispatch still does not call the new private libvirt
 or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
 and skipped. Slice 29B activates lifecycle v2 only in the pre-production guest,
 domain-plan, and native-KVM qualification path.
+
+The native `qemu:///system` qualification also does not yet broker filesystem
+access for libvirt's DAC QEMU identity. That broker must remain test-only until
+there is a separately reviewed production authority design. Its input is the
+unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
+libvirt capabilities, and every prospective ACL target must be a stable,
+owner-held, non-symlink regular file or directory below the resolved pytest
+root. The external qualified kernel must first be copied into that root so the
+source artifact's ownership and permissions are never mutated.
+
+The target validator pins the test root and walks each component with
+`openat`/`O_NOFOLLOW`, comparing visible and opened identities. Its returned
+stat is nevertheless only a snapshot after those descriptors close, not a
+race-free mutation capability. Any future ACL broker must repeat that walk at
+the mutation boundary. Keeping a final descriptor and addressing
+`/proc/self/fd/<n>` can narrow the gap, but does not turn pathname-oriented
+`setfacl` into an FD-bound operation.
+
+The owner-only kernel copy records the destination FD identity immediately
+after its `O_EXCL` create. Every successful final path validation must return
+that same device/inode and match a fresh destination-FD `fstat`. Failure cleanup
+unlinks only a path still naming that exact owned regular inode. If the initial
+destination `fstat` itself fails, `O_EXCL` alone cannot distinguish the created
+entry from a later same-UID replacement, so the harness preserves the partial
+path and reports an explicit identity-unavailable error.
+
+Linux POSIX access ACLs expose the ACL mask through the file's group mode bits.
+Consequently an effective named ACL for an owner-only `0700`, `0600`, or `0400`
+target cannot also leave its complete mode unchanged: `setfacl --no-mask`
+preserves the mode but reduces the named entry to no effective access. The
+qualification harness therefore does not currently pretend to install such an
+ACL. A future test-only implementation needs a tightly scoped activation
+boundary after all production path revalidation and immediately before
+`virDomainCreate`; it must restore ACLs only after QEMU has opened every file
+and created the lifecycle socket. If activation may have succeeded or the
+domain still exists, it must retain both permissions and backing files for safe
+recovery. This is not permission to weaken production modes or validators.
+Per-domain AppArmor rules are still an independent host qualification
+prerequisite; the test must never edit system policy.
