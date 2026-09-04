@@ -2945,6 +2945,31 @@ static int safe_workload_dev_entries(void) {
     return seen == (1U << (sizeof(allowed) / sizeof(allowed[0]))) - 1;
 }
 
+static i64 install_read_only_cgroup_view(void) {
+    static const char *staging = "/dev/.palimpsest-cgroup-view";
+    int staging_fd = -1;
+    i64 operation = sc2(SYS_mkdir, (i64)staging, 0700);
+    if (operation != 0 || !safe_dir(staging, 0, 1, 0700, &staging_fd))
+        return operation != 0 ? operation : -EIO;
+    operation = sc1(SYS_close, staging_fd);
+    if (operation != 0) return operation;
+    operation = sc5(SYS_mount, (i64)"/sys/fs/cgroup", (i64)staging, 0,
+                    MS_BIND | MS_REC, 0);
+    if (operation != 0) return operation;
+    operation = sc5(SYS_mount, 0, (i64)staging, 0,
+                    MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
+    if (operation != 0) return operation;
+    operation = sc2(SYS_umount2, (i64)"/sys/fs/cgroup", 0);
+    if (operation != 0) return operation;
+    operation = sc5(SYS_mount, (i64)staging, (i64)"/sys/fs/cgroup", 0, MS_MOVE, 0);
+    if (operation != 0) return operation;
+    operation = sc3(SYS_unlinkat, AT_FDCWD, (i64)staging, AT_REMOVEDIR);
+    if (operation != 0 || !safe_workload_dev_entries() ||
+        !verify_mountinfo("/sys/fs/cgroup", "cgroup2", 1, 0, 0, 0, 0))
+        return operation != 0 ? operation : -EIO;
+    return 0;
+}
+
 static int prepare_workload_mount_boundary(struct child_error_local *failure) {
     int empty = -1;
     u32 stage = 23;
@@ -2977,9 +3002,8 @@ static int prepare_workload_mount_boundary(struct child_error_local *failure) {
     if (operation != 0 || !safe_dir("/sys/class/virtio-ports", 0, 1, 0, &empty)) goto rejected;
     sc1(SYS_close, empty); empty = -1;
     stage = 30;
-    operation = sc5(SYS_mount, 0, (i64)"/sys/fs/cgroup", 0,
-                    MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
-    if (operation != 0 || !verify_mountinfo("/sys/fs/cgroup", "cgroup2", 1, 0, 0, 0, 0)) goto rejected;
+    operation = install_read_only_cgroup_view();
+    if (operation != 0) goto rejected;
     stage = 31;
     operation = sc5(SYS_mount, 0, (i64)"/sys", 0,
                     MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);

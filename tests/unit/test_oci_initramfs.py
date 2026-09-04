@@ -251,6 +251,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "X32_SYSCALL_BIT 0x40000000U" in source
     assert 'verify_mountinfo("/proc", "proc", 1' in source
     assert "sc2(SYS_chmod, (i64)path, 0666)" in source
+    assert 'MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC' in source
+    assert 'SYS_mount, (i64)staging, (i64)"/sys/fs/cgroup", 0, MS_MOVE' in source
     assert "child_failure_ready = early_error_bytes == sizeof(early_failure)" in source
     assert "SYS_getrandom 318" in source
     assert "O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY" in source
