@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v14"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v15"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -163,11 +163,11 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cleanup_scope": "dedicated-workload-cgroup",
-        "contract": "palimpsest.guest-pid1-supervisor.v7",
+        "contract": "palimpsest.guest-pid1-supervisor.v8",
         "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
-        "credentials": "root-pid1-broker-and-capabilityless-admitted-numeric-workload-identity",
-        "environment": "authenticated-image-environment-only",
-        "execution": "fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "credentials": "root-pid1-broker-image-root-passwd-group-resolution-empty-supplementary-groups",
+        "environment": "authenticated-image-environment-with-fixed-container-default-path",
+        "execution": "shell-free-path-search-fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
         "isolation": {
             "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
             "contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
@@ -241,8 +241,18 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v12")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v6")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v13")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v7")' in source
+    assert 'SYS_open, (i64)"/etc"' in source
+    assert 'read_account_database("passwd"' in source
+    assert 'read_account_database("group"' in source
+    assert "O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY" in source
+    assert "O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW" in source
+    assert "return path_seen &&" in source
+    assert "static i64 exec_workload(struct guest_process *process)" in source
+    assert "operation = exec_workload(process);" in source
+    assert "SYS_execve" in source
+    assert b"/bin/sh\0" not in packaged
     assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v2")' in source
     assert '"org.palimpsest.oci.lifecycle.0"' in source
     assert '"palimpsest.oci-lifecycle-control.v2"' in source

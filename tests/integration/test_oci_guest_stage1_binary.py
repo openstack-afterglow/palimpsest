@@ -7,6 +7,7 @@ import hashlib
 import shutil
 import struct
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ from palimpsest_local.oci_guest_filesystems import (
     verify_lower_device,
 )
 from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify_guest_stage1_transport
-from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
+from palimpsest_local.oci_process import MAX_PROCESS_BYTES, OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import canonical_json_bytes
 from palimpsest_local.oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from palimpsest_local.oci_stage1_transport import build_stage1_transport
@@ -250,22 +251,55 @@ def test_freestanding_binary_matches_python_reference_for_canonical_unicode_fixt
     assert completed.stdout == "palimpsest guest stage1 fixture: verified\n"
 
 
-def test_freestanding_binary_rejects_named_user_even_with_valid_envelope(
+def test_freestanding_binary_accepts_named_user_and_omitted_group_contract(
     scratch_image: str,
     tmp_path: Path,
 ) -> None:
     plan = _plan()
     value = plan.to_dict()
-    value["process"]["user"]["user"] = "root"
+    value["process"]["user"] = {"group": None, "user": "palimpsest"}
+    artifact = _envelope(canonical_json_bytes(value))
+    bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
+    assert verify_guest_stage1_transport(artifact, bindings).plan.process.user == OCIUserSpec("palimpsest", None)
+    _write_fixture(tmp_path, plan, artifact)
+
+    completed = _run(scratch_image, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_freestanding_binary_requires_canonical_default_path_projection(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    value = plan.to_dict()
+    value["process"]["environment"] = [
+        item for item in value["process"]["environment"] if item["name"] != "PATH"
+    ]
     artifact = _envelope(canonical_json_bytes(value))
     bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
     with pytest.raises(ArtifactValidationError, match="semantics"):
         verify_guest_stage1_transport(artifact, bindings)
     _write_fixture(tmp_path, plan, artifact)
 
-    completed = _run(scratch_image, tmp_path)
+    assert _run(scratch_image, tmp_path).returncode == 68
 
-    assert completed.returncode == 68
+
+def test_freestanding_binary_accepts_exact_process_byte_limit_with_omitted_group(
+    scratch_image: str,
+    tmp_path: Path,
+) -> None:
+    prefix = tuple("x" * (32 * 1024) for _ in range(7))
+    process = OCIProcessSpec((*prefix, "x" * 32665), (), "/", OCIUserSpec("x", None), 15)
+    plan = replace(_plan(), process=process)
+    built = build_stage1_transport(plan)
+    _write_fixture(tmp_path, plan, built.artifact)
+
+    assert sum(len(value.encode("utf-8")) + 1 for value in process.argv) + sum(
+        len(name.encode()) + len(value.encode("utf-8")) + 2 for name, value in process.environment
+    ) + len(process.cwd.encode("utf-8")) + len(str(process.user.to_dict()).encode()) == MAX_PROCESS_BYTES
+    assert _run(scratch_image, tmp_path).returncode == 0
 
 
 @pytest.mark.parametrize("field", ["user", "group"])

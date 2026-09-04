@@ -14,12 +14,15 @@
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "4dc008c9759210f8a04220bd70e61d24a0e33bbb1b0c0f0e89dbdc30fd25eda3",
+      "raw_sha256": "fc982d3f3dd465fc49444c3690e1ae8ad5480c5d8be30d8288943642ac59689f",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": "etc", "type": "directory"},
+        {"mode": 420, "path": "etc/group", "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467", "size_bytes": 30, "type": "file"},
+        {"mode": 420, "path": "etc/passwd", "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e", "size_bytes": 97, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -39,13 +42,16 @@
     "transition_dev": {
       "base64_file": "transition-dev.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "f061591117f7314c30dcd66ab50bcb25c08e3a43fcdf1d6140caad64d2ef9ef0",
+      "raw_sha256": "60906ca25686026c3b785f40bca696111e503ba6b587526a595e85e26ba10e1a",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653", "size_bytes": 9868, "type": "file"},
         {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
+        {"mode": 493, "path": "etc", "type": "directory"},
+        {"mode": 420, "path": "etc/group", "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467", "size_bytes": 30, "type": "file"},
+        {"mode": 420, "path": "etc/passwd", "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e", "size_bytes": 97, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -56,12 +62,15 @@
     "transition_proc": {
       "base64_file": "transition-proc.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "4eb5555ee106daff027520c4bb38f4450c6ab338c8e1ac25b0367c9e4d81d9fb",
+      "raw_sha256": "27adebeb6fcdb92cd586956305aba2c562c3d611b33ad95e32e82089963bb12e",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": "etc", "type": "directory"},
+        {"mode": 420, "path": "etc/group", "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467", "size_bytes": 30, "type": "file"},
+        {"mode": 420, "path": "etc/passwd", "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e", "size_bytes": 97, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
@@ -73,12 +82,15 @@
     "transition_sys": {
       "base64_file": "transition-sys.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "fe75d803e86b3bd0ba8c437dfbd258c83503235f2defcca0aca7df54fee496f9",
+      "raw_sha256": "4c0398c6ee9230e7803025ab64154fcc1a8e30f85cadaedea1779cc81cdb5bf0",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653", "size_bytes": 9868, "type": "file"},
+        {"mode": 493, "path": "etc", "type": "directory"},
+        {"mode": 420, "path": "etc/group", "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467", "size_bytes": 30, "type": "file"},
+        {"mode": 420, "path": "etc/passwd", "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e", "size_bytes": 97, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -94,7 +106,7 @@
     "size_bytes": 10,
     "top_ordinal": 1
   },
-  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v9",
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v10",
   "provenance": {
     "lower_builder": {
       "argv_policy": "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress",
@@ -112,12 +124,12 @@
       "build_script": "scripts/build_oci_guest_workload_proof.sh",
       "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
       "elf_mode": 493,
-      "elf_sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7",
+      "elf_sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653",
       "elf_size_bytes": 9868,
       "source": "guest/workload-proof/proof.c",
-      "source_sha256": "4934d9abc8d695968050b7f2b319906e8819b239919481e20251ed9a0d2aafab",
+      "source_sha256": "a92cfb1b2d1a606cf8964166e69a40325cefdff83a87d431ed121f2340985cd4",
       "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     }
   },
-  "schema": "palimpsest.kvm-filesystem-fixtures.v9"
+  "schema": "palimpsest.kvm-filesystem-fixtures.v10"
 }

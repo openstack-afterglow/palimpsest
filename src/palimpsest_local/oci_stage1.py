@@ -29,12 +29,12 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v12"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v12"
-OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v6"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v13"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v13"
+OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v7"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
-OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-capabilityless-isolated-user-group.v2"
+OCI_STAGE1_PROCESS_POLICY = "image-root-account-path-capabilityless-isolated-user-group.v3"
 OCI_STAGE1_WORKLOAD_ISOLATION = "palimpsest.workload-lifecycle-authority-isolation.v2"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -173,13 +173,6 @@ class OCIStage1Plan:
             self.process.require_bootable()
         except ArtifactValidationError:
             raise StateError("stage-1 process is not bootable") from None
-        if (
-            not self.process.argv[0].startswith("/")
-            or not self.process.user.user.isdecimal()
-            or self.process.user.group is None
-            or not self.process.user.group.isdecimal()
-        ):
-            raise StateError("stage-1 process is outside the executable process subset")
         if not isinstance(self.assembly_probes, tuple) or len(self.assembly_probes) > MAX_OCI_STAGE1_ASSEMBLY_PROBES:
             raise StateError("stage-1 assembly probes are invalid")
         probes: list[dict[str, Any]] = []

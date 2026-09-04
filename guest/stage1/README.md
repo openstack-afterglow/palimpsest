@@ -16,12 +16,17 @@ into its own process group, confirms `execve(2)` through a close-on-exec error
 pipe, forwards an allow-listed signal set through `signalfd`, and reaps all
 children with `wait4(2)`.
 
-The first executable subset is deliberately narrow: `argv[0]` must be an
-absolute path and both user and group must be explicit canonical numeric IDs.
-The child receives only the authenticated image environment, starts with no
-supplementary groups, then applies group, user, cwd, and executable in that
-order. Name lookup, an omitted primary group, and `PATH` search remain
-fail-closed until their image-root semantics are implemented.
+The executable subset accepts canonical numeric or image account names. PID 1
+reads only bounded, root-owned, not group/other-writable, no-follow regular
+`/etc/passwd` and `/etc/group` files; named matches must be unique. An omitted
+group uses the matching passwd primary GID, while a numeric UID absent from
+passwd uses Docker's GID 0 fallback. Explicit numeric groups bypass group-file
+lookup. Supplementary groups intentionally remain empty: this is a restricted
+security subset, not Docker's image group-membership expansion. The child gets
+the authenticated image environment plus the fixed container default `PATH`
+when absent. After credential drop and `chdir`, PID 1 performs shell-free
+`execve` candidate search; argv containing `/` is direct, and an empty PATH
+element explicitly means the workload cwd.
 
 New OCI-root volumes are formatted with a closed ext4 feature allow-list and
 fixed geometry rather than host `mke2fs.conf` defaults, then verified before
@@ -109,20 +114,20 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v16 receipt retains owner-only positive and per-control consoles plus a
+The v17 receipt retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v7` execution checkpoint, the
+the `palimpsest.guest-pid1-supervisor.v8` execution checkpoint, the
 `palimpsest.workload-lifecycle-authority-isolation.v2` boundary, and the
 `palimpsest.guest-lifecycle-broker.v3` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v12 admits
-only the explicit absolute/numeric process subset.
+and production VM launch remains disabled. Stage-1 plan/protocol v13 admits
+the bounded image-root account and shell-free PATH process subset.
 
 Before release, PID 1 verifies that the workload child has closed the
 lifecycle descriptor, entered a private mount namespace, installed an exact
@@ -144,10 +149,9 @@ four UID/GID values and empty supplementary-group list through bounded
 `/proc/1/status` parsing. It creates cooperative and stubborn descendants and
 then exits 42 naturally. PID 1 sends the configured stop signal after main
 exit; one descendant exits 43 and the other is killed through cgroup v2 with
-status 137. Three additional launch controls independently
-bind a
-missing executable, non-executable target, and missing cwd to exact child
-setup stage/errno rejection markers.
+status 137. Five additional launch controls independently bind a missing
+executable, non-executable target, missing cwd, absent named user, and absent
+named group to exact child setup stage/errno rejection markers.
 
 After root transition, PID 1 mounts and verifies cgroup v2, pins the workload
 directory plus `cgroup.procs`, `cgroup.kill`, and `cgroup.events`, and forks a
@@ -162,7 +166,7 @@ the terminal marker. This is still a single-workload qualification boundary;
 future detached stop, exec, and agent lifecycle need a separate production
 broker and runtime dispatch path.
 The cgroup provides workload containment and deterministic cleanup; it is not
-a complete hostile-root availability sandbox. Every admitted numeric identity,
+a complete hostile-root availability sandbox. Every admitted resolved identity,
 including UID 0, executes without capabilities behind the same boundary.
 
 The native proof opens the uniquely named lifecycle virtio port and runs the
@@ -171,7 +175,7 @@ base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
 retained-root reconnect/SNAPSHOT/same-ID retry and deduplication, plus the
 malformed, stale, replayed, and conflicting input matrix. TERMINAL is sent only
 after cgroup cleanup certainty and before the console terminal marker. Receipt
-v16 records `reconnect_proven=true` and `negative_input_proven=true`; production
+v17 records `reconnect_proven=true` and `negative_input_proven=true`; production
 runtime dispatch and host-daemon recovery remain future boundaries.
 
 Proof v7 uses two real zstd SquashFS images built from the committed

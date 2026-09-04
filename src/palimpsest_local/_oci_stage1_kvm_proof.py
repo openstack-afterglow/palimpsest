@@ -75,7 +75,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v16"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v17"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -124,6 +124,8 @@ WORKLOAD_NEGATIVE_CONTROL_NAMES = (
     "workload_missing_executable",
     "workload_non_executable",
     "workload_missing_cwd",
+    "workload_missing_user",
+    "workload_missing_group",
 )
 LIFECYCLE_NEGATIVE_CONTROL_NAMES = (
     "lifecycle_missing_port",
@@ -177,6 +179,10 @@ WORKLOAD_NEGATIVE_REJECTION_MARKERS = {
     + b"7; errno=13; started and terminal disabled; waiting fail-closed",
     "workload_missing_cwd": WORKLOAD_REJECTION_PREFIX
     + b"6; errno=2; started and terminal disabled; waiting fail-closed",
+    "workload_missing_user": WORKLOAD_REJECTION_PREFIX
+    + b"36; errno=22; started and terminal disabled; waiting fail-closed",
+    "workload_missing_group": WORKLOAD_REJECTION_PREFIX
+    + b"36; errno=22; started and terminal disabled; waiting fail-closed",
 }
 
 KERNEL_ENV = "PALIMPSEST_KVM_KERNEL"
@@ -296,7 +302,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:b9220e29d4b306e7e564bb506ec7f128f22ec8abe2149bf8fbd3421654109cf9"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:db5c1859b754b5b0c6f113238deba2407496c5d035e700a201f9d5ead6ba06f2"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -311,8 +317,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v9"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v9"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v10"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v10"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -328,10 +334,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7",
+        "elf_sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653",
         "elf_size_bytes": 9868,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "4934d9abc8d695968050b7f2b319906e8819b239919481e20251ed9a0d2aafab",
+        "source_sha256": "a92cfb1b2d1a606cf8964166e69a40325cefdff83a87d431ed121f2340985cd4",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -819,7 +825,7 @@ def build_proof_plan() -> OCIStage1Plan:
         ),
         process=OCIProcessSpec(
             (
-                "/.__palimpsest_workload_proof_v1",
+                ".__palimpsest_workload_proof_v1",
                 "palimpsest-argv-one",
                 "",
                 "line\nbreak",
@@ -827,9 +833,10 @@ def build_proof_plan() -> OCIStage1Plan:
             (
                 ("PALIMPSEST_PROOF_ENV", "value with spaces"),
                 ("PALIMPSEST_PROOF_EMPTY", ""),
+                ("PATH", "/proof/missing:/"),
             ),
             "/proof/workdir",
-            OCIUserSpec("65534", "65534"),
+            OCIUserSpec("palimpsest", None),
             15,
         ),
         assembly_probes=(dict(_PROOF_ASSEMBLY_PROBE),),
@@ -851,7 +858,7 @@ def build_uid0_isolation_proof_plan() -> OCIStage1Plan:
             (*base.process.argv, "palimpsest-uid0-isolation-v1"),
             base.process.environment,
             base.process.cwd,
-            OCIUserSpec("0", "0"),
+            OCIUserSpec("root", "root"),
             base.process.stop_signal,
         ),
         assembly_probes=tuple(dict(probe) for probe in base.assembly_probes),
@@ -1035,7 +1042,7 @@ def pre_mount_topology(plan: OCIStage1Plan, *, mode: str = "base") -> dict[str, 
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v9",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v10",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1547,7 +1554,7 @@ def _workload_negative_context(name: str) -> tuple[OCIStage1Plan, BuiltOCIStage1
     process = base.process
     if name == "workload_missing_executable":
         process = OCIProcessSpec(
-            ("/.__palimpsest_missing_workload_v1", *process.argv[1:]),
+            (".__palimpsest_missing_workload_v1", *process.argv[1:]),
             process.environment,
             process.cwd,
             process.user,
@@ -1561,12 +1568,24 @@ def _workload_negative_context(name: str) -> tuple[OCIStage1Plan, BuiltOCIStage1
             process.user,
             process.stop_signal,
         )
-    else:
+    elif name == "workload_missing_cwd":
         process = OCIProcessSpec(
             process.argv,
             process.environment,
             "/proof/missing",
             process.user,
+            process.stop_signal,
+        )
+    elif name == "workload_missing_user":
+        process = OCIProcessSpec(
+            process.argv, process.environment, process.cwd, OCIUserSpec("absent-user", None), process.stop_signal
+        )
+    else:
+        process = OCIProcessSpec(
+            process.argv,
+            process.environment,
+            process.cwd,
+            OCIUserSpec("palimpsest", "absent-group"),
             process.stop_signal,
         )
     plan = OCIStage1Plan(
@@ -1644,8 +1663,8 @@ def workload_negative_control_contract(name: str) -> dict[str, Any]:
             "size_bytes": transport.receipt.artifact_size_bytes,
         },
     }
-    expected_stage = 6 if name == "workload_missing_cwd" else 7
-    expected_errno = 13 if name == "workload_non_executable" else 2
+    expected_stage = 36 if name in {"workload_missing_user", "workload_missing_group"} else 6 if name == "workload_missing_cwd" else 7
+    expected_errno = 22 if expected_stage == 36 else 13 if name == "workload_non_executable" else 2
     contract: dict[str, Any] = {
         "attachments": attachments,
         "backings": backings,
@@ -3204,6 +3223,8 @@ class OCIStage1KVMProofReceipt:
             "schema": OCI_STAGE1_KVM_PROOF_SCHEMA,
             "stage1": {"contract": OCI_BOOTSTRAP_STAGE1_CONTRACT, "elf_digest": self.stage1_elf_digest},
             "supervisor": {
+                "account_resolution": "image-root-passwd-group",
+                "argv0": "shell-free-path-search-after-chdir",
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
                 "cgroup": "/palimpsest.workload",
                 "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
@@ -3217,12 +3238,14 @@ class OCIStage1KVMProofReceipt:
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
                 "main_status": 42,
+                "omitted_primary_group": True,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+                "supplementary_groups": "empty-restricted-subset",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
                 "uid0_capabilityless_proven": True,
             },
@@ -3374,6 +3397,8 @@ class OCIStage1KVMProofReceipt:
             }
             or supervisor
             != {
+                "account_resolution": "image-root-passwd-group",
+                "argv0": "shell-free-path-search-after-chdir",
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
                 "cgroup": "/palimpsest.workload",
                 "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
@@ -3387,12 +3412,14 @@ class OCIStage1KVMProofReceipt:
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
                 "main_status": 42,
+                "omitted_primary_group": True,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+                "supplementary_groups": "empty-restricted-subset",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
                 "uid0_capabilityless_proven": True,
             }
@@ -3818,14 +3845,18 @@ def _read_console_until(
     lifecycle_socket_path: Path | None = None,
     lifecycle_binding: OCIControlBinding | None = None,
     lifecycle_success: bool | None = None,
+    lifecycle_failure_state: str = "key-ack-sent",
     lifecycle_transcript: list[dict[str, Any]] | None = None,
     lifecycle_scenario: str = "normal",
     lifecycle_attempts: list[dict[str, Any]] | None = None,
     lifecycle_negative_name: str | None = None,
     lifecycle_negative_input: dict[str, Any] | None = None,
 ) -> bytes:
-    if (lifecycle_socket_path is None) != (lifecycle_binding is None) or (
-        lifecycle_binding is None and lifecycle_success is not None
+    if (
+        (lifecycle_socket_path is None) != (lifecycle_binding is None)
+        or (lifecycle_binding is None and lifecycle_success is not None)
+        or lifecycle_failure_state not in {"hello-sent", "key-ack-sent"}
+        or (lifecycle_success is not False and lifecycle_failure_state != "key-ack-sent")
     ):
         raise ArtifactValidationError("KVM lifecycle driver configuration is invalid")
     try:
@@ -4195,7 +4226,7 @@ def _read_console_until(
                             close_channel()
                             channel_finished = True
                             continue
-                        if lifecycle_success is False and session.state == "key-ack-sent":
+                        if lifecycle_success is False and session.state == lifecycle_failure_state:
                             close_channel()
                             channel_finished = True
                             continue
@@ -4388,7 +4419,7 @@ def _read_console_until(
             lifecycle_complete = (
                 session is None
                 or (lifecycle_success is True and session.state == "terminal")
-                or (lifecycle_success is False and session.state == "key-ack-sent")
+                or (lifecycle_success is False and session.state == lifecycle_failure_state)
             )
             if lifecycle_scenario == "composite":
                 lifecycle_complete = composite_done and connection_ordinal == 6
@@ -5323,6 +5354,11 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
                 lifecycle_socket_path=control_lifecycle_socket,
                 lifecycle_binding=control_binding,
                 lifecycle_success=False,
+                lifecycle_failure_state=(
+                    "hello-sent"
+                    if control_name in {"workload_missing_user", "workload_missing_group"}
+                    else "key-ack-sent"
+                ),
             )
             _verify_pinned_boot_files(
                 qemu_path=qemu_path,

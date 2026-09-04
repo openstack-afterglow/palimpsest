@@ -930,6 +930,37 @@ Scope boundary: slice 29B activates v2 only in the pre-production guest/domain
 and native-KVM qualification path. Production create/start/run/`-d`, libvirt
 channel ownership, runtime STOP dispatch, and Gate 2 remain disabled.
 
+### PR 4 slice 29C: image-root identity and shell-free PATH execution
+
+- Stage-1 plan/protocol v13 and handoff v7 admit named users/groups, omitted
+  primary groups, and non-absolute argv. The process contract inserts the fixed
+  container default PATH when the image omits it; no host bootstrap environment
+  is inherited.
+- Guest PID 1 resolves accounts only from bounded, root-owned, not
+  group/other-writable,
+  no-follow regular `/etc/passwd` and `/etc/group` files after the OCI root is
+  `/`. Named records must be unique. Omitted group uses the passwd primary GID;
+  a numeric UID absent from passwd retains Docker's GID 0 fallback. Explicit
+  numeric groups bypass the group database.
+- Supplementary groups remain deliberately empty under the existing isolation
+  contract. This is a fail-closed security subset and does not claim Docker's
+  supplementary membership expansion.
+- After credential drop and cwd application, the child performs direct
+  `execve` for argv containing `/`, otherwise ordered PATH candidate attempts.
+  No shell is invoked. ENOENT/ENOTDIR continue, EACCES is retained, and other
+  errors fail immediately; an empty PATH element explicitly names the workload
+  cwd.
+- The deterministic native proof uses a named UID with omitted group and a
+  relative argv whose first PATH candidate misses. The UID 0 isolation proof
+  separately resolves explicit named user/group. Missing-name controls fail at
+  the exact pre-fork account-resolution stage. Fixture policy/schema v10,
+  init/consumer v15, initramfs manifest/ABI v17, supervisor v8, domain
+  plan/core v12/v6, and KVM receipt v17 bind the checkpoint.
+
+Scope boundary: production create/start/run/`-d`, runtime STOP dispatch, agent
+and exec-session ownership, supplementary group expansion, and Gate 2 remain
+disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -948,9 +979,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Implement image-root passwd/group lookup, omitted primary-group and PATH
-   search semantics, then generalize the qualified single-workload cgroup
-   broker for agent and exec-session ownership.
+1. Generalize the qualified single-workload cgroup broker for agent and
+   exec-session ownership.
 2. Connect production final handoff, host stop/control and exit mapping,
    foreground-default `run` and detached `run -d`, then lifecycle/exec/log
    readiness for OCI-root/KVM.

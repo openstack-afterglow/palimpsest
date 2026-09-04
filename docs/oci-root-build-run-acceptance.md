@@ -94,11 +94,13 @@ Natural-exit and STOP races retain only bounded authenticated wire candidates
 until a later boundary commits one exact value. Complete, mixed, oversized,
 stale, replayed, cross-carrier, or conflicting inputs fail closed.
 
-Receipt v16 binds 41 native guest boots and one duplicate-name preboot
-rejection (42 QEMU invocations), stage-1 plan/protocol v12, handoff v6,
-init/consumer v14, initramfs manifest/ABI v16, supervisor v7, lifecycle broker
-v3, workload isolation v2, lifecycle protocol v2, fixture policy/schema v9,
-domain plan v11/core v5, and KVM proof v16. Receipt projections verify the
+Receipt v17 binds 43 native guest boots and one duplicate-name preboot
+rejection (44 QEMU invocations), stage-1 plan/protocol v13, handoff v7,
+init/consumer v15, initramfs manifest/ABI v17, supervisor v8, lifecycle broker
+v3, workload isolation v2, lifecycle protocol v2, fixture policy/schema v10,
+domain plan v12/core v6, and KVM proof v17. It additionally binds bounded
+image-root passwd/group lookup, omitted primary-GID resolution, empty
+supplementary groups, and shell-free PATH execution. Receipt projections verify the
 canonical envelope and MAC before retaining only safe digests and public
 bindings; raw boot keys and MAC tags are recursively excluded.
 

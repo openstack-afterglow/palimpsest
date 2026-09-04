@@ -520,14 +520,15 @@ def test_explicit_kernel_and_config_must_be_selected_as_a_pair(monkeypatch: pyte
 def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: Path) -> None:
     plan = build_proof_plan()
     assert plan.process.to_dict() == {
-        "argv": ["/.__palimpsest_workload_proof_v1", "palimpsest-argv-one", "", "line\nbreak"],
+            "argv": [".__palimpsest_workload_proof_v1", "palimpsest-argv-one", "", "line\nbreak"],
         "cwd": "/proof/workdir",
         "environment": [
             {"name": "PALIMPSEST_PROOF_ENV", "value": "value with spaces"},
-            {"name": "PALIMPSEST_PROOF_EMPTY", "value": ""},
+                {"name": "PALIMPSEST_PROOF_EMPTY", "value": ""},
+                {"name": "PATH", "value": "/proof/missing:/"},
         ],
         "stop_signal": 15,
-        "user": {"group": "65534", "user": "65534"},
+            "user": {"group": None, "user": "palimpsest"},
     }
     transport = build_stage1_transport(plan)
     cmdline = build_kernel_cmdline(plan, transport)
@@ -588,8 +589,8 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:b9220e29d4b306e7e564bb506ec7f128f22ec8abe2149bf8fbd3421654109cf9"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v9"
+    assert manifest_digest == "sha256:db5c1859b754b5b0c6f113238deba2407496c5d035e700a201f9d5ead6ba06f2"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v10"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
@@ -606,10 +607,10 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7",
+        "elf_sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653",
         "elf_size_bytes": 9868,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "4934d9abc8d695968050b7f2b319906e8819b239919481e20251ed9a0d2aafab",
+        "source_sha256": "a92cfb1b2d1a606cf8964166e69a40325cefdff83a87d431ed121f2340985cd4",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
 
@@ -1098,6 +1099,40 @@ time.sleep(2)
     temporary.cleanup()
 
 
+def test_console_reader_accepts_prebootstrap_account_failure_after_hello(tmp_path: Path) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-account-failure-", dir="/tmp")
+    channel = (Path(temporary.name) / "lifecycle.sock").resolve()
+    expected = WORKLOAD_NEGATIVE_REJECTION_MARKERS["workload_missing_user"]
+    program = f"""
+import socket, sys, time
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen(1)
+connection, _ = listener.accept()
+connection.recv(65536)
+sys.stdout.buffer.write({expected!r} + b'\\n')
+sys.stdout.flush()
+connection.close()
+time.sleep(2)
+"""
+    console = _read_console_until(
+        (sys.executable, "-c", program, os.fspath(channel)),
+        expected=expected,
+        forbidden=(SUCCESS_MARKER, WORKLOAD_STARTED_MARKER),
+        timeout_seconds=3,
+        require_alive_after_marker=True,
+        lifecycle_socket_path=channel,
+        lifecycle_binding=binding,
+        lifecycle_success=False,
+        lifecycle_failure_state="hello-sent",
+    )
+    assert _logical_line_count(console, expected) == 1
+    temporary.cleanup()
+
+
 def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path: Path) -> None:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
@@ -1373,9 +1408,9 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v16"
-    assert decoded["executed_boots"] == 41
-    assert decoded["qemu_invocations"] == 42
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v17"
+    assert decoded["executed_boots"] == 43
+    assert decoded["qemu_invocations"] == 44
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
         "lifecycle_missing_port",
         "lifecycle_wrong_name_only",
@@ -1410,7 +1445,9 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v7",
+        "contract": "palimpsest.guest-pid1-supervisor.v8",
+        "account_resolution": "image-root-passwd-group",
+        "argv0": "shell-free-path-search-after-chdir",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],
@@ -1423,12 +1460,14 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
         "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
         "main_status": 42,
+        "omitted_primary_group": True,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
         "process_group": True,
         "reaped_children": 3,
         "terminal_state": "parent-marker-then-fail-closed-wait",
         "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
+        "supplementary_groups": "empty-restricted-subset",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
         "uid0_capabilityless_proven": True,
     }

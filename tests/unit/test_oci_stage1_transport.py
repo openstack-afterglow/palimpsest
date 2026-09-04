@@ -267,9 +267,11 @@ def test_stage1_transport_covers_worst_case_canonical_process_escaping() -> None
         OCIProcessSpec(("/bin/demo",), (), "/", OCIUserSpec("0", None), 15),
     ],
 )
-def test_stage1_admission_rejects_processes_outside_executable_subset(process: OCIProcessSpec) -> None:
-    with pytest.raises(StateError, match="executable process subset"):
-        replace(_plan(), process=process)
+def test_stage1_admission_accepts_image_root_account_and_path_process_subset(process: OCIProcessSpec) -> None:
+    plan = replace(_plan(), process=process)
+    built = build_stage1_transport(plan)
+
+    assert verify_stage1_transport(built.artifact, built.receipt, expected_stage1_plan=plan) == plan
 
 
 def test_stage1_transport_file_boundary_rejects_tamper_links_modes_and_fifo(tmp_path: Path) -> None:

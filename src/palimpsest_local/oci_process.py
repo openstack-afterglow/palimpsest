@@ -13,6 +13,8 @@ from .errors import ArtifactValidationError
 MAX_PROCESS_ARGUMENTS = 4096
 MAX_PROCESS_ENVIRONMENT = 4096
 MAX_PROCESS_BYTES = 256 * 1024
+MAX_ACCOUNT_DATABASE_BYTES = 64 * 1024
+OCI_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 _SIGNALS = {
@@ -134,6 +136,10 @@ class OCIProcessSpec:
                 raise ArtifactValidationError("image process environment name is invalid or duplicated")
             names.add(name)
             environment.append((name, _plain_string(raw_value, f"image process environment[{index}].value")))
+        if "PATH" not in names:
+            if len(environment) >= MAX_PROCESS_ENVIRONMENT:
+                raise ArtifactValidationError("image process environment leaves no room for default PATH")
+            environment.append(("PATH", OCI_DEFAULT_PATH))
         cwd = _plain_string(self.cwd, "image process cwd", allow_empty=False)
         if not cwd.startswith("/") or posixpath.normpath(cwd) != cwd or "//" in cwd:
             raise ArtifactValidationError("image process cwd must be a canonical absolute path")
@@ -238,4 +244,106 @@ class OCIProcessSpec:
         return process
 
 
-__all__ = ["MAX_PROCESS_ARGUMENTS", "MAX_PROCESS_BYTES", "MAX_PROCESS_ENVIRONMENT", "OCIProcessSpec", "OCIUserSpec"]
+def _account_number(value: str, field_name: str) -> int:
+    try:
+        canonical = _account(value, field_name)
+    except ArtifactValidationError:
+        raise
+    if not canonical.isdecimal():
+        raise ArtifactValidationError(f"{field_name} is not numeric")
+    return int(canonical)
+
+
+def _account_lines(payload: bytes, field_name: str) -> tuple[str, ...]:
+    if not isinstance(payload, bytes) or len(payload) > MAX_ACCOUNT_DATABASE_BYTES or b"\0" in payload:
+        raise ArtifactValidationError(f"image-root {field_name} database is invalid")
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        raise ArtifactValidationError(f"image-root {field_name} database is not ASCII") from None
+    if text and not text.endswith("\n"):
+        raise ArtifactValidationError(f"image-root {field_name} database is unterminated")
+    lines = () if not text else tuple(text[:-1].split("\n"))
+    return tuple(line for line in lines if line and not line.startswith("#"))
+
+
+def resolve_oci_user(
+    user: OCIUserSpec,
+    *,
+    passwd: bytes | None,
+    group: bytes | None,
+) -> tuple[int, int]:
+    """Resolve Docker-compatible image User semantics without NSS.
+
+    Only the image-root ``/etc/passwd`` and ``/etc/group`` byte contracts are
+    consulted.  Numeric users remain valid without passwd; when their group is
+    omitted, an exact passwd UID match supplies the primary group and no match
+    falls back to GID 0, matching Docker's numeric-user behavior.
+    """
+
+    if not isinstance(user, OCIUserSpec):
+        raise ArtifactValidationError("image process user is invalid")
+    passwd_records: list[tuple[str, int, int]] = []
+    needs_passwd = not user.user.isdecimal() or user.group is None
+    if needs_passwd and passwd is not None:
+        for line in _account_lines(passwd, "passwd"):
+            fields = line.split(":")
+            if len(fields) != 7 or _ACCOUNT_RE.fullmatch(fields[0]) is None:
+                raise ArtifactValidationError("image-root passwd entry is invalid")
+            uid = _account_number(fields[2], "image-root passwd UID")
+            gid = _account_number(fields[3], "image-root passwd GID")
+            passwd_records.append((fields[0], uid, gid))
+
+    if user.user.isdecimal():
+        uid = int(user.user)
+        passwd_matches = [record for record in passwd_records if record[1] == uid]
+    else:
+        passwd_matches = [record for record in passwd_records if record[0] == user.user]
+        if not passwd_matches:
+            raise ArtifactValidationError("image process user is absent from image-root passwd")
+        uid = passwd_matches[0][1]
+    if len(passwd_matches) > 1:
+        raise ArtifactValidationError("image process user is ambiguous in image-root passwd")
+
+    if user.group is None:
+        return uid, passwd_matches[0][2] if passwd_matches else 0
+    if user.group.isdecimal():
+        return uid, int(user.group)
+    if group is None:
+        raise ArtifactValidationError("image process group is absent from image-root group")
+    matches: list[int] = []
+    for line in _account_lines(group, "group"):
+        fields = line.split(":")
+        if len(fields) != 4 or _ACCOUNT_RE.fullmatch(fields[0]) is None:
+            raise ArtifactValidationError("image-root group entry is invalid")
+        gid = _account_number(fields[2], "image-root group GID")
+        if fields[0] == user.group:
+            matches.append(gid)
+    if len(matches) != 1:
+        reason = "absent from" if not matches else "ambiguous in"
+        raise ArtifactValidationError(f"image process group is {reason} image-root group")
+    return uid, matches[0]
+
+
+def oci_path_candidates(process: OCIProcessSpec) -> tuple[str, ...]:
+    """Return shell-free execve candidates for the image process argv[0]."""
+
+    process.require_bootable()
+    command = process.argv[0]
+    if "/" in command:
+        return (command,)
+    path = next((value for name, value in process.environment if name == "PATH"), OCI_DEFAULT_PATH)
+    return tuple(f"{directory}/{command}" if directory else command for directory in path.split(":"))
+
+
+__all__ = [
+    "MAX_ACCOUNT_DATABASE_BYTES",
+    "MAX_PROCESS_ARGUMENTS",
+    "MAX_PROCESS_BYTES",
+    "MAX_PROCESS_ENVIRONMENT",
+    "OCI_DEFAULT_PATH",
+    "OCIProcessSpec",
+    "OCIUserSpec",
+    "oci_path_candidates",
+    "resolve_oci_user",
+]

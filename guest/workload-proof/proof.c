@@ -415,14 +415,15 @@ static int invocation_failure(u64 argc, char **argv, char **environment) {
     i64 cwd_size;
     int authority_error;
     int uid0_mode;
-    if ((argc != 4 && argc != 5) || !same_text(argv[0], "/.__palimpsest_workload_proof_v1") ||
+    if ((argc != 4 && argc != 5) || !same_text(argv[0], ".__palimpsest_workload_proof_v1") ||
         !same_text(argv[1], "palimpsest-argv-one") || !same_text(argv[2], "") ||
         !same_text(argv[3], "line\nbreak") ||
         (argc == 5 && !same_text(argv[4], "palimpsest-uid0-isolation-v1"))) return 1;
     uid0_mode = argc == 5;
-    if (!environment[0] || !environment[1] || environment[2] ||
+    if (!environment[0] || !environment[1] || !environment[2] || environment[3] ||
         !same_text(environment[0], "PALIMPSEST_PROOF_ENV=value with spaces") ||
-        !same_text(environment[1], "PALIMPSEST_PROOF_EMPTY=")) return 2;
+        !same_text(environment[1], "PALIMPSEST_PROOF_EMPTY=") ||
+        !same_text(environment[2], "PATH=/proof/missing:/")) return 2;
     if (sc0(SYS_getpid) <= 1 || sc0(SYS_getppid) != 1 || sc0(SYS_getpgrp) != sc0(SYS_getpid)) return 3;
     if (sc0(SYS_getuid) != (uid0_mode ? 0 : 65534) ||
         sc0(SYS_getgid) != (uid0_mode ? 0 : 65534) || sc2(SYS_getgroups, 0, 0) != 0) return 4;

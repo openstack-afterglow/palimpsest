@@ -32,15 +32,15 @@ from palimpsest_local._oci_stage1_kvm_proof import (
 pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
 
 
-def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_41_boot_control_matrices() -> None:
+def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_43_boot_control_matrices() -> None:
     if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
         pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
 
     result = run_oci_stage1_kvm_proof()
 
     receipt = result.receipt.to_dict()
-    assert receipt["executed_boots"] == 41
-    assert receipt["qemu_invocations"] == 42
+    assert receipt["executed_boots"] == 43
+    assert receipt["qemu_invocations"] == 44
     assert receipt["qualification"] == {
         "accelerator": "kvm",
         "architecture": "x86_64",
@@ -64,7 +64,7 @@ def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_41_boot_c
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v7",
+        "contract": "palimpsest.guest-pid1-supervisor.v8",
         "cgroup": "/palimpsest.workload",
         "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],

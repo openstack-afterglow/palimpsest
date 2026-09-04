@@ -164,7 +164,10 @@ def test_image_config_preserves_shell_free_process_contract() -> None:
     process = resolve_image(ref(), manifest, graph.read).config.process
 
     assert process.argv == ("/usr/bin/app", "serve", "--port=8080")
-    assert process.environment == (("A", "B"),)
+    assert process.environment == (
+        ("A", "B"),
+        ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+    )
     assert process.cwd == "/srv/app"
     assert process.user.to_dict() == {"group": "1001", "user": "1000"}
     assert process.stop_signal == 2

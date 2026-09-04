@@ -144,6 +144,10 @@ struct span { const char *p; usize n; };
 #define ECHILD 10
 #define EINVAL 22
 #define EPERM 1
+#define ENOENT 2
+#define EACCES 13
+#define ENOTDIR 20
+#define ENAMETOOLONG 36
 #define CLOCK_MONOTONIC 1
 #define GRND_NONBLOCK 1
 #define BLKROGET 0x125e
@@ -202,6 +206,8 @@ struct span { const char *p; usize n; };
 #define ENV_MAX_LOCAL 4096
 #define STRING_MAX_LOCAL (32 * 1024)
 #define PROCESS_MAX_LOCAL (256 * 1024)
+#define ACCOUNT_DATABASE_MAX_LOCAL (64 * 1024)
+#define OCI_DEFAULT_PATH_LOCAL "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 #define GENERATION_DIGITS_MAX 4096
 #define FILESYSTEM_VERIFY_BYTES_MAX 34359738368ul
 #define FILESYSTEM_IO_BYTES (1024 * 1024)
@@ -920,14 +926,22 @@ struct guest_process {
     char *argv[ARG_MAX_LOCAL + 1];
     char *envp[ENV_MAX_LOCAL + 1];
     char *cwd;
+    char *user_name;
+    char *group_name;
     u32 argc;
     u32 envc;
     u32 uid;
     u32 gid;
+    int user_numeric;
+    int group_numeric;
+    int group_present;
     u32 stop_signal;
     usize used;
     char arena[PROCESS_MAX_LOCAL + 1];
 };
+
+static u8 passwd_database[ACCOUNT_DATABASE_MAX_LOCAL];
+static u8 group_database[ACCOUNT_DATABASE_MAX_LOCAL];
 
 struct expected_device {
     char serial[21];
@@ -1179,6 +1193,17 @@ static int numeric_account(struct span s, u32 *result) {
     return 1;
 }
 
+static int valid_account_name(struct span s) {
+    usize i;
+    if (!s.n || s.n > 32 || !((s.p[0] >= 'A' && s.p[0] <= 'Z') ||
+        (s.p[0] >= 'a' && s.p[0] <= 'z') || s.p[0] == '_')) return 0;
+    for (i = 1; i < s.n; i++)
+        if (!((s.p[i] >= 'A' && s.p[i] <= 'Z') || (s.p[i] >= 'a' && s.p[i] <= 'z') ||
+              (s.p[i] >= '0' && s.p[i] <= '9') || s.p[i] == '_' || s.p[i] == '.' || s.p[i] == '-'))
+            return 0;
+    return 1;
+}
+
 static int append_environment(struct guest_process *process, struct span name, struct span value, char **result) {
     usize i, start = process->used;
     char *decoded;
@@ -1196,6 +1221,7 @@ static int append_environment(struct guest_process *process, struct span name, s
 
 static int parse_process(struct parser *j, struct guest_process *process) {
     u32 argc = 0, i;
+    int path_seen = 0;
     u64 number;
     struct span s;
     usize decoded;
@@ -1206,7 +1232,6 @@ static int parse_process(struct parser *j, struct guest_process *process) {
             if (argc >= ARG_MAX_LOCAL || !json_string(j, &s, &decoded, 0) || decoded > STRING_MAX_LOCAL) return 0;
             if (argc == 0 && decoded == 0) return 0;
             if (!decode_process_string(process, s, &process->argv[argc])) return 0;
-            if (argc == 0 && process->argv[0][0] != '/') return 0;
             j->process_bytes += decoded + 1;
             argc++;
             if (take_char(j, ']')) break;
@@ -1228,6 +1253,7 @@ static int parse_process(struct parser *j, struct guest_process *process) {
                 value_decoded > STRING_MAX_LOCAL || !take_char(j, '}')) return 0;
             for (i = 0; i < j->env_count; i++)
                 if (j->env_names[i].n == name.n && bytes_equal(j->env_names[i].p, name.p, name.n)) return 0;
+            if (name.n == 4 && bytes_equal(name.p, "PATH", 4)) path_seen = 1;
             j->env_names[j->env_count++] = name;
             if (!append_environment(process, name, value, &process->envp[process->envc])) return 0;
             process->envc++;
@@ -1239,16 +1265,27 @@ static int parse_process(struct parser *j, struct guest_process *process) {
     if (!take_char(j, ',') || !key(j, "stop_signal") || !uint_value(j, &number) || number < 1 || number > 64 ||
         !take_char(j, ',') || !key(j, "user") || !take_char(j, '{') || !key(j, "group")) return 0;
     process->stop_signal = (u32)number;
-    if (!plain_string(j, &s, &decoded) || !numeric_account(s, &process->gid)) return 0;
-    j->process_bytes += decoded + 25;
+    if (exact_literal(j, "null")) {
+        process->group_present = 0;
+        j->process_bytes += 4 + 23;
+    } else {
+        if (!plain_string(j, &s, &decoded) ||
+            (!numeric_account(s, &process->gid) && !valid_account_name(s)) ||
+            !decode_process_string(process, s, &process->group_name)) return 0;
+        process->group_present = 1;
+        process->group_numeric = numeric_account(s, &process->gid);
+        j->process_bytes += decoded + 25;
+    }
     if (!take_char(j, ',') || !key(j, "user") || !plain_string(j, &s, &decoded) ||
-        !numeric_account(s, &process->uid) ||
+        (!numeric_account(s, &process->uid) && !valid_account_name(s)) ||
+        !decode_process_string(process, s, &process->user_name) ||
         !take_char(j, '}') || !take_char(j, '}')) return 0;
+    process->user_numeric = numeric_account(s, &process->uid);
     j->process_bytes += decoded;
     process->argc = argc;
     process->argv[argc] = 0;
     process->envp[process->envc] = 0;
-    return j->process_bytes <= PROCESS_MAX_LOCAL && process->used <= PROCESS_MAX_LOCAL + 1;
+    return path_seen && j->process_bytes <= PROCESS_MAX_LOCAL && process->used <= PROCESS_MAX_LOCAL + 1;
 }
 
 static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices,
@@ -1352,19 +1389,19 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v6") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v7") || !take_char(&j, ',') ||
         !key(&j, "isolation") ||
         !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v2") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") ||
-        !exact_string(&j, "absolute-argv0-numeric-capabilityless-isolated-user-group.v2") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v12") ||
+        !exact_string(&j, "image-root-account-path-capabilityless-isolated-user-group.v3") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v13") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v12") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v13") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -3276,6 +3313,152 @@ static void set_workload_failure(struct child_error_local *failure, u32 stage, i
     failure->error = error < 0 ? (u32)(-error) : (u32)error;
 }
 
+static int read_account_database(const char *name, u8 *out, usize *used, int required) {
+    struct stat_local directory_stat, st;
+    i64 directory = sc3(SYS_open, (i64)"/etc",
+                        O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    i64 descriptor;
+    usize total = 0, i;
+    if (directory == -ENOENT) return required ? 0 : 2;
+    if (directory < 0 || sc2(SYS_fstat, directory, (i64)&directory_stat) != 0 ||
+        (directory_stat.mode & S_IFMT) != S_IFDIR || directory_stat.uid != 0 ||
+        (directory_stat.mode & 0022)) {
+        if (directory >= 0) sc1(SYS_close, directory);
+        return 0;
+    }
+    descriptor = sc4(SYS_openat, directory, (i64)name,
+                     O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (descriptor == -ENOENT) { sc1(SYS_close, directory); return required ? 0 : 2; }
+    if (descriptor < 0 || sc2(SYS_fstat, descriptor, (i64)&st) != 0 ||
+        (st.mode & S_IFMT) != S_IFREG || st.uid != 0 || st.nlink != 1 ||
+        (st.mode & 0022) || st.size < 0 || st.size > ACCOUNT_DATABASE_MAX_LOCAL) {
+        if (descriptor >= 0) sc1(SYS_close, descriptor);
+        sc1(SYS_close, directory);
+        return 0;
+    }
+    while (total < (usize)st.size) {
+        i64 count = sc3(SYS_read, descriptor, (i64)(out + total), (usize)st.size - total);
+        if (count == -EINTR) continue;
+        if (count <= 0 || (usize)count > (usize)st.size - total) {
+            sc1(SYS_close, descriptor); sc1(SYS_close, directory); return 0;
+        }
+        total += (usize)count;
+    }
+    if (sc1(SYS_close, descriptor) != 0 || sc1(SYS_close, directory) != 0 ||
+        (total && out[total - 1] != '\n')) return 0;
+    for (i = 0; i < total; i++) if (!out[i] || out[i] >= 0x80) return 0;
+    *used = total;
+    return 1;
+}
+
+static int account_field(const u8 *line, usize line_size, u32 index, struct span *out) {
+    usize start = 0, i;
+    u32 field = 0;
+    for (i = 0; i <= line_size; i++) {
+        if (i != line_size && line[i] != ':') continue;
+        if (field == index) { out->p = (const char *)line + start; out->n = i - start; return 1; }
+        field++;
+        start = i + 1;
+    }
+    return 0;
+}
+
+static int account_line_fields(const u8 *line, usize line_size, u32 expected) {
+    usize i;
+    u32 fields = 1;
+    for (i = 0; i < line_size; i++) if (line[i] == ':') fields++;
+    return fields == expected;
+}
+
+static int account_name_equal(const char *expected, struct span actual) {
+    usize size = slen(expected);
+    return size == actual.n && bytes_equal(expected, actual.p, size);
+}
+
+static int resolve_workload_identity(struct guest_process *process) {
+    usize passwd_size = 0, group_size = 0, offset, matches = 0;
+    int passwd_state;
+    u32 primary_gid = 0;
+    if (!process || !process->user_name || (process->group_present && !process->group_name)) return 0;
+    if (process->user_numeric && process->group_present && process->group_numeric) return 1;
+    passwd_state = 2;
+    if (!process->user_numeric || !process->group_present)
+        passwd_state = read_account_database("passwd", passwd_database, &passwd_size,
+                                             !process->user_numeric);
+    if (!passwd_state) return 0;
+    if (passwd_state == 1) {
+        for (offset = 0; offset < passwd_size;) {
+            usize end = offset;
+            struct span name, uid_text, gid_text;
+            u32 uid, gid;
+            while (end < passwd_size && passwd_database[end] != '\n') end++;
+            if (end == offset || passwd_database[offset] == '#') { offset = end + 1; continue; }
+            if (!account_line_fields(passwd_database + offset, end - offset, 7) ||
+                !account_field(passwd_database + offset, end - offset, 0, &name) || !valid_account_name(name) ||
+                !account_field(passwd_database + offset, end - offset, 2, &uid_text) || !numeric_account(uid_text, &uid) ||
+                !account_field(passwd_database + offset, end - offset, 3, &gid_text) || !numeric_account(gid_text, &gid))
+                return 0;
+            if ((process->user_numeric && uid == process->uid) ||
+                (!process->user_numeric && account_name_equal(process->user_name, name))) {
+                matches++;
+                process->uid = uid;
+                primary_gid = gid;
+            }
+            offset = end + 1;
+        }
+    }
+    if ((!process->user_numeric && matches != 1) || matches > 1) return 0;
+    if (!process->group_present) { process->gid = matches ? primary_gid : 0; return 1; }
+    if (process->group_numeric) return 1;
+    if (read_account_database("group", group_database, &group_size, 1) != 1) return 0;
+    matches = 0;
+    for (offset = 0; offset < group_size;) {
+        usize end = offset;
+        struct span name, gid_text;
+        u32 gid;
+        while (end < group_size && group_database[end] != '\n') end++;
+        if (end == offset || group_database[offset] == '#') { offset = end + 1; continue; }
+        if (!account_line_fields(group_database + offset, end - offset, 4) ||
+            !account_field(group_database + offset, end - offset, 0, &name) || !valid_account_name(name) ||
+            !account_field(group_database + offset, end - offset, 2, &gid_text) || !numeric_account(gid_text, &gid))
+            return 0;
+        if (account_name_equal(process->group_name, name)) { matches++; process->gid = gid; }
+        offset = end + 1;
+    }
+    return matches == 1;
+}
+
+static i64 exec_workload(struct guest_process *process) {
+    const char *path = OCI_DEFAULT_PATH_LOCAL;
+    usize i;
+    int denied = 0;
+    char candidate[PATH_MAX_LOCAL];
+    if (!process || !process->argv[0] || !process->argv[0][0]) return -EINVAL;
+    for (i = 0; process->argv[0][i]; i++)
+        if (process->argv[0][i] == '/') return sc3(SYS_execve, (i64)process->argv[0],
+                                                   (i64)process->argv, (i64)process->envp);
+    for (i = 0; i < process->envc; i++)
+        if (process->envp[i][0] == 'P' && process->envp[i][1] == 'A' && process->envp[i][2] == 'T' &&
+            process->envp[i][3] == 'H' && process->envp[i][4] == '=') path = process->envp[i] + 5;
+    for (;;) {
+        usize path_size = 0, command_size = slen(process->argv[0]), used = 0;
+        i64 operation;
+        while (path[path_size] && path[path_size] != ':') path_size++;
+        if (path_size) {
+            if (path_size + 1 + command_size + 1 > sizeof(candidate)) return -ENAMETOOLONG;
+            memcpy(candidate, path, path_size); used = path_size; candidate[used++] = '/';
+        } else if (command_size + 1 > sizeof(candidate)) return -ENAMETOOLONG;
+        memcpy(candidate + used, process->argv[0], command_size + 1);
+        operation = sc3(SYS_execve, (i64)candidate, (i64)process->argv, (i64)process->envp);
+        if (operation == -EACCES) denied = 1;
+        else if (operation != -ENOENT && operation != -ENOTDIR) return operation;
+        path += path_size;
+        if (!*path) break;
+        path++;
+    }
+    return denied ? -EACCES : -ENOENT;
+}
+
 static int drop_workload_credentials(struct guest_process *process,
                                      struct child_error_local *failure) {
     u32 real_id = 0, effective_id = 0, saved_id = 0;
@@ -3844,9 +4027,13 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     memset(result, 0, sizeof(*result));
     result->cooperative_status = WORKLOAD_STATUS_NONE;
     result->forced_status = WORKLOAD_STATUS_NONE;
-    if (!process || !process->argc || !process->argv[0] || process->argv[0][0] != '/' || !process->cwd ||
+    if (!process || !process->argc || !process->argv[0] || !process->argv[0][0] || !process->cwd ||
         !lifecycle || lifecycle->fd < 0) {
         set_workload_failure(failure, 8, EINVAL);
+        return 0;
+    }
+    if (!resolve_workload_identity(process)) {
+        set_workload_failure(failure, 36, EINVAL);
         return 0;
     }
     n = sc4(SYS_rt_sigprocmask, SIG_BLOCK, (i64)&mask, 0, 8);
@@ -3958,7 +4145,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         if (sc1(SYS_close, release_pipe[0]) != 0) child_fail(error_pipe[1], 13, EIO);
         operation = sc1(SYS_chdir, (i64)process->cwd);
         if (operation != 0) child_fail(error_pipe[1], 6, operation);
-        operation = sc3(SYS_execve, (i64)process->argv[0], (i64)process->argv, (i64)process->envp);
+        operation = exec_workload(process);
         child_fail(error_pipe[1], 7, operation);
     }
     sc1(SYS_close, error_pipe[1]);

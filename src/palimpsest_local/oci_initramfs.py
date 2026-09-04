@@ -31,12 +31,12 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v16"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v17"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v14"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v16"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v15"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v17"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v7"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v8"
 OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v3"
 OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v2"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
@@ -45,10 +45,10 @@ OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:b71f86f27dc1d8f49a500834369d34b9d08e47bc80a8b33e55bbfbb9be45efc1"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:57da4f978f5e6351567d949b1e74bdc5cafb2d02a96942852c56fc7713a95385"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:4aa3a80d9c6a07bd92d635890eab4b940100135d82cc4d5677e57b6892c9ff5c"
+OCI_STAGE1_BINARY_DIGEST = "sha256:52265bff283d226dd208775ae0ac1d7e86ef2af4409f715e735c2bd88f50a49a"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -371,9 +371,9 @@ def _supervisor_contract_dict() -> dict[str, Any]:
         "cleanup_scope": "dedicated-workload-cgroup",
         "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
         "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
-        "credentials": "root-pid1-broker-and-capabilityless-admitted-numeric-workload-identity",
-        "environment": "authenticated-image-environment-only",
-        "execution": "fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "credentials": "root-pid1-broker-image-root-passwd-group-resolution-empty-supplementary-groups",
+        "environment": "authenticated-image-environment-with-fixed-container-default-path",
+        "execution": "shell-free-path-search-fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
         "isolation": {
             "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
             "contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
@@ -433,7 +433,9 @@ def _guest_consumer_contract_bytes() -> bytes:
                 "root-owned-0755-empty-pseudo-filesystem-move-targets",
                 "moved-proc-sysfs-devtmpfs-post-transition-identity",
                 "bounded-canonical-json-process-decode",
-                "absolute-argv0-numeric-explicit-user-group-admission",
+                "image-root-passwd-group-unique-account-resolution",
+                "omitted-primary-group-with-empty-supplementary-groups",
+                "shell-free-argv0-path-search-after-chdir",
                 "private-mount-device-sysfs-cgroup-lifecycle-authority-boundary",
                 "empty-capability-sets-securebits-no-new-privs-seccomp",
                 "fork-execve-cloexec-launch-status",
