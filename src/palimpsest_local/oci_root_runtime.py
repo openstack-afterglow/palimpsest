@@ -1057,11 +1057,24 @@ def _cleanup_exact_launch_domain(
 
 
 def _close_unowned_stream(stream: Any) -> None:
+    """Abort a stream and invoke an optional binding-specific free extension."""
+
     for operation in ("abort", "free"):
         try:
-            getattr(stream, operation)()
+            candidate = getattr(stream, operation, None)
+            if callable(candidate):
+                candidate()
         except Exception:
             pass
+
+
+def _valid_lifecycle_stream_surface(stream: Any) -> bool:
+    try:
+        required = tuple(getattr(stream, operation, None) for operation in ("send", "recv", "abort"))
+        optional_free = getattr(stream, "free", None)
+    except Exception:
+        return False
+    return all(callable(operation) for operation in required) and (optional_free is None or callable(optional_free))
 
 
 def launch_defined_oci_root_domain(
@@ -1147,9 +1160,7 @@ def launch_defined_oci_root_domain(
                 stream = conn.newStream(flags)
             except Exception:
                 raise StateError("OCI-root lifecycle stream allocation failed") from None
-            if stream is None or any(
-                not callable(getattr(stream, operation, None)) for operation in ("send", "recv", "abort", "free")
-            ):
+            if stream is None or not _valid_lifecycle_stream_surface(stream):
                 raise StateError("OCI-root lifecycle stream surface is invalid")
             mutation.verify_binding()
             data = mutation.mutable_state()

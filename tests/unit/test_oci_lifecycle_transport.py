@@ -177,6 +177,37 @@ def test_handoff_handles_fragmentation_coalescing_would_block_and_redacts_receip
     ]
 
 
+class _GuestStreamWithoutFree:
+    """Mirror the public surface exposed by Python libvirt's virStream."""
+
+    def __init__(self) -> None:
+        self.delegate = _GuestStream()
+
+    def send(self, payload: bytes) -> int:
+        return self.delegate.send(payload)
+
+    def recv(self, size: int) -> bytes | int:
+        return self.delegate.recv(size)
+
+    def abort(self) -> None:
+        self.delegate.abort()
+
+
+def test_handoff_accepts_python_libvirt_stream_without_public_free() -> None:
+    stream = _GuestStreamWithoutFree()
+
+    receipt = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=lambda _receipt: None,
+        session=_session(BINDING),
+    )
+
+    assert receipt.terminal is not None and receipt.terminal.returncode == 42
+    assert stream.delegate.abort_calls == 1
+    assert stream.delegate.free_calls == 0
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -351,6 +382,54 @@ def test_handoff_validates_stream_surface_before_protocol_and_attempts_cleanup_o
             session=_session(BINDING),
         )
     assert calls == {"abort": 1, "free": 1}
+
+
+def test_handoff_rejects_missing_required_abort_and_attempts_optional_free_once() -> None:
+    calls = {"free": 0}
+    stream = type(
+        "MissingAbortStream",
+        (),
+        {
+            "send": lambda self, payload: len(payload),
+            "recv": lambda self, _size: -2,
+            "free": lambda self: calls.__setitem__("free", calls["free"] + 1),
+        },
+    )()
+
+    with pytest.raises(OCILifecycleTransportError, match="stream surface is invalid"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=lambda _receipt: None,
+            session=_session(BINDING),
+        )
+
+    assert calls == {"free": 1}
+
+
+@pytest.mark.parametrize("failed_operation", ["abort", "free"])
+def test_handoff_success_fails_when_available_stream_cleanup_fails(failed_operation: str) -> None:
+    class CleanupFailureGuestStream(_GuestStream):
+        def abort(self) -> None:
+            self.abort_calls += 1
+            if failed_operation == "abort":
+                raise RuntimeError("abort failed")
+
+        def free(self) -> None:
+            self.free_calls += 1
+            if failed_operation == "free":
+                raise RuntimeError("free failed")
+
+    stream = CleanupFailureGuestStream()
+    with pytest.raises(OCILifecycleTransportError, match="stream cleanup failed"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=lambda _receipt: None,
+            session=_session(BINDING),
+        )
+
+    assert stream.abort_calls == stream.free_calls == 1
 
 
 def test_handoff_preserves_primary_failure_when_stream_cleanup_also_fails() -> None:

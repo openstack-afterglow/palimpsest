@@ -203,13 +203,32 @@ def complete_initial_lifecycle_handoff(
     """Drive HELLO/BOOTSTRAP/KEY_ACK/READY through authenticated TERMINAL.
 
     ``stream`` must already be the exact domain channel opened with libvirt's
-    nonblocking flag.  The stream is always aborted and freed on return.
+    nonblocking flag.  It is always aborted on return.  Some Python libvirt
+    bindings do not expose ``virStreamFree`` as a public ``free`` method; when
+    absent, the binding owns final release when the wrapper is collected.  A
+    callable ``free`` extension is invoked after ``abort`` exactly once.
     """
 
     result: OCILifecycleHandoffReceipt | None = None
     failure: BaseException | None = None
+    abort_operation: Callable[[], Any] | None = None
+    free_operation: Callable[[], Any] | None = None
     try:
-        if any(not callable(getattr(stream, operation, None)) for operation in ("send", "recv", "abort", "free")):
+        try:
+            abort_candidate = getattr(stream, "abort", None)
+        except Exception:
+            raise OCILifecycleTransportError("OCI-root lifecycle stream surface is invalid") from None
+        abort_operation = abort_candidate if callable(abort_candidate) else None
+        try:
+            free_candidate = getattr(stream, "free", None)
+        except Exception:
+            raise OCILifecycleTransportError("OCI-root lifecycle stream surface is invalid") from None
+        free_operation = free_candidate if callable(free_candidate) else None
+        if (
+            any(not callable(getattr(stream, operation, None)) for operation in ("send", "recv"))
+            or not callable(abort_candidate)
+            or (free_candidate is not None and not callable(free_candidate))
+        ):
             raise OCILifecycleTransportError("OCI-root lifecycle stream surface is invalid")
         if type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise OCILifecycleTransportError("OCI-root lifecycle timeout is invalid")
@@ -301,9 +320,11 @@ def complete_initial_lifecycle_handoff(
     except BaseException as exc:
         failure = exc
     close_failed = False
-    for operation in ("abort", "free"):
+    for operation in (abort_operation, free_operation):
+        if operation is None:
+            continue
         try:
-            getattr(stream, operation)()
+            operation()
         except Exception:
             close_failed = True
     if failure is not None:

@@ -3051,6 +3051,25 @@ def test_oci_root_private_launch_preallocates_and_validates_stream_before_activa
     assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
 
 
+def test_oci_root_runtime_stream_surface_accepts_binding_without_public_free() -> None:
+    calls = {"abort": 0}
+    stream = SimpleNamespace(
+        send=lambda payload: len(payload),
+        recv=lambda _size: -2,
+        abort=lambda: calls.__setitem__("abort", calls["abort"] + 1),
+    )
+
+    assert oci_root_runtime_module._valid_lifecycle_stream_surface(stream)
+    assert not oci_root_runtime_module._valid_lifecycle_stream_surface(
+        SimpleNamespace(send=stream.send, recv=stream.recv)
+    )
+    assert not oci_root_runtime_module._valid_lifecycle_stream_surface(
+        SimpleNamespace(send=stream.send, recv=stream.recv, abort=stream.abort, free=object())
+    )
+    oci_root_runtime_module._close_unowned_stream(stream)
+    assert calls == {"abort": 1}
+
+
 @pytest.mark.parametrize("failure", ["definite-create", "partial-create", "id-inspection"])
 def test_oci_root_private_launch_create_boundary_uses_durable_activation_intent(
     tmp_path: Path,
