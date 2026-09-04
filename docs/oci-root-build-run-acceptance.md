@@ -124,6 +124,29 @@ rejection (42 QEMU invocations), stage-1 plan/protocol v11, handoff v5,
 init/consumer v13, initramfs manifest/ABI v15, supervisor v6, lifecycle v2,
 fixture policy/schema v9, and domain plan v10/core v4.
 
+Slice 29A adds a separate production-inert v2 host candidate without changing
+that v15 evidence or the active v1 guest/domain contract. The candidate uses a
+per-boot key, direction/carrier-separated HKDF-HMAC-SHA256, a console-only
+signed `BOUNDARY_ACK`, and exact canonical receipt projections that omit the
+raw key and MAC. It distinguishes host-attempted wire sequences from those the
+guest has proven accepted. Partial STOP recovery retains its logical STOP ID.
+For partial RECONNECT, a signed ACK retaining the old connection identity
+retries the same logical request, while an ACK committing the attempted
+connection consumes it and starts a new logical recovery request. Both use
+fresh wire/epoch/nonce/MAC data. A natural-terminal race preserves both possible
+STOP acceptance wires until a later ACK commits one exact value; a STOP-caused
+terminal permits only the attempted STOP wire. Signed receipt projections
+verify the key internally rather than trusting a caller-supplied result.
+Boundary parser evidence accepts only an empty parser, a one-to-three-byte
+partial header, or an incomplete bounded payload.
+
+This candidate remains inert until slice 29B atomically adds PID 1 key custody
+and post-fork wipe proof, guest framing/MAC verification, console boundary
+emission, negative native KVM coverage, regenerated deterministic assets, and
+the complete protocol/broker/isolation/supervisor/plan/guest/initramfs/proof/
+domain version cascade. Until that gate passes, neither v2 nor its boundary ACK
+is a guest-runtime or native-KVM claim.
+
 Production still does not call libvirt `openChannel`, dispatch runtime `STOP`,
 or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
 and skipped. The host nonce provides correlation and a replay challenge, not

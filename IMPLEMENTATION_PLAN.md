@@ -866,6 +866,43 @@ resources or signal peers allowed by the shared PID namespace. Production
 create/start/run/`-d` remains disabled, and native v15 evidence must be
 collected on the qualified Linux x86_64 KVM runner.
 
+### PR 4 slice 29A: authenticated lifecycle v2 host candidate
+
+- A separate, production-inert `palimpsest.oci-lifecycle-control.v2` host
+  candidate now defines the closed-world canonical envelope, incremental frame
+  codec, per-boot key identifier, direction/carrier-separated HKDF-HMAC-SHA256,
+  and constant-time authentication checks. The only unsigned message is the
+  initial `HELLO`; `BOOTSTRAP`, `KEY_ACK`, `RECONNECT`, `READY`, `SNAPSHOT`,
+  `STOP`, and `TERMINAL` use the private channel carrier, while signed
+  `BOUNDARY_ACK` is console-only.
+- The host state machine separates attempted host wire sequence from the last
+  sequence proven accepted by PID 1. A partial STOP therefore recovers through
+  an exact ready ACK/SNAPSHOT and retries the same logical STOP ID with a new
+  wire sequence. If natural termination races a STOP, the host retains the old
+  accepted wire and attempted STOP wire as bounded candidates until a signed
+  ACK commits one; a terminal carrying the STOP ID requires the STOP wire
+  exactly. A partial RECONNECT similarly distinguishes an unaccepted request
+  from an accepted request with a lost SNAPSHOT and uses the committed identity
+  to select same-logical or new-logical recovery under fresh wire data.
+- `BOUNDARY_ACK` binds boot/run/artifact identity, previous accepted connection
+  opener and nonce, lifecycle-state digest, host/guest sequences, and the exact
+  parser discard state. Only empty, a one-to-three-byte partial header, or an
+  incomplete bounded payload are reachable; complete or mixed parser states
+  fail closed. Receipt projections retain only canonical body/envelope digests,
+  key ID, bindings, counters, carrier, direction, and an internally derived
+  verification result. Signed projections require and verify the boot key;
+  callers cannot assert success. They exclude the raw boot key and MAC tag.
+- The v2 candidate is documented and unit-qualified independently of active
+  v1. It does not change the guest binary, domain/plan versions, deterministic
+  stage-1 assets, the retained native v15 receipt, or production dispatch.
+
+Scope boundary: slice 29A is not lifecycle activation. The active guest and
+native KVM proof still use v1, and production create/start/run/`-d` remains
+disabled. Slice 29B must implement PID 1 key custody and post-fork wipe proof,
+the guest v2 codec/MAC/state machine and console boundary path, regenerated
+assets, negative native KVM cases, and the complete fail-closed version cascade
+as one atomic activation gate.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -884,9 +921,11 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v15 lifecycle/isolation receipt and all retained-root plus
-   topology/filesystem/assembly/transition/workload negative evidence on the
-   connected Linux x86_64 KVM runner.
+1. Implement slice 29B: add PID 1-only boot-key custody, guest v2 framing/MAC
+   verification, authenticated console boundary ACKs, replay-safe reconnect,
+   negative native KVM cases, regenerated deterministic assets, and the full
+   protocol/broker/isolation/supervisor/plan/guest/initramfs/proof/domain
+   version cascade. Activate v2 only when that entire gate passes atomically.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH
    search semantics, then generalize the qualified single-workload cgroup
    broker for agent and exec-session ownership.
