@@ -671,7 +671,7 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:ee2f7bc790439250f73b4d43be01ba17c27769bd32acea60aad47314e85cdb95"
+    assert manifest_digest == "sha256:b9220e29d4b306e7e564bb506ec7f128f22ec8abe2149bf8fbd3421654109cf9"
     assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v9"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
@@ -689,10 +689,10 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c",
+        "elf_sha256": "fac936a406b773e5a041b27d8bf91ac702f93060467b4ec83ac0b5c34751bed7",
         "elf_size_bytes": 9868,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "4f6c1e6b7b2a8fef6e4078c3cb3407515db4057a388d706af9a8b2b7ccb1ebec",
+        "source_sha256": "4934d9abc8d695968050b7f2b319906e8819b239919481e20251ed9a0d2aafab",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
 

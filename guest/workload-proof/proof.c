@@ -322,20 +322,20 @@ static int denied_open(const char *path, int flags) {
     return descriptor == -EACCES || descriptor == -EPERM || descriptor == -EROFS;
 }
 
-static int verify_authority_escape_denied(void) {
+static int authority_escape_failure(void) {
     i64 operation;
-    if (!directory_is_empty("/proc/1/fd") ||
-        !directory_is_empty("/proc/1/fdinfo") ||
-        !denied_open("/proc/1/mem", O_RDONLY) ||
-        !denied_open("/proc/sys/kernel/randomize_va_space", O_WRONLY) ||
-        !directory_is_empty("/sys/class/virtio-ports") ||
-        !denied_open("/sys/kernel/uevent_seqnum", O_WRONLY)) return 0;
+    if (!directory_is_empty("/proc/1/fd")) return 1;
+    if (!directory_is_empty("/proc/1/fdinfo")) return 2;
+    if (!denied_open("/proc/1/mem", O_RDONLY)) return 3;
+    if (!denied_open("/proc/sys/kernel/randomize_va_space", O_WRONLY)) return 4;
+    if (!directory_is_empty("/sys/class/virtio-ports")) return 5;
+    if (!denied_open("/sys/kernel/uevent_seqnum", O_WRONLY)) return 6;
     operation = sc5(SYS_mount, 0, (i64)"/dev", 0, 0, 0);
-    if (operation != -EPERM) return 0;
+    if (operation != -EPERM) return 7;
     operation = sc3(SYS_mknod, (i64)"/dev/escape", S_IFCHR | 0600, 0);
-    if (operation != -EPERM) return 0;
+    if (operation != -EPERM) return 8;
     operation = sc1(SYS_unshare, CLONE_NEWNS);
-    return operation == -EPERM;
+    return operation == -EPERM ? 0 : 9;
 }
 
 static int verify_pid1_root_credentials(void) {
@@ -413,6 +413,7 @@ static int invocation_failure(u64 argc, char **argv, char **environment) {
     static const char sentinel[] = "palimpsest-oci-root-workload-proof-v1\n";
     char cwd[64];
     i64 cwd_size;
+    int authority_error;
     int uid0_mode;
     if ((argc != 4 && argc != 5) || !same_text(argv[0], "/.__palimpsest_workload_proof_v1") ||
         !same_text(argv[1], "palimpsest-argv-one") || !same_text(argv[2], "") ||
@@ -434,7 +435,8 @@ static int invocation_failure(u64 argc, char **argv, char **environment) {
     if (!verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs")) return 10;
     if (!verify_capabilityless_boundary()) return 11;
     if (!verify_private_devices()) return 12;
-    if (!verify_authority_escape_denied()) return 13;
+    authority_error = authority_escape_failure();
+    if (authority_error) return 20 + authority_error;
     if (!verify_pid1_root_credentials()) return 14;
     return 0;
 }
