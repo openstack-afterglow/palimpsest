@@ -170,6 +170,21 @@ relabeling, or granting access to the shared CAS blobs. This is not a portable
 AppArmor contract: a production AppArmor export/access boundary remains
 unimplemented, so public OCI-root dispatch remains disabled.
 
+The live qualification harness also injects one file-backed serial console
+only through its test-local domain XML wrapper. It pre-creates
+`console.log` as an owner-only file, requires the exact `path`/`append=on`
+source with its single DAC `relabel=no` child and serial target, and grants the
+libvirt DAC identity temporary `rw-` access through the same broker. The
+no-relabel child is emitted only for an OCI-root file console; the default PTY
+and cloud-image builder remain unchanged. A launch exception receives a
+binary-safe, 128-KiB-bounded console-tail note before the existing domain/ACL
+cleanup runs.
+Successful qualification additionally requires the root-transition,
+workload-started, and lifecycle-ready-committed stage-1 markers. The production
+OCI-root builder and projection carry the no-relabel contract, while the file
+path injection and evidence capture remain test-local; public dispatch is
+unchanged and disabled.
+
 Qualification-root deletion similarly binds the expected device/inode through
 an open descriptor and a random quarantine rename, then walks and removes
 children relative to held directory descriptors while rechecking the root

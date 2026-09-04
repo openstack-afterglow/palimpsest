@@ -2096,6 +2096,11 @@ def test_oci_root_disk_projection_binds_exact_dac_no_relabel_sources(tmp_path: P
     disks = projection["disks"]
     assert disks
     assert all(disk[4] == (("model", "dac"), ("relabel", "no")) for disk in disks)
+    assert projection["console"] == (
+        (("type", "pty"),),
+        None,
+        (("port", "0"), ("type", "serial")),
+    )
 
     root = ET.fromstring(xml)
     ET.indent(root)
@@ -2184,6 +2189,109 @@ def test_oci_root_definition_rejects_later_dac_no_relabel_removal(
     with pytest.raises(StateError, match="disk projection"):
         launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     assert conn.domains[name].create_calls == 0
+
+
+def test_oci_root_file_console_projection_binds_no_relabel_and_rejects_later_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "file-console-seclabel-drift"
+    console_path = (tmp_path / "console.log").resolve()
+    console_path.write_bytes(b"")
+    console_path.chmod(0o600)
+    original_builder = oci_root_kvm_module.build_oci_root_domain_xml
+
+    def build_with_file_console(spec, profile):
+        return original_builder(replace(spec, console_log=console_path), profile)
+
+    monkeypatch.setattr(oci_root_kvm_module, "build_oci_root_domain_xml", build_with_file_console)
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert projection["console"] == (
+        (("type", "file"),),
+        (("append", "on"), ("path", os.fspath(console_path))),
+        (("port", "0"), ("type", "serial")),
+        (("model", "dac"), ("relabel", "no")),
+    )
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(projection)
+
+    root = ET.fromstring(conn.domains[name].xml)
+    source = root.find("./devices/console/source")
+    label = root.find("./devices/console/source/seclabel")
+    assert source is not None and label is not None
+    source.remove(label)
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+    with pytest.raises(StateError, match="console contract"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing-source",
+        "missing-seclabel",
+        "duplicate-seclabel",
+        "wrong-model",
+        "wrong-relabel",
+        "extra-attribute",
+        "text",
+        "child",
+        "namespace",
+        "unknown-source-child",
+    ],
+)
+def test_oci_root_projection_rejects_noncanonical_file_console_seclabel(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    name = f"file-console-seclabel-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    snapshot = read_run_ledger_snapshot(roots, name)
+    xml = oci_root_kvm_module.resolve_committed_oci_root_domain_plan(
+        roots,
+        snapshot,
+        store,
+        boot,
+        profile,
+        runner=tools,
+    ).xml
+    root = ET.fromstring(xml)
+    console = root.find("./devices/console")
+    target = root.find("./devices/console/target")
+    assert console is not None and target is not None
+    console.attrib = {"type": "file"}
+    source = ET.Element("source", {"path": os.fspath((tmp_path / "console.log").resolve()), "append": "on"})
+    label = ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
+    console.insert(0, source)
+    if tamper == "missing-source":
+        console.remove(source)
+    elif tamper == "missing-seclabel":
+        source.remove(label)
+    elif tamper == "duplicate-seclabel":
+        source.append(deepcopy(label))
+    elif tamper == "wrong-model":
+        label.set("model", "selinux")
+    elif tamper == "wrong-relabel":
+        label.set("relabel", "yes")
+    elif tamper == "extra-attribute":
+        label.set("label", "+0:+0")
+    elif tamper == "text":
+        label.text = "forbidden"
+    elif tamper == "child":
+        ET.SubElement(label, "attacker")
+    elif tamper == "namespace":
+        label.tag = "{https://attacker.invalid/domain/v1}seclabel"
+    else:
+        ET.SubElement(source, "attacker")
+
+    with pytest.raises(StateError, match="console contract"):
+        oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
 
 
 @pytest.mark.parametrize("removed_device", ["audio", "watchdog"])

@@ -139,3 +139,13 @@ build/commit/resolve checks to that stable path. The suffix matches the
 qualified server's `virt-aa-helper` whitelist and the raw-disk driver; it is
 not a portable AppArmor contract. Production AppArmor export/access brokering
 is still unimplemented and public OCI-root dispatch remains disabled.
+
+For native diagnostics, the same test-local XML wrapper binds a pre-created
+owner-only `console.log` as the sole file serial console. Its exact
+`path`/`append=on` source carries a required DAC `relabel=no` child and is a
+temporary `rw-` DAC-broker target. That source policy applies only to the
+OCI-root file console; cloud-image consoles and the default OCI-root PTY are
+unchanged. Launch errors are annotated with a binary-safe tail capped at 128
+KiB before normal cleanup; success must contain the stage-1 root-transition, workload-started, and
+lifecycle-ready-committed markers. The public runtime gate remains unchanged
+and disabled.

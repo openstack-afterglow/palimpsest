@@ -17,7 +17,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,9 @@ from palimpsest_local import kvm, oci_root_runtime, platforms
 from palimpsest_local._oci_stage1_kvm_proof import (
     KERNEL_CONFIG_ENV,
     KERNEL_ENV,
+    LIFECYCLE_READY_COMMITTED_MARKER,
+    ROOT_TRANSITION_MARKER,
+    WORKLOAD_STARTED_MARKER,
     load_proof_filesystems,
     verify_kernel_config,
     verify_kvm_api,
@@ -87,6 +90,7 @@ _ENABLE_ENV = "PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT"
 _ROOT_SIZE_BYTES = 16 * 1024 * 1024
 _DAC_BASELABEL_RE = re.compile(r"^\+((?:0|[1-9][0-9]*)):\+((?:0|[1-9][0-9]*))$")
 _MAX_DAC_ID = 2**32 - 2
+_MAX_CONSOLE_TAIL_BYTES = 128 * 1024
 
 
 def _strict_scalar(element: ET.Element, *, attributes: dict[str, str] | None = None) -> str:
@@ -329,6 +333,77 @@ def _copy_qualified_kernel(source: Path, test_root: Path) -> Path:
         if destination_fd is not None:
             os.close(destination_fd)
     return destination
+
+
+def _create_qualification_console(test_root: Path) -> Path:
+    destination = test_root / "console.log"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        visible = destination.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or _stat_identity(visible) != _stat_identity(opened)
+        ):
+            raise ValueError("qualification console identity is unsafe")
+    except OSError:
+        raise ValueError("qualification console cannot be securely created") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return destination
+
+
+def _qualification_console_tail(path: Path) -> str:
+    descriptor: int | None = None
+    try:
+        visible = path.lstat()
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or visible.st_uid != os.geteuid()
+            or opened.st_uid != os.geteuid()
+            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_nlink != 1
+            or opened.st_size < 0
+        ):
+            return "<qualification console identity is unsafe>"
+        offset = max(0, opened.st_size - _MAX_CONSOLE_TAIL_BYTES)
+        payload = os.pread(descriptor, min(opened.st_size, _MAX_CONSOLE_TAIL_BYTES), offset)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino) or (current.st_dev, current.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            return "<qualification console identity changed while reading>"
+        prefix = "[truncated] " if offset else ""
+        return f"{prefix}{payload.decode('utf-8', errors='backslashreplace')}"
+    except OSError as exc:
+        return f"<qualification console unavailable: {type(exc).__name__}>"
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _annotate_qualification_console_failure(error: BaseException, path: Path) -> None:
+    error.add_note(f"qualification guest console tail:\n{_qualification_console_tail(path)}")
 
 
 def _remove_failed_lower_copy(parent_descriptor: int, name: str, expected: os.stat_result) -> None:
@@ -875,6 +950,38 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
         files[path] = permission
     if root_disks != 1:
         raise ValueError("qualification root disk binding is invalid")
+    consoles = xml.findall("./devices/console")
+    if len(consoles) != 1:
+        raise ValueError("qualification console binding is ambiguous")
+    console = consoles[0]
+    console_sources = console.findall("./source")
+    console_targets = console.findall("./target")
+    console_labels = console_sources[0].findall("./seclabel") if console_sources else []
+    if (
+        console.attrib != {"type": "file"}
+        or len(console_sources) != 1
+        or len(console_targets) != 1
+        or len(list(console)) != 2
+        or console_sources[0].attrib.get("append") != "on"
+        or set(console_sources[0].attrib) != {"append", "path"}
+        or console_targets[0].attrib != {"port": "0", "type": "serial"}
+        or len(console_labels) != 1
+        or len(list(console_sources[0])) != 1
+        or console_labels[0].attrib != {"model": "dac", "relabel": "no"}
+        or list(console_labels[0])
+        or list(console_targets[0])
+        or (console.text or "").strip()
+        or (console_sources[0].text or "").strip()
+        or (console_labels[0].text or "").strip()
+        or (console_labels[0].tail or "").strip()
+        or (console_targets[0].text or "").strip()
+        or (console_targets[0].tail or "").strip()
+    ):
+        raise ValueError("qualification console binding is invalid")
+    console_path = Path(console_sources[0].attrib["path"])
+    if console_path in files:
+        raise ValueError("qualification file ACL target is duplicated")
+    files[console_path] = "rw-"
     channels = xml.findall("./devices/channel")
     lifecycle_parents: set[Path] = set()
     for channel in channels:
@@ -1279,6 +1386,40 @@ def test_qualified_kernel_copy_preserves_partial_when_initial_fd_identity_is_una
     assert destination.read_bytes() == b""
 
 
+def test_qualification_console_is_owner_only_and_tail_is_bounded_binary_safe(tmp_path: Path) -> None:
+    console = _create_qualification_console(tmp_path)
+    assert console.name == "console.log"
+    assert console.read_bytes() == b""
+    assert stat.S_IMODE(console.stat().st_mode) == 0o600
+
+    payload = b"a" * (_MAX_CONSOLE_TAIL_BYTES + 7) + b"\xff\nlast"
+    console.write_bytes(payload)
+    tail = _qualification_console_tail(console)
+    assert tail.startswith("[truncated] ")
+    assert "\\xff\nlast" in tail
+    assert len(tail.encode("utf-8")) <= _MAX_CONSOLE_TAIL_BYTES + 32
+
+
+def test_qualification_console_tail_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_bytes(b"attacker")
+    console = tmp_path / "console.log"
+    console.symlink_to(target)
+
+    assert "unavailable" in _qualification_console_tail(console)
+
+
+def test_qualification_console_failure_note_preserves_primary_error(tmp_path: Path) -> None:
+    console = _create_qualification_console(tmp_path)
+    console.write_bytes(b"stage1 failed: \xff")
+    primary = RuntimeError("launch failed")
+
+    _annotate_qualification_console_failure(primary, console)
+
+    assert str(primary) == "launch failed"
+    assert primary.__notes__ == ["qualification guest console tail:\nstage1 failed: \\xff"]
+
+
 def _qualified_lower_fixture(tmp_path: Path) -> tuple[Path, str, int, Path]:
     payload = b"qualified-squashfs-lower"
     digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
@@ -1631,6 +1772,7 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
         "root": tmp_path / "root.raw",
         "stage1": run / "stage1.raw",
         "layer": tmp_path / "layer.raw",
+        "console": tmp_path / "console.log",
     }
     for path in paths.values():
         path.write_bytes(b"x")
@@ -1642,6 +1784,9 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
         '<target dev="vdb" bus="virtio"/></disk>'
         f'<disk><source file="{paths["layer"]}"><seclabel model="dac" relabel="no"/></source>'
         '<target dev="vdc" bus="virtio"/></disk>'
+        f'<console type="file"><source path="{paths["console"]}" append="on">'
+        '<seclabel model="dac" relabel="no"/></source>'
+        '<target type="serial" port="0"/></console>'
         f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
         '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
         "</devices></domain>"
@@ -1653,8 +1798,102 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
     assert actual[(tmp_path, "directory")] == "--x"
     assert actual[(run, "directory")] == "-wx"
     assert actual[(paths["root"], "regular")] == "rw-"
+    assert actual[(paths["console"], "regular")] == "rw-"
     for name in ("kernel", "initrd", "stage1", "layer"):
         assert actual[(paths[name], "regular")] == "r--"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing-console",
+        "duplicate-console",
+        "wrong-type",
+        "missing-source",
+        "duplicate-source",
+        "wrong-source-attrs",
+        "source-text",
+        "source-child",
+        "missing-seclabel",
+        "duplicate-seclabel",
+        "seclabel-model",
+        "seclabel-relabel",
+        "seclabel-extra-attribute",
+        "seclabel-text",
+        "seclabel-child",
+        "seclabel-namespace",
+        "wrong-target",
+        "extra-child",
+    ],
+)
+def test_qualification_acl_specifications_reject_malformed_console(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    paths = [tmp_path / name for name in ("kernel", "initrd", "root.raw", "console.log")]
+    for path in paths:
+        path.write_bytes(b"")
+    kernel, initrd, root_disk, console_path = paths
+    xml = ET.fromstring(
+        f"<domain><os><kernel>{kernel}</kernel><initrd>{initrd}</initrd></os><devices>"
+        f'<disk><source file="{root_disk}"><seclabel model="dac" relabel="no"/></source>'
+        '<target dev="vda" bus="virtio"/></disk>'
+        f'<console type="file"><source path="{console_path}" append="on">'
+        '<seclabel model="dac" relabel="no"/></source>'
+        '<target type="serial" port="0"/></console>'
+        f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
+        '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
+        "</devices></domain>"
+    )
+    devices = xml.find("./devices")
+    console = xml.find("./devices/console")
+    source = xml.find("./devices/console/source")
+    label = xml.find("./devices/console/source/seclabel")
+    target = xml.find("./devices/console/target")
+    assert (
+        devices is not None and console is not None and source is not None and label is not None and target is not None
+    )
+    if tamper == "missing-console":
+        devices.remove(console)
+    elif tamper == "duplicate-console":
+        devices.append(ET.fromstring(ET.tostring(console, encoding="unicode")))
+    elif tamper == "wrong-type":
+        console.set("type", "pty")
+    elif tamper == "missing-source":
+        console.remove(source)
+    elif tamper == "duplicate-source":
+        console.append(ET.fromstring(ET.tostring(source, encoding="unicode")))
+    elif tamper == "wrong-source-attrs":
+        source.set("append", "off")
+    elif tamper == "source-text":
+        source.text = "forbidden"
+    elif tamper == "source-child":
+        ET.SubElement(source, "attacker")
+    elif tamper == "missing-seclabel":
+        source.remove(label)
+    elif tamper == "duplicate-seclabel":
+        source.append(ET.fromstring(ET.tostring(label, encoding="unicode")))
+    elif tamper == "seclabel-model":
+        label.set("model", "selinux")
+    elif tamper == "seclabel-relabel":
+        label.set("relabel", "yes")
+    elif tamper == "seclabel-extra-attribute":
+        label.set("label", "+0:+0")
+    elif tamper == "seclabel-text":
+        label.text = "forbidden"
+    elif tamper == "seclabel-child":
+        ET.SubElement(label, "attacker")
+    elif tamper == "seclabel-namespace":
+        label.tag = "{https://attacker.invalid/domain/v1}seclabel"
+    elif tamper == "wrong-target":
+        target.set("port", "1")
+    else:
+        ET.SubElement(console, "attacker")
+
+    with pytest.raises(ValueError, match="console binding"):
+        _qualification_acl_specifications(tmp_path, ET.tostring(xml, encoding="unicode"))
 
 
 def test_qualification_acl_specifications_require_exact_dac_no_relabel(tmp_path: Path) -> None:
@@ -2444,6 +2683,17 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         roots = init_resolved_roots(StatePaths(qualification_root / "c", qualification_root / "s"))
         store = OCIStore(roots, repair_min_age_seconds=0)
         materialization = _proof_materialization(store)
+        console_path = _create_qualification_console(qualification_root)
+        original_build_oci_root_domain_xml = oci_root_kvm_module.build_oci_root_domain_xml
+
+        def build_qualification_domain_xml(spec: kvm.OCIRootDomainSpec, profile_value: platforms.DomainProfile) -> str:
+            return original_build_oci_root_domain_xml(replace(spec, console_log=console_path), profile_value)
+
+        monkeypatch.setattr(
+            oci_root_kvm_module,
+            "build_oci_root_domain_xml",
+            build_qualification_domain_xml,
+        )
         lower_stage_root = qualification_root / "l"
         lower_stage_root.mkdir(mode=0o700)
         original_verified_lower_path = oci_root_kvm_module._verified_lower_path
@@ -2549,16 +2799,20 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
 
         monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
         activation_conn = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
-        completed = launch_defined_oci_root_domain(
-            roots,
-            name,
-            store,
-            boot,
-            profile,
-            conn=activation_conn,
-            timeout_seconds=45,
-            terminal_timeout_seconds=45,
-        )
+        try:
+            completed = launch_defined_oci_root_domain(
+                roots,
+                name,
+                store,
+                boot,
+                profile,
+                conn=activation_conn,
+                timeout_seconds=45,
+                terminal_timeout_seconds=45,
+            )
+        except BaseException as exc:
+            _annotate_qualification_console_failure(exc, console_path)
+            raise
         assert completed.domain_id > 0
         owned_domain_id = -1
         assert expected_inactive_projection_digest is not None
@@ -2580,6 +2834,11 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
         assert "boot_key" not in repr(lifecycle)
         assert "tag" not in repr(lifecycle)
+        console_tail = _qualification_console_tail(console_path)
+        for marker in (ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, LIFECYCLE_READY_COMMITTED_MARKER):
+            assert marker.decode("ascii") in console_tail, (
+                f"qualification console is missing {marker!r}; tail:\n{console_tail}"
+            )
 
         snapshot = read_run_ledger_snapshot(roots, name)
         assert snapshot.state["status"] == "exited"

@@ -431,19 +431,52 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     console = consoles[0]
     console_targets = console.findall("./target")
     console_sources = console.findall("./source")
+    console_source_label: ET.Element | None = None
+    if console_sources:
+        source_labels = console_sources[0].findall("./seclabel")
+        if len(source_labels) == 1:
+            console_source_label = source_labels[0]
     if (
         len(console_targets) != 1
         or len(console_sources) > 1
         or any(child.tag not in {"address", "alias", "source", "target"} for child in console)
         or list(console_targets[0])
-        or any(list(source) for source in console_sources)
         or len(console.findall("./alias")) > 1
         or len(console.findall("./address")) > 1
+        or console_targets[0].attrib != {"port": "0", "type": "serial"}
+        or (console.text or "").strip()
+        or (console_targets[0].text or "").strip()
+        or any((child.tail or "").strip() for child in console)
+        or (not console_sources and (console.attrib != {"type": "pty"} or console_source_label is not None))
+        or (
+            console_sources
+            and (
+                console.attrib != {"type": "file"}
+                or set(console_sources[0].attrib) != {"append", "path"}
+                or console_sources[0].get("append") != "on"
+                or not isinstance(console_sources[0].get("path"), str)
+                or not console_sources[0].get("path", "").startswith("/")
+                or len(list(console_sources[0])) != 1
+                or console_source_label is None
+                or console_source_label.attrib != {"model": "dac", "relabel": "no"}
+                or list(console_source_label)
+                or (console_sources[0].text or "").strip()
+                or (console_source_label.text or "").strip()
+                or (console_source_label.tail or "").strip()
+            )
+        )
     ):
         raise StateError("defined OCI-root console contract is invalid")
     emulator = _single(root, "./devices/emulator", "defined OCI-root emulator is invalid")
     if emulator.attrib or list(emulator):
         raise StateError("defined OCI-root emulator is invalid")
+    console_projection: tuple[Any, ...] = (
+        tuple(sorted(console.attrib.items())),
+        None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
+        tuple(sorted(console_targets[0].attrib.items())),
+    )
+    if console_source_label is not None:
+        console_projection += (tuple(sorted(console_source_label.attrib.items())),)
     return {
         "channels": tuple(channel_projection),
         "controllers": tuple(controllers),
@@ -464,11 +497,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "memory": memory,
         "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
         "cpu": cpu,
-        "console": (
-            tuple(sorted(console.attrib.items())),
-            None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
-            tuple(sorted(console_targets[0].attrib.items())),
-        ),
+        "console": console_projection,
         "vcpus": _text(root, "./vcpu", "defined OCI-root vCPU contract is invalid"),
     }
 

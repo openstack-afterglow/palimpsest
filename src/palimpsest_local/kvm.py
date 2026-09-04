@@ -434,7 +434,8 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         console = ET.SubElement(devices, "console", {"type": "pty"})
     else:
         console = ET.SubElement(devices, "console", {"type": "file"})
-        ET.SubElement(console, "source", {"path": str(spec.console_log), "append": "on"})
+        console_source = ET.SubElement(console, "source", {"path": str(spec.console_log), "append": "on"})
+        ET.SubElement(console_source, "seclabel", {"model": "dac", "relabel": "no"})
     ET.SubElement(console, "target", {"type": "serial", "port": "0"})
     return ET.tostring(domain, encoding="unicode")
 

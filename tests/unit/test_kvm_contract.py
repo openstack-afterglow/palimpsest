@@ -160,6 +160,29 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
         "path": "/var/lib/palimpsest/runs/oci-demo/lifecycle.sock",
     }
     assert channels[0].find("target").attrib == {"type": "virtio", "name": OCI_CONTROL_CHANNEL_NAME}
+    console = xml.find("./devices/console")
+    assert console is not None and console.attrib == {"type": "pty"}
+    assert console.find("./source") is None
+
+
+def test_oci_root_file_console_disables_dac_relabel_only_for_its_source():
+    spec = _oci_root_spec()
+    xml = ET.fromstring(
+        build_oci_root_domain_xml(
+            OCIRootDomainSpec(**{**spec.__dict__, "console_log": Path("/var/log/palimpsest/oci-console.log")}),
+            _X86_PROFILE,
+        )
+    )
+
+    console = xml.find("./devices/console")
+    source = xml.find("./devices/console/source")
+    label = xml.find("./devices/console/source/seclabel")
+    assert console is not None and console.attrib == {"type": "file"}
+    assert source is not None and source.attrib == {
+        "path": "/var/log/palimpsest/oci-console.log",
+        "append": "on",
+    }
+    assert label is not None and label.attrib == {"model": "dac", "relabel": "no"}
 
 
 def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
@@ -229,6 +252,9 @@ def test_cloud_domain_xml_does_not_gain_oci_lifecycle_topology():
     assert OCI_CONTROL_CHANNEL_NAME not in names
     assert xml.find("./devices/controller[@type='virtio-serial']") is None
     assert xml.findall("./devices/disk/source/seclabel") == []
+    file_console_spec = DomainSpec(**{**_spec().__dict__, "console_log": Path("/var/log/palimpsest/cloud-console.log")})
+    file_console_xml = ET.fromstring(build_domain_xml(file_console_spec, _X86_PROFILE))
+    assert file_console_xml.findall("./devices/console/source/seclabel") == []
 
 
 def test_host_boot_artifact_policy_hashes_valid_explicit_files(tmp_path: Path):
