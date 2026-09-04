@@ -291,22 +291,42 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         raise StateError("defined OCI-root domain root is invalid")
     _validate_top_level_surface(root)
     metadata = _single(root, "./metadata", "defined OCI-root metadata contract is invalid")
-    expected_metadata_tags = {
-        f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle",
-        f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run",
-    }
-    if len(metadata) != 2 or {child.tag for child in metadata} != expected_metadata_tags:
+    if (
+        metadata.attrib
+        or (metadata.text is not None and metadata.text.strip())
+        or (metadata.tail is not None and metadata.tail.strip())
+        or any(child.tail is not None and child.tail.strip() for child in metadata)
+    ):
+        raise StateError("defined OCI-root metadata contract is invalid")
+    marker_tag = f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run"
+    lifecycle_tag = f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle"
+    metadata_tags = [child.tag for child in metadata]
+    if (
+        any(not isinstance(tag, str) or tag not in {lifecycle_tag, marker_tag} for tag in metadata_tags)
+        or metadata_tags.count(marker_tag) != 1
+        or metadata_tags.count(lifecycle_tag) > 1
+    ):
         raise StateError("defined OCI-root metadata contract is invalid")
     marker = _single(
         root,
-        f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run",
+        f"./metadata/{marker_tag}",
         "defined OCI-root ownership marker is invalid",
     )
-    lifecycle = _single(
-        root,
-        f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle",
-        "defined OCI-root lifecycle contract is invalid",
-    )
+    if set(marker.attrib) != {"contract", "id", "schema", "version"} or marker.text is not None or list(marker):
+        raise StateError("defined OCI-root ownership marker is invalid")
+    lifecycle_nodes = metadata.findall(f"./{lifecycle_tag}")
+    lifecycle_projection = {
+        "channel": kvm.OCI_CONTROL_CHANNEL_NAME,
+        "protocol": kvm.OCI_CONTROL_PROTOCOL_V2,
+    }
+    # libvirt retains only the ownership child when two application metadata
+    # children share this namespace.  Absence is normalized to the fixed
+    # lifecycle contract; the run contract digest and exact channel projection
+    # below still bind the per-run source path and guest target.
+    if lifecycle_nodes:
+        lifecycle = lifecycle_nodes[0]
+        if lifecycle.attrib != lifecycle_projection or lifecycle.text is not None or list(lifecycle):
+            raise StateError("defined OCI-root lifecycle contract is invalid")
     channels = root.findall("./devices/channel")
     controllers = [
         (controller.get("type"), controller.get("index"))
@@ -401,7 +421,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "interfaces": tuple(network_projection),
         "kernel": _text(root, "./os/kernel", "defined OCI-root kernel is invalid"),
         "kernel_cmdline": _text(root, "./os/cmdline", "defined OCI-root kernel command line is invalid"),
-        "lifecycle": dict(lifecycle.attrib),
+        "lifecycle": lifecycle_projection,
         "machine": (os_type.get("arch"), os_type.get("machine"), os_type.text),
         "marker": dict(marker.attrib),
         "current_memory": memory,

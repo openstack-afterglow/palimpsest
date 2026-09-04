@@ -2060,6 +2060,112 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
     assert read_run_ledger_snapshot(roots, "safe-defaults").state["status"] == "defined"
 
 
+def test_oci_root_define_accepts_libvirt_elided_redundant_lifecycle_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "elided-lifecycle")
+
+    def elide_lifecycle(xml: str) -> str:
+        root = ET.fromstring(xml)
+        authored_projection = oci_root_runtime_module._domain_projection(xml)
+        metadata = root.find("./metadata")
+        lifecycle = root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle")
+        owner = root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}run")
+        assert metadata is not None and lifecycle is not None and owner is not None
+        metadata.text = "\n  "
+        metadata.tail = "\n"
+        owner.tail = "\n  "
+        lifecycle.tail = "\n"
+        metadata.remove(lifecycle)
+        normalized = ET.tostring(root, encoding="unicode")
+        assert oci_root_runtime_module._domain_projection(normalized) == authored_projection
+        return normalized
+
+    conn = _DefinitionConnection(transform=elide_lifecycle)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    receipt = define_committed_oci_root_domain(
+        roots,
+        "elided-lifecycle",
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+    )
+
+    assert receipt.domain_uuid == conn.domains["elided-lifecycle"].UUIDString()
+    assert read_run_ledger_snapshot(roots, "elided-lifecycle").state["status"] == "defined"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "attributes",
+        "missing-attribute",
+        "content",
+        "binding",
+        "duplicate",
+        "namespace",
+        "owner-missing",
+        "metadata-attribute",
+        "metadata-text",
+        "metadata-tail",
+        "owner-tail",
+        "lifecycle-tail",
+    ],
+)
+def test_oci_root_domain_projection_rejects_noncanonical_lifecycle_metadata(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(
+        tmp_path, f"lifecycle-metadata-{tamper}"
+    )
+    snapshot = read_run_ledger_snapshot(roots, f"lifecycle-metadata-{tamper}")
+    xml = oci_root_kvm_module.resolve_committed_oci_root_domain_plan(
+        roots,
+        snapshot,
+        store,
+        boot,
+        profile,
+        runner=tools,
+    ).xml
+    root = ET.fromstring(xml)
+    metadata = root.find("./metadata")
+    lifecycle = root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle")
+    owner = root.find(f"./metadata/{{{oci_root_runtime_module.kvm.DOMAIN_MARKER_NAMESPACE}}}run")
+    assert metadata is not None and lifecycle is not None and owner is not None
+    if tamper == "attributes":
+        lifecycle.set("extra", "forbidden")
+    elif tamper == "missing-attribute":
+        lifecycle.attrib.pop("protocol")
+    elif tamper == "content":
+        lifecycle.text = "forbidden"
+    elif tamper == "binding":
+        lifecycle.set("channel", "attacker.control")
+    elif tamper == "duplicate":
+        metadata.append(deepcopy(lifecycle))
+    elif tamper == "namespace":
+        lifecycle.tag = "{https://attacker.invalid/domain/v1}lifecycle"
+    elif tamper == "owner-missing":
+        metadata.remove(owner)
+    elif tamper == "metadata-attribute":
+        metadata.set("attacker", "forbidden")
+    elif tamper == "metadata-text":
+        metadata.text = "forbidden"
+    elif tamper == "metadata-tail":
+        metadata.tail = "forbidden"
+    elif tamper == "owner-tail":
+        owner.tail = "forbidden"
+    else:
+        lifecycle.tail = "forbidden"
+
+    with pytest.raises(StateError):
+        oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
+
+
 @pytest.mark.parametrize("tamper", ["mismatch", "duplicate", "extra-attribute", "child"])
 def test_oci_root_define_rejects_noncanonical_generated_current_memory(
     tmp_path: Path,
