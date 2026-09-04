@@ -149,3 +149,11 @@ unchanged. Launch errors are annotated with a binary-safe tail capped at 128
 KiB before normal cleanup; success must contain the stage-1 root-transition, workload-started, and
 lifecycle-ready-committed markers. The public runtime gate remains unchanged
 and disabled.
+
+Libvirt 10 materializes one file-backed serial peer for the file console in
+inactive XML. The projection accepts only the exact mirror: identical source
+path and append mode, the same DAC no-relabel child, and an ISA-serial port-0
+target with its ISA-serial model. Only initial definition of an authored file
+console may normalize the resulting `serial=1` device count. That count and the
+console fingerprint are stored, making later removal or any mirror drift a
+launch blocker; the default PTY does not authorize a file serial mirror.

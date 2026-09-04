@@ -2294,6 +2294,240 @@ def test_oci_root_projection_rejects_noncanonical_file_console_seclabel(
         oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
 
 
+def _with_server_file_console_serial(xml: str, tamper: str | None = None) -> str:
+    root = ET.fromstring(xml)
+    devices = root.find("./devices")
+    console_source = root.find("./devices/console/source")
+    assert devices is not None and console_source is not None
+    serial = ET.SubElement(devices, "serial", {"type": "file"})
+    source = deepcopy(console_source)
+    serial.append(source)
+    label = source.find("./seclabel")
+    target = ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+    model = ET.SubElement(target, "model", {"name": "isa-serial"})
+    assert label is not None
+    if tamper == "duplicate":
+        devices.append(deepcopy(serial))
+    elif tamper == "serial-type":
+        serial.set("type", "pty")
+    elif tamper == "serial-extra-attribute":
+        serial.set("extra", "forbidden")
+    elif tamper == "serial-text":
+        serial.text = "forbidden"
+    elif tamper == "serial-tail":
+        serial.tail = "forbidden"
+    elif tamper == "serial-extra-child":
+        ET.SubElement(serial, "attacker")
+    elif tamper == "missing-source":
+        serial.remove(source)
+    elif tamper == "source-path":
+        source.set("path", "/tmp/attacker.log")
+    elif tamper == "source-append":
+        source.set("append", "off")
+    elif tamper == "source-missing-path":
+        source.attrib.pop("path")
+    elif tamper == "source-missing-append":
+        source.attrib.pop("append")
+    elif tamper == "source-extra-attribute":
+        source.set("extra", "forbidden")
+    elif tamper == "source-text":
+        source.text = "forbidden"
+    elif tamper == "source-tail":
+        source.tail = "forbidden"
+    elif tamper == "source-extra-child":
+        ET.SubElement(source, "attacker")
+    elif tamper == "source-namespace":
+        source.tag = "{https://attacker.invalid/domain/v1}source"
+    elif tamper == "missing-seclabel":
+        source.remove(label)
+    elif tamper == "duplicate-seclabel":
+        source.append(deepcopy(label))
+    elif tamper == "seclabel-model":
+        label.set("model", "selinux")
+    elif tamper == "seclabel-relabel":
+        label.set("relabel", "yes")
+    elif tamper == "seclabel-extra-attribute":
+        label.set("label", "+0:+0")
+    elif tamper == "seclabel-text":
+        label.text = "forbidden"
+    elif tamper == "seclabel-child":
+        ET.SubElement(label, "attacker")
+    elif tamper == "seclabel-namespace":
+        label.tag = "{https://attacker.invalid/domain/v1}seclabel"
+    elif tamper == "missing-target":
+        serial.remove(target)
+    elif tamper == "target-type":
+        target.set("type", "serial")
+    elif tamper == "target-port":
+        target.set("port", "1")
+    elif tamper == "target-missing-type":
+        target.attrib.pop("type")
+    elif tamper == "target-missing-port":
+        target.attrib.pop("port")
+    elif tamper == "target-extra-attribute":
+        target.set("extra", "forbidden")
+    elif tamper == "target-text":
+        target.text = "forbidden"
+    elif tamper == "target-tail":
+        target.tail = "forbidden"
+    elif tamper == "target-namespace":
+        target.tag = "{https://attacker.invalid/domain/v1}target"
+    elif tamper == "missing-model":
+        target.remove(model)
+    elif tamper == "model-name":
+        model.set("name", "serial")
+    elif tamper == "model-missing-name":
+        model.attrib.pop("name")
+    elif tamper == "model-extra-attribute":
+        model.set("extra", "forbidden")
+    elif tamper == "model-text":
+        model.text = "forbidden"
+    elif tamper == "model-tail":
+        model.tail = "forbidden"
+    elif tamper == "model-child":
+        ET.SubElement(model, "attacker")
+    elif tamper == "model-namespace":
+        model.tag = "{https://attacker.invalid/domain/v1}model"
+    return ET.tostring(root, encoding="unicode")
+
+
+def test_oci_root_define_normalizes_exact_server_file_console_serial_and_records_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "file-console-serial-mirror"
+    console_path = (tmp_path / "console.log").resolve()
+    console_path.write_bytes(b"")
+    console_path.chmod(0o600)
+    original_builder = oci_root_kvm_module.build_oci_root_domain_xml
+
+    def build_with_file_console(spec, profile):
+        return original_builder(replace(spec, console_log=console_path), profile)
+
+    monkeypatch.setattr(oci_root_kvm_module, "build_oci_root_domain_xml", build_with_file_console)
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection(transform=_with_server_file_console_serial)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert dict(projection["device_counts"])["serial"] == 1
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(projection)
+    serial = ET.fromstring(conn.domains[name].xml).find("./devices/serial")
+    assert serial is not None
+    assert ET.tostring(serial, encoding="unicode") == (
+        f'<serial type="file"><source path="{console_path}" append="on">'
+        '<seclabel model="dac" relabel="no" /></source><target type="isa-serial" port="0">'
+        '<model name="isa-serial" /></target></serial>'
+    )
+
+    root = ET.fromstring(conn.domains[name].xml)
+    devices = root.find("./devices")
+    serial = root.find("./devices/serial")
+    assert devices is not None and serial is not None
+    devices.remove(serial)
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+    with pytest.raises(StateError, match="changed after definition"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "duplicate",
+        "serial-type",
+        "serial-extra-attribute",
+        "serial-text",
+        "serial-tail",
+        "serial-extra-child",
+        "missing-source",
+        "source-path",
+        "source-append",
+        "source-missing-path",
+        "source-missing-append",
+        "source-extra-attribute",
+        "source-text",
+        "source-tail",
+        "source-extra-child",
+        "source-namespace",
+        "missing-seclabel",
+        "duplicate-seclabel",
+        "seclabel-model",
+        "seclabel-relabel",
+        "seclabel-extra-attribute",
+        "seclabel-text",
+        "seclabel-child",
+        "seclabel-namespace",
+        "missing-target",
+        "target-type",
+        "target-port",
+        "target-missing-type",
+        "target-missing-port",
+        "target-extra-attribute",
+        "target-text",
+        "target-tail",
+        "target-namespace",
+        "missing-model",
+        "model-name",
+        "model-missing-name",
+        "model-extra-attribute",
+        "model-text",
+        "model-tail",
+        "model-child",
+        "model-namespace",
+    ],
+)
+def test_oci_root_define_rejects_noncanonical_server_file_console_serial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    name = f"serial-mirror-{tamper}"
+    console_path = (tmp_path / "console.log").resolve()
+    console_path.write_bytes(b"")
+    original_builder = oci_root_kvm_module.build_oci_root_domain_xml
+
+    def build_with_file_console(spec, profile):
+        return original_builder(replace(spec, console_log=console_path), profile)
+
+    monkeypatch.setattr(oci_root_kvm_module, "build_oci_root_domain_xml", build_with_file_console)
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection(transform=lambda xml: _with_server_file_console_serial(xml, tamper))
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises(StateError, match="serial|device"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert name not in conn.domains
+
+
+def test_oci_root_default_pty_rejects_file_serial_mirror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "pty-file-serial-mirror"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def add_file_serial(xml: str) -> str:
+        root = ET.fromstring(xml)
+        devices = root.find("./devices")
+        assert devices is not None
+        serial = ET.SubElement(devices, "serial", {"type": "file"})
+        source = ET.SubElement(serial, "source", {"path": "/tmp/console.log", "append": "on"})
+        ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
+        target = ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+        ET.SubElement(target, "model", {"name": "isa-serial"})
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=add_file_serial)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    with pytest.raises(StateError, match="file serial mirror"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert name not in conn.domains
+
+
 @pytest.mark.parametrize("removed_device", ["audio", "watchdog"])
 def test_oci_root_define_records_safe_generated_devices_and_rejects_later_removal(
     tmp_path: Path,

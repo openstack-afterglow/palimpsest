@@ -185,6 +185,15 @@ OCI-root builder and projection carry the no-relabel contract, while the file
 path injection and evidence capture remain test-local; public dispatch is
 unchanged and disabled.
 
+On the qualified libvirt 10 host, an inactive domain with that file console
+also contains one generated `<serial type="file">` peer. It is accepted only
+when its source path, `append=on`, DAC no-relabel child, ISA-serial target, and
+ISA-serial model exactly mirror the sole file console. Initial post-define
+comparison normalizes the generated `serial=1` count only for that authored
+file-console form. The stored projection retains the count and console
+fingerprint, so later removal, duplication, source rebinding, or structural
+change fails closed. A file serial remains forbidden for the default PTY.
+
 Qualification-root deletion similarly binds the expected device/inode through
 an open descriptor and a random quarantine rename, then walks and removes
 children relative to held directory descriptors while rechecking the root

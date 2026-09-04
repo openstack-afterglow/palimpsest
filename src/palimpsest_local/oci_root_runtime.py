@@ -148,14 +148,54 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
     return tuple(sorted(projected))
 
 
-def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...]:
+def _validate_file_console_serial_mirror(serial: ET.Element, console_source: ET.Element | None) -> None:
+    sources = serial.findall("./source")
+    targets = serial.findall("./target")
+    source_labels = sources[0].findall("./seclabel") if sources else []
+    models = targets[0].findall("./model") if targets else []
+    if (
+        console_source is None
+        or serial.attrib != {"type": "file"}
+        or [child.tag for child in serial] != ["source", "target"]
+        or len(sources) != 1
+        or len(targets) != 1
+        or sources[0].attrib != console_source.attrib
+        or len(source_labels) != 1
+        or len(list(sources[0])) != 1
+        or source_labels[0].attrib != {"model": "dac", "relabel": "no"}
+        or targets[0].attrib != {"port": "0", "type": "isa-serial"}
+        or [child.tag for child in targets[0]] != ["model"]
+        or len(models) != 1
+        or models[0].attrib != {"name": "isa-serial"}
+        or list(source_labels[0])
+        or list(models[0])
+        or (serial.text or "").strip()
+        or (serial.tail or "").strip()
+        or (sources[0].text or "").strip()
+        or (sources[0].tail or "").strip()
+        or (source_labels[0].text or "").strip()
+        or (source_labels[0].tail or "").strip()
+        or (targets[0].text or "").strip()
+        or (targets[0].tail or "").strip()
+        or (models[0].text or "").strip()
+        or (models[0].tail or "").strip()
+    ):
+        raise StateError("defined OCI-root generated file serial mirror is invalid")
+
+
+def _validate_devices_surface(
+    devices: ET.Element,
+    *,
+    file_console_source: ET.Element | None = None,
+) -> tuple[tuple[str, int], ...]:
     """Reject host-resource devices; admit only bounded inert normalization.
 
     Libvirt may synthesize a disabled audio backend, a reset-only watchdog,
-    bus controllers, a PTY serial peer, legacy input devices, a panic notifier,
-    or a virtio balloon in inactive XML.  Those classes have no host path/source
-    selector and are bounded here.  Every authored OCI-root device remains part
-    of the exact projection below.
+    bus controllers, a PTY serial peer, an exact file-console serial mirror,
+    legacy input devices, a panic notifier, or a virtio balloon in inactive
+    XML.  Only the file-console mirror has a host path, and that path plus its
+    complete shape must equal the authored console source.  Every authored
+    OCI-root device remains part of the exact projection below.
     """
 
     authored = {"channel", "console", "disk", "emulator", "interface"}
@@ -191,7 +231,7 @@ def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...
             raise StateError(f"defined OCI-root device class is forbidden: {tag}")
         generated_counts[tag] = generated_counts.get(tag, 0) + 1
         limits = {"audio": 1, "input": 2, "memballoon": 1, "panic": 1, "serial": 1, "watchdog": 1}
-        if generated_counts[tag] > limits[tag] or child.find(".//source") is not None:
+        if generated_counts[tag] > limits[tag] or (tag != "serial" and child.find(".//source") is not None):
             raise StateError("defined OCI-root generated device set is invalid")
         if tag == "audio":
             if child.attrib != {"id": "1", "type": "none"} or child.text is not None or list(child):
@@ -218,15 +258,21 @@ def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...
         ):
             raise StateError("defined OCI-root generated panic device is invalid")
         if tag == "serial":
-            targets = child.findall("./target")
-            if (
-                child.attrib != {"type": "pty"}
-                or len(targets) != 1
-                or targets[0].get("port") != "0"
-                or targets[0].get("type") not in {"isa-serial", "serial"}
-                or any(grandchild.tag not in {"address", "alias", "target"} for grandchild in child)
-            ):
-                raise StateError("defined OCI-root generated serial device is invalid")
+            if child.get("type") == "file":
+                _validate_file_console_serial_mirror(child, file_console_source)
+                counts[tag] = generated_counts[tag]
+            else:
+                targets = child.findall("./target")
+                if (
+                    file_console_source is not None
+                    or child.attrib != {"type": "pty"}
+                    or len(targets) != 1
+                    or targets[0].get("port") != "0"
+                    or targets[0].get("type") not in {"isa-serial", "serial"}
+                    or any(grandchild.tag not in {"address", "alias", "target"} for grandchild in child)
+                    or child.find(".//source") is not None
+                ):
+                    raise StateError("defined OCI-root generated serial device is invalid")
     required = {"channel": 1, "console": 1, "emulator": 1}
     if any(counts.get(tag, 0) != count for tag, count in required.items()):
         raise StateError("defined OCI-root authored device multiplicity is invalid")
@@ -481,7 +527,10 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "channels": tuple(channel_projection),
         "controllers": tuple(controllers),
         "disks": _disk_projection(root),
-        "device_counts": _validate_devices_surface(_single(root, "./devices", "defined OCI-root devices are invalid")),
+        "device_counts": _validate_devices_surface(
+            _single(root, "./devices", "defined OCI-root devices are invalid"),
+            file_console_source=console_sources[0] if console_source_label is not None else None,
+        ),
         "domain_type": root.get("type"),
         "emulator": emulator.text,
         "features": tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(features)),
@@ -577,6 +626,15 @@ def _validated_post_define_projection(
     for generated_device in ("audio", "watchdog"):
         if generated_device not in authored_device_counts and actual_device_counts.get(generated_device) == 1:
             authored_device_counts[generated_device] = 1
+    authored_console = authored.get("console")
+    if (
+        isinstance(authored_console, tuple)
+        and len(authored_console) == 4
+        and authored_console[0] == (("type", "file"),)
+        and "serial" not in authored_device_counts
+        and actual_device_counts.get("serial") == 1
+    ):
+        authored_device_counts["serial"] = 1
     authored["device_counts"] = tuple(sorted(authored_device_counts.items()))
     if actual != authored:
         raise StateError("defined OCI-root domain does not match the committed contract")
