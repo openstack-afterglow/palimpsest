@@ -479,29 +479,37 @@ def _validate_machine_alias(
         or authored_name != profile.machine
         or authored_type != "hvm"
         or actual_type != authored_type
+        or profile.domain_type != "kvm"
         or not isinstance(actual_name, str)
         or not actual_name
     ):
         raise StateError("defined OCI-root machine contract is invalid")
     try:
-        capabilities = conn.getCapabilities()
+        inspect_capabilities = conn.getDomainCapabilities
+        if not callable(inspect_capabilities):
+            raise TypeError
+        capabilities = inspect_capabilities(
+            str(profile.emulator),
+            profile.arch,
+            profile.machine,
+            profile.domain_type,
+            0,
+        )
         root = ET.fromstring(capabilities)
     except Exception as exc:
         raise StateError("libvirt machine alias capabilities cannot be inspected") from exc
-    if root.tag != "capabilities":
+    if root.tag != "domainCapabilities" or root.attrib or (root.text is not None and root.text.strip()):
         raise StateError("libvirt machine alias capabilities are invalid")
-    matching_machines: list[ET.Element] = []
-    for guest in root.findall("./guest"):
-        if guest.findtext("./os_type") != "hvm":
-            continue
-        for arch in guest.findall("./arch"):
-            if arch.get("name") != authored_arch:
-                continue
-            for machine in arch.findall("./machine"):
-                if machine.text == authored_name:
-                    matching_machines.append(machine)
-    if len(matching_machines) != 1 or matching_machines[0].get("canonical") != actual_name:
-        raise StateError("defined OCI-root machine alias is not an exact libvirt capability mapping")
+    expected_scalars = {
+        "arch": authored_arch,
+        "domain": profile.domain_type,
+        "machine": actual_name,
+        "path": str(profile.emulator),
+    }
+    for tag, expected in expected_scalars.items():
+        scalar = _single(root, f"./{tag}", "libvirt machine alias domain capabilities are ambiguous")
+        if scalar.attrib or scalar.text != expected or list(scalar):
+            raise StateError("defined OCI-root machine alias is not an exact libvirt domain capability")
 
 
 def _validated_post_define_projection(

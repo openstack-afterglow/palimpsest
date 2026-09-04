@@ -1734,15 +1734,17 @@ class _DefinitionConnection:
             free=lambda: None,
         )
         self.stream_flags: list[int] = []
+        self.domain_capability_calls: list[tuple[str, str, str, str, int]] = []
 
     def getURI(self) -> str:
         return self.uri
 
-    def getCapabilities(self) -> str:
+    def getDomainCapabilities(self, emulator: str, arch: str, machine: str, domain: str, flags: int) -> str:
+        self.domain_capability_calls.append((emulator, arch, machine, domain, flags))
         return (
-            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
-            "<machine canonical='pc-q35-noble'>q35</machine>"
-            "</arch></guest></capabilities>"
+            "<domainCapabilities>"
+            f"<path>{emulator}</path><domain>{domain}</domain><machine>pc-q35-noble</machine><arch>{arch}</arch>"
+            "</domainCapabilities>"
         )
 
     def lookupByName(self, name: str) -> _DefinedDomain:
@@ -2376,6 +2378,7 @@ def test_oci_root_define_records_capability_validated_canonical_machine_projecti
 
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
+    assert conn.domain_capability_calls == [(str(profile.emulator), profile.arch, profile.machine, "kvm", 0)]
     definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
     actual_projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
     assert definition["schema"] == "palimpsest.oci-root-definition.v2"
@@ -2390,7 +2393,20 @@ def test_oci_root_define_records_capability_validated_canonical_machine_projecti
     assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
 
 
-@pytest.mark.parametrize("capability", ["missing", "wrong", "ambiguous", "mixed"])
+@pytest.mark.parametrize(
+    "capability",
+    [
+        "missing-method",
+        "malformed-root",
+        "duplicate",
+        "wrong-path",
+        "wrong-domain",
+        "wrong-machine",
+        "wrong-arch",
+        "scalar-attributes",
+        "scalar-child",
+    ],
+)
 def test_oci_root_define_rejects_unproven_machine_alias_normalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2405,28 +2421,36 @@ def test_oci_root_define_rejects_unproven_machine_alias_normalization(
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=canonicalize_machine)
-    if capability == "missing":
-        conn.getCapabilities = lambda: "<capabilities/>"  # type: ignore[method-assign]
-    elif capability == "wrong":
-        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
-            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
-            "<machine canonical='pc-q35-other'>q35</machine>"
-            "</arch></guest></capabilities>"
-        )
-    elif capability == "ambiguous":
-        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
-            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
-            "<machine canonical='pc-q35-noble'>q35</machine>"
-            "<machine canonical='pc-q35-noble'>q35</machine>"
-            "</arch></guest></capabilities>"
-        )
+    if capability == "missing-method":
+        conn.getDomainCapabilities = None  # type: ignore[method-assign]
     else:
-        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
-            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
-            "<machine canonical='pc-q35-noble'>q35</machine>"
-            "<machine>q35</machine>"
-            "</arch></guest></capabilities>"
-        )
+
+        def bad_domain_capabilities(emulator: str, arch: str, machine: str, domain: str, flags: int) -> str:
+            assert (emulator, arch, machine, domain, flags) == (
+                str(profile.emulator),
+                profile.arch,
+                profile.machine,
+                "kvm",
+                0,
+            )
+            root = ET.Element("capabilities" if capability == "malformed-root" else "domainCapabilities")
+            values = {
+                "path": "/foreign/qemu" if capability == "wrong-path" else emulator,
+                "domain": "qemu" if capability == "wrong-domain" else domain,
+                "machine": "pc-q35-8.2" if capability == "wrong-machine" else "pc-q35-noble",
+                "arch": "aarch64" if capability == "wrong-arch" else arch,
+            }
+            for tag, value in values.items():
+                ET.SubElement(root, tag).text = value
+            if capability == "duplicate":
+                ET.SubElement(root, "machine").text = values["machine"]
+            elif capability == "scalar-attributes":
+                root.find("./machine").set("canonical", "forbidden")
+            elif capability == "scalar-child":
+                ET.SubElement(root.find("./machine"), "attacker")
+            return ET.tostring(root, encoding="unicode")
+
+        conn.getDomainCapabilities = bad_domain_capabilities  # type: ignore[method-assign]
     monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
 
     with pytest.raises(StateError, match="machine alias"):
