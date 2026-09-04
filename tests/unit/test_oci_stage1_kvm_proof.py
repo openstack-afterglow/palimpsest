@@ -1046,6 +1046,58 @@ time.sleep(2)
     temporary.cleanup()
 
 
+def test_console_reader_accepts_workload_failure_after_v2_key_ack(tmp_path: Path) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    temporary = tempfile.TemporaryDirectory(prefix="pali-lifecycle-workload-failure-", dir="/tmp")
+    channel = (Path(temporary.name) / "lifecycle.sock").resolve()
+    expected = WORKLOAD_NEGATIVE_REJECTION_MARKERS["workload_missing_executable"]
+    program = f"""
+import socket, struct, sys, time
+from palimpsest_local.oci_control_protocol_v2 import OCIControlV2Message, decode_frame, encode_frame, sign_message, verify_message_authentication
+
+def receive(connection):
+    header = b''
+    while len(header) < 4:
+        header += connection.recv(1)
+    size = struct.unpack('>I', header)[0]
+    payload = b''
+    while len(payload) < size:
+        payload += connection.recv(1)
+    return decode_frame(header + payload)
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen(1)
+connection, _ = listener.accept()
+hello = receive(connection)
+key = bytes(range(32))
+bootstrap = sign_message(OCIControlV2Message(kind='BOOTSTRAP', binding=hello.body.binding,
+    boot_attempt_id=hello.body.boot_attempt_id, host_nonce=hello.body.host_nonce, epoch=1,
+    wire_sequence=1, payload={{'boot_key': key.hex()}},
+    boot_generation='11111111-1111-4111-8111-111111111111', reply_to=hello.body.request_id), key)
+connection.sendall(encode_frame(bootstrap))
+key_ack = receive(connection)
+verify_message_authentication(key_ack, key)
+sys.stdout.buffer.write({expected!r} + b'\\n')
+sys.stdout.flush()
+time.sleep(2)
+"""
+    console = _read_console_until(
+        (sys.executable, "-c", program, os.fspath(channel)),
+        expected=expected,
+        forbidden=(SUCCESS_MARKER, WORKLOAD_STARTED_MARKER),
+        timeout_seconds=3,
+        require_alive_after_marker=True,
+        lifecycle_socket_path=channel,
+        lifecycle_binding=binding,
+        lifecycle_success=False,
+    )
+    assert _logical_line_count(console, expected) == 1
+    temporary.cleanup()
+
+
 def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path: Path) -> None:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)

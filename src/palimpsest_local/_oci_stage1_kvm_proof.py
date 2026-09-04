@@ -4195,7 +4195,7 @@ def _read_console_until(
                             close_channel()
                             channel_finished = True
                             continue
-                        if lifecycle_success is False and session.state == "hello-sent":
+                        if lifecycle_success is False and session.state == "key-ack-sent":
                             close_channel()
                             channel_finished = True
                             continue
@@ -4388,7 +4388,7 @@ def _read_console_until(
             lifecycle_complete = (
                 session is None
                 or (lifecycle_success is True and session.state == "terminal")
-                or (lifecycle_success is False and session.state == "hello-sent")
+                or (lifecycle_success is False and session.state == "key-ack-sent")
             )
             if lifecycle_scenario == "composite":
                 lifecycle_complete = composite_done and connection_ordinal == 6
