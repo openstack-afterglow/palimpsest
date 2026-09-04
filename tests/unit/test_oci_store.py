@@ -2031,6 +2031,11 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
 
     def safe_defaults(xml: str) -> str:
         root = ET.fromstring(xml)
+        memory = root.find("./memory")
+        assert memory is not None and memory.text is not None
+        memory.set("unit", "KiB")
+        memory.text = str(int(memory.text) * 1024)
+        ET.SubElement(root, "currentMemory", dict(memory.attrib)).text = memory.text
         ET.SubElement(root, "clock", {"offset": "utc"})
         ET.SubElement(root, "on_poweroff").text = "destroy"
         ET.SubElement(root, "on_reboot").text = "restart"
@@ -2053,6 +2058,41 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
 
     assert receipt.domain_uuid == conn.domains["safe-defaults"].UUIDString()
     assert read_run_ledger_snapshot(roots, "safe-defaults").state["status"] == "defined"
+
+
+@pytest.mark.parametrize("tamper", ["mismatch", "duplicate", "extra-attribute", "child"])
+def test_oci_root_define_rejects_noncanonical_generated_current_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    name = f"current-memory-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def bad_current_memory(xml: str) -> str:
+        root = ET.fromstring(xml)
+        memory = root.find("./memory")
+        assert memory is not None and memory.text is not None
+        current = ET.SubElement(root, "currentMemory", dict(memory.attrib))
+        current.text = memory.text
+        if tamper == "mismatch":
+            current.text = str(int(memory.text) + 1)
+        elif tamper == "duplicate":
+            ET.SubElement(root, "currentMemory", dict(memory.attrib)).text = memory.text
+        elif tamper == "extra-attribute":
+            current.set("placement", "static")
+        else:
+            ET.SubElement(current, "attacker")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=bad_current_memory)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises(StateError):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
 
 
 @pytest.mark.parametrize("tamper", ["lower", "root", "transport", "kernel", "socket", "profile"])

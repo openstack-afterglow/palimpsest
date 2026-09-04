@@ -218,7 +218,7 @@ def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...
 
 def _validate_top_level_surface(root: ET.Element) -> None:
     authored = {"cpu", "devices", "features", "memory", "metadata", "name", "os", "vcpu"}
-    safe_defaults = {"clock", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
+    safe_defaults = {"clock", "currentMemory", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
     counts: dict[str, int] = {}
     for child in list(root):
         if not isinstance(child.tag, str) or "}" in child.tag:
@@ -241,6 +241,11 @@ def _validate_top_level_surface(root: ET.Element) -> None:
         elif child.tag == "clock":
             if child.attrib != {"offset": "utc"} or any(grandchild.tag != "timer" for grandchild in child):
                 raise StateError("defined OCI-root generated clock is invalid")
+        elif child.tag == "currentMemory":
+            # libvirt may materialize this redundant field in inactive XML.  Its
+            # value is checked against memory after authored multiplicity has
+            # been established below.
+            pass
         elif child.tag in {"on_crash", "on_poweroff", "on_reboot"}:
             expected = {"on_crash": "destroy", "on_poweroff": "destroy", "on_reboot": "restart"}[child.tag]
             if child.text != expected or child.attrib or list(child):
@@ -256,6 +261,25 @@ def _validate_top_level_surface(root: ET.Element) -> None:
                 raise StateError("defined OCI-root generated power-management default is invalid")
     if any(counts.get(tag, 0) != 1 for tag in authored):
         raise StateError("defined OCI-root authored top-level multiplicity is invalid")
+    _memory_projection(root)
+
+
+def _memory_projection(root: ET.Element) -> tuple[str, int]:
+    memory = _single(root, "./memory", "defined OCI-root memory contract is invalid")
+    if (
+        set(memory.attrib) != {"unit"}
+        or memory.get("unit") not in {"KiB", "MiB"}
+        or re.fullmatch(r"[1-9][0-9]*", memory.text or "") is None
+        or list(memory)
+    ):
+        raise StateError("defined OCI-root memory contract is invalid")
+    current = root.findall("./currentMemory")
+    if current and (
+        len(current) != 1 or current[0].attrib != memory.attrib or current[0].text != memory.text or list(current[0])
+    ):
+        raise StateError("defined OCI-root generated current memory is invalid")
+    multiplier = 1 if memory.get("unit") == "KiB" else 1024
+    return ("KiB", int(memory.text or "0") * multiplier)
 
 
 def _domain_projection(xml: str) -> dict[str, Any]:
@@ -343,7 +367,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         or any(len(os_element.findall(f"./{tag}")) != 1 for tag in expected_os_children)
     ):
         raise StateError("defined OCI-root direct-boot contract is invalid")
-    memory = _single(root, "./memory", "defined OCI-root memory contract is invalid")
+    memory = _memory_projection(root)
     cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
     features = _single(root, "./features", "defined OCI-root feature contract is invalid")
     consoles = root.findall("./devices/console")
@@ -380,7 +404,8 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "lifecycle": dict(lifecycle.attrib),
         "machine": (os_type.get("arch"), os_type.get("machine"), os_type.text),
         "marker": dict(marker.attrib),
-        "memory": (memory.get("unit"), memory.text),
+        "current_memory": memory,
+        "memory": memory,
         "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
         "cpu": (
             tuple(sorted(cpu.attrib.items())),
