@@ -477,15 +477,17 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
     assert domain.undefine_calls == 1
 
 
-def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanup(
+def test_live_oci_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     boot, profile = _require_live_host(tmp_path)
-    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    roots = init_resolved_roots(StatePaths(tmp_path / "c", tmp_path / "s"))
     store = OCIStore(roots, repair_min_age_seconds=0)
     materialization = _proof_materialization(store)
-    name = f"pali-live-{uuid.uuid4().hex[:12]}"
+    name = f"p-{uuid.uuid4().hex[:6]}"
+    lifecycle_path = roots.runs / name / "lifecycle.sock"
+    assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
     prepared: PreparedOCIRootRun | None = None
     conn = kvm.connect(profile.uri)
     owned_uuid: str | None = None
@@ -554,7 +556,6 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
         assert definition["schema"] == "palimpsest.oci-root-definition.v2"
         expected_inactive_projection_digest = definition["projection_digest"]
         direct_connect_attempts: list[object] = []
-        lifecycle_path = roots.runs / name / "lifecycle.sock"
         original_connect = socket.socket.connect
 
         def reject_direct_lifecycle_connect(instance: socket.socket, address: object) -> object:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -16,6 +17,7 @@ from palimpsest_local.errors import StateError
 from palimpsest_local.kvm import (
     DOMAIN_MARKER_NAMESPACE,
     DOMAIN_MARKER_VERSION,
+    LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES,
     MAX_LAYER_DISKS,
     DomainSpec,
     KvmError,
@@ -177,6 +179,37 @@ def test_oci_root_domain_xml_rejects_wrong_platform_and_layer_order():
             OCIRootDomainSpec(**{**spec.__dict__, "lifecycle_socket": Path("relative/lifecycle.sock")}),
             _X86_PROFILE,
         )
+
+
+@pytest.mark.parametrize(
+    ("size", "accepted"),
+    [
+        (LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES, True),
+        (LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES + 1, False),
+    ],
+)
+def test_oci_root_lifecycle_socket_path_enforces_linux_af_unix_byte_boundary(size: int, accepted: bool):
+    suffix = "/lifecycle.sock"
+    socket_path = Path("/" + "a" * (size - len(os.fsencode(suffix)) - 1) + suffix)
+    assert len(os.fsencode(socket_path)) == size
+    spec = _oci_root_spec()
+    candidate = OCIRootDomainSpec(**{**spec.__dict__, "lifecycle_socket": socket_path})
+
+    if accepted:
+        build_oci_root_domain_xml(candidate, _X86_PROFILE)
+    else:
+        with pytest.raises(KvmError, match="AF_UNIX pathname limit"):
+            build_oci_root_domain_xml(candidate, _X86_PROFILE)
+
+
+def test_oci_root_lifecycle_socket_path_rejects_embedded_nul():
+    spec = _oci_root_spec()
+    candidate = OCIRootDomainSpec(
+        **{**spec.__dict__, "lifecycle_socket": Path("/var/lib/palimpsest/\0/lifecycle.sock")}
+    )
+
+    with pytest.raises(KvmError, match="lifecycle socket path"):
+        build_oci_root_domain_xml(candidate, _X86_PROFILE)
 
 
 def test_cloud_domain_xml_does_not_gain_oci_lifecycle_topology():

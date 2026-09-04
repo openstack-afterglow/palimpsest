@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ _NETWORK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _DISK_LETTERS = "bcdefghijklmnopqrstuvwxyz"
 MAX_LAYER_DISKS = len(_DISK_LETTERS)
 MAX_OCI_ROOT_LAYER_DISKS = MAX_LAYER_DISKS - 1
+LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES = 107
 DOMAIN_MARKER_VERSION = "0.1.0"
 DOMAIN_MARKER_NAMESPACE = "https://afterglow.dev/palimpsest-local/domain/v1"
 ET.register_namespace("palimpsest", DOMAIN_MARKER_NAMESPACE)
@@ -35,6 +37,19 @@ class KvmError(RuntimeError):
 
 class KvmUnavailable(KvmError):
     """The optional libvirt runtime is unavailable."""
+
+
+def _validate_oci_lifecycle_socket_path(path: Path | None) -> None:
+    if not isinstance(path, Path) or not path.is_absolute() or path.name != "lifecycle.sock":
+        raise KvmError("OCI-root lifecycle socket path is invalid")
+    try:
+        encoded = os.fsencode(path)
+    except (TypeError, UnicodeError, ValueError):
+        raise KvmError("OCI-root lifecycle socket path is invalid") from None
+    if b"\0" in encoded:
+        raise KvmError("OCI-root lifecycle socket path is invalid")
+    if len(encoded) > LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES:
+        raise KvmError("OCI-root lifecycle socket path exceeds the Linux AF_UNIX pathname limit")
 
 
 @dataclass(frozen=True)
@@ -309,12 +324,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root boot contract digest is not canonical")
     if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL_V2:
         raise KvmError("OCI-root lifecycle channel contract is invalid")
-    if (
-        not isinstance(spec.lifecycle_socket, Path)
-        or not spec.lifecycle_socket.is_absolute()
-        or spec.lifecycle_socket.name != "lifecycle.sock"
-    ):
-        raise KvmError("OCI-root lifecycle socket path is invalid")
+    _validate_oci_lifecycle_socket_path(spec.lifecycle_socket)
 
     seen_serials = {spec.root_serial}
     for index, layer in enumerate(spec.layers):

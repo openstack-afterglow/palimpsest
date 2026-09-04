@@ -9,6 +9,7 @@ import os
 import pickle
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -138,6 +139,13 @@ def _squashfs(payload: bytes = b"payload" + b"\0" * 57, *, align: bool = True) -
 def _store(tmp_path: Path, *, repair_age: float = 0) -> tuple[StatePaths, OCIStore]:
     roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
     return roots, OCIStore(roots, repair_min_age_seconds=repair_age)
+
+
+def _short_oci_store() -> tuple[StatePaths, OCIStore]:
+    temporary = tempfile.TemporaryDirectory(prefix="p-", dir=Path("/tmp").resolve())
+    roots, store = _store(Path(temporary.name))
+    store._test_temporary_directory = temporary
+    return roots, store
 
 
 def _occurrence(ordinal: int = 0) -> DerivedLayerOccurrence:
@@ -1781,7 +1789,7 @@ class _DefinitionConnection:
 
 
 def _committed_oci_domain(tmp_path: Path, name: str):
-    roots, store = _store(tmp_path)
+    roots, store = _short_oci_store()
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
     kernel_bytes = bytearray(0x206)
@@ -1836,7 +1844,7 @@ def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: 
 
 
 def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Path, monkeypatch) -> None:
-    roots, store = _store(tmp_path)
+    roots, store = _short_oci_store()
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
     kernel_bytes = bytearray(0x206)
@@ -3325,7 +3333,7 @@ def test_oci_root_domain_transport_commit_failure_is_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    roots, store = _store(tmp_path)
+    roots, store = _short_oci_store()
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
     kernel_bytes = bytearray(0x206)
