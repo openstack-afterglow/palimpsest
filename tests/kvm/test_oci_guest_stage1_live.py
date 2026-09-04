@@ -21,6 +21,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
     ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
+    WORKLOAD_ISOLATION_MARKER,
     WORKLOAD_NEGATIVE_CONTROL_NAMES,
     WORKLOAD_NEGATIVE_REJECTION_MARKERS,
     WORKLOAD_STARTED_MARKER,
@@ -31,15 +32,15 @@ from palimpsest_local._oci_stage1_kvm_proof import (
 pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
 
 
-def test_packaged_stage1_supervises_workload_and_rejects_all_40_boot_control_matrices() -> None:
+def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_41_boot_control_matrices() -> None:
     if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
         pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
 
     result = run_oci_stage1_kvm_proof()
 
     receipt = result.receipt.to_dict()
-    assert receipt["executed_boots"] == 40
-    assert receipt["qemu_invocations"] == 41
+    assert receipt["executed_boots"] == 41
+    assert receipt["qemu_invocations"] == 42
     assert receipt["qualification"] == {
         "accelerator": "kvm",
         "architecture": "x86_64",
@@ -63,17 +64,18 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_40_boot_control_mat
     }
     assert receipt["workload_started"] is True
     assert receipt["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v5",
+        "contract": "palimpsest.guest-pid1-supervisor.v6",
         "cgroup": "/palimpsest.workload",
-        "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],
         "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "cooperative_status": 43,
-        "credential_timing": "child-after-parent-cgroup-attach-release",
+        "credential_timing": "child-isolate-drop-verify-parent-attach-release",
         "forced_status": 137,
         "forwarded_signal": 15,
         "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
@@ -82,6 +84,7 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_40_boot_control_mat
         "terminal_state": "parent-marker-then-fail-closed-wait",
         "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+        "uid0_capabilityless_proven": True,
     }
     assert receipt["lifecycle"]["single_connection_proven"] is True
     assert receipt["lifecycle"]["reconnect_proven"] is True
@@ -109,12 +112,17 @@ def test_packaged_stage1_supervises_workload_and_rejects_all_40_boot_control_mat
     assert receipt["overlay_assembled"] is True
     assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.console, ROOT_TRANSITION_MARKER) == 1
+    assert _logical_line_count(result.console, WORKLOAD_ISOLATION_MARKER) == 1
     assert _logical_line_count(result.console, WORKLOAD_STARTED_MARKER) == 1
     assert _logical_line_count(result.console, REJECTION_MARKER) == 0
     assert _logical_line_count(result.console, ASSEMBLY_REJECTION_MARKER) == 0
     assert _logical_line_count(result.console, ROOT_TRANSITION_REJECTION_MARKER) == 0
     assert _logical_line_count(result.retained_console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.retained_console, ROOT_TRANSITION_MARKER) == 1
+    assert _logical_line_count(result.retained_console, WORKLOAD_ISOLATION_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, WORKLOAD_ISOLATION_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, WORKLOAD_STARTED_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, SUCCESS_MARKER) == 1
     assert _logical_line_count(result.retained_console, WORKLOAD_STARTED_MARKER) == 1
     assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
     for console in result.negative_consoles.values():

@@ -29,12 +29,13 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v10"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v10"
-OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v4"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v11"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v11"
+OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v5"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
-OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-explicit-user-group.v1"
+OCI_STAGE1_PROCESS_POLICY = "absolute-argv0-numeric-capabilityless-isolated-user-group.v2"
+OCI_STAGE1_WORKLOAD_ISOLATION = "palimpsest.workload-lifecycle-authority-isolation.v1"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
 _PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+$")
@@ -283,6 +284,7 @@ class OCIStage1Plan:
             "boot_plan_digest": self.boot_plan_digest,
             "domain_core_digest": self.domain_core_digest,
             "handoff": OCI_STAGE1_HANDOFF,
+            "isolation": OCI_STAGE1_WORKLOAD_ISOLATION,
             "phase": "stage1-contract",
             "process": self.process.to_dict(),
             "process_policy": OCI_STAGE1_PROCESS_POLICY,
@@ -306,6 +308,7 @@ class OCIStage1Plan:
             "boot_plan_digest",
             "domain_core_digest",
             "handoff",
+            "isolation",
             "phase",
             "process",
             "process_policy",
@@ -322,6 +325,7 @@ class OCIStage1Plan:
             or value.get("protocol") != OCI_STAGE1_PROTOCOL
             or value.get("phase") != "stage1-contract"
             or value.get("handoff") != OCI_STAGE1_HANDOFF
+            or value.get("isolation") != OCI_STAGE1_WORKLOAD_ISOLATION
             or value.get("process_policy") != OCI_STAGE1_PROCESS_POLICY
             or not isinstance(run, dict)
             or set(run) != {"name", "run_id"}
@@ -374,6 +378,7 @@ __all__ = [
     "OCI_STAGE1_PROTOCOL",
     "OCI_STAGE1_PROCESS_POLICY",
     "OCI_STAGE1_ROOT_LAYOUT",
+    "OCI_STAGE1_WORKLOAD_ISOLATION",
     "OCIStage1Plan",
     "oci_stage1_device_serial",
 ]

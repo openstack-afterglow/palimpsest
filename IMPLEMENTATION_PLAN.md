@@ -827,6 +827,45 @@ correlation/replay state, not cryptographic peer authentication. Native v14
 evidence must be collected on the qualified Linux x86_64 KVM runner; local
 policy tests and reproducible binaries are not a substitute.
 
+### PR 4 slice 28B: capabilityless UID 0 lifecycle-authority boundary
+
+- Numeric UID/GID `0:0` is still an admitted OCI process identity, but it is
+  now deliberately capabilityless. Before the workload is released, the child
+  closes its inherited lifecycle descriptor, creates a private mount
+  namespace, replaces `/dev` with a private tmpfs containing exactly
+  `null`, `zero`, `full`, `random`, `urandom`, and `tty`, masks the virtio-port
+  sysfs control path, and makes `/proc`, `/sys`, plus `/sys/fs/cgroup`
+  read-only while preserving ordinary proc reads.
+- Capability bounding, ambient, permitted, effective, and inheritable sets are
+  emptied; securebits are locked and `no_new_privs` is set and verified. A
+  narrow post-setup seccomp filter denies namespace, mount, device-node,
+  introspection, kernel-loading, x32 ABI entry, and newer mount authority syscalls while
+  allowing ordinary fork/clone. `clone3` reports `ENOSYS` so libc may fall back
+  to an ordinary clone.
+- PID 1 sets and verifies `PR_SET_DUMPABLE=0` before fork. A dedicated exact
+  child-ready/error handshake makes isolation parent-verifiable before PID 1
+  attaches the child to its cgroup and sends the existing release byte. The
+  isolation marker therefore precedes `WORKLOAD_STARTED` and lifecycle READY;
+  any missing, malformed, or out-of-order acknowledgement fails closed.
+- The proof workload verifies `Cap*=0`, `NoNewPrivs=1`, `Seccomp=2`, exact and
+  functional safe devices, ordinary fork, denied mount/mknod/unshare/control
+  writes, hidden lifecycle device discovery, and inaccessible PID 1 fd/memory.
+  The native matrix adds one explicit UID 0 positive boot without removing any
+  existing case: 41 guest boots and one duplicate-name preboot rejection, 42
+  QEMU invocations total. Workload stdout remains supplementary; PID 1 terminal
+  state and the lifecycle exchange remain qualification authority.
+- Stage-1 plan/protocol v11, handoff v5, process policy v2, init/consumer v13,
+  initramfs manifest/ABI v15, supervisor v6, lifecycle broker v2, fixture
+  policy/schema v9, domain plan v10 (domain core v4), and KVM receipt v15 bind
+  this checkpoint.
+
+Scope boundary: this is a pre-MAC lifecycle-authority confidentiality and
+integrity boundary, not a complete hostile-root availability sandbox. It does
+not add a PID or user namespace, so an admitted UID 0 process may still consume
+resources or signal peers allowed by the shared PID namespace. Production
+create/start/run/`-d` remains disabled, and native v15 evidence must be
+collected on the qualified Linux x86_64 KVM runner.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -845,7 +884,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Collect the qualified v14 lifecycle receipt and all retained-root plus
+1. Collect the qualified v15 lifecycle/isolation receipt and all retained-root plus
    topology/filesystem/assembly/transition/workload negative evidence on the
    connected Linux x86_64 KVM runner.
 2. Implement image-root passwd/group lookup, omitted primary-group and PATH

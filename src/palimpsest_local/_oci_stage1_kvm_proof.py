@@ -56,6 +56,7 @@ from .oci_initramfs import (
     OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
     OCI_STAGE1_ROOT_TRANSITION_CONTRACT,
     OCI_STAGE1_SUPERVISOR_CONTRACT,
+    OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
     build_bootstrap_initramfs,
 )
 from .oci_process import OCIProcessSpec, OCIUserSpec
@@ -63,7 +64,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v14"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v15"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -75,6 +76,9 @@ DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 # CRLF, while the pipe-based pure test preserves LF exactly.
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
+WORKLOAD_ISOLATION_MARKER = (
+    b"palimpsest guest stage1: workload isolation committed; lifecycle authority retained by pid1"
+)
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
 LIFECYCLE_READY_COMMITTED_MARKER = b"palimpsest guest stage1: lifecycle ready committed"
@@ -180,7 +184,7 @@ ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES = (
     "transition_proc_not_directory",
 )
 KVM_PROOF_BOOT_COUNT = (
-    2
+    3
     + len(NEGATIVE_CONTROL_NAMES)
     + len(FILESYSTEM_NEGATIVE_CONTROL_NAMES)
     + len(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
@@ -191,6 +195,7 @@ KVM_PROOF_BOOT_COUNT = (
 EVIDENCE_FILE_NAMES = (
     "console.bin",
     "retained-console.bin",
+    "uid0-isolation-console.bin",
     "receipt.json",
     *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
     *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),
@@ -206,6 +211,11 @@ _REQUIRED_KERNEL_CONFIG = (
     "CONFIG_BLK_DEV_INITRD",
     "CONFIG_CGROUPS",
     "CONFIG_DEVTMPFS",
+    "CONFIG_NAMESPACES",
+    "CONFIG_MULTIUSER",
+    "CONFIG_SECCOMP",
+    "CONFIG_SECCOMP_FILTER",
+    "CONFIG_TMPFS",
     "CONFIG_EXT4_FS",
     "CONFIG_OVERLAY_FS",
     "CONFIG_PCI",
@@ -250,7 +260,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:22994200aeb8559cdcb7eae9d4a47a813c4be6d82b32b82b0684ada8b81c695c"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:09ba82bf6eba669456e3c176e88a495a665d0d8df880acefc08e954c9ea1c4f5"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -265,8 +275,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v8"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v8"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v9"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v9"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -282,10 +292,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "d70514b6ea07ef566fb85503b1c858cf7292235434c6772b9c49ef7c69d8ac12",
-        "elf_size_bytes": 9044,
+        "elf_sha256": "c847a04488f3638d74861a1be5c19cf45392e31c8afb78edd20b1a5582b86261",
+        "elf_size_bytes": 9836,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "3276e256b16dc30d61d0c4a787b2e0a0ae9b669d493b0936bd97387043f60a00",
+        "source_sha256": "f3a19386355e768693309cebf10e7aed1d5835b97c73a20a814e3eab858db0c6",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -790,6 +800,28 @@ def build_proof_plan() -> OCIStage1Plan:
     )
 
 
+def build_uid0_isolation_proof_plan() -> OCIStage1Plan:
+    """Return the explicit UID-0 adversarial lifecycle-authority proof plan."""
+
+    base = build_proof_plan()
+    return OCIStage1Plan(
+        run_id="bf516823-a094-4e8f-896c-b21962868fde",
+        run_name="kvm-stage1-uid0-isolation-proof",
+        boot_plan_digest=base.boot_plan_digest,
+        domain_core_digest="sha256:" + "c" * 64,
+        root=dict(base.root),
+        layers=tuple(dict(layer) for layer in base.layers),
+        process=OCIProcessSpec(
+            (*base.process.argv, "palimpsest-uid0-isolation-v1"),
+            base.process.environment,
+            base.process.cwd,
+            OCIUserSpec("0", "0"),
+            base.process.stop_signal,
+        ),
+        assembly_probes=tuple(dict(probe) for probe in base.assembly_probes),
+    )
+
+
 def transport_serial(artifact_digest: str) -> str:
     _validate_digest(artifact_digest, "transport digest")
     identity = f"palimpsest-oci-root-stage1-transport-v1\0{artifact_digest}".encode()
@@ -936,8 +968,9 @@ def _duplicate_lifecycle_qemu_arguments(first: Path, second: Path) -> tuple[str,
     )
 
 
-def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
-    if not isinstance(plan, OCIStage1Plan) or plan.to_dict() != build_proof_plan().to_dict():
+def pre_mount_topology(plan: OCIStage1Plan, *, mode: str = "base") -> dict[str, Any]:
+    expected = build_proof_plan() if mode == "base" else build_uid0_isolation_proof_plan() if mode == "uid0" else None
+    if not isinstance(plan, OCIStage1Plan) or expected is None or plan.to_dict() != expected.to_dict():
         raise ArtifactValidationError("KVM proof topology plan is invalid")
 
     filesystems = load_proof_filesystems()
@@ -966,7 +999,7 @@ def pre_mount_topology(plan: OCIStage1Plan) -> dict[str, Any]:
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v8",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v9",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -2078,13 +2111,11 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         or value.get("natural_terminal_proven") is not False
         or value.get("peer_identity") != "socket-dev-ino-uid-type-plus-linux-so-peercred-qemu-pid.v1"
         or value.get("reconnect_boundary") != "proof-only-known-workload-console-eof-barrier.v1"
-        or value.get("production_reconnect_requirement")
-        != "privileged-in-band-boundary-ack-or-equivalent-barrier"
+        or value.get("production_reconnect_requirement") != "privileged-in-band-boundary-ack-or-equivalent-barrier"
         or value.get("rapid_reconnect_proven") is not False
         or value.get("single_connection_proven") is not True
         or value.get("reconnect_proven") is not True
-        or value.get("session_profile")
-        != "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1"
+        or value.get("session_profile") != "peer-boundary-coordinated-partial-retry-committed-same-id-dedupe.v1"
         or value.get("connection_limit") != 16
     ):
         return False
@@ -2489,9 +2520,7 @@ def _lifecycle_receipt(
             "contract": contract,
             "immutable_backings_verified": True,
             "lifecycle_rejection_marker_count": 1,
-            "peer_boundary_marker_count": _logical_line_count(
-                negative_consoles[name], LIFECYCLE_PEER_BOUNDARY_MARKER
-            ),
+            "peer_boundary_marker_count": _logical_line_count(negative_consoles[name], LIFECYCLE_PEER_BOUNDARY_MARKER),
             "pid1_alive_after_marker": True,
             "root_post_digest": negative_root_post_digests[name],
             "root_seed_digest": contract["backings"]["root"]["artifact_digest"],
@@ -2529,9 +2558,7 @@ def _lifecycle_receipt(
                 "initial_ready_host_observed": False,
                 "logical_attempts": retained_attempts,
                 "pid1_alive_after_terminal": True,
-                "peer_boundary_marker_count": _logical_line_count(
-                    retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER
-                ),
+                "peer_boundary_marker_count": _logical_line_count(retained_console, LIFECYCLE_PEER_BOUNDARY_MARKER),
                 "partial_frame_buffered_marker_count": _logical_line_count(
                     retained_console, LIFECYCLE_PARTIAL_BUFFERED_MARKER
                 ),
@@ -2575,6 +2602,121 @@ def _lifecycle_receipt(
     }
 
 
+def _uid0_lifecycle_evidence(
+    plan: OCIStage1Plan, transport: BuiltOCIStage1Transport, frames: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Bind the distinct UID-0 boot's complete single-connection exchange."""
+
+    return {
+        "binding": {
+            "domain_core_digest": plan.domain_core_digest,
+            "run_id": plan.run_id,
+            "stage1_artifact_digest": transport.receipt.artifact_digest,
+        },
+        "broker_contract": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
+        "channel_name": OCI_CONTROL_CHANNEL_NAME,
+        "frames": [dict(frame) for frame in frames],
+        "protocol": OCI_CONTROL_PROTOCOL,
+        "transport": "qemu-private-unix-socket-to-virtio-serial",
+    }
+
+
+def _valid_uid0_lifecycle_evidence(value: Any, plan: OCIStage1Plan, transport: BuiltOCIStage1Transport) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "binding",
+        "broker_contract",
+        "channel_name",
+        "frames",
+        "protocol",
+        "transport",
+    }:
+        return False
+    expected_header = _uid0_lifecycle_evidence(plan, transport, [])
+    if any(value.get(key) != expected for key, expected in expected_header.items() if key != "frames"):
+        return False
+    frames = value.get("frames")
+    expected = (
+        ("host-to-guest", "HELLO"),
+        ("guest-to-host", "READY"),
+        ("host-to-guest", "STOP"),
+        ("guest-to-host", "TERMINAL"),
+    )
+    if not isinstance(frames, list) or len(frames) != 4:
+        return False
+    generation = frames[1].get("boot_generation") if isinstance(frames[1], Mapping) else None
+    for frame, (direction, kind) in zip(frames, expected, strict=True):
+        if (
+            not isinstance(frame, Mapping)
+            or set(frame)
+            != {
+                "boot_generation",
+                "connection",
+                "digest",
+                "direction",
+                "host_nonce",
+                "kind",
+                "reply_to",
+                "request_id",
+                "sequence",
+                "size_bytes",
+            }
+            or frame.get("connection") != 1
+            or frame.get("direction") != direction
+            or frame.get("kind") != kind
+        ):
+            return False
+    hello, ready, stop, terminal = frames
+    nonce = hello["host_nonce"]
+    try:
+        parsed_generation = uuid.UUID(generation)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", nonce or "") is None
+        or str(parsed_generation) != generation
+        or parsed_generation.version != 4
+        or any(frame["host_nonce"] != nonce for frame in frames)
+        or (hello["request_id"], hello["sequence"], hello["boot_generation"], hello["reply_to"])
+        != (1, None, None, None)
+        or (ready["request_id"], ready["sequence"], ready["boot_generation"], ready["reply_to"])
+        != (None, 1, generation, 1)
+        or (stop["request_id"], stop["sequence"], stop["boot_generation"], stop["reply_to"])
+        != (2, None, generation, None)
+        or (terminal["request_id"], terminal["sequence"], terminal["boot_generation"], terminal["reply_to"])
+        != (None, 2, generation, 2)
+    ):
+        return False
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+    messages = (
+        OCIControlMessage("HELLO", binding, nonce, {}, request_id=hello["request_id"]),
+        OCIControlMessage(
+            "READY",
+            binding,
+            nonce,
+            {},
+            sequence=ready["sequence"],
+            boot_generation=generation,
+            reply_to=ready["reply_to"],
+        ),
+        OCIControlMessage(
+            "STOP", binding, nonce, {"signal": 15}, request_id=stop["request_id"], boot_generation=generation
+        ),
+        OCIControlMessage(
+            "TERMINAL",
+            binding,
+            nonce,
+            {"terminal": {"exit_code": 42, "signal": None}},
+            sequence=terminal["sequence"],
+            boot_generation=generation,
+            reply_to=terminal["reply_to"],
+        ),
+    )
+    return all(
+        frame["digest"] == _digest(encoded) and frame["size_bytes"] == len(encoded)
+        for frame, encoded in zip(frames, map(encode_frame, messages), strict=True)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class OCIStage1KVMProofReceipt:
     kernel_digest: str
@@ -2595,6 +2737,8 @@ class OCIStage1KVMProofReceipt:
     root_second_boot_digest: str
     console: bytes
     retained_console: bytes
+    uid0_isolation_console: bytes
+    uid0_isolation_root_post_digest: str
     negative_consoles: Mapping[str, bytes]
     filesystem_negative_consoles: Mapping[str, bytes]
     assembly_negative_consoles: Mapping[str, bytes]
@@ -2607,6 +2751,7 @@ class OCIStage1KVMProofReceipt:
     lifecycle_negative_root_post_digests: Mapping[str, str]
     qemu_duplicate_name_output: bytes
     lifecycle: Mapping[str, Any]
+    uid0_lifecycle: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         for value, field in (
@@ -2619,6 +2764,7 @@ class OCIStage1KVMProofReceipt:
             (self.root_seed_digest, "root seed digest"),
             (self.root_post_run_digest, "root post-run digest"),
             (self.root_second_boot_digest, "root second-boot digest"),
+            (self.uid0_isolation_root_post_digest, "UID-0 isolation root post-run digest"),
         ):
             _validate_digest(value, field)
         try:
@@ -2629,6 +2775,8 @@ class OCIStage1KVMProofReceipt:
         expected_initramfs = build_bootstrap_initramfs().manifest
         expected_plan = build_proof_plan()
         expected_transport = build_stage1_transport(expected_plan)
+        expected_uid0_plan = build_uid0_isolation_proof_plan()
+        expected_uid0_transport = build_stage1_transport(expected_uid0_plan)
         if (
             type(self.kernel_size_bytes) is not int
             or not 1 <= self.kernel_size_bytes <= MAX_KERNEL_BYTES
@@ -2637,6 +2785,7 @@ class OCIStage1KVMProofReceipt:
             or not isinstance(self.transport, Mapping)
             or transport_receipt.to_dict() != dict(self.transport)
             or transport_receipt != expected_transport.receipt
+            or not _valid_uid0_lifecycle_evidence(self.uid0_lifecycle, expected_uid0_plan, expected_uid0_transport)
             or not isinstance(self.transport_serial, str)
             or _SERIAL_RE.fullmatch(self.transport_serial) is None
             or self.transport_serial != transport_serial(transport_receipt.artifact_digest)
@@ -2659,6 +2808,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.console, SUCCESS_MARKER) != 1
             or _logical_prefix_count(self.console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.console, ROOT_TRANSITION_MARKER) != 1
+            or _logical_line_count(self.console, WORKLOAD_ISOLATION_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or _logical_line_count(self.console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
@@ -2668,6 +2818,7 @@ class OCIStage1KVMProofReceipt:
             or not _logical_lines_in_order(
                 self.console,
                 ROOT_TRANSITION_MARKER,
+                WORKLOAD_ISOLATION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
                 LIFECYCLE_STOP_DISPATCHED_MARKER,
@@ -2686,6 +2837,7 @@ class OCIStage1KVMProofReceipt:
             or _logical_line_count(self.retained_console, SUCCESS_MARKER) != 1
             or _logical_prefix_count(self.retained_console, WORKLOAD_TERMINAL_PREFIX) != 1
             or _logical_line_count(self.retained_console, ROOT_TRANSITION_MARKER) != 1
+            or _logical_line_count(self.retained_console, WORKLOAD_ISOLATION_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_STARTED_MARKER) != 1
             or _logical_line_count(self.retained_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
             or _logical_line_count(self.retained_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
@@ -2695,6 +2847,7 @@ class OCIStage1KVMProofReceipt:
             or not _logical_lines_in_order(
                 self.retained_console,
                 ROOT_TRANSITION_MARKER,
+                WORKLOAD_ISOLATION_MARKER,
                 WORKLOAD_STARTED_MARKER,
                 WORKLOAD_SIGNAL_ARMED_MARKER,
                 LIFECYCLE_PEER_BOUNDARY_MARKER,
@@ -2710,8 +2863,28 @@ class OCIStage1KVMProofReceipt:
             or _logical_prefix_count(self.retained_console, WORKLOAD_REJECTION_PREFIX) != 0
             or _logical_prefix_count(self.retained_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
             or _logical_prefix_count(self.retained_console, LIFECYCLE_REJECTION_PREFIX) != 0
+            or not isinstance(self.uid0_isolation_console, bytes)
+            or not 1 <= len(self.uid0_isolation_console) <= MAX_CONSOLE_BYTES
+            or _logical_line_count(self.uid0_isolation_console, ROOT_TRANSITION_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, WORKLOAD_ISOLATION_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, WORKLOAD_STARTED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, WORKLOAD_SIGNAL_ARMED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, LIFECYCLE_STOP_DISPATCHED_MARKER) != 1
+            or _logical_line_count(self.uid0_isolation_console, SUCCESS_MARKER) != 1
+            or not _logical_lines_in_order(
+                self.uid0_isolation_console,
+                ROOT_TRANSITION_MARKER,
+                WORKLOAD_ISOLATION_MARKER,
+                WORKLOAD_STARTED_MARKER,
+                WORKLOAD_SIGNAL_ARMED_MARKER,
+                LIFECYCLE_STOP_DISPATCHED_MARKER,
+                SUCCESS_MARKER,
+            )
+            or _logical_prefix_count(self.uid0_isolation_console, WORKLOAD_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.uid0_isolation_console, WORKLOAD_CLEANUP_REJECTION_PREFIX) != 0
+            or _logical_prefix_count(self.uid0_isolation_console, LIFECYCLE_REJECTION_PREFIX) != 0
             or any(
-                _logical_line_count(self.retained_console, marker) != 0
+                _logical_line_count(self.uid0_isolation_console, marker) != 0
                 for marker in (
                     REJECTION_MARKER,
                     FILESYSTEM_REJECTION_MARKER,
@@ -2903,6 +3076,8 @@ class OCIStage1KVMProofReceipt:
             raise ArtifactValidationError("KVM proof receipt value is invalid")
 
     def to_dict(self) -> dict[str, Any]:
+        expected_uid0_plan = build_uid0_isolation_proof_plan()
+        expected_uid0_transport = build_stage1_transport(expected_uid0_plan)
         return {
             "cmdline": {"digest": _digest(self.cmdline.encode("ascii")), "text": self.cmdline},
             "console": {
@@ -2913,6 +3088,11 @@ class OCIStage1KVMProofReceipt:
             "retained_console": {
                 "digest": _digest(self.retained_console),
                 "size_bytes": len(self.retained_console),
+                "success_marker": SUCCESS_MARKER.decode("ascii"),
+            },
+            "uid0_isolation_console": {
+                "digest": _digest(self.uid0_isolation_console),
+                "size_bytes": len(self.uid0_isolation_console),
                 "success_marker": SUCCESS_MARKER.decode("ascii"),
             },
             "initramfs": {
@@ -3054,15 +3234,16 @@ class OCIStage1KVMProofReceipt:
             "supervisor": {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
                 "cgroup": "/palimpsest.workload",
-                "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+                "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
                 "cgroup_write_escape_denied": ["parent", "own"],
                 "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
                 "cooperative_status": 43,
-                "credential_timing": "child-after-parent-cgroup-attach-release",
+                "credential_timing": "child-isolate-drop-verify-parent-attach-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
+                "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
                 "main_status": 42,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
@@ -3071,11 +3252,47 @@ class OCIStage1KVMProofReceipt:
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+                "uid0_capabilityless_proven": True,
             },
             "switch_root": True,
             "topology": pre_mount_topology(build_proof_plan()),
             "transport": {**dict(self.transport), "serial": self.transport_serial},
             "workload_started": True,
+            "workload_isolation": {
+                "capabilities": {
+                    "ambient": 0,
+                    "bounding": 0,
+                    "effective": 0,
+                    "inheritable": 0,
+                    "permitted": 0,
+                },
+                "contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
+                "device_allowlist": ["full", "null", "random", "tty", "urandom", "zero"],
+                "lifecycle_device_visible": False,
+                "lifecycle_fd_inherited": False,
+                "lifecycle": dict(self.uid0_lifecycle),
+                "mount_namespace": "private",
+                "namespace_creation_denied": True,
+                "no_new_privs": True,
+                "pid1_proc_authority_inaccessible": True,
+                "root_post_digest": self.uid0_isolation_root_post_digest,
+                "root_seed_digest": load_proof_filesystems().root_digest,
+                "seccomp_mode": 2,
+                "standard_devices_and_fork_work": True,
+                "proc_sys_and_cgroup_control_read_only": True,
+                "plan": expected_uid0_plan.to_dict(),
+                "transport": {
+                    **expected_uid0_transport.receipt.to_dict(),
+                    "serial": transport_serial(expected_uid0_transport.receipt.artifact_digest),
+                },
+                "cmdline": {
+                    "digest": _digest(
+                        build_kernel_cmdline(expected_uid0_plan, expected_uid0_transport).encode("ascii")
+                    ),
+                    "text": build_kernel_cmdline(expected_uid0_plan, expected_uid0_transport),
+                },
+                "uid": 0,
+            },
         }
 
     @property
@@ -3091,6 +3308,7 @@ class OCIStage1KVMProofReceipt:
         negative_consoles: Mapping[str, bytes],
         filesystem_negative_consoles: Mapping[str, bytes],
         retained_console: bytes,
+        uid0_isolation_console: bytes,
         assembly_negative_consoles: Mapping[str, bytes],
         assembly_negative_root_post_digests: Mapping[str, str],
         root_transition_negative_consoles: Mapping[str, bytes],
@@ -3126,6 +3344,7 @@ class OCIStage1KVMProofReceipt:
             "qemu",
             "qemu_invocations",
             "retained_console",
+            "uid0_isolation_console",
             "root_assembly",
             "root_is_slash",
             "root_transition",
@@ -3139,11 +3358,13 @@ class OCIStage1KVMProofReceipt:
             "transport",
             "workload_negative_controls",
             "workload_started",
+            "workload_isolation",
         }:
             raise ArtifactValidationError("KVM proof receipt fields are invalid")
         cmdline = value.get("cmdline")
         console_value = value.get("console")
         retained_console_value = value.get("retained_console")
+        uid0_isolation_console_value = value.get("uid0_isolation_console")
         initramfs = value.get("initramfs")
         kernel = value.get("kernel")
         qemu = value.get("qemu")
@@ -3158,6 +3379,7 @@ class OCIStage1KVMProofReceipt:
         lifecycle = value.get("lifecycle")
         supervisor = value.get("supervisor")
         root_volume = value.get("root_volume")
+        workload_isolation = value.get("workload_isolation")
         if (
             value.get("schema") != OCI_STAGE1_KVM_PROOF_SCHEMA
             or value.get("executed_boots") != KVM_PROOF_BOOT_COUNT
@@ -3182,15 +3404,16 @@ class OCIStage1KVMProofReceipt:
             != {
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
                 "cgroup": "/palimpsest.workload",
-                "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+                "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
                 "cgroup_write_escape_denied": ["parent", "own"],
                 "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
                 "cooperative_status": 43,
-                "credential_timing": "child-after-parent-cgroup-attach-release",
+                "credential_timing": "child-isolate-drop-verify-parent-attach-release",
                 "forced_status": 137,
                 "forwarded_signal": 15,
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
+                "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
                 "main_status": 42,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
                 "privileged_broker_after_fork": True,
@@ -3199,6 +3422,7 @@ class OCIStage1KVMProofReceipt:
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+                "uid0_capabilityless_proven": True,
             }
             or value.get("pre_mount_devices") is not True
             or value.get("filesystem_verified") is not True
@@ -3221,6 +3445,68 @@ class OCIStage1KVMProofReceipt:
             }
             or root_volume.get("content_verified") is not False
             or root_volume.get("retained_same_backing") is not True
+            or not isinstance(workload_isolation, Mapping)
+            or set(workload_isolation)
+            != {
+                "capabilities",
+                "contract",
+                "device_allowlist",
+                "lifecycle_device_visible",
+                "lifecycle_fd_inherited",
+                "lifecycle",
+                "mount_namespace",
+                "namespace_creation_denied",
+                "no_new_privs",
+                "pid1_proc_authority_inaccessible",
+                "root_post_digest",
+                "root_seed_digest",
+                "seccomp_mode",
+                "standard_devices_and_fork_work",
+                "proc_sys_and_cgroup_control_read_only",
+                "plan",
+                "transport",
+                "cmdline",
+                "uid",
+            }
+            or workload_isolation.get("capabilities")
+            != {"ambient": 0, "bounding": 0, "effective": 0, "inheritable": 0, "permitted": 0}
+            or workload_isolation.get("contract") != OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT
+            or workload_isolation.get("device_allowlist") != ["full", "null", "random", "tty", "urandom", "zero"]
+            or workload_isolation.get("lifecycle_device_visible") is not False
+            or workload_isolation.get("lifecycle_fd_inherited") is not False
+            or not _valid_uid0_lifecycle_evidence(
+                workload_isolation.get("lifecycle"),
+                build_uid0_isolation_proof_plan(),
+                build_stage1_transport(build_uid0_isolation_proof_plan()),
+            )
+            or workload_isolation.get("mount_namespace") != "private"
+            or workload_isolation.get("namespace_creation_denied") is not True
+            or workload_isolation.get("no_new_privs") is not True
+            or workload_isolation.get("pid1_proc_authority_inaccessible") is not True
+            or workload_isolation.get("root_seed_digest") != load_proof_filesystems().root_digest
+            or workload_isolation.get("seccomp_mode") != 2
+            or workload_isolation.get("standard_devices_and_fork_work") is not True
+            or workload_isolation.get("proc_sys_and_cgroup_control_read_only") is not True
+            or workload_isolation.get("plan") != build_uid0_isolation_proof_plan().to_dict()
+            or workload_isolation.get("transport")
+            != {
+                **build_stage1_transport(build_uid0_isolation_proof_plan()).receipt.to_dict(),
+                "serial": transport_serial(
+                    build_stage1_transport(build_uid0_isolation_proof_plan()).receipt.artifact_digest
+                ),
+            }
+            or workload_isolation.get("cmdline")
+            != {
+                "digest": _digest(
+                    build_kernel_cmdline(
+                        build_uid0_isolation_proof_plan(), build_stage1_transport(build_uid0_isolation_proof_plan())
+                    ).encode("ascii")
+                ),
+                "text": build_kernel_cmdline(
+                    build_uid0_isolation_proof_plan(), build_stage1_transport(build_uid0_isolation_proof_plan())
+                ),
+            }
+            or workload_isolation.get("uid") != 0
             or value.get("topology") != pre_mount_topology(build_proof_plan())
             or qualification
             != {
@@ -3236,6 +3522,8 @@ class OCIStage1KVMProofReceipt:
             or set(console_value) != {"digest", "size_bytes", "success_marker"}
             or not isinstance(retained_console_value, Mapping)
             or set(retained_console_value) != {"digest", "size_bytes", "success_marker"}
+            or not isinstance(uid0_isolation_console_value, Mapping)
+            or set(uid0_isolation_console_value) != {"digest", "size_bytes", "success_marker"}
             or not isinstance(initramfs, Mapping)
             or set(initramfs) != {"artifact_digest", "artifact_size_bytes", "manifest_digest"}
             or not isinstance(kernel, Mapping)
@@ -3371,6 +3659,8 @@ class OCIStage1KVMProofReceipt:
             root_volume["boot2_post_digest"],
             console,
             retained_console,
+            uid0_isolation_console,
+            workload_isolation["root_post_digest"],
             negative_consoles,
             filesystem_negative_consoles,
             assembly_negative_consoles,
@@ -3383,6 +3673,7 @@ class OCIStage1KVMProofReceipt:
             lifecycle_negative_root_post_digests,
             qemu_duplicate_name_output,
             lifecycle,
+            workload_isolation["lifecycle"],
         )
         if receipt.to_dict() != dict(value):
             raise ArtifactValidationError("KVM proof receipt is not canonical")
@@ -3394,6 +3685,7 @@ class OCIStage1KVMProofResult:
     receipt: OCIStage1KVMProofReceipt
     console: bytes
     retained_console: bytes
+    uid0_isolation_console: bytes
     negative_consoles: Mapping[str, bytes]
     filesystem_negative_consoles: Mapping[str, bytes]
     assembly_negative_consoles: Mapping[str, bytes]
@@ -3676,8 +3968,7 @@ def _read_console_until(
                 and not channel_finished
                 and lifecycle_socket_path is not None
                 and lifecycle_socket_path.exists()
-                and _logical_line_count(bytes(console), LIFECYCLE_PEER_BOUNDARY_MARKER)
-                >= required_peer_boundaries
+                and _logical_line_count(bytes(console), LIFECYCLE_PEER_BOUNDARY_MARKER) >= required_peer_boundaries
             ):
                 try:
                     metadata = lifecycle_socket_path.lstat()
@@ -3715,11 +4006,7 @@ def _read_console_until(
                                     negative_input=True,
                                 )
                             else:
-                                queue_raw(
-                                    _lifecycle_hello_frame(
-                                        request_id=1
-                                    )
-                                )
+                                queue_raw(_lifecycle_hello_frame(request_id=1))
                         else:
                             if lifecycle_negative_input is not None:
                                 lifecycle_negative_input["boot_generation"] = None
@@ -3762,11 +4049,7 @@ def _read_console_until(
                                         negative_input=True,
                                     )
                                 else:
-                                    queue_raw(
-                                        _lifecycle_hello_frame(
-                                            request_id=1
-                                        )
-                                    )
+                                    queue_raw(_lifecycle_hello_frame(request_id=1))
                             else:
                                 if lifecycle_negative_input is not None:
                                     lifecycle_negative_input["boot_generation"] = None
@@ -4016,9 +4299,10 @@ def _read_console_until(
                 current, LIFECYCLE_REJECTION_PREFIX
             ):
                 raise KVMProofFailure("QEMU emitted a lifecycle rejection marker")
-            if lifecycle_scenario in {"negative", "discovery-negative"} and _logical_prefix_count(
-                current, LIFECYCLE_REJECTION_PREFIX
-            ) > 1:
+            if (
+                lifecycle_scenario in {"negative", "discovery-negative"}
+                and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX) > 1
+            ):
                 raise KVMProofFailure("QEMU emitted lifecycle rejection more than once")
             terminal_count = _logical_prefix_count(current, WORKLOAD_TERMINAL_PREFIX)
             successful_terminal_count = _logical_line_count(current, SUCCESS_MARKER)
@@ -4496,14 +4780,18 @@ def _write_pre_mount_topology(directory: Path, plan: OCIStage1Plan) -> tuple[Pat
     return root_path, lower_paths
 
 
-def _verify_pre_mount_topology(root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan) -> None:
-    devices = pre_mount_topology(plan)["devices"]
+def _verify_pre_mount_topology(
+    root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan, *, mode: str = "base"
+) -> None:
+    devices = pre_mount_topology(plan, mode=mode)["devices"]
     _verify_file_digest(root_path, devices[0]["artifact_digest"], 0o600)
     for path, layer in zip(lower_paths, devices[1:], strict=True):
         _verify_file_digest(path, layer["artifact_digest"], 0o400)
 
 
-def _verify_post_run_topology(root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan) -> str:
+def _verify_post_run_topology(
+    root_path: Path, lower_paths: tuple[Path, ...], plan: OCIStage1Plan, *, mode: str = "base"
+) -> str:
     """Bind the mutable root's post-run bytes while retaining immutable lower equality."""
 
     verified_root = _read_pinned_regular_file(
@@ -4513,7 +4801,7 @@ def _verify_post_run_topology(root_path: Path, lower_paths: tuple[Path, ...], pl
     )
     if verified_root.size_bytes != plan.root["size_bytes"] or stat.S_IMODE(root_path.stat().st_mode) != 0o600:
         raise KVMProofFailure("KVM proof mutable root identity changed")
-    devices = pre_mount_topology(plan)["devices"]
+    devices = pre_mount_topology(plan, mode=mode)["devices"]
     for path, layer in zip(lower_paths, devices[1:], strict=True):
         _verify_file_digest(path, layer["artifact_digest"], 0o400)
     return verified_root.digest
@@ -4547,6 +4835,15 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         domain_core_digest=plan.domain_core_digest,
         stage1_artifact_digest=transport.receipt.artifact_digest,
     )
+    uid0_plan = build_uid0_isolation_proof_plan()
+    uid0_transport = build_stage1_transport(uid0_plan)
+    uid0_cmdline = build_kernel_cmdline(uid0_plan, uid0_transport)
+    uid0_serial = transport_serial(uid0_transport.receipt.artifact_digest)
+    uid0_lifecycle_binding = OCIControlBinding(
+        run_id=uid0_plan.run_id,
+        domain_core_digest=uid0_plan.domain_core_digest,
+        stage1_artifact_digest=uid0_transport.receipt.artifact_digest,
+    )
     evidence = _actual_evidence_directory()
 
     with _temp_root() as temporary_name:
@@ -4556,6 +4853,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         initramfs_path = _secure_write(root, "initramfs.cpio", initramfs.payload, mode=0o400)
         transport_path = _secure_write(root, "stage1-plan.raw", transport.artifact, mode=0o400)
         root_path, lower_paths = _write_pre_mount_topology(root, plan)
+        uid0_transport_path = _secure_write(root, "uid0-stage1-plan.raw", uid0_transport.artifact, mode=0o400)
+        uid0_root_path = _secure_write(root, "uid0-root.raw", load_proof_filesystems().root, mode=0o600)
         contracts = negative_control_contracts()
         negative_backings = _materialize_negative_backings(root, contracts, transport)
         filesystem_contracts = filesystem_negative_control_contracts()
@@ -4670,6 +4969,50 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         )
         _verify_file_digest(transport_path, transport.receipt.artifact_digest, 0o400)
         root_second_boot_digest = _verify_post_run_topology(root_path, lower_paths, plan)
+        _verify_file_digest(uid0_transport_path, uid0_transport.receipt.artifact_digest, 0o400)
+        _verify_pre_mount_topology(uid0_root_path, lower_paths, uid0_plan, mode="uid0")
+        uid0_lifecycle_socket = root / "lifecycle-uid0-isolation.sock"
+        uid0_command = build_qemu_command(
+            qemu_path=qemu_path,
+            kernel_path=kernel_path,
+            initramfs_path=initramfs_path,
+            transport_path=uid0_transport_path,
+            root_path=uid0_root_path,
+            lower_paths=lower_paths,
+            plan=uid0_plan,
+            cmdline=uid0_cmdline,
+            serial=uid0_serial,
+            lifecycle_socket_path=uid0_lifecycle_socket,
+        )
+        uid0_lifecycle_transcript: list[dict[str, Any]] = []
+        uid0_isolation_console = _read_console_until(
+            uid0_command,
+            expected=SUCCESS_MARKER,
+            forbidden=(
+                REJECTION_MARKER,
+                FILESYSTEM_REJECTION_MARKER,
+                ASSEMBLY_REJECTION_MARKER,
+                ROOT_TRANSITION_REJECTION_MARKER,
+                PREPARATION_FAILURE_MARKER,
+                *WORKLOAD_NEGATIVE_REJECTION_MARKERS.values(),
+            ),
+            timeout_seconds=DEFAULT_BOOT_TIMEOUT_SECONDS,
+            require_alive_after_marker=True,
+            lifecycle_socket_path=uid0_lifecycle_socket,
+            lifecycle_binding=uid0_lifecycle_binding,
+            lifecycle_success=True,
+            lifecycle_transcript=uid0_lifecycle_transcript,
+        )
+        _verify_pinned_boot_files(
+            qemu_path=qemu_path,
+            qemu=qemu,
+            kernel_path=kernel_path,
+            kernel=kernel,
+            initramfs_path=initramfs_path,
+            initramfs_digest=initramfs.manifest.artifact_digest,
+        )
+        _verify_file_digest(uid0_transport_path, uid0_transport.receipt.artifact_digest, 0o400)
+        uid0_isolation_root_post_digest = _verify_post_run_topology(uid0_root_path, lower_paths, uid0_plan, mode="uid0")
         negative_consoles: dict[str, bytes] = {}
         for control_name in NEGATIVE_CONTROL_NAMES:
             contract = contracts[control_name]
@@ -5042,6 +5385,8 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         root_second_boot_digest,
         console,
         retained_console,
+        uid0_isolation_console,
+        uid0_isolation_root_post_digest,
         negative_consoles,
         filesystem_negative_consoles,
         assembly_negative_consoles,
@@ -5066,10 +5411,12 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             console,
             retained_console,
         ),
+        _uid0_lifecycle_evidence(uid0_plan, uid0_transport, uid0_lifecycle_transcript),
     )
     if evidence is not None:
         _secure_write(evidence, "console.bin", console, mode=0o400)
         _secure_write(evidence, "retained-console.bin", retained_console, mode=0o400)
+        _secure_write(evidence, "uid0-isolation-console.bin", uid0_isolation_console, mode=0o400)
         for control_name in NEGATIVE_CONTROL_NAMES:
             _secure_write(
                 evidence,
@@ -5118,6 +5465,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
         receipt,
         console,
         retained_console,
+        uid0_isolation_console,
         negative_consoles,
         filesystem_negative_consoles,
         assembly_negative_consoles,

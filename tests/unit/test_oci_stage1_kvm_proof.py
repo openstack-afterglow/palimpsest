@@ -39,6 +39,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     ROOT_TRANSITION_REJECTION_MARKER,
     SUCCESS_MARKER,
     WORKLOAD_CLEANUP_REJECTION_PREFIX,
+    WORKLOAD_ISOLATION_MARKER,
     WORKLOAD_NEGATIVE_CONTROL_NAMES,
     WORKLOAD_NEGATIVE_REJECTION_MARKERS,
     WORKLOAD_SIGNAL_ARMED_MARKER,
@@ -52,7 +53,9 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     _logical_line_count,
     _read_console_until,
     _secure_write,
+    _uid0_lifecycle_evidence,
     _verify_fixture_source_tree,
+    _verify_post_run_topology,
     _verify_workload_proof_provenance,
     assembly_negative_control_contract,
     build_assembly_negative_qemu_command,
@@ -62,9 +65,11 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     build_proof_plan,
     build_qemu_command,
     build_root_transition_negative_qemu_command,
+    build_uid0_isolation_proof_plan,
     build_workload_negative_qemu_command,
     filesystem_negative_control_contract,
     lifecycle_negative_control_contract,
+    load_proof_filesystems,
     negative_control_contract,
     pre_mount_topology,
     root_transition_negative_control_contract,
@@ -111,6 +116,8 @@ def _positive_console(*, retained: bool = False) -> bytes:
     payload = (
         b"kernel boot\r\n"
         + ROOT_TRANSITION_MARKER
+        + b"\r\n"
+        + WORKLOAD_ISOLATION_MARKER
         + b"\r\n"
         + WORKLOAD_STARTED_MARKER
         + b"\r\n"
@@ -443,6 +450,51 @@ def _receipt() -> OCIStage1KVMProofReceipt:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
     initramfs = build_bootstrap_initramfs()
+    uid0_plan = build_uid0_isolation_proof_plan()
+    uid0_transport = build_stage1_transport(uid0_plan)
+    binding = OCIControlBinding(uid0_plan.run_id, uid0_plan.domain_core_digest, uid0_transport.receipt.artifact_digest)
+    nonce = "a" * 64
+    generation = "33333333-3333-4333-8333-333333333333"
+    messages = (
+        ("host-to-guest", OCIControlMessage("HELLO", binding, nonce, {}, request_id=1)),
+        (
+            "guest-to-host",
+            OCIControlMessage("READY", binding, nonce, {}, sequence=1, boot_generation=generation, reply_to=1),
+        ),
+        (
+            "host-to-guest",
+            OCIControlMessage("STOP", binding, nonce, {"signal": 15}, request_id=2, boot_generation=generation),
+        ),
+        (
+            "guest-to-host",
+            OCIControlMessage(
+                "TERMINAL",
+                binding,
+                nonce,
+                {"terminal": {"exit_code": 42, "signal": None}},
+                sequence=2,
+                boot_generation=generation,
+                reply_to=2,
+            ),
+        ),
+    )
+    uid0_frames = []
+    for direction, message in messages:
+        frame = encode_frame(message)
+        uid0_frames.append(
+            {
+                "boot_generation": message.boot_generation,
+                "connection": 1,
+                "digest": "sha256:" + hashlib.sha256(frame).hexdigest(),
+                "direction": direction,
+                "host_nonce": message.host_nonce,
+                "kind": message.kind,
+                "reply_to": message.reply_to,
+                "request_id": message.request_id,
+                "sequence": message.sequence,
+                "size_bytes": len(frame),
+            }
+        )
     return OCIStage1KVMProofReceipt(
         "sha256:" + "1" * 64,
         4096,
@@ -462,6 +514,8 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         "sha256:" + "5" * 64,
         _positive_console(),
         _positive_console(retained=True),
+        _positive_console(),
+        "sha256:" + "a" * 64,
         _negative_consoles(),
         _filesystem_negative_consoles(),
         _assembly_negative_consoles(),
@@ -474,6 +528,27 @@ def _receipt() -> OCIStage1KVMProofReceipt:
         {name: "sha256:" + "9" * 64 for name in LIFECYCLE_NEGATIVE_CONTROL_NAMES},
         QEMU_DUPLICATE_NAME_REJECTION_MARKER + b"\n",
         _lifecycle(),
+        _uid0_lifecycle_evidence(uid0_plan, uid0_transport, uid0_frames),
+    )
+
+
+def _decode_receipt(value: dict[str, object], receipt: OCIStage1KVMProofReceipt) -> OCIStage1KVMProofReceipt:
+    return OCIStage1KVMProofReceipt.from_dict(
+        value,
+        console=receipt.console,
+        negative_consoles=receipt.negative_consoles,
+        filesystem_negative_consoles=receipt.filesystem_negative_consoles,
+        retained_console=receipt.retained_console,
+        uid0_isolation_console=receipt.uid0_isolation_console,
+        assembly_negative_consoles=receipt.assembly_negative_consoles,
+        assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
+        root_transition_negative_consoles=receipt.root_transition_negative_consoles,
+        root_transition_negative_root_post_digests=receipt.root_transition_negative_root_post_digests,
+        workload_negative_consoles=receipt.workload_negative_consoles,
+        workload_negative_root_post_digests=receipt.workload_negative_root_post_digests,
+        lifecycle_negative_consoles=receipt.lifecycle_negative_consoles,
+        lifecycle_negative_root_post_digests=receipt.lifecycle_negative_root_post_digests,
+        qemu_duplicate_name_output=receipt.qemu_duplicate_name_output,
     )
 
 
@@ -596,8 +671,8 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:22994200aeb8559cdcb7eae9d4a47a813c4be6d82b32b82b0684ada8b81c695c"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v8"
+    assert manifest_digest == "sha256:09ba82bf6eba669456e3c176e88a495a665d0d8df880acefc08e954c9ea1c4f5"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v9"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
@@ -614,12 +689,31 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "d70514b6ea07ef566fb85503b1c858cf7292235434c6772b9c49ef7c69d8ac12",
-        "elf_size_bytes": 9044,
+        "elf_sha256": "c847a04488f3638d74861a1be5c19cf45392e31c8afb78edd20b1a5582b86261",
+        "elf_size_bytes": 9836,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "3276e256b16dc30d61d0c4a787b2e0a0ae9b669d493b0936bd97387043f60a00",
+        "source_sha256": "f3a19386355e768693309cebf10e7aed1d5835b97c73a20a814e3eab858db0c6",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
+
+
+def test_uid0_topology_requires_explicit_exact_mode(tmp_path: Path) -> None:
+    base = build_proof_plan()
+    uid0 = build_uid0_isolation_proof_plan()
+    with pytest.raises(ArtifactValidationError, match="topology plan"):
+        pre_mount_topology(uid0)
+    with pytest.raises(ArtifactValidationError, match="topology plan"):
+        pre_mount_topology(base, mode="uid0")
+    assert pre_mount_topology(uid0, mode="uid0")["devices"] == pre_mount_topology(base)["devices"]
+
+    fixtures = load_proof_filesystems()
+    root = _write(tmp_path / "root.raw", fixtures.root, 0o600)
+    lowers = tuple(
+        _write(tmp_path / f"lower-{index}.raw", payload, 0o400) for index, payload in enumerate(fixtures.lowers)
+    )
+    assert _verify_post_run_topology(root, lowers, uid0, mode="uid0") == fixtures.root_digest
+    with pytest.raises(ArtifactValidationError, match="topology plan"):
+        _verify_post_run_topology(root, lowers, uid0)
     with pytest.raises(ArtifactValidationError, match="fixture policy"):
         verify_proof_filesystem_manifest({"schema": "palimpsest.kvm-filesystem-fixtures.v1"})
 
@@ -1235,6 +1329,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
             negative_consoles=negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1248,9 +1343,9 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v14"
-    assert decoded["executed_boots"] == 40
-    assert decoded["qemu_invocations"] == 41
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v15"
+    assert decoded["executed_boots"] == 41
+    assert decoded["qemu_invocations"] == 42
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
         "lifecycle_missing_port",
         "lifecycle_wrong_name_only",
@@ -1285,17 +1380,18 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v5",
+        "contract": "palimpsest.guest-pid1-supervisor.v6",
         "cgroup": "/palimpsest.workload",
-        "cgroup_security": "containment-and-cleanup-not-hostile-root-sandbox",
+        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cgroup_write_escape_denied": ["parent", "own"],
         "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "cooperative_status": 43,
-        "credential_timing": "child-after-parent-cgroup-attach-release",
+        "credential_timing": "child-isolate-drop-verify-parent-attach-release",
         "forced_status": 137,
         "forwarded_signal": 15,
         "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
         "main_status": 42,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
         "privileged_broker_after_fork": True,
@@ -1304,6 +1400,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         "terminal_state": "parent-marker-then-fail-closed-wait",
         "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
         "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+        "uid0_capabilityless_proven": True,
     }
     assert decoded["pre_mount_devices"] is True
     assert decoded["filesystem_verified"] is True
@@ -1346,6 +1443,49 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         )
 
 
+def test_uid0_console_rejection_marker_is_rejected() -> None:
+    receipt = _receipt()
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, uid0_isolation_console=receipt.uid0_isolation_console + REJECTION_MARKER + b"\n")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "argv",
+        "user",
+        "transport",
+        "cmdline",
+        "lifecycle-request",
+        "lifecycle-sequence",
+        "lifecycle-reply",
+        "lifecycle-contract",
+    ],
+)
+def test_uid0_receipt_evidence_is_exactly_bound(mutation: str) -> None:
+    receipt = _receipt()
+    value = copy.deepcopy(receipt.to_dict())
+    evidence = value["workload_isolation"]
+    if mutation == "argv":
+        evidence["plan"]["process"]["argv"][-1] = "wrong-mode"
+    elif mutation == "user":
+        evidence["plan"]["process"]["user"]["uid"] = "65534"
+    elif mutation == "transport":
+        evidence["transport"]["serial"] = "0" * 20
+    elif mutation == "cmdline":
+        evidence["cmdline"]["text"] += " changed"
+    elif mutation == "lifecycle-request":
+        evidence["lifecycle"]["frames"][0]["request_id"] = 9
+    elif mutation == "lifecycle-sequence":
+        evidence["lifecycle"]["frames"][1]["sequence"] = 9
+    elif mutation == "lifecycle-reply":
+        evidence["lifecycle"]["frames"][3]["reply_to"] = 9
+    else:
+        evidence["lifecycle"]["broker_contract"] = "wrong"
+    with pytest.raises(ArtifactValidationError, match="policy|canonical"):
+        _decode_receipt(value, receipt)
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["missing", "extra", "method", "pivot", "switch", "root", "pseudo-order", "workload"],
@@ -1378,6 +1518,7 @@ def test_receipt_rejects_root_transition_claim_tamper(mutation: str) -> None:
             negative_consoles=receipt.negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1417,6 +1558,7 @@ def test_receipt_rejects_readonly_size_missing_wrong_duplicate_and_extra_topolog
             negative_consoles=negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1467,6 +1609,7 @@ def test_receipt_rejects_negative_control_mapping_tamper(mutation: str) -> None:
             negative_consoles=consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1505,6 +1648,7 @@ def test_receipt_rejects_filesystem_control_mapping_tamper(mutation: str) -> Non
             negative_consoles=receipt.negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1654,6 +1798,7 @@ def test_receipt_rejects_workload_negative_control_mapping_tamper() -> None:
             negative_consoles=receipt.negative_consoles,
             filesystem_negative_consoles=receipt.filesystem_negative_consoles,
             retained_console=receipt.retained_console,
+            uid0_isolation_console=receipt.uid0_isolation_console,
             assembly_negative_consoles=receipt.assembly_negative_consoles,
             assembly_negative_root_post_digests=receipt.assembly_negative_root_post_digests,
             root_transition_negative_consoles=receipt.root_transition_negative_consoles,
@@ -1797,6 +1942,7 @@ def test_evidence_names_and_owner_only_publication_are_exact(tmp_path: Path) -> 
     assert EVIDENCE_FILE_NAMES == (
         "console.bin",
         "retained-console.bin",
+        "uid0-isolation-console.bin",
         "receipt.json",
         *(f"negative-{name}.bin" for name in NEGATIVE_CONTROL_NAMES),
         *(f"filesystem-negative-{name}.bin" for name in FILESYSTEM_NEGATIVE_CONTROL_NAMES),

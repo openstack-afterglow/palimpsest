@@ -50,7 +50,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v9"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v10"
 OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v4"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 OCI_ROOT_LIFECYCLE_ENDPOINT = "run-private/lifecycle.sock"

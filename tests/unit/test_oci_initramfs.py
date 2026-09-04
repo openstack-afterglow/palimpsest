@@ -140,10 +140,12 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     assert OCIInitramfsManifest.from_dict(value) == built.manifest
-    assert value["stage1"]["capability"] == "authenticated-overlay-switch-root-pid1-supervisor"
+    assert value["stage1"]["capability"] == (
+        "authenticated-overlay-switch-root-pid1-supervisor-workload-isolation"
+    )
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v12"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v13"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -161,16 +163,25 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["workload_started"] is True
     assert value["stage1"]["supervisor"] == {
         "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
-        "cgroup_security": "workload-containment-and-cleanup-not-hostile-root-sandbox",
+        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
         "cleanup_scope": "dedicated-workload-cgroup",
-        "contract": "palimpsest.guest-pid1-supervisor.v5",
-        "credential_transition": "release-after-cgroup-attach-then-setgroups-setresgid-setresuid-verified",
-        "credentials": "root-pid1-broker-and-admitted-numeric-workload-identity-empty-supplementary-groups",
+        "contract": "palimpsest.guest-pid1-supervisor.v6",
+        "credential_transition": "isolate-drop-verify-handshake-cgroup-attach-release",
+        "credentials": "root-pid1-broker-and-capabilityless-admitted-numeric-workload-identity",
         "environment": "authenticated-image-environment-only",
-        "execution": "fork-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "execution": "fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "isolation": {
+            "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
+            "contract": "palimpsest.workload-lifecycle-authority-isolation.v1",
+            "devices": ["full", "null", "random", "tty", "urandom", "zero"],
+            "lifecycle_fd": "child-closed-before-isolation-ready",
+            "mounts": "private-dev-tmpfs-masked-virtio-ports-readonly-proc-sys-cgroup",
+            "pid1_proc": "nondumpable-before-fork",
+            "seccomp": "authority-escape-boundary-filter",
+        },
         "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v2",
         "lifecycle_delivery": "reconnect-snapshot-same-id-stop-retry-v1",
-        "privilege_after_fork": "root-pid1-narrow-broker-workload-identity-only",
+        "privilege_after_fork": "root-pid1-narrow-broker-capabilityless-workload",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
         "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
         "terminal_state": "parent-marker-then-fail-closed-wait",
@@ -226,15 +237,19 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     source = (repository / "guest" / "stage1" / "init.c").read_text()
     packaged = (repository / "src" / "palimpsest_local" / "assets" / "oci-stage1-init.x86_64").read_bytes()
 
-    assert source.count("return n ? 0 : -1;") == 3
+    assert source.count("return n ? 0 : -1;") == 4
     assert "sc2(SYS_kill, main_pid, SIGKILL)" not in source
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v10")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v4")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v11")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v5")' in source
+    assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v1")' in source
     assert '"org.palimpsest.oci.lifecycle.0"' in source
     assert '"palimpsest.oci-lifecycle-control.v1"' in source
+    assert "BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT" in source
+    assert "X32_SYSCALL_BIT 0x40000000U" in source
+    assert 'verify_mountinfo("/proc", "proc", 1' in source
     assert "SYS_getrandom 318" in source
     assert "O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY" in source
     assert "value.n != 36" in source

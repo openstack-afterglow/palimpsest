@@ -7,7 +7,8 @@ under `-accel kvm -cpu host`. Device attachment order is intentionally
 permuted. The positive boot must mount the authenticated ext4/SquashFS set,
 assemble OverlayFS, perform the authenticated move-mount/chroot root
 transition, execute the proof workload as numeric `65534:65534` from
-`/proof/workdir`, and require PID 1 to supervise its process group. The
+`/proof/workdir`, and require PID 1 to supervise its process group. A separate
+positive boot executes the same proof as capabilityless numeric `0:0`. The
 parent-authored terminal marker must report main status 42, cooperative status
 43, forced status 137, three reaped children, forwarded SIGTERM 15, root PID 1
 credentials, and completed cgroup cleanup; workload output is never
@@ -31,7 +32,7 @@ Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
 drives canonical lifecycle frames with partial nonblocking I/O and records
 path-free frame digests plus nonce/generation/request/sequence correlation.
-Receipt v14 covers a single connection and an exact six-connection retained-
+Receipt v15 covers a single connection and an exact six-connection retained-
 root session. The latter proves lost initial READY recovery; ready, stopping,
 and terminal SNAPSHOTs; a connection-local partial STOP; complete same-ID
 retry; and an already-committed same-ID duplicate accepted without a second
@@ -65,22 +66,25 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-receipt v14 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v15 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
-It also binds the exact argv, two-entry environment, cwd, numeric uid/gid,
-empty supplementary groups, root PID 1's fd-pinned cgroup-v2 broker, child-only
-credential drop after the attach/release gate, stop signal, process-group
+It also binds the exact base and UID 0 mode argv, two-entry environment, cwd,
+and their respective numeric uid/gid,
+empty supplementary groups, root PID 1's fd-pinned cgroup-v2 broker, child
+isolation and credential drop before the parent-verifiable attach/release gate,
+stop signal, process-group
 supervision, signal forwarding, all reaped statuses, and verified empty-cgroup
 removal. The workload also proves UID 65534 cannot write-open either the parent
 or its own `cgroup.procs`. Production define/start remains
 disabled.
 
-The v14 canonical receipt binds all 40 native-KVM guest boots: two positive boots
+The v15 canonical receipt binds all 41 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and three
-workload-launch controls, plus ten lifecycle controls. One additional QEMU
-invocation is the duplicate-name preboot rejection, for 41 invocations total.
+workload-launch controls, ten lifecycle controls, and one UID 0 isolation
+positive boot. One additional QEMU invocation is the duplicate-name preboot
+rejection, for 42 invocations total.
 It binds every path-free negative topology contract and
 its console digest, records mutable-root seed/boot-one/boot-two digests, and
 keeps immutable transport/lower equality. The two committed real SquashFS
@@ -99,7 +103,7 @@ markers and must remain alive fail-closed.
 
 The highest lower and every transition fixture include the exact `0755`
 `/.__palimpsest_workload_proof_v1`, the root sentinel, and
-`/proof/workdir`. Fixture policy v8 binds the recursive source entry types and
+`/proof/workdir`. Fixture policy v9 binds the recursive source entry types and
 modes, proof source/build-script/ELF hashes, digest-pinned GCC image, and the
 pinned mksquashfs 4.7.5 zstd-level-3 build policy.
 Evidence contains positive and retained-boot consoles plus every named
@@ -112,19 +116,26 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v10, OCI-root domain plan is v8, and the init
-contract is v12. Initramfs manifest/ABI are v14, supervisor is v5, lifecycle
-broker is v2, and filesystem fixture policy/schema are v8. Pre-mount,
+The stage-1 plan/protocol is v11, OCI-root domain plan is v10, and the init
+contract is v13. Initramfs manifest/ABI are v15, supervisor is v6, lifecycle
+broker is v2, and filesystem fixture policy/schema are v9. Pre-mount,
 filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v14 receipt on the qualified runner; this source update and
+must still produce a v15 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
-This qualification PID 1 remains a root, narrow broker while only the admitted
-workload child drops to its numeric identity. The boundary remains
+This qualification PID 1 remains a root, narrow broker while the admitted
+workload child enters a private mount namespace, closes the lifecycle fd,
+drops every capability, locks securebits, enables `no_new_privs` and the narrow
+authority seccomp filter, and then assumes its numeric identity. The UID 0
+proof checks the same boundary with `Cap*=0`, `NoNewPrivs=1`, `Seccomp=2`, an
+exact private safe-device set, read-only/masked control paths, inaccessible PID
+1 fd/memory, denied authority syscalls, and a working ordinary fork. This is a
+lifecycle-authority boundary, not a complete hostile-root availability
+sandbox: no PID or user namespace is introduced. The boundary remains
 single-workload: future detached stop, multi-user exec, and agent lifecycle
 require a separate production broker and authenticated host lifecycle channel.
-The cgroup is a containment and cleanup mechanism, not a hostile-root sandbox;
-production policy must separately constrain admitted root/capability workloads.
+The cgroup is a containment and cleanup mechanism; production policy must
+separately constrain denial-of-service behavior.

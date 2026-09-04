@@ -91,8 +91,9 @@ v8 and domain core v3. Earlier v4/v5/v6/v7 and core-v2 previews are rejected and
 before a future launch; loading one never migrates, deletes, or otherwise
 changes its run state or transport artifact.
 
-The v14 native qualification harness now exercises both a single connection
-and a six-connection retained-root session. The latter loses the initial READY,
+The v15 native qualification harness exercises a single connection, a
+six-connection retained-root session, and a separate capabilityless UID 0
+positive boot. The retained-root session loses the initial READY,
 reconnects through READY/stopping/terminal snapshots, writes a partial STOP,
 retries the complete same logical STOP, and then proves already-committed
 same-ID deduplication without a second signal dispatch. Linux connects pin the
@@ -109,6 +110,19 @@ wire inputs; a separate non-boot QEMU invocation proves duplicate named ports
 are rejected before stage 1 starts. Thus `reconnect_proven=true` and
 `negative_input_proven=true`; natural workload terminal delivery remains
 implemented but explicitly unqualified (`natural_terminal_proven=false`).
+
+The UID 0 boot proves the pre-MAC lifecycle-authority isolation boundary before
+workload release: the lifecycle fd is closed, PID 1 is non-dumpable, `/dev` is
+an exact private safe-device tmpfs, procfs/sysfs/cgroup controls are read-only or
+masked, all capability sets are empty, securebits are locked,
+`NoNewPrivs=1`, and `Seccomp=2`. Authority syscalls and PID 1 fd/memory access
+are denied while ordinary fork and safe-device I/O still work. This does not
+claim a PID/user namespace or complete denial-of-service containment.
+
+Receipt v15 binds 41 native guest boots and one duplicate-name preboot
+rejection (42 QEMU invocations), stage-1 plan/protocol v11, handoff v5,
+init/consumer v13, initramfs manifest/ABI v15, supervisor v6, lifecycle v2,
+fixture policy/schema v9, and domain plan v10/core v4.
 
 Production still does not call libvirt `openChannel`, dispatch runtime `STOP`,
 or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in

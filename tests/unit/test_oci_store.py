@@ -1832,8 +1832,9 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
-    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v10"
-    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v4"
+    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v11"
+    assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v5"
+    assert stage1.to_dict()["isolation"] == "palimpsest.workload-lifecycle-authority-isolation.v1"
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
 
     tampered = deepcopy(plan.to_dict())

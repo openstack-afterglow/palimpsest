@@ -56,6 +56,47 @@ struct span { const char *p; usize n; };
 #define SYS_unlinkat 263
 #define SYS_clock_gettime 228
 #define SYS_getrandom 318
+#define SYS_mknod 133
+#define SYS_capget 125
+#define SYS_capset 126
+#define SYS_prctl 157
+#define SYS_unshare 272
+#define SYS_seccomp 317
+#define SYS_clone 56
+#define SYS_clone3 435
+#define SYS_umount2 166
+#define SYS_ptrace 101
+#define SYS_process_vm_readv 310
+#define SYS_process_vm_writev 311
+#define SYS_pidfd_getfd 438
+#define SYS_open_by_handle_at 304
+#define SYS_pivot_root 155
+#define SYS_reboot 169
+#define SYS_swapon 167
+#define SYS_swapoff 168
+#define SYS_init_module 175
+#define SYS_delete_module 176
+#define SYS_finit_module 313
+#define SYS_kexec_load 246
+#define SYS_bpf 321
+#define SYS_perf_event_open 298
+#define SYS_add_key 248
+#define SYS_request_key 249
+#define SYS_keyctl 250
+#define SYS_userfaultfd 323
+#define SYS_io_uring_setup 425
+#define SYS_io_uring_enter 426
+#define SYS_io_uring_register 427
+#define SYS_open_tree 428
+#define SYS_move_mount 429
+#define SYS_fsopen 430
+#define SYS_fsconfig 431
+#define SYS_fsmount 432
+#define SYS_fspick 433
+#define SYS_mount_setattr 442
+#define SYS_setns 308
+#define SYS_mknodat 259
+#define SYS_newfstatat 262
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -77,6 +118,8 @@ struct span { const char *p; usize n; };
 #define WNOHANG 1
 #define SEEK_SET 0
 #define AT_REMOVEDIR 0x200
+#define AT_FDCWD -100
+#define AT_SYMLINK_NOFOLLOW 0x100
 #define S_IFMT 0170000
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
@@ -86,6 +129,8 @@ struct span { const char *p; usize n; };
 #define MS_NOSUID 2
 #define MS_NODEV 4
 #define MS_NOEXEC 8
+#define MS_REMOUNT 32
+#define MS_BIND 4096
 #define MS_REC 16384
 #define MS_PRIVATE 262144
 #define MS_MOVE 8192
@@ -97,10 +142,53 @@ struct span { const char *p; usize n; };
 #define ESRCH 3
 #define ECHILD 10
 #define EINVAL 22
+#define EPERM 1
 #define CLOCK_MONOTONIC 1
 #define GRND_NONBLOCK 1
 #define BLKROGET 0x125e
 #define BLKGETSIZE64 0x80081272
+
+#define CLONE_NEWNS 0x00020000
+#define CLONE_NEWCGROUP 0x02000000
+#define CLONE_NEWUTS 0x04000000
+#define CLONE_NEWIPC 0x08000000
+#define CLONE_NEWUSER 0x10000000
+#define CLONE_NEWPID 0x20000000
+#define CLONE_NEWNET 0x40000000
+
+#define PR_GET_DUMPABLE 3
+#define PR_SET_DUMPABLE 4
+#define PR_CAPBSET_READ 23
+#define PR_CAPBSET_DROP 24
+#define PR_GET_SECUREBITS 27
+#define PR_SET_SECUREBITS 28
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+#define PR_GET_SECCOMP 21
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_IS_SET 1
+#define PR_CAP_AMBIENT_CLEAR_ALL 4
+#define WORKLOAD_SECUREBITS 239
+
+#define LINUX_CAPABILITY_VERSION_3 0x20080522
+#define SECCOMP_SET_MODE_FILTER 1
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#define SECCOMP_MODE_FILTER 2
+#define BPF_LD 0x00
+#define BPF_W 0x00
+#define BPF_ABS 0x20
+#define BPF_JMP 0x05
+#define BPF_JEQ 0x10
+#define BPF_JSET 0x40
+#define BPF_ALU 0x04
+#define BPF_AND 0x50
+#define BPF_K 0x00
+#define BPF_RET 0x06
+#define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#define SECCOMP_RET_ERRNO 0x00050000U
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#define AUDIT_ARCH_X86_64 0xc000003eU
+#define X32_SYSCALL_BIT 0x40000000U
 
 #define CMDLINE_MAX 4096
 #define PAYLOAD_MAX (2 * 1024 * 1024)
@@ -128,6 +216,7 @@ struct span { const char *p; usize n; };
 #define EXIT_WORKLOAD 72
 
 #define WORKLOAD_STARTED_MARKER "palimpsest guest stage1: workload started; root is slash; supervisor active\n"
+#define WORKLOAD_ISOLATION_MARKER "palimpsest guest stage1: workload isolation committed; lifecycle authority retained by pid1\n"
 #define ROOT_TRANSITION_MARKER "palimpsest guest stage1: root transition complete; root is slash; workload pending\n"
 #define WORKLOAD_TERMINAL_PREFIX "palimpsest guest stage1: workload terminal; main_status="
 #define WORKLOAD_REJECTED_PREFIX "palimpsest guest stage1: workload launch rejected; stage="
@@ -204,6 +293,34 @@ struct child_error_local {
     u32 stage;
     u32 error;
 };
+
+struct capability_header_local {
+    u32 version;
+    int pid;
+};
+
+struct capability_data_local {
+    u32 effective;
+    u32 permitted;
+    u32 inheritable;
+};
+
+struct sock_filter_local {
+    unsigned short code;
+    u8 jt;
+    u8 jf;
+    u32 k;
+};
+
+struct sock_fprog_local {
+    unsigned short len;
+    struct sock_filter_local *filter;
+};
+
+#define BPF_STMT_LOCAL(code_value, k_value) \
+    { (unsigned short)(code_value), 0, 0, (u32)(k_value) }
+#define BPF_JUMP_LOCAL(code_value, k_value, jt_value, jf_value) \
+    { (unsigned short)(code_value), (u8)(jt_value), (u8)(jf_value), (u32)(k_value) }
 
 struct supervisor_result {
     u32 main_status;
@@ -305,6 +422,10 @@ static inline i64 sc5(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e) {
                      : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
                      : "rcx", "r11", "memory");
     return r;
+}
+
+static inline i64 prctl_local(i64 option, i64 argument) {
+    return sc5(SYS_prctl, option, argument, 0, 0, 0);
 }
 
 void *memcpy(void *dst, const void *src, usize n) {
@@ -1159,16 +1280,19 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         s.n != 71 || !bytes_equal(s.p, b->resource, 71) || !take_char(&j, ',') ||
         !key(&j, "domain_core_digest") || !plain_string(&j, &s, 0) || s.n != 71 ||
         !bytes_equal(s.p, b->core, 71) || !take_char(&j, ',') || !key(&j, "handoff") ||
-        !exact_string(&j, "first-party-pid1-supervisor.v4") || !take_char(&j, ',') ||
+        !exact_string(&j, "first-party-pid1-supervisor.v5") || !take_char(&j, ',') ||
+        !key(&j, "isolation") ||
+        !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v1") || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
-        !key(&j, "process_policy") || !exact_string(&j, "absolute-argv0-numeric-explicit-user-group.v1") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v10") ||
+        !key(&j, "process_policy") ||
+        !exact_string(&j, "absolute-argv0-numeric-capabilityless-isolated-user-group.v2") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v11") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v10") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v11") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -2770,6 +2894,280 @@ static int exact_line_once_local(const u8 *payload, usize size, const char *expe
     return matches == 1;
 }
 
+static u64 make_device_number(u32 major, u32 minor) {
+    return (minor & 0xffU) | ((u64)(major & 0xfffU) << 8) |
+           ((u64)(minor & ~0xffU) << 12) | ((u64)(major & ~0xfffU) << 32);
+}
+
+static int make_safe_workload_device(const char *path, u32 major, u32 minor) {
+    struct stat_local st;
+    if (sc3(SYS_mknod, (i64)path, S_IFCHR | 0666, make_device_number(major, minor)) != 0)
+        return 0;
+    return sc4(SYS_newfstatat, AT_FDCWD, (i64)path, (i64)&st, AT_SYMLINK_NOFOLLOW) == 0 &&
+           (st.mode & S_IFMT) == S_IFCHR && (st.mode & 07777) == 0666 &&
+           dev_major(st.rdev) == major && dev_minor(st.rdev) == minor;
+}
+
+static int safe_workload_dev_entries(void) {
+    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty"};
+    u8 entries[2048];
+    u32 seen = 0;
+    i64 directory = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory < 0) return 0;
+    for (;;) {
+        i64 n = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (n < 0) { sc1(SYS_close, directory); return 0; }
+        if (!n) break;
+        while (offset < (usize)n) {
+            const u8 *entry = entries + offset;
+            usize length, i;
+            u32 reclen;
+            int match = -1;
+            if ((usize)n - offset < 20) { sc1(SYS_close, directory); return 0; }
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, directory); return 0; }
+            for (length = 0; length < reclen - 19 && entry[19 + length]; length++) {}
+            if (length == reclen - 19) { sc1(SYS_close, directory); return 0; }
+            if (!((length == 1 && entry[19] == '.') ||
+                  (length == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+                    if (length == slen(allowed[i]) && bytes_equal(entry + 19, allowed[i], length)) match = (int)i;
+                if (match < 0 || (seen & (1U << match))) { sc1(SYS_close, directory); return 0; }
+                seen |= 1U << match;
+            }
+            offset += reclen;
+        }
+    }
+    if (sc1(SYS_close, directory) != 0) return 0;
+    return seen == (1U << (sizeof(allowed) / sizeof(allowed[0]))) - 1;
+}
+
+static int prepare_workload_mount_boundary(struct child_error_local *failure) {
+    int empty = -1;
+    i64 operation = sc1(SYS_unshare, CLONE_NEWNS);
+    if (operation != 0) goto rejected;
+    operation = sc5(SYS_mount, 0, (i64)"/", 0, MS_REC | MS_PRIVATE, 0);
+    if (operation != 0) goto rejected;
+    operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/dev", (i64)"tmpfs",
+                    MS_NOSUID | MS_NOEXEC, (i64)"mode=0755,size=64k,nr_inodes=16");
+    if (operation != 0 ||
+        !make_safe_workload_device("/dev/null", 1, 3) ||
+        !make_safe_workload_device("/dev/zero", 1, 5) ||
+        !make_safe_workload_device("/dev/full", 1, 7) ||
+        !make_safe_workload_device("/dev/random", 1, 8) ||
+        !make_safe_workload_device("/dev/urandom", 1, 9) ||
+        !make_safe_workload_device("/dev/tty", 5, 0) ||
+        !safe_workload_dev_entries()) {
+        operation = -EIO;
+        goto rejected;
+    }
+    operation = sc5(SYS_mount, 0, (i64)"/proc", 0,
+                    MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
+    if (operation != 0 || !verify_mountinfo("/proc", "proc", 1, 0, 0, 0, 0)) goto rejected;
+    operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/sys/class/virtio-ports", (i64)"tmpfs",
+                    MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                    (i64)"mode=0555,size=4k,nr_inodes=2");
+    if (operation != 0 || !safe_dir("/sys/class/virtio-ports", 0, 1, 0, &empty)) goto rejected;
+    sc1(SYS_close, empty); empty = -1;
+    operation = sc5(SYS_mount, 0, (i64)"/sys/fs/cgroup", 0,
+                    MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
+    if (operation != 0 || !verify_mountinfo("/sys/fs/cgroup", "cgroup2", 1, 0, 0, 0, 0)) goto rejected;
+    operation = sc5(SYS_mount, 0, (i64)"/sys", 0,
+                    MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, 0);
+    if (operation != 0 || !verify_mountinfo("/sys", "sysfs", 1, 0, 0, 0, 0)) goto rejected;
+    return 1;
+rejected:
+    if (empty >= 0) sc1(SYS_close, empty);
+    set_workload_failure(failure, 23, operation != 0 ? operation : EIO);
+    return 0;
+}
+
+static int read_cap_last_cap(u32 *last) {
+    u8 text[32];
+    i64 count = read_bounded_file("/proc/sys/kernel/cap_last_cap", text, sizeof(text), 1, 0);
+    usize size;
+    u32 value;
+    if (count < 2 || text[count - 1] != '\n') return 0;
+    size = (usize)count - 1;
+    if (!parse_u32_decimal(text, size, &value) || value > 63) return 0;
+    *last = value;
+    return 1;
+}
+
+static int prepare_workload_securebits(struct child_error_local *failure) {
+    u32 last, capability;
+    i64 operation;
+    if (!read_cap_last_cap(&last)) {
+        set_workload_failure(failure, 24, EIO);
+        return 0;
+    }
+    for (capability = 0; capability <= last; capability++) {
+        operation = prctl_local(PR_CAPBSET_DROP, capability);
+        if (operation != 0 || prctl_local(PR_CAPBSET_READ, capability) != 0) {
+            set_workload_failure(failure, 24, operation != 0 ? operation : EIO);
+            return 0;
+        }
+    }
+    operation = prctl_local(PR_SET_SECUREBITS, WORKLOAD_SECUREBITS);
+    if (operation != 0 || prctl_local(PR_GET_SECUREBITS, 0) != WORKLOAD_SECUREBITS) {
+        set_workload_failure(failure, 24, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    return 1;
+}
+
+static int clear_workload_capabilities(struct child_error_local *failure) {
+    struct capability_header_local header = {LINUX_CAPABILITY_VERSION_3, 0};
+    struct capability_data_local data[2];
+    u32 last, capability;
+    i64 operation;
+    memset(data, 0, sizeof(data));
+    operation = sc2(SYS_capset, (i64)&header, (i64)data);
+    if (operation != 0) goto rejected;
+    memset(data, 0xff, sizeof(data));
+    operation = sc2(SYS_capget, (i64)&header, (i64)data);
+    if (operation != 0 || data[0].effective || data[0].permitted || data[0].inheritable ||
+        data[1].effective || data[1].permitted || data[1].inheritable) {
+        operation = operation != 0 ? operation : -EIO;
+        goto rejected;
+    }
+    operation = sc5(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    if (operation != 0 || !read_cap_last_cap(&last)) {
+        operation = operation != 0 ? operation : -EIO;
+        goto rejected;
+    }
+    for (capability = 0; capability <= last; capability++) {
+        if (sc5(SYS_prctl, PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, capability, 0, 0) != 0 ||
+            prctl_local(PR_CAPBSET_READ, capability) != 0) {
+            operation = -EIO;
+            goto rejected;
+        }
+    }
+    operation = prctl_local(PR_SET_NO_NEW_PRIVS, 1);
+    if (operation != 0 || prctl_local(PR_GET_NO_NEW_PRIVS, 0) != 1) {
+        operation = operation != 0 ? operation : -EIO;
+        goto rejected;
+    }
+    return 1;
+rejected:
+    set_workload_failure(failure, 25, operation != 0 ? operation : EIO);
+    return 0;
+}
+
+static int install_workload_seccomp(struct child_error_local *failure) {
+    static struct sock_filter_local filter[] = {
+        BPF_STMT_LOCAL(BPF_LD | BPF_W | BPF_ABS, 4),
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT_LOCAL(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1),
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+#define DENY_SYSCALL(number) \
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JEQ | BPF_K, number, 0, 1), \
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+        DENY_SYSCALL(SYS_unshare),
+        DENY_SYSCALL(SYS_setns),
+        DENY_SYSCALL(SYS_mount),
+        DENY_SYSCALL(SYS_umount2),
+        DENY_SYSCALL(SYS_mknod),
+        DENY_SYSCALL(SYS_mknodat),
+        DENY_SYSCALL(SYS_ptrace),
+        DENY_SYSCALL(SYS_process_vm_readv),
+        DENY_SYSCALL(SYS_process_vm_writev),
+        DENY_SYSCALL(SYS_pidfd_getfd),
+        DENY_SYSCALL(SYS_open_by_handle_at),
+        DENY_SYSCALL(SYS_chroot),
+        DENY_SYSCALL(SYS_pivot_root),
+        DENY_SYSCALL(SYS_reboot),
+        DENY_SYSCALL(SYS_swapon),
+        DENY_SYSCALL(SYS_swapoff),
+        DENY_SYSCALL(SYS_init_module),
+        DENY_SYSCALL(SYS_delete_module),
+        DENY_SYSCALL(SYS_finit_module),
+        DENY_SYSCALL(SYS_kexec_load),
+        DENY_SYSCALL(SYS_bpf),
+        DENY_SYSCALL(SYS_perf_event_open),
+        DENY_SYSCALL(SYS_add_key),
+        DENY_SYSCALL(SYS_request_key),
+        DENY_SYSCALL(SYS_keyctl),
+        DENY_SYSCALL(SYS_userfaultfd),
+        DENY_SYSCALL(SYS_io_uring_setup),
+        DENY_SYSCALL(SYS_io_uring_enter),
+        DENY_SYSCALL(SYS_io_uring_register),
+        DENY_SYSCALL(SYS_open_tree),
+        DENY_SYSCALL(SYS_move_mount),
+        DENY_SYSCALL(SYS_fsopen),
+        DENY_SYSCALL(SYS_fsconfig),
+        DENY_SYSCALL(SYS_fsmount),
+        DENY_SYSCALL(SYS_fspick),
+        DENY_SYSCALL(SYS_mount_setattr),
+#undef DENY_SYSCALL
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 38),
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 4),
+        BPF_STMT_LOCAL(BPF_LD | BPF_W | BPF_ABS, 16),
+        BPF_STMT_LOCAL(BPF_ALU | BPF_AND | BPF_K,
+                       CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
+                       CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET),
+        BPF_JUMP_LOCAL(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT_LOCAL(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog_local program = {
+        (unsigned short)(sizeof(filter) / sizeof(filter[0])), filter
+    };
+    i64 operation = sc3(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, (i64)&program);
+    if (operation != 0 || prctl_local(PR_GET_SECCOMP, 0) != SECCOMP_MODE_FILTER) {
+        set_workload_failure(failure, 26, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    return 1;
+}
+
+static int prepare_workload_isolation(struct guest_process *process,
+                                      struct child_error_local *failure) {
+    return prepare_workload_mount_boundary(failure) &&
+           prepare_workload_securebits(failure) &&
+           drop_workload_credentials(process, failure) &&
+           clear_workload_capabilities(failure) &&
+           install_workload_seccomp(failure);
+}
+
+static int append_status_id_line(char out[64], const char *label, u32 value) {
+    usize used = 0;
+    out[0] = 0;
+    return append_text(out, &used, label) && append_u32(out, &used, value) &&
+           append_text(out, &used, "\t") && append_u32(out, &used, value) &&
+           append_text(out, &used, "\t") && append_u32(out, &used, value) &&
+           append_text(out, &used, "\t") && append_u32(out, &used, value) &&
+           append_text(out, &used, "\n");
+}
+
+static int verify_workload_isolation_status(i64 pid, const struct guest_process *process) {
+    u8 status[16384];
+    char path[64], uid_line[64], gid_line[64];
+    usize used = 0;
+    i64 count;
+    path[0] = 0;
+    if (pid <= 1 || pid > 0xffffffffU || !append_text(path, &used, "/proc/") ||
+        !append_u32(path, &used, (u32)pid) || !append_text(path, &used, "/status") ||
+        !append_status_id_line(uid_line, "Uid:\t", process->uid) ||
+        !append_status_id_line(gid_line, "Gid:\t", process->gid)) return 0;
+    count = read_bounded_file(path, status, sizeof(status), 1, 0);
+    return count > 0 &&
+        exact_line_once_local(status, (usize)count, uid_line) &&
+        exact_line_once_local(status, (usize)count, gid_line) &&
+        exact_line_once_local(status, (usize)count, "Groups:\t \n") &&
+        exact_line_once_local(status, (usize)count, "CapInh:\t0000000000000000\n") &&
+        exact_line_once_local(status, (usize)count, "CapPrm:\t0000000000000000\n") &&
+        exact_line_once_local(status, (usize)count, "CapEff:\t0000000000000000\n") &&
+        exact_line_once_local(status, (usize)count, "CapBnd:\t0000000000000000\n") &&
+        exact_line_once_local(status, (usize)count, "CapAmb:\t0000000000000000\n") &&
+        exact_line_once_local(status, (usize)count, "NoNewPrivs:\t1\n") &&
+        exact_line_once_local(status, (usize)count, "Seccomp:\t2\n");
+}
+
 static i64 openat_local(int directory_fd, const char *name, int flags) {
     return sc4(SYS_openat, directory_fd, (i64)name, flags, 0);
 }
@@ -2942,7 +3340,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                               struct supervisor_result *result,
                               struct lifecycle_session *lifecycle) {
     u64 mask = supervised_signal_mask(), empty_mask = 0;
-    int error_pipe[2], release_pipe[2], status = 0, main_done = 0;
+    int error_pipe[2], isolation_pipe[2], release_pipe[2], status = 0, main_done = 0;
     struct workload_cgroup cgroup;
     i64 signal_fd, main_pid, n;
     struct pollfd_local pollfds[2];
@@ -2953,7 +3351,8 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     memset(result, 0, sizeof(*result));
     result->cooperative_status = WORKLOAD_STATUS_NONE;
     result->forced_status = WORKLOAD_STATUS_NONE;
-    if (!process || !process->argc || !process->argv[0] || process->argv[0][0] != '/' || !process->cwd) {
+    if (!process || !process->argc || !process->argv[0] || process->argv[0][0] != '/' || !process->cwd ||
+        !lifecycle || lifecycle->fd < 0) {
         set_workload_failure(failure, 8, EINVAL);
         return 0;
     }
@@ -2984,10 +3383,23 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return 0;
     }
+    n = sc2(SYS_pipe2, (i64)isolation_pipe, O_CLOEXEC);
+    if (n != 0) {
+        set_workload_failure(failure, 23, n);
+        sc1(SYS_close, release_pipe[0]);
+        sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, error_pipe[1]);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
     if (!prepare_workload_cgroup(&cgroup)) {
         set_workload_failure(failure, 14, EIO);
         sc1(SYS_close, release_pipe[0]);
         sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]);
+        sc1(SYS_close, isolation_pipe[1]);
         sc1(SYS_close, error_pipe[0]);
         sc1(SYS_close, error_pipe[1]);
         sc1(SYS_close, signal_fd);
@@ -2999,6 +3411,22 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         if (!remove_empty_workload_cgroup(&cgroup)) set_workload_failure(failure, 18, EIO);
         sc1(SYS_close, release_pipe[0]);
         sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]);
+        sc1(SYS_close, isolation_pipe[1]);
+        sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, error_pipe[1]);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
+    n = prctl_local(PR_SET_DUMPABLE, 0);
+    if (n != 0 || prctl_local(PR_GET_DUMPABLE, 0) != 0) {
+        set_workload_failure(failure, 15, n != 0 ? n : EIO);
+        if (!remove_empty_workload_cgroup(&cgroup)) set_workload_failure(failure, 18, EIO);
+        sc1(SYS_close, release_pipe[0]);
+        sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]);
+        sc1(SYS_close, isolation_pipe[1]);
         sc1(SYS_close, error_pipe[0]);
         sc1(SYS_close, error_pipe[1]);
         sc1(SYS_close, signal_fd);
@@ -3008,38 +3436,61 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     main_pid = sc0(SYS_fork);
     if (main_pid == 0) {
         i64 operation;
-        u8 release = 0;
+        u8 isolation_ready = 1, release = 0;
+        if (sc1(SYS_close, lifecycle->fd) != 0) child_fail(error_pipe[1], 23, EIO);
         sc1(SYS_close, error_pipe[0]);
+        sc1(SYS_close, isolation_pipe[0]);
         sc1(SYS_close, release_pipe[1]);
         sc1(SYS_close, signal_fd);
         close_workload_cgroup(&cgroup);
-        operation = sc3(SYS_read, release_pipe[0], (i64)&release, 1);
-        if (operation != 1 || release != 1) child_fail(error_pipe[1], 13, operation < 0 ? operation : EIO);
-        if (sc1(SYS_close, release_pipe[0]) != 0) child_fail(error_pipe[1], 13, EIO);
         operation = sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         if (operation != 0) child_fail(error_pipe[1], 1, operation);
         operation = sc2(SYS_setpgid, 0, 0);
         if (operation != 0) child_fail(error_pipe[1], 2, operation);
         {
-            struct child_error_local credential_failure;
-            if (!drop_workload_credentials(process, &credential_failure))
-                child_fail(error_pipe[1], credential_failure.stage, credential_failure.error);
+            struct child_error_local isolation_failure;
+            if (!prepare_workload_isolation(process, &isolation_failure))
+                child_fail(error_pipe[1], isolation_failure.stage, isolation_failure.error);
         }
+        operation = sc3(SYS_write, isolation_pipe[1], (i64)&isolation_ready, 1);
+        if (operation != 1 || sc1(SYS_close, isolation_pipe[1]) != 0)
+            child_fail(error_pipe[1], 23, operation < 0 ? operation : EIO);
+        operation = sc3(SYS_read, release_pipe[0], (i64)&release, 1);
+        if (operation != 1 || release != 1) child_fail(error_pipe[1], 13, operation < 0 ? operation : EIO);
+        if (sc1(SYS_close, release_pipe[0]) != 0) child_fail(error_pipe[1], 13, EIO);
         operation = sc1(SYS_chdir, (i64)process->cwd);
         if (operation != 0) child_fail(error_pipe[1], 6, operation);
         operation = sc3(SYS_execve, (i64)process->argv[0], (i64)process->argv, (i64)process->envp);
         child_fail(error_pipe[1], 7, operation);
     }
     sc1(SYS_close, error_pipe[1]);
+    sc1(SYS_close, isolation_pipe[1]);
     sc1(SYS_close, release_pipe[0]);
     if (main_pid < 0) {
         set_workload_failure(failure, 11, main_pid);
         sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]);
         sc1(SYS_close, error_pipe[0]);
         if (!remove_empty_workload_cgroup(&cgroup)) set_workload_failure(failure, 18, EIO);
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return 0;
+    }
+    {
+        u8 isolation_ready = 0;
+        n = sc3(SYS_read, isolation_pipe[0], (i64)&isolation_ready, 1);
+        if (sc1(SYS_close, isolation_pipe[0]) != 0 || n != 1 || isolation_ready != 1 ||
+            !verify_workload_isolation_status(main_pid, process)) {
+            set_workload_failure(failure, 23, n < 0 ? n : EIO);
+            sc1(SYS_close, release_pipe[1]);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
+            sc1(SYS_close, error_pipe[0]);
+            if (!n) set_workload_failure(failure, 18, EIO);
+            close_workload_cgroup(&cgroup);
+            sc1(SYS_close, signal_fd);
+            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+            return n ? 0 : -1;
+        }
     }
     n = sc2(SYS_setpgid, main_pid, main_pid);
     if (n != 0 || !move_pid_to_workload_cgroup(&cgroup, main_pid)) {
@@ -3053,6 +3504,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return n ? 0 : -1;
     }
+    write_all(1, WORKLOAD_ISOLATION_MARKER);
     {
         u8 release = 1;
         n = sc3(SYS_write, release_pipe[1], (i64)&release, 1);

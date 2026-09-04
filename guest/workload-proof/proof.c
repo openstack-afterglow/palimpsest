@@ -31,10 +31,19 @@ typedef unsigned long usize;
 #define SYS_getgroups 115
 #define SYS_signalfd4 289
 #define SYS_pipe2 293
+#define SYS_getdents64 217
+#define SYS_fstat 5
+#define SYS_mount 165
+#define SYS_mknod 133
+#define SYS_unshare 272
+#define SYS_newfstatat 262
 
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_CLOEXEC 02000000
+#define O_NONBLOCK 04000
+#define O_NOFOLLOW 0400000
+#define O_DIRECTORY 0200000
 #define SIG_BLOCK 0
 #define SIGTERM 15
 #define SIGNALLFD_INFO_BYTES 128
@@ -42,6 +51,13 @@ typedef unsigned long usize;
 #define EINTR 4
 #define EACCES 13
 #define EPERM 1
+#define EROFS 30
+#define ENOSPC 28
+#define S_IFMT 0170000
+#define S_IFCHR 0020000
+#define CLONE_NEWNS 0x00020000
+#define AT_FDCWD -100
+#define AT_SYMLINK_NOFOLLOW 0x100
 
 #define MAIN_SUCCESS 42
 #define DESCENDANT_SUCCESS 43
@@ -82,6 +98,25 @@ static inline i64 sc4(i64 n, i64 a, i64 b, i64 c, i64 d) {
                      : "rcx", "r11", "memory");
     return r;
 }
+
+static inline i64 sc5(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e) {
+    register i64 r10 __asm__("r10") = d;
+    register i64 r8 __asm__("r8") = e;
+    i64 r;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+
+struct timespec_local { i64 sec; i64 nsec; };
+struct stat_local {
+    u64 dev; u64 ino; u64 nlink; u32 mode; u32 uid; u32 gid; u32 pad0; u64 rdev;
+    i64 size; i64 blksize; i64 blocks;
+    struct timespec_local atime; struct timespec_local mtime; struct timespec_local ctime;
+    i64 reserved[3];
+};
 
 static usize slen(const char *value) {
     usize size = 0;
@@ -157,6 +192,151 @@ static int exact_line_count(const char *payload, usize payload_size, const char 
     return count;
 }
 
+static int read_file(const char *path, char *buffer, usize capacity, usize *used_out) {
+    usize used = 0;
+    int descriptor = (int)sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (descriptor < 0) return 0;
+    while (used < capacity) {
+        i64 count = sc3(SYS_read, descriptor, (i64)(buffer + used), capacity - used);
+        if (count == -EINTR) continue;
+        if (count < 0 || (usize)count > capacity - used) { sc1(SYS_close, descriptor); return 0; }
+        if (!count) { *used_out = used; return sc1(SYS_close, descriptor) == 0; }
+        used += (usize)count;
+    }
+    sc1(SYS_close, descriptor);
+    return 0;
+}
+
+static int verify_capabilityless_boundary(void) {
+    static const char *lines[] = {
+        "CapInh:\t0000000000000000\n", "CapPrm:\t0000000000000000\n",
+        "CapEff:\t0000000000000000\n", "CapBnd:\t0000000000000000\n",
+        "CapAmb:\t0000000000000000\n", "NoNewPrivs:\t1\n", "Seccomp:\t2\n",
+    };
+    char status[PID1_STATUS_MAX];
+    usize used = 0, i;
+    if (!read_file("/proc/self/status", status, sizeof(status), &used)) return 0;
+    for (i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
+        if (exact_line_count(status, used, lines[i]) != 1) return 0;
+    return 1;
+}
+
+static int allowed_dev_name(const u8 *name, usize size) {
+    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty"};
+    usize i;
+    for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+        if (size == slen(allowed[i])) {
+            usize at;
+            u8 difference = 0;
+            for (at = 0; at < size; at++) difference |= name[at] ^ (u8)allowed[i][at];
+            if (!difference) return (int)i + 1;
+        }
+    return 0;
+}
+
+static int verify_private_devices(void) {
+    u8 entries[2048];
+    u32 seen = 0;
+    i64 directory = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory < 0) return 0;
+    for (;;) {
+        i64 count = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (count < 0) { sc1(SYS_close, directory); return 0; }
+        if (!count) break;
+        while (offset < (usize)count) {
+            u32 reclen;
+            usize length;
+            int allowed;
+            const u8 *entry = entries + offset;
+            if ((usize)count - offset < 20) { sc1(SYS_close, directory); return 0; }
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)count - offset) { sc1(SYS_close, directory); return 0; }
+            for (length = 0; length < reclen - 19 && entry[19 + length]; length++) {}
+            if (length == reclen - 19) { sc1(SYS_close, directory); return 0; }
+            if (!((length == 1 && entry[19] == '.') ||
+                  (length == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                allowed = allowed_dev_name(entry + 19, length);
+                if (!allowed || (seen & (1U << (allowed - 1)))) { sc1(SYS_close, directory); return 0; }
+                seen |= 1U << (allowed - 1);
+            }
+            offset += reclen;
+        }
+    }
+    if (sc1(SYS_close, directory) != 0 || seen != 0x3f) return 0;
+    {
+        static const char *paths[] = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"};
+        usize i;
+        for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            struct stat_local st;
+            if (sc4(SYS_newfstatat, AT_FDCWD, (i64)paths[i], (i64)&st, AT_SYMLINK_NOFOLLOW) != 0 ||
+                (st.mode & S_IFMT) != S_IFCHR) return 0;
+        }
+    }
+    {
+        u8 byte = 0xff;
+        i64 fd = sc3(SYS_open, (i64)"/dev/null", O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+        if (fd < 0 || sc3(SYS_write, fd, (i64)&byte, 1) != 1 || sc1(SYS_close, fd) != 0) return 0;
+        fd = sc3(SYS_open, (i64)"/dev/zero", O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+        if (fd < 0 || sc3(SYS_read, fd, (i64)&byte, 1) != 1 || byte != 0 || sc1(SYS_close, fd) != 0) return 0;
+        fd = sc3(SYS_open, (i64)"/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+        if (fd < 0 || sc3(SYS_read, fd, (i64)&byte, 1) != 1 || sc1(SYS_close, fd) != 0) return 0;
+        fd = sc3(SYS_open, (i64)"/dev/full", O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+        if (fd < 0 || sc3(SYS_write, fd, (i64)&byte, 1) != -ENOSPC || sc1(SYS_close, fd) != 0) return 0;
+    }
+    return 1;
+}
+
+static int directory_is_empty(const char *path) {
+    u8 entries[512];
+    i64 directory = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory < 0) return 0;
+    for (;;) {
+        i64 count = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (count < 0) { sc1(SYS_close, directory); return 0; }
+        if (!count) break;
+        while (offset < (usize)count) {
+            const u8 *entry = entries + offset;
+            u32 reclen;
+            usize length;
+            if ((usize)count - offset < 20) { sc1(SYS_close, directory); return 0; }
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)count - offset) { sc1(SYS_close, directory); return 0; }
+            for (length = 0; length < reclen - 19 && entry[19 + length]; length++) {}
+            if (length == reclen - 19 ||
+                !((length == 1 && entry[19] == '.') ||
+                  (length == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                sc1(SYS_close, directory);
+                return 0;
+            }
+            offset += reclen;
+        }
+    }
+    return sc1(SYS_close, directory) == 0;
+}
+
+static int denied_open(const char *path, int flags) {
+    i64 descriptor = sc3(SYS_open, (i64)path, flags | O_CLOEXEC | O_NOFOLLOW, 0);
+    if (descriptor >= 0) { sc1(SYS_close, descriptor); return 0; }
+    return descriptor == -EACCES || descriptor == -EPERM || descriptor == -EROFS;
+}
+
+static int verify_authority_escape_denied(void) {
+    i64 operation;
+    if (!denied_open("/proc/1/fd", O_RDONLY | O_DIRECTORY) ||
+        !denied_open("/proc/1/mem", O_RDONLY) ||
+        !denied_open("/proc/sys/kernel/randomize_va_space", O_WRONLY) ||
+        !directory_is_empty("/sys/class/virtio-ports") ||
+        !denied_open("/sys/kernel/uevent_seqnum", O_WRONLY)) return 0;
+    operation = sc5(SYS_mount, 0, (i64)"/dev", 0, 0, 0);
+    if (operation != -EPERM) return 0;
+    operation = sc3(SYS_mknod, (i64)"/dev/escape", S_IFCHR | 0600, 0);
+    if (operation != -EPERM) return 0;
+    operation = sc1(SYS_unshare, CLONE_NEWNS);
+    return operation == -EPERM;
+}
+
 static int verify_pid1_root_credentials(void) {
     static const char uid_line[] = "Uid:\t0\t0\t0\t0\n";
     static const char gid_line[] = "Gid:\t0\t0\t0\t0\n";
@@ -200,7 +380,7 @@ static int verify_cgroup_escape_denied(const char *path) {
         sc1(SYS_close, descriptor);
         return 0;
     }
-    return descriptor == -EACCES || descriptor == -EPERM;
+    return descriptor == -EACCES || descriptor == -EPERM || descriptor == -EROFS;
 }
 
 static int block_sigterm(void) {
@@ -232,14 +412,18 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
     static const char sentinel[] = "palimpsest-oci-root-workload-proof-v1\n";
     char cwd[64];
     i64 cwd_size;
-    if (argc != 4 || !same_text(argv[0], "/.__palimpsest_workload_proof_v1") ||
+    int uid0_mode;
+    if ((argc != 4 && argc != 5) || !same_text(argv[0], "/.__palimpsest_workload_proof_v1") ||
         !same_text(argv[1], "palimpsest-argv-one") || !same_text(argv[2], "") ||
-        !same_text(argv[3], "line\nbreak")) return 0;
+        !same_text(argv[3], "line\nbreak") ||
+        (argc == 5 && !same_text(argv[4], "palimpsest-uid0-isolation-v1"))) return 0;
+    uid0_mode = argc == 5;
     if (!environment[0] || !environment[1] || environment[2] ||
         !same_text(environment[0], "PALIMPSEST_PROOF_ENV=value with spaces") ||
         !same_text(environment[1], "PALIMPSEST_PROOF_EMPTY=")) return 0;
     if (sc0(SYS_getpid) <= 1 || sc0(SYS_getppid) != 1 || sc0(SYS_getpgrp) != sc0(SYS_getpid)) return 0;
-    if (sc0(SYS_getuid) != 65534 || sc0(SYS_getgid) != 65534 || sc2(SYS_getgroups, 0, 0) != 0) return 0;
+    if (sc0(SYS_getuid) != (uid0_mode ? 0 : 65534) ||
+        sc0(SYS_getgid) != (uid0_mode ? 0 : 65534) || sc2(SYS_getgroups, 0, 0) != 0) return 0;
     cwd_size = sc2(SYS_getcwd, (i64)cwd, sizeof(cwd));
     if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 0;
     return read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel) &&
@@ -247,6 +431,8 @@ static int verify_invocation(u64 argc, char **argv, char **environment) {
            read_exact_file("/proc/self/cgroup", "0::/palimpsest.workload\n") &&
            verify_cgroup_escape_denied("/sys/fs/cgroup/cgroup.procs") &&
            verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs") &&
+           verify_capabilityless_boundary() && verify_private_devices() &&
+           verify_authority_escape_denied() &&
            verify_pid1_root_credentials();
 }
 

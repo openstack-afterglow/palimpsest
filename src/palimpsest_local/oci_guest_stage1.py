@@ -33,12 +33,13 @@ from .oci_stage1 import (
     OCI_STAGE1_PROCESS_POLICY,
     OCI_STAGE1_PROTOCOL,
     OCI_STAGE1_ROOT_LAYOUT,
+    OCI_STAGE1_WORKLOAD_ISOLATION,
     OCIStage1Plan,
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v12"
-OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-pid1-supervisor"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v13"
+OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-pid1-supervisor-workload-isolation"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
 MAX_GUEST_SYSFS_SERIAL_BYTES = 64
@@ -459,6 +460,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         "boot_plan_digest",
         "domain_core_digest",
         "handoff",
+        "isolation",
         "phase",
         "process",
         "process_policy",
@@ -474,6 +476,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         or value.get("protocol") != OCI_STAGE1_PROTOCOL
         or value.get("phase") != "stage1-contract"
         or value.get("handoff") != OCI_STAGE1_HANDOFF
+        or value.get("isolation") != OCI_STAGE1_WORKLOAD_ISOLATION
         or value.get("process_policy") != OCI_STAGE1_PROCESS_POLICY
         or not isinstance(run, Mapping)
         or set(run) != {"name", "run_id"}

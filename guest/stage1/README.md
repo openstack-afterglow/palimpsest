@@ -109,19 +109,32 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v12 proof retains owner-only positive and per-control consoles plus a
+The v15 receipt retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v4` execution checkpoint and the
-single-connection `palimpsest.guest-lifecycle-broker.v1` exchange.
+the `palimpsest.guest-pid1-supervisor.v6` execution checkpoint, the
+`palimpsest.workload-lifecycle-authority-isolation.v1` boundary, and the
+`palimpsest.guest-lifecycle-broker.v2` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v9 admits
+and production VM launch remains disabled. Stage-1 plan/protocol v11 admits
 only the explicit absolute/numeric process subset.
+
+Before release, PID 1 verifies that the workload child has closed the
+lifecycle descriptor, entered a private mount namespace, installed an exact
+private safe `/dev`, made or masked sysfs/cgroup control paths read-only,
+emptied every capability set, locked securebits, enabled `no_new_privs`, and
+installed the narrow authority seccomp filter. The exact isolation marker is
+emitted only after this child-ready handshake and cgroup attachment, before
+`WORKLOAD_STARTED` and lifecycle READY. The UID 0 native positive boot proves
+that numeric root receives no capabilities or lifecycle authority while normal
+argv/env/cwd/root/stdout, safe-device I/O, ordinary fork, stop, and cleanup
+remain usable. No PID or user namespace is claimed; this does not make the
+workload availability-safe against all same-PID-namespace denial of service.
 
 The positive highest lower contains the separately reproducible proof workload
 and its OCI-root sentinel. That workload validates argv, environment, cwd,
@@ -138,26 +151,27 @@ setup stage/errno rejection markers.
 
 After root transition, PID 1 mounts and verifies cgroup v2, pins the workload
 directory plus `cgroup.procs`, `cgroup.kill`, and `cgroup.events`, and forks a
-child held behind a release gate. Only after root PID 1 moves that child into
-the dedicated cgroup may the child drop groups/GID/UID and exec. Cleanup uses
+child held behind a release gate. The child first closes the lifecycle fd,
+installs and verifies its isolation boundary, and reports readiness. Only then
+does root PID 1 move it into the dedicated cgroup and send the release byte;
+the child may subsequently change cwd and exec. Cleanup uses
 only the pinned controls and requires stop-signal grace, `cgroup.kill`,
 `wait4` to `ECHILD`, `populated 0`, empty procs, and successful removal before
 the terminal marker. This is still a single-workload qualification boundary;
 future detached stop, exec, and agent lifecycle need a separate privileged
 broker plus an authenticated host lifecycle channel.
 The cgroup provides workload containment and deterministic cleanup; it is not
-a hostile-root security sandbox. The child executes the admitted numeric OCI
-identity, which need not be unprivileged for every valid image.
+a complete hostile-root availability sandbox. Every admitted numeric identity,
+including UID 0, executes without capabilities behind the same boundary.
 
-The native proof now opens the uniquely named lifecycle virtio port and runs a
-strict bounded HELLO/READY/STOP/TERMINAL exchange. TERMINAL is sent only after
-cgroup cleanup certainty and before the console terminal marker. This is one
-connection only (`reconnect_proven=false`); the production libvirt path,
-SNAPSHOT, retransmission, and cryptographic peer authentication remain future
-work.
-Receipt v12 records `negative_input_proven=false`; the guest-C malformed,
-stale-binding, duplicate, truncated, and oversized runtime matrix has not yet
-been collected on native KVM.
+The native proof opens the uniquely named lifecycle virtio port and runs the
+bounded HELLO/READY/STOP/TERMINAL exchange for both the base and distinct UID 0
+plans. It also qualifies retained-root reconnect/SNAPSHOT/same-ID retry and
+deduplication, plus the malformed, stale, replayed, and conflicting input
+matrix. TERMINAL is sent only after cgroup cleanup certainty and before the
+console terminal marker. Receipt v15 records `reconnect_proven=true` and
+`negative_input_proven=true`; arbitrary rapid reconnect and cryptographic peer
+authentication remain future production boundaries.
 
 Proof v7 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
