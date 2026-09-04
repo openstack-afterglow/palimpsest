@@ -2994,13 +2994,13 @@ static int prepare_workload_mount_boundary(struct child_error_local *failure) {
     stage = 28;
     operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/proc/1/fd", (i64)"tmpfs",
                     MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
-                    (i64)"mode=0500,size=4k,nr_inodes=2");
+                    (i64)"mode=0555,size=4k,nr_inodes=2");
     if (operation != 0 || !safe_dir("/proc/1/fd", 0, 1, 0, &empty) ||
         !verify_mountinfo("/proc/1/fd", "tmpfs", 1, 0, 0, 0, 0)) goto rejected;
     sc1(SYS_close, empty); empty = -1;
     operation = sc5(SYS_mount, (i64)"tmpfs", (i64)"/proc/1/fdinfo", (i64)"tmpfs",
                     MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
-                    (i64)"mode=0500,size=4k,nr_inodes=2");
+                    (i64)"mode=0555,size=4k,nr_inodes=2");
     if (operation != 0 || !safe_dir("/proc/1/fdinfo", 0, 1, 0, &empty) ||
         !verify_mountinfo("/proc/1/fdinfo", "tmpfs", 1, 0, 0, 0, 0)) goto rejected;
     sc1(SYS_close, empty); empty = -1;
