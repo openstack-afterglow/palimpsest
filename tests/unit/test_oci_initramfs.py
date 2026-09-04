@@ -250,6 +250,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT" in source
     assert "X32_SYSCALL_BIT 0x40000000U" in source
     assert 'verify_mountinfo("/proc", "proc", 1' in source
+    assert 'verify_mountinfo("/proc/1/fd", "tmpfs", 1' in source
+    assert 'verify_mountinfo("/proc/1/fdinfo", "tmpfs", 1' in source
     assert "sc2(SYS_chmod, (i64)path, 0666)" in source
     assert 'MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC' in source
     assert 'SYS_mount, (i64)staging, (i64)"/sys/fs/cgroup", 0, MS_MOVE' in source

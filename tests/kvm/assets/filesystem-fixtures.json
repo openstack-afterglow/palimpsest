@@ -14,12 +14,12 @@
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "c20d7b62d700376609ae969d4bffafee364d2f72de33a14878c1942195bc5fd3",
+      "raw_sha256": "502a7346dfdf8a4a1925832975858da7b062eb76c86abeae4a2773071f0aead7",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "40487f57c70fd3768ef895ca737ea74e02ef3a5357b47622f1b77a18ff3ac102", "size_bytes": 9848, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c", "size_bytes": 9868, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -39,12 +39,12 @@
     "transition_dev": {
       "base64_file": "transition-dev.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "20d68ea71c54011db8a2b7bf0b1e0a47f67c7e9fdabfc1f475b99b3baceb117c",
+      "raw_sha256": "1bf2dd5d99a63c547e1558e96c495c12dc1fad8639367f18d50c8dfedf0e14ba",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "40487f57c70fd3768ef895ca737ea74e02ef3a5357b47622f1b77a18ff3ac102", "size_bytes": 9848, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c", "size_bytes": 9868, "type": "file"},
         {"mode": 420, "path": "dev", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
@@ -56,12 +56,12 @@
     "transition_proc": {
       "base64_file": "transition-proc.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "08559291b002e29d3753e404f56c4f9710e1493deab0dc99e7c94dc712df9156",
+      "raw_sha256": "56b2bec0a2c02baa0b287a308803c39291a11930166dd0697f816ba6ee4bc216",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "40487f57c70fd3768ef895ca737ea74e02ef3a5357b47622f1b77a18ff3ac102", "size_bytes": 9848, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c", "size_bytes": 9868, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 420, "path": "proc", "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109", "size_bytes": 16, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
@@ -73,12 +73,12 @@
     "transition_sys": {
       "base64_file": "transition-sys.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "995cde0e28d32ce3d0fbaf58a2cce7eb51ecfe1f221b3a4cb3cf073859e7edbe",
+      "raw_sha256": "31b08952984e8e079d3c38e1de5719109a6ee73c9293cc3245f382a3c134acf5",
       "raw_size_bytes": 4096,
       "source_entries": [
         {"mode": 420, "path": ".__palimpsest_oci_root_workload_proof_v1", "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db", "size_bytes": 38, "type": "file"},
         {"mode": 420, "path": ".__palimpsest_overlay_order_probe_v1", "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a", "size_bytes": 10, "type": "file"},
-        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "40487f57c70fd3768ef895ca737ea74e02ef3a5357b47622f1b77a18ff3ac102", "size_bytes": 9848, "type": "file"},
+        {"mode": 493, "path": ".__palimpsest_workload_proof_v1", "sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c", "size_bytes": 9868, "type": "file"},
         {"mode": 420, "path": "layer.txt", "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741", "size_bytes": 21, "type": "file"},
         {"mode": 493, "path": "proof", "type": "directory"},
         {"mode": 493, "path": "proof/workdir", "type": "directory"},
@@ -112,10 +112,10 @@
       "build_script": "scripts/build_oci_guest_workload_proof.sh",
       "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
       "elf_mode": 493,
-      "elf_sha256": "40487f57c70fd3768ef895ca737ea74e02ef3a5357b47622f1b77a18ff3ac102",
-      "elf_size_bytes": 9848,
+      "elf_sha256": "e8aef26b352fd23ddf5428618eb239d71bc84c22ecc0065a8d562008d77b846c",
+      "elf_size_bytes": 9868,
       "source": "guest/workload-proof/proof.c",
-      "source_sha256": "097047ae7fb944500766b5b21a773ef045166e35b2b52bcfd5464a558033aa4a",
+      "source_sha256": "4f6c1e6b7b2a8fef6e4078c3cb3407515db4057a388d706af9a8b2b7ccb1ebec",
       "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     }
   },

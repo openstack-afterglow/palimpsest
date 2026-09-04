@@ -324,7 +324,8 @@ static int denied_open(const char *path, int flags) {
 
 static int verify_authority_escape_denied(void) {
     i64 operation;
-    if (!denied_open("/proc/1/fd", O_RDONLY | O_DIRECTORY) ||
+    if (!directory_is_empty("/proc/1/fd") ||
+        !directory_is_empty("/proc/1/fdinfo") ||
         !denied_open("/proc/1/mem", O_RDONLY) ||
         !denied_open("/proc/sys/kernel/randomize_va_space", O_WRONLY) ||
         !directory_is_empty("/sys/class/virtio-ports") ||
