@@ -36,6 +36,10 @@ class OCILifecycleTransportError(StateError):
     """Stable failure at the libvirt stream or lifecycle handoff boundary."""
 
 
+class OCILifecycleStreamCallbackCleanupError(OCILifecycleTransportError):
+    """The stream callback may still be registered, so the stream must remain open."""
+
+
 @dataclass(frozen=True, slots=True)
 class OCILifecycleHandoffReceipt:
     """Secret-free projection of one authenticated boot lifecycle."""
@@ -114,7 +118,7 @@ def _send_all(
     *,
     deadline: float | None,
     monotonic: Callable[[], float],
-    wait: Callable[[float], None],
+    wait_writable: Callable[[float], None],
 ) -> None:
     offset = 0
     while offset < len(payload):
@@ -124,7 +128,7 @@ def _send_all(
         except Exception:
             raise OCILifecycleTransportError("OCI-root lifecycle stream send failed") from None
         if sent == -2:
-            _pause(deadline, monotonic, wait)
+            _pause(deadline, monotonic, wait_writable)
             continue
         if type(sent) is not int or sent <= 0 or sent > len(payload) - offset:
             raise OCILifecycleTransportError("OCI-root lifecycle stream send result is invalid")
@@ -198,6 +202,8 @@ def complete_initial_lifecycle_handoff(
     terminal_timeout_seconds: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     wait: Callable[[float], None] = time.sleep,
+    wait_writable: Callable[[float], None] | None = None,
+    before_stream_close: Callable[[], None] | None = None,
     session: HostOCIControlV2Session | None = None,
 ) -> OCILifecycleHandoffReceipt:
     """Drive HELLO/BOOTSTRAP/KEY_ACK/READY through authenticated TERMINAL.
@@ -242,6 +248,12 @@ def complete_initial_lifecycle_handoff(
             raise OCILifecycleTransportError("OCI-root lifecycle ready callback is invalid")
         if not callable(monotonic) or not callable(wait):
             raise OCILifecycleTransportError("OCI-root lifecycle timing callback is invalid")
+        if wait_writable is None:
+            wait_writable = wait
+        if not callable(wait_writable):
+            raise OCILifecycleTransportError("OCI-root lifecycle timing callback is invalid")
+        if before_stream_close is not None and not callable(before_stream_close):
+            raise OCILifecycleTransportError("OCI-root lifecycle stream cleanup callback is invalid")
         ready_deadline = monotonic() + float(timeout_seconds)
         if not math.isfinite(ready_deadline):
             raise OCILifecycleTransportError("OCI-root lifecycle clock result is invalid")
@@ -254,7 +266,7 @@ def complete_initial_lifecycle_handoff(
             raise OCILifecycleTransportError("OCI-root lifecycle session is invalid")
         hello = session.hello()
         encoded = encode_frame(hello)
-        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait=wait)
+        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait_writable=wait_writable)
         transcript.append(session.transcript_projection(hello, encoded))
 
         bootstrap = _receive_one(stream, decoder, pending, deadline=ready_deadline, monotonic=monotonic, wait=wait)
@@ -269,7 +281,7 @@ def complete_initial_lifecycle_handoff(
 
         key_ack = session.key_ack()
         encoded = encode_frame(key_ack)
-        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait=wait)
+        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait_writable=wait_writable)
         observed_tags.add(key_ack.tag or "")
         transcript.append(session.transcript_projection(key_ack, encoded))
 
@@ -319,6 +331,15 @@ def complete_initial_lifecycle_handoff(
         )
     except BaseException as exc:
         failure = exc
+    if isinstance(failure, OCILifecycleStreamCallbackCleanupError):
+        raise failure
+    if before_stream_close is not None:
+        try:
+            before_stream_close()
+        except Exception:
+            raise OCILifecycleStreamCallbackCleanupError(
+                "OCI-root lifecycle stream event cleanup failed; stream retained"
+            ) from None
     close_failed = False
     for operation in (abort_operation, free_operation):
         if operation is None:
@@ -340,6 +361,7 @@ __all__ = [
     "DEFAULT_HANDOFF_TIMEOUT_SECONDS",
     "OCI_ROOT_HANDOFF_SCHEMA",
     "OCILifecycleHandoffReceipt",
+    "OCILifecycleStreamCallbackCleanupError",
     "OCILifecycleTransportError",
     "complete_initial_lifecycle_handoff",
 ]

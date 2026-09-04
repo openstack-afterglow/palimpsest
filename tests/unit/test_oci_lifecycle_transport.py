@@ -177,6 +177,57 @@ def test_handoff_handles_fragmentation_coalescing_would_block_and_redacts_receip
     ]
 
 
+def test_handoff_uses_writable_wait_only_for_send_backpressure_and_removes_events_before_abort() -> None:
+    stream = _GuestStream()
+    waits: list[str] = []
+    cleanup: list[str] = []
+    original_abort = stream.abort
+    original_free = stream.free
+
+    def abort() -> None:
+        cleanup.append("abort")
+        original_abort()
+
+    def free() -> None:
+        cleanup.append("free")
+        original_free()
+
+    stream.abort = abort  # type: ignore[method-assign]
+    stream.free = free  # type: ignore[method-assign]
+    receipt = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=lambda _receipt: None,
+        wait=lambda _seconds: waits.append("readable"),
+        wait_writable=lambda _seconds: waits.append("writable"),
+        before_stream_close=lambda: cleanup.append("event-remove"),
+        session=_session(BINDING),
+    )
+
+    assert receipt.phase == "terminal"
+    assert waits[0] == "writable"
+    assert "readable" in waits
+    assert cleanup == ["event-remove", "abort", "free"]
+
+
+def test_handoff_event_cleanup_failure_retains_stream_without_abort_or_free() -> None:
+    stream = _GuestStream()
+
+    def fail_event_cleanup() -> None:
+        raise RuntimeError("event cleanup failed")
+
+    with pytest.raises(OCILifecycleTransportError, match="stream event cleanup failed; stream retained"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=lambda _receipt: None,
+            before_stream_close=fail_event_cleanup,
+            session=_session(BINDING),
+        )
+
+    assert stream.abort_calls == stream.free_calls == 0
+
+
 class _GuestStreamWithoutFree:
     """Mirror the public surface exposed by Python libvirt's virStream."""
 

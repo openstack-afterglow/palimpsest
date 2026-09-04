@@ -71,6 +71,7 @@ from palimpsest_local.oci_root_prepare import (
     release_prepared_oci_root_run,
 )
 from palimpsest_local.oci_root_runtime import (
+    connect_oci_root_libvirt,
     define_committed_oci_root_domain,
     launch_defined_oci_root_domain,
 )
@@ -2706,7 +2707,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         name = f"p-{uuid.uuid4().hex[:6]}"
         lifecycle_path = roots.runs / name / "lifecycle.sock"
         assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
-        conn = kvm.connect(profile.uri)
+        conn = connect_oci_root_libvirt(profile.uri)
         qemu_uid, qemu_gid = _parse_qemu_dac_baselabel(conn.getCapabilities())
         assert 0 <= qemu_uid <= _MAX_DAC_ID
         assert 0 <= qemu_gid <= _MAX_DAC_ID

@@ -7,7 +7,10 @@ dispatch remains disabled until the privileged lifecycle handshake is ready.
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import re
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
@@ -26,6 +29,8 @@ from .oci_lifecycle_transport import (
     DEFAULT_HANDOFF_TIMEOUT_SECONDS,
     OCI_ROOT_HANDOFF_SCHEMA,
     OCILifecycleHandoffReceipt,
+    OCILifecycleStreamCallbackCleanupError,
+    OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
 )
 from .oci_root_kvm import (
@@ -41,6 +46,27 @@ from .state import StatePaths, locked_existing_run
 
 OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+_EVENT_DRIVER_LOCK = threading.Lock()
+_EVENT_RUN_LOCK = threading.Lock()
+_EVENT_DRIVER_LIBVIRT: Any | None = None
+_EVENT_DRIVER_PID: int | None = None
+_EVENT_DRIVER_POISONED = False
+_EVENT_DRIVER_TOKEN = object()
+_EVENT_STREAM_QUARANTINE: list[tuple[Any, Any]] = []
+_EVENT_WAIT_MAX_MILLISECONDS = 10
+
+
+def _poison_event_driver_after_fork() -> None:
+    global _EVENT_DRIVER_LOCK, _EVENT_RUN_LOCK, _EVENT_DRIVER_PID, _EVENT_DRIVER_POISONED
+    _EVENT_DRIVER_LOCK = threading.Lock()
+    _EVENT_RUN_LOCK = threading.Lock()
+    _EVENT_DRIVER_PID = os.getpid()
+    _EVENT_DRIVER_POISONED = True
+
+
+_REGISTER_AT_FORK = getattr(os, "register_at_fork", None)
+if callable(_REGISTER_AT_FORK):
+    _REGISTER_AT_FORK(after_in_child=_poison_event_driver_after_fork)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +92,208 @@ class CompletedOCIRootHandoff:
     libvirt_uri: str
     terminal: ProcessExit
     lifecycle: OCILifecycleHandoffReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class _OCIRootEventConnection:
+    connection: Any
+    libvirt: Any
+    pid: int
+    token: object
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.connection, name)
+
+
+def _libvirt_event_surface(libvirt: Any) -> tuple[int, int, int, int]:
+    operations = (
+        "virEventRegisterDefaultImpl",
+        "virEventRunDefaultImpl",
+        "virEventAddTimeout",
+        "virEventUpdateTimeout",
+        "virEventRemoveTimeout",
+    )
+    try:
+        if any(not callable(getattr(libvirt, operation, None)) for operation in operations):
+            raise StateError("required libvirt default event support is unavailable")
+        events = tuple(
+            getattr(libvirt, name)
+            for name in (
+                "VIR_STREAM_EVENT_READABLE",
+                "VIR_STREAM_EVENT_WRITABLE",
+                "VIR_STREAM_EVENT_ERROR",
+                "VIR_STREAM_EVENT_HANGUP",
+            )
+        )
+    except StateError:
+        raise
+    except Exception:
+        raise StateError("required libvirt default event support is unavailable") from None
+    if (
+        any(type(event) is not int or event <= 0 for event in events)
+        or len(set(events)) != len(events)
+        or any(left & right for index, left in enumerate(events) for right in events[index + 1 :])
+    ):
+        raise StateError("required libvirt default event support is unavailable")
+    return events
+
+
+def connect_oci_root_libvirt(uri: str) -> _OCIRootEventConnection:
+    """Open the explicit private OCI connection after one default-event setup."""
+
+    global _EVENT_DRIVER_LIBVIRT, _EVENT_DRIVER_PID
+    libvirt = kvm._libvirt()
+    pid = os.getpid()
+    if not callable(_REGISTER_AT_FORK):
+        raise StateError("libvirt default event fork guard is unavailable")
+    _libvirt_event_surface(libvirt)
+    if _EVENT_DRIVER_PID is not None and _EVENT_DRIVER_PID != pid:
+        raise StateError("libvirt default event implementation identity changed")
+    with _EVENT_DRIVER_LOCK:
+        if _EVENT_DRIVER_POISONED:
+            raise StateError("libvirt default event implementation is poisoned")
+        if _EVENT_DRIVER_LIBVIRT is None:
+            try:
+                registered = libvirt.virEventRegisterDefaultImpl()
+            except Exception:
+                raise StateError("libvirt default event initialization failed") from None
+            if type(registered) is not int or registered != 0:
+                raise StateError("libvirt default event initialization failed")
+            _EVENT_DRIVER_LIBVIRT = libvirt
+            _EVENT_DRIVER_PID = pid
+        elif _EVENT_DRIVER_LIBVIRT is not libvirt or _EVENT_DRIVER_PID != pid:
+            raise StateError("libvirt default event implementation identity changed")
+        connection = kvm.connect(uri)
+        if kvm._libvirt() is not libvirt:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            raise StateError("libvirt default event implementation identity changed")
+    return _OCIRootEventConnection(connection, libvirt, pid, _EVENT_DRIVER_TOKEN)
+
+
+class _LibvirtLifecycleEventPump:
+    def __init__(self, libvirt: Any, stream: Any):
+        readable, writable, error, hangup = _libvirt_event_surface(libvirt)
+        self._libvirt = libvirt
+        self._stream = stream
+        self._readable = readable
+        self._writable = writable
+        self._error = error
+        self._hangup = hangup
+        self._base_events = readable | error | hangup
+        self._all_events = self._base_events | writable
+        self._observed_events = 0
+        self._callback_invalid = False
+        self._closed = False
+        try:
+            added = stream.eventAddCallback(self._base_events, self._stream_event, self)
+        except Exception:
+            try:
+                stream.eventRemoveCallback()
+            except Exception:
+                pass
+            raise StateError("OCI-root lifecycle stream event callback registration failed") from None
+        if added is not None and (type(added) is not int or added != 0):
+            try:
+                stream.eventRemoveCallback()
+            except Exception:
+                pass
+            raise StateError("OCI-root lifecycle stream event callback registration failed")
+
+    def _stream_event(self, stream: Any, events: Any, opaque: Any) -> None:
+        if stream is not self._stream or opaque is not self or type(events) is not int or events & ~self._all_events:
+            self._callback_invalid = True
+            return
+        self._observed_events |= events
+
+    @staticmethod
+    def _timer_event(_timer: Any, _opaque: Any) -> None:
+        return
+
+    def _wait(self, seconds: float, *, writable: bool) -> None:
+        if self._closed or type(seconds) not in {int, float} or not math.isfinite(seconds) or seconds <= 0:
+            raise OCILifecycleTransportError("OCI-root lifecycle event wait is invalid")
+        mask = self._all_events if writable else self._base_events
+        update_attempted = False
+        timer_id: int | None = None
+        failure: BaseException | None = None
+        cleanup_failed = False
+        self._observed_events = 0
+        try:
+            if writable:
+                update_attempted = True
+                updated_result = self._stream.eventUpdateCallback(mask)
+                if type(updated_result) is not int or updated_result != 0:
+                    raise OCILifecycleTransportError("OCI-root lifecycle stream event update failed")
+            milliseconds = max(1, min(_EVENT_WAIT_MAX_MILLISECONDS, math.ceil(seconds * 1000)))
+            timer_id = self._libvirt.virEventAddTimeout(milliseconds, self._timer_event, self)
+            if type(timer_id) is not int or timer_id < 0:
+                raise OCILifecycleTransportError("OCI-root lifecycle event timer registration failed")
+            if not _EVENT_RUN_LOCK.acquire(timeout=min(float(seconds), _EVENT_WAIT_MAX_MILLISECONDS / 1000)):
+                raise OCILifecycleTransportError("OCI-root lifecycle default event pump is already active")
+            try:
+                result = self._libvirt.virEventRunDefaultImpl()
+            finally:
+                _EVENT_RUN_LOCK.release()
+            if type(result) is not int or result != 0:
+                raise OCILifecycleTransportError("OCI-root lifecycle default event pump failed")
+            if self._callback_invalid:
+                raise OCILifecycleTransportError("OCI-root lifecycle stream event callback was invalid")
+            if self._observed_events & self._error:
+                raise OCILifecycleTransportError("OCI-root lifecycle stream reported an error")
+        except BaseException as exc:
+            failure = exc
+        if timer_id is not None:
+            try:
+                removed = self._libvirt.virEventRemoveTimeout(timer_id)
+                if type(removed) is not int or removed != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    disabled = self._libvirt.virEventUpdateTimeout(timer_id, -1)
+                    if type(disabled) is not int or disabled != 0:
+                        cleanup_failed = True
+                except Exception:
+                    cleanup_failed = True
+        if update_attempted:
+            try:
+                restored = self._stream.eventUpdateCallback(self._base_events)
+                if type(restored) is not int or restored != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            global _EVENT_DRIVER_POISONED
+            with _EVENT_DRIVER_LOCK:
+                _EVENT_DRIVER_POISONED = True
+                if not any(pump is self for pump, _stream in _EVENT_STREAM_QUARANTINE):
+                    _EVENT_STREAM_QUARANTINE.append((self, self._stream))
+            raise OCILifecycleStreamCallbackCleanupError(
+                "OCI-root lifecycle event timer cleanup failed; event driver poisoned"
+            )
+        if failure is not None:
+            raise failure
+
+    def wait_readable(self, seconds: float) -> None:
+        self._wait(seconds, writable=False)
+
+    def wait_writable(self, seconds: float) -> None:
+        self._wait(seconds, writable=True)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            removed = self._stream.eventRemoveCallback()
+        except Exception:
+            raise OCILifecycleTransportError("OCI-root lifecycle stream event callback cleanup failed") from None
+        if type(removed) is not int or removed != 0:
+            raise OCILifecycleTransportError("OCI-root lifecycle stream event callback cleanup failed")
+        self._closed = True
 
 
 def _single(parent: ET.Element, path: str, message: str) -> ET.Element:
@@ -1074,6 +1302,38 @@ def _handle_launch_failure(
         return cleanup_phase
 
 
+def _record_launch_cleanup_required(
+    roots: StatePaths,
+    name: str,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    domain_id: int | None,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+    ledger_phase: str,
+    ready_lifecycle: OCILifecycleHandoffReceipt | None,
+) -> None:
+    with locked_existing_run(roots, name) as mutation:
+        ledger_domain_id = None if ledger_phase == "activating" else domain_id
+        _require_expected_handoff(
+            mutation.snapshot.state,
+            resolved,
+            domain_uuid,
+            ledger_domain_id,
+            libvirt_uri,
+            boot_attempt_id,
+            ledger_phase,
+            ready_lifecycle,
+        )
+        data = mutation.mutable_state()
+        data["error"] = "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
+        handoff = data.get("oci_root_handoff")
+        if not isinstance(handoff, dict):
+            raise StateError("OCI-root launch ledger changed before failure publication")
+        handoff["phase"] = "cleanup-required"
+        mutation.write_state("failed", data)
+
+
 def _exact_launch_instance(
     conn: Any,
     resolved: ResolvedOCIRootDomainPlan,
@@ -1165,7 +1425,10 @@ def _close_unowned_stream(stream: Any) -> None:
 
 def _valid_lifecycle_stream_surface(stream: Any) -> bool:
     try:
-        required = tuple(getattr(stream, operation, None) for operation in ("send", "recv", "abort"))
+        required = tuple(
+            getattr(stream, operation, None)
+            for operation in ("send", "recv", "abort", "eventAddCallback", "eventUpdateCallback", "eventRemoveCallback")
+        )
         optional_free = getattr(stream, "free", None)
     except Exception:
         return False
@@ -1190,8 +1453,22 @@ def launch_defined_oci_root_domain(
     not implement detached operation, reconnect, stop, exec, or log delivery.
     """
 
-    if conn is None:
-        raise StateError("OCI-root launch requires an explicit libvirt connection")
+    try:
+        event_libvirt = conn.libvirt
+        event_pid = conn.pid
+        event_token = conn.token
+    except Exception:
+        raise StateError("OCI-root launch requires an explicit event-ready libvirt connection") from None
+    if (
+        event_token is not _EVENT_DRIVER_TOKEN
+        or event_libvirt is not _EVENT_DRIVER_LIBVIRT
+        or event_pid != os.getpid()
+        or event_pid != _EVENT_DRIVER_PID
+    ):
+        raise StateError("OCI-root launch requires an explicit event-ready libvirt connection")
+    with _EVENT_DRIVER_LOCK:
+        if _EVENT_DRIVER_POISONED:
+            raise StateError("libvirt default event implementation is poisoned")
     started_intent = False
     resolved: ResolvedOCIRootDomainPlan | None = None
     domain_uuid: str | None = None
@@ -1227,7 +1504,7 @@ def launch_defined_oci_root_domain(
                 domain_uuid,
                 expected_projection_digest=definition_projection_digest,
             )
-            libvirt = kvm._libvirt()
+            libvirt = event_libvirt
             flags = getattr(libvirt, "VIR_STREAM_NONBLOCK", None)
             inactive_flag = getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", None)
             if type(flags) is not int or type(inactive_flag) is not int:
@@ -1309,6 +1586,8 @@ def launch_defined_oci_root_domain(
             stream = None
             raise
 
+        event_pump = _LibvirtLifecycleEventPump(libvirt, stream)
+
         def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
             nonlocal ledger_phase, ready_lifecycle
             with locked_existing_run(roots, name) as mutation:
@@ -1363,15 +1642,35 @@ def launch_defined_oci_root_domain(
                 ledger_phase = "ready"
 
         stream_handed_off = True
-        lifecycle = complete_initial_lifecycle_handoff(
-            stream,
-            binding,
-            on_ready=publish_ready,
-            timeout_seconds=timeout_seconds,
-            terminal_timeout_seconds=terminal_timeout_seconds,
-            session=lifecycle_session,
-        )
+        handoff_failure: BaseException | None = None
+        lifecycle: OCILifecycleHandoffReceipt | None = None
+        try:
+            lifecycle = complete_initial_lifecycle_handoff(
+                stream,
+                binding,
+                on_ready=publish_ready,
+                timeout_seconds=timeout_seconds,
+                terminal_timeout_seconds=terminal_timeout_seconds,
+                session=lifecycle_session,
+                wait=event_pump.wait_readable,
+                wait_writable=event_pump.wait_writable,
+                before_stream_close=event_pump.close,
+            )
+        except BaseException as exc:
+            handoff_failure = exc
+        if not isinstance(handoff_failure, OCILifecycleStreamCallbackCleanupError):
+            try:
+                event_pump.close()
+            except BaseException:
+                handoff_failure = OCILifecycleStreamCallbackCleanupError(
+                    "OCI-root lifecycle stream event cleanup failed; stream retained"
+                )
+        if isinstance(handoff_failure, OCILifecycleStreamCallbackCleanupError):
+            with _EVENT_DRIVER_LOCK:
+                _EVENT_STREAM_QUARANTINE.append((event_pump, stream))
         stream = None
+        if handoff_failure is not None:
+            raise handoff_failure
         terminal = lifecycle.terminal if isinstance(lifecycle, OCILifecycleHandoffReceipt) else None
         if terminal is None or lifecycle.phase != "terminal" or lifecycle.boot_attempt_id != boot_attempt_id:
             raise StateError("OCI-root lifecycle terminal result is missing")
@@ -1455,7 +1754,7 @@ def launch_defined_oci_root_domain(
             terminal,
             lifecycle,
         )
-    except BaseException:
+    except BaseException as launch_failure:
         if stream is not None and not stream_handed_off:
             _close_unowned_stream(stream)
         if (
@@ -1466,19 +1765,33 @@ def launch_defined_oci_root_domain(
             and definition_projection_digest is not None
         ):
             try:
-                cleanup_phase = _handle_launch_failure(
-                    roots,
-                    name,
-                    conn,
-                    resolved,
-                    domain_uuid,
-                    domain_id,
-                    libvirt_uri,
-                    boot_attempt_id,
-                    ledger_phase,
-                    ready_lifecycle,
-                    definition_projection_digest,
-                )
+                if isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError):
+                    _record_launch_cleanup_required(
+                        roots,
+                        name,
+                        resolved,
+                        domain_uuid,
+                        domain_id,
+                        libvirt_uri,
+                        boot_attempt_id,
+                        ledger_phase,
+                        ready_lifecycle,
+                    )
+                    cleanup_phase = "cleanup-required"
+                else:
+                    cleanup_phase = _handle_launch_failure(
+                        roots,
+                        name,
+                        conn,
+                        resolved,
+                        domain_uuid,
+                        domain_id,
+                        libvirt_uri,
+                        boot_attempt_id,
+                        ledger_phase,
+                        ready_lifecycle,
+                        definition_projection_digest,
+                    )
             except Exception:
                 raise StateError("OCI-root launch state changed; cleanup was not attempted") from None
             if cleanup_phase == "cleanup-not-attempted":
@@ -1493,6 +1806,7 @@ __all__ = [
     "OCI_ROOT_DEFINITION_SCHEMA",
     "CompletedOCIRootHandoff",
     "DefinedOCIRootDomain",
+    "connect_oci_root_libvirt",
     "define_committed_oci_root_domain",
     "launch_defined_oci_root_domain",
 ]

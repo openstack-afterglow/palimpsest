@@ -1652,12 +1652,79 @@ class _FakeLibvirtError(RuntimeError):
         return self._code
 
 
-_FAKE_LIBVIRT = SimpleNamespace(
-    libvirtError=_FakeLibvirtError,
-    VIR_DOMAIN_XML_INACTIVE=2,
-    VIR_ERR_NO_DOMAIN=42,
-    VIR_STREAM_NONBLOCK=1,
-)
+class _FakeLibvirt:
+    libvirtError = _FakeLibvirtError
+    VIR_DOMAIN_XML_INACTIVE = 2
+    VIR_ERR_NO_DOMAIN = 42
+    VIR_STREAM_NONBLOCK = 1
+    VIR_STREAM_EVENT_READABLE = 1
+    VIR_STREAM_EVENT_WRITABLE = 2
+    VIR_STREAM_EVENT_ERROR = 4
+    VIR_STREAM_EVENT_HANGUP = 8
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.next_timer = 40
+        self.on_run = None
+
+    def virEventRegisterDefaultImpl(self) -> int:
+        self.calls.append(("register",))
+        return 0
+
+    def virEventAddTimeout(self, milliseconds: int, callback: object, opaque: object) -> int:
+        self.calls.append(("timer-add", milliseconds, callback, opaque))
+        self.next_timer += 1
+        return self.next_timer
+
+    def virEventRemoveTimeout(self, timer: int) -> int:
+        self.calls.append(("timer-remove", timer))
+        return 0
+
+    def virEventUpdateTimeout(self, timer: int, milliseconds: int) -> int:
+        self.calls.append(("timer-update", timer, milliseconds))
+        return 0
+
+    def virEventRunDefaultImpl(self) -> int:
+        self.calls.append(("run",))
+        if self.on_run is not None:
+            self.on_run()
+        return 0
+
+
+_FAKE_LIBVIRT = _FakeLibvirt()
+
+
+class _FakeLifecycleStream:
+    def __init__(self) -> None:
+        self.callback: object | None = None
+        self.callback_opaque: object | None = None
+        self.calls: list[tuple[object, ...]] = []
+
+    def send(self, payload: bytes) -> int:
+        return len(payload)
+
+    def recv(self, _size: int) -> int:
+        return -2
+
+    def abort(self) -> None:
+        self.calls.append(("abort",))
+
+    def free(self) -> None:
+        self.calls.append(("free",))
+
+    def eventAddCallback(self, events: int, callback: object, opaque: object) -> None:
+        self.calls.append(("event-add", events))
+        self.callback = callback
+        self.callback_opaque = opaque
+
+    def eventUpdateCallback(self, events: int) -> int:
+        self.calls.append(("event-update", events))
+        return 0
+
+    def eventRemoveCallback(self) -> int:
+        self.calls.append(("event-remove",))
+        self.callback = None
+        return 0
 
 
 class _DefinedDomain:
@@ -1735,12 +1802,7 @@ class _DefinitionConnection:
         self.open_channel_result = open_channel_result
         self.lookup_error: Exception | None = None
         self.define_calls = 0
-        self.stream = SimpleNamespace(
-            send=lambda payload: len(payload),
-            recv=lambda _size: -2,
-            abort=lambda: None,
-            free=lambda: None,
-        )
+        self.stream = _FakeLifecycleStream()
         self.stream_flags: list[int] = []
         self.domain_capability_calls: list[tuple[str, str, str, str, int]] = []
 
@@ -1786,6 +1848,21 @@ class _DefinitionConnection:
         if self.rebind_uuid:
             self.domains[name] = _DefinedDomain(self, name, actual)
         return domain
+
+
+def _evented_connection(
+    connection: _DefinitionConnection,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    libvirt: object = _FAKE_LIBVIRT,
+):
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_LIBVIRT", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_PID", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_POISONED", False)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_STREAM_QUARANTINE", [])
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: libvirt)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "connect", lambda _uri: connection)
+    return oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
 
 
 def _committed_oci_domain(tmp_path: Path, name: str):
@@ -2173,7 +2250,7 @@ def test_oci_root_definition_rejects_later_dac_no_relabel_removal(
     name = "disk-source-seclabel-drift"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
@@ -2207,7 +2284,7 @@ def test_oci_root_file_console_projection_binds_no_relabel_and_rejects_later_rem
     monkeypatch.setattr(oci_root_kvm_module, "build_oci_root_domain_xml", build_with_file_console)
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
@@ -2407,7 +2484,7 @@ def test_oci_root_define_normalizes_exact_server_file_console_serial_and_records
     monkeypatch.setattr(oci_root_kvm_module, "build_oci_root_domain_xml", build_with_file_console)
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection(transform=_with_server_file_console_serial)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
 
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
@@ -2546,7 +2623,7 @@ def test_oci_root_define_records_safe_generated_devices_and_rejects_later_remova
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=add_generated_devices)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
 
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
@@ -2833,7 +2910,7 @@ def test_oci_root_define_records_defaulted_cpu_and_rejects_later_drift(
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=default_cpu)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
 
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
@@ -2929,7 +3006,7 @@ def test_oci_root_define_records_capability_validated_canonical_machine_projecti
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=canonicalize_machine)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
 
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
@@ -3024,7 +3101,7 @@ def test_oci_root_private_launch_rejects_unbound_definition_projection_ledger(
     name = f"definition-projection-{tamper}"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     with state_module.locked_existing_run(roots, name) as mutation:
         data = mutation.mutable_state()
@@ -3331,12 +3408,38 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     name = "launch-complete"
     roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     defined = define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    event_order: list[str] = []
+    domain_for_order = conn.domains[name]
+    original_open_channel = domain_for_order.openChannel
+    original_event_add = conn.stream.eventAddCallback
+
+    def open_channel(*args, **kwargs):
+        event_order.append("open-channel")
+        return original_open_channel(*args, **kwargs)
+
+    def event_add(*args, **kwargs):
+        event_order.append("event-add")
+        return original_event_add(*args, **kwargs)
+
+    domain_for_order.openChannel = open_channel  # type: ignore[method-assign]
+    conn.stream.eventAddCallback = event_add  # type: ignore[method-assign]
     observed_statuses: list[str] = []
     terminal = ProcessExit(17, 17, None, ProcessExitCategory.EXITED)
 
-    def handoff(_stream, binding, *, on_ready, timeout_seconds, terminal_timeout_seconds, session):
+    def handoff(
+        _stream,
+        binding,
+        *,
+        on_ready,
+        timeout_seconds,
+        terminal_timeout_seconds,
+        session,
+        wait,
+        wait_writable,
+        before_stream_close,
+    ):
         assert binding.run_id == plan.run_id
         assert binding.domain_core_digest == plan.domain_core_digest
         assert binding.stage1_artifact_digest == plan.stage1_transport["artifact_digest"]
@@ -3356,6 +3459,10 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         assert starting["oci_root_handoff"]["domain_id"] == 7
         on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
         observed_statuses.append(read_run_ledger_snapshot(roots, name).state["status"])
+        assert callable(wait) and callable(wait_writable)
+        before_stream_close()
+        _stream.abort()
+        _stream.free()
         return _handoff_receipt("terminal", terminal, boot_attempt_id=session.boot_attempt_id)
 
     monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
@@ -3376,6 +3483,8 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     assert [(channel, flags) for channel, _stream, flags in domain.open_channel_calls] == [
         ("org.palimpsest.oci.lifecycle.0", 0)
     ]
+    assert event_order == ["open-channel", "event-add"]
+    assert conn.stream.calls[-3:] == [("event-remove",), ("abort",), ("free",)]
     assert domain.create_calls == domain.destroy_calls == 1
     assert domain.isActive() == 0
     assert _FAKE_LIBVIRT.VIR_DOMAIN_XML_INACTIVE in domain.xml_desc_flags
@@ -3407,11 +3516,11 @@ def test_oci_root_private_launch_rejects_name_uuid_disagreement_without_mutation
     name = "launch-mismatch"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     original = conn.domains[name]
     foreign = _DefinedDomain(conn, name, original.xml)
-    conn.lookupByUUIDString = lambda _domain_uuid: foreign  # type: ignore[method-assign]
+    conn.connection.lookupByUUIDString = lambda _domain_uuid: foreign  # type: ignore[method-assign]
 
     with pytest.raises(StateError, match="name and UUID"):
         launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
@@ -3429,7 +3538,7 @@ def test_oci_root_private_launch_failure_cleans_exact_domain_or_records_cleanup_
     name = f"launch-failure-{'yes' if cleanup_failure else 'no'}"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection(destroy_error=RuntimeError("SENSITIVE DESTROY FAILURE") if cleanup_failure else None)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
 
@@ -3460,21 +3569,47 @@ def test_oci_root_private_launch_requires_libvirt_surface_before_starting_intent
 ) -> None:
     name = "launch-libvirt-surface"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
-    conn = _DefinitionConnection()
+    raw_conn = _DefinitionConnection()
     monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
-    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=raw_conn, runner=tools)
     unsupported = SimpleNamespace(
         libvirtError=_FakeLibvirtError,
         VIR_ERR_NO_DOMAIN=42,
         VIR_STREAM_NONBLOCK=1,
+        VIR_STREAM_EVENT_READABLE=1,
+        VIR_STREAM_EVENT_WRITABLE=2,
+        VIR_STREAM_EVENT_ERROR=4,
+        VIR_STREAM_EVENT_HANGUP=8,
+        virEventRegisterDefaultImpl=lambda: 0,
+        virEventRunDefaultImpl=lambda: 0,
+        virEventAddTimeout=lambda _milliseconds, _callback, _opaque: 1,
+        virEventUpdateTimeout=lambda _timer, _milliseconds: 0,
+        virEventRemoveTimeout=lambda _timer: 0,
     )
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: unsupported)
+    conn = _evented_connection(raw_conn, monkeypatch, libvirt=unsupported)
 
     with pytest.raises(StateError, match="libvirt stream or inactive XML"):
         launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     domain = conn.domains[name]
     assert domain.create_calls == domain.destroy_calls == domain.undefine_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+def test_oci_root_private_launch_rejects_ordinary_preopened_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-preopened-connection"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    with pytest.raises(StateError, match="event-ready libvirt connection"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name].create_calls == 0
     assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
 
 
@@ -3485,7 +3620,7 @@ def test_oci_root_private_launch_preallocates_and_validates_stream_before_activa
     name = "launch-stream-preflight"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
     calls = {"abort": 0, "free": 0}
@@ -3493,7 +3628,7 @@ def test_oci_root_private_launch_preallocates_and_validates_stream_before_activa
     def close(operation: str) -> None:
         calls[operation] += 1
 
-    conn.stream = SimpleNamespace(
+    conn.connection.stream = SimpleNamespace(
         send=lambda payload: len(payload),
         abort=lambda: close("abort"),
         free=lambda: close("free"),
@@ -3513,6 +3648,9 @@ def test_oci_root_runtime_stream_surface_accepts_binding_without_public_free() -
         send=lambda payload: len(payload),
         recv=lambda _size: -2,
         abort=lambda: calls.__setitem__("abort", calls["abort"] + 1),
+        eventAddCallback=lambda _events, _callback, _opaque: None,
+        eventUpdateCallback=lambda _events: 0,
+        eventRemoveCallback=lambda: 0,
     )
 
     assert oci_root_runtime_module._valid_lifecycle_stream_surface(stream)
@@ -3526,6 +3664,202 @@ def test_oci_root_runtime_stream_surface_accepts_binding_without_public_free() -
     assert calls == {"abort": 1}
 
 
+def test_oci_root_evented_connection_registers_once_before_open_and_rejects_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libvirt = _FakeLibvirt()
+    connections = [_DefinitionConnection(), _DefinitionConnection()]
+    order: list[str] = []
+    original_register = libvirt.virEventRegisterDefaultImpl
+
+    def register() -> int:
+        order.append("register")
+        return original_register()
+
+    def connect(_uri: str) -> _DefinitionConnection:
+        order.append("open")
+        return connections.pop(0)
+
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_LIBVIRT", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_PID", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_POISONED", False)
+    monkeypatch.setattr(libvirt, "virEventRegisterDefaultImpl", register)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: libvirt)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "connect", connect)
+
+    first = oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
+    second = oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
+    assert first.libvirt is second.libvirt is libvirt
+    assert order == ["register", "open", "open"]
+
+    monkeypatch.setattr(oci_root_runtime_module.os, "getpid", lambda: first.pid + 1)
+    with pytest.raises(StateError, match="identity changed"):
+        oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
+    assert order == ["register", "open", "open"]
+
+
+@pytest.mark.parametrize("failure", ["missing", "raise", "result"])
+def test_oci_root_evented_connection_fails_before_open_when_event_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    libvirt = _FakeLibvirt()
+    opens: list[str] = []
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_LIBVIRT", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_PID", None)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_POISONED", False)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: libvirt)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "connect", lambda uri: opens.append(uri))
+    if failure == "missing":
+        libvirt.virEventRunDefaultImpl = None  # type: ignore[method-assign]
+    elif failure == "raise":
+        libvirt.virEventRegisterDefaultImpl = lambda: (_ for _ in ()).throw(RuntimeError("failed"))  # type: ignore[method-assign]
+    else:
+        libvirt.virEventRegisterDefaultImpl = lambda: -1  # type: ignore[method-assign]
+
+    with pytest.raises(StateError, match="event support|event initialization"):
+        oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
+    assert opens == []
+
+
+def test_oci_root_lifecycle_event_pump_uses_bounded_timer_and_writable_only_for_send() -> None:
+    libvirt = _FakeLibvirt()
+    stream = _FakeLifecycleStream()
+    pump = oci_root_runtime_module._LibvirtLifecycleEventPump(libvirt, stream)
+    libvirt.on_run = lambda: stream.callback(stream, libvirt.VIR_STREAM_EVENT_HANGUP, stream.callback_opaque)
+
+    pump.wait_readable(0.5)
+    pump.wait_writable(0.5)
+    pump.close()
+
+    assert stream.calls == [
+        ("event-add", 13),
+        ("event-update", 15),
+        ("event-update", 13),
+        ("event-remove",),
+    ]
+    assert [(call[0], call[1]) for call in libvirt.calls if call[0] == "timer-add"] == [
+        ("timer-add", 10),
+        ("timer-add", 10),
+    ]
+    assert [call[0] for call in libvirt.calls].count("run") == 2
+    assert [call[0] for call in libvirt.calls].count("timer-remove") == 2
+
+
+def test_oci_root_lifecycle_event_pump_fails_closed_on_error_and_cleans_timer() -> None:
+    libvirt = _FakeLibvirt()
+    stream = _FakeLifecycleStream()
+    pump = oci_root_runtime_module._LibvirtLifecycleEventPump(libvirt, stream)
+    libvirt.on_run = lambda: stream.callback(stream, libvirt.VIR_STREAM_EVENT_ERROR, stream.callback_opaque)
+
+    with pytest.raises(oci_root_runtime_module.OCILifecycleTransportError, match="reported an error"):
+        pump.wait_readable(0.01)
+    pump.close()
+
+    assert [call[0] for call in libvirt.calls].count("timer-remove") == 1
+    assert stream.calls[-1] == ("event-remove",)
+
+
+def test_oci_root_launch_quarantines_stream_when_event_callback_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-event-remove-failure"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+    stream = conn.stream
+
+    def fail_remove() -> int:
+        stream.calls.append(("event-remove",))
+        return -1
+
+    stream.eventRemoveCallback = fail_remove  # type: ignore[method-assign]
+
+    def fail_handoff(_stream, _binding, *, before_stream_close, **_kwargs):
+        with pytest.raises(oci_root_runtime_module.OCILifecycleTransportError, match="callback cleanup failed"):
+            before_stream_close()
+        raise oci_root_runtime_module.OCILifecycleStreamCallbackCleanupError("stream retained")
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", fail_handoff)
+    with pytest.raises(StateError, match="cleanup is required"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert stream.calls == [("event-add", 13), ("event-remove",)]
+    assert domain.isActive() == 1
+    assert domain.destroy_calls == domain.undefine_calls == 0
+    assert oci_root_runtime_module._EVENT_STREAM_QUARANTINE[-1][1] is stream
+    snapshot = read_run_ledger_snapshot(roots, name).state
+    assert snapshot["status"] == "failed"
+    assert snapshot["oci_root_handoff"]["phase"] == "cleanup-required"
+
+
+def test_oci_root_timer_cleanup_failure_poisons_existing_connection_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "launch-poisoned-event-driver"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    libvirt = _FakeLibvirt()
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch, libvirt=libvirt)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    domain = conn.domains[name]
+    stream = _FakeLifecycleStream()
+    pump = oci_root_runtime_module._LibvirtLifecycleEventPump(libvirt, stream)
+
+    def fail_remove(timer: int) -> int:
+        libvirt.calls.append(("timer-remove", timer))
+        return -1
+
+    libvirt.virEventRemoveTimeout = fail_remove  # type: ignore[method-assign]
+    with pytest.raises(
+        oci_root_runtime_module.OCILifecycleStreamCallbackCleanupError,
+        match="event timer cleanup failed; event driver poisoned",
+    ):
+        pump.wait_readable(0.01)
+
+    timer_id = libvirt.next_timer
+    assert ("timer-remove", timer_id) in libvirt.calls
+    assert ("timer-update", timer_id, -1) in libvirt.calls
+    assert oci_root_runtime_module._EVENT_DRIVER_POISONED is True
+    assert oci_root_runtime_module._EVENT_STREAM_QUARANTINE[-1] == (pump, stream)
+
+    with pytest.raises(StateError, match="event implementation is poisoned"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert domain.create_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+def test_oci_root_after_fork_hook_replaces_held_locks_and_poisons_child_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inherited_driver_lock = threading.Lock()
+    inherited_run_lock = threading.Lock()
+    inherited_driver_lock.acquire()
+    inherited_run_lock.acquire()
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_LOCK", inherited_driver_lock)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_RUN_LOCK", inherited_run_lock)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_PID", 10)
+    monkeypatch.setattr(oci_root_runtime_module, "_EVENT_DRIVER_POISONED", False)
+    monkeypatch.setattr(oci_root_runtime_module.os, "getpid", lambda: 11)
+
+    oci_root_runtime_module._poison_event_driver_after_fork()
+
+    child_driver_lock = oci_root_runtime_module._EVENT_DRIVER_LOCK
+    child_run_lock = oci_root_runtime_module._EVENT_RUN_LOCK
+    assert child_driver_lock is not inherited_driver_lock
+    assert child_run_lock is not inherited_run_lock
+    assert child_driver_lock.acquire(blocking=False)
+    assert child_run_lock.acquire(blocking=False)
+    child_driver_lock.release()
+    child_run_lock.release()
+    assert oci_root_runtime_module._EVENT_DRIVER_PID == 11
+    assert oci_root_runtime_module._EVENT_DRIVER_POISONED is True
+    inherited_driver_lock.release()
+    inherited_run_lock.release()
+
+
 @pytest.mark.parametrize("failure", ["definite-create", "partial-create", "id-inspection"])
 def test_oci_root_private_launch_create_boundary_uses_durable_activation_intent(
     tmp_path: Path,
@@ -3535,7 +3869,7 @@ def test_oci_root_private_launch_create_boundary_uses_durable_activation_intent(
     name = f"launch-{failure}"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
     observed: list[tuple[str, str, bool]] = []
@@ -3589,7 +3923,7 @@ def test_oci_root_private_launch_rejects_nonzero_or_none_open_channel_result(
     name = "launch-open-result"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection(open_channel_result=None)
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     monkeypatch.setattr(
         oci_root_runtime_module,
@@ -3613,7 +3947,7 @@ def test_oci_root_private_launch_does_not_cleanup_or_overwrite_changed_boot_ledg
     name = "launch-concurrent-change"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
 
@@ -3645,7 +3979,7 @@ def test_oci_root_private_launch_failure_retains_durable_ready_projection(
     name = "launch-ready-failure"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
 
     def ready_then_fail(_stream, _binding, *, on_ready, session, **_kwargs):
@@ -3671,7 +4005,7 @@ def test_oci_root_private_launch_never_cleans_a_changed_boot_instance(
     name = f"launch-drift-{drift}"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
 
@@ -3705,7 +4039,7 @@ def test_oci_root_private_launch_rejects_same_attempt_handoff_ledger_tamper(
     name = f"launch-ledger-{tamper.replace('_', '-')}"
     roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
-    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    conn = _evented_connection(conn, monkeypatch)
     define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
     domain = conn.domains[name]
 

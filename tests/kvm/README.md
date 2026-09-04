@@ -138,6 +138,12 @@ Positive consoles must then contain exactly one fixed marker each for channel
 readiness, accepted initial HELLO, transmitted BOOTSTRAP, and accepted KEY_ACK,
 in that order before workload isolation/start. These are diagnostic progress
 lines, not lifecycle authority or a substitute for authenticated receipts.
+The libvirt qualification opens its connection only through the private
+event-ready connector. That connector registers the default libvirt event
+implementation before connection open; the handoff then pumps the nonblocking
+stream with callback events and a 10-ms timer, enabling writable notification
+only for send backpressure and removing the callback before abort/free. This
+does not enable any public or detached OCI-root runtime command.
 
 This qualification PID 1 remains a root, narrow broker while the admitted
 workload child enters a private mount namespace, closes the lifecycle fd,

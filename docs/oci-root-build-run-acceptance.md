@@ -122,6 +122,17 @@ or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
 and skipped. Slice 29B activates lifecycle v2 only in the pre-production guest,
 domain-plan, and native-KVM qualification path.
 
+The private OCI-root connector registers libvirt's default event implementation
+once, before opening its first connection, and binds the registration to the
+current process. Lifecycle launch rejects ordinary pre-opened connections and
+post-fork reuse. After `openChannel`, a stream callback plus a bounded 10-ms
+timer drives `virEventRunDefaultImpl` during nonblocking waits. Receive waits
+subscribe to readable/error/hangup; writable is added only while a send reports
+backpressure, then removed to avoid a writable busy loop. The callback is
+removed before stream abort/free on every normal or exceptional handoff path.
+This remains a synchronous private qualification surface; public create,
+start, run, and detached dispatch stay disabled.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
