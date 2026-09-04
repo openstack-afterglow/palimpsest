@@ -3483,18 +3483,35 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         return 0;
     }
     {
+        struct child_error_local early_failure;
         u8 isolation_ready = 0;
         u32 isolation_stage = 0;
+        usize early_error_bytes = 0;
+        i64 early_error_read = 0;
         i64 close_result;
+        int child_failure_ready = 0;
         n = sc3(SYS_read, isolation_pipe[0], (i64)&isolation_ready, 1);
         close_result = sc1(SYS_close, isolation_pipe[0]);
+        if (n == 0) {
+            while (early_error_bytes < sizeof(early_failure)) {
+                early_error_read = sc3(SYS_read, error_pipe[0],
+                                       (i64)((u8 *)&early_failure + early_error_bytes),
+                                       sizeof(early_failure) - early_error_bytes);
+                if (early_error_read <= 0) break;
+                early_error_bytes += (usize)early_error_read;
+            }
+            child_failure_ready = early_error_bytes == sizeof(early_failure);
+        }
         if (close_result != 0 || n != 1 || isolation_ready != 1)
             isolation_stage = 33;
         else if (!verify_workload_isolation_status(main_pid, process))
             isolation_stage = 34;
         if (isolation_stage) {
-            set_workload_failure(failure, isolation_stage,
-                                 n < 0 ? n : (close_result < 0 ? close_result : EIO));
+            if (child_failure_ready)
+                *failure = early_failure;
+            else
+                set_workload_failure(failure, isolation_stage,
+                                     n < 0 ? n : (close_result < 0 ? close_result : EIO));
             sc1(SYS_close, release_pipe[1]);
             n = terminate_and_reap(main_pid, (int)signal_fd, &cgroup, result, lifecycle);
             sc1(SYS_close, error_pipe[0]);
