@@ -14,6 +14,7 @@ import fcntl
 import gzip
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -84,6 +85,7 @@ MAX_KERNEL_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_QEMU_VERSION_BYTES = 16 * 1024
 MAX_CONSOLE_BYTES = 4 * 1024 * 1024
 DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
+INITIAL_HELLO_DELAY_AFTER_ROOT_TRANSITION_SECONDS = 5.25
 # Do not include the line ending: a real 8250 console commonly maps LF to
 # CRLF, while the pipe-based pure test preserves LF exactly.
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
@@ -3948,6 +3950,7 @@ def _read_console_until(
     lifecycle_attempts: list[dict[str, Any]] | None = None,
     lifecycle_negative_name: str | None = None,
     lifecycle_negative_input: dict[str, Any] | None = None,
+    initial_hello_delay_after_root_transition_seconds: float = 0.0,
 ) -> bytes:
     if (
         (lifecycle_socket_path is None) != (lifecycle_binding is None)
@@ -3956,6 +3959,14 @@ def _read_console_until(
         or (lifecycle_success is not False and lifecycle_failure_state != "key-ack-sent")
     ):
         raise ArtifactValidationError("KVM lifecycle driver configuration is invalid")
+    if (
+        type(initial_hello_delay_after_root_transition_seconds) not in {int, float}
+        or not math.isfinite(initial_hello_delay_after_root_transition_seconds)
+        or initial_hello_delay_after_root_transition_seconds < 0
+        or initial_hello_delay_after_root_transition_seconds >= timeout_seconds
+        or (lifecycle_binding is None and initial_hello_delay_after_root_transition_seconds != 0)
+    ):
+        raise ArtifactValidationError("KVM initial lifecycle delay is invalid")
     try:
         process = subprocess.Popen(
             command,
@@ -3973,7 +3984,8 @@ def _read_console_until(
     selector = selectors.DefaultSelector()
     selector.register(descriptor, selectors.EVENT_READ, "console")
     console = bytearray()
-    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    deadline = started_at + timeout_seconds
     marker_seen_at: float | None = None
     channel: socket.socket | None = None
     if lifecycle_scenario not in {"normal", "composite", "negative", "discovery-negative"}:
@@ -4019,6 +4031,7 @@ def _read_console_until(
     observed_tags: set[str] = set()
     negative_key: bytes | None = None
     initial_host_nonce: str | None = None
+    root_transition_seen_at: float | None = None
 
     def record_frame(direction: str, frame: bytes, envelope: OCIControlV2Envelope) -> None:
         if session is None:
@@ -4196,6 +4209,13 @@ def _read_console_until(
                 and lifecycle_socket_path is not None
                 and lifecycle_socket_path.exists()
                 and admitted_boundaries >= required_peer_boundaries
+                and (
+                    initial_hello_delay_after_root_transition_seconds == 0
+                    or (
+                        root_transition_seen_at is not None
+                        and now - root_transition_seen_at >= initial_hello_delay_after_root_transition_seconds
+                    )
+                )
             ):
                 try:
                     metadata = lifecycle_socket_path.lstat()
@@ -4395,6 +4415,21 @@ def _read_console_until(
                         except OCIControlProtocolV2Error:
                             raise KVMProofFailure("KVM lifecycle protocol was rejected") from None
             current = bytes(console)
+            if (
+                initial_hello_delay_after_root_transition_seconds
+                and root_transition_seen_at is None
+                and _logical_line_count(current, ROOT_TRANSITION_MARKER) == 1
+            ):
+                root_transition_seen_at = now
+            if (
+                initial_hello_delay_after_root_transition_seconds
+                and (
+                    root_transition_seen_at is None
+                    or now - root_transition_seen_at < initial_hello_delay_after_root_transition_seconds
+                )
+                and _logical_line_count(current, WORKLOAD_STARTED_MARKER)
+            ):
+                raise KVMProofFailure("workload started before the delayed initial lifecycle HELLO")
             armed_count = _logical_line_count(current, WORKLOAD_SIGNAL_ARMED_MARKER)
             if armed_count > 1:
                 raise KVMProofFailure("workload signal synchronization marker was emitted more than once")
@@ -5122,6 +5157,7 @@ def run_oci_stage1_kvm_proof() -> OCIStage1KVMProofResult:
             lifecycle_binding=lifecycle_binding,
             lifecycle_success=True,
             lifecycle_transcript=lifecycle_transcript,
+            initial_hello_delay_after_root_transition_seconds=(INITIAL_HELLO_DELAY_AFTER_ROOT_TRANSITION_SECONDS),
         )
         _verify_pinned_boot_files(
             qemu_path=qemu_path,

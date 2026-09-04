@@ -1001,6 +1001,7 @@ def receive(connection):
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(sys.argv[1])
 listener.listen(1)
+sys.stdout.buffer.write({ROOT_TRANSITION_MARKER!r} + b'\\n'); sys.stdout.flush()
 connection, _ = listener.accept()
 hello = receive(connection)
 generation = '11111111-1111-4111-8111-111111111111'
@@ -1016,7 +1017,7 @@ ready = sign_message(OCIControlV2Message(kind='READY', binding=hello.body.bindin
     wire_sequence=2, payload={{}}, boot_generation=generation, reply_to=key_ack.body.wire_sequence), key)
 frame = encode_frame(ready)
 for part in (frame[:1], frame[1:3], frame[3:]): connection.sendall(part)
-for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
+for marker in ({WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
     sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
 stop = receive(connection)
 verify_message_authentication(stop, key)
@@ -1028,8 +1029,9 @@ frame = encode_frame(terminal)
 for byte in frame: connection.sendall(bytes((byte,)))
 sys.stdout.buffer.write({SUCCESS_MARKER!r} + b'\\n'); sys.stdout.flush()
 time.sleep(2)
-"""
+    """
     transcript: list[dict[str, object]] = []
+    started = time.monotonic()
     console = _read_console_until(
         (sys.executable, "-c", program, os.fspath(channel)),
         expected=SUCCESS_MARKER,
@@ -1040,7 +1042,9 @@ time.sleep(2)
         lifecycle_binding=binding,
         lifecycle_success=True,
         lifecycle_transcript=transcript,
+        initial_hello_delay_after_root_transition_seconds=0.1,
     )
+    assert time.monotonic() - started >= 0.08
     assert _logical_line_count(console, WORKLOAD_SIGNAL_ARMED_MARKER) == 1
     assert [frame["kind"] for frame in transcript] == ["HELLO", "BOOTSTRAP", "KEY_ACK", "READY", "STOP", "TERMINAL"]
     assert [frame["direction"] for frame in transcript] == [
@@ -1053,6 +1057,26 @@ time.sleep(2)
     ]
     assert len({frame["boot_generation"] for frame in transcript[1:]}) == 1
     temporary.cleanup()
+
+
+@pytest.mark.parametrize("delay", [-1, float("nan"), float("inf"), 3])
+def test_console_reader_rejects_invalid_initial_hello_delay(delay: float) -> None:
+    plan = build_proof_plan()
+    transport = build_stage1_transport(plan)
+    binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
+
+    with pytest.raises(ArtifactValidationError, match="initial lifecycle delay"):
+        _read_console_until(
+            (sys.executable, "-c", "raise SystemExit(1)"),
+            expected=SUCCESS_MARKER,
+            forbidden=(REJECTION_MARKER,),
+            timeout_seconds=3,
+            require_alive_after_marker=True,
+            lifecycle_socket_path=Path("/tmp/not-used.sock"),
+            lifecycle_binding=binding,
+            lifecycle_success=True,
+            initial_hello_delay_after_root_transition_seconds=delay,
+        )
 
 
 def test_console_reader_accepts_workload_failure_after_v2_key_ack(tmp_path: Path) -> None:

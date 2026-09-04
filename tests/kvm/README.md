@@ -130,6 +130,10 @@ failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
 must still produce a v19 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
+The first positive boot deliberately withholds its initial lifecycle HELLO
+until 5.25 seconds after PID 1's root-transition marker, proving that PID 1
+remains fail-closed past the removed five-second pre-input race while retaining
+its per-partial-frame deadline.
 
 This qualification PID 1 remains a root, narrow broker while the admitted
 workload child enters a private mount namespace, closes the lifecycle fd,

@@ -183,6 +183,16 @@ terminal marker. Receipt v19 records `reconnect_proven=true` and
 `negative_input_proven=true`; production
 runtime dispatch and host-daemon recovery remain future boundaries.
 
+PID 1 remains fail-closed without a valid initial HELLO. Before the first
+frame byte it waits for the host-owned activation timeout rather than imposing
+a competing guest deadline, so a delayed libvirt channel attachment cannot
+race a fixed guest timer. Once any byte arrives, the existing five-second
+partial-frame deadline applies; malformed or binding-invalid HELLO input is
+still rejected immediately and no workload starts before authentication.
+The release-qualified native proof deliberately delays its first positive
+HELLO until more than five seconds after the root-transition marker to exercise
+this startup ordering.
+
 Proof v7 uses two real zstd SquashFS images built from the committed
 `tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
 sentinel with different bytes; an optional authenticated plan probe (empty for

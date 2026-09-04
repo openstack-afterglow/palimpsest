@@ -363,6 +363,7 @@ struct lifecycle_session {
     int natural_terminal_frozen;
     int natural_late_stop_allowed;
     int partial_frame_marker_emitted;
+    int initial_input_seen;
     u32 nonce_count;
     u32 request_count;
     u32 header_used;
@@ -2202,6 +2203,7 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
         }
         n = sc3(SYS_read, session->fd, (i64)target, needed);
         if (n > 0 && (usize)n <= needed) {
+            session->initial_input_seen = 1;
             if (!session->frame_deadline) {
                 u64 now = monotonic_millis();
                 if (!now) return -1;
@@ -2792,26 +2794,29 @@ static int lifecycle_pump(struct lifecycle_session *session,
 
 static int prepare_lifecycle(struct lifecycle_session *session) {
     usize size = 0;
-    u64 deadline;
     memset(session, 0, sizeof(*session)); session->fd = -1;
     if (!lifecycle_crypto_kat()) { session->poisoned = 1; return 0; }
     session->fd = discover_lifecycle_channel();
     session->next_sequence = 1;
     session->reconnect_backoff_ms = 10;
-    deadline = monotonic_millis() + 5000;
     if (session->fd < 0) {
         session->poisoned = 1;
         if (session->fd >= 0) sc1(SYS_close, session->fd);
         session->fd = -1;
         return 0;
     }
-    while (monotonic_millis() < deadline) {
+    /* The host owns the bounded activation timeout.  Stay fail-closed before
+     * the first input byte instead of racing libvirt's post-create channel
+     * attachment.  Once any byte arrives, read_control_frame() retains its
+     * five-second partial-frame deadline and a peer boundary is terminal for
+     * this initial, unauthenticated exchange. */
+    for (;;) {
         int frame = read_control_frame(session, &size);
         if (frame == 1) {
             if (parse_hello(session, size)) return 1;
             break;
         }
-        if (frame == -1) break;
+        if (frame == -1 || (frame == -2 && session->initial_input_seen)) break;
         {
             struct pollfd_local none;
             int delay = (int)session->reconnect_backoff_ms;

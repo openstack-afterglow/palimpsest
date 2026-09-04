@@ -248,6 +248,28 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"lifecycle rejected; stage=" in stage1
 
 
+def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    source = (repository / "guest" / "stage1" / "init.c").read_text()
+
+    prepare = source[
+        source.index("static int prepare_lifecycle(") : source.index("static int authenticate_lifecycle_bootstrap(")
+    ]
+    reader = source[source.index("static int read_control_frame(") : source.index("static int nonce_seen(")]
+    connection_lost = source[
+        source.index("static void lifecycle_connection_lost(") : source.index("static int lifecycle_poll_timeout(")
+    ]
+    live_main = source[source.index("static __attribute__((noreturn, used)) void start_c(") :]
+    assert "deadline = monotonic_millis() + 5000" not in prepare
+    assert "for (;;)" in prepare
+    assert "frame == -2 && session->initial_input_seen" in prepare
+    assert "session->initial_input_seen = 1" in reader
+    assert "initial_input_seen" not in connection_lost
+    assert "session->frame_deadline = now + 5000" in reader
+    assert "session->frame_deadline && monotonic_millis() >= session->frame_deadline" in reader
+    assert live_main.index("if (!prepare_lifecycle(&lifecycle))") < live_main.index("supervise_workload(&workload")
+
+
 def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     repository = Path(__file__).resolve().parents[2]
     source = (repository / "guest" / "stage1" / "init.c").read_text()
