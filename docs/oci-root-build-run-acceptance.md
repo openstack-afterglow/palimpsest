@@ -116,22 +116,22 @@ or expose the protocol through `run`, `stop`, or `-d`, so Gate 2 remains opt-in
 and skipped. Slice 29B activates lifecycle v2 only in the pre-production guest,
 domain-plan, and native-KVM qualification path.
 
-The native `qemu:///system` qualification also does not yet broker filesystem
-access for libvirt's DAC QEMU identity. That broker must remain test-only until
-there is a separately reviewed production authority design. Its input is the
+The native `qemu:///system` qualification has a test-only filesystem access
+broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
 libvirt capabilities, and every prospective ACL target must be a stable,
-owner-held, non-symlink regular file or directory below the resolved pytest
-root. The external qualified kernel must first be copied into that root so the
-source artifact's ownership and permissions are never mutated.
+owner-held, non-symlink regular file or directory below a short owner-only
+qualification root created directly under a strict root-owned `01777` `/tmp`.
+The external qualified kernel is copied into that root so the source artifact's
+ownership and permissions are never mutated.
 
 The target validator pins the test root and walks each component with
 `openat`/`O_NOFOLLOW`, comparing visible and opened identities. Its returned
 stat is nevertheless only a snapshot after those descriptors close, not a
-race-free mutation capability. Any future ACL broker must repeat that walk at
-the mutation boundary. Keeping a final descriptor and addressing
-`/proc/self/fd/<n>` can narrow the gap, but does not turn pathname-oriented
-`setfacl` into an FD-bound operation.
+race-free mutation capability. The broker repeats the check, retains the target
+descriptor, and invokes `getfacl`/`setfacl` through its inherited
+`/proc/self/fd/<n>` name. This narrows component-substitution exposure, but does
+not turn pathname-oriented `setfacl` into a native FD mutation API.
 
 The owner-only kernel copy records the destination FD identity immediately
 after its `O_EXCL` create. Every successful final path validation must return
@@ -145,12 +145,32 @@ Linux POSIX access ACLs expose the ACL mask through the file's group mode bits.
 Consequently an effective named ACL for an owner-only `0700`, `0600`, or `0400`
 target cannot also leave its complete mode unchanged: `setfacl --no-mask`
 preserves the mode but reduces the named entry to no effective access. The
-qualification harness therefore does not currently pretend to install such an
-ACL. A future test-only implementation needs a tightly scoped activation
-boundary after all production path revalidation and immediately before
-`virDomainCreate`; it must restore ACLs only after QEMU has opened every file
-and created the lifecycle socket. If activation may have succeeded or the
-domain still exists, it must retain both permissions and backing files for safe
-recovery. This is not permission to weaken production modes or validators.
+qualification-only connection/domain proxy therefore installs an exact named
+ACL immediately before `virDomainCreate`, verifies the expected temporary ACL
+mask/mode change, and restores the exact original basic ACL and mode only after
+successful lifecycle completion, exact name/UUID/owner/projection/inactive
+validation, persistent-domain undefine, and proof that both name and UUID are
+absent. An external reactivation makes the inactive-only undefine fail before
+restoration, retaining the ACL, held descriptors, domain, and backing tree.
+Ambiguous create, launch, or cleanup does the same. The root is never an
+automatic `TemporaryDirectory`. This is not permission to weaken production
+modes or validators, and public OCI-root dispatch remains disabled.
+
+Qualification-root deletion similarly binds the expected device/inode through
+an open descriptor and a random quarantine rename, then walks and removes
+children relative to held directory descriptors while rechecking the root
+binding before child mutations. Each child is itself moved to a fresh 128-bit
+random quarantine name, checked against its held descriptor, recursively
+emptied when it is a directory, and checked again immediately before removal.
+Every unlink/rmdir requires both zero link count through the held descriptor
+and absence of its quarantine name. Any observed replacement of a public or
+quarantine name is left untouched, not renamed back or deleted.
+A successful root removal additionally requires the held directory's link
+count to become zero and the quarantine name to be absent. This materially
+narrows cleanup exposure, but POSIX pathname mutation cannot make the final
+rename/unlink atomic with the preceding identity check. A fully hostile process
+running as the same host UID could follow random names with inotify and race
+that final syscall; the qualification harness does not claim protection from
+that threat.
 Per-domain AppArmor rules are still an independent host qualification
 prerequisite; the test must never edit system policy.

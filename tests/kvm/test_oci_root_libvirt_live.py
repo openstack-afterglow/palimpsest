@@ -7,14 +7,19 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import stat
 import subprocess
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -325,6 +330,535 @@ def _copy_qualified_kernel(source: Path, test_root: Path) -> Path:
     return destination
 
 
+def _create_qualification_root() -> tuple[Path, os.stat_result]:
+    temporary_parent = Path("/tmp")
+    try:
+        parent = temporary_parent.lstat()
+    except OSError:
+        raise ValueError("qualification /tmp prerequisite is unavailable") from None
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or stat.S_IMODE(parent.st_mode) != 0o1777
+    ):
+        raise ValueError("qualification /tmp prerequisite is unsafe")
+    path = Path(tempfile.mkdtemp(prefix="p-", dir=temporary_parent))
+    visible = path.lstat()
+    if not stat.S_ISDIR(visible.st_mode) or visible.st_uid != os.geteuid() or stat.S_IMODE(visible.st_mode) != 0o700:
+        raise ValueError("qualification root is unsafe")
+    return path, visible
+
+
+def _acl_mode(perms: str) -> int:
+    if not re.fullmatch(r"[r-][w-][x-]", perms):
+        raise ValueError("qualification ACL permissions are invalid")
+    return (4 if perms[0] == "r" else 0) | (2 if perms[1] == "w" else 0) | (1 if perms[2] == "x" else 0)
+
+
+@dataclass(frozen=True)
+class _ACLStructure:
+    user: str
+    named_users: tuple[tuple[int, str], ...]
+    group: str
+    mask: str | None
+    other: str
+
+    def setfile_text(self) -> str:
+        lines = [f"user::{self.user}"]
+        lines.extend(f"user:{uid}:{permission}" for uid, permission in self.named_users)
+        lines.append(f"group::{self.group}")
+        if self.mask is not None:
+            lines.append(f"mask::{self.mask}")
+        lines.append(f"other::{self.other}")
+        return "\n".join(lines) + "\n"
+
+
+def _parse_acl(payload: str) -> _ACLStructure:
+    if not isinstance(payload, str) or not payload.endswith("\n"):
+        raise ValueError("qualification target ACL is noncanonical")
+    lines = payload.splitlines()
+    trailing_blank_lines = 0
+    while lines and lines[-1] == "":
+        lines.pop()
+        trailing_blank_lines += 1
+    if trailing_blank_lines > 1:
+        raise ValueError("qualification target ACL is noncanonical")
+    if any(not line for line in lines) or len(lines) < 3:
+        raise ValueError("qualification target ACL is noncanonical")
+
+    def permission(line: str, prefix: str) -> str:
+        if not line.startswith(prefix) or len(line) != len(prefix) + 3:
+            raise ValueError("qualification target ACL is noncanonical")
+        value = line.removeprefix(prefix)
+        _acl_mode(value)
+        return value
+
+    index = 0
+    user = permission(lines[index], "user::")
+    index += 1
+    named_users: list[tuple[int, str]] = []
+    while index < len(lines) and lines[index].startswith("user:") and not lines[index].startswith("user::"):
+        match = re.fullmatch(r"user:(0|[1-9][0-9]*):([r-][w-][x-])", lines[index])
+        if match is None:
+            raise ValueError("qualification target ACL is noncanonical")
+        uid = int(match.group(1))
+        if uid > _MAX_DAC_ID or any(existing == uid for existing, _ in named_users):
+            raise ValueError("qualification target ACL is noncanonical")
+        named_users.append((uid, match.group(2)))
+        index += 1
+    if index >= len(lines):
+        raise ValueError("qualification target ACL is noncanonical")
+    group = permission(lines[index], "group::")
+    index += 1
+    mask: str | None = None
+    if index < len(lines) and lines[index].startswith("mask::"):
+        mask = permission(lines[index], "mask::")
+        index += 1
+    if index >= len(lines):
+        raise ValueError("qualification target ACL is noncanonical")
+    other = permission(lines[index], "other::")
+    index += 1
+    if index != len(lines) or (named_users and mask is None):
+        raise ValueError("qualification target ACL is noncanonical")
+    return _ACLStructure(user, tuple(named_users), group, mask, other)
+
+
+@dataclass
+class _HeldACLTarget:
+    path: Path
+    descriptor: int
+    opened: os.stat_result
+    permission: str
+    original_acl: _ACLStructure
+
+    @property
+    def fd_path(self) -> str:
+        return f"/proc/self/fd/{self.descriptor}"
+
+
+class _QualificationDACBroker:
+    def __init__(
+        self,
+        root: Path,
+        uid: int,
+        specifications: tuple[tuple[Path, str, str], ...],
+        *,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        if uid == os.geteuid() or not 0 <= uid <= _MAX_DAC_ID:
+            raise ValueError("qualification DAC uid is invalid")
+        self.root = root.resolve(strict=True)
+        self.uid = uid
+        self._runner = runner
+        self.targets: list[_HeldACLTarget] = []
+        self.applied = False
+        self.restored = False
+        self.ambiguous = False
+        try:
+            for path, kind, permission in specifications:
+                resolved, snapshot = _validate_qualification_acl_target(self.root, path, kind=kind)
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+                if kind == "directory":
+                    flags |= os.O_DIRECTORY
+                descriptor = os.open(resolved, flags)
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (snapshot.st_dev, snapshot.st_ino):
+                    os.close(descriptor)
+                    raise ValueError("qualification ACL target changed before it was held")
+                _acl_mode(permission)
+                target = _HeldACLTarget(
+                    resolved,
+                    descriptor,
+                    opened,
+                    permission,
+                    _ACLStructure("---", (), "---", None, "---"),
+                )
+                self.targets.append(target)
+                target.original_acl = self._getfacl(target)
+                if target.original_acl.named_users or target.original_acl.mask is not None:
+                    raise ValueError("qualification target has a pre-existing extended ACL")
+                expected_mode = (
+                    (_acl_mode(target.original_acl.user) << 6)
+                    | (_acl_mode(target.original_acl.group) << 3)
+                    | _acl_mode(target.original_acl.other)
+                )
+                if stat.S_IMODE(opened.st_mode) != expected_mode:
+                    raise ValueError("qualification ACL snapshot and mode disagree")
+        except BaseException:
+            self.close()
+            raise
+
+    def _command(self, arguments: list[str], target: _HeldACLTarget, *, input_text: str | None = None) -> str:
+        result = self._runner(
+            arguments,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            pass_fds=(target.descriptor,),
+            timeout=10,
+        )
+        if result.returncode != 0 or result.stderr or not isinstance(result.stdout, str):
+            raise ValueError("qualification ACL command failed")
+        return result.stdout
+
+    def _getfacl(self, target: _HeldACLTarget) -> _ACLStructure:
+        return _parse_acl(self._command(["getfacl", "-cpn", "--", target.fd_path], target))
+
+    def _verify_held(self, target: _HeldACLTarget) -> os.stat_result:
+        current = os.fstat(target.descriptor)
+        visible = target.path.lstat()
+        if (
+            (current.st_dev, current.st_ino) != (target.opened.st_dev, target.opened.st_ino)
+            or (visible.st_dev, visible.st_ino) != (target.opened.st_dev, target.opened.st_ino)
+            or current.st_uid != os.geteuid()
+            or visible.st_uid != os.geteuid()
+            or current.st_gid != target.opened.st_gid
+            or visible.st_gid != target.opened.st_gid
+            or current.st_nlink != target.opened.st_nlink
+            or visible.st_nlink != target.opened.st_nlink
+            or stat.S_IFMT(current.st_mode) != stat.S_IFMT(target.opened.st_mode)
+            or stat.S_IFMT(visible.st_mode) != stat.S_IFMT(target.opened.st_mode)
+        ):
+            raise ValueError("qualification ACL held target identity changed")
+        return current
+
+    def apply(self) -> None:
+        if self.applied or self.restored or self.ambiguous:
+            raise ValueError("qualification ACL broker state is invalid")
+        touched: list[_HeldACLTarget] = []
+        try:
+            for target in self.targets:
+                self._verify_held(target)
+                touched.append(target)
+                self._command(
+                    ["setfacl", "-m", f"u:{self.uid}:{target.permission}", "--", target.fd_path],
+                    target,
+                )
+                original = target.original_acl
+                mask = _acl_mode(original.group) | _acl_mode(target.permission)
+                mask_text = f"{'r' if mask & 4 else '-'}{'w' if mask & 2 else '-'}{'x' if mask & 1 else '-'}"
+                expected_acl = _ACLStructure(
+                    original.user,
+                    ((self.uid, target.permission),),
+                    original.group,
+                    mask_text,
+                    original.other,
+                )
+                actual_acl = self._getfacl(target)
+                current = self._verify_held(target)
+                if actual_acl != expected_acl or stat.S_IMODE(current.st_mode) != (
+                    (_acl_mode(original.user) << 6) | (mask << 3) | _acl_mode(original.other)
+                ):
+                    raise ValueError("qualification ACL grant verification failed")
+            self.applied = True
+        except BaseException as exc:
+            try:
+                self._restore_targets(tuple(reversed(touched)))
+            except BaseException as restore_error:
+                self.applied = True
+                self.ambiguous = True
+                raise ValueError("qualification ACL rollback is ambiguous") from restore_error
+            self.restored = True
+            raise exc
+
+    def _restore_targets(self, targets: tuple[_HeldACLTarget, ...]) -> None:
+        for target in targets:
+            self._verify_held(target)
+            self._command(
+                ["setfacl", "--set-file=-", "--", target.fd_path],
+                target,
+                input_text=target.original_acl.setfile_text(),
+            )
+            current = self._verify_held(target)
+            if self._getfacl(target) != target.original_acl or stat.S_IMODE(current.st_mode) != stat.S_IMODE(
+                target.opened.st_mode
+            ):
+                raise ValueError("qualification ACL restoration failed")
+
+    def restore(self) -> None:
+        if not self.applied or self.restored or self.ambiguous:
+            raise ValueError("qualification ACL broker cannot restore")
+        try:
+            self._restore_targets(tuple(reversed(self.targets)))
+        except BaseException:
+            self.ambiguous = True
+            raise
+        self.restored = True
+
+    def restore_after_domain_absent(self) -> None:
+        if not self.applied or self.restored:
+            raise ValueError("qualification ACL broker cannot restore")
+        try:
+            self._restore_targets(tuple(reversed(self.targets)))
+        except BaseException:
+            self.ambiguous = True
+            raise
+        self.ambiguous = False
+        self.restored = True
+
+    def close(self) -> None:
+        if self.ambiguous or (self.applied and not self.restored):
+            raise ValueError("qualification ACL broker cannot release held targets")
+        for target in reversed(self.targets):
+            try:
+                os.close(target.descriptor)
+            except OSError:
+                pass
+        self.targets.clear()
+
+
+class _ActivationDomainProxy:
+    def __init__(self, domain: Any, domain_uuid: str, broker: _QualificationDACBroker) -> None:
+        self._domain = domain
+        self._domain_uuid = domain_uuid
+        self._broker = broker
+        self._create_called = False
+
+    def create(self) -> Any:
+        if self._create_called:
+            raise ValueError("qualification domain create proxy was reused")
+        self._create_called = True
+        self._broker.apply()
+        try:
+            result = self._domain.create()
+        except BaseException:
+            try:
+                active = self._domain.isActive()
+                domain_uuid = self._domain.UUIDString()
+            except BaseException:
+                self._broker.ambiguous = True
+                raise
+            if active != 0 or domain_uuid != self._domain_uuid:
+                self._broker.ambiguous = True
+            raise
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._domain, name)
+
+
+class _ActivationConnectionProxy:
+    def __init__(self, connection: Any, domain_uuid: str, broker: _QualificationDACBroker) -> None:
+        self._connection = connection
+        self._domain_uuid = domain_uuid
+        self._broker = broker
+        self.domain_proxy: _ActivationDomainProxy | None = None
+
+    def _wrap_for_create(self, domain: Any) -> Any:
+        if domain.UUIDString() != self._domain_uuid:
+            return domain
+        if self._broker.restored:
+            return domain
+        if self.domain_proxy is None:
+            self.domain_proxy = _ActivationDomainProxy(domain, self._domain_uuid, self._broker)
+        return self.domain_proxy
+
+    def lookupByName(self, name: str) -> Any:
+        return self._wrap_for_create(self._connection.lookupByName(name))
+
+    def lookupByUUIDString(self, domain_uuid: str) -> Any:
+        return self._connection.lookupByUUIDString(domain_uuid)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tuple[Path, str, str], ...]:
+    xml = ET.fromstring(domain_xml)
+    files: dict[Path, str] = {}
+    for element_name in ("kernel", "initrd"):
+        value = xml.findtext(f"./os/{element_name}")
+        if not value:
+            raise ValueError("qualification boot artifact path is missing")
+        files[Path(value)] = "r--"
+    root_disks = 0
+    for disk in xml.findall("./devices/disk"):
+        source = disk.find("./source")
+        target = disk.find("./target")
+        if source is None or target is None or set(source.attrib) != {"file"} or set(target.attrib) != {"dev", "bus"}:
+            raise ValueError("qualification disk binding is invalid")
+        permission = "rw-" if target.get("dev") == "vda" else "r--"
+        root_disks += permission == "rw-"
+        path = Path(source.attrib["file"])
+        if path in files:
+            raise ValueError("qualification file ACL target is duplicated")
+        files[path] = permission
+    if root_disks != 1:
+        raise ValueError("qualification root disk binding is invalid")
+    channels = xml.findall("./devices/channel")
+    lifecycle_parents: set[Path] = set()
+    for channel in channels:
+        target = channel.find("./target")
+        source = channel.find("./source")
+        if target is not None and target.get("name") == "org.palimpsest.oci.lifecycle.0":
+            if source is None or set(source.attrib) != {"mode", "path"} or source.get("mode") != "bind":
+                raise ValueError("qualification lifecycle socket binding is invalid")
+            lifecycle_parents.add(Path(source.attrib["path"]).parent)
+    if len(lifecycle_parents) != 1:
+        raise ValueError("qualification lifecycle socket binding is ambiguous")
+    directories: dict[Path, str] = {root: "--x"}
+    for path in (*files, *lifecycle_parents):
+        try:
+            relative = path.resolve(strict=True).relative_to(root.resolve(strict=True))
+        except (OSError, ValueError):
+            raise ValueError("qualification ACL target escapes the root") from None
+        cursor = root
+        for component in relative.parts[:-1] if path in files else relative.parts:
+            cursor /= component
+            directories.setdefault(cursor, "--x")
+    for parent in lifecycle_parents:
+        directories[parent] = "-wx"
+    ordered_directories = sorted(directories.items(), key=lambda item: (len(item[0].parts), os.fspath(item[0])))
+    ordered_files = sorted(files.items(), key=lambda item: os.fspath(item[0]))
+    return tuple((path, "directory", permission) for path, permission in ordered_directories) + tuple(
+        (path, "regular", permission) for path, permission in ordered_files
+    )
+
+
+def _empty_held_qualification_directory(descriptor: int, verify_root_binding: Callable[[], None]) -> None:
+    names = os.listdir(descriptor)
+    verify_root_binding()
+    for name in names:
+        verify_root_binding()
+        if name in {"", ".", ".."} or "/" in name:
+            raise ValueError("qualification root cleanup entry is invalid")
+        visible = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        if stat.S_ISDIR(visible.st_mode):
+            flags |= os.O_DIRECTORY
+        child_descriptor = os.open(name, flags, dir_fd=descriptor)
+        try:
+            opened = os.fstat(child_descriptor)
+            if (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("qualification root cleanup entry identity changed")
+            current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            held = os.fstat(child_descriptor)
+            if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                raise ValueError("qualification root cleanup entry identity changed")
+            if stat.S_ISREG(held.st_mode) and held.st_nlink != 1:
+                raise ValueError("qualification root cleanup entry link count is invalid")
+            verify_root_binding()
+            quarantine_name = f".p-{secrets.token_hex(16)}.cleanup"
+            try:
+                os.stat(quarantine_name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("qualification root cleanup child quarantine collided")
+            verify_root_binding()
+            os.rename(name, quarantine_name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+
+            def verify_child_binding(
+                child_quarantine_name: str = quarantine_name,
+                held_child_descriptor: int = child_descriptor,
+            ) -> None:
+                verify_root_binding()
+                quarantined = os.stat(child_quarantine_name, dir_fd=descriptor, follow_symlinks=False)
+                child = os.fstat(held_child_descriptor)
+                if (quarantined.st_dev, quarantined.st_ino) != (child.st_dev, child.st_ino):
+                    raise ValueError("qualification root cleanup child identity changed while quarantined")
+
+            verify_child_binding()
+            if stat.S_ISDIR(held.st_mode):
+                _empty_held_qualification_directory(child_descriptor, verify_child_binding)
+            elif not stat.S_ISREG(held.st_mode):
+                raise ValueError("qualification root cleanup entry kind is invalid")
+            verify_child_binding()
+            if stat.S_ISDIR(held.st_mode):
+                os.rmdir(quarantine_name, dir_fd=descriptor)
+            else:
+                os.unlink(quarantine_name, dir_fd=descriptor)
+            child = os.fstat(child_descriptor)
+            if child.st_nlink != 0:
+                raise ValueError("qualification root cleanup child unlink was not proven")
+            try:
+                os.stat(quarantine_name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("qualification root cleanup child quarantine remains")
+        finally:
+            os.close(child_descriptor)
+
+
+def _remove_qualification_root(path: Path, expected: os.stat_result) -> None:
+    if path.parent != Path("/tmp") or not path.name.startswith("p-"):
+        raise ValueError("qualification root cleanup identity changed")
+    parent_descriptor = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    root_descriptor = -1
+    quarantine_name = f".{path.name}.{secrets.token_hex(16)}.cleanup"
+    try:
+        root_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        visible = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(visible.st_mode)
+            or visible.st_uid != os.geteuid()
+            or visible.st_gid != expected.st_gid
+            or stat.S_IMODE(visible.st_mode) != 0o700
+            or (visible.st_dev, visible.st_ino) != (expected.st_dev, expected.st_ino)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            or opened.st_uid != visible.st_uid
+            or opened.st_gid != visible.st_gid
+            or opened.st_nlink != visible.st_nlink
+        ):
+            raise ValueError("qualification root cleanup identity changed")
+        # Moving the held inode to a private random name makes a deterministic
+        # same-UID replacement at the public name detectable before deletion.
+        # A fully hostile same-UID process can still race any pathname unlink;
+        # this qualification-only cleanup therefore rechecks the moved name
+        # against the held FD and refuses deletion on every observed mismatch.
+        os.rename(path.name, quarantine_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
+
+        def verify_quarantine_binding() -> None:
+            quarantined = os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            held = os.fstat(root_descriptor)
+            if (quarantined.st_dev, quarantined.st_ino) != (expected.st_dev, expected.st_ino) or (
+                held.st_dev,
+                held.st_ino,
+            ) != (expected.st_dev, expected.st_ino):
+                raise ValueError("qualification root cleanup identity changed while quarantined")
+
+        verify_quarantine_binding()
+        _empty_held_qualification_directory(root_descriptor, verify_quarantine_binding)
+        verify_quarantine_binding()
+        os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+        held = os.fstat(root_descriptor)
+        if held.st_nlink != 0:
+            raise ValueError("qualification root cleanup unlink was not proven")
+        try:
+            os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("qualification root cleanup quarantine remains")
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        os.close(parent_descriptor)
+
+
+def _remove_inactive_domain_then_restore(
+    broker: _QualificationDACBroker,
+    remove_exact_inactive: Callable[[], None],
+    prove_absent: Callable[[], bool],
+) -> None:
+    try:
+        remove_exact_inactive()
+        if not prove_absent():
+            raise ValueError("qualification domain absence was not proven")
+    except BaseException:
+        broker.ambiguous = True
+        raise
+    broker.restore_after_domain_absent()
+
+
 _DAC_CAPABILITIES = """\
 <capabilities>
   <host>
@@ -557,6 +1091,575 @@ def test_qualified_kernel_copy_preserves_partial_when_initial_fd_identity_is_una
     assert destination.read_bytes() == b""
 
 
+class _FakeACLRunner:
+    def __init__(
+        self,
+        *,
+        fail_setfacl_calls: frozenset[int] = frozenset(),
+        initial_acl: str | None = None,
+    ) -> None:
+        self.acls: dict[int, str] = {}
+        self.events: list[str] = []
+        self.fail_setfacl_calls = fail_setfacl_calls
+        self.setfacl_calls = 0
+        self.initial_acl = initial_acl
+
+    def __call__(self, arguments, *, input, text, capture_output, check, pass_fds, timeout):
+        assert text is capture_output is True
+        assert check is False
+        assert timeout == 10
+        descriptor = int(arguments[-1].rsplit("/", 1)[1])
+        assert pass_fds == (descriptor,)
+        command = arguments[0]
+        self.events.append(command)
+        if descriptor not in self.acls:
+            mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+            basic_acl = (
+                f"user::{'r' if mode & 0o400 else '-'}{'w' if mode & 0o200 else '-'}"
+                f"{'x' if mode & 0o100 else '-'}\n"
+                f"group::{'r' if mode & 0o040 else '-'}{'w' if mode & 0o020 else '-'}"
+                f"{'x' if mode & 0o010 else '-'}\n"
+                f"other::{'r' if mode & 0o004 else '-'}{'w' if mode & 0o002 else '-'}"
+                f"{'x' if mode & 0o001 else '-'}\n"
+            )
+            self.acls[descriptor] = self.initial_acl or basic_acl
+        if command == "getfacl":
+            return subprocess.CompletedProcess(arguments, 0, self.acls[descriptor] + "\n", "")
+        self.setfacl_calls += 1
+        if self.setfacl_calls in self.fail_setfacl_calls:
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        if arguments[1] == "-m":
+            permission = arguments[2].split(":", 2)[2]
+            original = _parse_acl(self.acls[descriptor])
+            assert not original.named_users and original.mask is None
+            mask = _acl_mode(original.group) | _acl_mode(permission)
+            mask_text = f"{'r' if mask & 4 else '-'}{'w' if mask & 2 else '-'}{'x' if mask & 1 else '-'}"
+            applied = _ACLStructure(
+                original.user,
+                ((int(arguments[2].split(":", 2)[1]), permission),),
+                original.group,
+                mask_text,
+                original.other,
+            )
+            self.acls[descriptor] = applied.setfile_text()
+            os.fchmod(
+                descriptor,
+                (_acl_mode(original.user) << 6) | (mask << 3) | _acl_mode(original.other),
+            )
+        else:
+            assert arguments[1] == "--set-file=-"
+            assert input is not None
+            original = _parse_acl(input)
+            assert not original.named_users and original.mask is None
+            self.acls[descriptor] = input
+            os.fchmod(
+                descriptor,
+                (_acl_mode(original.user) << 6) | (_acl_mode(original.group) << 3) | _acl_mode(original.other),
+            )
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+
+def test_acl_parser_accepts_gnu_getfacl_trailing_blank_line_and_compares_structure() -> None:
+    basic = "user::rw-\ngroup::r--\nother::---\n"
+    extended = "user::rw-\nuser:107:r--\ngroup::r--\nmask::r--\nother::---\n\n"
+
+    assert _parse_acl(basic) == _ACLStructure("rw-", (), "r--", None, "---")
+    assert _parse_acl(extended) == _ACLStructure("rw-", ((107, "r--"),), "r--", "r--", "---")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "user::rw-\ngroup::---\nother::---",
+        "user::rw-\n\ngroup::---\nother::---\n",
+        "user::rw-\ngroup::---\nother::---\n\n\n",
+        "user::rw-\nuser:01:r--\ngroup::---\nmask::r--\nother::---\n",
+        "user::rw-\nuser:7:r--\nuser:7:r--\ngroup::---\nmask::r--\nother::---\n",
+        "user::rw-\nuser:7:r--\ngroup::---\nother::---\n",
+    ],
+)
+def test_acl_parser_rejects_noncanonical_structure(payload: str) -> None:
+    with pytest.raises(ValueError, match="noncanonical"):
+        _parse_acl(payload)
+
+
+def test_qualification_dac_broker_applies_in_order_and_restores_in_reverse(tmp_path: Path) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"root")
+    artifact.chmod(0o600)
+    runner = _FakeACLRunner()
+    broker = _QualificationDACBroker(
+        tmp_path,
+        os.geteuid() + 1,
+        ((tmp_path, "directory", "--x"), (artifact, "regular", "rw-")),
+        runner=runner,
+    )
+
+    broker.apply()
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o710
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o660
+    broker.restore()
+
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    assert runner.events == ["getfacl", "getfacl", "setfacl", "getfacl", "setfacl", "getfacl"] + [
+        "setfacl",
+        "getfacl",
+        "setfacl",
+        "getfacl",
+    ]
+    broker.close()
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir() or shutil.which("getfacl") is None or shutil.which("setfacl") is None,
+    reason="requires Linux /proc/self/fd plus GNU getfacl/setfacl",
+)
+def test_qualification_dac_broker_real_fd_bound_apply_and_restore(tmp_path: Path) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"root")
+    artifact.chmod(0o600)
+    original_root = tmp_path.stat()
+    original_artifact = artifact.stat()
+    broker = _QualificationDACBroker(
+        tmp_path,
+        os.geteuid() + 1,
+        ((tmp_path, "directory", "--x"), (artifact, "regular", "rw-")),
+    )
+
+    broker.apply()
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o710
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o660
+    broker.restore()
+
+    restored_root = tmp_path.stat()
+    restored_artifact = artifact.stat()
+    assert stat.S_IMODE(restored_root.st_mode) == 0o700
+    assert stat.S_IMODE(restored_artifact.st_mode) == 0o600
+    for original, restored in ((original_root, restored_root), (original_artifact, restored_artifact)):
+        assert (restored.st_dev, restored.st_ino, restored.st_uid, restored.st_gid, restored.st_nlink) == (
+            original.st_dev,
+            original.st_ino,
+            original.st_uid,
+            original.st_gid,
+            original.st_nlink,
+        )
+    broker.close()
+
+
+def test_qualification_dac_broker_refuses_replaced_held_path(tmp_path: Path) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"root")
+    artifact.chmod(0o600)
+    displaced = tmp_path / "displaced.raw"
+    runner = _FakeACLRunner()
+    broker = _QualificationDACBroker(
+        tmp_path,
+        os.geteuid() + 1,
+        ((artifact, "regular", "rw-"),),
+        runner=runner,
+    )
+    artifact.rename(displaced)
+    artifact.write_bytes(b"replacement")
+
+    with pytest.raises(ValueError, match="identity changed"):
+        broker.apply()
+
+    assert artifact.read_bytes() == b"replacement"
+    assert stat.S_IMODE(displaced.stat().st_mode) == 0o600
+    broker.close()
+
+
+def test_qualification_dac_broker_rejects_preexisting_extended_acl(tmp_path: Path) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"root")
+    runner = _FakeACLRunner(initial_acl="user::rw-\ngroup::---\nmask::---\nother::---\n")
+
+    with pytest.raises(ValueError, match="pre-existing extended ACL"):
+        _QualificationDACBroker(
+            tmp_path,
+            os.geteuid() + 1,
+            ((artifact, "regular", "r--"),),
+            runner=runner,
+        )
+
+
+@pytest.mark.parametrize(("failed_calls", "ambiguous"), [(frozenset({2}), False), (frozenset({2, 3}), True)])
+def test_qualification_dac_broker_failure_restores_or_retains_exact_state(
+    tmp_path: Path,
+    failed_calls: frozenset[int],
+    ambiguous: bool,
+) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"root")
+    artifact.chmod(0o600)
+    runner = _FakeACLRunner(fail_setfacl_calls=failed_calls)
+    broker = _QualificationDACBroker(
+        tmp_path,
+        os.geteuid() + 1,
+        ((tmp_path, "directory", "--x"), (artifact, "regular", "rw-")),
+        runner=runner,
+    )
+
+    with pytest.raises(ValueError):
+        broker.apply()
+
+    assert broker.ambiguous is ambiguous
+    if ambiguous:
+        assert broker.applied is True
+        assert broker.restored is False
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o710
+        with pytest.raises(ValueError, match="cannot release"):
+            broker.close()
+        broker.restore_after_domain_absent()
+    else:
+        assert broker.restored is True
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+        assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    broker.close()
+
+
+def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    paths = {
+        "kernel": tmp_path / "k",
+        "initrd": tmp_path / "i",
+        "root": tmp_path / "root.raw",
+        "stage1": run / "stage1.raw",
+        "layer": tmp_path / "layer.squashfs",
+    }
+    for path in paths.values():
+        path.write_bytes(b"x")
+    xml = (
+        f"<domain><os><kernel>{paths['kernel']}</kernel><initrd>{paths['initrd']}</initrd></os><devices>"
+        f'<disk><source file="{paths["root"]}"/><target dev="vda" bus="virtio"/></disk>'
+        f'<disk><source file="{paths["stage1"]}"/><target dev="vdb" bus="virtio"/></disk>'
+        f'<disk><source file="{paths["layer"]}"/><target dev="vdc" bus="virtio"/></disk>'
+        f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
+        '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
+        "</devices></domain>"
+    )
+
+    specifications = _qualification_acl_specifications(tmp_path, xml)
+    actual = {(path, kind): permission for path, kind, permission in specifications}
+
+    assert actual[(tmp_path, "directory")] == "--x"
+    assert actual[(run, "directory")] == "-wx"
+    assert actual[(paths["root"], "regular")] == "rw-"
+    for name in ("kernel", "initrd", "stage1", "layer"):
+        assert actual[(paths[name], "regular")] == "r--"
+
+
+class _FakeActivationBroker:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.ambiguous = False
+        self.restored = False
+
+    def apply(self) -> None:
+        self.events.append("apply")
+
+    def restore_after_domain_absent(self) -> None:
+        self.events.append("restore-absent")
+        self.ambiguous = False
+        self.restored = True
+
+
+class _FakeActivationDomain:
+    def __init__(self, *, active_on_failure: int | None = None) -> None:
+        self.active_on_failure = active_on_failure
+        self.events: list[str] = []
+
+    def UUIDString(self) -> str:
+        return "bdffb19a-dd39-4b15-986f-77d1298e0950"
+
+    def create(self) -> int:
+        self.events.append("create")
+        if self.active_on_failure is not None:
+            raise RuntimeError("create")
+        return 0
+
+    def isActive(self) -> int:
+        self.events.append("active")
+        assert self.active_on_failure is not None
+        return self.active_on_failure
+
+
+def test_activation_domain_proxy_applies_once_and_caller_restores_only_after_absence() -> None:
+    broker = _FakeActivationBroker()
+    domain = _FakeActivationDomain()
+    proxy = _ActivationDomainProxy(domain, domain.UUIDString(), broker)  # type: ignore[arg-type]
+
+    assert proxy.create() == 0
+    with pytest.raises(ValueError, match="reused"):
+        proxy.create()
+    broker.restore_after_domain_absent()
+
+    assert broker.events == ["apply", "restore-absent"]
+    assert domain.events == ["create"]
+
+
+def test_activation_connection_proxy_wraps_only_name_lookup_create_surface() -> None:
+    broker = _FakeActivationBroker()
+    by_name = _FakeActivationDomain()
+    by_uuid = _FakeActivationDomain()
+
+    class Connection:
+        def lookupByName(self, _name: str):
+            return by_name
+
+        def lookupByUUIDString(self, _domain_uuid: str):
+            return by_uuid
+
+    connection = _ActivationConnectionProxy(Connection(), by_name.UUIDString(), broker)  # type: ignore[arg-type]
+
+    assert isinstance(connection.lookupByName("demo"), _ActivationDomainProxy)
+    assert connection.lookupByUUIDString(by_name.UUIDString()) is by_uuid
+
+
+@pytest.mark.parametrize(("active", "ambiguous"), [(0, False), (1, True)])
+def test_activation_domain_proxy_never_restores_acl_on_create_failure(active: int, ambiguous: bool) -> None:
+    broker = _FakeActivationBroker()
+    domain = _FakeActivationDomain(active_on_failure=active)
+    proxy = _ActivationDomainProxy(domain, domain.UUIDString(), broker)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="create"):
+        proxy.create()
+
+    assert broker.events == ["apply"]
+    assert broker.ambiguous is ambiguous
+
+
+def test_remove_inactive_domain_proves_absence_before_acl_restore() -> None:
+    events: list[str] = []
+
+    class OrderedBroker(_FakeActivationBroker):
+        def restore_after_domain_absent(self) -> None:
+            events.append("restore-absent")
+            super().restore_after_domain_absent()
+
+    broker = OrderedBroker()
+
+    def remove_exact_inactive() -> None:
+        events.extend(("inspect-inactive", "undefine"))
+
+    def prove_absent() -> bool:
+        events.append("prove-absent")
+        return True
+
+    _remove_inactive_domain_then_restore(  # type: ignore[arg-type]
+        broker,
+        remove_exact_inactive,
+        prove_absent,
+    )
+
+    assert events == ["inspect-inactive", "undefine", "prove-absent", "restore-absent"]
+
+
+def test_remove_inactive_domain_retains_acl_when_domain_reactivated() -> None:
+    broker = _FakeActivationBroker()
+
+    def reject_reactivated() -> None:
+        raise ValueError("domain is active")
+
+    with pytest.raises(ValueError, match="domain is active"):
+        _remove_inactive_domain_then_restore(  # type: ignore[arg-type]
+            broker,
+            reject_reactivated,
+            lambda: pytest.fail("absence proof must not run"),
+        )
+
+    assert broker.events == []
+    assert broker.ambiguous is True
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="requires Linux unlink evidence")
+def test_empty_held_qualification_directory_removes_only_held_tree_entries(tmp_path: Path) -> None:
+    nested = tmp_path / "state"
+    nested.mkdir()
+    (nested / "ledger.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "root.raw").write_bytes(b"root")
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    checks = 0
+
+    def verify_root_binding() -> None:
+        nonlocal checks
+        checks += 1
+        assert os.fstat(descriptor).st_ino == tmp_path.stat().st_ino
+
+    try:
+        _empty_held_qualification_directory(descriptor, verify_root_binding)
+    finally:
+        os.close(descriptor)
+
+    assert tuple(tmp_path.iterdir()) == ()
+    assert checks >= 4
+
+
+def test_empty_held_directory_preserves_child_quarantine_on_rename_boundary_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "root.raw"
+    public.write_bytes(b"owned")
+    displaced = tmp_path / "owned-displaced"
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    original_rename = os.rename
+    injected = False
+
+    def replace_before_child_quarantine(source, destination, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            original_rename("root.raw", displaced.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            public.write_bytes(b"replacement")
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", replace_before_child_quarantine)
+    try:
+        with pytest.raises(ValueError, match="child identity changed while quarantined"):
+            _empty_held_qualification_directory(descriptor, lambda: None)
+
+        quarantines = tuple(tmp_path.glob(".p-*.cleanup"))
+        assert not public.exists()
+        assert displaced.read_bytes() == b"owned"
+        assert len(quarantines) == 1
+        assert quarantines[0].read_bytes() == b"replacement"
+    finally:
+        os.close(descriptor)
+        monkeypatch.undo()
+        for entry in tuple(tmp_path.iterdir()):
+            entry.unlink()
+
+
+def test_empty_held_directory_preserves_late_child_quarantine_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "root.raw"
+    public.write_bytes(b"owned")
+    displaced = tmp_path / "owned-displaced"
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    original_stat = os.stat
+    original_rename = os.rename
+    successful_quarantine_stats = 0
+
+    def replace_before_child_removal(path, *args, **kwargs):
+        nonlocal successful_quarantine_stats
+        result = original_stat(path, *args, **kwargs)
+        if isinstance(path, str) and path.startswith(".p-") and path.endswith(".cleanup"):
+            successful_quarantine_stats += 1
+            if successful_quarantine_stats == 2:
+                original_rename(path, displaced.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+                (tmp_path / path).write_bytes(b"replacement")
+                return original_stat(path, *args, **kwargs)
+        return result
+
+    monkeypatch.setattr(os, "stat", replace_before_child_removal)
+    try:
+        with pytest.raises(ValueError, match="child identity changed while quarantined"):
+            _empty_held_qualification_directory(descriptor, lambda: None)
+
+        quarantines = tuple(tmp_path.glob(".p-*.cleanup"))
+        assert not public.exists()
+        assert displaced.read_bytes() == b"owned"
+        assert len(quarantines) == 1
+        assert quarantines[0].read_bytes() == b"replacement"
+    finally:
+        os.close(descriptor)
+        monkeypatch.undo()
+        for entry in tuple(tmp_path.iterdir()):
+            entry.unlink()
+
+
+@pytest.mark.skipif(stat.S_ISLNK(Path("/tmp").lstat().st_mode), reason="requires a non-symlink /tmp")
+def test_remove_qualification_root_removes_only_expected_inode() -> None:
+    root = Path(tempfile.mkdtemp(prefix="p-", dir="/tmp"))
+    expected = root.lstat()
+    nested = root / "state"
+    nested.mkdir()
+    (nested / "ledger.json").write_text("{}", encoding="utf-8")
+
+    _remove_qualification_root(root, expected)
+
+    assert not root.exists()
+
+
+@pytest.mark.skipif(stat.S_ISLNK(Path("/tmp").lstat().st_mode), reason="requires a non-symlink /tmp")
+def test_remove_qualification_root_refuses_same_uid_swap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(tempfile.mkdtemp(prefix="p-", dir="/tmp"))
+    displaced = root.with_name(f"{root.name}-original")
+    expected = root.lstat()
+    original_rename = os.rename
+    injected = False
+
+    def replace_before_quarantine(source, destination, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            original_rename(root, displaced)
+            root.mkdir(mode=0o700)
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", replace_before_quarantine)
+    try:
+        with pytest.raises(ValueError, match="identity changed while quarantined"):
+            _remove_qualification_root(root, expected)
+
+        quarantines = tuple(root.parent.glob(f".{root.name}.*.cleanup"))
+        assert not root.exists()
+        assert displaced.is_dir()
+        assert len(quarantines) == 1
+        assert quarantines[0].is_dir()
+        assert (quarantines[0].stat().st_dev, quarantines[0].stat().st_ino) != (expected.st_dev, expected.st_ino)
+        assert (displaced.stat().st_dev, displaced.stat().st_ino) == (expected.st_dev, expected.st_ino)
+    finally:
+        for quarantine in root.parent.glob(f".{root.name}.*.cleanup"):
+            shutil.rmtree(quarantine)
+        shutil.rmtree(displaced)
+
+
+@pytest.mark.skipif(stat.S_ISLNK(Path("/tmp").lstat().st_mode), reason="requires a non-symlink /tmp")
+def test_remove_qualification_root_refuses_late_quarantine_swap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(tempfile.mkdtemp(prefix="p-", dir="/tmp"))
+    (root / "owned").write_bytes(b"owned")
+    displaced = root.with_name(f"{root.name}-original")
+    expected = root.lstat()
+    original_listdir = os.listdir
+    original_rename = os.rename
+    injected = False
+
+    def replace_after_quarantine(descriptor):
+        nonlocal injected
+        if not injected:
+            injected = True
+            (quarantine,) = tuple(root.parent.glob(f".{root.name}.*.cleanup"))
+            original_rename(quarantine, displaced)
+            quarantine.mkdir(mode=0o700)
+            (quarantine / "do-not-delete").write_bytes(b"replacement")
+        return original_listdir(descriptor)
+
+    monkeypatch.setattr(os, "listdir", replace_after_quarantine)
+    try:
+        with pytest.raises(ValueError, match="identity changed while quarantined"):
+            _remove_qualification_root(root, expected)
+
+        (quarantine,) = tuple(root.parent.glob(f".{root.name}.*.cleanup"))
+        assert (quarantine / "do-not-delete").read_bytes() == b"replacement"
+        assert displaced.is_dir()
+        assert (displaced / "owned").read_bytes() == b"owned"
+        assert (displaced.stat().st_dev, displaced.stat().st_ino) == (expected.st_dev, expected.st_ino)
+    finally:
+        for quarantine in root.parent.glob(f".{root.name}.*.cleanup"):
+            shutil.rmtree(quarantine)
+        shutil.rmtree(displaced)
+
+
 def _digest(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
@@ -568,9 +1671,11 @@ def _require_live_host(tmp_path: Path):
     config_value = os.environ.get(KERNEL_CONFIG_ENV)
     if not kernel_value or not config_value:
         pytest.fail(f"{KERNEL_ENV} and {KERNEL_CONFIG_ENV} must explicitly select qualified artifacts")
-    for executable in ("qemu-img", "mkfs.ext4", "debugfs"):
+    for executable in ("qemu-img", "mkfs.ext4", "debugfs", "getfacl", "setfacl"):
         if shutil.which(executable) is None:
             pytest.fail(f"required live OCI-root tool is unavailable: {executable}")
+    if not Path("/proc/self/fd").is_dir():
+        pytest.fail("qualified OCI-root DAC broker requires Linux /proc/self/fd")
     assert verify_kvm_api() == 12
     verify_kernel_config(Path(config_value).resolve())
     built = build_bootstrap_initramfs()
@@ -919,6 +2024,44 @@ def test_exact_cleanup_refuses_active_domain_identity_drift(
     assert domain.undefine_calls == 0
 
 
+def test_exact_cleanup_expected_inactive_refuses_reactivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "cleanup-proof"
+    domain_uuid = "2cc94a91-eabc-44f4-b2bd-f3f177618fb9"
+    run_id = "524e3513-98f1-4406-a152-8d726b396a91"
+    plan_digest = "sha256:" + "c" * 64
+    xml = _cleanup_test_xml(domain_uuid, run_id, plan_digest)
+    conn = _CleanupTestConnection(name, domain_uuid, xml, 41)
+    domain = conn.domain
+    assert domain is not None
+    fake_libvirt = type(
+        "FakeLibvirt",
+        (),
+        {
+            "VIR_DOMAIN_XML_INACTIVE": 1,
+            "VIR_ERR_NO_DOMAIN": 404,
+            "libvirtError": _MissingCleanupDomainError,
+        },
+    )
+    monkeypatch.setattr(kvm, "_libvirt", lambda: fake_libvirt)
+    monkeypatch.setattr(oci_root_runtime, "_domain_projection", lambda value: {"xml": value})
+
+    with pytest.raises(AssertionError):
+        _remove_exact_owned_domain(
+            conn,
+            name,
+            domain_uuid,
+            run_id,
+            plan_digest,
+            -1,
+            oci_root_runtime._projection_digest({"xml": xml}),
+        )
+
+    assert domain.destroy_calls == 0
+    assert domain.undefine_calls == 0
+
+
 def test_exact_cleanup_revalidates_active_domain_before_destroy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -956,26 +2099,47 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
     assert domain.undefine_calls == 1
 
 
-def test_live_oci_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    boot, profile = _require_live_host(tmp_path)
-    roots = init_resolved_roots(StatePaths(tmp_path / "c", tmp_path / "s"))
-    store = OCIStore(roots, repair_min_age_seconds=0)
-    materialization = _proof_materialization(store)
-    name = f"p-{uuid.uuid4().hex[:6]}"
-    lifecycle_path = roots.runs / name / "lifecycle.sock"
-    assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
+def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.environ.get(_ENABLE_ENV) != "1":
+        pytest.skip(f"set {_ENABLE_ENV}=1 on the qualified native Linux/KVM libvirt runner")
+    qualification_root, qualification_root_identity = _create_qualification_root()
+    try:
+        boot, profile = _require_live_host(qualification_root)
+    except BaseException:
+        try:
+            (qualification_root / "k").lstat()
+        except FileNotFoundError:
+            _remove_qualification_root(qualification_root, qualification_root_identity)
+        except OSError:
+            pass
+        # A present or ambiguous kernel-copy entry may be the deliberately
+        # preserved unknown inode from an initial fstat failure.  Retain the
+        # entire owner-only qualification root rather than deleting through it.
+        raise
+    conn: Any | None = None
+    try:
+        roots = init_resolved_roots(StatePaths(qualification_root / "c", qualification_root / "s"))
+        store = OCIStore(roots, repair_min_age_seconds=0)
+        materialization = _proof_materialization(store)
+        name = f"p-{uuid.uuid4().hex[:6]}"
+        lifecycle_path = roots.runs / name / "lifecycle.sock"
+        assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
+        conn = kvm.connect(profile.uri)
+        qemu_uid, qemu_gid = _parse_qemu_dac_baselabel(conn.getCapabilities())
+        assert 0 <= qemu_uid <= _MAX_DAC_ID
+        assert 0 <= qemu_gid <= _MAX_DAC_ID
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        _remove_qualification_root(qualification_root, qualification_root_identity)
+        raise
     prepared: PreparedOCIRootRun | None = None
-    conn = kvm.connect(profile.uri)
-    qemu_uid, qemu_gid = _parse_qemu_dac_baselabel(conn.getCapabilities())
-    assert 0 <= qemu_uid <= _MAX_DAC_ID
-    assert 0 <= qemu_gid <= _MAX_DAC_ID
     owned_uuid: str | None = None
     owned_domain_id: int | None = None
     plan_digest: str | None = None
     expected_inactive_projection_digest: str | None = None
+    broker: _QualificationDACBroker | None = None
+    retain_qualification_state = False
     try:
         with reserve_new_run(
             roots,
@@ -1037,6 +2201,11 @@ def test_live_oci_root(
         definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
         assert definition["schema"] == "palimpsest.oci-root-definition.v2"
         expected_inactive_projection_digest = definition["projection_digest"]
+        broker = _QualificationDACBroker(
+            qualification_root,
+            qemu_uid,
+            _qualification_acl_specifications(qualification_root, resolved.xml),
+        )
         direct_connect_attempts: list[object] = []
         original_connect = socket.socket.connect
 
@@ -1047,22 +2216,20 @@ def test_live_oci_root(
             return original_connect(instance, address)  # type: ignore[arg-type]
 
         monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
-        # A future qualification-only DAC broker belongs in a conn/domain proxy
-        # around domain.create(): production revalidation must see original modes,
-        # and ambiguous activation must retain ACLs and backing files.  Effective
-        # POSIX ACLs cannot satisfy the former while they are installed because
-        # the ACL mask is exposed as the group mode bits.
+        activation_conn = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
         completed = launch_defined_oci_root_domain(
             roots,
             name,
             store,
             boot,
             profile,
-            conn=conn,
+            conn=activation_conn,
             timeout_seconds=45,
             terminal_timeout_seconds=45,
         )
-        owned_domain_id = completed.domain_id
+        assert completed.domain_id > 0
+        owned_domain_id = -1
+        assert expected_inactive_projection_digest is not None
 
         assert direct_connect_attempts == []
         assert completed.domain_uuid == defined.domain_uuid
@@ -1085,10 +2252,51 @@ def test_live_oci_root(
         snapshot = read_run_ledger_snapshot(roots, name)
         assert snapshot.state["status"] == "exited"
         assert snapshot.state["oci_root_handoff"]["phase"] == "terminal"
-        domain = conn.lookupByUUIDString(defined.domain_uuid)
-        assert domain.UUIDString() == defined.domain_uuid
-        assert domain.isActive() == 0
-        assert _owner_marker(domain)["contract"] == plan.digest
+        try:
+            _, active, current_domain_id = _inspect_exact_owned_domain(
+                conn,
+                name,
+                defined.domain_uuid,
+                plan.run_id,
+                plan.digest,
+                expected_inactive_projection_digest,
+            )
+            if active != 0 or current_domain_id != -1:
+                raise ValueError("qualification terminal domain is not exactly inactive")
+        except BaseException:
+            broker.ambiguous = True
+            retain_qualification_state = True
+            raise
+
+        def remove_terminal_domain() -> None:
+            _remove_exact_owned_domain(
+                conn,
+                name,
+                defined.domain_uuid,
+                plan.run_id,
+                plan.digest,
+                -1,
+                expected_inactive_projection_digest,
+            )
+
+        def prove_terminal_domain_absent() -> bool:
+            by_name = _lookup_domain(conn, name)
+            by_uuid = _lookup_domain_uuid(conn, defined.domain_uuid)
+            return by_name is None and by_uuid is None
+
+        try:
+            _remove_inactive_domain_then_restore(
+                broker,
+                remove_terminal_domain,
+                prove_terminal_domain_absent,
+            )
+        except BaseException:
+            retain_qualification_state = True
+            raise
+        owned_uuid = None
+        owned_domain_id = None
+        assert broker.restored is True
+        assert broker.ambiguous is False
 
         verified_root = load_oci_root_volume(roots, prepared.transaction.volume_id)
         assert verified_root.path == root_path
@@ -1105,17 +2313,6 @@ def test_live_oci_root(
         assert debugfs.returncode == 0, debugfs.stderr[-2000:]
         assert "Type: directory" in debugfs.stdout
 
-        _remove_exact_owned_domain(
-            conn,
-            name,
-            defined.domain_uuid,
-            plan.run_id,
-            plan.digest,
-            owned_domain_id,
-            expected_inactive_projection_digest,
-        )
-        owned_uuid = None
-        owned_domain_id = None
         release_prepared_oci_root_run(roots, prepared, store)
         assert read_run_ledger_snapshot(roots, name).state["status"] == "removed"
         assert _lookup_domain(conn, name) is None
@@ -1126,7 +2323,8 @@ def test_live_oci_root(
         prepared = None
     finally:
         if (
-            owned_uuid is not None
+            not retain_qualification_state
+            and owned_uuid is not None
             and owned_domain_id is not None
             and plan_digest is not None
             and expected_inactive_projection_digest is not None
@@ -1141,6 +2339,18 @@ def test_live_oci_root(
                 owned_domain_id,
                 expected_inactive_projection_digest,
             )
-        if prepared is not None and _lookup_domain(conn, name) is None:
+        domain_absent = False
+        if not retain_qualification_state:
+            name_absent = _lookup_domain(conn, name) is None
+            uuid_absent = owned_uuid is None or _lookup_domain_uuid(conn, owned_uuid) is None
+            domain_absent = name_absent and uuid_absent
+        if broker is not None and broker.applied and not broker.restored and domain_absent:
+            broker.restore_after_domain_absent()
+        access_restored = broker is None or broker.restored or (not broker.applied and not broker.ambiguous)
+        if prepared is not None and domain_absent and access_restored:
             release_prepared_oci_root_run(roots, prepared, store)
+        if broker is not None and access_restored and not retain_qualification_state:
+            broker.close()
         conn.close()
+        if domain_absent and access_restored:
+            _remove_qualification_root(qualification_root, qualification_root_identity)

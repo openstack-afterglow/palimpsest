@@ -116,14 +116,16 @@ same logical STOP on a fresh wire, deduplicates it without a second signal,
 and reconnects through terminal state. Native evidence remains mandatory;
 local policy tests and reproducible compilation are not a substitute.
 
-The native live harness still lacks the test-only DAC access boundary needed
-when `qemu:///system` runs QEMU under a different UID. Production dispatch and
-its owner-only path validators remain unchanged and disabled. The harness may
-eventually derive only the exact KVM `+uid:+gid` baselabel from libvirt
-capabilities and validate ACL targets beneath its resolved temporary root, but
-effective POSIX ACLs on current `0700`/`0600`/`0400` authorities necessarily
-change group mode bits via the ACL mask. ACL installation therefore remains
-blocked until a create-boundary apply/restore design can preserve production
-revalidation and retain access/backing state whenever domain activation is
-ambiguous. AppArmor policy remains an external per-domain qualification input,
-not something this test edits.
+The native live harness now has a qualification-only DAC access boundary for
+`qemu:///system`; production dispatch and owner-only validators remain
+unchanged and disabled. It derives the exact KVM `+uid:+gid` baselabel, holds
+validated targets beneath a short `/tmp` qualification root, and applies named
+ACLs only inside a connection/domain proxy immediately around `domain.create()`.
+The required ACL mask temporarily changes group mode bits, which are verified
+and restored with the original ACL only after successful lifecycle completion,
+exact ownership/projection/inactivity validation, persistent-domain undefine,
+and proof that both domain name and UUID are absent. An observed external
+reactivation makes inactive-only cleanup fail before restoration and retains
+the ACL, backing tree, and held descriptors. Ambiguous activation or launch
+does the same. AppArmor policy remains an external per-domain qualification
+input, not something this test edits.
