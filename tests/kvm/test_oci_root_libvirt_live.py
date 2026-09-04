@@ -11,10 +11,8 @@ import socket
 import subprocess
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -250,7 +248,7 @@ def _inspect_exact_owned_domain(
     domain_uuid: str,
     run_id: str,
     plan_digest: str,
-    expected_inactive_projection: Mapping[str, Any],
+    expected_inactive_projection_digest: str,
 ):
     by_name = _lookup_domain(conn, name)
     by_uuid = _lookup_domain_uuid(conn, domain_uuid)
@@ -268,7 +266,10 @@ def _inspect_exact_owned_domain(
     observed: list[tuple[int, int]] = []
     for candidate in (by_name, by_uuid):
         inactive_xml = candidate.XMLDesc(inactive_flag)
-        assert oci_root_runtime._domain_projection(inactive_xml) == expected_inactive_projection
+        assert (
+            oci_root_runtime._projection_digest(oci_root_runtime._domain_projection(inactive_xml))
+            == expected_inactive_projection_digest
+        )
         xml_root = ET.fromstring(inactive_xml)
         xml_uuids = xml_root.findall("./uuid")
         assert not xml_uuids or xml_uuids[0].text == domain_uuid
@@ -287,7 +288,7 @@ def _remove_exact_owned_domain(
     run_id: str,
     plan_digest: str,
     expected_domain_id: int,
-    expected_inactive_projection: Mapping[str, Any],
+    expected_inactive_projection_digest: str,
 ) -> None:
     domain = _lookup_domain(conn, name)
     if domain is None:
@@ -299,7 +300,7 @@ def _remove_exact_owned_domain(
         domain_uuid,
         run_id,
         plan_digest,
-        expected_inactive_projection,
+        expected_inactive_projection_digest,
     )
     if active == 1:
         assert expected_domain_id > 0 and domain_id == expected_domain_id
@@ -309,7 +310,7 @@ def _remove_exact_owned_domain(
             domain_uuid,
             run_id,
             plan_digest,
-            expected_inactive_projection,
+            expected_inactive_projection_digest,
         )
         assert active == 1 and domain_id == expected_domain_id
         domain.destroy()
@@ -319,7 +320,7 @@ def _remove_exact_owned_domain(
         domain_uuid,
         run_id,
         plan_digest,
-        expected_inactive_projection,
+        expected_inactive_projection_digest,
     )
     assert active == 0 and domain_id == -1
     domain.undefine()
@@ -432,7 +433,7 @@ def test_exact_cleanup_refuses_active_domain_identity_drift(
             run_id,
             plan_digest,
             41,
-            {"xml": expected_xml},
+            oci_root_runtime._projection_digest({"xml": expected_xml}),
         )
 
     assert domain.destroy_calls == 0
@@ -469,7 +470,7 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
         run_id,
         plan_digest,
         41,
-        {"xml": xml},
+        oci_root_runtime._projection_digest({"xml": xml}),
     )
 
     assert domain.destroy_calls == 1
@@ -490,7 +491,7 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
     owned_uuid: str | None = None
     owned_domain_id: int | None = None
     plan_digest: str | None = None
-    expected_inactive_projection: Mapping[str, Any] | None = None
+    expected_inactive_projection_digest: str | None = None
     try:
         with reserve_new_run(
             roots,
@@ -517,8 +518,6 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
         )
         plan = commit_oci_root_domain_plan(roots, resolved, store)
         plan_digest = plan.digest
-        expected_inactive_projection = oci_root_runtime._domain_projection(resolved.xml)
-
         assert _lookup_domain(conn, name) is None
         collision = conn.defineXML(resolved.xml)
         assert collision is not None and collision.isActive() == 0
@@ -526,6 +525,13 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
         owned_domain_id = collision.ID()
         assert owned_domain_id == -1
         assert _owner_marker(collision)["id"] == plan.run_id
+        inactive_flag = getattr(kvm._libvirt(), "VIR_DOMAIN_XML_INACTIVE", None)
+        assert type(inactive_flag) is int
+        expected_inactive_projection_digest = oci_root_runtime._validated_post_define_projection(
+            conn,
+            resolved,
+            collision.XMLDesc(inactive_flag),
+        )
         with pytest.raises(StateError, match="domain name is already reserved"):
             define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn)
         assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
@@ -536,7 +542,7 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
             plan.run_id,
             plan.digest,
             owned_domain_id,
-            expected_inactive_projection,
+            expected_inactive_projection_digest,
         )
         owned_uuid = None
         owned_domain_id = None
@@ -544,6 +550,9 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
         defined = define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn)
         owned_uuid = defined.domain_uuid
         owned_domain_id = -1
+        definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+        assert definition["schema"] == "palimpsest.oci-root-definition.v2"
+        expected_inactive_projection_digest = definition["projection_digest"]
         direct_connect_attempts: list[object] = []
         lifecycle_path = roots.runs / name / "lifecycle.sock"
         original_connect = socket.socket.connect
@@ -615,7 +624,7 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
             plan.run_id,
             plan.digest,
             owned_domain_id,
-            expected_inactive_projection,
+            expected_inactive_projection_digest,
         )
         owned_uuid = None
         owned_domain_id = None
@@ -632,7 +641,7 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
             owned_uuid is not None
             and owned_domain_id is not None
             and plan_digest is not None
-            and expected_inactive_projection is not None
+            and expected_inactive_projection_digest is not None
             and prepared is not None
         ):
             _remove_exact_owned_domain(
@@ -642,7 +651,7 @@ def test_live_production_prepare_define_launch_natural_terminal_and_exact_cleanu
                 prepared.transaction.owner.run_id,
                 plan_digest,
                 owned_domain_id,
-                expected_inactive_projection,
+                expected_inactive_projection_digest,
             )
         if prepared is not None and _lookup_domain(conn, name) is None:
             release_prepared_oci_root_run(roots, prepared, store)

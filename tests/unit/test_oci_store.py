@@ -1738,6 +1738,13 @@ class _DefinitionConnection:
     def getURI(self) -> str:
         return self.uri
 
+    def getCapabilities(self) -> str:
+        return (
+            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
+            "<machine canonical='pc-q35-noble'>q35</machine>"
+            "</arch></guest></capabilities>"
+        )
+
     def lookupByName(self, name: str) -> _DefinedDomain:
         if self.lookup_error is not None:
             raise self.lookup_error
@@ -2019,7 +2026,10 @@ def test_oci_root_define_revalidates_and_durably_records_inactive_domain(
         "libvirt_uri": profile.uri,
         "phase": "defined",
         "plan_digest": plan.digest,
-        "schema": "palimpsest.oci-root-definition.v1",
+        "projection_digest": oci_root_runtime_module._projection_digest(
+            oci_root_runtime_module._domain_projection(conn.domains["define-ready"].xml)
+        ),
+        "schema": "palimpsest.oci-root-definition.v2",
     }
 
 
@@ -2164,6 +2174,199 @@ def test_oci_root_domain_projection_rejects_noncanonical_lifecycle_metadata(
 
     with pytest.raises(StateError):
         oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
+
+
+def test_oci_root_define_accepts_libvirt_generated_hard_disk_boot_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "generated-boot")
+
+    def add_boot_default(xml: str) -> str:
+        root = ET.fromstring(xml)
+        authored_projection = oci_root_runtime_module._domain_projection(xml)
+        os_element = root.find("./os")
+        assert os_element is not None
+        ET.SubElement(os_element, "boot", {"dev": "hd"})
+        normalized = ET.tostring(root, encoding="unicode")
+        assert oci_root_runtime_module._domain_projection(normalized) == authored_projection
+        return normalized
+
+    conn = _DefinitionConnection(transform=add_boot_default)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    receipt = define_committed_oci_root_domain(
+        roots,
+        "generated-boot",
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+    )
+
+    assert receipt.domain_uuid == conn.domains["generated-boot"].UUIDString()
+    assert read_run_ledger_snapshot(roots, "generated-boot").state["status"] == "defined"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "duplicate",
+        "cdrom",
+        "network",
+        "fd",
+        "extra-attribute",
+        "missing-attribute",
+        "text",
+        "child",
+        "unknown-os-child",
+    ],
+)
+def test_oci_root_domain_projection_rejects_noncanonical_generated_boot_default(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    name = f"generated-boot-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    snapshot = read_run_ledger_snapshot(roots, name)
+    xml = oci_root_kvm_module.resolve_committed_oci_root_domain_plan(
+        roots,
+        snapshot,
+        store,
+        boot,
+        profile,
+        runner=tools,
+    ).xml
+    root = ET.fromstring(xml)
+    os_element = root.find("./os")
+    assert os_element is not None
+    generated = ET.SubElement(os_element, "boot", {"dev": "hd"})
+    if tamper == "duplicate":
+        ET.SubElement(os_element, "boot", {"dev": "hd"})
+    elif tamper in {"cdrom", "network", "fd"}:
+        generated.set("dev", tamper)
+    elif tamper == "extra-attribute":
+        generated.set("extra", "forbidden")
+    elif tamper == "missing-attribute":
+        generated.attrib.clear()
+    elif tamper == "text":
+        generated.text = "forbidden"
+    elif tamper == "child":
+        ET.SubElement(generated, "attacker")
+    else:
+        ET.SubElement(os_element, "attacker")
+
+    with pytest.raises(StateError, match="direct-boot contract"):
+        oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
+
+
+def test_oci_root_define_records_capability_validated_canonical_machine_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "canonical-machine"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def canonicalize_machine(xml: str) -> str:
+        root = ET.fromstring(xml)
+        machine = root.find("./os/type")
+        assert machine is not None
+        machine.set("machine", "pc-q35-noble")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=canonicalize_machine)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    actual_projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert definition["schema"] == "palimpsest.oci-root-definition.v2"
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(actual_projection)
+
+    root = ET.fromstring(conn.domains[name].xml)
+    root.find("./os/type").set("machine", "pc-q35-8.2")
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+    with pytest.raises(StateError, match="changed after definition"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+
+
+@pytest.mark.parametrize("capability", ["missing", "wrong", "ambiguous", "mixed"])
+def test_oci_root_define_rejects_unproven_machine_alias_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capability: str,
+) -> None:
+    name = f"machine-alias-{capability}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def canonicalize_machine(xml: str) -> str:
+        root = ET.fromstring(xml)
+        root.find("./os/type").set("machine", "pc-q35-noble")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=canonicalize_machine)
+    if capability == "missing":
+        conn.getCapabilities = lambda: "<capabilities/>"  # type: ignore[method-assign]
+    elif capability == "wrong":
+        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
+            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
+            "<machine canonical='pc-q35-other'>q35</machine>"
+            "</arch></guest></capabilities>"
+        )
+    elif capability == "ambiguous":
+        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
+            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
+            "<machine canonical='pc-q35-noble'>q35</machine>"
+            "<machine canonical='pc-q35-noble'>q35</machine>"
+            "</arch></guest></capabilities>"
+        )
+    else:
+        conn.getCapabilities = lambda: (  # type: ignore[method-assign]
+            "<capabilities><guest><os_type>hvm</os_type><arch name='x86_64'>"
+            "<machine canonical='pc-q35-noble'>q35</machine>"
+            "<machine>q35</machine>"
+            "</arch></guest></capabilities>"
+        )
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises(StateError, match="machine alias"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
+
+
+@pytest.mark.parametrize("tamper", ["legacy-schema", "missing-projection", "changed-projection"])
+def test_oci_root_private_launch_rejects_unbound_definition_projection_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    name = f"definition-projection-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    with state_module.locked_existing_run(roots, name) as mutation:
+        data = mutation.mutable_state()
+        definition = data["oci_root_definition"]
+        if tamper == "legacy-schema":
+            definition["schema"] = "palimpsest.oci-root-definition.v1"
+        elif tamper == "missing-projection":
+            definition.pop("projection_digest")
+        else:
+            definition["projection_digest"] = "sha256:" + "f" * 64
+        mutation.write_state("defined", data)
+
+    with pytest.raises(StateError, match="definition ledger|changed after definition"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert conn.domains[name].create_calls == 0
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
 
 
 @pytest.mark.parametrize("tamper", ["mismatch", "duplicate", "extra-attribute", "child"])
@@ -2330,7 +2533,7 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
         elif failure == "console":
             root.find("./devices/console/target").set("port", "1")
         elif failure == "direct-boot":
-            ET.SubElement(root.find("./os"), "boot", {"dev": "hd"})
+            ET.SubElement(root.find("./os"), "boot", {"dev": "cdrom"})
         elif failure == "filesystem":
             filesystem = ET.SubElement(root.find("./devices"), "filesystem", {"type": "mount"})
             ET.SubElement(filesystem, "source", {"dir": "/"})

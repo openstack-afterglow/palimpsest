@@ -6,6 +6,7 @@ dispatch remains disabled until the privileged lifecycle handshake is ready.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -20,6 +21,7 @@ from .oci_control_protocol_v2 import (
     HostOCIControlV2Session,
     OCIControlV2Binding,
 )
+from .oci_layout import canonical_json
 from .oci_lifecycle_transport import (
     DEFAULT_HANDOFF_TIMEOUT_SECONDS,
     OCI_ROOT_HANDOFF_SCHEMA,
@@ -37,7 +39,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import ProcessExit
 from .state import StatePaths, locked_existing_run
 
-OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v1"
+OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
 
@@ -380,11 +382,18 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     os_type = _single(root, "./os/type", "defined OCI-root machine contract is invalid")
     os_element = _single(root, "./os", "defined OCI-root direct-boot contract is invalid")
     expected_os_children = {"cmdline", "initrd", "kernel", "type"}
+    boot_elements = os_element.findall("./boot")
     if (
         os_element.attrib
-        or len(os_element) != 4
-        or {child.tag for child in os_element} != expected_os_children
+        or any(child.tag not in expected_os_children | {"boot"} for child in os_element)
         or any(len(os_element.findall(f"./{tag}")) != 1 for tag in expected_os_children)
+        or len(boot_elements) > 1
+        or (
+            boot_elements
+            and (
+                boot_elements[0].attrib != {"dev": "hd"} or boot_elements[0].text is not None or list(boot_elements[0])
+            )
+        )
     ):
         raise StateError("defined OCI-root direct-boot contract is invalid")
     memory = _memory_projection(root)
@@ -417,6 +426,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "domain_type": root.get("type"),
         "emulator": emulator.text,
         "features": tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(features)),
+        "generated_boot": "hd",
         "initramfs": _text(root, "./os/initrd", "defined OCI-root initramfs is invalid"),
         "interfaces": tuple(network_projection),
         "kernel": _text(root, "./os/kernel", "defined OCI-root kernel is invalid"),
@@ -438,6 +448,69 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         ),
         "vcpus": _text(root, "./vcpu", "defined OCI-root vCPU contract is invalid"),
     }
+
+
+def _projection_digest(projection: Mapping[str, Any]) -> str:
+    return f"sha256:{hashlib.sha256(canonical_json(dict(projection))).hexdigest()}"
+
+
+def _validate_machine_alias(
+    conn: Any,
+    profile: DomainProfile,
+    authored_machine: tuple[str | None, str | None, str | None],
+    actual_machine: tuple[str | None, str | None, str | None],
+) -> None:
+    if authored_machine == actual_machine:
+        return
+    authored_arch, authored_name, authored_type = authored_machine
+    actual_arch, actual_name, actual_type = actual_machine
+    if (
+        authored_arch != profile.arch
+        or actual_arch != authored_arch
+        or authored_name != profile.machine
+        or authored_type != "hvm"
+        or actual_type != authored_type
+        or not isinstance(actual_name, str)
+        or not actual_name
+    ):
+        raise StateError("defined OCI-root machine contract is invalid")
+    try:
+        capabilities = conn.getCapabilities()
+        root = ET.fromstring(capabilities)
+    except Exception as exc:
+        raise StateError("libvirt machine alias capabilities cannot be inspected") from exc
+    if root.tag != "capabilities":
+        raise StateError("libvirt machine alias capabilities are invalid")
+    matching_machines: list[ET.Element] = []
+    for guest in root.findall("./guest"):
+        if guest.findtext("./os_type") != "hvm":
+            continue
+        for arch in guest.findall("./arch"):
+            if arch.get("name") != authored_arch:
+                continue
+            for machine in arch.findall("./machine"):
+                if machine.text == authored_name:
+                    matching_machines.append(machine)
+    if len(matching_machines) != 1 or matching_machines[0].get("canonical") != actual_name:
+        raise StateError("defined OCI-root machine alias is not an exact libvirt capability mapping")
+
+
+def _validated_post_define_projection(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    actual_xml: str,
+) -> str:
+    authored = _domain_projection(resolved.xml)
+    actual = _domain_projection(actual_xml)
+    authored_machine = authored.get("machine")
+    actual_machine = actual.get("machine")
+    if not isinstance(authored_machine, tuple) or not isinstance(actual_machine, tuple):
+        raise StateError("defined OCI-root machine projection is invalid")
+    _validate_machine_alias(conn, resolved.profile, authored_machine, actual_machine)
+    authored["machine"] = actual_machine
+    if actual != authored:
+        raise StateError("defined OCI-root domain does not match the committed contract")
+    return _projection_digest(actual)
 
 
 def _domain_uuid(domain: Any) -> str:
@@ -465,15 +538,24 @@ def _validate_defined_domain(
     domain: Any,
     resolved: ResolvedOCIRootDomainPlan,
     expected_uuid: str,
-) -> None:
+    *,
+    conn: Any | None = None,
+    expected_projection_digest: str | None = None,
+) -> str:
+    if (conn is None) == (expected_projection_digest is None):
+        raise StateError("defined OCI-root projection validation authority is invalid")
     if _domain_uuid(domain) != expected_uuid:
         raise StateError("defined OCI-root domain UUID changed after definition")
     try:
         actual_xml = domain.XMLDesc()
     except Exception as exc:
         raise StateError("defined OCI-root domain cannot be inspected") from exc
-    if _domain_projection(actual_xml) != _domain_projection(resolved.xml):
-        raise StateError("defined OCI-root domain does not match the committed contract")
+    if conn is not None:
+        projection_digest = _validated_post_define_projection(conn, resolved, actual_xml)
+    else:
+        projection_digest = _projection_digest(_domain_projection(actual_xml))
+        if projection_digest != expected_projection_digest:
+            raise StateError("defined OCI-root domain changed after definition")
     actual_root = ET.fromstring(actual_xml)
     xml_uuids = actual_root.findall("./uuid")
     if xml_uuids and xml_uuids[0].text != expected_uuid:
@@ -484,6 +566,7 @@ def _validate_defined_domain(
         raise StateError("defined OCI-root domain activity cannot be inspected") from exc
     if active != 0:
         raise StateError("defined OCI-root domain became active before start authorization")
+    return projection_digest
 
 
 def _lookup(conn: Any, name: str) -> Any | None:
@@ -617,7 +700,7 @@ def define_committed_oci_root_domain(
             current = _lookup(conn, name)
             if current is None:
                 raise StateError("defined OCI-root domain is missing")
-            _validate_defined_domain(current, resolved, domain_uuid)
+            projection_digest = _validate_defined_domain(current, resolved, domain_uuid, conn=conn)
             mutation.verify_binding()
             data = mutation.mutable_state()
             data["oci_root_definition"] = {
@@ -625,6 +708,7 @@ def define_committed_oci_root_domain(
                 "libvirt_uri": libvirt_uri,
                 "phase": "defined",
                 "plan_digest": resolved.plan.digest,
+                "projection_digest": projection_digest,
                 "schema": OCI_ROOT_DEFINITION_SCHEMA,
             }
             result = mutation.write_state("defined", data)
@@ -652,13 +736,14 @@ def define_committed_oci_root_domain(
         )
 
 
-def _definition_ledger(state: Mapping[str, Any], profile: DomainProfile) -> tuple[str, str]:
+def _definition_ledger(state: Mapping[str, Any], profile: DomainProfile) -> tuple[str, str, str]:
     value = state.get("oci_root_definition")
     if not isinstance(value, Mapping) or set(value) != {
         "domain_uuid",
         "libvirt_uri",
         "phase",
         "plan_digest",
+        "projection_digest",
         "schema",
     }:
         raise StateError("OCI-root durable definition ledger is invalid")
@@ -666,7 +751,13 @@ def _definition_ledger(state: Mapping[str, Any], profile: DomainProfile) -> tupl
         raise StateError("OCI-root durable definition ledger is invalid")
     domain_uuid = value.get("domain_uuid")
     plan_digest = value.get("plan_digest")
-    if not isinstance(domain_uuid, str) or not isinstance(plan_digest, str):
+    projection_digest = value.get("projection_digest")
+    if (
+        not isinstance(domain_uuid, str)
+        or not isinstance(plan_digest, str)
+        or not isinstance(projection_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", projection_digest) is None
+    ):
         raise StateError("OCI-root durable definition ledger is invalid")
     try:
         if str(uuid.UUID(domain_uuid)) != domain_uuid:
@@ -675,7 +766,7 @@ def _definition_ledger(state: Mapping[str, Any], profile: DomainProfile) -> tupl
         raise StateError("OCI-root durable definition ledger is invalid") from None
     if value.get("libvirt_uri") != profile.uri:
         raise StateError("OCI-root durable definition URI is invalid")
-    return domain_uuid, plan_digest
+    return domain_uuid, plan_digest, projection_digest
 
 
 def _lookup_uuid(conn: Any, domain_uuid: str) -> Any | None:
@@ -711,6 +802,7 @@ def _validate_active_domain(
     resolved: ResolvedOCIRootDomainPlan,
     expected_uuid: str,
     expected_domain_id: int,
+    expected_projection_digest: str,
 ) -> None:
     if _domain_uuid(domain) != expected_uuid:
         raise StateError("active OCI-root domain UUID changed")
@@ -721,8 +813,8 @@ def _validate_active_domain(
         actual_xml = domain.XMLDesc(inactive_flag)
     except Exception as exc:
         raise StateError("active OCI-root domain cannot be inspected") from exc
-    if _domain_projection(actual_xml) != _domain_projection(resolved.xml):
-        raise StateError("active OCI-root domain does not match the committed contract")
+    if _projection_digest(_domain_projection(actual_xml)) != expected_projection_digest:
+        raise StateError("active OCI-root persistent domain changed after definition")
     try:
         active = domain.isActive()
     except Exception as exc:
@@ -812,6 +904,7 @@ def _handle_launch_failure(
     boot_attempt_id: str,
     ledger_phase: str,
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
+    expected_projection_digest: str,
 ) -> str:
     with locked_existing_run(roots, name) as mutation:
         ledger_domain_id = None if ledger_phase == "activating" else domain_id
@@ -827,7 +920,13 @@ def _handle_launch_failure(
         )
         cleanup_phase = "failed"
         try:
-            _cleanup_exact_launch_domain(conn, resolved, domain_uuid, domain_id)
+            _cleanup_exact_launch_domain(
+                conn,
+                resolved,
+                domain_uuid,
+                domain_id,
+                expected_projection_digest,
+            )
         except _LaunchControlAmbiguity:
             cleanup_phase = "cleanup-not-attempted"
         except Exception:
@@ -852,6 +951,7 @@ def _exact_launch_instance(
     resolved: ResolvedOCIRootDomainPlan,
     expected_uuid: str,
     expected_domain_id: int,
+    expected_projection_digest: str,
     *,
     active: bool,
 ) -> Any:
@@ -861,7 +961,7 @@ def _exact_launch_instance(
         if type(inactive_flag) is not int:
             raise StateError("libvirt inactive XML inspection support is unavailable")
         actual_xml = domain.XMLDesc(inactive_flag)
-        if _domain_projection(actual_xml) != _domain_projection(resolved.xml):
+        if _projection_digest(_domain_projection(actual_xml)) != expected_projection_digest:
             raise StateError("OCI-root persistent domain XML changed")
         actual_root = ET.fromstring(actual_xml)
         xml_uuids = actual_root.findall("./uuid")
@@ -883,6 +983,7 @@ def _cleanup_exact_launch_domain(
     resolved: ResolvedOCIRootDomainPlan,
     expected_uuid: str,
     expected_domain_id: int | None,
+    expected_projection_digest: str,
 ) -> None:
     try:
         domain = _exact_domain(conn, resolved, expected_uuid)
@@ -899,6 +1000,7 @@ def _cleanup_exact_launch_domain(
             resolved,
             expected_uuid,
             expected_domain_id,
+            expected_projection_digest,
             active=True,
         )
         try:
@@ -910,6 +1012,7 @@ def _cleanup_exact_launch_domain(
         resolved,
         expected_uuid,
         0 if expected_domain_id is None else expected_domain_id,
+        expected_projection_digest,
         active=False,
     )
     try:
@@ -958,10 +1061,13 @@ def launch_defined_oci_root_domain(
     stream: Any | None = None
     stream_handed_off = False
     ready_lifecycle: OCILifecycleHandoffReceipt | None = None
+    definition_projection_digest: str | None = None
     try:
         with locked_existing_run(roots, name) as mutation:
             libvirt_uri = _connection_uri(conn, profile)
-            domain_uuid, definition_digest = _definition_ledger(mutation.snapshot.state, profile)
+            domain_uuid, definition_digest, definition_projection_digest = _definition_ledger(
+                mutation.snapshot.state, profile
+            )
             resolved = resolve_committed_oci_root_domain_plan(
                 roots,
                 mutation.snapshot,
@@ -974,7 +1080,12 @@ def launch_defined_oci_root_domain(
             if definition_digest != resolved.plan.digest:
                 raise StateError("OCI-root durable definition plan binding is invalid")
             domain = _exact_domain(conn, resolved, domain_uuid)
-            _validate_defined_domain(domain, resolved, domain_uuid)
+            _validate_defined_domain(
+                domain,
+                resolved,
+                domain_uuid,
+                expected_projection_digest=definition_projection_digest,
+            )
             libvirt = kvm._libvirt()
             flags = getattr(libvirt, "VIR_STREAM_NONBLOCK", None)
             inactive_flag = getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", None)
@@ -1030,7 +1141,7 @@ def launch_defined_oci_root_domain(
                 raise StateError("OCI-root domain activation did not yield an active boot instance")
             domain_id = captured_domain_id
             domain = _exact_domain(conn, resolved, domain_uuid)
-            _validate_active_domain(domain, resolved, domain_uuid, domain_id)
+            _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
             data = mutation.mutable_state()
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
@@ -1047,7 +1158,7 @@ def launch_defined_oci_root_domain(
 
         try:
             domain = _exact_domain(conn, resolved, domain_uuid)
-            _validate_active_domain(domain, resolved, domain_uuid, domain_id)
+            _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
             try:
                 opened = domain.openChannel(channel_name, stream, 0)
             except Exception:
@@ -1062,8 +1173,14 @@ def launch_defined_oci_root_domain(
         def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
             nonlocal ledger_phase, ready_lifecycle
             with locked_existing_run(roots, name) as mutation:
-                current_uuid, current_digest = _definition_ledger(mutation.snapshot.state, profile)
-                if current_uuid != domain_uuid or current_digest != resolved.plan.digest:
+                current_uuid, current_digest, current_projection_digest = _definition_ledger(
+                    mutation.snapshot.state, profile
+                )
+                if (
+                    current_uuid != domain_uuid
+                    or current_digest != resolved.plan.digest
+                    or current_projection_digest != definition_projection_digest
+                ):
                     raise StateError("OCI-root durable definition changed before READY")
                 if (
                     not isinstance(lifecycle, OCILifecycleHandoffReceipt)
@@ -1082,7 +1199,13 @@ def launch_defined_oci_root_domain(
                     "starting",
                 )
                 active_domain = _exact_domain(conn, resolved, domain_uuid)
-                _validate_active_domain(active_domain, resolved, domain_uuid, domain_id)
+                _validate_active_domain(
+                    active_domain,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    definition_projection_digest,
+                )
                 data = mutation.mutable_state()
                 data.pop("error", None)
                 data["oci_root_handoff"] = _handoff_ledger(
@@ -1115,8 +1238,14 @@ def launch_defined_oci_root_domain(
             raise StateError("OCI-root lifecycle terminal result is missing")
 
         with locked_existing_run(roots, name) as mutation:
-            current_uuid, current_digest = _definition_ledger(mutation.snapshot.state, profile)
-            if current_uuid != domain_uuid or current_digest != resolved.plan.digest:
+            current_uuid, current_digest, current_projection_digest = _definition_ledger(
+                mutation.snapshot.state, profile
+            )
+            if (
+                current_uuid != domain_uuid
+                or current_digest != resolved.plan.digest
+                or current_projection_digest != definition_projection_digest
+            ):
                 raise StateError("OCI-root durable definition changed before TERMINAL")
             if ready_lifecycle is None:
                 raise StateError("OCI-root durable READY receipt is missing")
@@ -1148,6 +1277,7 @@ def launch_defined_oci_root_domain(
                     resolved,
                     domain_uuid,
                     domain_id,
+                    definition_projection_digest,
                     active=True,
                 )
                 try:
@@ -1159,6 +1289,7 @@ def launch_defined_oci_root_domain(
                 resolved,
                 domain_uuid,
                 domain_id,
+                definition_projection_digest,
                 active=False,
             )
             data = mutation.mutable_state()
@@ -1188,7 +1319,13 @@ def launch_defined_oci_root_domain(
     except BaseException:
         if stream is not None and not stream_handed_off:
             _close_unowned_stream(stream)
-        if started_intent and resolved is not None and domain_uuid is not None and boot_attempt_id is not None:
+        if (
+            started_intent
+            and resolved is not None
+            and domain_uuid is not None
+            and boot_attempt_id is not None
+            and definition_projection_digest is not None
+        ):
             try:
                 cleanup_phase = _handle_launch_failure(
                     roots,
@@ -1201,6 +1338,7 @@ def launch_defined_oci_root_domain(
                     boot_attempt_id,
                     ledger_phase,
                     ready_lifecycle,
+                    definition_projection_digest,
                 )
             except Exception:
                 raise StateError("OCI-root launch state changed; cleanup was not attempted") from None

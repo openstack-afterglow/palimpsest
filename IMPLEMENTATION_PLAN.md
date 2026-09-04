@@ -1009,6 +1009,12 @@ and Gate 2 remain disabled.
   Cleanup destroys or undefines only that exact boot instance; restart,
   identity drift, or ambiguous creation leaves the domain untouched and records
   cleanup as not attempted or required.
+- Definition ledger v2 binds the capability-validated canonical libvirt machine
+  alias and the complete post-define semantic projection digest. Bounded
+  libvirt defaults (`currentMemory`, hard-disk boot selection, and redundant
+  same-namespace lifecycle metadata elision) normalize only when their exact
+  committed meaning is unchanged; all later operations require the recorded
+  projection digest.
 - Guest PID 1 publishes TERMINAL only after workload and cgroup cleanup, stable
   no-follow identity checks for OverlayFS `/` and `/proc/self/root`, successful
   `syncfs`, and successful descriptor closes. KVM proof/receipt v19 binds the
