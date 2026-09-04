@@ -29,13 +29,13 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v13"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v13"
-OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v7"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v14"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v14"
+OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v8"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
 OCI_STAGE1_PROCESS_POLICY = "image-root-account-path-capabilityless-isolated-user-group.v3"
-OCI_STAGE1_WORKLOAD_ISOLATION = "palimpsest.workload-lifecycle-authority-isolation.v2"
+OCI_STAGE1_WORKLOAD_ISOLATION = "palimpsest.workload-lifecycle-authority-isolation.v3"
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
 _PROBE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+$")

@@ -31,24 +31,24 @@ from .oci_guest_stage1 import (
 )
 from .oci_provenance import canonical_json_bytes
 
-OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v17"
+OCI_INITRAMFS_MANIFEST_SCHEMA = "palimpsest.oci-initramfs-manifest.v18"
 OCI_INITRAMFS_GENERATOR_CONTRACT = "palimpsest.initramfs.newc.v1"
-OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v15"
-OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v17"
+OCI_BOOTSTRAP_STAGE1_CONTRACT = "palimpsest.guest-stage1-init.x86_64.v16"
+OCI_STAGE1_ABI = "palimpsest.guest-stage1-bootstrap.v18"
 OCI_STAGE1_ROOT_TRANSITION_CONTRACT = "palimpsest.stage1-root-transition.v1"
-OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v8"
+OCI_STAGE1_SUPERVISOR_CONTRACT = "palimpsest.guest-pid1-supervisor.v9"
 OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v3"
-OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v2"
+OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v3"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
 OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:57da4f978f5e6351567d949b1e74bdc5cafb2d02a96942852c56fc7713a95385"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:f4456d7e4922ddb713f5284e522e3e9919d6beddfe8b5736a713f6567c08dcbd"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:52265bff283d226dd208775ae0ac1d7e86ef2af4409f715e735c2bd88f50a49a"
+OCI_STAGE1_BINARY_DIGEST = "sha256:c176626f70c981a45a2907d5b5e2e626de7d28307683b1fbeef2d30a343bcc26"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -366,14 +366,16 @@ def _bootstrap_stage1_binary() -> bytes:
 
 def _supervisor_contract_dict() -> dict[str, Any]:
     return {
-        "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
-        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
-        "cleanup_scope": "dedicated-workload-cgroup",
+        "agent_cgroup": "/palimpsest.agent",
+        "cgroup": "fd-pinned-cgroup-v2-agent-exec-session-hierarchy",
+        "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+        "cleanup_scope": "exec-session-leaf-then-empty-agent-parent",
         "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
         "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "credentials": "root-pid1-broker-image-root-passwd-group-resolution-empty-supplementary-groups",
         "environment": "authenticated-image-environment-with-fixed-container-default-path",
-        "execution": "shell-free-path-search-fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "exec_session_cgroup": "/palimpsest.agent/exec-00000001",
+        "execution": "shell-free-path-search-fork-isolation-ready-exec-session-attach-release-gate-execve-cloexec-error-pipe",
         "isolation": {
             "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
             "contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
@@ -386,11 +388,16 @@ def _supervisor_contract_dict() -> dict[str, Any]:
         },
         "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
         "lifecycle_delivery": "authenticated-v2-bootstrap-boundary-ack-reconnect-snapshot-same-id-stop-retry",
+        "max_active_sessions_qualified": 1,
+        "membership": "pid1-root-agent-parent-empty-workload-in-primary-leaf",
+        "parallel_exec_sessions_proven": False,
         "privilege_after_fork": "root-pid1-narrow-broker-capabilityless-workload",
+        "session_id": 1,
+        "session_id_allocation": "guest-internal-monotonic-u32",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
-        "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+        "production_cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
         "terminal_state": "parent-marker-then-fail-closed-wait",
-        "wait": "wait4-to-echild-with-empty-cgroup-proof",
+        "wait": "wait4-to-echild-with-empty-leaf-and-parent-proof",
     }
 
 

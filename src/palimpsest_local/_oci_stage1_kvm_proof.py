@@ -75,7 +75,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v17"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v18"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -88,7 +88,8 @@ DEFAULT_BOOT_TIMEOUT_SECONDS = 45.0
 ROOT_TRANSITION_MARKER = b"palimpsest guest stage1: root transition complete; root is slash; workload pending"
 WORKLOAD_STARTED_MARKER = b"palimpsest guest stage1: workload started; root is slash; supervisor active"
 WORKLOAD_ISOLATION_MARKER = (
-    b"palimpsest guest stage1: workload isolation committed; lifecycle authority retained by pid1"
+    b"palimpsest guest stage1: workload isolation committed; agent cgroup and exec session owned by pid1; "
+    b"lifecycle authority retained by pid1"
 )
 WORKLOAD_SIGNAL_ARMED_MARKER = b"palimpsest workload proof: signal handlers armed"
 WORKLOAD_STOP_OBSERVED_MARKER = b"palimpsest workload proof: stop observed"
@@ -101,7 +102,8 @@ WORKLOAD_TERMINAL_PREFIX = b"palimpsest guest stage1: workload terminal; main_st
 WORKLOAD_TERMINAL_MARKER = (
     b"palimpsest guest stage1: workload terminal; main_status=42; cooperative_status=43; "
     b"forced_status=137; reaped=3; forwarded=15; pid1_uid=0; pid1_gid=0; pid1_groups=0; "
-    b"cleanup=cgroup.kill; cgroup_populated=0; waiting fail-closed"
+    b"cleanup=exec-session-cgroup.kill; leaf_populated=0; leaf_removed=1; "
+    b"parent_populated=0; parent_removed=1; waiting fail-closed"
 )
 SUCCESS_MARKER = WORKLOAD_TERMINAL_MARKER
 REJECTION_MARKER = b"palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed"
@@ -302,7 +304,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:db5c1859b754b5b0c6f113238deba2407496c5d035e700a201f9d5ead6ba06f2"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:3ad31e3cf2159aee100c639cbfa57eed77d6278251b01dc3fab0351417dd4d02"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -317,8 +319,8 @@ def verify_proof_filesystem_manifest(value: Any) -> str:
     digest = _digest(canonical_json_bytes(value))
     if (
         digest != _PROOF_FILESYSTEM_MANIFEST_DIGEST
-        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v10"
-        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v10"
+        or value.get("schema") != "palimpsest.kvm-filesystem-fixtures.v11"
+        or value.get("policy") != "palimpsest.kvm-actual-filesystem-fixtures.v11"
         or value.get("assembly_probe") != _PROOF_ASSEMBLY_PROBE
     ):
         raise ArtifactValidationError("KVM filesystem fixture policy is invalid")
@@ -334,10 +336,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653",
-        "elf_size_bytes": 9868,
+        "elf_sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
+        "elf_size_bytes": 9932,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "a92cfb1b2d1a606cf8964166e69a40325cefdff83a87d431ed121f2340985cd4",
+        "source_sha256": "f8c07a962b98a52e50f8e08feaebf07d65dbc9cd84c51b4b1c2622c4d9f3affa",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:
@@ -1042,7 +1044,7 @@ def pre_mount_topology(plan: OCIStage1Plan, *, mode: str = "base") -> dict[str, 
     topology = {
         "devices": devices,
         "fixture_manifest_digest": filesystems.manifest_digest,
-        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v10",
+        "fixture_policy": "palimpsest.kvm-actual-filesystem-fixtures.v11",
         "policy": "virtio-blk-pre-mount-device-set.v1",
     }
     topology["digest"] = _digest(canonical_json_bytes(topology))
@@ -1663,7 +1665,13 @@ def workload_negative_control_contract(name: str) -> dict[str, Any]:
             "size_bytes": transport.receipt.artifact_size_bytes,
         },
     }
-    expected_stage = 36 if name in {"workload_missing_user", "workload_missing_group"} else 6 if name == "workload_missing_cwd" else 7
+    expected_stage = (
+        36
+        if name in {"workload_missing_user", "workload_missing_group"}
+        else 6
+        if name == "workload_missing_cwd"
+        else 7
+    )
     expected_errno = 22 if expected_stage == 36 else 13 if name == "workload_non_executable" else 2
     contract: dict[str, Any] = {
         "attachments": attachments,
@@ -3226,10 +3234,11 @@ class OCIStage1KVMProofReceipt:
                 "account_resolution": "image-root-passwd-group",
                 "argv0": "shell-free-path-search-after-chdir",
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-                "cgroup": "/palimpsest.workload",
-                "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
-                "cgroup_write_escape_denied": ["parent", "own"],
-                "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+                "agent_cgroup": "/palimpsest.agent",
+                "cgroup": "/palimpsest.agent/exec-00000001",
+                "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+                "cgroup_write_escape_denied": ["root", "agent-parent", "exec-session-leaf"],
+                "cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
                 "cooperative_status": 43,
                 "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
                 "forced_status": 137,
@@ -3237,12 +3246,24 @@ class OCIStage1KVMProofReceipt:
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
+                "leaf_populated_after_cleanup": False,
+                "leaf_populated_before_release": True,
+                "leaf_removed": True,
                 "main_status": 42,
+                "max_active_sessions_qualified": 1,
                 "omitted_primary_group": True,
+                "parallel_exec_sessions_proven": False,
+                "parent_cgroup_procs_empty": True,
+                "parent_populated_after_cleanup": False,
+                "parent_recursively_populated": True,
+                "parent_removed": True,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+                "pid1_outside_agent": True,
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
+                "session_id": 1,
+                "session_id_allocation": "guest-internal-monotonic-u32",
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "supplementary_groups": "empty-restricted-subset",
@@ -3400,10 +3421,11 @@ class OCIStage1KVMProofReceipt:
                 "account_resolution": "image-root-passwd-group",
                 "argv0": "shell-free-path-search-after-chdir",
                 "contract": OCI_STAGE1_SUPERVISOR_CONTRACT,
-                "cgroup": "/palimpsest.workload",
-                "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
-                "cgroup_write_escape_denied": ["parent", "own"],
-                "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+                "agent_cgroup": "/palimpsest.agent",
+                "cgroup": "/palimpsest.agent/exec-00000001",
+                "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+                "cgroup_write_escape_denied": ["root", "agent-parent", "exec-session-leaf"],
+                "cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
                 "cooperative_status": 43,
                 "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
                 "forced_status": 137,
@@ -3411,12 +3433,24 @@ class OCIStage1KVMProofReceipt:
                 "lifecycle_broker": OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT,
                 "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
                 "isolation_contract": OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT,
+                "leaf_populated_after_cleanup": False,
+                "leaf_populated_before_release": True,
+                "leaf_removed": True,
                 "main_status": 42,
+                "max_active_sessions_qualified": 1,
                 "omitted_primary_group": True,
+                "parallel_exec_sessions_proven": False,
+                "parent_cgroup_procs_empty": True,
+                "parent_populated_after_cleanup": False,
+                "parent_recursively_populated": True,
+                "parent_removed": True,
                 "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+                "pid1_outside_agent": True,
                 "privileged_broker_after_fork": True,
                 "process_group": True,
                 "reaped_children": 3,
+                "session_id": 1,
+                "session_id_allocation": "guest-internal-monotonic-u32",
                 "terminal_state": "parent-marker-then-fail-closed-wait",
                 "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
                 "supplementary_groups": "empty-restricted-subset",
@@ -4395,8 +4429,7 @@ def _read_console_until(
                 current, LIFECYCLE_REJECTION_PREFIX
             ):
                 raise KVMProofFailure(
-                    "QEMU emitted a lifecycle rejection marker: "
-                    f"{_redact_lifecycle_boundary_lines(current)[-512:]!r}"
+                    f"QEMU emitted a lifecycle rejection marker: {_redact_lifecycle_boundary_lines(current)[-512:]!r}"
                 )
             if (
                 lifecycle_scenario in {"negative", "discovery-negative"}

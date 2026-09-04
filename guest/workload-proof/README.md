@@ -39,10 +39,10 @@ It also parses `/proc/1/status` within a fixed 8 KiB bound and requires exactly
 one `Uid`, `Gid`, and `Groups` line. All real, effective, saved, and filesystem
 UID/GID values must be zero and the supplementary-group list must be empty.
 The helper independently requires its own `/proc/self/cgroup` to contain the
-exact unified-v2 membership `0::/palimpsest.workload`. It also requires
-write-only opens of both the parent and its own `cgroup.procs` to fail with
-exactly `EACCES` or `EPERM`, proving the admitted UID 65534 cannot move itself
-out of the subtree through those controls.
+exact unified-v2 membership `0::/palimpsest.agent/exec-00000001`. It also
+requires write-only opens of the cgroup root, agent parent, and its own session
+leaf `cgroup.procs` to fail, proving the admitted UID 65534 cannot move itself
+through any visible level of the hierarchy.
 
 After validating the contract, the main process blocks SIGTERM and forks two
 same-process-group descendants. The cooperative descendant consumes PID 1's
@@ -52,9 +52,9 @@ keeps SIGTERM blocked and remains until the broker uses the pinned
 ready, the main arms its own signalfd, emits the proof-only scheduling marker,
 and waits. The host sends STOP only after broker READY and that marker; root
 PID 1 forwards the configured OCI stop signal, after which the main exits 42.
-PID 1 observes the cooperative grace result and kills the remaining
-cgroup, reap to `ECHILD`, prove `populated 0` and empty `cgroup.procs`, and
-remove the cgroup before it may publish terminal success.
+PID 1 observes the cooperative grace result and kills only the session leaf,
+reaps to `ECHILD`, proves the leaf empty and removes it, then proves the empty
+agent parent has no direct processes and removes it before terminal success.
 
 This cgroup is a workload containment and cleanup boundary, not a security
 sandbox against a hostile workload admitted as root or with powerful
@@ -65,6 +65,7 @@ sealer used by stage 1:
 
 ```sh
 scripts/build_oci_guest_workload_proof.sh
+scripts/build_oci_guest_kvm_filesystem_fixtures.py
 ```
 
 The default output is `tests/kvm/assets/workload-proof.x86_64`. Rebuilding to

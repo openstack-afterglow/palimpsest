@@ -32,7 +32,7 @@ Positive boots also use one private owner-bound QEMU Unix socket with
 `server=on,wait=off`, one named virtio-serial port, and virtio RNG. The host
 drives canonical lifecycle frames with partial nonblocking I/O and records
 path-free frame digests plus nonce/generation/request/sequence correlation.
-Receipt v17 covers a single connection and an exact six-connection retained-
+Receipt v18 covers a single connection and an exact six-connection retained-
 root session. The latter proves a lost initial READY, an accepted RECONNECT
 whose SNAPSHOT is lost, a connection-local partial STOP, complete same-ID retry,
 an already-committed same-ID duplicate without a second signal dispatch, and a
@@ -67,20 +67,20 @@ uv run pytest -m stage1_kvm tests/kvm -vv
 
 Missing prerequisites fail once qualified mode is enabled. TCG results are
 development smoke evidence only and are never accepted by this harness. This
-receipt v17 records the authenticated OverlayFS moved onto `/`, exact root and moved
+receipt v18 records the authenticated OverlayFS moved onto `/`, exact root and moved
 pseudo-filesystem identities, `switch_root=true`, and `pivot_root=false`; it
 does not claim that the initial initramfs root was unmounted or reclaimed.
 It also binds the exact base and UID 0 mode argv, three-entry environment, cwd,
 and their respective resolved numeric uid/gid,
-empty supplementary groups, root PID 1's fd-pinned cgroup-v2 broker, child
+empty supplementary groups, root PID 1's fd-pinned agent/session cgroup-v2 broker, child
 isolation and credential drop before the parent-verifiable attach/release gate,
 stop signal, process-group
-supervision, signal forwarding, all reaped statuses, and verified empty-cgroup
-removal. The workload also proves UID 65534 cannot write-open either the parent
-or its own `cgroup.procs`. Production define/start remains
+supervision, signal forwarding, all reaped statuses, and verified leaf-first,
+parent-second removal. The workload also proves UID 65534 cannot write-open
+the cgroup root, agent parent, or its own session `cgroup.procs`. Production define/start remains
 disabled.
 
-The v17 canonical receipt binds all 43 native-KVM guest boots: two positive boots
+The v18 canonical receipt binds all 43 native-KVM guest boots: two positive boots
 using the same retained mutable root, 13 topology controls, six filesystem
 controls, three assembly controls, three root-transition controls, and five
 workload-launch controls, ten lifecycle controls, and one UID 0 isolation
@@ -105,9 +105,9 @@ fail-closed.
 
 The highest lower and every transition fixture include the exact `0755`
 `/.__palimpsest_workload_proof_v1`, the root sentinel, and
-`/proof/workdir`, plus exact passwd/group inputs. Fixture policy v10 binds the recursive source entry types and
+`/proof/workdir`, plus exact passwd/group inputs. Fixture policy v11 binds the recursive source entry types and
 modes, proof source/build-script/ELF hashes, digest-pinned GCC image, and the
-pinned mksquashfs 4.7.5 zstd-level-3 build policy.
+pinned mksquashfs 4.7.5 zstd-level-3, xattr-free build policy.
 Evidence contains positive and retained-boot consoles plus every named
 negative console and the raw QEMU duplicate-name rejection output. All
 evidence files are
@@ -118,15 +118,17 @@ aggregator. It fails if the self-hosted job is disabled, skipped or
 unsuccessful; setting the repository variable to false cannot turn this proof
 into a green merge check.
 
-The stage-1 plan/protocol is v13, OCI-root domain plan/core are v12/v6, and the
-init contract is v15. Initramfs manifest/ABI are v17, supervisor is v8,
-lifecycle broker is v3, workload isolation is v2, and filesystem fixture
-policy/schema are v10. Pre-mount,
+The stage-1 plan/protocol is v14, OCI-root domain plan/core are v13/v7, and the
+init contract is v16. Initramfs manifest/ABI are v18, supervisor is v9,
+lifecycle broker is v3, workload isolation is v3, and filesystem fixture
+policy/schema are v11. The agent parent remains empty while the primary
+session uses guest-internal monotonic ID 1; only one active session is
+qualified and parallel runtime exec remains unproven. Pre-mount,
 filesystem, and assembly negative controls reject before
 root transition and must contain no root-transition rejection marker. A
 failure after an irreversible mount move emits the dedicated indeterminate
 root-state marker and waits fail-closed; no rollback is claimed. Native KVM
-must still produce a v17 receipt on the qualified runner; this source update and
+must still produce a v18 receipt on the qualified runner; this source update and
 local macOS tests are not native-KVM runtime evidence.
 
 This qualification PID 1 remains a root, narrow broker while the admitted

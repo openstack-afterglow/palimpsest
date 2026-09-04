@@ -431,11 +431,12 @@ static int invocation_failure(u64 argc, char **argv, char **environment) {
     if (cwd_size <= 0 || (usize)cwd_size > sizeof(cwd) || !same_text(cwd, "/proof/workdir")) return 5;
     if (!read_exact_file("/.__palimpsest_oci_root_workload_proof_v1", sentinel)) return 6;
     if (!read_exact_file("/proc/self/root/.__palimpsest_oci_root_workload_proof_v1", sentinel)) return 7;
-    if (!read_exact_file("/proc/self/cgroup", "0::/palimpsest.workload\n")) return 8;
+    if (!read_exact_file("/proc/self/cgroup", "0::/palimpsest.agent/exec-00000001\n")) return 8;
     if (!verify_cgroup_escape_denied("/sys/fs/cgroup/cgroup.procs")) return 9;
-    if (!verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.workload/cgroup.procs")) return 10;
-    if (!verify_capabilityless_boundary()) return 11;
-    if (!verify_private_devices()) return 12;
+    if (!verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.agent/cgroup.procs")) return 10;
+    if (!verify_cgroup_escape_denied("/sys/fs/cgroup/palimpsest.agent/exec-00000001/cgroup.procs")) return 11;
+    if (!verify_capabilityless_boundary()) return 12;
+    if (!verify_private_devices()) return 13;
     authority_error = authority_escape_failure();
     if (authority_error) return 20 + authority_error;
     if (!verify_pid1_root_credentials()) return 14;

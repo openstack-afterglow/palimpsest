@@ -38,7 +38,7 @@ from .oci_stage1 import (
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v15"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v16"
 OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-pid1-supervisor-workload-isolation"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096

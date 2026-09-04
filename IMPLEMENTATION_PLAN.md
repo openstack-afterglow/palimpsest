@@ -961,6 +961,40 @@ Scope boundary: production create/start/run/`-d`, runtime STOP dispatch, agent
 and exec-session ownership, supplementary group expansion, and Gate 2 remain
 disabled.
 
+### PR 4 slice 29D: qualified agent and exec-session cgroup ownership
+
+- PID 1 now owns an empty `/palimpsest.agent` cgroup parent and a primary
+  `/palimpsest.agent/exec-00000001` leaf. Both directories and each node's
+  `cgroup.procs`, `cgroup.kill`, and `cgroup.events` are no-follow pinned and
+  verified as cgroup v2, root-owned exact-mode objects. Existing names are
+  rejected with no adoption. PID 1 remains at `0::/`, the parent has no direct
+  processes, and the admitted workload is attached only to the leaf.
+- Exec-session IDs are guest-internal monotonic u32 values, rendered with at
+  least eight decimal digits without aliasing the nine- and ten-digit range.
+  This qualification permits exactly one active session (`id=1`) and records
+  `parallel_exec_sessions_proven=false`; it does not expose a runtime exec API.
+- The attach gate verifies exact `/proc/PID/cgroup` membership, leaf
+  `populated 1`, recursive parent `populated 1`, empty parent `cgroup.procs`,
+  and PID 1 outside the hierarchy before releasing the child. The proof
+  workload independently denies write-open of root, parent, and leaf
+  `cgroup.procs` through its private read-only cgroup view.
+- Cleanup signals only the pinned leaf `cgroup.kill`, reaps through `ECHILD`,
+  proves the leaf empty and removes it, then proves the parent recursively
+  empty with no direct processes and removes it. The terminal marker binds
+  both zero-population results and both removals; any uncertainty disables
+  terminal success.
+- Stage-1 plan/protocol v14, handoff v8, workload isolation v3,
+  init/consumer v16, initramfs manifest/ABI v18, supervisor v9, domain
+  plan/core v13/v7, fixture policy/schema v11, and KVM proof/receipt v18 bind
+  this checkpoint. Lifecycle protocol v2, lifecycle broker v3, and process
+  policy v3 are unchanged. A checked-in fixture rebuild tool binds the updated
+  proof ELF into all four affected SquashFS images reproducibly; `-no-xattrs`
+  excludes host metadata such as macOS provenance attributes from those bytes.
+
+Scope boundary: production create/start/run/`-d`, host runtime STOP, runtime
+exec/log readiness, parallel exec sessions, supplementary group expansion,
+and Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -979,11 +1013,9 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Generalize the qualified single-workload cgroup broker for agent and
-   exec-session ownership.
-2. Connect production final handoff, host stop/control and exit mapping,
+1. Connect production final handoff, host stop/control and exit mapping,
    foreground-default `run` and detached `run -d`, then lifecycle/exec/log
    readiness for OCI-root/KVM.
-3. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
+2. Activate the opt-in local build-to-run gate on a qualified self-hosted Linux
    KVM runner and require it before claiming production OCI-image-to-VM-root
    readiness.

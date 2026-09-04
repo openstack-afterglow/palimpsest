@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v15"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v16"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -160,17 +160,19 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     }
     assert value["stage1"]["workload_started"] is True
     assert value["stage1"]["supervisor"] == {
-        "cgroup": "fd-pinned-cgroup-v2-palimpsest.workload",
-        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
-        "cleanup_scope": "dedicated-workload-cgroup",
-        "contract": "palimpsest.guest-pid1-supervisor.v8",
+        "agent_cgroup": "/palimpsest.agent",
+        "cgroup": "fd-pinned-cgroup-v2-agent-exec-session-hierarchy",
+        "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+        "cleanup_scope": "exec-session-leaf-then-empty-agent-parent",
+        "contract": "palimpsest.guest-pid1-supervisor.v9",
         "credential_transition": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "credentials": "root-pid1-broker-image-root-passwd-group-resolution-empty-supplementary-groups",
         "environment": "authenticated-image-environment-with-fixed-container-default-path",
-        "execution": "shell-free-path-search-fork-isolation-ready-cgroup-attach-release-gate-execve-cloexec-error-pipe",
+        "exec_session_cgroup": "/palimpsest.agent/exec-00000001",
+        "execution": "shell-free-path-search-fork-isolation-ready-exec-session-attach-release-gate-execve-cloexec-error-pipe",
         "isolation": {
             "capabilities": "empty-bounding-ambient-permitted-effective-inheritable",
-            "contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
+            "contract": "palimpsest.workload-lifecycle-authority-isolation.v3",
             "devices": ["full", "null", "random", "tty", "urandom", "zero"],
             "lifecycle_fd": "child-closed-before-isolation-ready",
             "lifecycle_key": "pid1-generated-post-fork-post-isolation-never-inherited",
@@ -180,11 +182,16 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
         },
         "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
         "lifecycle_delivery": "authenticated-v2-bootstrap-boundary-ack-reconnect-snapshot-same-id-stop-retry",
+        "max_active_sessions_qualified": 1,
+        "membership": "pid1-root-agent-parent-empty-workload-in-primary-leaf",
+        "parallel_exec_sessions_proven": False,
         "privilege_after_fork": "root-pid1-narrow-broker-capabilityless-workload",
+        "session_id": 1,
+        "session_id_allocation": "guest-internal-monotonic-u32",
         "signal_transport": "blocked-signalfd-process-group-forwarding",
-        "production_cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+        "production_cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
         "terminal_state": "parent-marker-then-fail-closed-wait",
-        "wait": "wait4-to-echild-with-empty-cgroup-proof",
+        "wait": "wait4-to-echild-with-empty-leaf-and-parent-proof",
     }
     assert value["stage1"]["linkage"] == "static"
     assert "/Users/" not in rendered and "/tmp/" not in rendered
@@ -225,7 +232,10 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
     assert b"; pid1_uid=" in stage1
     assert b"; pid1_gid=" in stage1
     assert b"; pid1_groups=" in stage1
-    assert b"; cleanup=cgroup.kill; cgroup_populated=0" in stage1
+    assert (
+        b"; cleanup=exec-session-cgroup.kill; leaf_populated=0; leaf_removed=1; "
+        b"parent_populated=0; parent_removed=1" in stage1
+    )
     assert b"org.palimpsest.oci.lifecycle.0" in stage1
     assert b"palimpsest.oci-lifecycle-control.v2" in stage1
     assert b"lifecycle rejected; stage=" in stage1
@@ -241,8 +251,26 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v13")' in source
-    assert 'exact_string(&j, "first-party-pid1-supervisor.v7")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v14")' in source
+    assert 'exact_string(&j, "first-party-pid1-supervisor.v8")' in source
+    assert '"palimpsest.agent"' in source
+    assert '"0::/palimpsest.agent/exec-00000001\\n"' in source
+    assert "struct workload_agent" in source
+    assert "struct exec_session" in source
+    assert "static int create_exec_session(" in source
+    assert 'safe_dir("/sys/fs/cgroup", 0, 0, 0555' in source
+    assert "root_fs.type != CGROUP2_MAGIC" in source
+    assert "static int close_cgroup_node(" in source
+    assert "if (!close_cgroup_node(&session->leaf)) valid = 0;" in source
+    assert "if (!close_cgroup_node(&agent->parent)) valid = 0;" in source
+    assert "agent->next_session_id++" in source
+    assert "u32 divisor = 1000000000" in source
+    assert "divisor <= 10000000" in source
+    assert "agent->active_sessions != 1" in source
+    assert 'cgroup_populated(&agent->parent, "populated 1\\n")' in source
+    assert "cgroup_procs_empty(&agent->parent)" in source
+    assert "kill_exec_session(session)" in source
+    assert "remove_empty_exec_session_and_agent(agent, session)" in source
     assert 'SYS_open, (i64)"/etc"' in source
     assert 'read_account_database("passwd"' in source
     assert 'read_account_database("group"' in source
@@ -253,7 +281,7 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "operation = exec_workload(process);" in source
     assert "SYS_execve" in source
     assert b"/bin/sh\0" not in packaged
-    assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v2")' in source
+    assert 'exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v3")' in source
     assert '"org.palimpsest.oci.lifecycle.0"' in source
     assert '"palimpsest.oci-lifecycle-control.v2"' in source
     assert "BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT" in source

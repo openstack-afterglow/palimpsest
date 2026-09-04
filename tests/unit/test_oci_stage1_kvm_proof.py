@@ -520,15 +520,15 @@ def test_explicit_kernel_and_config_must_be_selected_as_a_pair(monkeypatch: pyte
 def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: Path) -> None:
     plan = build_proof_plan()
     assert plan.process.to_dict() == {
-            "argv": [".__palimpsest_workload_proof_v1", "palimpsest-argv-one", "", "line\nbreak"],
+        "argv": [".__palimpsest_workload_proof_v1", "palimpsest-argv-one", "", "line\nbreak"],
         "cwd": "/proof/workdir",
         "environment": [
             {"name": "PALIMPSEST_PROOF_ENV", "value": "value with spaces"},
-                {"name": "PALIMPSEST_PROOF_EMPTY", "value": ""},
-                {"name": "PATH", "value": "/proof/missing:/"},
+            {"name": "PALIMPSEST_PROOF_EMPTY", "value": ""},
+            {"name": "PATH", "value": "/proof/missing:/"},
         ],
         "stop_signal": 15,
-            "user": {"group": None, "user": "palimpsest"},
+        "user": {"group": None, "user": "palimpsest"},
     }
     transport = build_stage1_transport(plan)
     cmdline = build_kernel_cmdline(plan, transport)
@@ -589,9 +589,13 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:db5c1859b754b5b0c6f113238deba2407496c5d035e700a201f9d5ead6ba06f2"
-    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v10"
+    assert manifest_digest == "sha256:3ad31e3cf2159aee100c639cbfa57eed77d6278251b01dc3fab0351417dd4d02"
+    assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v11"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
+    assert manifest["provenance"]["lower_builder"]["argv_policy"] == (
+        "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports "
+        "-no-xattrs -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress"
+    )
     helper = manifest["provenance"]["workload_proof"]
     helper_source = (Path(__file__).parents[2] / helper["source"]).read_bytes()
     assert b"/proc/self/root/.__palimpsest_oci_root_workload_proof_v1" in helper_source
@@ -600,17 +604,18 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
     assert b'"Uid:\\t0\\t0\\t0\\t0\\n"' in helper_source
     assert b'"Gid:\\t0\\t0\\t0\\t0\\n"' in helper_source
     assert b'"Groups:\\t \\n"' in helper_source
-    assert b'"0::/palimpsest.workload\\n"' in helper_source
+    assert b'"0::/palimpsest.agent/exec-00000001\\n"' in helper_source
     assert b'"/sys/fs/cgroup/cgroup.procs"' in helper_source
-    assert b'"/sys/fs/cgroup/palimpsest.workload/cgroup.procs"' in helper_source
+    assert b'"/sys/fs/cgroup/palimpsest.agent/cgroup.procs"' in helper_source
+    assert b'"/sys/fs/cgroup/palimpsest.agent/exec-00000001/cgroup.procs"' in helper_source
     assert helper == {
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "50a030f5f54340894e5460e04c15af16f82115e2f9989b094fc86680c075c653",
-        "elf_size_bytes": 9868,
+        "elf_sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
+        "elf_size_bytes": 9932,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "a92cfb1b2d1a606cf8964166e69a40325cefdff83a87d431ed121f2340985cd4",
+        "source_sha256": "f8c07a962b98a52e50f8e08feaebf07d65dbc9cd84c51b4b1c2622c4d9f3affa",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
 
@@ -1408,7 +1413,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v17"
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v18"
     assert decoded["executed_boots"] == 43
     assert decoded["qemu_invocations"] == 44
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
@@ -1445,26 +1450,39 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
     }
     assert decoded["workload_started"] is True
     assert decoded["supervisor"] == {
-        "contract": "palimpsest.guest-pid1-supervisor.v8",
+        "contract": "palimpsest.guest-pid1-supervisor.v9",
         "account_resolution": "image-root-passwd-group",
         "argv0": "shell-free-path-search-after-chdir",
-        "cgroup": "/palimpsest.workload",
-        "cgroup_security": "private-readonly-view-plus-dedicated-cleanup-authority",
-        "cgroup_write_escape_denied": ["parent", "own"],
-        "cleanup": "stop-signal-grace-cgroup.kill-wait4-echild-populated-zero-rmdir",
+        "agent_cgroup": "/palimpsest.agent",
+        "cgroup": "/palimpsest.agent/exec-00000001",
+        "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+        "cgroup_write_escape_denied": ["root", "agent-parent", "exec-session-leaf"],
+        "cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
         "cooperative_status": 43,
         "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
         "forced_status": 137,
         "forwarded_signal": 15,
         "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
         "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
-        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v2",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v3",
+        "leaf_populated_after_cleanup": False,
+        "leaf_populated_before_release": True,
+        "leaf_removed": True,
         "main_status": 42,
+        "max_active_sessions_qualified": 1,
         "omitted_primary_group": True,
+        "parallel_exec_sessions_proven": False,
+        "parent_cgroup_procs_empty": True,
+        "parent_populated_after_cleanup": False,
+        "parent_recursively_populated": True,
+        "parent_removed": True,
         "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+        "pid1_outside_agent": True,
         "privileged_broker_after_fork": True,
         "process_group": True,
         "reaped_children": 3,
+        "session_id": 1,
+        "session_id_allocation": "guest-internal-monotonic-u32",
         "terminal_state": "parent-marker-then-fail-closed-wait",
         "terminal_wire_order": "cleanup-certainty-then-terminal-frame-then-console-marker",
         "supplementary_groups": "empty-restricted-subset",

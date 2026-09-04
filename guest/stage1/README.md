@@ -114,19 +114,19 @@ structure controls carry their mutated image digest through a distinct
 plan/transport/cmdline, while only the digest control intentionally keeps the
 original digest.
 
-The v17 receipt retains owner-only positive and per-control consoles plus a
+The v18 receipt retains owner-only positive and per-control consoles plus a
 canonical receipt binding each exact path-free topology. Missing
 KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
 converted into skips. TCG can be useful for development but is never accepted
 as qualified evidence. This boundary proves transport, block identity,
 filesystem structure/content policy, OverlayFS assembly, and an actual `/`
 through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
-the `palimpsest.guest-pid1-supervisor.v8` execution checkpoint, the
-`palimpsest.workload-lifecycle-authority-isolation.v2` boundary, and the
+the `palimpsest.guest-pid1-supervisor.v9` execution checkpoint, the
+`palimpsest.workload-lifecycle-authority-isolation.v3` boundary, and the
 `palimpsest.guest-lifecycle-broker.v3` exchange.
 Literal `pivot_root` remains false, the initial initramfs root is covered rather
 than claimed unmounted or reclaimed, mutable root content is not authenticated,
-and production VM launch remains disabled. Stage-1 plan/protocol v13 admits
+and production VM launch remains disabled. Stage-1 plan/protocol v14 admits
 the bounded image-root account and shell-free PATH process subset.
 
 Before release, PID 1 verifies that the workload child has closed the
@@ -144,7 +144,7 @@ workload availability-safe against all same-PID-namespace denial of service.
 The positive highest lower contains the separately reproducible proof workload
 and its OCI-root sentinel. That workload validates argv, environment, cwd,
 credentials, parent PID, process group, its own `/proc/self/root` and exact
-`/palimpsest.workload` cgroup membership, and PID 1's
+`/palimpsest.agent/exec-00000001` cgroup membership, and PID 1's
 four UID/GID values and empty supplementary-group list through bounded
 `/proc/1/status` parsing. It creates cooperative and stubborn descendants and
 then exits 42 naturally. PID 1 sends the configured stop signal after main
@@ -153,18 +153,21 @@ status 137. Five additional launch controls independently bind a missing
 executable, non-executable target, missing cwd, absent named user, and absent
 named group to exact child setup stage/errno rejection markers.
 
-After root transition, PID 1 mounts and verifies cgroup v2, pins the workload
-directory plus `cgroup.procs`, `cgroup.kill`, and `cgroup.events`, and forks a
-child held behind a release gate. The child first closes the lifecycle fd,
+After root transition, PID 1 mounts and verifies cgroup v2, creates and pins
+the empty `/palimpsest.agent` parent and monotonic session leaf
+`exec-00000001` plus both nodes' `cgroup.procs`, `cgroup.kill`, and
+`cgroup.events`, and forks a child held behind a release gate. Existing names
+are rejected rather than adopted. The child first closes the lifecycle fd,
 installs and verifies its isolation boundary, and reports readiness. Only then
 does root PID 1 move it into the dedicated cgroup, generate the per-boot
 lifecycle key, complete authenticated BOOTSTRAP/KEY_ACK, and send the release byte;
 the child may subsequently change cwd and exec. Cleanup uses
-only the pinned controls and requires stop-signal grace, `cgroup.kill`,
-`wait4` to `ECHILD`, `populated 0`, empty procs, and successful removal before
-the terminal marker. This is still a single-workload qualification boundary;
-future detached stop, exec, and agent lifecycle need a separate production
-broker and runtime dispatch path.
+only the pinned leaf `cgroup.kill`; it requires `wait4` to `ECHILD`, an empty
+leaf and successful leaf removal, then an empty direct-process-free parent and
+successful parent removal before the terminal marker. Session IDs are
+guest-internal monotonic u32 values, but this qualification permits at most one
+active session and does not prove parallel exec. Future detached stop, runtime
+exec, and agent lifecycle still need the production broker and dispatch path.
 The cgroup provides workload containment and deterministic cleanup; it is not
 a complete hostile-root availability sandbox. Every admitted resolved identity,
 including UID 0, executes without capabilities behind the same boundary.
@@ -175,7 +178,7 @@ base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
 retained-root reconnect/SNAPSHOT/same-ID retry and deduplication, plus the
 malformed, stale, replayed, and conflicting input matrix. TERMINAL is sent only
 after cgroup cleanup certainty and before the console terminal marker. Receipt
-v17 records `reconnect_proven=true` and `negative_input_proven=true`; production
+v18 records `reconnect_proven=true` and `negative_input_proven=true`; production
 runtime dispatch and host-daemon recovery remain future boundaries.
 
 Proof v7 uses two real zstd SquashFS images built from the committed
