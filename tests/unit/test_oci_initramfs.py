@@ -250,6 +250,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT" in source
     assert "X32_SYSCALL_BIT 0x40000000U" in source
     assert 'verify_mountinfo("/proc", "proc", 1' in source
+    assert "sc2(SYS_chmod, (i64)path, 0666)" in source
+    assert "child_failure_ready = early_error_bytes == sizeof(early_failure)" in source
     assert "SYS_getrandom 318" in source
     assert "O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY" in source
     assert "value.n != 36" in source

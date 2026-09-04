@@ -36,6 +36,7 @@ struct span { const char *p; usize n; };
 #define SYS_chdir 80
 #define SYS_mkdir 83
 #define SYS_readlink 89
+#define SYS_chmod 90
 #define SYS_setpgid 109
 #define SYS_getgroups 115
 #define SYS_setgroups 116
@@ -2903,6 +2904,7 @@ static int make_safe_workload_device(const char *path, u32 major, u32 minor) {
     struct stat_local st;
     if (sc3(SYS_mknod, (i64)path, S_IFCHR | 0666, make_device_number(major, minor)) != 0)
         return 0;
+    if (sc2(SYS_chmod, (i64)path, 0666) != 0) return 0;
     return sc4(SYS_newfstatat, AT_FDCWD, (i64)path, (i64)&st, AT_SYMLINK_NOFOLLOW) == 0 &&
            (st.mode & S_IFMT) == S_IFCHR && (st.mode & 07777) == 0666 &&
            dev_major(st.rdev) == major && dev_minor(st.rdev) == minor;
