@@ -2080,6 +2080,112 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
     assert read_run_ledger_snapshot(roots, "safe-defaults").state["status"] == "defined"
 
 
+def test_oci_root_disk_projection_binds_exact_dac_no_relabel_sources(tmp_path: Path) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "disk-source-seclabel")
+    snapshot = read_run_ledger_snapshot(roots, "disk-source-seclabel")
+    xml = oci_root_kvm_module.resolve_committed_oci_root_domain_plan(
+        roots,
+        snapshot,
+        store,
+        boot,
+        profile,
+        runner=tools,
+    ).xml
+
+    projection = oci_root_runtime_module._domain_projection(xml)
+    disks = projection["disks"]
+    assert disks
+    assert all(disk[4] == (("model", "dac"), ("relabel", "no")) for disk in disks)
+
+    root = ET.fromstring(xml)
+    ET.indent(root)
+    assert oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode")) == projection
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing",
+        "duplicate",
+        "wrong-model",
+        "relabel-yes",
+        "missing-attribute",
+        "extra-attribute",
+        "text",
+        "child",
+        "namespace",
+        "unknown-source-child",
+    ],
+)
+def test_oci_root_disk_projection_rejects_noncanonical_source_seclabel(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    name = f"disk-source-seclabel-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    snapshot = read_run_ledger_snapshot(roots, name)
+    xml = oci_root_kvm_module.resolve_committed_oci_root_domain_plan(
+        roots,
+        snapshot,
+        store,
+        boot,
+        profile,
+        runner=tools,
+    ).xml
+    root = ET.fromstring(xml)
+    source = root.find("./devices/disk/source")
+    label = source.find("./seclabel") if source is not None else None
+    assert source is not None and label is not None
+    if tamper == "missing":
+        source.remove(label)
+    elif tamper == "duplicate":
+        source.append(deepcopy(label))
+    elif tamper == "wrong-model":
+        label.set("model", "selinux")
+    elif tamper == "relabel-yes":
+        label.set("relabel", "yes")
+    elif tamper == "missing-attribute":
+        label.attrib.pop("relabel")
+    elif tamper == "extra-attribute":
+        label.set("label", "+0:+0")
+    elif tamper == "text":
+        label.text = "forbidden"
+    elif tamper == "child":
+        ET.SubElement(label, "attacker")
+    elif tamper == "namespace":
+        label.tag = "{https://attacker.invalid/domain/v1}seclabel"
+    else:
+        ET.SubElement(source, "attacker")
+
+    with pytest.raises(StateError, match="disk projection"):
+        oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
+
+
+def test_oci_root_definition_rejects_later_dac_no_relabel_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "disk-source-seclabel-drift"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(projection)
+    root = ET.fromstring(conn.domains[name].xml)
+    source = root.find("./devices/disk/source")
+    label = source.find("./seclabel") if source is not None else None
+    assert source is not None and label is not None
+    source.remove(label)
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+
+    with pytest.raises(StateError, match="disk projection"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+
+
 @pytest.mark.parametrize("removed_device", ["audio", "watchdog"])
 def test_oci_root_define_records_safe_generated_devices_and_rejects_later_removal(
     tmp_path: Path,

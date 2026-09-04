@@ -156,6 +156,20 @@ Ambiguous create, launch, or cleanup does the same. The root is never an
 automatic `TemporaryDirectory`. This is not permission to weaken production
 modes or validators, and public OCI-root dispatch remains disabled.
 
+Every OCI-root disk source also carries an exact per-source libvirt DAC
+`relabel=no` contract. The inactive-domain projection requires and digests that
+single canonical label for the writable root, stage-1 transport, and every
+read-only lower; disappearance, duplication, or any attribute/content change
+is definition drift. Cloud-image disks do not inherit this OCI-root policy.
+For native qualification only, extensionless content-addressed lowers are
+revalidated and copied beneath the owner-only test root as `<sha256>.raw`, and
+the test redirects all build/commit/resolve lower-path checks to those same
+staged copies. The `.raw` suffix matches the qualified server's
+`virt-aa-helper` whitelist and the libvirt raw-disk driver without changing,
+relabeling, or granting access to the shared CAS blobs. This is not a portable
+AppArmor contract: a production AppArmor export/access boundary remains
+unimplemented, so public OCI-root dispatch remains disabled.
+
 Qualification-root deletion similarly binds the expected device/inode through
 an open descriptor and a random quarantine rename, then walks and removes
 children relative to held directory descriptors while rechecking the root
@@ -172,5 +186,6 @@ rename/unlink atomic with the preceding identity check. A fully hostile process
 running as the same host UID could follow random names with inotify and race
 that final syscall; the qualification harness does not claim protection from
 that threat.
-Per-domain AppArmor rules are still an independent host qualification
-prerequisite; the test must never edit system policy.
+Per-domain AppArmor rules beyond this qualification-only extension adapter are
+still an independent host qualification prerequisite; the test must never edit
+system policy.

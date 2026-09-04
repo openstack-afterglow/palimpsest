@@ -164,13 +164,16 @@ def _disk(
     device: str = "disk",
     bus: str = "virtio",
     shareable: bool = False,
+    dac_no_relabel: bool = False,
 ) -> ET.Element:
     disk = ET.SubElement(devices, "disk", {"type": "file", "device": device})
     driver = {"name": "qemu", "type": disk_format}
     if target == "vda":
         driver["discard"] = "unmap"
     ET.SubElement(disk, "driver", driver)
-    ET.SubElement(disk, "source", {"file": str(path)})
+    source = ET.SubElement(disk, "source", {"file": str(path)})
+    if dac_no_relabel:
+        ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
     ET.SubElement(disk, "target", {"dev": target, "bus": bus})
     if readonly:
         ET.SubElement(disk, "readonly")
@@ -389,7 +392,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
     )
     devices = ET.SubElement(domain, "devices")
     ET.SubElement(devices, "emulator").text = str(profile.emulator)
-    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False)
+    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False, dac_no_relabel=True)
     ET.SubElement(root, "serial").text = spec.root_serial
     transport_disk = _disk(
         devices,
@@ -397,10 +400,19 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         transport.target_dev,
         "raw",
         readonly=True,
+        dac_no_relabel=True,
     )
     ET.SubElement(transport_disk, "serial").text = transport.serial
     for layer in spec.layers:
-        disk = _disk(devices, layer.host_path, layer.target_dev, "raw", readonly=True, shareable=True)
+        disk = _disk(
+            devices,
+            layer.host_path,
+            layer.target_dev,
+            "raw",
+            readonly=True,
+            shareable=True,
+            dac_no_relabel=True,
+        )
         ET.SubElement(disk, "serial").text = layer.serial
     ET.SubElement(devices, "controller", {"type": "virtio-serial", "index": "0"})
     lifecycle_channel = ET.SubElement(devices, "channel", {"type": "unix"})

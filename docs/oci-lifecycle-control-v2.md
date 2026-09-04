@@ -129,3 +129,13 @@ reactivation makes inactive-only cleanup fail before restoration and retains
 the ACL, backing tree, and held descriptors. Ambiguous activation or launch
 does the same. AppArmor policy remains an external per-domain qualification
 input, not something this test edits.
+
+OCI-root disk sources carry an exact DAC `relabel=no` child that is required by
+the stored inactive-domain projection, preventing libvirt from changing the
+ownership of shared read-only CAS lowers (and applying the same no-relabel rule
+to the root and stage-1 transport). The native test alone stages each verified
+extensionless CAS lower as an owner-only `<sha256>.raw` copy and redirects all
+build/commit/resolve checks to that stable path. The suffix matches the
+qualified server's `virt-aa-helper` whitelist and the raw-disk driver; it is
+not a portable AppArmor contract. Production AppArmor export/access brokering
+is still unimplemented and public OCI-root dispatch remains disabled.

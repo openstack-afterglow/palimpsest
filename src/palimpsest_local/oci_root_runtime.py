@@ -93,6 +93,7 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
         readonly_count = len(disk.findall("./readonly"))
         shareable_count = len(disk.findall("./shareable"))
         backing_stores = disk.findall("./backingStore")
+        source_labels = source.findall("./seclabel")
         if any(
             child.tag
             not in {"address", "alias", "backingStore", "driver", "readonly", "serial", "shareable", "source", "target"}
@@ -117,7 +118,13 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
             or not isinstance(serials[0].text, str)
             or readonly_count > 1
             or shareable_count > 1
-            or list(source)
+            or len(source_labels) != 1
+            or len(list(source)) != 1
+            or source_labels[0].attrib != {"model": "dac", "relabel": "no"}
+            or list(source_labels[0])
+            or (source.text or "").strip()
+            or (source_labels[0].text or "").strip()
+            or (source_labels[0].tail or "").strip()
             or list(target)
             or list(driver)
             or serials[0].attrib
@@ -133,6 +140,7 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
                 source.get("file"),
                 serials[0].text,
                 tuple(sorted(driver.attrib.items())),
+                tuple(sorted(source_labels[0].attrib.items())),
                 readonly_count == 1,
                 shareable_count == 1,
             )

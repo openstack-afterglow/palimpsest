@@ -133,6 +133,17 @@ def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     assert all(disk.find("readonly") is not None for disk in disks[1:])
     assert disks[1].find("shareable") is None
     assert all(disk.find("shareable") is not None for disk in disks[2:])
+    assert [source.attrib for source in xml.findall("./devices/disk/source")] == [
+        {"file": os.fspath(path)}
+        for path in (
+            _oci_root_spec().root_disk,
+            _oci_root_spec().stage1_transport.host_path,
+            *[layer.host_path for layer in _oci_root_spec().layers],
+        )
+    ]
+    assert [label.attrib for label in xml.findall("./devices/disk/source/seclabel")] == [
+        {"model": "dac", "relabel": "no"}
+    ] * len(disks)
     marker = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
     assert marker is not None and marker.get("contract") == "sha256:" + "4" * 64
     lifecycle = xml.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}lifecycle")
@@ -217,6 +228,7 @@ def test_cloud_domain_xml_does_not_gain_oci_lifecycle_topology():
     names = [target.get("name") for target in xml.findall("./devices/channel/target")]
     assert OCI_CONTROL_CHANNEL_NAME not in names
     assert xml.find("./devices/controller[@type='virtio-serial']") is None
+    assert xml.findall("./devices/disk/source/seclabel") == []
 
 
 def test_host_boot_artifact_policy_hashes_valid_explicit_files(tmp_path: Path):

@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import palimpsest_local.oci_root_kvm as oci_root_kvm_module
 from palimpsest_local import kvm, oci_root_runtime, platforms
 from palimpsest_local._oci_stage1_kvm_proof import (
     KERNEL_CONFIG_ENV,
@@ -328,6 +329,180 @@ def _copy_qualified_kernel(source: Path, test_root: Path) -> Path:
         if destination_fd is not None:
             os.close(destination_fd)
     return destination
+
+
+def _remove_failed_lower_copy(parent_descriptor: int, name: str, expected: os.stat_result) -> None:
+    try:
+        visible = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError:
+        raise ValueError("failed qualified lower copy identity changed") from None
+    if (
+        not stat.S_ISREG(visible.st_mode)
+        or visible.st_uid != os.geteuid()
+        or (visible.st_dev, visible.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise ValueError("failed qualified lower copy identity changed")
+    try:
+        os.unlink(name, dir_fd=parent_descriptor)
+    except OSError:
+        raise ValueError("failed qualified lower copy could not be removed") from None
+
+
+def _hash_pinned_file(descriptor: int, size: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise ValueError("qualified lower copy did not contain its declared size")
+        digest.update(chunk)
+        offset += len(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _stage_qualified_lower(source: Path, digest: str, size: int, stage_root: Path) -> Path:
+    """Create or revalidate one owner-only server-qualified raw-disk test copy."""
+
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest or "") is None or type(size) is not int or size < 0:
+        raise ValueError("qualified lower identity is invalid")
+    try:
+        stage_root_resolved, stage_identity = _validate_qualification_acl_target(
+            stage_root,
+            stage_root,
+            kind="directory",
+        )
+        source_visible = source.lstat()
+        source_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        raise ValueError("qualified lower source cannot be securely opened") from None
+    destination = stage_root_resolved / f"{digest.removeprefix('sha256:')}.raw"
+    destination_name = destination.name
+    stage_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    created: os.stat_result | None = None
+    try:
+        source_opened = os.fstat(source_descriptor)
+        stage_descriptor = os.open(
+            stage_root_resolved,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        stage_opened = os.fstat(stage_descriptor)
+        if (
+            not stat.S_ISDIR(stage_identity.st_mode)
+            or stage_identity.st_uid != os.geteuid()
+            or stat.S_IMODE(stage_identity.st_mode) != 0o700
+            or _stat_identity(stage_opened) != _stat_identity(stage_identity)
+            or not source.is_absolute()
+            or not stat.S_ISREG(source_visible.st_mode)
+            or not stat.S_ISREG(source_opened.st_mode)
+            or source_visible.st_uid != os.geteuid()
+            or source_opened.st_uid != os.geteuid()
+            or source_opened.st_nlink != 1
+            or stat.S_IMODE(source_opened.st_mode) not in {0o400, 0o444}
+            or source_opened.st_size != size
+            or (source_visible.st_dev, source_visible.st_ino) != (source_opened.st_dev, source_opened.st_ino)
+            or _hash_pinned_file(source_descriptor, size) != digest
+        ):
+            raise ValueError("qualified lower source identity is unsafe")
+        source_after_hash = os.fstat(source_descriptor)
+        source_current = source.lstat()
+        if _stat_identity(source_after_hash) != _stat_identity(source_opened) or _stat_identity(
+            source_current
+        ) != _stat_identity(source_opened):
+            raise ValueError("qualified lower source changed during verification")
+
+        try:
+            destination_descriptor = os.open(
+                destination_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=stage_descriptor,
+            )
+        except FileExistsError:
+            destination_descriptor = os.open(
+                destination_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=stage_descriptor,
+            )
+            existing = os.fstat(destination_descriptor)
+            existing_visible = os.stat(destination_name, dir_fd=stage_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_uid != os.geteuid()
+                or existing.st_nlink != 1
+                or stat.S_IMODE(existing.st_mode) != 0o400
+                or existing.st_size != size
+                or (existing_visible.st_dev, existing_visible.st_ino) != (existing.st_dev, existing.st_ino)
+                or _hash_pinned_file(destination_descriptor, size) != digest
+                or _stat_identity(os.fstat(destination_descriptor)) != _stat_identity(existing)
+                or _stat_identity(destination.lstat()) != _stat_identity(existing)
+            ):
+                raise ValueError("qualified lower staged copy is invalid") from None
+            return destination
+
+        try:
+            try:
+                created = os.fstat(destination_descriptor)
+            except OSError:
+                raise ValueError(
+                    "qualified lower copy identity is unavailable; partial destination was preserved"
+                ) from None
+            offset = 0
+            while offset < size:
+                chunk = os.pread(source_descriptor, min(1024 * 1024, size - offset), offset)
+                if not chunk:
+                    raise ValueError("qualified lower source changed while it was copied")
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    if written <= 0:
+                        raise ValueError("qualified lower copy did not make progress")
+                    view = view[written:]
+                offset += len(chunk)
+            os.fchmod(destination_descriptor, 0o400)
+            os.fsync(destination_descriptor)
+            source_after_copy = os.fstat(source_descriptor)
+            source_current = source.lstat()
+            destination_current = os.fstat(destination_descriptor)
+            destination_visible = os.stat(destination_name, dir_fd=stage_descriptor, follow_symlinks=False)
+            if _stat_identity(source_after_copy) != _stat_identity(source_opened) or _stat_identity(
+                source_current
+            ) != _stat_identity(source_opened):
+                raise ValueError("qualified lower source changed while it was copied")
+            if (
+                not stat.S_ISREG(destination_current.st_mode)
+                or destination_current.st_uid != os.geteuid()
+                or destination_current.st_nlink != 1
+                or stat.S_IMODE(destination_current.st_mode) != 0o400
+                or destination_current.st_size != size
+                or (destination_current.st_dev, destination_current.st_ino) != (created.st_dev, created.st_ino)
+                or (destination_visible.st_dev, destination_visible.st_ino) != (created.st_dev, created.st_ino)
+                or _hash_pinned_file(destination_descriptor, size) != digest
+                or _stat_identity(os.fstat(destination_descriptor)) != _stat_identity(destination_current)
+                or _stat_identity(destination.lstat()) != _stat_identity(destination_current)
+            ):
+                raise ValueError("qualified lower changed while it was staged")
+        except (OSError, ValueError) as exc:
+            if created is None:
+                if isinstance(exc, ValueError):
+                    raise
+                raise ValueError(
+                    "qualified lower copy identity is unavailable; partial destination was preserved"
+                ) from None
+            try:
+                _remove_failed_lower_copy(stage_descriptor, destination_name, created)
+            except ValueError as cleanup_error:
+                raise cleanup_error from exc
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError("qualified lower cannot be securely staged") from None
+        return destination
+    finally:
+        os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if stage_descriptor is not None:
+            os.close(stage_descriptor)
 
 
 def _create_qualification_root() -> tuple[Path, os.stat_result]:
@@ -677,7 +852,20 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
     for disk in xml.findall("./devices/disk"):
         source = disk.find("./source")
         target = disk.find("./target")
-        if source is None or target is None or set(source.attrib) != {"file"} or set(target.attrib) != {"dev", "bus"}:
+        labels = source.findall("./seclabel") if source is not None else []
+        if (
+            source is None
+            or target is None
+            or set(source.attrib) != {"file"}
+            or set(target.attrib) != {"dev", "bus"}
+            or len(labels) != 1
+            or len(list(source)) != 1
+            or labels[0].attrib != {"model": "dac", "relabel": "no"}
+            or list(labels[0])
+            or (source.text or "").strip()
+            or (labels[0].text or "").strip()
+            or (labels[0].tail or "").strip()
+        ):
             raise ValueError("qualification disk binding is invalid")
         permission = "rw-" if target.get("dev") == "vda" else "r--"
         root_disks += permission == "rw-"
@@ -1091,6 +1279,121 @@ def test_qualified_kernel_copy_preserves_partial_when_initial_fd_identity_is_una
     assert destination.read_bytes() == b""
 
 
+def _qualified_lower_fixture(tmp_path: Path) -> tuple[Path, str, int, Path]:
+    payload = b"qualified-squashfs-lower"
+    digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    source = (tmp_path / "source").resolve()
+    source.write_bytes(payload)
+    source.chmod(0o400)
+    stage_root = tmp_path / "l"
+    stage_root.mkdir(mode=0o700)
+    return source, digest, len(payload), stage_root
+
+
+def test_qualified_lower_stage_is_owner_only_and_revalidates_both_files(tmp_path: Path) -> None:
+    source, digest, size, stage_root = _qualified_lower_fixture(tmp_path)
+    source_before = source.stat()
+
+    staged = _stage_qualified_lower(source, digest, size, stage_root)
+    assert staged.name == f"{digest.removeprefix('sha256:')}.raw"
+    assert staged.read_bytes() == source.read_bytes()
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o400
+    assert _stage_qualified_lower(source, digest, size, stage_root) == staged
+    source_after = source.stat()
+    assert (source_after.st_dev, source_after.st_ino, source_after.st_mode) == (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_mode,
+    )
+
+    source.chmod(0o600)
+    source.write_bytes(b"x" * size)
+    source.chmod(0o400)
+    with pytest.raises(ValueError, match="source identity"):
+        _stage_qualified_lower(source, digest, size, stage_root)
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_qualified_lower_stage_removes_exact_partial_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source, digest, size, stage_root = _qualified_lower_fixture(tmp_path)
+    destination = stage_root / f"{digest.removeprefix('sha256:')}.raw"
+
+    def raise_oserror(*_args):
+        raise OSError(failure)
+
+    monkeypatch.setattr(os, failure, raise_oserror)
+    with pytest.raises(ValueError):
+        _stage_qualified_lower(source, digest, size, stage_root)
+    assert not destination.exists()
+
+
+def test_qualified_lower_stage_rejects_source_swap_and_removes_its_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, digest, size, stage_root = _qualified_lower_fixture(tmp_path)
+    destination = stage_root / f"{digest.removeprefix('sha256:')}.raw"
+    original_lstat = Path.lstat
+    source_stats = 0
+
+    def swap_source(path: Path):
+        nonlocal source_stats
+        if path == source:
+            source_stats += 1
+            if source_stats == 3:
+                source.unlink()
+                source.write_bytes(b"replacement")
+                source.chmod(0o400)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", swap_source)
+    with pytest.raises(ValueError, match="source changed"):
+        _stage_qualified_lower(source, digest, size, stage_root)
+    assert source_stats == 3
+    assert not destination.exists()
+
+
+def test_qualified_lower_stage_never_removes_replaced_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, digest, size, stage_root = _qualified_lower_fixture(tmp_path)
+    destination = stage_root / f"{digest.removeprefix('sha256:')}.raw"
+    original_lstat = Path.lstat
+    replaced = False
+
+    def swap_destination(path: Path):
+        nonlocal replaced
+        if path == destination and not replaced:
+            replaced = True
+            destination.unlink()
+            destination.write_bytes(b"replacement")
+            destination.chmod(0o400)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", swap_destination)
+    with pytest.raises(ValueError, match="identity changed"):
+        _stage_qualified_lower(source, digest, size, stage_root)
+    assert replaced is True
+    assert destination.read_bytes() == b"replacement"
+
+
+def test_qualified_lower_stage_rejects_changed_existing_copy(tmp_path: Path) -> None:
+    source, digest, size, stage_root = _qualified_lower_fixture(tmp_path)
+    staged = _stage_qualified_lower(source, digest, size, stage_root)
+    staged.chmod(0o600)
+    staged.write_bytes(b"x" * size)
+    staged.chmod(0o400)
+
+    with pytest.raises(ValueError, match="staged copy"):
+        _stage_qualified_lower(source, digest, size, stage_root)
+    assert staged.read_bytes() == b"x" * size
+
+
 class _FakeACLRunner:
     def __init__(
         self,
@@ -1327,15 +1630,18 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
         "initrd": tmp_path / "i",
         "root": tmp_path / "root.raw",
         "stage1": run / "stage1.raw",
-        "layer": tmp_path / "layer.squashfs",
+        "layer": tmp_path / "layer.raw",
     }
     for path in paths.values():
         path.write_bytes(b"x")
     xml = (
         f"<domain><os><kernel>{paths['kernel']}</kernel><initrd>{paths['initrd']}</initrd></os><devices>"
-        f'<disk><source file="{paths["root"]}"/><target dev="vda" bus="virtio"/></disk>'
-        f'<disk><source file="{paths["stage1"]}"/><target dev="vdb" bus="virtio"/></disk>'
-        f'<disk><source file="{paths["layer"]}"/><target dev="vdc" bus="virtio"/></disk>'
+        f'<disk><source file="{paths["root"]}"><seclabel model="dac" relabel="no"/></source>'
+        '<target dev="vda" bus="virtio"/></disk>'
+        f'<disk><source file="{paths["stage1"]}"><seclabel model="dac" relabel="no"/></source>'
+        '<target dev="vdb" bus="virtio"/></disk>'
+        f'<disk><source file="{paths["layer"]}"><seclabel model="dac" relabel="no"/></source>'
+        '<target dev="vdc" bus="virtio"/></disk>'
         f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
         '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
         "</devices></domain>"
@@ -1349,6 +1655,23 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
     assert actual[(paths["root"], "regular")] == "rw-"
     for name in ("kernel", "initrd", "stage1", "layer"):
         assert actual[(paths[name], "regular")] == "r--"
+
+
+def test_qualification_acl_specifications_require_exact_dac_no_relabel(tmp_path: Path) -> None:
+    artifact = tmp_path / "root.raw"
+    artifact.write_bytes(b"x")
+    run = tmp_path / "run"
+    run.mkdir()
+    xml = (
+        f"<domain><os><kernel>{artifact}</kernel><initrd>{artifact}</initrd></os><devices>"
+        f'<disk><source file="{artifact}"/><target dev="vda" bus="virtio"/></disk>'
+        f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
+        '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
+        "</devices></domain>"
+    )
+
+    with pytest.raises(ValueError, match="disk binding"):
+        _qualification_acl_specifications(tmp_path, xml)
 
 
 class _FakeActivationBroker:
@@ -2121,6 +2444,15 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         roots = init_resolved_roots(StatePaths(qualification_root / "c", qualification_root / "s"))
         store = OCIStore(roots, repair_min_age_seconds=0)
         materialization = _proof_materialization(store)
+        lower_stage_root = qualification_root / "l"
+        lower_stage_root.mkdir(mode=0o700)
+        original_verified_lower_path = oci_root_kvm_module._verified_lower_path
+
+        def stage_verified_lower(roots_value: StatePaths, digest: str, size: int) -> Path:
+            source = original_verified_lower_path(roots_value, digest, size)
+            return _stage_qualified_lower(source, digest, size, lower_stage_root)
+
+        monkeypatch.setattr(oci_root_kvm_module, "_verified_lower_path", stage_verified_lower)
         name = f"p-{uuid.uuid4().hex[:6]}"
         lifecycle_path = roots.runs / name / "lifecycle.sock"
         assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
