@@ -4363,7 +4363,10 @@ def _read_console_until(
             if lifecycle_scenario not in {"negative", "discovery-negative"} and _logical_prefix_count(
                 current, LIFECYCLE_REJECTION_PREFIX
             ):
-                raise KVMProofFailure("QEMU emitted a lifecycle rejection marker")
+                raise KVMProofFailure(
+                    "QEMU emitted a lifecycle rejection marker: "
+                    f"{_redact_lifecycle_boundary_lines(current)[-512:]!r}"
+                )
             if (
                 lifecycle_scenario in {"negative", "discovery-negative"}
                 and _logical_prefix_count(current, LIFECYCLE_REJECTION_PREFIX) > 1
