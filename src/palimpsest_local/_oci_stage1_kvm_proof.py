@@ -4181,13 +4181,13 @@ def _read_console_until(
                                                     ),
                                                     negative_input=True,
                                                 )
-                                    elif message.kind == "TERMINAL":
-                                        if lifecycle_success is not True or message.payload != {
-                                            "terminal": {"exit_code": 42, "signal": None}
-                                        }:
-                                            raise KVMProofFailure(
-                                                f"KVM lifecycle terminal status is invalid: {message.payload!r}"
-                                            )
+                                elif message.kind == "TERMINAL":
+                                    if lifecycle_success is not True or message.payload != {
+                                        "terminal": {"exit_code": 42, "signal": None}
+                                    }:
+                                        raise KVMProofFailure(
+                                            f"KVM lifecycle terminal status is invalid: {message.payload!r}"
+                                        )
                                 if lifecycle_scenario == "composite" and message.kind == "SNAPSHOT":
                                     state = message.payload["state"]
                                     if connection_ordinal == 2 and state == "ready":
