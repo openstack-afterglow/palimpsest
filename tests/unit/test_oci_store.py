@@ -2070,6 +2070,102 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
     assert read_run_ledger_snapshot(roots, "safe-defaults").state["status"] == "defined"
 
 
+@pytest.mark.parametrize("removed_device", ["audio", "watchdog"])
+def test_oci_root_define_records_safe_generated_devices_and_rejects_later_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    removed_device: str,
+) -> None:
+    name = f"generated-devices-remove-{removed_device}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def add_generated_devices(xml: str) -> str:
+        root = ET.fromstring(xml)
+        devices = root.find("./devices")
+        assert devices is not None
+        ET.SubElement(devices, "audio", {"id": "1", "type": "none"})
+        ET.SubElement(devices, "watchdog", {"action": "reset", "model": "itco"})
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=add_generated_devices)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert dict(projection["device_counts"])["audio"] == 1
+    assert dict(projection["device_counts"])["watchdog"] == 1
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(projection)
+
+    root = ET.fromstring(conn.domains[name].xml)
+    devices = root.find("./devices")
+    removed = root.find(f"./devices/{removed_device}")
+    assert devices is not None and removed is not None
+    devices.remove(removed)
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+    with pytest.raises(StateError, match="changed after definition"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "duplicate",
+        "non-none",
+        "extra-attribute",
+        "missing-id",
+        "missing-type",
+        "text",
+        "child",
+        "source",
+    ],
+)
+@pytest.mark.parametrize("device", ["audio", "watchdog"])
+def test_oci_root_define_rejects_noncanonical_safe_generated_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    device: str,
+) -> None:
+    name = f"generated-{device}-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def add_bad_generated_device(xml: str) -> str:
+        root = ET.fromstring(xml)
+        devices = root.find("./devices")
+        assert devices is not None
+        canonical = {"id": "1", "type": "none"} if device == "audio" else {"action": "reset", "model": "itco"}
+        generated = ET.SubElement(devices, device, canonical)
+        if tamper == "duplicate":
+            ET.SubElement(devices, device, canonical)
+        elif tamper == "non-none":
+            generated.set("type" if device == "audio" else "action", "spice" if device == "audio" else "shutdown")
+        elif tamper == "extra-attribute":
+            generated.set("extra", "forbidden")
+        elif tamper == "missing-id":
+            generated.attrib.pop("id" if device == "audio" else "action")
+        elif tamper == "missing-type":
+            generated.attrib.pop("type" if device == "audio" else "model")
+        elif tamper == "text":
+            generated.text = "forbidden"
+        elif tamper == "child":
+            ET.SubElement(generated, "attacker")
+        else:
+            ET.SubElement(generated, "source", {"path": "/tmp/attacker"})
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=add_bad_generated_device)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises(StateError):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
+
+
 def test_oci_root_define_accepts_libvirt_elided_redundant_lifecycle_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

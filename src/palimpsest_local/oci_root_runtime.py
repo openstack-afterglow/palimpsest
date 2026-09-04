@@ -143,14 +143,15 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
 def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...]:
     """Reject host-resource devices; admit only bounded inert normalization.
 
-    Libvirt may synthesize bus controllers, a PTY serial peer, legacy input
-    devices, a panic notifier, or a virtio balloon in inactive XML.  Those
-    classes have no host path/source selector and are bounded here.  Every
-    authored OCI-root device remains part of the exact projection below.
+    Libvirt may synthesize a disabled audio backend, a reset-only watchdog,
+    bus controllers, a PTY serial peer, legacy input devices, a panic notifier,
+    or a virtio balloon in inactive XML.  Those classes have no host path/source
+    selector and are bounded here.  Every authored OCI-root device remains part
+    of the exact projection below.
     """
 
     authored = {"channel", "console", "disk", "emulator", "interface"}
-    safe_generated = {"input", "memballoon", "panic", "serial"}
+    safe_generated = {"audio", "input", "memballoon", "panic", "serial", "watchdog"}
     counts: dict[str, int] = {}
     generated_counts: dict[str, int] = {}
     safe_controller_ids: set[tuple[str, str]] = set()
@@ -181,9 +182,17 @@ def _validate_devices_surface(devices: ET.Element) -> tuple[tuple[str, int], ...
         if tag not in safe_generated:
             raise StateError(f"defined OCI-root device class is forbidden: {tag}")
         generated_counts[tag] = generated_counts.get(tag, 0) + 1
-        limits = {"input": 2, "memballoon": 1, "panic": 1, "serial": 1}
+        limits = {"audio": 1, "input": 2, "memballoon": 1, "panic": 1, "serial": 1, "watchdog": 1}
         if generated_counts[tag] > limits[tag] or child.find(".//source") is not None:
             raise StateError("defined OCI-root generated device set is invalid")
+        if tag == "audio":
+            if child.attrib != {"id": "1", "type": "none"} or child.text is not None or list(child):
+                raise StateError("defined OCI-root generated audio device is invalid")
+            counts[tag] = generated_counts[tag]
+        if tag == "watchdog":
+            if child.attrib != {"action": "reset", "model": "itco"} or child.text is not None or list(child):
+                raise StateError("defined OCI-root generated watchdog device is invalid")
+            counts[tag] = generated_counts[tag]
         if tag == "input" and (
             child.get("type") not in {"keyboard", "mouse", "tablet"}
             or child.get("bus") not in {"ps2", "usb"}
@@ -508,6 +517,12 @@ def _validated_post_define_projection(
         raise StateError("defined OCI-root machine projection is invalid")
     _validate_machine_alias(conn, resolved.profile, authored_machine, actual_machine)
     authored["machine"] = actual_machine
+    authored_device_counts = dict(authored.get("device_counts", ()))
+    actual_device_counts = dict(actual.get("device_counts", ()))
+    for generated_device in ("audio", "watchdog"):
+        if generated_device not in authored_device_counts and actual_device_counts.get(generated_device) == 1:
+            authored_device_counts[generated_device] = 1
+    authored["device_counts"] = tuple(sorted(authored_device_counts.items()))
     if actual != authored:
         raise StateError("defined OCI-root domain does not match the committed contract")
     return _projection_digest(actual)

@@ -1012,9 +1012,9 @@ and Gate 2 remain disabled.
 - Definition ledger v2 binds the capability-validated canonical libvirt machine
   alias and the complete post-define semantic projection digest. Bounded
   libvirt defaults (`currentMemory`, hard-disk boot selection, and redundant
-  same-namespace lifecycle metadata elision) normalize only when their exact
-  committed meaning is unchanged; all later operations require the recorded
-  projection digest.
+  same-namespace lifecycle metadata elision, disabled audio, and the q35 iTCO
+  reset watchdog) normalize only when their exact committed meaning is
+  unchanged; all later operations require the recorded projection digest.
 - Guest PID 1 publishes TERMINAL only after workload and cgroup cleanup, stable
   no-follow identity checks for OverlayFS `/` and `/proc/self/root`, successful
   `syncfs`, and successful descriptor closes. KVM proof/receipt v19 binds the
