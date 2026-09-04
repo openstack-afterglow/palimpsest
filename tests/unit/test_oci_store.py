@@ -2359,6 +2359,105 @@ def test_oci_root_domain_projection_rejects_noncanonical_generated_boot_default(
         oci_root_runtime_module._domain_projection(ET.tostring(root, encoding="unicode"))
 
 
+@pytest.mark.parametrize("drift", ["remove-defaults", "change-default"])
+def test_oci_root_define_records_defaulted_cpu_and_rejects_later_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    name = f"defaulted-cpu-{drift}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def default_cpu(xml: str) -> str:
+        root = ET.fromstring(xml)
+        cpu = root.find("./cpu")
+        assert cpu is not None
+        cpu.set("check", "none")
+        cpu.set("migratable", "on")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=default_cpu)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
+    projection = oci_root_runtime_module._domain_projection(conn.domains[name].xml)
+    assert projection["cpu"] == (
+        (("check", "none"), ("migratable", "on"), ("mode", "host-passthrough")),
+        (),
+    )
+    assert definition["projection_digest"] == oci_root_runtime_module._projection_digest(projection)
+
+    root = ET.fromstring(conn.domains[name].xml)
+    cpu = root.find("./cpu")
+    assert cpu is not None
+    if drift == "remove-defaults":
+        cpu.attrib.pop("check")
+        cpu.attrib.pop("migratable")
+    else:
+        cpu.set("migratable", "off")
+    conn.domains[name].xml = ET.tostring(root, encoding="unicode")
+    with pytest.raises(StateError, match="changed after definition|CPU contract"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    assert conn.domains[name].create_calls == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "check-full",
+        "migratable-off",
+        "extra-attribute",
+        "missing-check",
+        "missing-migratable",
+        "missing-mode",
+        "text",
+        "child",
+    ],
+)
+def test_oci_root_define_rejects_noncanonical_defaulted_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    name = f"defaulted-cpu-{tamper}"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+
+    def bad_cpu(xml: str) -> str:
+        root = ET.fromstring(xml)
+        cpu = root.find("./cpu")
+        assert cpu is not None
+        cpu.set("check", "none")
+        cpu.set("migratable", "on")
+        if tamper == "check-full":
+            cpu.set("check", "full")
+        elif tamper == "migratable-off":
+            cpu.set("migratable", "off")
+        elif tamper == "extra-attribute":
+            cpu.set("match", "exact")
+        elif tamper == "missing-check":
+            cpu.attrib.pop("check")
+        elif tamper == "missing-migratable":
+            cpu.attrib.pop("migratable")
+        elif tamper == "missing-mode":
+            cpu.attrib.pop("mode")
+        elif tamper == "text":
+            cpu.text = "forbidden"
+        else:
+            ET.SubElement(cpu, "attacker")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=bad_cpu)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+
+    with pytest.raises(StateError, match="CPU contract"):
+        define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    assert name not in conn.domains
+    assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"
+
+
 def test_oci_root_define_records_capability_validated_canonical_machine_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

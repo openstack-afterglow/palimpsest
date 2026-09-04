@@ -293,6 +293,15 @@ def _memory_projection(root: ET.Element) -> tuple[str, int]:
     return ("KiB", int(memory.text or "0") * multiplier)
 
 
+def _cpu_projection(root: ET.Element) -> tuple[tuple[tuple[str, str], ...], tuple[Any, ...]]:
+    cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
+    authored = {"mode": "host-passthrough"}
+    libvirt_defaulted = {"check": "none", "migratable": "on", "mode": "host-passthrough"}
+    if cpu.attrib not in (authored, libvirt_defaulted) or cpu.text is not None or list(cpu):
+        raise StateError("defined OCI-root CPU contract is invalid")
+    return (tuple(sorted(cpu.attrib.items())), ())
+
+
 def _domain_projection(xml: str) -> dict[str, Any]:
     try:
         root = ET.fromstring(xml)
@@ -406,7 +415,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     ):
         raise StateError("defined OCI-root direct-boot contract is invalid")
     memory = _memory_projection(root)
-    cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
+    cpu = _cpu_projection(root)
     features = _single(root, "./features", "defined OCI-root feature contract is invalid")
     consoles = root.findall("./devices/console")
     if len(consoles) != 1:
@@ -446,10 +455,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "current_memory": memory,
         "memory": memory,
         "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
-        "cpu": (
-            tuple(sorted(cpu.attrib.items())),
-            tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(cpu)),
-        ),
+        "cpu": cpu,
         "console": (
             tuple(sorted(console.attrib.items())),
             None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
@@ -525,6 +531,10 @@ def _validated_post_define_projection(
         raise StateError("defined OCI-root machine projection is invalid")
     _validate_machine_alias(conn, resolved.profile, authored_machine, actual_machine)
     authored["machine"] = actual_machine
+    actual_cpu = actual.get("cpu")
+    libvirt_cpu = (("check", "none"), ("migratable", "on"), ("mode", "host-passthrough"))
+    if actual_cpu == (libvirt_cpu, ()):
+        authored["cpu"] = actual_cpu
     authored_device_counts = dict(authored.get("device_counts", ()))
     actual_device_counts = dict(actual.get("device_counts", ()))
     for generated_device in ("audio", "watchdog"):
