@@ -69,6 +69,15 @@ def test_partial_retirement_resumes_from_saved_original_snapshot(case, monkeypat
     case.store._require_lease_set_retired(case.source_leases)
 
 
+def test_completed_receipt_roundtrips_frozen_ledger_member_sequences(case):
+    receipt = _run(case)
+    frozen = read_run_ledger_snapshot(case.roots, case.binding.record.name).state["oci_monitor_lower_handoff"]
+    assert isinstance(frozen["source_leases"]["members"], tuple)
+    assert isinstance(frozen["successor_leases"]["members"], tuple)
+    assert isinstance(receipt.to_dict()["source_leases"]["members"], list)
+    assert handoff.MonitorLowerHandoffReceipt.from_dict(frozen) == receipt
+
+
 def test_partial_source_without_own_intent_is_refused(case):
     before = case.state.read_bytes()
     (case.roots.oci_derived_store / "leases" / case.source_leases.members[0].lease_id).unlink()

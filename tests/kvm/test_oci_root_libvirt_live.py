@@ -3206,7 +3206,7 @@ def _qualify_retained_root_reuse(
     monkeypatch, root, roots, store, materialization, boot, profile, conn, qemu_uid, first, first_binding, first_monitor
 ):
     from palimpsest_local import oci_root_prepare as preparation
-    from palimpsest_local.oci_monitor_handoff import handoff_retained_root_lower_leases
+    from palimpsest_local.oci_monitor_handoff import MonitorLowerHandoffReceipt, handoff_retained_root_lower_leases
     from palimpsest_local.oci_monitor_retention import retain_inactive_monitor_root
     from palimpsest_local.oci_root_volume import release_oci_root_volume
     from palimpsest_local.oci_store import OCIStoreError
@@ -3309,7 +3309,7 @@ def _qualify_retained_root_reuse(
     handoff = handoff_retained_root_lower_leases(roots, first_binding, successor_snapshot.record, store, conn=conn)
     assert handoff.phase == "completed"
     after_handoff = read_run_ledger_snapshot(roots, first_binding.record.name).state
-    assert after_handoff["oci_monitor_lower_handoff"] == handoff.to_dict()
+    assert MonitorLowerHandoffReceipt.from_dict(after_handoff["oci_monitor_lower_handoff"]) == handoff
     handoff_ignored = {"oci_monitor_lower_handoff", "lifecycle_revision"}
     assert {key: value for key, value in after_handoff.items() if key not in handoff_ignored} == {
         key: value for key, value in after_retention.items() if key not in handoff_ignored
