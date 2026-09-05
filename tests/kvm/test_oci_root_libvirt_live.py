@@ -74,6 +74,7 @@ from palimpsest_local.oci_root_runtime import (
     connect_oci_root_libvirt,
     define_committed_oci_root_domain,
     launch_defined_oci_root_domain,
+    prepare_oci_root_monitor_binding,
 )
 from palimpsest_local.oci_root_volume import load_oci_root_volume
 from palimpsest_local.oci_store import (
@@ -2800,6 +2801,35 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
 
         monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
         activation_conn = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
+        expected_boot_attempt_id = str(uuid.uuid4())
+        monitor_binding = prepare_oci_root_monitor_binding(
+            roots,
+            name,
+            store,
+            boot,
+            profile,
+            conn=activation_conn,
+            boot_attempt_id=expected_boot_attempt_id,
+        )
+        assert monitor_binding.domain_uuid == defined.domain_uuid
+        assert monitor_binding.expected_definition_projection_digest == expected_inactive_projection_digest
+        assert monitor_binding.plan_digest == plan.digest
+        assert monitor_binding.stage1_artifact_digest == plan.stage1_transport["artifact_digest"]
+        wrong_projection = (
+            "sha256:" + ("0" if expected_inactive_projection_digest != "sha256:" + "0" * 64 else "1") * 64
+        )
+        with pytest.raises(StateError):
+            launch_defined_oci_root_domain(
+                roots,
+                name,
+                store,
+                boot,
+                profile,
+                conn=activation_conn,
+                monitor_binding=replace(monitor_binding, expected_definition_projection_digest=wrong_projection),
+            )
+        assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
+        assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
         try:
             completed = launch_defined_oci_root_domain(
                 roots,
@@ -2810,6 +2840,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
                 conn=activation_conn,
                 timeout_seconds=45,
                 terminal_timeout_seconds=45,
+                monitor_binding=monitor_binding,
             )
         except BaseException as exc:
             _annotate_qualification_console_failure(exc, console_path)
@@ -2826,6 +2857,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         lifecycle = completed.lifecycle.to_dict()
         assert lifecycle["schema"] == "palimpsest.oci-root-handoff.v1"
         assert lifecycle["phase"] == "terminal"
+        assert lifecycle["boot_attempt_id"] == expected_boot_attempt_id
         assert [entry["kind"] for entry in lifecycle["transcript"]] == [
             "HELLO",
             "BOOTSTRAP",
@@ -2844,6 +2876,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         snapshot = read_run_ledger_snapshot(roots, name)
         assert snapshot.state["status"] == "exited"
         assert snapshot.state["oci_root_handoff"]["phase"] == "terminal"
+        assert snapshot.state["oci_root_handoff"]["boot_attempt_id"] == expected_boot_attempt_id
         try:
             _, active, current_domain_id = _inspect_exact_owned_domain(
                 conn,

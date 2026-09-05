@@ -1162,6 +1162,32 @@ paths and does not define/create/start/stop a VM. Public create/start/run/`-d`,
 guest readiness, lifecycle STOP, active-binding promotion, and Gate 2 remain
 disabled.
 
+### PR 4 slice 30H: verified definition-to-launch binding
+
+The private runtime now prepares a monitor binding from an already-defined,
+verified inactive domain. Under the run lock it re-resolves the committed plan,
+checks the durable definition and live inactive XML, and captures the actual
+normalized projection digest, domain UUID, run identity, stage-1 digest, URI,
+owner UID, and a caller-selected canonical boot-attempt UUID.
+
+The returned binding is a snapshot, not proof of monitor journal ownership.
+Bound launch compares it with freshly resolved state before stream allocation
+and again before activation. A mismatch cannot create a domain or publish a
+starting intent. The lifecycle session uses the selected boot attempt through
+READY and TERMINAL. Existing unbound synchronous qualification remains
+available, and the real libvirt qualification exercises the bound path.
+
+Here `expected_definition_projection_digest` means the actual normalized
+digest captured after definition. It is not a prediction from authored XML:
+libvirt can resolve machine aliases and insert strictly validated defaults.
+A future child-owned definition protocol must distinguish pre-definition
+intent from this post-definition observation.
+
+Scope: this is the identity bridge needed before child execution integration.
+It does not yet transfer state/store/boot authority to the child, promote the
+owner journal to an active binding, or multiplex lifecycle and IPC events.
+Public run/`-d`, authenticated runtime STOP, and Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:

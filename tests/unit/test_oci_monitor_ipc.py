@@ -516,6 +516,10 @@ def test_public_runtime_modules_do_not_import_monitor_ipc() -> None:
             if isinstance(node, ast.Import) and any(alias.name.endswith("oci_monitor_ipc") for alias in node.names):
                 importers.append(name)
             elif isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("oci_monitor_ipc"):
+                if name == "oci_root_runtime.py" and [alias.name for alias in node.names] == [
+                    "MonitorPreActivationBinding"
+                ]:
+                    continue
                 importers.append(name)
     assert importers == []
 

@@ -77,7 +77,11 @@ from palimpsest_local.oci_root_prepare import (
     reconcile_oci_root_preparation,
     release_prepared_oci_root_run,
 )
-from palimpsest_local.oci_root_runtime import define_committed_oci_root_domain, launch_defined_oci_root_domain
+from palimpsest_local.oci_root_runtime import (
+    define_committed_oci_root_domain,
+    launch_defined_oci_root_domain,
+    prepare_oci_root_monitor_binding,
+)
 from palimpsest_local.oci_root_volume import (
     OCIRootVolumeRecord,
     claim_oci_root_volume,
@@ -3401,15 +3405,25 @@ def _handoff_receipt(
     )
 
 
+@pytest.mark.parametrize("use_monitor_binding", [False, True])
 def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    use_monitor_binding: bool,
 ) -> None:
     name = "launch-complete"
     roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
     conn = _DefinitionConnection()
     conn = _evented_connection(conn, monkeypatch)
     defined = define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    chosen_attempt = str(uuid.uuid4())
+    monitor_binding = (
+        prepare_oci_root_monitor_binding(
+            roots, name, store, boot, profile, conn=conn, boot_attempt_id=chosen_attempt, runner=tools
+        )
+        if use_monitor_binding
+        else None
+    )
     event_order: list[str] = []
     domain_for_order = conn.domains[name]
     original_open_channel = domain_for_order.openChannel
@@ -3445,6 +3459,8 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         assert binding.stage1_artifact_digest == plan.stage1_transport["artifact_digest"]
         assert timeout_seconds == 9
         assert terminal_timeout_seconds is None
+        if use_monitor_binding:
+            assert session.boot_attempt_id == chosen_attempt
         starting = read_run_ledger_snapshot(roots, name).state
         observed_statuses.append(starting["status"])
         assert set(starting["oci_root_handoff"]) == {
@@ -3457,6 +3473,7 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
             "schema",
         }
         assert starting["oci_root_handoff"]["domain_id"] == 7
+        assert starting["oci_root_handoff"]["boot_attempt_id"] == session.boot_attempt_id
         on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
         observed_statuses.append(read_run_ledger_snapshot(roots, name).state["status"])
         assert callable(wait) and callable(wait_writable)
@@ -3475,6 +3492,7 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         conn=conn,
         runner=tools,
         timeout_seconds=9,
+        monitor_binding=monitor_binding,
     )
 
     domain = conn.domains[name]
@@ -3507,6 +3525,158 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     }
     assert "boot_key" not in repr(handoff_ledger)
     assert "tag" not in repr(handoff_ledger)
+
+
+def test_oci_root_monitor_binding_uses_actual_post_definition_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "monitor-normalized"
+    roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
+    authored_digest = ""
+
+    def normalize(xml: str) -> str:
+        nonlocal authored_digest
+        authored_digest = oci_root_runtime_module._projection_digest(oci_root_runtime_module._domain_projection(xml))
+        root = ET.fromstring(xml)
+        root.find("./os/type").set("machine", "pc-q35-noble")
+        return ET.tostring(root, encoding="unicode")
+
+    conn = _DefinitionConnection(transform=normalize)
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    defined = define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    state_path = roots.runs / name / "state.json"
+    before = state_path.read_bytes()
+    chosen_attempt = str(uuid.uuid4())
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=chosen_attempt, runner=tools
+    )
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert binding.record == snapshot.record
+    assert binding.owner_uid == os.geteuid()
+    assert binding.plan_digest == plan.digest
+    assert binding.stage1_artifact_digest == plan.stage1_transport["artifact_digest"]
+    assert binding.domain_uuid == defined.domain_uuid
+    assert binding.libvirt_uri == profile.uri
+    assert binding.boot_attempt_id == chosen_attempt
+    assert binding.expected_definition_projection_digest == snapshot.state["oci_root_definition"]["projection_digest"]
+    assert binding.expected_definition_projection_digest != authored_digest
+    assert state_path.read_bytes() == before
+    assert conn.stream_flags == []
+    assert conn.domains[name].create_calls == conn.domains[name].destroy_calls == conn.domains[name].undefine_calls == 0
+
+
+@pytest.mark.parametrize("attempt", [None, 1, "", "NOT-A-UUID", "ACA88126-D991-4DE8-B66B-90DC07904DFF"])
+def test_oci_root_monitor_binding_rejects_invalid_attempt_before_reading_state(tmp_path: Path, attempt: object) -> None:
+    with pytest.raises(StateError, match="boot attempt ID is not canonical"):
+        prepare_oci_root_monitor_binding(
+            StatePaths(tmp_path / "absent-config", tmp_path / "absent-state"),
+            "missing-run",
+            None,
+            None,
+            None,
+            conn=None,
+            boot_attempt_id=attempt,
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "record",
+        "owner_uid",
+        "owner_uid_type",
+        "plan_digest",
+        "expected_definition_projection_digest",
+        "stage1_artifact_digest",
+        "domain_uuid",
+        "libvirt_uri",
+        "boot_attempt_id",
+        "type",
+    ],
+)
+def test_oci_root_monitor_launch_rejects_every_mismatched_binding_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    name = "monitor-invalid"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    values = {
+        "record": replace(binding.record, run_id=str(uuid.uuid4())),
+        "owner_uid": os.geteuid() + 1,
+        "owner_uid_type": float(os.geteuid()),
+        "plan_digest": "sha256:" + "a" * 64,
+        "expected_definition_projection_digest": "sha256:" + "b" * 64,
+        "stage1_artifact_digest": "sha256:" + "c" * 64,
+        "domain_uuid": str(uuid.uuid4()),
+        "libvirt_uri": "qemu:///session",
+        "boot_attempt_id": "not-a-canonical-uuid",
+    }
+    if field == "type":
+        binding = binding.to_dict()
+    else:
+        # Bypass dataclass validation to exercise the launch boundary itself.
+        object.__setattr__(binding, "owner_uid" if field == "owner_uid_type" else field, values[field])
+    state_path = roots.runs / name / "state.json"
+    before = state_path.read_bytes()
+    with pytest.raises(StateError, match="monitor"):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding
+        )
+    assert state_path.read_bytes() == before
+    assert conn.stream_flags == []
+    assert conn.domains[name].create_calls == conn.domains[name].destroy_calls == conn.domains[name].undefine_calls == 0
+
+
+@pytest.mark.parametrize("tamper", ["xml", "uuid", "uri", "state", "binding"])
+def test_oci_root_monitor_launch_revalidates_after_stream_before_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
+) -> None:
+    name = "monitor-stream-tamper"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    domain = conn.domains[name]
+    state_path = roots.runs / name / "state.json"
+    expected_state = state_path.read_bytes()
+    new_stream = conn.newStream
+
+    def allocate(flags):
+        nonlocal expected_state
+        stream = new_stream(flags)
+        if tamper == "xml":
+            root = ET.fromstring(domain.xml)
+            root.find("./devices/disk/source").set("file", "/foreign/root.raw")
+            domain.xml = ET.tostring(root, encoding="unicode")
+        elif tamper == "uuid":
+            domain.domain_uuid = str(uuid.uuid4())
+        elif tamper == "uri":
+            conn.connection.uri = "qemu:///session"
+        elif tamper == "state":
+            data = json.loads(expected_state)
+            data["oci_root_definition"]["projection_digest"] = "sha256:" + "d" * 64
+            state_path.write_text(json.dumps(data))
+            expected_state = state_path.read_bytes()
+        else:
+            object.__setattr__(binding, "boot_attempt_id", str(uuid.uuid4()))
+        return stream
+
+    monkeypatch.setattr(conn.connection, "newStream", allocate)
+    with pytest.raises(StateError):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding
+        )
+    assert state_path.read_bytes() == expected_state
+    assert conn.stream_flags == [_FAKE_LIBVIRT.VIR_STREAM_NONBLOCK]
+    assert conn.stream.calls[-2:] == [("abort",), ("free",)]
+    assert domain.create_calls == domain.destroy_calls == domain.undefine_calls == 0
 
 
 def test_oci_root_private_launch_rejects_name_uuid_disagreement_without_mutation(

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import kvm
-from .errors import StateError
+from .errors import PalimpsestError, StateError
 from .oci_control_protocol_v2 import (
     OCI_CONTROL_CHANNEL_NAME,
     HostOCIControlV2Session,
@@ -33,6 +33,7 @@ from .oci_lifecycle_transport import (
     OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
 )
+from .oci_monitor_ipc import MonitorPreActivationBinding
 from .oci_root_kvm import (
     ResolvedOCIRootDomainPlan,
     VerifiedHostBootArtifacts,
@@ -42,7 +43,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import ProcessExit
-from .state import StatePaths, locked_existing_run
+from .state import RunLedgerSnapshot, StatePaths, locked_existing_run
 
 OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -1153,6 +1154,69 @@ def _exact_domain(conn: Any, resolved: ResolvedOCIRootDomainPlan, expected_uuid:
     return by_name
 
 
+def _validate_monitor_boot_attempt(boot_attempt_id: str) -> None:
+    try:
+        if type(boot_attempt_id) is not str or str(uuid.UUID(boot_attempt_id)) != boot_attempt_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise StateError("OCI-root monitor boot attempt ID is not canonical") from None
+
+
+def _resolved_monitor_binding(
+    snapshot: RunLedgerSnapshot,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    projection_digest: str,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+) -> MonitorPreActivationBinding:
+    return MonitorPreActivationBinding(
+        record=snapshot.record,
+        owner_uid=os.geteuid(),
+        plan_digest=resolved.plan.digest,
+        expected_definition_projection_digest=projection_digest,
+        stage1_artifact_digest=str(resolved.plan.stage1_transport["artifact_digest"]),
+        domain_uuid=domain_uuid,
+        boot_attempt_id=boot_attempt_id,
+        libvirt_uri=libvirt_uri,
+    )
+
+
+def prepare_oci_root_monitor_binding(
+    roots: StatePaths,
+    name: str,
+    store: OCIStore,
+    boot_artifacts: VerifiedHostBootArtifacts,
+    profile: DomainProfile,
+    *,
+    conn: Any,
+    boot_attempt_id: str,
+    runner: CommandRunner = _default_runner,
+) -> MonitorPreActivationBinding:
+    """Bind a verified inactive definition to one chosen future boot attempt.
+
+    This is a snapshot of the durable post-definition contract, including
+    libvirt's accepted XML normalization. It grants no monitor ownership.
+    """
+
+    _validate_monitor_boot_attempt(boot_attempt_id)
+    with locked_existing_run(roots, name) as mutation:
+        libvirt_uri = _connection_uri(conn, profile)
+        domain_uuid, definition_digest, projection_digest = _definition_ledger(mutation.snapshot.state, profile)
+        resolved = resolve_committed_oci_root_domain_plan(
+            roots, mutation.snapshot, store, boot_artifacts, profile, runner=runner, expected_status="defined"
+        )
+        if definition_digest != resolved.plan.digest:
+            raise StateError("OCI-root durable definition plan binding is invalid")
+        domain = _exact_domain(conn, resolved, domain_uuid)
+        _validate_defined_domain(domain, resolved, domain_uuid, expected_projection_digest=projection_digest)
+        binding = _resolved_monitor_binding(
+            mutation.snapshot, resolved, domain_uuid, projection_digest, libvirt_uri, boot_attempt_id
+        )
+        mutation.verify_binding()
+        return binding
+
+
 def _validate_active_domain(
     domain: Any,
     resolved: ResolvedOCIRootDomainPlan,
@@ -1446,6 +1510,7 @@ def launch_defined_oci_root_domain(
     runner: CommandRunner = _default_runner,
     timeout_seconds: float = DEFAULT_HANDOFF_TIMEOUT_SECONDS,
     terminal_timeout_seconds: float | None = None,
+    monitor_binding: MonitorPreActivationBinding | None = None,
 ) -> CompletedOCIRootHandoff:
     """Privately launch an exact defined domain and synchronously observe exit.
 
@@ -1453,6 +1518,14 @@ def launch_defined_oci_root_domain(
     not implement detached operation, reconnect, stop, exec, or log delivery.
     """
 
+    if monitor_binding is not None:
+        if type(monitor_binding) is not MonitorPreActivationBinding:
+            raise StateError("OCI-root monitor launch binding type is invalid")
+        _validate_monitor_boot_attempt(monitor_binding.boot_attempt_id)
+        try:
+            MonitorPreActivationBinding.__post_init__(monitor_binding)
+        except PalimpsestError:
+            raise StateError("OCI-root monitor launch binding is invalid") from None
     try:
         event_libvirt = conn.libvirt
         event_pid = conn.pid
@@ -1504,6 +1577,15 @@ def launch_defined_oci_root_domain(
                 domain_uuid,
                 expected_projection_digest=definition_projection_digest,
             )
+            if monitor_binding is not None and monitor_binding != _resolved_monitor_binding(
+                mutation.snapshot,
+                resolved,
+                domain_uuid,
+                definition_projection_digest,
+                libvirt_uri,
+                monitor_binding.boot_attempt_id,
+            ):
+                raise StateError("OCI-root monitor launch binding does not match the defined run")
             libvirt = event_libvirt
             flags = getattr(libvirt, "VIR_STREAM_NONBLOCK", None)
             inactive_flag = getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", None)
@@ -1526,7 +1608,11 @@ def launch_defined_oci_root_domain(
                 resolved.plan.domain_core_digest,
                 str(resolved.plan.stage1_transport["artifact_digest"]),
             )
-            lifecycle_session = HostOCIControlV2Session(binding)
+            lifecycle_session = (
+                HostOCIControlV2Session(binding)
+                if monitor_binding is None
+                else HostOCIControlV2Session(binding, boot_attempt_factory=lambda: monitor_binding.boot_attempt_id)
+            )
             boot_attempt_id = lifecycle_session.boot_attempt_id
             try:
                 stream = conn.newStream(flags)
@@ -1535,6 +1621,32 @@ def launch_defined_oci_root_domain(
             if stream is None or not _valid_lifecycle_stream_surface(stream):
                 raise StateError("OCI-root lifecycle stream surface is invalid")
             mutation.verify_binding()
+            if monitor_binding is not None:
+                current_uri = _connection_uri(conn, profile)
+                current_uuid, current_digest, current_projection = _definition_ledger(mutation.snapshot.state, profile)
+                current_resolved = resolve_committed_oci_root_domain_plan(
+                    roots,
+                    mutation.snapshot,
+                    store,
+                    boot_artifacts,
+                    profile,
+                    runner=runner,
+                    expected_status="defined",
+                )
+                if current_digest != current_resolved.plan.digest or monitor_binding != _resolved_monitor_binding(
+                    mutation.snapshot,
+                    current_resolved,
+                    current_uuid,
+                    current_projection,
+                    current_uri,
+                    lifecycle_session.boot_attempt_id,
+                ):
+                    raise StateError("OCI-root monitor launch binding changed before activation")
+                domain = _exact_domain(conn, current_resolved, current_uuid)
+                _validate_defined_domain(
+                    domain, current_resolved, current_uuid, expected_projection_digest=current_projection
+                )
+                mutation.verify_binding()
             data = mutation.mutable_state()
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
@@ -1809,4 +1921,5 @@ __all__ = [
     "connect_oci_root_libvirt",
     "define_committed_oci_root_domain",
     "launch_defined_oci_root_domain",
+    "prepare_oci_root_monitor_binding",
 ]

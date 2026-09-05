@@ -216,10 +216,24 @@ Graceful inert-monitor shutdown is `aborting` → exact socket unlink/fsync →
 `abandoned`; an absent-socket abandoned record can start a new generation under
 the same lock and monotonic revision history.
 
-This remains an ownership and IPC foundation only. No public runtime,
-dispatcher, CLI, libvirt launch, or active-domain lease imports it. It does not
-claim VM STOP, READY, active-binding promotion, create/start/run/`-d`, or Gate
-2 activation.
+The IPC child remains an ownership foundation. Public runtime, dispatcher,
+CLI, and active-domain lease paths do not import it. The private launch uses
+only its immutable binding type in 30H below. This does not provide VM STOP,
+READY through IPC, active-binding promotion, create/start/run/`-d`, or Gate 2
+activation.
+
+Slice 30H connects the private synchronous launch to an explicit monitor
+binding. Preparation runs under the run lock and verifies an existing inactive
+domain against the durable definition and re-resolved plan. It records the
+actual normalized definition projection and a caller-selected boot attempt.
+Launch revalidates all identity fields before allocating a stream and before
+activation, and carries the same attempt through READY and TERMINAL. The live
+libvirt qualification verifies that attempt in both the receipt and run ledger.
+
+This preparation result is a snapshot, not a monitor ownership capability.
+Its expected projection is the observed post-definition digest, not authored
+XML's digest. Child-owned define/create, active journal promotion, lifecycle/IPC
+event scheduling, public `run -d`, and Gate 2 require subsequent integration.
 
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
