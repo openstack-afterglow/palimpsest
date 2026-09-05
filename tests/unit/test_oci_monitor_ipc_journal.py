@@ -259,22 +259,20 @@ def test_reconcile_live_or_unknown_writer_never_mutates(
 def test_stale_recorded_socket_is_quarantined_and_abandoned(tmp_path: Path) -> None:
     directory = tmp_path / "run"
     directory_fd = _directory(directory)
-    writer = _writer()
-    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, writer)
-    bound = ipc._BoundMonitorSocket(directory_fd, lease.snapshot.socket_name)
-    lease.mark_prepared(*bound.identity)
-    lease.mark_committed()
-    bound.close(preserve_path=True)
-    lease.close()
+    handle = ipc.spawn_monitor_exec(directory_fd, _identity(), timeout=2)
     try:
-        reconciled = ipc.reconcile_stale_monitor_exec(
-            directory_fd,
-            _binding(),
-            liveness_probe=lambda _writer: monitor.ProcessLiveness.STALE,
-        )
+        handle._process.kill()
+        assert handle._process.wait(timeout=2) == -signal.SIGKILL
+        assert monitor.probe_process_liveness(handle.endpoint.writer) is monitor.ProcessLiveness.STALE
+        reconciled = ipc.reconcile_stale_monitor_exec(directory_fd, _binding())
         assert reconciled.phase == "abandoned"
+        assert reconciled.writer == ipc.current_process_identity()
         assert not (directory / reconciled.socket_name).exists()
     finally:
+        if handle._process.poll() is None:
+            handle._process.kill()
+            handle._process.wait(timeout=2)
+        handle.close()
         os.close(directory_fd)
 
 
@@ -346,28 +344,54 @@ def test_graceful_cleanup_preserves_preexisting_deterministic_quarantine(
 def test_claiming_socket_without_durable_inode_is_preserved_control_lost(tmp_path: Path) -> None:
     directory = tmp_path / "run"
     directory_fd = _directory(directory)
-    lease = ipc._PreactivationJournalLease.create(
-        directory_fd,
-        _identity(),
-        "1" * 64,
-        _writer(),
+    local, child = socket.socketpair()
+    local.settimeout(2)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "palimpsest_local.oci_monitor_ipc",
+            "--private-child-v2",
+            str(directory_fd),
+            str(child.fileno()),
+        ],
+        close_fds=True,
+        pass_fds=(directory_fd, child.fileno()),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    bound = ipc._BoundMonitorSocket(directory_fd, lease.snapshot.socket_name)
-    bound.close(preserve_path=True)
-    lease.close()
+    child.close()
     socket_path = directory / ipc._socket_name_for_generation(_GENERATION)
     try:
+        ipc._send_frame(
+            local,
+            {
+                "binding": _binding().to_dict(),
+                "generation": _GENERATION,
+                "nonce": "1" * 64,
+                "parent": ipc.current_process_identity().to_dict(),
+                "schema": ipc._CONFIG_SCHEMA,
+                "timeout_ms": 5000,
+            },
+        )
+        assert ipc._recv_frame(local) == {"kind": "bound", "schema": ipc._SPAWN_SCHEMA}
+        claiming = ipc._read_preactivation_journal(directory_fd, _binding())
+        assert claiming is not None and claiming[0].phase == "claiming"
+        assert claiming[0].socket_inode is None
+        process.kill()
+        assert process.wait(timeout=2) == -signal.SIGKILL
         with pytest.raises(ipc.MonitorIPCError) as captured:
-            ipc.reconcile_stale_monitor_exec(
-                directory_fd,
-                _binding(),
-                liveness_probe=lambda _writer: monitor.ProcessLiveness.STALE,
-            )
+            ipc.reconcile_stale_monitor_exec(directory_fd, _binding())
         assert captured.value.category is ipc.MonitorIPCErrorCategory.CONTROL_LOST
         assert socket_path.exists()
         loaded = ipc._read_preactivation_journal(directory_fd, _binding())
         assert loaded is not None and loaded[0].phase == "control-lost"
     finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        local.close()
         socket_path.unlink(missing_ok=True)
         os.close(directory_fd)
 
