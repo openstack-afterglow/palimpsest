@@ -2120,6 +2120,190 @@ class OCIStore:
                     self._read_occurrence(authority, receipt, verify_artifact=False)
         return tuple(found)
 
+    def _validate_handoff_lease_set(self, lease_set: DurableLeaseSet) -> str:
+        """Validate an exact snapshot and return its deterministic wire schema."""
+        if type(lease_set) is not DurableLeaseSet or type(lease_set.owner) is not ArtifactLeaseOwner:
+            raise OCIStoreError("oci-store-handoff", "lease-set snapshot is invalid")
+        if (
+            type(lease_set.members) is not tuple
+            or not lease_set.members
+            or any(type(member) is not DurableLeaseSetMember for member in lease_set.members)
+        ):
+            raise OCIStoreError("oci-store-handoff", "lease-set members are invalid")
+        lease_set.__post_init__()
+        owner = lease_set.owner
+        try:
+            canonical_owner = ArtifactLeaseOwner(**owner.to_dict())
+            canonical_id = str(uuid.UUID(owner.run_id))
+        except (TypeError, ValueError, AttributeError):
+            raise OCIStoreError("oci-store-handoff", "lease-set owner is invalid") from None
+        if canonical_owner != owner or canonical_id != owner.run_id:
+            raise OCIStoreError("oci-store-handoff", "lease-set owner is not canonical")
+        for member in lease_set.members:
+            if type(member) is not DurableLeaseSetMember or type(member.receipt) is not DerivedLayerReceipt:
+                raise OCIStoreError("oci-store-handoff", "lease-set member is invalid")
+            try:
+                canonical_id = str(uuid.UUID(member.lease_id))
+            except (TypeError, ValueError, AttributeError):
+                raise OCIStoreError("oci-store-handoff", "lease-set member identity is invalid") from None
+            if (
+                canonical_id != member.lease_id
+                or type(member.ordinal) is not int
+                or type(member.acquired_ns) is not int
+                or member.acquired_ns < 0
+            ):
+                raise OCIStoreError("oci-store-handoff", "lease-set member identity is invalid")
+            member.receipt.__post_init__()
+        receipts = tuple(member.receipt for member in lease_set.members)
+        self._validate_lease_set_inputs(receipts, owner, lease_set.plan_digest)
+        if any(receipt.store_id != self.identity for receipt in receipts):
+            raise OCIStoreError("oci-store-handoff", "lease-set store identity changed")
+        for schema in (DERIVED_LEASE_SET_SCHEMA, _DERIVED_LEASE_SET_SCHEMA_V1):
+            expected = self._lease_set_intent_value(receipts, owner, lease_set.plan_digest, schema=schema)
+            if expected["lease_set_id"] == lease_set.lease_set_id and tuple(
+                member["lease_id"] for member in expected["members"]
+            ) == tuple(member.lease_id for member in lease_set.members):
+                return schema
+        raise OCIStoreError("oci-store-handoff", "lease-set deterministic binding changed")
+
+    def _require_lease_set_retired(self, source: DurableLeaseSet) -> None:
+        """Read-only historical proof; never re-release a reappeared old pin."""
+        self._validate_handoff_lease_set(source)
+        with self._authority() as authority, ExitStack() as locks:
+            for lease_id in sorted(member.lease_id for member in source.members):
+                locks.enter_context(self._lock(authority, f"lease-use-{lease_id.replace('-', '')}.lock"))
+            with self._lock(authority, "lease-index.lock"):
+                for directory_fd, name in (
+                    (authority.lease_sets_fd, _digest_hex(source.lease_set_id)),
+                    *((authority.leases_fd, member.lease_id) for member in source.members),
+                ):
+                    try:
+                        self._read_file(directory_fd, name)
+                    except OCIStoreError as exc:
+                        if exc.code == "oci-store-missing":
+                            continue
+                        raise
+                    raise OCIStoreError("oci-store-handoff", "retired source pins reappeared")
+
+    def _retire_replaced_lease_set(
+        self, source: DurableLeaseSet, successor: DurableLeaseSet, *, resume: bool, verify: Callable[[], None]
+    ) -> None:
+        """Retire old pins while one exact complete successor remains protected.
+
+        The caller durably saves both original snapshots before entering and
+        commits completion after return. ``verify`` must only read its already
+        held run/volume authorities: no store calls or ledger writes are safe
+        under the lease-use -> artifact-digest -> lease-index lock order here.
+        No successor pin, occurrence, recipe, or artifact is removed.
+        """
+        if type(resume) is not bool or not callable(verify):
+            raise OCIStoreError("oci-store-handoff", "lease retirement authority is invalid")
+        schemas = (self._validate_handoff_lease_set(source), self._validate_handoff_lease_set(successor))
+        if (
+            source.owner.run_id == successor.owner.run_id
+            or source.owner.run_name == successor.owner.run_name
+            or source.owner.role != successor.owner.role
+            or source.lease_set_id == successor.lease_set_id
+            or tuple(member.receipt for member in source.members)
+            != tuple(member.receipt for member in successor.members)
+        ):
+            raise OCIStoreError("oci-store-handoff", "successor does not independently protect the same ordered graph")
+        ids = {member.lease_id for item in (source, successor) for member in item.members}
+        if len(ids) != len(source.members) + len(successor.members):
+            raise OCIStoreError("oci-store-handoff", "source and successor pins overlap")
+        with self._authority() as authority, ExitStack() as locks:
+            for lease_id in sorted(ids):
+                locks.enter_context(self._lock(authority, f"lease-use-{lease_id.replace('-', '')}.lock"))
+            for digest in sorted({member.receipt.image_digest for member in source.members}):
+                locks.enter_context(self._artifacts.digest_guard(digest))
+            with self._lock(authority, "lease-index.lock"):
+                missing_ids: set[str] = set()
+                expected_intent_present: bool | None = None
+
+                def inspect(item: DurableLeaseSet, schema: str, *, allow_missing: bool) -> tuple[bool, set[str]]:
+                    receipts = tuple(member.receipt for member in item.members)
+                    expected_intent = self._lease_set_intent_value(
+                        receipts, item.owner, item.plan_digest, schema=schema
+                    )
+                    intent_present = True
+                    try:
+                        payload, _ = self._read_file(authority.lease_sets_fd, _digest_hex(item.lease_set_id))
+                    except OCIStoreError as exc:
+                        if not allow_missing or exc.code != "oci-store-missing":
+                            raise
+                        intent_present = False
+                    else:
+                        if payload != _canonical(expected_intent):
+                            raise OCIStoreError("oci-store-handoff", "lease-set intent changed")
+                    present = set()
+                    lease_schema = (
+                        _DERIVED_LEASE_SCHEMA_V1 if schema == _DERIVED_LEASE_SET_SCHEMA_V1 else DERIVED_LEASE_SCHEMA
+                    )
+                    for member in item.members:
+                        try:
+                            payload, _ = self._read_file(authority.leases_fd, member.lease_id)
+                        except OCIStoreError as exc:
+                            if allow_missing and exc.code == "oci-store-missing":
+                                continue
+                            raise
+                        expected = self._lease_record_value(
+                            member.lease_id, item.owner, member.receipt, member.acquired_ns, schema=lease_schema
+                        )
+                        if payload != _canonical(expected):
+                            raise OCIStoreError("oci-store-handoff", "lease-set acquisition snapshot changed")
+                        self._read_occurrence(authority, member.receipt, verify_artifact=False)
+                        present.add(member.lease_id)
+                    if not intent_present and present:
+                        raise OCIStoreError("oci-store-handoff", "lease members remain without their original intent")
+                    return intent_present, present
+
+                def verify_sets(*, initial: bool = False) -> tuple[bool, set[str]]:
+                    nonlocal expected_intent_present
+                    self._verify_authority_binding(authority)
+                    inspect(successor, schemas[1], allow_missing=False)
+                    intent_present, present = inspect(source, schemas[0], allow_missing=resume or not initial)
+                    if present & missing_ids:
+                        raise OCIStoreError("oci-store-handoff", "retired source member reappeared")
+                    absent = {member.lease_id for member in source.members if member.lease_id not in present}
+                    if initial:
+                        missing_ids.update(absent)
+                        expected_intent_present = intent_present
+                    elif absent != missing_ids or intent_present != expected_intent_present:
+                        raise OCIStoreError("oci-store-handoff", "source pins changed during retirement")
+                    return intent_present, present
+
+                verify()
+                verify_sets(initial=True)
+                for member in successor.members:
+                    self._read_occurrence(authority, member.receipt)
+                for member in source.members:
+                    if member.lease_id in missing_ids:
+                        continue
+                    verify()
+                    _, present = verify_sets()
+                    if member.lease_id not in present:
+                        raise OCIStoreError("oci-store-handoff", "source pin disappeared before retirement")
+                    try:
+                        os.unlink(member.lease_id, dir_fd=authority.leases_fd)
+                    except OSError:
+                        raise OCIStoreError("oci-store-handoff", "source member retirement failed") from None
+                    missing_ids.add(member.lease_id)
+                os.fsync(authority.leases_fd)
+                verify()
+                intent_present, present = verify_sets()
+                if present:
+                    raise OCIStoreError("oci-store-handoff", "source members remain before intent retirement")
+                if intent_present:
+                    try:
+                        os.unlink(_digest_hex(source.lease_set_id), dir_fd=authority.lease_sets_fd)
+                    except OSError:
+                        raise OCIStoreError("oci-store-handoff", "source intent retirement failed") from None
+                    expected_intent_present = False
+                os.fsync(authority.lease_sets_fd)
+                verify()
+                if verify_sets() != (False, set()):
+                    raise OCIStoreError("oci-store-handoff", "source retirement is incomplete")
+
     def release_lease_set(self, lease_set: DurableLeaseSet) -> None:
         """Release a complete lease set; interrupted releases remain retryable."""
         if not isinstance(lease_set, DurableLeaseSet):

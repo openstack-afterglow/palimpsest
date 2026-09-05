@@ -1360,6 +1360,37 @@ Definition, ACL, and temporary-fixture cleanup remain separately validated.
 Production access provisioning, root deletion, socket/run reclamation, public
 foreground/`-d` dispatch, and local build-to-run Gate 2 remain gated.
 
+### PR 4 slice 30N: explicit retained-root lower lease handoff
+
+A private handoff retires the old run's lower leases only after a distinct,
+caller-selected successor has prepared the same graph and exclusively claimed
+the same retained root. The successor must still be `creating/resources-ready`,
+before domain planning/definition or monitor activation. Both run locks and
+the exact volume lock fence the original evidence and successor attachment.
+The writable disk, its ownership/generation, both lifecycle states, original
+journal/socket, and immutable image data are not modified by handoff.
+
+An old-ledger intent records exact source and successor lease snapshots before
+retirement. The store locks the union of lease-use identities, then image
+digests, then its lease index. It verifies the complete successor set inside
+that boundary before unlinking only the captured old members and old intent.
+Partial removal can resume only from the saved handoff intent; drift stops
+further removal. Ledger writes stay outside artifact digest guards to avoid
+inverting the artifact-reference lock order.
+
+Completion records a historical transfer. Replay proves the old pins remain
+absent but does not open the disk or depend on the successor still existing or
+owning that volume. The original 30M retention API remains fail-closed after
+its original pins retire; callers use the completed handoff receipt instead.
+An incomplete handoff must finish before defining or otherwise advancing the
+successor, because changed recipient state is deliberately not adopted.
+
+Live qualification performs handoff before the second real VM boot, verifies
+only the old pins disappear while the successor and immutable bytes remain,
+and verifies the successor pins block artifact collection. The upper-only
+executable then runs from the same root. This is not old-run/socket removal,
+root deletion, production filesystem access provisioning, or public dispatch.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1378,10 +1409,10 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add production filesystem access provisioning and explicit retained-volume
-   lower-lease handoff before reclaiming old run resources. Keep the old lower
-   pins until their replacement ownership is durably established. Connect
-   deletion/socket reclamation to the proven inactive-domain cleanup boundary.
+1. Add production filesystem access provisioning, then connect explicit
+   deletion/socket and old-run reclamation to the proven inactive-domain
+   cleanup and completed lower-lease handoff boundaries. Preserve lower pins
+   whenever replacement ownership has not been durably established.
    Authenticated control requires
    the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
    alone cannot recover running control.

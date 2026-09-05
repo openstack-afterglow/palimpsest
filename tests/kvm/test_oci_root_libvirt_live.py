@@ -3206,8 +3206,10 @@ def _qualify_retained_root_reuse(
     monkeypatch, root, roots, store, materialization, boot, profile, conn, qemu_uid, first, first_binding, first_monitor
 ):
     from palimpsest_local import oci_root_prepare as preparation
+    from palimpsest_local.oci_monitor_handoff import handoff_retained_root_lower_leases
     from palimpsest_local.oci_monitor_retention import retain_inactive_monitor_root
     from palimpsest_local.oci_root_volume import release_oci_root_volume
+    from palimpsest_local.oci_store import OCIStoreError
 
     root_path = first.root_volume.path
     assert _lookup_domain(conn, first_binding.record.name) is None
@@ -3292,6 +3294,51 @@ def _qualify_retained_root_reuse(
     assert load_oci_root_volume(roots, second.transaction.volume_id).record == second_record
     assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_retention
 
+    successor_snapshot = read_run_ledger_snapshot(roots, second_name)
+    successor_leases = store.load_lease_set(
+        second.transaction.lower_lease_set_id,
+        second.transaction.owner,
+        plan_digest=second.transaction.boot_plan_digest,
+    )
+    immutable_paths = {
+        roots.store / "blobs" / "sha256" / member.receipt.image_digest.removeprefix("sha256:")
+        for member in successor_leases.members
+    }
+    assert immutable_paths
+    immutable_digests = {path: _sha256_file(path) for path in immutable_paths}
+    handoff = handoff_retained_root_lower_leases(roots, first_binding, successor_snapshot.record, store, conn=conn)
+    assert handoff.phase == "completed"
+    after_handoff = read_run_ledger_snapshot(roots, first_binding.record.name).state
+    assert after_handoff["oci_monitor_lower_handoff"] == handoff.to_dict()
+    handoff_ignored = {"oci_monitor_lower_handoff", "lifecycle_revision"}
+    assert {key: value for key, value in after_handoff.items() if key not in handoff_ignored} == {
+        key: value for key, value in after_retention.items() if key not in handoff_ignored
+    }
+    assert after_handoff["lifecycle_revision"] == after_retention["lifecycle_revision"] + 2
+    assert read_run_ledger_snapshot(roots, second_name) == successor_snapshot
+    assert store.list_lease_set_intents(first.transaction.owner) == ()
+    assert store.list_leases(first.transaction.owner) == ()
+    assert (
+        store.load_lease_set(
+            second.transaction.lower_lease_set_id,
+            second.transaction.owner,
+            plan_digest=second.transaction.boot_plan_digest,
+        )
+        == successor_leases
+    )
+    for member in successor_leases.members:
+        with store._artifacts.digest_guard(member.receipt.image_digest):
+            with pytest.raises(OCIStoreError, match="retained by a durable OCI lease"):
+                store.assert_artifact_unleased(member.receipt.image_digest)
+    assert load_oci_root_volume(roots, second.transaction.volume_id).record == second_record
+    assert (root_path.stat().st_dev, root_path.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+    assert _sha256_file(root_path) == before_digest
+    assert {path: _sha256_file(path) for path in immutable_paths} == immutable_digests
+    assert (
+        handoff_retained_root_lower_leases(roots, first_binding, successor_snapshot.record, store, conn=conn) == handoff
+    )
+    assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_handoff
+
     resolved = build_oci_root_domain_plan(roots, second, store, boot, profile, memory_mib=512, vcpus=1, network=None)
     plan = commit_oci_root_domain_plan(roots, resolved, store)
     defined = define_committed_oci_root_domain(roots, second_name, store, boot, profile, conn=conn)
@@ -3355,8 +3402,23 @@ def _qualify_retained_root_reuse(
         ]
         assert plan.process.argv[0] == f"/{basename}"
         assert (root_path.stat().st_dev, root_path.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
-        assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_retention
-        assert store.list_lease_set_intents(first.transaction.owner) == original_leases
+        assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_handoff
+        assert store.list_lease_set_intents(first.transaction.owner) == ()
+        assert store.list_leases(first.transaction.owner) == ()
+        assert (
+            store.load_lease_set(
+                second.transaction.lower_lease_set_id,
+                second.transaction.owner,
+                plan_digest=second.transaction.boot_plan_digest,
+            )
+            == successor_leases
+        )
+        assert (
+            handoff_retained_root_lower_leases(roots, first_binding, successor_snapshot.record, store, conn=conn)
+            == handoff
+        )
+        assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_handoff
+        assert {path: _sha256_file(path) for path in immutable_paths} == immutable_digests
         assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
         assert (socket_path.lstat().st_dev, socket_path.lstat().st_ino) == (
             socket_metadata.st_dev,
@@ -3397,11 +3459,13 @@ def _qualify_retained_root_reuse(
             delete=True,
         )
         assert not root_path.exists()
-        for transaction in (first.transaction, second.transaction):
-            store.rollback_lease_set(
-                transaction.lower_lease_set_id, transaction.owner, plan_digest=transaction.boot_plan_digest
-            )
-            assert store.list_lease_set_intents(transaction.owner) == ()
+        assert store.list_lease_set_intents(first.transaction.owner) == ()
+        store.rollback_lease_set(
+            second.transaction.lower_lease_set_id,
+            second.transaction.owner,
+            plan_digest=second.transaction.boot_plan_digest,
+        )
+        assert store.list_lease_set_intents(second.transaction.owner) == ()
     finally:
         if transport is not None:
             transport.close(preserve_path=True)

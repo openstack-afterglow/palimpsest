@@ -672,32 +672,31 @@ def load_oci_root_volume(
         return VerifiedOCIRootVolume(record, path, filesystem_uuid)
 
 
-def _retain_exact_oci_root_volume(
+@contextmanager
+def _locked_exact_root_volume(
     roots: StatePaths,
     expected: OCIRootVolumeRecord,
     *,
     filesystem_uuid: str,
-    before_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
-    after_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
+    allow_retained_successor: bool = False,
     runner: CommandRunner = _default_runner,
-) -> OCIRootVolumeRecord:
-    """Private retain-only CAS; callbacks run inside the volume lock.
-
-    The caller owns run/journal authority and must persist intent before the
-    detach. Callbacks must not reacquire this volume lock. An exact retained
-    successor is exposed to the callback solely for intent-based crash resume.
-    """
+) -> Iterator[tuple[OCIRootVolumeRecord, tuple[int, int], Callable[[OCIRootVolumeRecord], None], int, Path]]:
+    """Hold exact volume identity; yielded verification performs no store calls."""
     if type(expected) is not OCIRootVolumeRecord:
         raise StateError("exact root retention record is invalid")
     expected.__post_init__()
     if expected.retention_policy != "retain" or expected.status != "attached":
         raise StateError("exact root retention requires an originally retained attachment")
-    retained = replace(
-        expected,
-        status="retained",
-        attached_run_id=None,
-        attached_run_name=None,
-        generation=expected.generation + 1,
+    retained = (
+        replace(
+            expected,
+            status="retained",
+            attached_run_id=None,
+            attached_run_name=None,
+            generation=expected.generation + 1,
+        )
+        if allow_retained_successor
+        else None
     )
     path, record_path, lock_path = _paths(roots, expected.volume_id)
     with _RetentionVolumeLock(roots, lock_path) as volume_lock, _root_authority(roots) as directory_fd:
@@ -756,16 +755,43 @@ def _retain_exact_oci_root_volume(
             verify(current)
             _verify_kvm_path(path, expected.size_bytes, oci_root_volume_label(expected.volume_id), runner)
             verify(current)
-            before_retention(current, identity)
-            verify(current)
-            if current == expected:
-                _write_record(directory_fd, record_path, retained)
-            verify(retained)
-            after_retention(retained, identity)
-            verify(retained)
-            return retained
+            yield current, identity, verify, directory_fd, record_path
         finally:
             os.close(file_fd)
+
+
+def _retain_exact_oci_root_volume(
+    roots: StatePaths,
+    expected: OCIRootVolumeRecord,
+    *,
+    filesystem_uuid: str,
+    before_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
+    after_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
+    runner: CommandRunner = _default_runner,
+) -> OCIRootVolumeRecord:
+    """Private retain-only CAS; callbacks run inside the volume lock."""
+    with _locked_exact_root_volume(
+        roots,
+        expected,
+        filesystem_uuid=filesystem_uuid,
+        allow_retained_successor=True,
+        runner=runner,
+    ) as (current, identity, verify, directory_fd, record_path):
+        retained = replace(
+            expected,
+            status="retained",
+            attached_run_id=None,
+            attached_run_name=None,
+            generation=expected.generation + 1,
+        )
+        before_retention(current, identity)
+        verify(current)
+        if current == expected:
+            _write_record(directory_fd, record_path, retained)
+        verify(retained)
+        after_retention(retained, identity)
+        verify(retained)
+        return retained
 
 
 def release_oci_root_volume(

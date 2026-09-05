@@ -333,6 +333,22 @@ graph to boot. The new run must acquire its own lower leases before claiming
 the retained disk; automatic retirement of the old pins, standalone disk
 export, and removal of the old run are not provided by this boundary.
 
+Slice 30N adds explicit lower-lease handoff to a different prepared run, before
+its domain is planned or defined. The successor must own the same root inode
+at the exact next attachment generation and hold a complete same-graph lease
+set. Both run locks and the volume lock protect this binding; the store holds
+both sets' use locks plus digest/index guards while retiring only the old pins.
+Intent and completion are written outside digest guards to avoid lock inversion.
+Only an existing intent permits exact partial-removal recovery.
+
+Completed replay is historical and requires the old pins to remain absent;
+it does not touch a later owner or require the recipient run to survive.
+The original retention API refuses once its required old pins have retired.
+Callers must finish an incomplete handoff before advancing the successor.
+Live qualification now boots the upper-only executable after old-pin retirement,
+with the new pins intact and still blocking collection. Disk data, lifecycle
+evidence, and the original journal/socket remain outside this reclamation scope.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

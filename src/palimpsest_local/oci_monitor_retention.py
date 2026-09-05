@@ -149,7 +149,7 @@ class MonitorRootRetentionReceipt:
             raise MonitorRootRetentionError("invalid root retention receipt") from None
 
 
-def _resources(state: Mapping[str, Any], binding: MonitorPreActivationBinding, store: OCIStore):
+def _resource_bindings(state: Mapping[str, Any], binding: MonitorPreActivationBinding):
     transaction = OCIRootPreparationTransaction.from_dict(state.get("oci_root"))
     value = state.get("oci_root_domain")
     if not isinstance(value, Mapping) or set(value) != {"digest", "plan"}:
@@ -172,11 +172,6 @@ def _resources(state: Mapping[str, Any], binding: MonitorPreActivationBinding, s
         or transaction.owner.run_name != binding.record.name
     ):
         raise MonitorRootRetentionError("root retention resource binding is invalid")
-    leases = store.load_lease_set(
-        transaction.lower_lease_set_id, transaction.owner, plan_digest=transaction.boot_plan_digest
-    )
-    if tuple(member.receipt for member in leases.members) != transaction.receipts:
-        raise MonitorRootRetentionError("root retention original lower leases changed")
     expected = OCIRootVolumeRecord(
         transaction.volume_id,
         transaction.volume_size_bytes,
@@ -187,6 +182,16 @@ def _resources(state: Mapping[str, Any], binding: MonitorPreActivationBinding, s
         binding.record.name,
         plan.root_volume["generation"],
     )
+    return transaction, plan, expected
+
+
+def _resources(state: Mapping[str, Any], binding: MonitorPreActivationBinding, store: OCIStore):
+    transaction, plan, expected = _resource_bindings(state, binding)
+    leases = store.load_lease_set(
+        transaction.lower_lease_set_id, transaction.owner, plan_digest=transaction.boot_plan_digest
+    )
+    if tuple(member.receipt for member in leases.members) != transaction.receipts:
+        raise MonitorRootRetentionError("root retention original lower leases changed")
     return transaction, plan, expected, leases
 
 
