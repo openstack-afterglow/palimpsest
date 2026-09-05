@@ -149,6 +149,47 @@ It may commit only `adopting` then `control-lost` for a future exact cleanup
 path. No runtime, supervisor, dispatcher, CLI, or libvirt launch code imports
 this module yet, so public run/`-d` remains disabled.
 
+The next production-inert foundation establishes a fresh-exec monitor process
+and owner-private local IPC without connecting it to that active-domain lease.
+It must run while the parent is single-threaded and before libvirt is imported,
+then execs a capability-free child with only the held run-directory FD and a
+bootstrap channel inherited. An exact pre-activation binding schema is limited
+to run identity, owner UID, plan/stage-1 digests, an explicitly expected
+pre-define projection digest, preassigned domain and boot-attempt UUIDs,
+lifecycle protocol, and fixed libvirt URI. Its digest, a generation, a
+transient nonce, and both process incarnations bind `PREPARED` and `COMMIT`
+receipts. COMMIT here means only that the IPC child is authenticated and
+serving; it is not guest READY, VM ownership, or a runtime-state transition.
+
+The IPC endpoint is a `0600` filesystem AF_UNIX socket below the held `0700`
+run directory, addressed through a short `/proc/self/fd` path and pinned by
+device/inode. This was chosen instead of Linux's abstract namespace so stale
+socket collisions and replacement remain visible and fail closed. Neither the
+socket name nor the nonce is treated as a secret: reciprocal authorization is
+Linux `SO_PEERCRED` UID/PID plus host-boot UUID and `/proc` start ticks. Frames
+are canonical and bounded. The path-free endpoint receipt is canonical and
+serializable but returned only in memory; a live same-owner caller explicitly
+handed those bytes can reconnect after exact socket and peer revalidation, but
+restart discovery is not implemented. Before COMMIT, parent death/channel
+closure or timeout exits and removes the exact socket. The only
+commands are DESCRIBE, PING, and shutdown of the inert monitor process itself;
+there is no STOP, READY, libvirt, lifecycle-key, or domain-mutation surface.
+
+This resolves only the exec and IPC proof boundary. Because the existing 30E
+binding requires an already-active domain ID and post-define projection, using
+it after parent-owned `domain.create()` would leave a create-to-exec crash
+window. A later slice must instead make the already-execed child own an
+immutable pre-activation journal, register libvirt events, define/create the
+domain, and publish the exact active binding. Public run/`-d` stays disabled.
+That integration must durably publish and directory-fsync the endpoint receipt
+before sending COMMIT. Until then, a parent crash after the in-memory COMMIT may
+leave a live but undiscoverable child, so 30F makes no daemon-restart claim.
+It must also keep `expected_definition_projection_digest` distinct from the
+canonical actual projection digest that becomes knowable only after the child
+performs libvirt define and reads normalized `XMLDesc`. The child must require
+an exact match before promoting the claim into an active binding; 30F performs
+no such promotion.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

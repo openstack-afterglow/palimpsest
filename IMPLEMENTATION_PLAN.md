@@ -1067,6 +1067,57 @@ launch module imports this foundation. Public create/start/run/`-d`, monitor
 process spawning, authenticated reconnect/STOP, adoption cleanup, logs/exec,
 and Gate 2 remain disabled.
 
+### PR 4 slice 30F: fresh-exec and reciprocal IPC foundation
+
+- A second production-inert module defines the process/IPC boundary that must
+  precede any future monitor-owned libvirt connection. It permits spawning only
+  on Linux, while single-threaded and before the Python libvirt module is
+  loaded, and uses a real `python -m` exec with `close_fds=True` plus an exact
+  two-FD `pass_fds` inventory. No environment secrets, filesystem path, boot
+  key, MAC, or error representation crosses or is stored by this boundary.
+- The immutable pre-activation binding contains only the run identity, owner
+  UID, plan/stage-1 digests, an explicitly expected pre-define projection
+  digest, preassigned domain and boot-attempt UUIDs, lifecycle protocol, and
+  fixed libvirt URI. It deliberately has no active domain ID. A canonical
+  digest of that fixed schema, a fresh generation, and a transient nonce bind
+  the two-phase `PREPARED` then `COMMIT` spawn receipts.
+  The canonical, serializable endpoint receipt additionally binds the child
+  host-boot/PID/start-tick incarnation and exact socket device/inode. This
+  slice returns it in memory and does not publish it durably.
+- The child has no domain, libvirt, lifecycle, or `MonitorLease` import and no
+  mutation command. It first creates a filesystem AF_UNIX socket inside the
+  caller-held `0700` run directory through a short `/proc/self/fd` address,
+  fixes it to `0600`, and pins its inode. Filesystem namespace plus DAC and
+  inode revalidation were chosen over an abstract socket so stale endpoints
+  and pathname replacement are observable and fail closed. The pathname,
+  generation, and nonce are correlation values, not authentication secrets.
+- Parent and fresh-exec child authenticate each other through Linux
+  `SO_PEERCRED` UID/PID plus host boot UUID and `/proc` start ticks. Before
+  COMMIT, config-channel closure, parent disappearance, malformed input, or a
+  bounded timeout removes only the exact child socket and exits. Committed IPC
+  frames are canonical and size bounded; the only semantic commands are
+  `DESCRIBE`, `PING`, and monitor-process `SHUTDOWN`. A live same-owner caller
+  explicitly handed the serialized endpoint can reconnect after exact peer and
+  socket validation; daemon restart discovery is not claimed.
+
+Scope boundary: 30F does not use the 30E active-domain lease and does not
+launch, define, start, stop, or inspect a VM. `COMMIT` only moves the child into
+its in-memory serving state; it is not durable receipt publication, guest
+readiness, or durable run state. The active domain ID cannot safely be known
+before libvirt define/create, so the next integration
+must let this already-execed child own a new pre-activation journal and perform
+libvirt event registration plus define/create itself before atomically
+publishing the active-domain binding. It must also atomically persist and
+directory-fsync the endpoint receipt before COMMIT; without that publication,
+a parent crash after the in-memory COMMIT can leave a live but undiscoverable
+IPC child. The next schema must also distinguish the preactivation expected
+`expected_definition_projection_digest` carried here from the canonical actual
+projection digest, which only the child can derive after its own libvirt
+define/`XMLDesc` normalization. The child must require that exact match before
+promoting the claim to the active binding; 30F does not perform or claim that
+promotion. Public create/start/run/`-d`, STOP, readiness, restart recovery, and
+Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
