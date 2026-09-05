@@ -8,10 +8,12 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +101,345 @@ def _advance_lease(lease: ipc._PreactivationJournalLease, phase: str) -> None:
     lease.mark_ready()
     if phase != "ready":
         lease.mark_terminal()
+
+
+def test_snapshot_cannot_observe_publication_before_in_memory_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, "committed")
+    published, release, reading, finished = (threading.Event() for _ in range(4))
+    original_fsync = os.fsync
+    snapshots, failures = [], []
+
+    def pause_after_publish(fd: int) -> None:
+        original_fsync(fd)
+        if fd == lease._directory_fd:
+            published.set()
+            assert release.wait(2)
+
+    def transition() -> None:
+        try:
+            lease.mark_activating()
+        except BaseException as exc:
+            failures.append(exc)
+
+    def read() -> None:
+        reading.set()
+        try:
+            snapshots.append(lease.snapshot)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(ipc.os, "fsync", pause_after_publish)
+    writer, reader = threading.Thread(target=transition), threading.Thread(target=read)
+    try:
+        writer.start()
+        assert published.wait(2)
+        reader.start()
+        assert reading.wait(2)
+        assert not finished.wait(0.05)
+        release.set()
+        writer.join(2)
+        reader.join(2)
+        assert not failures
+        assert len(snapshots) == 1 and snapshots[0].phase == "activating"
+        assert not lease._poisoned
+    finally:
+        release.set()
+        writer.join(2)
+        if reader.ident is not None:
+            reader.join(2)
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    "phase,done,expected",
+    [
+        ("committed", False, "launch-pending"),
+        ("committed", True, "launch-failed"),
+        ("activating", False, "activating"),
+        ("active", False, "active"),
+        ("ready", False, "ready"),
+        ("terminal", False, "terminal"),
+        ("terminal", True, "terminal"),
+    ],
+)
+def test_ipc_worker_describe_and_transport_shutdown_are_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    done: bool,
+    expected: str,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, phase)
+    completion = threading.Event()
+    if done:
+        completion.set()
+    worker = SimpleNamespace(done=completion)
+    operations = iter(
+        [ipc.MonitorIPCOperation.DESCRIBE, ipc.MonitorIPCOperation.PING, ipc.MonitorIPCOperation.SHUTDOWN]
+    )
+    replies = []
+
+    class Channel:
+        def settimeout(self, _timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Listener:
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            if len(replies) == 3:
+                raise OSError("end test service")
+            return Channel(), None
+
+    bound = SimpleNamespace(validate=lambda: None, listener=Listener())
+    monkeypatch.setattr(ipc, "_recv_frame", lambda _channel: {})
+    monkeypatch.setattr(ipc, "_decode_request", lambda *_args: (next(operations), str(uuid.uuid4()), _writer()))
+    monkeypatch.setattr(ipc, "_authorize_peer", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_send_frame", lambda _channel, value: replies.append(value))
+    try:
+        allowed = done and phase in {"committed", "terminal"}
+        if allowed:
+            assert ipc._serve_committed(bound, _identity(), _writer(), 1, lease, worker) is (phase == "terminal")
+        else:
+            with pytest.raises(ipc.MonitorIPCError):
+                ipc._serve_committed(bound, _identity(), _writer(), 1, lease, worker)
+        assert [reply["state"] for reply in replies] == [
+            expected,
+            "pong",
+            "shutting-down" if allowed else "shutdown-refused",
+        ]
+        assert lease.snapshot.phase == ("aborting" if done and phase == "committed" else phase)
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("phase", ["committed", "activating", "active", "ready", "terminal"])
+def test_discovery_accepts_only_same_owner_monotonic_activation_revisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, phase)
+    endpoint = lease.snapshot.endpoint
+
+    def request(_fd, _endpoint, operation, **_kwargs):
+        for previous, transition in [
+            ("committed", lease.mark_activating),
+            ("activating", lambda: lease.promote_active(_active_binding())),
+            ("active", lease.mark_ready),
+            ("ready", lease.mark_terminal),
+        ]:
+            if lease.snapshot.phase == previous:
+                transition()
+        return ipc.MonitorIPCReply(operation, "terminal", _writer())
+
+    monkeypatch.setattr(ipc, "request_monitor", request)
+    try:
+        assert (
+            ipc.discover_monitor_exec(directory_fd, _binding(), liveness_probe=lambda _: monitor.ProcessLiveness.LIVE)
+            == endpoint
+        )
+        assert lease.snapshot.phase == "terminal"
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("change", ["nonce", "revision", "socket", "state"])
+def test_discovery_does_not_ignore_drift_while_allowing_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, "committed")
+    before = lease.snapshot
+    _advance = lease.mark_activating()
+    del _advance
+    after = lease.snapshot
+    if change == "nonce":
+        after = replace(after, nonce_digest="sha256:" + "f" * 64)
+    elif change == "revision":
+        after = replace(after, revision=after.revision + 1)
+    elif change == "socket":
+        after = replace(after, socket_inode=after.socket_inode + 1)
+    values = iter(
+        [
+            (before, ipc._canonical_bytes(before.to_dict()) + b"\n"),
+            (after, ipc._canonical_bytes(after.to_dict()) + b"\n"),
+        ]
+    )
+    monkeypatch.setattr(ipc, "_read_preactivation_journal", lambda *_args: next(values))
+    monkeypatch.setattr(
+        ipc,
+        "request_monitor",
+        lambda *_args, **_kwargs: ipc.MonitorIPCReply(
+            ipc.MonitorIPCOperation.DESCRIBE, "terminal" if change == "state" else "activating", _writer()
+        ),
+    )
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as failure:
+            ipc.discover_monitor_exec(directory_fd, _binding(), liveness_probe=lambda _: monitor.ProcessLiveness.LIVE)
+        assert failure.value.category is ipc.MonitorIPCErrorCategory.INVALID_JOURNAL
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("fence", ["valid", "wrong", "closed", "lost-accepted-ack"])
+def test_child_requires_post_committed_activation_fence_and_keeps_lost_ack_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fence: str,
+) -> None:
+    from palimpsest_local.oci_monitor_launch import MonitorLaunchAuthority
+
+    directory_fd = _directory(tmp_path / "run")
+    identity, nonce = _identity(), "1" * 64
+    parent = monitor.MonitorProcessIdentity(os.getpid() + 10000, _BOOT_ID, 101)
+    events = []
+    config = {
+        "binding": identity.binding.to_dict(),
+        "generation": identity.generation,
+        "nonce": nonce,
+        "parent": parent.to_dict(),
+        "schema": ipc._CONFIG_SCHEMA,
+        "timeout_ms": 100,
+        "launch_authority": {"private": "test"},
+    }
+    frames = iter(
+        [
+            config,
+            ipc._spawn_message("prepare", identity, nonce, parent),
+            ipc._spawn_message("commit", identity, nonce, parent),
+            ipc._spawn_message("activate" if fence != "wrong" else "commit", identity, nonce, parent, (12, 34)),
+        ]
+    )
+
+    class Channel:
+        def settimeout(self, _timeout):
+            pass
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Authority:
+        def validate(self, **_kwargs):
+            events.append("validate")
+
+        def close(self):
+            events.append("close-authority")
+
+    authority = Authority()
+
+    class Bound:
+        identity = (12, 34)
+
+        def __init__(self, *_args):
+            pass
+
+        def validate(self):
+            pass
+
+        def unlink_exact_and_fsync(self):
+            events.append("unlink")
+
+        def close(self, **_kwargs):
+            pass
+
+    class Worker:
+        def __init__(self, received, _fd, _binding, lease):
+            assert received is authority
+            self.lease = lease
+
+        def start(self):
+            assert events[-2:] == ["authorize", "validate"]
+            assert self.lease.snapshot.phase == "committed"
+            events.append("worker-start")
+            self.lease.mark_activating()
+            self.lease.promote_active(_active_binding())
+            self.lease.mark_ready()
+            self.lease.mark_terminal()
+
+        def join(self):
+            pass
+
+    def receive(_channel):
+        value = next(frames)
+        if "committed" in events and value.get("kind") == "activate" and fence == "closed":
+            raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.CLOSED)
+        return value
+
+    def send(_channel, message):
+        events.append(message["kind"])
+        if message["kind"] == "committed":
+            loaded = ipc._read_preactivation_journal(directory_fd, identity)
+            assert loaded is not None and loaded[0].phase == "committed"
+            assert "worker-start" not in events
+        if message["kind"] == "launch-accepted" and fence == "lost-accepted-ack":
+            raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.CLOSED)
+
+    def serve(_bound, _identity, _writer, _timeout, lease, worker):
+        events.append("serve")
+        if worker is None:
+            assert lease.snapshot.phase == "committed"
+            lease.mark_aborting()
+            return False
+        assert lease.snapshot.phase == "terminal"
+        return True
+
+    monkeypatch.setattr(MonitorLaunchAuthority, "from_dict", classmethod(lambda _cls, value, **kwargs: authority))
+    monkeypatch.setattr(ipc.socket, "socket", lambda **_kwargs: Channel())
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    monkeypatch.setattr(ipc, "_recv_frame", receive)
+    monkeypatch.setattr(ipc, "_send_frame", send)
+    monkeypatch.setattr(ipc, "_accept_precommit", lambda *_args: Channel())
+    monkeypatch.setattr(ipc, "_BoundMonitorSocket", Bound)
+    monkeypatch.setattr(ipc, "_authorize_peer", lambda *_args: events.append("authorize"))
+    monkeypatch.setattr(ipc, "_LaunchWorker", Worker)
+    monkeypatch.setattr(ipc, "_serve_committed", serve)
+    try:
+        assert ipc._child_main(directory_fd, 123) == 0
+        launched = fence in {"valid", "lost-accepted-ack"}
+        assert ("worker-start" in events) is launched
+        loaded = ipc._read_preactivation_journal(directory_fd, identity)
+        assert loaded is not None and loaded[0].phase == ("terminal" if launched else "abandoned")
+        assert events.index("committed") < events.index("serve")
+        if launched:
+            assert events.index("worker-start") < events.index("launch-accepted") < events.index("serve")
+    finally:
+        os.close(directory_fd)
 
 
 def test_same_v2_lease_promotes_and_preserves_active_binding(

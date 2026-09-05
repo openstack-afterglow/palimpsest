@@ -1,10 +1,8 @@
-"""Inert fresh-exec IPC and a promotable OCI monitor ownership journal.
+"""Private fresh-exec monitor IPC and its serialized VM ownership journal.
 
-The fresh-exec child remains inert: it receives no libvirt connection,
-lifecycle key, or VM execution capability. Its v2 journal lease shares the
-per-run lock/journal namespace with the active v1 owner. A private synchronous
-runtime can promote a held v2 lease to record exact active VM ownership;
-inert discovery, shutdown, and stale cleanup cannot erase activation evidence.
+The default child is inert. A typed inherited launch authority optionally
+enables a child-owned worker, only after the parent's post-COMMITTED fence.
+Transport shutdown never stops a VM or erases activation evidence.
 """
 
 from __future__ import annotations
@@ -28,7 +26,8 @@ import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from functools import wraps
+from typing import TYPE_CHECKING, Any
 
 from .errors import PalimpsestError
 from .oci_monitor import (
@@ -42,6 +41,9 @@ from .oci_monitor import (
     probe_process_liveness,
 )
 from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
+
+if TYPE_CHECKING:
+    from .oci_monitor_launch import MonitorLaunchAuthority
 
 _SOCKET_NAME = "oci-monitor-ipc-v1.sock"
 _CONFIG_SCHEMA = "palimpsest.oci-monitor-exec-config.v2"
@@ -78,6 +80,8 @@ _PREACTIVATION_PHASES = frozenset(
     }
 )
 _ACTIVATION_PHASES = frozenset({"activating", "active", "ready", "terminal"})
+_DISCOVERABLE_PHASES = frozenset({"committed"}) | _ACTIVATION_PHASES
+_DESCRIBE_STATES = _DISCOVERABLE_PHASES | {"launch-pending", "launch-failed", "control-lost"}
 _RENAME_NOREPLACE = 1
 
 
@@ -589,6 +593,9 @@ class _ForkClosePreactivationLease:
         directory_fd, self.directory_fd = self.directory_fd, -1
         lease = self.lease()
         if lease is not None:
+            # A vanished worker may have held this lock at fork. The child
+            # has no authority and must fail CLOSED, not deadlock on that lock.
+            lease._mutex = threading.RLock()
             lease._lock_fd = -1
             lease._directory_fd = -1
             lease._fork_resource = None
@@ -624,6 +631,15 @@ if hasattr(os, "register_at_fork"):
     )
 
 
+def _serialized_lease(method: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(method)
+    def locked(self: _PreactivationJournalLease, *args: Any, **kwargs: Any) -> Any:
+        with self._mutex:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 class _PreactivationJournalLease:
     __slots__ = (
         "__weakref__",
@@ -634,6 +650,7 @@ class _PreactivationJournalLease:
         "_identity",
         "_lock_fd",
         "_lock_identity",
+        "_mutex",
         "_poisoned",
         "_snapshot",
         "_snapshot_bytes",
@@ -643,6 +660,7 @@ class _PreactivationJournalLease:
         if type(directory_fd) is not int or not isinstance(identity, MonitorExecIdentity):
             raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
         self._closed = False
+        self._mutex = threading.RLock()
         self._directory_fd = -1
         self._directory_identity: tuple[int, int] | None = None
         self._fork_resource: _ForkClosePreactivationLease | None = None
@@ -755,6 +773,7 @@ class _PreactivationJournalLease:
             raise
 
     @property
+    @_serialized_lease
     def snapshot(self) -> MonitorPreactivationJournalSnapshot:
         self._require_authority()
         assert self._snapshot is not None
@@ -766,6 +785,7 @@ class _PreactivationJournalLease:
     def mark_committed(self) -> MonitorPreactivationJournalSnapshot:
         return self._transition("committed", allowed={"prepared"})
 
+    @_serialized_lease
     def validate_directory_binding(self, directory_fd: int) -> None:
         self._require_authority()
         if type(directory_fd) is not int:
@@ -774,6 +794,7 @@ class _PreactivationJournalLease:
         if _journal_identity(os.fstat(directory_fd)) != self._directory_identity:
             raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
 
+    @_serialized_lease
     def validate_launch_binding(
         self,
         binding: MonitorPreActivationBinding,
@@ -814,6 +835,7 @@ class _PreactivationJournalLease:
     def mark_control_lost(self) -> MonitorPreactivationJournalSnapshot:
         return self._transition("control-lost", allowed={"aborting", "adopting"} | _ACTIVATION_PHASES)
 
+    @_serialized_lease
     def _take_over(self, writer: MonitorProcessIdentity) -> MonitorPreactivationJournalSnapshot:
         """Publish stale adoption without requiring authority from the stale writer."""
 
@@ -850,6 +872,7 @@ class _PreactivationJournalLease:
         self._publish(candidate, create=False)
         return candidate
 
+    @_serialized_lease
     def _transition(
         self,
         phase: str,
@@ -1059,6 +1082,7 @@ class _PreactivationJournalLease:
                 self._snapshot = None
                 self._snapshot_bytes = None
 
+    @_serialized_lease
     def _require_authority(self) -> None:
         if self._closed:
             raise MonitorIPCError(MonitorIPCErrorCategory.CLOSED)
@@ -1079,6 +1103,7 @@ class _PreactivationJournalLease:
             self._poisoned = True
             raise
 
+    @_serialized_lease
     def close(self) -> None:
         _FORK_PREACTIVATION_LOCK.acquire()
         try:
@@ -1606,12 +1631,17 @@ def _response_message(
     identity: MonitorExecIdentity,
     writer: MonitorProcessIdentity,
     request_id: str,
+    *,
+    state: str | None = None,
 ) -> dict[str, Any]:
-    state = {
-        MonitorIPCOperation.DESCRIBE: "committed",
-        MonitorIPCOperation.PING: "pong",
-        MonitorIPCOperation.SHUTDOWN: "shutting-down",
-    }[operation]
+    state = (
+        state
+        or {
+            MonitorIPCOperation.DESCRIBE: "committed",
+            MonitorIPCOperation.PING: "pong",
+            MonitorIPCOperation.SHUTDOWN: "shutting-down",
+        }[operation]
+    )
     return {
         "binding_digest": identity.binding_digest,
         "generation": identity.generation,
@@ -1646,13 +1676,62 @@ def _decode_request(
     return operation, request_id, _process_from_dict(value["client"])
 
 
+class _LaunchWorker:
+    """One child-local worker; IPC stays responsive during blocking lifecycle IO."""
+
+    def __init__(
+        self,
+        authority: MonitorLaunchAuthority,
+        directory_fd: int,
+        binding: MonitorPreActivationBinding,
+        lease: _PreactivationJournalLease,
+    ) -> None:
+        self.done = threading.Event()
+        self.failed = False
+        self._authority = authority
+        self._directory_fd = directory_fd
+        self._binding = binding
+        self._lease = lease
+        self._thread = threading.Thread(target=self._run, name="oci-monitor-launch", daemon=False)
+
+    def start(self) -> None:
+        try:
+            self._thread.start()
+        except BaseException:
+            self._authority.close()
+            self.done.set()
+            raise
+
+    def join(self) -> None:
+        if self._thread.ident is not None:
+            self._thread.join()
+
+    def _run(self) -> None:
+        try:
+            self._authority.run(self._directory_fd, self._binding, self._lease)
+        except Exception:
+            # Never expose an exception string, path, or lifecycle secret.
+            self.failed = True
+            try:
+                if self._lease.snapshot.phase in _ACTIVATION_PHASES:
+                    self._lease.mark_control_lost()
+            except MonitorIPCError:
+                pass
+        finally:
+            try:
+                self._authority.close()
+            finally:
+                self.done.set()
+
+
 def _serve_committed(
     bound: _BoundMonitorSocket,
     identity: MonitorExecIdentity,
     writer: MonitorProcessIdentity,
     timeout: float,
     lease: _PreactivationJournalLease,
-) -> None:
+    worker: _LaunchWorker | None = None,
+) -> bool:
     while True:
         bound.validate()
         bound.listener.settimeout(timeout)
@@ -1671,18 +1750,43 @@ def _serve_committed(
                 bound.validate()
             except MonitorIPCError:
                 continue
-            if operation is MonitorIPCOperation.SHUTDOWN:
-                if _has_activation_evidence(lease.snapshot) or lease.snapshot.phase == "control-lost":
+            # A journal publication and this decision must be one serialized
+            # view, including the interval between fsync and in-memory update.
+            with lease._mutex:
+                snapshot = lease.snapshot
+                terminal_shutdown = snapshot.phase == "terminal" and worker is not None and worker.done.is_set()
+                state = None
+                if operation is MonitorIPCOperation.SHUTDOWN:
+                    if worker is not None and not worker.done.is_set():
+                        state = "shutdown-refused"
+                    elif terminal_shutdown:
+                        pass
+                    elif _has_activation_evidence(snapshot) or snapshot.phase == "control-lost":
+                        state = "shutdown-refused"
+                    else:
+                        lease.mark_aborting()
+                elif operation is MonitorIPCOperation.DESCRIBE:
+                    state = snapshot.phase
+                    if state == "committed" and worker is not None:
+                        state = "launch-failed" if worker.done.is_set() else "launch-pending"
+                response = _response_message(operation, identity, writer, request_id, state=state)
+            try:
+                # A slow/lost peer must not hold the ownership mutex while
+                # the lifecycle worker needs to publish READY or TERMINAL.
+                _send_frame(channel, response)
+            except MonitorIPCError:
+                if operation is not MonitorIPCOperation.SHUTDOWN or state == "shutdown-refused":
                     continue
-                lease.mark_aborting()
-            _send_frame(channel, _response_message(operation, identity, writer, request_id))
+                # An accepted transport shutdown is durable even if its ACK
+                # is lost. Finish exact socket cleanup after leaving channel.
         if operation is MonitorIPCOperation.SHUTDOWN:
-            return
+            if state != "shutdown-refused":
+                return terminal_shutdown
 
 
 def _identity_from_config(value: dict[str, Any]) -> tuple[MonitorExecIdentity, MonitorProcessIdentity, str, float]:
     expected = {"binding", "generation", "nonce", "parent", "schema", "timeout_ms"}
-    if set(value) != expected or value.get("schema") != _CONFIG_SCHEMA:
+    if set(value) not in (expected, expected | {"launch_authority"}) or value.get("schema") != _CONFIG_SCHEMA:
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
     nonce = value["nonce"]
     timeout_ms = value["timeout_ms"]
@@ -1737,9 +1841,19 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
         return 70
     bound: _BoundMonitorSocket | None = None
     lease: _PreactivationJournalLease | None = None
+    authority = None
+    worker: _LaunchWorker | None = None
     try:
         config.settimeout(_MAX_TIMEOUT_SECONDS)
-        identity, parent, nonce, timeout = _identity_from_config(_recv_frame(config))
+        value = _recv_frame(config)
+        identity, parent, nonce, timeout = _identity_from_config(value)
+        if "launch_authority" in value:
+            from .oci_monitor_launch import MonitorLaunchAuthority
+
+            authority = MonitorLaunchAuthority.from_dict(
+                value["launch_authority"], excluded_fds=(directory_fd, config_fd)
+            )
+            authority.validate(directory_fd=directory_fd, binding=identity.binding)
         if parent.pid == os.getpid():
             raise MonitorIPCError(MonitorIPCErrorCategory.UNAUTHORIZED_PEER)
         writer = current_process_identity()
@@ -1772,17 +1886,47 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
                 # The durable committed journal is now authoritative. Losing
                 # the parent ACK path must not tear down a discoverable monitor.
                 pass
+            if authority is not None:
+                try:
+                    fence = _recv_frame(channel)
+                    _validate_spawn_message(fence, "activate", identity, nonce, parent, bound.identity)
+                    _authorize_peer(channel, parent, identity.owner_uid)
+                    bound.validate()
+                    if lease.snapshot.phase != "committed":
+                        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
+                    authority.validate(directory_fd=directory_fd, binding=identity.binding)
+                except Exception:
+                    # COMMIT alone grants no VM mutation authority. Parent
+                    # death/lost fence leaves an inert discoverable journal.
+                    authority.close()
+                    authority = None
+                else:
+                    worker = _LaunchWorker(authority, directory_fd, identity.binding, lease)
+                    authority = None  # The worker now owns these inherited FDs.
+                    worker.start()
+                    try:
+                        _send_frame(channel, _spawn_message("launch-accepted", identity, nonce, writer, bound.identity))
+                    except MonitorIPCError:
+                        # The activation fence was accepted. Losing this ACK
+                        # cannot revoke child ownership or stop an active VM.
+                        pass
         try:
             config.close()
         except OSError:
             pass
-        _serve_committed(bound, identity, writer, timeout, lease)
+        preserve_terminal = _serve_committed(bound, identity, writer, timeout, lease, worker)
         bound.unlink_exact_and_fsync()
-        lease.mark_abandoned()
+        if not preserve_terminal:
+            lease.mark_abandoned()
         bound.close()
         lease.close()
         return 0
     except Exception as failure:
+        # Never tear down the worker's descriptors or release its ownership
+        # lease while lifecycle IO might still be using them. A broken IPC
+        # listener is not permission to abandon or terminate its VM.
+        if worker is not None:
+            worker.join()
         error = (
             failure if isinstance(failure, MonitorIPCError) else MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED)
         )
@@ -1823,6 +1967,8 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
             lease.close()
         return 70
     finally:
+        if authority is not None:
+            authority.close()
         try:
             config.close()
         except OSError:
@@ -1910,7 +2056,11 @@ class MonitorExecHandle:
         if result != 0:
             raise MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED)
         loaded = _read_preactivation_journal(self._directory_fd, self._endpoint.identity)
-        if loaded is None or loaded[0].phase != "abandoned" or loaded[0].writer != self._endpoint.writer:
+        if (
+            loaded is None
+            or loaded[0].phase not in {"abandoned", "terminal"}
+            or loaded[0].writer != self._endpoint.writer
+        ):
             raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
         assert self._endpoint.socket_name is not None
         try:
@@ -1939,8 +2089,9 @@ def spawn_monitor_exec(
     timeout: float = 5.0,
     executable: str | None = None,
     popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    launch_authority: MonitorLaunchAuthority | None = None,
 ) -> MonitorExecHandle:
-    """Fresh-exec a capability-free monitor and commit reciprocal IPC identity."""
+    """Commit reciprocal identity, then optionally fence a typed child launch."""
 
     if (
         not isinstance(identity, MonitorExecIdentity)
@@ -1950,6 +2101,16 @@ def spawn_monitor_exec(
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
     _validate_directory(directory_fd)
     _require_spawn_boundary()
+    authority_fds: tuple[int, ...] = ()
+    if launch_authority is not None:
+        from .oci_monitor_launch import MonitorLaunchAuthority
+
+        if type(launch_authority) is not MonitorLaunchAuthority:
+            raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+        launch_authority.validate(directory_fd=directory_fd, binding=identity.binding)
+        authority_fds = launch_authority.pass_fds
+        if directory_fd in authority_fds:
+            raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
     with _SPAWN_LOCK:
         try:
             parent = current_process_identity()
@@ -1973,7 +2134,7 @@ def spawn_monitor_exec(
                 process = popen_factory(
                     argv,
                     close_fds=True,
-                    pass_fds=(directory_fd, child.fileno()),
+                    pass_fds=(directory_fd, child.fileno(), *authority_fds),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -1984,17 +2145,17 @@ def spawn_monitor_exec(
                 raise MonitorIPCError(MonitorIPCErrorCategory.SPAWN_FAILED) from None
             child.close()
             local.settimeout(timeout)
-            _send_frame(
-                local,
-                {
-                    "binding": identity.binding.to_dict(),
-                    "generation": identity.generation,
-                    "nonce": nonce,
-                    "parent": _process_to_dict(parent),
-                    "schema": _CONFIG_SCHEMA,
-                    "timeout_ms": int(timeout * 1000),
-                },
-            )
+            config_value = {
+                "binding": identity.binding.to_dict(),
+                "generation": identity.generation,
+                "nonce": nonce,
+                "parent": _process_to_dict(parent),
+                "schema": _CONFIG_SCHEMA,
+                "timeout_ms": int(timeout * 1000),
+            }
+            if launch_authority is not None:
+                config_value["launch_authority"] = launch_authority.to_dict()
+            _send_frame(local, config_value)
             if _recv_frame(local) != {"kind": "bound", "schema": _SPAWN_SCHEMA}:
                 raise MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED)
             socket_name = _socket_name_for_generation(identity.generation)
@@ -2048,6 +2209,16 @@ def spawn_monitor_exec(
                         *endpoint_identity,
                     ),
                 )
+                if launch_authority is not None:
+                    _send_frame(channel, _spawn_message("activate", identity, nonce, parent, endpoint_identity))
+                    _validate_spawn_message(
+                        _recv_frame(channel),
+                        "launch-accepted",
+                        identity,
+                        nonce,
+                        writer,
+                        endpoint_identity,
+                    )
             endpoint = MonitorExecEndpoint(identity, writer, *endpoint_identity, socket_name)
             local.close()
             return MonitorExecHandle(directory_fd, endpoint, process, timeout)
@@ -2120,8 +2291,18 @@ def request_monitor(
         _send_frame(channel, _request_message(operation, endpoint.identity, client, request_id))
         value = _recv_frame(channel)
     expected = _response_message(operation, endpoint.identity, endpoint.writer, request_id)
+    if (
+        operation is MonitorIPCOperation.DESCRIBE
+        and type(value.get("state")) is str
+        and value["state"] in _DESCRIBE_STATES
+    ):
+        expected["state"] = value["state"]
+    elif operation is MonitorIPCOperation.SHUTDOWN and value.get("state") == "shutdown-refused":
+        expected["state"] = "shutdown-refused"
     if value != expected:
         raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+    if expected["state"] == "shutdown-refused":
+        raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
     return MonitorIPCReply(operation, expected["state"], endpoint.writer)
 
 
@@ -2135,8 +2316,15 @@ def shutdown_monitor_exec(
 
     loaded = _read_preactivation_journal(directory_fd, endpoint.identity)
     assert loaded is not None
-    if _has_activation_evidence(loaded[0]) or loaded[0].phase == "control-lost":
+    if (_has_activation_evidence(loaded[0]) and loaded[0].phase != "terminal") or loaded[0].phase == "control-lost":
         raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
+    if loaded[0].phase == "terminal":
+        try:
+            live = probe_process_liveness(loaded[0].writer)
+        except Exception:
+            live = ProcessLiveness.UNKNOWN
+        if live is not ProcessLiveness.LIVE:
+            raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
     reply = request_monitor(directory_fd, endpoint, MonitorIPCOperation.SHUTDOWN, timeout=timeout)
     if reply.state != "shutting-down":
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
@@ -2147,7 +2335,7 @@ def shutdown_monitor_exec(
         snapshot = loaded[0]
         if snapshot.phase == "control-lost":
             raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
-        if snapshot.phase == "abandoned":
+        if snapshot.phase in {"abandoned", "terminal"}:
             assert endpoint.socket_name is not None
             try:
                 os.stat(endpoint.socket_name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2155,7 +2343,8 @@ def shutdown_monitor_exec(
                 return snapshot
             except OSError:
                 raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST) from None
-            raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
+            if snapshot.phase == "abandoned":
+                raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
         if time.monotonic() >= deadline:
             raise MonitorIPCError(MonitorIPCErrorCategory.TIMEOUT)
         time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
@@ -2168,7 +2357,7 @@ def discover_monitor_exec(
     timeout: float = 5.0,
     liveness_probe: Callable[[MonitorProcessIdentity], ProcessLiveness] = probe_process_liveness,
 ) -> MonitorExecEndpoint:
-    """Discover only a live, exact committed monitor for the caller's binding."""
+    """Discover an exact live binding across monotonic activation revisions."""
 
     if not isinstance(binding, MonitorPreActivationBinding) or not callable(liveness_probe):
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
@@ -2183,13 +2372,29 @@ def discover_monitor_exec(
         raise MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED)
     if liveness is not ProcessLiveness.LIVE:
         raise MonitorIPCError(MonitorIPCErrorCategory.WRITER_UNKNOWN)
-    if snapshot.phase != "committed":
+    if snapshot.phase not in _DISCOVERABLE_PHASES:
         raise MonitorIPCError(MonitorIPCErrorCategory.NOT_COMMITTED)
     endpoint = snapshot.endpoint
     reply = request_monitor(directory_fd, endpoint, MonitorIPCOperation.DESCRIBE, timeout=timeout)
-    if reply.state != "committed":
+    if reply.state not in _DISCOVERABLE_PHASES | {"launch-pending", "launch-failed"}:
         raise MonitorIPCError(MonitorIPCErrorCategory.NOT_COMMITTED)
-    if _read_preactivation_journal(directory_fd, endpoint.identity) != loaded:
+    after = _read_preactivation_journal(directory_fd, endpoint.identity)
+    assert after is not None
+    # The worker may advance while DESCRIBE is in flight. Only monotonic
+    # revisions with the exact same process/socket/identity are acceptable.
+    latest = after[0]
+    order = {phase: index for index, phase in enumerate(("committed", "activating", "active", "ready", "terminal"))}
+    described_phase = "committed" if reply.state in {"launch-pending", "launch-failed"} else reply.state
+    if (
+        latest.phase not in _DISCOVERABLE_PHASES
+        or latest.endpoint != endpoint
+        or latest.nonce_digest != snapshot.nonce_digest
+        or latest.revision < snapshot.revision
+        or not order[snapshot.phase] <= order[described_phase] <= order[latest.phase]
+        or latest.revision - snapshot.revision != order[latest.phase] - order[snapshot.phase]
+        or (snapshot.active_binding is not None and latest.active_binding != snapshot.active_binding)
+        or (latest.revision == snapshot.revision and after != loaded)
+    ):
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
     return endpoint
 
@@ -2417,7 +2622,11 @@ def _entrypoint(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(_entrypoint(sys.argv))
+    # Runtime imports must share canonical dataclass/lease identities, not a
+    # second set of classes created under Python's __main__ module alias.
+    from palimpsest_local.oci_monitor_ipc import _entrypoint as _canonical_entrypoint
+
+    raise SystemExit(_canonical_entrypoint(sys.argv))
 
 
 __all__ = [

@@ -251,6 +251,29 @@ terminal publication failure preserves an already-durable `exited` state.
 Trusted authority transfer and child-owned libvirt/event execution remain
 unimplemented, as do public `run -d`, authenticated VM STOP, and Gate 2.
 
+Slice 30J adds an optional launch authority to the fresh-exec monitor. Explicit
+inherited FDs bind the selected state/store/run roots and boot artifacts; strict
+metadata/profile checks and boot/store verification precede child-owned libvirt
+access. The parent must confirm COMMITTED and send a distinct authenticated
+activation fence. A non-daemon worker then owns the existing bound, leased
+launch while the IPC main thread remains responsive. Journal operations are
+serialized, and authority is not released until worker completion.
+
+The live test now qualifies both synchronous and child-owned variants. A clean
+launcher exits before the child finishes an actual VM create; PING and live
+discovery must still work. The test continues the worker and verifies the
+terminal journal's child identity before retiring its transport. The terminal
+journal is retained, not abandoned. Active SHUTDOWN is not supported and must
+not be confused with authenticated guest STOP.
+
+The child's test-only DAC adapter verifies the exact held broker target and
+named-QEMU ACL, allowing only the known permission/ctime effect of that grant
+before applying the original metadata checks. Directory timestamps may change
+through normal state publication; immutable boot-file timestamps may not.
+Production authority validation does not relax permissions. Domain definition
+still precedes the clean launcher; public foreground/detached dispatch and
+local build-to-run Gate 2 remain disabled.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

@@ -12,7 +12,9 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -43,6 +45,7 @@ from palimpsest_local.oci_converter import (
     LayerIntakeReceipt,
 )
 from palimpsest_local.oci_initramfs import build_bootstrap_initramfs
+from palimpsest_local.oci_lifecycle_transport import OCILifecycleHandoffReceipt
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
@@ -84,7 +87,7 @@ from palimpsest_local.oci_store import (
     MaterializationResult,
     OCIStore,
 )
-from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from palimpsest_local.runtime_types import DispatchKey, ProcessExit, ProcessExitCategory, RuntimeBackend, RuntimeKind
 from palimpsest_local.state import StatePaths, init_resolved_roots, read_run_ledger_snapshot, reserve_new_run
 
 pytestmark = [pytest.mark.kvm, pytest.mark.oci_root_libvirt]
@@ -2664,7 +2667,100 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
     assert domain.undefine_calls == 1
 
 
-def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
+def _launch_in_exec_monitor(root, roots, binding, boot, conn):
+    launched = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
+        input=json.dumps(
+            {
+                "root": str(root),
+                "binding": binding.to_dict(),
+                "kernel": str(boot.kernel.path),
+                "initramfs": str(boot.initramfs.path),
+                "kernel_digest": boot.kernel.digest,
+                "initramfs_digest": boot.initramfs.digest,
+            }
+        ),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert launched.returncode == 0, launched.stderr[-8000:]
+    response = json.loads(launched.stdout)
+    endpoint = monitor_ipc.MonitorExecEndpoint.from_dict(response["endpoint"])
+    assert endpoint.writer.pid not in {os.getpid(), response["launcher_pid"]}
+    directory_fd = os.open(
+        roots.runs / binding.record.name / "monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        deadline = time.monotonic() + 75
+        observed_active = False
+        while time.monotonic() < deadline:
+            snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
+            if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
+                # The clean launcher has already exited. Its child owns a real
+                # VM and must still answer IPC while its worker waits in create.
+                assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
+                assert (
+                    monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.PING).state
+                    == "pong"
+                )
+                observed_active = True
+                (root / "continue-monitor").write_bytes(b"continue\n")
+            if snapshot.phase == "terminal":
+                break
+            assert snapshot.phase not in {"control-lost", "aborting", "abandoned"}, snapshot.to_dict()
+            time.sleep(0.02)
+        else:
+            raise AssertionError("child monitor did not reach TERMINAL")
+        assert observed_active
+        assert snapshot.writer == endpoint.writer
+        assert snapshot.revision == 7
+        assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
+        # TERMINAL publication precedes worker completion; retry only the
+        # transport-retirement request until its connection is released.
+        while True:
+            try:
+                retired = monitor_ipc.shutdown_monitor_exec(directory_fd, endpoint, timeout=1)
+                break
+            except monitor_ipc.MonitorIPCError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+        assert retired.phase == "terminal"
+        handoff = read_run_ledger_snapshot(roots, binding.record.name).state["oci_root_handoff"]
+        receipt = handoff["lifecycle"]
+        exit_data = receipt["terminal"]
+        terminal = ProcessExit(
+            exit_data["returncode"],
+            exit_data["exit_code"],
+            exit_data["signal_number"],
+            ProcessExitCategory(exit_data["category"]),
+        )
+        lifecycle = OCILifecycleHandoffReceipt(
+            receipt["boot_attempt_id"],
+            receipt["boot_generation"],
+            receipt["key_id"],
+            receipt["phase"],
+            tuple(receipt["transcript"]),
+            terminal,
+        )
+        return oci_root_runtime.CompletedOCIRootHandoff(
+            binding.record.run_id,
+            binding.record.name,
+            binding.plan_digest,
+            binding.domain_uuid,
+            handoff["domain_id"],
+            binding.libvirt_uri,
+            terminal,
+            lifecycle,
+        ), snapshot
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("child_owned", [False, True])
+def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool) -> None:
     if os.environ.get(_ENABLE_ENV) != "1":
         pytest.skip(f"set {_ENABLE_ENV}=1 on the qualified native Linux/KVM libvirt runner")
     qualification_root, qualification_root_identity = _create_qualification_root()
@@ -2838,35 +2934,50 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
         # The host monitor must not share the guest-accessible lifecycle
         # directory: the qualification DAC broker grants QEMU access there.
-        monitor_fd = os.open(monitor_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if not child_owned:
+            monitor_fd = os.open(monitor_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                monitor_identity = monitor_ipc.MonitorExecIdentity(monitor_binding, str(uuid.uuid4()))
+                monitor_lease = monitor_ipc._PreactivationJournalLease.create(
+                    monitor_fd, monitor_identity, secrets.token_hex(32), monitor_ipc.current_process_identity()
+                )
+                monitor_socket = monitor_ipc._BoundMonitorSocket(monitor_fd, monitor_lease.snapshot.socket_name)
+                monitor_lease.mark_prepared(*monitor_socket.identity)
+                monitor_lease.mark_committed()
+            finally:
+                os.close(monitor_fd)
         try:
-            monitor_identity = monitor_ipc.MonitorExecIdentity(monitor_binding, str(uuid.uuid4()))
-            monitor_lease = monitor_ipc._PreactivationJournalLease.create(
-                monitor_fd, monitor_identity, secrets.token_hex(32), monitor_ipc.current_process_identity()
-            )
-            monitor_socket = monitor_ipc._BoundMonitorSocket(monitor_fd, monitor_lease.snapshot.socket_name)
-            monitor_lease.mark_prepared(*monitor_socket.identity)
-            monitor_lease.mark_committed()
-        finally:
-            os.close(monitor_fd)
-        try:
-            completed = launch_defined_oci_root_domain(
-                roots,
-                name,
-                store,
-                boot,
-                profile,
-                conn=activation_conn,
-                timeout_seconds=45,
-                terminal_timeout_seconds=45,
-                monitor_binding=monitor_binding,
-                monitor_lease=monitor_lease,
-            )
+            if child_owned:
+                # The child applies the identical named-QEMU ACL grant. Keep
+                # the parent's original held snapshots for restoration only
+                # after the exact terminal domain has been removed.
+                broker.applied = True
+                completed, monitor_snapshot = _launch_in_exec_monitor(
+                    qualification_root, roots, monitor_binding, boot, conn
+                )
+            else:
+                completed = launch_defined_oci_root_domain(
+                    roots,
+                    name,
+                    store,
+                    boot,
+                    profile,
+                    conn=activation_conn,
+                    timeout_seconds=45,
+                    terminal_timeout_seconds=45,
+                    monitor_binding=monitor_binding,
+                    monitor_lease=monitor_lease,
+                )
+                monitor_snapshot = monitor_lease.snapshot
         except BaseException as exc:
+            if child_owned:
+                # An unconfirmed child can still own the VM. Never race its
+                # mutation authority with qualification cleanup in the parent.
+                retain_qualification_state = True
+                broker.ambiguous = True
             _annotate_qualification_console_failure(exc, console_path)
             raise
         assert completed.domain_id > 0
-        monitor_snapshot = monitor_lease.snapshot
         assert monitor_snapshot.phase == "terminal"
         assert monitor_snapshot.revision == 7
         assert monitor_snapshot.active_binding is not None
@@ -2875,15 +2986,13 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         assert monitor_snapshot.active_binding.boot_attempt_id == expected_boot_attempt_id
         assert monitor_snapshot.active_binding.definition_projection_digest == expected_inactive_projection_digest
         assert stat.S_IMODE(monitor_directory.stat().st_mode) == 0o700
-        # This test holds the real journal in the qualification process; it
-        # does not claim fresh-exec child ownership or runtime IPC service.
-        # Terminal ownership was verified above. Remove only our exact socket
-        # before the regular-file/directory qualification tree cleanup.
-        monitor_socket.unlink_exact_and_fsync()
-        monitor_socket.close()
-        monitor_socket = None
-        monitor_lease.close()
-        monitor_lease = None
+        if not child_owned:
+            # The synchronous variant holds the journal in this process.
+            monitor_socket.unlink_exact_and_fsync()
+            monitor_socket.close()
+            monitor_socket = None
+            monitor_lease.close()
+            monitor_lease = None
         owned_domain_id = -1
         assert expected_inactive_projection_digest is not None
 

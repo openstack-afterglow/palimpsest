@@ -269,6 +269,173 @@ def test_spawn_boundary_rejects_loaded_libvirt_or_multiple_threads(monkeypatch: 
     assert threaded.value.category is ipc.MonitorIPCErrorCategory.SPAWN_BOUNDARY
 
 
+@pytest.mark.parametrize("failure", [None, "journal", "ack"])
+def test_parent_activation_fence_follows_exact_committed_reread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    from types import SimpleNamespace
+
+    from palimpsest_local.oci_monitor_launch import MonitorLaunchAuthority
+
+    directory_fd = _directory(tmp_path / "run")
+    identity, parent, writer, nonce = _identity(), _process(), _process(), "1" * 64
+    events = []
+    authority = object.__new__(MonitorLaunchAuthority)
+    monkeypatch.setattr(MonitorLaunchAuthority, "validate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MonitorLaunchAuthority, "pass_fds", property(lambda _self: (401, 402)))
+    monkeypatch.setattr(MonitorLaunchAuthority, "to_dict", lambda _self: {"private": "fd-authority"})
+
+    class Channel:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def fileno(self):
+            return 400
+
+        def settimeout(self, _timeout):
+            pass
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    prepared = ipc.MonitorPreactivationJournalSnapshot(
+        identity,
+        ipc._nonce_digest(nonce),
+        "prepared",
+        2,
+        writer,
+        ipc._socket_name_for_generation(identity.generation),
+        12,
+        34,
+    )
+    responses = iter(
+        [
+            {"kind": "bound", "schema": ipc._SPAWN_SCHEMA},
+            ipc._spawn_message("prepared", identity, nonce, writer, (12, 34)),
+            ipc._spawn_message("committed", identity, nonce, writer, (12, 34)),
+            ipc._spawn_message("launch-accepted", identity, nonce, writer, (12, 34)),
+        ]
+    )
+
+    def receive(_channel):
+        value = next(responses)
+        if failure == "ack" and value["kind"] == "launch-accepted":
+            raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.CLOSED)
+        return value
+
+    def exact(_fd, snapshot):
+        events.append("read-" + snapshot.phase)
+        if failure == "journal" and snapshot.phase == "committed":
+            raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.INVALID_JOURNAL)
+
+    def spawn(_argv, **kwargs):
+        assert kwargs["pass_fds"] == (directory_fd, 400, 401, 402)
+        return SimpleNamespace(pid=writer.pid)
+
+    monkeypatch.setattr(ipc, "_require_spawn_boundary", lambda: None)
+    monkeypatch.setattr(ipc, "current_process_identity", lambda: parent)
+    monkeypatch.setattr(ipc.os, "urandom", lambda _count: bytes.fromhex(nonce))
+    monkeypatch.setattr(ipc.socket, "socketpair", lambda *_args: (Channel(), Channel()))
+    monkeypatch.setattr(ipc.socket, "socket", Channel)
+    monkeypatch.setattr(ipc, "_send_frame", lambda _channel, value: events.append(value.get("kind", "config")))
+    monkeypatch.setattr(ipc, "_recv_frame", receive)
+    monkeypatch.setattr(ipc, "_visible_socket", lambda *_args: SimpleNamespace(st_dev=12, st_ino=34))
+    monkeypatch.setattr(ipc, "_connect_socket", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_authorize_peer", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_read_boot_id_for_spawn", lambda: writer.host_boot_id)
+    monkeypatch.setattr(ipc, "_read_start_ticks_for_spawn", lambda _pid: writer.start_ticks)
+    monkeypatch.setattr(ipc, "_read_preactivation_journal", lambda *_args: (prepared, b"unused"))
+    monkeypatch.setattr(ipc, "_require_exact_journal_snapshot", exact)
+    monkeypatch.setattr(ipc, "_terminate_failed_child", lambda *_args: pytest.fail("committed child must survive"))
+    try:
+        if failure:
+            with pytest.raises(ipc.MonitorIPCError):
+                ipc.spawn_monitor_exec(directory_fd, identity, launch_authority=authority, popen_factory=spawn)
+        else:
+            handle = ipc.spawn_monitor_exec(directory_fd, identity, launch_authority=authority, popen_factory=spawn)
+            handle.close()
+        assert events[:5] == ["config", "prepare", "read-prepared", "commit", "read-committed"]
+        assert ("activate" in events) is (failure != "journal")
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("authority", [object(), {}, True])
+def test_spawn_rejects_untyped_launch_authority_before_child_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: object,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "_require_spawn_boundary", lambda: None)
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as failure:
+            ipc.spawn_monitor_exec(
+                directory_fd,
+                _identity(),
+                launch_authority=authority,
+                popen_factory=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+            )
+        assert failure.value.category is ipc.MonitorIPCErrorCategory.INVALID_IDENTITY
+        assert list((tmp_path / "run").iterdir()) == []
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.skipif(not _linux_peercred(), reason="requires Linux /proc and SO_PEERCRED")
+def test_fresh_exec_rejects_invalid_launch_authority_before_ownership_claim(tmp_path: Path) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    local, child = socket.socketpair()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "palimpsest_local.oci_monitor_ipc",
+            "--private-child-v2",
+            str(directory_fd),
+            str(child.fileno()),
+        ],
+        close_fds=True,
+        pass_fds=(directory_fd, child.fileno()),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={"PATH": os.defpath, "PYTHONNOUSERSITE": "1"},
+    )
+    child.close()
+    try:
+        local.settimeout(2)
+        ipc._send_frame(
+            local,
+            {
+                "binding": _identity().binding.to_dict(),
+                "generation": _identity().generation,
+                "nonce": "1" * 64,
+                "parent": ipc.current_process_identity().to_dict(),
+                "schema": ipc._CONFIG_SCHEMA,
+                "timeout_ms": 100,
+                "launch_authority": {},
+            },
+        )
+        assert ipc._recv_frame(local) == {"schema": ipc._SPAWN_SCHEMA, "kind": "error", "category": "child-failed"}
+        assert process.wait(timeout=2) == 70
+        assert list((tmp_path / "run").iterdir()) == []
+    finally:
+        local.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(directory_fd)
+
+
 def test_directory_requires_exact_owner_private_mode(tmp_path: Path) -> None:
     directory = tmp_path / "run"
     directory.mkdir(mode=0o755)

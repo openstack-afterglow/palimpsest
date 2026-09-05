@@ -3699,7 +3699,7 @@ def test_oci_root_monitor_lease_loss_after_starting_intent_does_not_create_or_cl
 
 
 @pytest.mark.parametrize("boundary", ["channel", "ready", "terminal", "cleanup-destroy", "cleanup-undefine"])
-@pytest.mark.parametrize("revocation", ["close", "control-lost"])
+@pytest.mark.parametrize("revocation", ["close", "control-lost", "bootstrap-authority"])
 def test_oci_root_monitor_rechecks_journal_after_last_domain_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, boundary: str, revocation: str
 ) -> None:
@@ -3725,7 +3725,7 @@ def test_oci_root_monitor_rechecks_journal_after_last_domain_read(
         if not invalidated and (armed or (boundary == "channel" and id_reads == 3)):
             if revocation == "close":
                 lease.close()
-            else:
+            elif revocation == "control-lost":
                 lease.mark_control_lost()
             invalidated = True
         return result
@@ -3757,10 +3757,24 @@ def test_oci_root_monitor_rechecks_journal_after_last_domain_read(
 
     domain.ID = domain_id
     domain.destroy = destroy
+
+    def authority_guard():
+        if revocation == "bootstrap-authority" and invalidated:
+            raise StateError("inherited bootstrap authority changed")
+
     monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
     with pytest.raises(StateError, match="cleanup is required"):
         launch_defined_oci_root_domain(
-            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding, monitor_lease=lease
+            roots,
+            name,
+            store,
+            boot,
+            profile,
+            conn=conn,
+            runner=tools,
+            monitor_binding=binding,
+            monitor_lease=lease,
+            authority_guard=authority_guard,
         )
     assert invalidated
     assert domain.create_calls == 1

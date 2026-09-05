@@ -1,0 +1,250 @@
+"""Test-only clean launcher and qualified child adapter; never a runtime entrypoint."""
+
+from __future__ import annotations
+
+import json
+import os
+import runpy
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _guard_lifecycle_connect(original_connect, path: Path):
+    def connect(channel, address):
+        if isinstance(address, (str, bytes, os.PathLike)) and os.fsdecode(address) == str(path):
+            raise AssertionError("direct lifecycle socket connection is forbidden")
+        return original_connect(channel, address)
+
+    return connect
+
+
+def _qualification_metadata_adapter(original_metadata, context, acl_structure, acl_mode):
+    """Permit exactly the broker's recorded grant, never a general mode bypass."""
+
+    def metadata(key, entry, opened, visible, owner_uid):
+        # The control socket and ownership journal are never QEMU resources.
+        if key == "monitor":
+            return original_metadata(key, entry, opened, visible, owner_uid)
+        broker = context.get("broker")
+        target = (
+            None
+            if broker is None
+            else next(
+                (
+                    item
+                    for item in broker.targets
+                    if (item.opened.st_dev, item.opened.st_ino) == (opened.st_dev, opened.st_ino)
+                ),
+                None,
+            )
+        )
+        if target is None or not broker.applied:
+            return original_metadata(key, entry, opened, visible, owner_uid)
+        # FD/path identity checks also remain in the production validator.
+        current = broker._verify_held(target)
+        original = target.original_acl
+        mask = acl_mode(original.group) | acl_mode(target.permission)
+        mask_text = f"{'r' if mask & 4 else '-'}{'w' if mask & 2 else '-'}{'x' if mask & 1 else '-'}"
+        expected = acl_structure(
+            original.user, ((broker.uid, target.permission),), original.group, mask_text, original.other
+        )
+        granted = context["granted"][(opened.st_dev, opened.st_ino)]
+        if broker._getfacl(target) != expected or any(
+            value.st_mode != granted.st_mode
+            or (not stat.S_ISDIR(value.st_mode) and value.st_ctime_ns != granted.st_ctime_ns)
+            for value in (opened, visible, current)
+        ):
+            raise ValueError("qualified monitor ACL changed")
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+
+        def normalized(value):
+            data = {field: getattr(value, field) for field in fields}
+            data["st_mode"] = entry["mode"]
+            data["st_ctime_ns"] = entry["ctime_ns"]
+            return SimpleNamespace(**data)
+
+        return original_metadata(key, entry, normalized(opened), normalized(visible), owner_uid)
+
+    return metadata
+
+
+def _install_qualification(root: Path) -> None:
+    # The qualified server supplies libvirt-python outside the test venv.
+    # Production intentionally does not inherit or infer this search path.
+    sys.path.append("/usr/lib/python3/dist-packages")
+    import palimpsest_local.oci_monitor_launch as authority_module
+    from palimpsest_local import oci_root_kvm, oci_root_runtime
+    from palimpsest_local.state import read_run_ledger_snapshot
+
+    fixture = runpy.run_path(str(Path(__file__).with_name("test_oci_root_libvirt_live.py")))
+    original_xml = oci_root_kvm.build_oci_root_domain_xml
+    original_lower = oci_root_kvm._verified_lower_path
+    original_connect = oci_root_runtime.connect_oci_root_libvirt
+    original_run = authority_module.MonitorLaunchAuthority.run
+    original_metadata = authority_module._validate_entry_metadata
+    context: dict = {}
+
+    def xml(spec, profile):
+        return original_xml(replace(spec, console_log=root / "console.log"), profile)
+
+    def lower(roots, digest, size):
+        return fixture["_stage_qualified_lower"](original_lower(roots, digest, size), digest, size, root / "l")
+
+    metadata = _qualification_metadata_adapter(
+        original_metadata, context, fixture["_ACLStructure"], fixture["_acl_mode"]
+    )
+
+    def connect(uri):
+        assert threading.current_thread() is not threading.main_thread()
+        conn = original_connect(uri)
+        roots, store, boot, profile = context["resources"]
+        binding = context["binding"]
+        resolved = oci_root_kvm.resolve_committed_oci_root_domain_plan(
+            roots,
+            read_run_ledger_snapshot(roots, binding.record.name),
+            store,
+            boot,
+            profile,
+            expected_status="defined",
+        )
+        uid, _gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
+        broker = fixture["_QualificationDACBroker"](
+            root, uid, fixture["_qualification_acl_specifications"](root, resolved.xml)
+        )
+        context["broker"] = broker
+        proxy = fixture["_ActivationConnectionProxy"](conn, binding.domain_uuid, broker)
+        original_apply = broker.apply
+
+        def apply():
+            original_apply()
+            context["granted"] = {
+                (target.opened.st_dev, target.opened.st_ino): os.fstat(target.descriptor) for target in broker.targets
+            }
+
+        broker.apply = apply
+        domain = proxy.lookupByName(binding.record.name)
+        original_create = domain.create
+
+        def create():
+            result = original_create()
+            deadline = time.monotonic() + 30
+            # Hold an actual active VM at the create boundary while the launcher
+            # has exited, so the test can verify the independent IPC main loop.
+            while not (root / "continue-monitor").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("qualified monitor continuation was not delivered")
+                time.sleep(0.01)
+            return result
+
+        domain.create = create
+        return proxy
+
+    def run(self, directory_fd, binding, lease):
+        original_socket_connect = socket.socket.connect
+        try:
+            context["resources"] = self._rebuild()
+            context["binding"] = binding
+            socket.socket.connect = _guard_lifecycle_connect(
+                original_socket_connect, context["resources"][0].runs / binding.record.name / "lifecycle.sock"
+            )
+            return original_run(self, directory_fd, binding, lease)
+        except BaseException:
+            # Qualification evidence only: traceback lines, no captured locals.
+            try:
+                fd = os.open(
+                    root / "monitor-child-error.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+                )
+                with os.fdopen(fd, "w") as output:
+                    output.write(traceback.format_exc())
+            except OSError:
+                pass
+            raise
+        finally:
+            socket.socket.connect = original_socket_connect
+
+    oci_root_kvm.build_oci_root_domain_xml = xml
+    oci_root_kvm._verified_lower_path = lower
+    oci_root_runtime.connect_oci_root_libvirt = connect
+    authority_module._validate_entry_metadata = metadata
+    authority_module.MonitorLaunchAuthority.run = run
+
+
+def main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from palimpsest_local import oci_monitor_ipc as ipc
+
+    if sys.argv[1] == "child":
+        _install_qualification(Path(sys.argv[2]))
+        return ipc._entrypoint([__file__, *sys.argv[-3:]])
+
+    from palimpsest_local.oci_monitor_launch import prepare_monitor_launch_authority
+    from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
+    from palimpsest_local.oci_store import OCIStore
+    from palimpsest_local.platforms import resolve_domain_profile
+    from palimpsest_local.state import StatePaths
+
+    payload = json.load(sys.stdin)
+    root = Path(payload["root"])
+    roots = StatePaths(root / "c", root / "s")
+    binding = ipc.MonitorPreActivationBinding.from_dict(payload["binding"])
+    boot = verify_host_boot_artifacts(
+        Path(payload["kernel"]),
+        Path(payload["initramfs"]),
+        expected_kernel_digest=payload["kernel_digest"],
+        expected_initramfs_digest=payload["initramfs_digest"],
+    )
+    directory_fd = os.open(
+        roots.runs / binding.record.name / "monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        with prepare_monitor_launch_authority(
+            roots,
+            OCIStore(roots),
+            boot,
+            resolve_domain_profile("kvm", "x86_64"),
+            binding,
+            timeout_seconds=60,
+            terminal_timeout_seconds=60,
+        ) as authority:
+
+            def popen(argv, **kwargs):
+                return subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "child", str(root), *argv[1:]], **kwargs
+                )
+
+            import uuid
+
+            handle = ipc.spawn_monitor_exec(
+                directory_fd,
+                ipc.MonitorExecIdentity(binding, str(uuid.uuid4())),
+                timeout=15,
+                launch_authority=authority,
+                popen_factory=popen,
+            )
+            print(json.dumps({"endpoint": handle.endpoint.to_dict(), "launcher_pid": os.getpid()}), flush=True)
+            handle.close()
+    finally:
+        os.close(directory_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

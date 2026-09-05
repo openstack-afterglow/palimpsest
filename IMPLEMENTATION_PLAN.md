@@ -1214,6 +1214,43 @@ fresh-exec IPC child remains inert: trusted root/store/boot FD transfer,
 child-owned libvirt execution and lifecycle/IPC multiplexing are still next.
 Public run/`-d`, authenticated VM STOP, and Gate 2 remain disabled.
 
+### PR 4 slice 30J: fresh-exec child-owned private launch
+
+An optional explicit launch authority now pins caller-selected state/store/run
+directories and read-only boot artifacts across exec. The private bootstrap
+frame contains a strict profile, resource identities, timeouts, and inherited
+FD numbers; paths and descriptors are never inferred from a journal or exposed
+in IPC replies. The child revalidates paths, descriptor identity, metadata,
+boot digests and store identity before opening libvirt. An authority guard is
+also checked at subsequent launch and cleanup mutation boundaries.
+
+The parent verifies durable COMMITTED before sending a separate authenticated
+activation fence. Only that fence starts the non-daemon worker, which owns the
+libvirt connection, event driver, stream and lifecycle key. The IPC main thread
+continues PING/DESCRIBE service. A per-lease reentrant mutex protects journal
+publication and observation; slow response IO does not hold that mutex. Main
+thread failure cannot release the lease or resource FDs while the worker can
+still mutate the VM.
+
+Discovery accepts only identity-preserving forward activation revisions.
+SHUTDOWN remains forbidden during pending/active execution; after successful
+TERMINAL and worker completion it retires only the IPC transport, preserving the
+terminal journal instead of marking it abandoned. This is not guest STOP.
+
+The live qualification adds a clean launcher that exits after returning the
+child endpoint. A test-only create barrier lets the observer prove that the
+child owns an active VM and answers IPC without its launcher. The test then
+requires READY/TERMINAL, the exact child writer and active identity, and terminal
+transport retirement. Its existing filesystem/DAC qualification adapters run
+inside the child too; an exact-ACL metadata adapter permits only the broker's
+known grant. Production permission policy remains strict.
+
+Scope: the domain is still defined and its normalized binding prepared before
+the clean launch process. Public run/`-d`, authenticated VM STOP, production
+filesystem access provisioning, and Gate 2 remain disabled. The next runtime
+step is bounded guest STOP delivery through the live worker's memory-only key,
+followed by the public foreground/detached adapter and end-to-end build/run gate.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1232,10 +1269,10 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Build the long-lived host monitor process on the 30E ownership journal and
-   add exact-domain cleanup for stale ownership. Authenticated STOP/control may
-   be resumed only by a live monitor retaining its in-memory lifecycle v2 boot
-   key; a dead monitor's journal alone cannot recover running control.
+1. Add bounded authenticated guest STOP delivery to the live child worker and
+   exact-domain cleanup for stale ownership. Authenticated control requires
+   the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
+   alone cannot recover running control.
 2. Connect foreground-default `run` and detached `run -d` to that monitor,
    preserving public fail-closed behavior until both paths are qualified.
 3. Add lifecycle/exec/log readiness and activate the opt-in local build-to-run
