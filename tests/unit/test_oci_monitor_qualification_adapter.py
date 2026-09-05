@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import runpy
 import stat
@@ -121,8 +122,9 @@ def test_only_exact_recorded_named_qemu_grant_is_accepted(directory):
 def test_unexpected_acl_is_rejected(change):
     adapter, broker, entry, _original, granted = _setup()
     broker.acl = replace(broker.acl, **change)
-    with pytest.raises(ValueError, match="ACL changed"):
+    with pytest.raises(ValueError, match="metadata rejected") as captured:
         adapter("kernel", entry, granted, granted, os.geteuid())
+    assert "ACL changed" in str(captured.value.__cause__)
 
 
 @pytest.mark.parametrize(
@@ -162,8 +164,9 @@ def test_nonbroker_and_monitor_entries_always_use_strict_policy(case):
         broker.applied = False
     elif case == "not-target":
         broker.targets = []
-    with pytest.raises(StateError):
+    with pytest.raises(ValueError, match="metadata rejected") as captured:
         adapter("monitor" if case == "monitor" else "run", entry, granted, granted, os.geteuid())
+    assert isinstance(captured.value.__cause__, StateError)
 
 
 @pytest.mark.parametrize(
@@ -186,3 +189,163 @@ def test_child_connection_guard_preserves_unrelated_ipc_and_network_calls():
     for address in ("/private/run/monitor.sock", ("localhost", 1234)):
         guard(channel, address)
     assert received == [(channel, "/private/run/monitor.sock"), (channel, ("localhost", 1234))]
+
+
+def test_metadata_diagnostics_identify_key_and_numeric_changes_without_paths():
+    adapter, _broker, entry, _original, granted = _setup()
+    entry["path"] = "/private/secret/artifact"
+    entry["secret"] = "never include frame payload"
+    visible = SimpleNamespace(**{**vars(granted), "st_size": granted.st_size + 1})
+    with pytest.raises(ValueError, match="metadata rejected") as captured:
+        adapter("kernel", entry, granted, visible, os.geteuid())
+    message = str(captured.value)
+    assert '"key": "kernel"' in message
+    assert '"size": [10, 11]' in message
+    assert "secret" not in message and "/private" not in message and "payload" not in message
+
+
+def test_exception_evidence_includes_suppressed_context_without_locals():
+    def fail():
+        secret_local = "do-not-print-this-local-value"
+        assert secret_local
+        try:
+            raise ValueError("inner metadata failure")
+        except ValueError:
+            raise StateError("outer stable failure") from None
+
+    try:
+        fail()
+    except StateError as error:
+        evidence = _HELPER["_exception_evidence"](error)
+    assert "inner metadata failure" in evidence and "outer stable failure" in evidence
+    assert "Exception context 1" in evidence
+    assert "do-not-print-this-local-value" not in evidence
+
+
+def test_exception_evidence_bounds_and_deduplicates_context_chain():
+    exceptions = [ValueError(f"marker-{index}") for index in range(12)]
+    for left, right in zip(exceptions, exceptions[1:], strict=False):
+        left.__context__ = right
+    evidence = _HELPER["_exception_evidence"](exceptions[0])
+    assert "marker-7" in evidence and "marker-8" not in evidence
+    exceptions[1].__context__ = exceptions[0]
+    evidence = _HELPER["_exception_evidence"](exceptions[0])
+    assert evidence.count("Exception context") == 2
+
+
+def _boot_setup(monkeypatch, *, active=1):
+    _adapter, broker, entry, _original, granted = _setup()
+    policy = {
+        "uid": os.geteuid() + 1,
+        "gid": os.getegid() + 1,
+        "reader_uid": os.geteuid(),
+        "prove_activity": lambda: active,
+        "digests": {"kernel": "sha256:" + hashlib.sha256(b"x" * 10).hexdigest()},
+    }
+    observed = SimpleNamespace(
+        **{
+            **vars(granted),
+            "st_uid": policy["uid"] if active else entry["uid"],
+            "st_gid": policy["gid"] if active else entry["gid"],
+            "st_ctime_ns": granted.st_ctime_ns + 10,
+        }
+    )
+    target = broker.targets[0]
+    broker.acl = replace(broker.acl, named_users=tuple(sorted(((policy["uid"], "r--"), (policy["reader_uid"], "r--")))))
+    target.descriptor = 123
+    target.path = SimpleNamespace(lstat=lambda: observed)
+    fake_os = SimpleNamespace(fstat=lambda _: observed, pread=lambda _fd, size, _offset: b"x" * size)
+    monkeypatch.setitem(_HELPER["_validate_qualified_boot_relabel"].__globals__, "os", fake_os)
+    context = {"broker": broker, "granted": {(1, 2): granted}, "boot_relabel": policy}
+    adapter = _HELPER["_qualification_metadata_adapter"](_validate_entry_metadata, context, ACL, _acl_mode)
+    return adapter, broker, entry, observed, policy, fake_os
+
+
+@pytest.mark.parametrize("active", [0, 1])
+def test_boot_relabel_requires_exact_active_qemu_or_inactive_original_owner(monkeypatch, active):
+    adapter, _broker, entry, observed, _policy, _fake_os = _boot_setup(monkeypatch, active=active)
+    with pytest.raises(StateError):
+        _validate_entry_metadata("kernel", entry, observed, observed, os.geteuid())
+    adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+@pytest.mark.parametrize("active", [0, 1])
+@pytest.mark.parametrize(
+    "field", ["st_uid", "st_gid", "st_ino", "st_dev", "st_mode", "st_size", "st_nlink", "st_mtime_ns"]
+)
+def test_boot_relabel_rejects_unapproved_owner_or_immutable_metadata(monkeypatch, active, field):
+    adapter, _broker, entry, observed, _policy, _fake_os = _boot_setup(monkeypatch, active=active)
+    setattr(observed, field, getattr(observed, field) + 1)
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+@pytest.mark.parametrize("active", [0, 1])
+def test_boot_relabel_cannot_use_other_phase_owner(monkeypatch, active):
+    adapter, _broker, entry, observed, policy, _fake_os = _boot_setup(monkeypatch, active=active)
+    observed.st_uid, observed.st_gid = (entry["uid"], entry["gid"]) if active else (policy["uid"], policy["gid"])
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+@pytest.mark.parametrize("activity", [True, -1, 2, None])
+def test_boot_relabel_rejects_ambiguous_domain_activity(monkeypatch, activity):
+    adapter, _broker, entry, observed, policy, _fake_os = _boot_setup(monkeypatch)
+    policy["prove_activity"] = lambda: activity
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+def test_boot_relabel_rechecks_bound_domain_after_hash(monkeypatch):
+    adapter, _broker, entry, observed, policy, _fake_os = _boot_setup(monkeypatch)
+    activities = iter([1, 0])
+    policy["prove_activity"] = lambda: next(activities)
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+def test_boot_relabel_rechecks_hash_even_if_size_mtime_preserved(monkeypatch):
+    adapter, _broker, entry, observed, _policy, fake_os = _boot_setup(monkeypatch)
+    fake_os.pread = lambda _fd, size, _offset: b"y" * size
+    with pytest.raises(ValueError, match="metadata rejected") as captured:
+        adapter("kernel", entry, observed, observed, os.geteuid())
+    assert "digest changed" in str(captured.value.__cause__)
+
+
+def test_boot_relabel_rejects_ctime_change_during_hash(monkeypatch):
+    adapter, _broker, entry, observed, _policy, fake_os = _boot_setup(monkeypatch)
+
+    def read(_fd, size, _offset):
+        fake_os.fstat = lambda _: SimpleNamespace(**{**vars(observed), "st_ctime_ns": observed.st_ctime_ns + 1})
+        return b"x" * size
+
+    fake_os.pread = read
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+def test_boot_relabel_keeps_exact_acl_check(monkeypatch):
+    adapter, broker, entry, observed, _policy, _fake_os = _boot_setup(monkeypatch)
+    broker.acl = replace(broker.acl, named_users=((9999, "rwx"),))
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+@pytest.mark.parametrize("change", ["extra-user", "missing-reader", "reader-write"])
+def test_boot_relabel_reader_acl_is_explicit_and_exclusive(monkeypatch, change):
+    adapter, broker, entry, observed, policy, _fake_os = _boot_setup(monkeypatch)
+    if change == "extra-user":
+        users = (*broker.acl.named_users, (99999, "r--"))
+    elif change == "missing-reader":
+        users = ((policy["uid"], "r--"),)
+    else:
+        users = ((policy["uid"], "r--"), (policy["reader_uid"], "rw-"))
+    broker.acl = replace(broker.acl, named_users=tuple(sorted(users)))
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("kernel", entry, observed, observed, os.geteuid())
+
+
+def test_boot_relabel_policy_does_not_apply_to_nonboot_entries(monkeypatch):
+    adapter, _broker, entry, observed, _policy, _fake_os = _boot_setup(monkeypatch)
+    with pytest.raises(ValueError, match="metadata rejected"):
+        adapter("run", entry, observed, observed, os.geteuid())

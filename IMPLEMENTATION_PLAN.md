@@ -1242,8 +1242,11 @@ child endpoint. A test-only create barrier lets the observer prove that the
 child owns an active VM and answers IPC without its launcher. The test then
 requires READY/TERMINAL, the exact child writer and active identity, and terminal
 transport retirement. Its existing filesystem/DAC qualification adapters run
-inside the child too; an exact-ACL metadata adapter permits only the broker's
-known grant. Production permission policy remains strict.
+inside the child too. The metadata adapter requires the exact broker ACL and
+adds two explicit read grants (QEMU and the original owner) only to boot copies.
+It permits boot-copy DAC ownership changes only after matching the active/inactive
+domain instance and rehashing the held boot file. Production permission policy
+remains strict; the host's boot-file relabel behavior is not silently trusted.
 
 Scope: the domain is still defined and its normalized binding prepared before
 the clean launch process. Public run/`-d`, authenticated VM STOP, production

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
@@ -17,6 +18,54 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+def _exception_evidence(error: BaseException) -> str:
+    """Expose suppressed exception context for qualification, without locals."""
+    parts = []
+    seen = set()
+    for index in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        parts.append(f"Exception context {index}:\n")
+        parts.extend(traceback.format_exception(type(error), error, error.__traceback__, chain=False))
+        error = error.__cause__ or error.__context__
+    return "".join(parts)
+
+
+def _metadata_differences(entry, opened, visible, granted=None):
+    # Explicit numeric metadata fields only; never include paths or the frame.
+    fields = {
+        "device": "st_dev",
+        "inode": "st_ino",
+        "uid": "st_uid",
+        "gid": "st_gid",
+        "nlink": "st_nlink",
+        "mode": "st_mode",
+        "size": "st_size",
+        "mtime_ns": "st_mtime_ns",
+        "ctime_ns": "st_ctime_ns",
+    }
+    result = {}
+    for label, snapshot in (("opened", opened), ("visible", visible)):
+        differences = {
+            name: [entry[name], getattr(snapshot, field)]
+            for name, field in fields.items()
+            if name in entry and entry[name] != getattr(snapshot, field)
+        }
+        if differences:
+            result[label] = differences
+    if granted is not None:
+        result["grant"] = {
+            label: {
+                name: [getattr(granted, field), getattr(snapshot, field)]
+                for name, field in fields.items()
+                if getattr(granted, field) != getattr(snapshot, field)
+            }
+            for label, snapshot in (("opened", opened), ("visible", visible))
+        }
+    return result
+
+
 def _guard_lifecycle_connect(original_connect, path: Path):
     def connect(channel, address):
         if isinstance(address, (str, bytes, os.PathLike)) and os.fsdecode(address) == str(path):
@@ -24,6 +73,69 @@ def _guard_lifecycle_connect(original_connect, path: Path):
         return original_connect(channel, address)
 
     return connect
+
+
+def _validate_qualified_boot_relabel(key, entry, opened, visible, target, granted, policy):
+    """Prove one copied BOOT artifact across qualified libvirt DAC relabeling."""
+    if key not in {"kernel", "initramfs"}:
+        raise ValueError("qualified DAC relabel is limited to boot artifacts")
+    activity = policy["prove_activity"]()
+    if type(activity) is not int or activity not in {0, 1}:
+        raise ValueError("qualified boot domain activity is invalid")
+    owner = (policy["uid"], policy["gid"]) if activity else (entry["uid"], entry["gid"])
+    immutable = {
+        "device": "st_dev",
+        "inode": "st_ino",
+        "nlink": "st_nlink",
+        "size": "st_size",
+        "mtime_ns": "st_mtime_ns",
+    }
+
+    def verify(info):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_mode != granted.st_mode
+            or info.st_nlink != 1
+            or (info.st_uid, info.st_gid) != owner
+            or any(getattr(info, field) != entry[name] for name, field in immutable.items())
+        ):
+            raise ValueError("qualified boot immutable identity or selected DAC owner changed")
+
+    before = os.fstat(target.descriptor)
+    for info in (opened, visible, before, target.path.lstat()):
+        verify(info)
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < entry["size"]:
+        chunk = os.pread(target.descriptor, min(1024 * 1024, entry["size"] - offset), offset)
+        if not chunk:
+            raise ValueError("qualified boot artifact ended during verification")
+        digest.update(chunk)
+        offset += len(chunk)
+    if "sha256:" + digest.hexdigest() != policy["digests"][key]:
+        raise ValueError("qualified boot artifact digest changed")
+    after = os.fstat(target.descriptor)
+    final = target.path.lstat()
+    for info in (after, final):
+        verify(info)
+        if any(
+            getattr(info, field) != getattr(before, field)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        ):
+            raise ValueError("qualified boot artifact changed during digest verification")
+    if policy["prove_activity"]() != activity:
+        raise ValueError("qualified boot domain changed during verification")
+    return before
 
 
 def _qualification_metadata_adapter(original_metadata, context, acl_structure, acl_mode):
@@ -49,17 +161,22 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
         if target is None or not broker.applied:
             return original_metadata(key, entry, opened, visible, owner_uid)
         # FD/path identity checks also remain in the production validator.
-        current = broker._verify_held(target)
         original = target.original_acl
         mask = acl_mode(original.group) | acl_mode(target.permission)
         mask_text = f"{'r' if mask & 4 else '-'}{'w' if mask & 2 else '-'}{'x' if mask & 1 else '-'}"
-        expected = acl_structure(
-            original.user, ((broker.uid, target.permission),), original.group, mask_text, original.other
-        )
+        boot_policy = context.get("boot_relabel") if key in {"kernel", "initramfs"} else None
+        users = ((broker.uid, target.permission),)
+        if boot_policy is not None:
+            users = tuple(sorted((*users, (boot_policy["reader_uid"], "r--"))))
+        expected = acl_structure(original.user, users, original.group, mask_text, original.other)
         granted = context["granted"][(opened.st_dev, opened.st_ino)]
+        if boot_policy is None:
+            current = broker._verify_held(target)
+        else:
+            current = _validate_qualified_boot_relabel(key, entry, opened, visible, target, granted, boot_policy)
         if broker._getfacl(target) != expected or any(
             value.st_mode != granted.st_mode
-            or (not stat.S_ISDIR(value.st_mode) and value.st_ctime_ns != granted.st_ctime_ns)
+            or (boot_policy is None and not stat.S_ISDIR(value.st_mode) and value.st_ctime_ns != granted.st_ctime_ns)
             for value in (opened, visible, current)
         ):
             raise ValueError("qualified monitor ACL changed")
@@ -79,11 +196,22 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
             data = {field: getattr(value, field) for field in fields}
             data["st_mode"] = entry["mode"]
             data["st_ctime_ns"] = entry["ctime_ns"]
+            if boot_policy is not None:
+                data["st_uid"] = entry["uid"]
+                data["st_gid"] = entry["gid"]
             return SimpleNamespace(**data)
 
         return original_metadata(key, entry, normalized(opened), normalized(visible), owner_uid)
 
-    return metadata
+    def diagnosed_metadata(key, entry, opened, visible, owner_uid):
+        try:
+            return metadata(key, entry, opened, visible, owner_uid)
+        except Exception as error:
+            granted = context.get("granted", {}).get((opened.st_dev, opened.st_ino))
+            evidence = {"key": key, "differences": _metadata_differences(entry, opened, visible, granted)}
+            raise ValueError("qualified monitor metadata rejected: " + json.dumps(evidence, sort_keys=True)) from error
+
+    return diagnosed_metadata
 
 
 def _install_qualification(root: Path) -> None:
@@ -125,7 +253,7 @@ def _install_qualification(root: Path) -> None:
             profile,
             expected_status="defined",
         )
-        uid, _gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
+        uid, gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
         broker = fixture["_QualificationDACBroker"](
             root, uid, fixture["_qualification_acl_specifications"](root, resolved.xml)
         )
@@ -135,6 +263,29 @@ def _install_qualification(root: Path) -> None:
 
         def apply():
             original_apply()
+            # Keep the qualification owner genuinely able to reopen the copied
+            # BOOT files after libvirt changes their DAC owner to QEMU. This
+            # narrowly named read grant is not an O_PATH/read-rights bypass.
+            for target in broker.targets:
+                if target.path not in {boot.kernel.path, boot.initramfs.path}:
+                    continue
+                broker._verify_held(target)
+                broker._command(["setfacl", "-m", f"u:{os.geteuid()}:r--", "--", target.fd_path], target)
+                original = target.original_acl
+                expected = fixture["_ACLStructure"](
+                    original.user,
+                    tuple(sorted(((broker.uid, "r--"), (os.geteuid(), "r--")))),
+                    original.group,
+                    "r--",
+                    original.other,
+                )
+                actual = broker._verify_held(target)
+                if (
+                    target.permission != "r--"
+                    or broker._getfacl(target) != expected
+                    or stat.S_IMODE(actual.st_mode) != 0o440
+                ):
+                    raise ValueError("qualified copied boot reader grant is invalid")
             context["granted"] = {
                 (target.opened.st_dev, target.opened.st_ino): os.fstat(target.descriptor) for target in broker.targets
             }
@@ -143,8 +294,40 @@ def _install_qualification(root: Path) -> None:
         domain = proxy.lookupByName(binding.record.name)
         original_create = domain.create
 
+        def prove_activity():
+            captured_id = context.get("created_domain_id")
+            if type(captured_id) is not int or captured_id <= 0:
+                raise ValueError("qualified boot has no captured create identity")
+            exact = oci_root_runtime._exact_domain(conn, resolved, binding.domain_uuid)
+            active = exact.isActive()
+            if type(active) is not int or active not in {0, 1}:
+                raise ValueError("qualified boot activity is ambiguous")
+            oci_root_runtime._exact_launch_instance(
+                conn,
+                resolved,
+                binding.domain_uuid,
+                captured_id,
+                binding.expected_definition_projection_digest,
+                active=active == 1,
+            )
+            return active
+
+        context["boot_relabel"] = {
+            "uid": uid,
+            "gid": gid,
+            "reader_uid": os.geteuid(),
+            "prove_activity": prove_activity,
+            "digests": {"kernel": boot.kernel.digest, "initramfs": boot.initramfs.digest},
+        }
+
         def create():
             result = original_create()
+            captured_id = domain.ID()
+            if type(captured_id) is not int or captured_id <= 0:
+                raise ValueError("qualified create did not yield an exact active ID")
+            context["created_domain_id"] = captured_id
+            if prove_activity() != 1:
+                raise ValueError("qualified create did not remain active")
             deadline = time.monotonic() + 30
             # Hold an actual active VM at the create boundary while the launcher
             # has exited, so the test can verify the independent IPC main loop.
@@ -166,14 +349,14 @@ def _install_qualification(root: Path) -> None:
                 original_socket_connect, context["resources"][0].runs / binding.record.name / "lifecycle.sock"
             )
             return original_run(self, directory_fd, binding, lease)
-        except BaseException:
+        except BaseException as error:
             # Qualification evidence only: traceback lines, no captured locals.
             try:
                 fd = os.open(
                     root / "monitor-child-error.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
                 )
                 with os.fdopen(fd, "w") as output:
-                    output.write(traceback.format_exc())
+                    output.write(_exception_evidence(error))
             except OSError:
                 pass
             raise

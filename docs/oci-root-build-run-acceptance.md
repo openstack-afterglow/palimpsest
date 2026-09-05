@@ -267,9 +267,15 @@ journal is retained, not abandoned. Active SHUTDOWN is not supported and must
 not be confused with authenticated guest STOP.
 
 The child's test-only DAC adapter verifies the exact held broker target and
-named-QEMU ACL, allowing only the known permission/ctime effect of that grant
-before applying the original metadata checks. Directory timestamps may change
-through normal state publication; immutable boot-file timestamps may not.
+named-QEMU ACL. Boot copies additionally receive an exact original-owner read
+grant so production read-only reopening remains possible after relabeling;
+other broker targets retain their single QEMU grant.
+Libvirt also relabels the copied kernel/initramfs while the VM
+is active: the adapter accepts the exact QEMU owner only with an exact active
+domain-instance proof, and the original owner only with an inactive proof after
+creation. It rehashes both held boot files and keeps their inode, size, mtime,
+link count, mode and ACL checks. Directory timestamps may change through normal
+state publication; no arbitrary owner or content change is accepted.
 Production authority validation does not relax permissions. Domain definition
 still precedes the clean launcher; public foreground/detached dispatch and
 local build-to-run Gate 2 remain disabled.
