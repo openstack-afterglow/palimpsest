@@ -245,7 +245,7 @@ def test_spawn_contract_uses_fresh_module_exec_and_exact_fd_inventory(
         os.close(directory_fd)
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv[1:4] == ["-m", "palimpsest_local.oci_monitor_ipc", "--private-child-v1"]
+    assert argv[1:4] == ["-m", "palimpsest_local.oci_monitor_ipc", "--private-child-v2"]
     assert kwargs["close_fds"] is True
     assert kwargs["pass_fds"] == (directory_fd, int(argv[5]))
     assert kwargs["stdin"] is subprocess.DEVNULL
@@ -298,7 +298,7 @@ def test_connect_race_errors_are_stable_and_do_not_reflect_paths(
         def connect(self, _address: str) -> None:
             raise failure
 
-    monkeypatch.setattr(ipc, "_socket_address", lambda _fd: "/sensitive/path")
+    monkeypatch.setattr(ipc, "_socket_address", lambda _fd, _name=ipc._SOCKET_NAME: "/sensitive/path")
     with pytest.raises(ipc.MonitorIPCError) as captured:
         ipc._connect_socket(FailingChannel(), 7)  # type: ignore[arg-type]
     assert captured.value.category is category
@@ -339,11 +339,12 @@ def test_real_fresh_exec_reciprocal_handshake_and_typed_commands(tmp_path: Path)
         assert ipc.request_monitor(directory_fd, restored, ipc.MonitorIPCOperation.PING, timeout=2).state == "pong"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as malformed:
             malformed.settimeout(2)
-            malformed.connect(ipc._socket_address(directory_fd))
+            assert handle.endpoint.socket_name is not None
+            malformed.connect(ipc._socket_address(directory_fd, handle.endpoint.socket_name))
             malformed.sendall(struct.pack(">I", ipc._MAX_FRAME_BYTES + 1))
         assert handle.request(ipc.MonitorIPCOperation.PING).state == "pong"
         handle.shutdown()
-        assert not (tmp_path / "run" / ipc._SOCKET_NAME).exists()
+        assert not (tmp_path / "run" / ipc._socket_name_for_generation(_GENERATION)).exists()
     finally:
         if handle is not None and handle._process.poll() is None:
             handle._process.kill()
@@ -364,7 +365,7 @@ def test_parent_abort_before_prepare_exits_and_removes_exact_socket(tmp_path: Pa
                 sys.executable,
                 "-m",
                 "palimpsest_local.oci_monitor_ipc",
-                "--private-child-v1",
+                "--private-child-v2",
                 str(directory_fd),
                 str(child.fileno()),
             ],
@@ -391,7 +392,7 @@ def test_parent_abort_before_prepare_exits_and_removes_exact_socket(tmp_path: Pa
         assert ipc._recv_frame(local) == {"kind": "bound", "schema": ipc._SPAWN_SCHEMA}
         local.close()
         assert process.wait(timeout=2) == 70
-        assert not (tmp_path / "run" / ipc._SOCKET_NAME).exists()
+        assert not (tmp_path / "run" / ipc._socket_name_for_generation(_GENERATION)).exists()
     finally:
         for channel in (local, child):
             try:
@@ -415,7 +416,7 @@ def test_precommit_accept_timeout_is_stable_and_removes_socket(tmp_path: Path) -
                 sys.executable,
                 "-m",
                 "palimpsest_local.oci_monitor_ipc",
-                "--private-child-v1",
+                "--private-child-v2",
                 str(directory_fd),
                 str(child.fileno()),
             ],
@@ -442,7 +443,7 @@ def test_precommit_accept_timeout_is_stable_and_removes_socket(tmp_path: Path) -
         error = ipc._recv_frame(local)
         assert error == {"category": "timeout", "kind": "error", "schema": ipc._SPAWN_SCHEMA}
         assert process.wait(timeout=2) == 70
-        assert not (tmp_path / "run" / ipc._SOCKET_NAME).exists()
+        assert not (tmp_path / "run" / ipc._socket_name_for_generation(_GENERATION)).exists()
     finally:
         local.close()
         child.close()
@@ -492,7 +493,7 @@ def test_crashed_child_leaves_stale_socket_and_next_spawn_refuses_collision(tmp_
     directory_fd = _directory(tmp_path / "run")
     handle = ipc.spawn_monitor_exec(directory_fd, _identity(), timeout=2)
     try:
-        socket_path = tmp_path / "run" / ipc._SOCKET_NAME
+        socket_path = tmp_path / "run" / ipc._socket_name_for_generation(_GENERATION)
         assert socket_path.exists()
         os.kill(handle.pid, signal.SIGKILL)
         handle._process.wait(timeout=2)

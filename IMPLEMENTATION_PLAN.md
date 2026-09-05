@@ -1118,6 +1118,50 @@ promoting the claim to the active binding; 30F does not perform or claim that
 promotion. Public create/start/run/`-d`, STOP, readiness, restart recovery, and
 Gate 2 remain disabled.
 
+### PR 4 slice 30G: child-owned durable preactivation claim
+
+- The fresh-exec child, rather than its launcher, now owns the per-run monitor
+  lock for its entire lifetime. Preactivation journal v2 deliberately reuses
+  the exact 30E `oci-monitor-owner-v1.lock` and
+  `oci-monitor-owner-v1.json` pathnames, so a v1 active-domain owner and a v2
+  preactivation owner cannot coexist. The v1 decoder and transition contract
+  remain unchanged.
+- Journal v2 binds the exact preactivation binding, generation, child
+  host-boot/PID/start-tick incarnation, generation-derived socket name,
+  revision, and a SHA-256 digest of the transient nonce. `active_binding` is
+  fixed to null; raw nonce, lifecycle key, MAC, filesystem path, and error
+  representation are forbidden. The child durably publishes `claiming`
+  before binding its socket, `prepared` with the exact socket device/inode
+  before PREPARED, and `committed` before COMMITTED. Each publication uses an
+  owner-only temporary inode, file fsync, atomic link/replace, directory fsync,
+  and exact canonical reread.
+- The parent exact-rereads the descriptor-pinned `prepared` revision before
+  sending COMMIT and the next exact `committed` revision before returning a
+  handle. Once COMMIT was sent, launcher failure never kills the child merely
+  because its acknowledgement path failed; the durable record is the recovery
+  authority. A restart caller supplies the trusted immutable binding, derives
+  generation from the journal, then requires live process incarnation, exact
+  socket inode, reciprocal peer credentials, DESCRIBE, and an unchanged
+  journal before discovery succeeds.
+- Reconciliation mutates nothing for live or unknown writers. A provably stale
+  writer is taken over only after acquiring the same lock and CAS-rereading the
+  same journal. A recorded socket inode is opened with `O_PATH`, moved to a
+  generation-and-inode-derived quarantine with atomic no-clobber rename,
+  revalidated, unlinked, and directory-fsynced before `abandoned`; a restart
+  can finish an interrupted quarantine. Replacement or cleanup ambiguity is
+  preserved as `control-lost`. A stale `claiming` record has no durable inode:
+  absence is safe, but any pathname is preserved and becomes `control-lost`.
+  Graceful shutdown publishes `aborting`, removes and fsyncs the exact socket,
+  then publishes `abandoned`. An exact abandoned record with an absent old
+  socket can be rearmed as a new generation under the shared lock without
+  resetting revision history.
+
+Scope boundary: 30G is still production-inert. It does not import from the
+runtime, dispatcher, CLI, libvirt launch, or active `MonitorLease` integration
+paths and does not define/create/start/stop a VM. Public create/start/run/`-d`,
+guest readiness, lifecycle STOP, active-binding promotion, and Gate 2 remain
+disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:

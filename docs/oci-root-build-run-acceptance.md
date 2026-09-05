@@ -190,6 +190,37 @@ performs libvirt define and reads normalized `XMLDesc`. The child must require
 an exact match before promoting the claim into an active binding; 30F performs
 no such promotion.
 
+Slice 30G closes that IPC-child discovery window with a child-owned
+preactivation journal. It uses the same owner journal and flock pathnames as
+30E, but a strict v2 schema with `active_binding: null`; therefore v1 active
+ownership and v2 preactivation ownership are mutually exclusive. The child
+publishes and fsyncs `claiming` before binding its generation-derived socket,
+then durably records `prepared` plus the socket device/inode before PREPARED and
+`committed` before COMMITTED. The launcher descriptor-pins and exact-rereads
+both records before progressing. Only a nonce digest is journaled; raw nonce,
+boot key, MAC, path, and error text remain absent.
+
+Restart discovery begins from the caller-trusted immutable binding, not a
+remembered generation. It parses the canonical generation from the journal and
+requires an exact live writer incarnation, socket inode, peer credentials,
+DESCRIBE response, and unchanged journal. Live precommit and unknown-liveness
+records are never mutated. Stale recovery acquires the shared lock, CAS-rereads
+the record, publishes `adopting`, and removes only an exact recorded socket
+through an `O_PATH`-pinned, generation-and-inode-derived quarantine using
+Linux atomic no-clobber rename plus directory fsync. A restart can therefore
+finish a quarantine interrupted by a process crash. Replacement or cleanup
+ambiguity is preserved and ends in `control-lost`. In particular, `claiming`
+has no recorded inode: a leftover pathname cannot be proven to be the child's
+socket, so it is preserved as `control-lost` rather than deleted.
+Graceful inert-monitor shutdown is `aborting` → exact socket unlink/fsync →
+`abandoned`; an absent-socket abandoned record can start a new generation under
+the same lock and monotonic revision history.
+
+This remains an ownership and IPC foundation only. No public runtime,
+dispatcher, CLI, libvirt launch, or active-domain lease imports it. It does not
+claim VM STOP, READY, active-binding promotion, create/start/run/`-d`, or Gate
+2 activation.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
