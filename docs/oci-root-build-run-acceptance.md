@@ -294,6 +294,25 @@ its signal handlers are armed after launcher exit, repeats IPC STOP and PING,
 and requires one signed STOP plus the matching TERMINAL with exit 42. Public
 stop/run/`-d`, reconnect, production access provisioning and Gate 2 remain gated.
 
+Slice 30L adds private inactive-only cleanup after the original monitor is
+proven stale. It holds the existing monitor lock plus the pinned run lock,
+keeps the original journal unchanged, and validates the independent binding,
+durable definition/handoff, connection URI and exact persistent inactive VM
+before undefine. Active/unknown ownership, uncaptured activation, mismatched
+name/UUID/owner/projection, and initially missing domains are refused.
+
+A separate run-state cleanup intent supports crash resume. Completion requires
+both name and UUID absent; completed replay is absence-only and cannot remove
+a reappeared VM. Existing exit/status evidence, sockets, source artifacts and
+VM-specific root volumes remain untouched. Last-observed-inactive checks cannot
+exclude an external administrator racing libvirt's non-conditional undefine.
+
+The fourth live variant leaves a completed child's socket/journal stale, uses
+this private cleanup on its exact inactive definition and repeats it to prove
+idempotency and evidence preservation. Only the fixture subsequently retires
+its exact socket and temporary tree. Production access provisioning, explicit resource reclamation,
+public run/`-d` and Gate 2 remain gated.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

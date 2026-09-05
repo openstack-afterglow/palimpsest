@@ -8,7 +8,9 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -38,7 +40,7 @@ from palimpsest_local._oci_stage1_kvm_proof import (
     verify_kernel_config,
     verify_kvm_api,
 )
-from palimpsest_local.errors import StateError
+from palimpsest_local.errors import PalimpsestError, StateError
 from palimpsest_local.oci_converter import (
     DEFAULT_LAYER_CONVERSION_LIMITS,
     LAYER_INTAKE_POLICY_ID,
@@ -2686,6 +2688,43 @@ def _console_marker_count(console: str, marker: str) -> int:
     return console.splitlines().count(marker)
 
 
+class _CountingInactiveCleanupConnection:
+    """Read-through real libvirt adapter proving exactly one inactive undefine."""
+
+    def __init__(self, connection):
+        self._connection = connection
+        self.undefine_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def _wrap(self, domain):
+        owner = self
+
+        class Domain:
+            def __getattr__(self, name):
+                return getattr(domain, name)
+
+            def undefine(self):
+                assert domain.isActive() == 0 and domain.ID() == -1
+                owner.undefine_calls += 1
+                return domain.undefine()
+
+            def destroy(self):
+                raise AssertionError("stale inactive cleanup must never destroy a VM")
+
+            def destroyFlags(self, _flags):
+                raise AssertionError("stale inactive cleanup must never destroy a VM")
+
+        return Domain()
+
+    def lookupByName(self, name):
+        return self._wrap(self._connection.lookupByName(name))
+
+    def lookupByUUIDString(self, domain_uuid):
+        return self._wrap(self._connection.lookupByUUIDString(domain_uuid))
+
+
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_console_marker_count_matches_exact_lines_with_terminal_newlines(newline: str) -> None:
     marker = "palimpsest workload proof: signal handlers armed"
@@ -2693,7 +2732,188 @@ def test_console_marker_count_matches_exact_lines_with_terminal_newlines(newline
     assert _console_marker_count(console, marker) == 2
 
 
-def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=False):
+def _terminate_exact_completed_monitor(directory_fd, endpoint, expected_snapshot, *, timeout=5):
+    """Stop only a completed qualification monitor through its pinned pidfd."""
+    assert hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+    assert expected_snapshot.phase == "terminal"
+    assert expected_snapshot.endpoint == endpoint
+    assert endpoint.writer.pid != os.getpid()
+    expected_journal = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)
+    assert expected_journal is not None and expected_journal[0] == expected_snapshot
+    assert monitor_ipc.discover_monitor_exec(directory_fd, endpoint.identity.binding) == endpoint
+    assert (
+        monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP).state
+        == "stop-terminal"
+    )
+    pidfd = os.pidfd_open(endpoint.writer.pid, 0)
+    try:
+        # Re-prove boot ID/start ticks after pinning the process, and recheck
+        # the exact journal and authenticated endpoint immediately before
+        # signalling. No raw-PID signal and no libvirt VM operation occur.
+        assert monitor_ipc.probe_process_liveness(endpoint.writer) is monitor_ipc.ProcessLiveness.LIVE
+        assert monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity) == expected_journal
+        assert (
+            monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP).state
+            == "stop-terminal"
+        )
+        assert monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity) == expected_journal
+        assert monitor_ipc.probe_process_liveness(endpoint.writer) is monitor_ipc.ProcessLiveness.LIVE
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+        assert select.select([pidfd], [], [], timeout)[0] == [pidfd]
+        deadline = time.monotonic() + timeout
+        while monitor_ipc.probe_process_liveness(endpoint.writer) is not monitor_ipc.ProcessLiveness.STALE:
+            assert time.monotonic() < deadline, "completed monitor was not reaped or its liveness is ambiguous"
+            time.sleep(0.01)
+        assert monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity) == expected_journal
+        metadata = os.stat(endpoint.socket_name, dir_fd=directory_fd, follow_symlinks=False)
+        assert stat.S_ISSOCK(metadata.st_mode)
+        assert (metadata.st_dev, metadata.st_ino) == (endpoint.socket_device, endpoint.socket_inode)
+    finally:
+        os.close(pidfd)
+
+
+def _remove_completed_fixture_socket(monitor_directory, snapshot):
+    """Fixture-only retirement after completed recovery and domain absence.
+
+    Production recovery deliberately preserves this socket as evidence. The
+    isolated live fixture removes only its exact inode before its own teardown.
+    """
+    directory_fd = os.open(monitor_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    held_fd = -1
+    try:
+        journal = monitor_ipc._read_preactivation_journal(directory_fd, snapshot.identity)
+        assert journal is not None and journal[0] == snapshot and snapshot.phase == "terminal"
+        assert monitor_ipc.probe_process_liveness(snapshot.writer) is monitor_ipc.ProcessLiveness.STALE
+        expected = (snapshot.socket_device, snapshot.socket_inode)
+        held_fd = os.open(snapshot.socket_name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+        held = os.fstat(held_fd)
+        visible = monitor_ipc._visible_socket(directory_fd, snapshot.socket_name)
+        assert stat.S_ISSOCK(held.st_mode)
+        assert (held.st_dev, held.st_ino) == expected == (visible.st_dev, visible.st_ino)
+        assert monitor_ipc._read_preactivation_journal(directory_fd, snapshot.identity) == journal
+        quarantine = monitor_ipc._socket_quarantine_name(snapshot.socket_name, expected)
+        monitor_ipc._rename_noreplace(directory_fd, snapshot.socket_name, quarantine)
+        moved = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+        assert (moved.st_dev, moved.st_ino) == expected
+        assert monitor_ipc._remove_exact_quarantined_socket(directory_fd, quarantine, expected)
+        assert os.fstat(held_fd).st_nlink == 0
+        with pytest.raises(FileNotFoundError):
+            os.stat(snapshot.socket_name, dir_fd=directory_fd, follow_symlinks=False)
+        assert monitor_ipc._read_preactivation_journal(directory_fd, snapshot.identity) == journal
+    finally:
+        if held_fd >= 0:
+            os.close(held_fd)
+        os.close(directory_fd)
+
+
+@pytest.mark.skipif(sys.platform != "linux" or not hasattr(os, "O_PATH"), reason="requires Linux O_PATH socket pin")
+@pytest.mark.parametrize("replacement", [False, True])
+def test_completed_fixture_socket_cleanup_is_exact_and_preserves_replacement(tmp_path, monkeypatch, replacement):
+    from types import SimpleNamespace
+
+    directory = tmp_path / "monitor"
+    directory.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    socket_path = directory / "owned.sock"
+    listener.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    metadata = socket_path.lstat()
+    listener.close()
+    snapshot = SimpleNamespace(
+        phase="terminal",
+        identity=object(),
+        writer=object(),
+        socket_name=socket_path.name,
+        socket_device=metadata.st_dev,
+        socket_inode=metadata.st_ino,
+    )
+    monkeypatch.setattr(monitor_ipc, "_read_preactivation_journal", lambda *_args: (snapshot, b"journal"))
+    monkeypatch.setattr(monitor_ipc, "probe_process_liveness", lambda *_args: monitor_ipc.ProcessLiveness.STALE)
+    if replacement:
+        socket_path.rename(directory / "original.sock")
+        socket_path.write_bytes(b"foreign replacement")
+        socket_path.chmod(0o600)
+        with pytest.raises((AssertionError, monitor_ipc.MonitorIPCError)):
+            _remove_completed_fixture_socket(directory, snapshot)
+        assert socket_path.read_bytes() == b"foreign replacement"
+        assert (directory / "original.sock").is_socket()
+    else:
+        _remove_completed_fixture_socket(directory, snapshot)
+        assert list(directory.iterdir()) == []
+
+
+@pytest.mark.parametrize("drift", [None, "writer", "journal", "worker-pending"])
+def test_completed_monitor_retirement_pins_pid_and_refuses_identity_drift(monkeypatch, drift):
+    from types import SimpleNamespace
+
+    writer = SimpleNamespace(pid=os.getpid() + 10000)
+    endpoint = SimpleNamespace(
+        writer=writer,
+        identity=SimpleNamespace(binding=object()),
+        socket_name="owned.sock",
+        socket_device=12,
+        socket_inode=34,
+    )
+    snapshot = SimpleNamespace(phase="terminal", endpoint=endpoint)
+    events = []
+    journal_reads = 0
+
+    def journal(*_args):
+        nonlocal journal_reads
+        journal_reads += 1
+        return snapshot, b"changed" if drift == "journal" and journal_reads > 1 else b"journal"
+
+    def liveness(_writer):
+        assert _writer is writer
+        if drift == "writer" or "signal" in events:
+            return monitor_ipc.ProcessLiveness.STALE
+        return monitor_ipc.ProcessLiveness.LIVE
+
+    def pin(pid, flags):
+        assert pid == writer.pid and flags == 0
+        events.append("pin")
+        return 456
+
+    def send(pidfd, signum, info, flags):
+        assert (pidfd, signum, info, flags) == (456, signal.SIGTERM, None, 0)
+        assert journal_reads >= 3
+        events.append("signal")
+
+    original_stat, original_close = os.stat, os.close
+    monkeypatch.setattr(os, "pidfd_open", pin, raising=False)
+    monkeypatch.setattr(signal, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("raw-PID signals are forbidden"))
+    monkeypatch.setattr(os, "close", lambda fd: events.append("close") if fd == 456 else original_close(fd))
+    monkeypatch.setattr(
+        os,
+        "stat",
+        lambda path, **kwargs: (
+            SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_dev=12, st_ino=34)
+            if kwargs.get("dir_fd") == 123
+            else original_stat(path, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(select, "select", lambda *_args: ([456], [], []))
+    monkeypatch.setattr(monitor_ipc, "_read_preactivation_journal", journal)
+    monkeypatch.setattr(monitor_ipc, "discover_monitor_exec", lambda *_args: endpoint)
+    monkeypatch.setattr(
+        monitor_ipc,
+        "request_monitor",
+        lambda *_args: SimpleNamespace(state="stop-refused" if drift == "worker-pending" else "stop-terminal"),
+    )
+    monkeypatch.setattr(monitor_ipc, "probe_process_liveness", liveness)
+    if drift is None:
+        _terminate_exact_completed_monitor(123, endpoint, snapshot)
+        assert events == ["pin", "signal", "close"]
+    else:
+        with pytest.raises(AssertionError):
+            _terminate_exact_completed_monitor(123, endpoint, snapshot)
+        assert "signal" not in events
+        if "pin" in events:
+            assert events[-1] == "close"
+
+
+def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=False, stale_cleanup=False):
     launched = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
         input=json.dumps(
@@ -2770,13 +2990,28 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
         # transport-retirement request until its connection is released.
         while True:
             try:
-                if stop_workload:
+                if stop_workload or stale_cleanup:
                     stopped = monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP)
                     if stopped.state != "stop-terminal":
                         if time.monotonic() >= deadline:
                             raise AssertionError("child monitor did not confirm durable STOP terminal")
                         time.sleep(0.02)
                         continue
+                if stale_cleanup:
+                    from palimpsest_local.oci_monitor_recovery import reconcile_inactive_monitor_domain
+
+                    # The worker has released its run lock, but the live
+                    # transport still owns the journal lease. Refuse cleanup
+                    # without changing durable state or the inactive domain.
+                    before_refusal = read_run_ledger_snapshot(roots, binding.record.name).state
+                    with pytest.raises(PalimpsestError):
+                        reconcile_inactive_monitor_domain(roots, binding, conn=conn)
+                    assert read_run_ledger_snapshot(roots, binding.record.name).state == before_refusal
+                    assert monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0] == snapshot
+                    assert conn.lookupByUUIDString(binding.domain_uuid).isActive() == 0
+                    _terminate_exact_completed_monitor(directory_fd, endpoint, snapshot)
+                    retired = snapshot
+                    break
                 retired = monitor_ipc.shutdown_monitor_exec(directory_fd, endpoint, timeout=1)
                 break
             except monitor_ipc.MonitorIPCError:
@@ -2815,8 +3050,18 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
         os.close(directory_fd)
 
 
-@pytest.mark.parametrize(("child_owned", "stop_workload"), [(False, False), (True, False), (True, True)])
-def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_workload: bool) -> None:
+@pytest.mark.parametrize(
+    ("child_owned", "stop_workload", "stale_cleanup"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
+def test_live_oci_root(
+    monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_workload: bool, stale_cleanup: bool
+) -> None:
     if os.environ.get(_ENABLE_ENV) != "1":
         pytest.skip(f"set {_ENABLE_ENV}=1 on the qualified native Linux/KVM libvirt runner")
     qualification_root, qualification_root_identity = _create_qualification_root()
@@ -3009,7 +3254,13 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_
                 # after the exact terminal domain has been removed.
                 broker.applied = True
                 completed, monitor_snapshot = _launch_in_exec_monitor(
-                    qualification_root, roots, monitor_binding, boot, conn, stop_workload=stop_workload
+                    qualification_root,
+                    roots,
+                    monitor_binding,
+                    boot,
+                    conn,
+                    stop_workload=stop_workload,
+                    stale_cleanup=stale_cleanup,
                 )
             else:
                 completed = launch_defined_oci_root_domain(
@@ -3106,6 +3357,44 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_
             raise
 
         def remove_terminal_domain() -> None:
+            if stale_cleanup:
+                from palimpsest_local.oci_monitor_recovery import reconcile_inactive_monitor_domain
+
+                original_state = read_run_ledger_snapshot(roots, name).state
+                original_journal = (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes()
+                socket_path = monitor_directory / monitor_snapshot.socket_name
+                socket_metadata = socket_path.lstat()
+                original_disk_digest = _sha256_file(root_path)
+                preserved_files = [boot.kernel.path, boot.initramfs.path]
+                preserved_files.extend(
+                    path for path in roots.oci_derived_store.rglob("*") if stat.S_ISREG(path.lstat().st_mode)
+                )
+                original_file_digests = {path: _sha256_file(path) for path in preserved_files}
+                counted_conn = _CountingInactiveCleanupConnection(conn)
+                receipt = reconcile_inactive_monitor_domain(roots, monitor_binding, conn=counted_conn)
+                assert receipt.phase == "completed"
+                after = read_run_ledger_snapshot(roots, name).state
+                assert after["oci_monitor_inactive_cleanup"] == receipt.to_dict()
+                ignored = {"oci_monitor_inactive_cleanup", "lifecycle_revision"}
+                assert {key: value for key, value in after.items() if key not in ignored} == {
+                    key: value for key, value in original_state.items() if key not in ignored
+                }
+                assert after["lifecycle_revision"] == original_state["lifecycle_revision"] + 2
+                assert counted_conn.undefine_calls == 1
+                assert prove_terminal_domain_absent()
+                assert reconcile_inactive_monitor_domain(roots, monitor_binding, conn=counted_conn) == receipt
+                assert counted_conn.undefine_calls == 1
+                assert read_run_ledger_snapshot(roots, name).state == after
+                assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
+                current_socket = socket_path.lstat()
+                assert stat.S_ISSOCK(current_socket.st_mode)
+                assert (current_socket.st_dev, current_socket.st_ino) == (
+                    socket_metadata.st_dev,
+                    socket_metadata.st_ino,
+                )
+                assert _sha256_file(root_path) == original_disk_digest
+                assert {path: _sha256_file(path) for path in preserved_files} == original_file_digests
+                return
             _remove_exact_owned_domain(
                 conn,
                 name,
@@ -3134,6 +3423,13 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_
         owned_domain_id = None
         assert broker.restored is True
         assert broker.ambiguous is False
+        if stale_cleanup:
+            try:
+                assert prove_terminal_domain_absent()
+                _remove_completed_fixture_socket(monitor_directory, monitor_snapshot)
+            except BaseException:
+                retain_qualification_state = True
+                raise
 
         verified_root = load_oci_root_volume(roots, prepared.transaction.volume_id)
         assert verified_root.path == root_path

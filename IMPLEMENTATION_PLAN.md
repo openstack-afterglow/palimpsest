@@ -1287,6 +1287,44 @@ Scope: this is private live-worker control, not public stop/run/`-d` dispatch.
 Reconnect, stale-owner recovery/cleanup, production filesystem access brokering,
 and local build-to-run Gate 2 remain unimplemented or disabled.
 
+### PR 4 slice 30L: inactive-only stale monitor domain cleanup
+
+Private recovery accepts independently selected roots, the expected immutable
+monitor binding, and an explicit libvirt connection. It never derives paths
+from the journal or reopens boot images, and has no create/start/destroy path.
+The original monitor must be provably stale, not live or unknown. Recovery
+holds the existing per-monitor lock and the pinned run lock, and continually
+revalidates the original journal bytes, writer identity, run/definition/handoff
+binding, and connection URI. It does not adopt or rewrite the original journal.
+
+Only captured active bindings are eligible. An exact persistent domain must
+match both name and UUID, its owner marker and stored inactive XML projection,
+and be inactive with ID -1 immediately before undefine. The cleanup never
+signals an active VM. Libvirt has no atomic inactive-only undefine operation:
+these are last-observed-inactive checks under Palimpsest's locks, not exclusion
+of external administrator races. Any ambiguous result retains all resources.
+
+A separate `oci_monitor_inactive_cleanup` run-state record commits an intent
+before undefine and completion only after both name and UUID are absent. An
+initially absent domain without a matching prior intent is rejected. Retrying
+an interrupted intent revalidates the same stale authority; a completed receipt
+only rechecks absence and never authorizes deletion of a reappeared domain.
+Existing status, process-exit/handoff records, journal, socket, volumes and source
+artifacts are preserved. Domain absence is not a synthetic process-exit result.
+
+The live qualification adds a child-owned natural-exit case that retires only
+the completed test monitor, preserving its stale socket/journal. The private
+cleanup must then remove the exact inactive definition, preserve its evidence,
+and return the same completed receipt on replay before the test restores DAC
+access. After these preservation assertions, fixture-only exact socket cleanup
+allows normal temporary-tree teardown; the production API never removes it.
+Existing natural-exit and authenticated STOP variants remain intact.
+
+Scope: active-domain force cleanup, uncaptured activation recovery, socket and
+disk/volume reclamation, production filesystem access provisioning, public
+stop/run/`-d`, and Gate 2 remain gated. Running control cannot be recovered from
+a dead monitor's stored journal or receipts.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1305,8 +1343,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add exact-domain cleanup for stale ownership and production filesystem
-   access provisioning. Authenticated control requires
+1. Add production filesystem access provisioning and connect explicit resource
+   reclamation to the proven inactive-domain cleanup boundary. Authenticated control requires
    the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
    alone cannot recover running control.
 2. Connect foreground-default `run` and detached `run -d` to that monitor,
