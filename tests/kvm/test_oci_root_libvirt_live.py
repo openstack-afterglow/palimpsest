@@ -2263,7 +2263,7 @@ def _require_live_host(tmp_path: Path):
     return verified, profile
 
 
-def _proof_materialization(store: OCIStore) -> OCIImageMaterializationReceipt:
+def _proof_materialization(store: OCIStore, *, stop_workload: bool = False) -> OCIImageMaterializationReceipt:
     # This qualification starts at the derived-store boundary.  The loader
     # below independently verifies the checked-in real mksquashfs outputs and
     # their source/build manifest; OCI registry intake is covered elsewhere.
@@ -2351,6 +2351,20 @@ def _proof_materialization(store: OCIStore) -> OCIImageMaterializationReceipt:
         OCIUserSpec("palimpsest", None),
         15,
     )
+    if stop_workload:
+        # The checked-in proof blocks until PID 1 forwards SIGTERM, then exits
+        # 42. Preserve its exact existing invocation/environment contract.
+        process = OCIProcessSpec(
+            (".__palimpsest_workload_proof_v1", "palimpsest-argv-one", "", "line\nbreak"),
+            (
+                ("PALIMPSEST_PROOF_ENV", "value with spaces"),
+                ("PALIMPSEST_PROOF_EMPTY", ""),
+                ("PATH", "/proof/missing:/"),
+            ),
+            "/proof/workdir",
+            OCIUserSpec("palimpsest", None),
+            15,
+        )
     manifest_digest = _digest(b"palimpsest-live-libvirt-manifest-v1")
     config_digest = _digest(json.dumps(process.to_dict(), sort_keys=True).encode())
     return OCIImageMaterializationReceipt(
@@ -2667,7 +2681,7 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
     assert domain.undefine_calls == 1
 
 
-def _launch_in_exec_monitor(root, roots, binding, boot, conn):
+def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=False):
     launched = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
         input=json.dumps(
@@ -2695,6 +2709,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn):
     try:
         deadline = time.monotonic() + 75
         observed_active = False
+        stop_requested = False
         while time.monotonic() < deadline:
             snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
             if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
@@ -2705,8 +2720,29 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn):
                     monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.PING).state
                     == "pong"
                 )
+                if stop_workload:
+                    assert (
+                        monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP).state
+                        == "stop-refused"
+                    )
                 observed_active = True
                 (root / "continue-monitor").write_bytes(b"continue\n")
+            if stop_workload and snapshot.phase == "ready" and not stop_requested:
+                # This non-secret marker is only a timing barrier: termination
+                # itself must still be proved by the authenticated transcript.
+                console = _qualification_console_tail(root / "console.log")
+                if "palimpsest workload proof: signal handlers armed\n" in console:
+                    assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
+                    for _ in range(3):
+                        response = monitor_ipc.request_monitor(
+                            directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP
+                        )
+                        assert response.state in {"stop-accepted", "stop-terminal"}
+                    assert (
+                        monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.PING).state
+                        == "pong"
+                    )
+                    stop_requested = True
             if snapshot.phase == "terminal":
                 break
             assert snapshot.phase not in {"control-lost", "aborting", "abandoned"}, snapshot.to_dict()
@@ -2714,6 +2750,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn):
         else:
             raise AssertionError("child monitor did not reach TERMINAL")
         assert observed_active
+        assert stop_requested == stop_workload
         assert snapshot.writer == endpoint.writer
         assert snapshot.revision == 7
         assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
@@ -2721,6 +2758,13 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn):
         # transport-retirement request until its connection is released.
         while True:
             try:
+                if stop_workload:
+                    stopped = monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP)
+                    if stopped.state != "stop-terminal":
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("child monitor did not confirm durable STOP terminal")
+                        time.sleep(0.02)
+                        continue
                 retired = monitor_ipc.shutdown_monitor_exec(directory_fd, endpoint, timeout=1)
                 break
             except monitor_ipc.MonitorIPCError:
@@ -2759,8 +2803,8 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn):
         os.close(directory_fd)
 
 
-@pytest.mark.parametrize("child_owned", [False, True])
-def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool) -> None:
+@pytest.mark.parametrize(("child_owned", "stop_workload"), [(False, False), (True, False), (True, True)])
+def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_workload: bool) -> None:
     if os.environ.get(_ENABLE_ENV) != "1":
         pytest.skip(f"set {_ENABLE_ENV}=1 on the qualified native Linux/KVM libvirt runner")
     qualification_root, qualification_root_identity = _create_qualification_root()
@@ -2781,7 +2825,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool) -> No
     try:
         roots = init_resolved_roots(StatePaths(qualification_root / "c", qualification_root / "s"))
         store = OCIStore(roots, repair_min_age_seconds=0)
-        materialization = _proof_materialization(store)
+        materialization = _proof_materialization(store, stop_workload=stop_workload)
         console_path = _create_qualification_console(qualification_root)
         original_build_oci_root_domain_xml = oci_root_kvm_module.build_oci_root_domain_xml
 
@@ -2953,7 +2997,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool) -> No
                 # after the exact terminal domain has been removed.
                 broker.applied = True
                 completed, monitor_snapshot = _launch_in_exec_monitor(
-                    qualification_root, roots, monitor_binding, boot, conn
+                    qualification_root, roots, monitor_binding, boot, conn, stop_workload=stop_workload
                 )
             else:
                 completed = launch_defined_oci_root_domain(
@@ -2998,23 +3042,32 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool) -> No
 
         assert direct_connect_attempts == []
         assert completed.domain_uuid == defined.domain_uuid
-        assert completed.terminal.returncode == 101
-        assert completed.terminal.exit_code == 101
+        expected_exit = 42 if stop_workload else 101
+        assert completed.terminal.returncode == expected_exit
+        assert completed.terminal.exit_code == expected_exit
         assert completed.terminal.signal_number is None
         lifecycle = completed.lifecycle.to_dict()
         assert lifecycle["schema"] == "palimpsest.oci-root-handoff.v1"
         assert lifecycle["phase"] == "terminal"
         assert lifecycle["boot_attempt_id"] == expected_boot_attempt_id
-        assert [entry["kind"] for entry in lifecycle["transcript"]] == [
+        expected_transcript = [
             "HELLO",
             "BOOTSTRAP",
             "KEY_ACK",
             "READY",
-            "TERMINAL",
         ]
+        if stop_workload:
+            expected_transcript.append("STOP")
+        expected_transcript.append("TERMINAL")
+        assert [entry["kind"] for entry in lifecycle["transcript"]] == expected_transcript
+        if stop_workload:
+            stop_receipt, terminal_receipt = lifecycle["transcript"][-2:]
+            assert terminal_receipt["reply_to"] == stop_receipt["request_id"]
         assert "boot_key" not in repr(lifecycle)
         assert "tag" not in repr(lifecycle)
         console_tail = _qualification_console_tail(console_path)
+        if stop_workload:
+            assert console_tail.count("palimpsest workload proof: stop observed\n") == 1
         for marker in (ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, LIFECYCLE_READY_COMMITTED_MARKER):
             assert marker.decode("ascii") in console_tail, (
                 f"qualification console is missing {marker!r}; tail:\n{console_tail}"

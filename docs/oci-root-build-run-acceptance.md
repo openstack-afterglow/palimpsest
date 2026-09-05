@@ -280,6 +280,20 @@ Production authority validation does not relax permissions. Domain definition
 still precedes the clean launcher; public foreground/detached dispatch and
 local build-to-run Gate 2 remain disabled.
 
+Slice 30K adds private authenticated guest STOP through the live child worker.
+The IPC loop queues a single fixed SIGTERM only after durable READY. Duplicate
+requests are idempotent and cannot extend its bounded deadline; acceptance is
+not proof of delivery or exit. Only the worker accesses the boot key/session,
+and every STOP write revalidates the exact domain and retained authority.
+Signed TERMINAL feeds the existing durable exit mapping. An accepted STOP's
+ambiguous send, EOF or timeout preserves cleanup-required/control-lost and never
+uses force destroy as a timeout fallback.
+
+The additional live case runs the checked-in signal-aware workload, waits until
+its signal handlers are armed after launcher exit, repeats IPC STOP and PING,
+and requires one signed STOP plus the matching TERMINAL with exit 42. Public
+stop/run/`-d`, reconnect, production access provisioning and Gate 2 remain gated.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

@@ -34,6 +34,7 @@ from .oci_lifecycle_transport import (
     complete_initial_lifecycle_handoff,
 )
 from .oci_monitor import MonitorBinding
+from .oci_monitor_control import MonitorStopControl
 from .oci_monitor_ipc import MonitorPreActivationBinding, _PreactivationJournalLease
 from .oci_root_kvm import (
     ResolvedOCIRootDomainPlan,
@@ -1391,6 +1392,7 @@ def _record_launch_cleanup_required(
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
     *,
     journal_authority_lost: bool = False,
+    accepted_stop_failure: bool = False,
 ) -> None:
     with locked_existing_run(roots, name) as mutation:
         ledger_domain_id = None if ledger_phase == "activating" else domain_id
@@ -1408,6 +1410,8 @@ def _record_launch_cleanup_required(
         data["error"] = (
             "OCI-root monitor journal authority lost; cleanup is required"
             if journal_authority_lost
+            else "OCI-root admitted guest STOP did not complete; cleanup is required"
+            if accepted_stop_failure
             else "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
         )
         handoff = data.get("oci_root_handoff")
@@ -1576,17 +1580,23 @@ def launch_defined_oci_root_domain(
     monitor_binding: MonitorPreActivationBinding | None = None,
     monitor_lease: _PreactivationJournalLease | None = None,
     authority_guard: Callable[[], None] | None = None,
+    stop_control: MonitorStopControl | None = None,
 ) -> CompletedOCIRootHandoff:
     """Privately launch an exact defined domain and synchronously observe exit.
 
     This function remains disconnected from public runtime dispatch.  It does
-    not implement detached operation, reconnect, stop, exec, or log delivery.
+    not implement public detached operation, reconnect, exec, or log delivery.
+    A bound monitor can request one authenticated guest STOP through its worker.
     """
 
     if monitor_lease is not None and (type(monitor_lease) is not _PreactivationJournalLease or monitor_binding is None):
         raise StateError("OCI-root monitor launch requires an exact bound journal lease")
     if authority_guard is not None and (not callable(authority_guard) or monitor_lease is None):
         raise StateError("OCI-root launch authority guard requires a bound monitor lease")
+    if stop_control is not None and (
+        type(stop_control) is not MonitorStopControl or monitor_lease is None or authority_guard is None
+    ):
+        raise StateError("OCI-root STOP control requires an exact guarded monitor lease")
 
     def verify_monitor_lease(mutation: Any, lease: _PreactivationJournalLease, *args: Any, **kwargs: Any) -> None:
         _verify_monitor_lease_directory(mutation, lease, *args, authority_guard=authority_guard, **kwargs)
@@ -1862,6 +1872,40 @@ def launch_defined_oci_root_domain(
                 ledger_phase = "ready"
                 if monitor_lease is not None:
                     monitor_lease.mark_ready()
+                if stop_control is not None:
+                    stop_control.mark_ready()
+
+        def before_stop_send() -> None:
+            # This callback runs only on the lifecycle worker, immediately
+            # before every write attempt (including partial/EAGAIN retries).
+            with locked_existing_run(roots, name) as mutation:
+                if monitor_lease is None or ready_lifecycle is None:
+                    raise StateError("OCI-root STOP requires a durable monitor READY")
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+                if _connection_uri(conn, profile) != libvirt_uri:
+                    raise StateError("OCI-root connection URI changed before STOP")
+                current = _definition_ledger(mutation.snapshot.state, profile)
+                if current != (domain_uuid, resolved.plan.digest, definition_projection_digest):
+                    raise StateError("OCI-root durable definition changed before STOP")
+                _require_expected_handoff(
+                    mutation.snapshot.state,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    libvirt_uri,
+                    boot_attempt_id,
+                    "ready",
+                    ready_lifecycle,
+                )
+                _exact_launch_instance(
+                    conn,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    definition_projection_digest,
+                    active=True,
+                )
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
 
         stream_handed_off = True
         handoff_failure: BaseException | None = None
@@ -1877,6 +1921,11 @@ def launch_defined_oci_root_domain(
                 wait=event_pump.wait_readable,
                 wait_writable=event_pump.wait_writable,
                 before_stream_close=event_pump.close,
+                **(
+                    {"stop_control": stop_control, "before_stop_send": before_stop_send}
+                    if stop_control is not None
+                    else {}
+                ),
             )
         except BaseException as exc:
             handoff_failure = exc
@@ -1975,6 +2024,8 @@ def launch_defined_oci_root_domain(
             terminal_durable = True
             if monitor_lease is not None:
                 monitor_lease.mark_terminal()
+            if stop_control is not None:
+                stop_control.mark_terminal()
         return CompletedOCIRootHandoff(
             resolved.plan.run_id,
             resolved.plan.run_name,
@@ -1986,6 +2037,8 @@ def launch_defined_oci_root_domain(
             lifecycle,
         )
     except BaseException as launch_failure:
+        if stop_control is not None:
+            stop_control.mark_control_lost()
         if stream is not None and not stream_handed_off:
             _close_unowned_stream(stream)
         if terminal_durable:
@@ -2012,7 +2065,11 @@ def launch_defined_oci_root_domain(
                             )
                     except BaseException:
                         journal_authority_valid = False
-                if not journal_authority_valid or isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError):
+                if (
+                    not journal_authority_valid
+                    or isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError)
+                    or (stop_control is not None and stop_control.accepted)
+                ):
                     _record_launch_cleanup_required(
                         roots,
                         name,
@@ -2024,6 +2081,11 @@ def launch_defined_oci_root_domain(
                         ledger_phase,
                         ready_lifecycle,
                         journal_authority_lost=not journal_authority_valid,
+                        accepted_stop_failure=(
+                            stop_control is not None
+                            and stop_control.accepted
+                            and not isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError)
+                        ),
                     )
                     cleanup_phase = "cleanup-required"
                 else:

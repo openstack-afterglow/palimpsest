@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import PalimpsestError, StateError
+from .oci_monitor_control import MonitorStopControl
 from .oci_monitor_ipc import MonitorPreActivationBinding
 from .oci_root_kvm import VerifiedHostBootArtifacts, verify_host_boot_artifacts
 from .oci_store import OCIStore
@@ -310,13 +311,22 @@ class MonitorLaunchAuthority:
         self.validate()
         return roots, store, boot, _profile(self._frame["profile"])
 
-    def run(self, directory_fd: int, binding: MonitorPreActivationBinding, lease: Any) -> Any:
+    def run(
+        self,
+        directory_fd: int,
+        binding: MonitorPreActivationBinding,
+        lease: Any,
+        *,
+        stop_control: MonitorStopControl | None = None,
+    ) -> Any:
         # This import is intentionally worker-local: no libvirt/event state is
         # inherited from the spawning process or initialized by the IPC loop.
         from .oci_root_runtime import connect_oci_root_libvirt, launch_defined_oci_root_domain
 
         connection = None
         try:
+            if stop_control is not None and type(stop_control) is not MonitorStopControl:
+                raise _invalid()
             self.validate(directory_fd, binding)
             roots, store, boot, profile = self._rebuild()
             connection = connect_oci_root_libvirt(binding.libvirt_uri)
@@ -333,6 +343,7 @@ class MonitorLaunchAuthority:
                 timeout_seconds=self._frame["timeout_seconds"],
                 terminal_timeout_seconds=self._frame["terminal_timeout_seconds"],
                 authority_guard=lambda: self.validate(directory_fd, binding),
+                **({"stop_control": stop_control} if stop_control is not None else {}),
             )
         finally:
             try:

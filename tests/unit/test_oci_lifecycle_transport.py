@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import struct
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,7 @@ from palimpsest_local.oci_lifecycle_transport import (
     OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
 )
+from palimpsest_local.oci_monitor_control import MonitorStopControl
 
 RUN_ID = "f6f546e2-e734-4920-9eff-1762b348a249"
 ATTEMPT_ID = "aca88126-d991-4de8-b66b-90dc07904dff"
@@ -41,10 +44,12 @@ class _GuestStream:
         signal_number: int | None = None,
         terminal_delay: int = 0,
         trailing_terminal_wire: str | None = None,
+        await_stop: bool = False,
     ) -> None:
         self.signal_number = signal_number
         self.terminal_delay = terminal_delay
         self.trailing_terminal_wire = trailing_terminal_wire
+        self.await_stop = await_stop
         self.host = bytearray()
         self.guest: list[bytes | int] = [-2]
         self.abort_calls = 0
@@ -122,12 +127,30 @@ class _GuestStream:
                     trailing = encode_frame(terminal)
                 elif self.trailing_terminal_wire == "truncated":
                     trailing = b"\x00\x00"
-                if self.terminal_delay:
+                if self.await_stop:
+                    self.guest.append(encode_frame(ready))
+                elif self.terminal_delay:
                     self.guest.append(encode_frame(ready))
                     self.guest.extend([-2] * self.terminal_delay)
                     self.guest.append(encode_frame(terminal) + trailing)
                 else:
                     self.guest.append(encode_frame(ready) + encode_frame(terminal) + trailing)
+            elif envelope.body.kind == "STOP":
+                terminal = sign_message(
+                    OCIControlV2Message(
+                        "TERMINAL",
+                        BINDING,
+                        ATTEMPT_ID,
+                        NONCE,
+                        1,
+                        3,
+                        {"terminal": {"exit_code": None, "signal": 15}},
+                        boot_generation=BOOT_GENERATION,
+                        reply_to=envelope.body.request_id,
+                    ),
+                    KEY,
+                )
+                self.guest.append(encode_frame(terminal))
         return len(payload)
 
     def recv(self, _size: int) -> bytes | int:
@@ -138,6 +161,277 @@ class _GuestStream:
 
     def free(self) -> None:
         self.free_calls += 1
+
+
+def test_stop_is_worker_signed_once_with_guard_before_every_partial_send():
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+    guards = []
+    writes = []
+    original_send = stream.send
+    admitted = False
+
+    def send(payload):
+        if admitted:
+            writes.append(len(payload))
+            assert len(guards) == len(writes)
+        return original_send(payload)
+
+    def ready(_receipt):
+        nonlocal admitted
+        control.mark_ready()
+        assert control.request() == control.request() == "stop-accepted"
+        stream.send_would_block = True
+        admitted = True
+
+    stream.send = send
+    result = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=ready,
+        session=_session(BINDING),
+        stop_control=control,
+        before_stop_send=lambda: guards.append(True),
+    )
+    assert stream.sent_kinds == ["HELLO", "KEY_ACK", "STOP"]
+    assert len(guards) == len(writes) == 3  # EAGAIN, short write, final write.
+    assert result.terminal.returncode == -15
+    assert control.request() == "stop-accepted"  # Receipt is not durable yet.
+    assert not control.take_stop()
+    control.mark_terminal()
+    assert control.request() == "stop-terminal"
+    encoded = json.dumps(result.to_dict())
+    assert KEY.hex() not in encoded and '"tag"' not in encoded
+
+
+def test_buffered_natural_terminal_takes_priority_over_admitted_stop():
+    stream = _GuestStream()
+    control = MonitorStopControl()
+
+    def ready(_receipt):
+        control.mark_ready()
+        assert control.request() == "stop-accepted"
+
+    receipt = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=ready,
+        session=_session(BINDING),
+        stop_control=control,
+        before_stop_send=lambda: pytest.fail("unexpected STOP write"),
+    )
+    assert receipt.terminal.returncode == 42
+    assert stream.sent_kinds == ["HELLO", "KEY_ACK"]
+    assert not control.take_stop()
+
+
+@pytest.mark.parametrize("split", [1, 2, 3, 4, 5, 17])
+def test_partial_natural_terminal_completes_without_injecting_stop(split):
+    stream = _GuestStream(terminal_delay=1)
+    control = MonitorStopControl()
+
+    def ready(_receipt):
+        control.mark_ready()
+        control.request()
+        terminal_frame = stream.guest[-1]
+        stream.guest[:] = [terminal_frame[:split], -2, terminal_frame[split:]]
+
+    receipt = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=ready,
+        session=_session(BINDING),
+        stop_control=control,
+        before_stop_send=lambda: pytest.fail("unexpected STOP write"),
+    )
+    assert receipt.terminal.returncode == 42
+    assert stream.sent_kinds == ["HELLO", "KEY_ACK"]
+
+
+@pytest.mark.parametrize("failure_at", [1, 2, 3])
+def test_stop_authority_revocation_prevents_next_write(failure_at):
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+    checks = 0
+
+    def ready(_receipt):
+        control.mark_ready()
+        control.request()
+        stream.send_would_block = True
+
+    def guard():
+        nonlocal checks
+        checks += 1
+        if checks == failure_at:
+            raise OCILifecycleTransportError("authority revoked")
+
+    with pytest.raises(OCILifecycleTransportError, match="authority revoked"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=control,
+            before_stop_send=guard,
+        )
+    assert checks == failure_at
+    assert "STOP" not in stream.sent_kinds
+    assert control.accepted and control.request() == "control-lost"
+    assert stream.abort_calls == stream.free_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["backpressure", "no-terminal", "partial-terminal", "partial-header"])
+def test_stop_deadline_bounds_backpressure_terminal_wait_and_partial_input(monkeypatch, mode):
+    clock = [0.0]
+    monkeypatch.setattr("palimpsest_local.oci_monitor_control.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+    original_send = stream.send
+    admitted = False
+
+    def send(payload):
+        if admitted and mode == "backpressure":
+            return -2
+        result = original_send(payload)
+        if "STOP" in stream.sent_kinds:
+            stream.guest.clear()
+        return result
+
+    def ready(_receipt):
+        nonlocal admitted
+        control.mark_ready()
+        control.request()
+        admitted = True
+        if mode == "partial-terminal":
+            stream.guest.append(b"\x00\x00")
+        elif mode == "partial-header":
+            stream.guest.append(b"\x00\x00\x01\x00")
+
+    def wait(_seconds):
+        clock[0] += 1
+        if admitted:
+            assert control.request() == "stop-accepted"
+
+    stream.send = send
+    with pytest.raises(OCILifecycleTransportError, match="timed out"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=control,
+            before_stop_send=lambda: None,
+            monotonic=lambda: clock[0],
+            wait=wait,
+        )
+    assert clock[0] <= 32
+    assert control.request() == "control-lost"
+    if mode != "no-terminal":
+        assert "STOP" not in stream.sent_kinds
+
+
+def test_stop_admission_racing_initial_deadline_read_still_bounds_send(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("palimpsest_local.oci_monitor_control.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+    original_take = control.take_stop
+    original_send = stream.send
+    after_ready = False
+
+    def take():
+        control.request()
+        return original_take()
+
+    def ready(_receipt):
+        nonlocal after_ready
+        control.mark_ready()
+        after_ready = True
+
+    def wait(_seconds):
+        clock[0] += 1
+        assert clock[0] < 40
+
+    control.take_stop = take
+    stream.send = lambda payload: -2 if after_ready else original_send(payload)
+    with pytest.raises(OCILifecycleTransportError, match="timed out"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=control,
+            before_stop_send=lambda: None,
+            monotonic=lambda: clock[0],
+            wait=wait,
+        )
+    assert control.accepted and control.request() == "control-lost"
+
+
+def test_stop_guard_exhausting_deadline_never_writes_stop(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("palimpsest_local.oci_monitor_control.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+
+    def ready(_receipt):
+        control.mark_ready()
+        control.request()
+
+    def guard():
+        clock[0] = 31.0
+
+    with pytest.raises(OCILifecycleTransportError, match="timed out"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=control,
+            before_stop_send=guard,
+            monotonic=lambda: clock[0],
+        )
+    assert stream.sent_kinds == ["HELLO", "KEY_ACK"]
+    assert not stream.host
+
+
+@pytest.mark.parametrize("tamper", ["tag", "reply", "binding", "trailing"])
+def test_stop_still_requires_exact_authenticated_terminal(tamper):
+    stream = _GuestStream(await_stop=True)
+    control = MonitorStopControl()
+    original_send = stream.send
+
+    def ready(_receipt):
+        control.mark_ready()
+        control.request()
+
+    def send(payload):
+        count = original_send(payload)
+        if "STOP" in stream.sent_kinds and stream.guest:
+            frame = stream.guest[-1]
+            terminal = decode_frame(frame)
+            if tamper == "tag":
+                changed = sign_message(terminal.body, b"x" * 32)
+            elif tamper == "reply":
+                changed = sign_message(replace(terminal.body, reply_to=123456), KEY)
+            elif tamper == "binding":
+                changed = sign_message(replace(terminal.body, binding=replace(BINDING, run_id=ATTEMPT_ID)), KEY)
+            else:
+                changed = terminal
+            stream.guest[-1] = encode_frame(changed) + (b"\x00" if tamper == "trailing" else b"")
+        return count
+
+    stream.send = send
+    with pytest.raises(OCILifecycleTransportError, match="TERMINAL"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=control,
+            before_stop_send=lambda: None,
+        )
+    assert control.request() == "control-lost"
 
 
 @pytest.mark.parametrize(

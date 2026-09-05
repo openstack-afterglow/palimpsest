@@ -3425,6 +3425,152 @@ def _committed_monitor_lease(roots, name, binding, monkeypatch, request, *, dire
         os.close(directory_fd)
 
 
+@pytest.mark.parametrize(
+    "failure", ["timeout", "partial-send", "callback-cleanup", "authority", "domain-id", "journal"]
+)
+def test_oci_root_admitted_stop_failure_preserves_exact_vm(
+    tmp_path,
+    monkeypatch,
+    request,
+    failure,
+):
+    from palimpsest_local.oci_lifecycle_transport import OCILifecycleStreamCallbackCleanupError
+    from palimpsest_local.oci_monitor_control import MonitorStopControl
+
+    name = "stop-preserve"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots,
+        name,
+        store,
+        boot,
+        profile,
+        conn=conn,
+        boot_attempt_id=str(uuid.uuid4()),
+        runner=tools,
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    control = MonitorStopControl()
+    domain = conn.domains[name]
+    revoked = False
+
+    def authority_guard():
+        if revoked:
+            raise StateError("authority revoked before STOP")
+
+    def handoff(stream, _binding, *, on_ready, session, before_stream_close, stop_control, before_stop_send, **kwargs):
+        nonlocal revoked
+        try:
+            assert stop_control is control
+            assert control.request() == "stop-refused"
+            on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+            assert lease.snapshot.phase == "ready"
+            assert control.request() == "stop-accepted"
+            if failure == "authority":
+                revoked = True
+            elif failure == "domain-id":
+                domain.ID = lambda: 999
+            elif failure == "journal":
+                lease.mark_control_lost()
+            before_stop_send()
+            if failure == "callback-cleanup":
+                raise OCILifecycleStreamCallbackCleanupError("test callback cleanup failure")
+            raise StateError("test STOP send or terminal timeout")
+        finally:
+            before_stream_close()
+            stream.abort()
+            stream.free()
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
+    with pytest.raises(StateError, match="cleanup is required"):
+        launch_defined_oci_root_domain(
+            roots,
+            name,
+            store,
+            boot,
+            profile,
+            conn=conn,
+            runner=tools,
+            monitor_binding=binding,
+            monitor_lease=lease,
+            authority_guard=authority_guard,
+            stop_control=control,
+        )
+    assert domain.create_calls == 1
+    assert domain.destroy_calls == domain.undefine_calls == 0
+    assert domain.isActive() == 1
+    assert control.request() == "control-lost"
+    state = read_run_ledger_snapshot(roots, name).state
+    assert state["status"] == "failed"
+    assert state["oci_root_handoff"]["phase"] == "cleanup-required"
+    assert lease.snapshot.phase == "control-lost"
+    if failure in {"timeout", "partial-send", "domain-id"}:
+        assert state["error"] == "OCI-root admitted guest STOP did not complete; cleanup is required"
+
+
+def test_oci_root_stop_terminal_ack_requires_durable_state_and_journal(tmp_path, monkeypatch, request):
+    from palimpsest_local.oci_monitor_control import MonitorStopControl
+
+    name = "stop-complete"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots,
+        name,
+        store,
+        boot,
+        profile,
+        conn=conn,
+        boot_attempt_id=str(uuid.uuid4()),
+        runner=tools,
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    control = MonitorStopControl()
+    terminal = ProcessExit(-15, None, 15, ProcessExitCategory.SIGNALED)
+
+    def handoff(stream, _binding, *, on_ready, session, before_stream_close, before_stop_send, **kwargs):
+        try:
+            on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+            assert control.request() == "stop-accepted"
+            before_stop_send()
+            control.mark_observed_terminal()
+            assert control.request() == "stop-accepted"
+            return _handoff_receipt("terminal", terminal, boot_attempt_id=session.boot_attempt_id)
+        finally:
+            before_stream_close()
+            stream.abort()
+            stream.free()
+
+    original_mark_terminal = control.mark_terminal
+
+    def mark_terminal():
+        assert read_run_ledger_snapshot(roots, name).state["status"] == "exited"
+        assert lease.snapshot.phase == "terminal"
+        original_mark_terminal()
+
+    control.mark_terminal = mark_terminal
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
+    result = launch_defined_oci_root_domain(
+        roots,
+        name,
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+        monitor_binding=binding,
+        monitor_lease=lease,
+        authority_guard=lambda: None,
+        stop_control=control,
+    )
+    assert result.terminal == terminal
+    assert control.request() == "stop-terminal"
+    assert conn.domains[name].destroy_calls == 1
+
+
 @pytest.mark.parametrize("use_monitor_binding", [False, True, "lease"])
 def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     tmp_path: Path,

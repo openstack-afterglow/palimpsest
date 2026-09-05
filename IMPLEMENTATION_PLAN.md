@@ -1254,6 +1254,39 @@ filesystem access provisioning, and Gate 2 remain disabled. The next runtime
 step is bounded guest STOP delivery through the live worker's memory-only key,
 followed by the public foreground/detached adapter and end-to-end build/run gate.
 
+### PR 4 slice 30K: authenticated guest STOP in the live worker
+
+The private IPC STOP operation submits one semantic SIGTERM request to a bounded,
+child-local control slot. Only the lifecycle worker holds the v2 session and
+boot key, constructs the authenticated STOP, and writes the libvirt stream.
+Admission requires durable READY. Repeated authenticated requests coalesce;
+they neither send another STOP nor renew the fixed 30-second admission deadline.
+An acceptance reply
+means queued, not delivered or terminated. A lost IPC response leaves the outcome
+unknown and may be retried against the same live monitor.
+
+Before each STOP stream write, including partial-write/backpressure retries,
+the worker revalidates the held authority, journal, durable handoff, and exact
+active domain instance. Already-buffered guest input takes priority, allowing
+natural authenticated TERMINAL to win without a fabricated STOP cause. The
+existing authenticated terminal receipt determines the process exit result;
+only the durable exited ledger and terminal journal authorize a terminal reply.
+
+Failure after accepting STOP preserves cleanup-required/control-lost evidence.
+Timeout, EOF, and ambiguous writes do not escalate to domain.destroy(). The
+existing exact-domain teardown after an authenticated TERMINAL is unchanged.
+No key or queued request is reconstructed from a dead monitor's journal.
+
+The live qualification retains both natural-exit variants and adds child-owned
+STOP against the existing signal-aware workload proof. After the launcher exits,
+the test waits for signal readiness, repeats STOP while checking PING, and
+requires exactly one signed STOP, a matching TERMINAL reply, exit 42, and the
+guest's single stop-observed marker before exact terminal cleanup.
+
+Scope: this is private live-worker control, not public stop/run/`-d` dispatch.
+Reconnect, stale-owner recovery/cleanup, production filesystem access brokering,
+and local build-to-run Gate 2 remain unimplemented or disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1272,8 +1305,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add bounded authenticated guest STOP delivery to the live child worker and
-   exact-domain cleanup for stale ownership. Authenticated control requires
+1. Add exact-domain cleanup for stale ownership and production filesystem
+   access provisioning. Authenticated control requires
    the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
    alone cannot recover running control.
 2. Connect foreground-default `run` and detached `run -d` to that monitor,

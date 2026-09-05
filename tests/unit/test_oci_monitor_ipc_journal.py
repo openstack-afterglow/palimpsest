@@ -233,6 +233,157 @@ def test_ipc_worker_describe_and_transport_shutdown_are_serialized(
         os.close(directory_fd)
 
 
+@pytest.mark.parametrize(
+    "phase,mailbox,done,failed,expected",
+    [
+        ("committed", "inert", False, False, "stop-refused"),
+        ("committed", "pending", False, False, "stop-refused"),
+        ("activating", "pending", False, False, "stop-refused"),
+        ("active", "pending", False, False, "stop-refused"),
+        ("ready", "pending", False, False, "stop-refused"),
+        ("ready", "ready", False, False, "stop-accepted"),
+        ("ready", "observed-terminal", False, False, "stop-refused"),
+        ("ready", "control-lost", False, False, "stop-refused"),
+        ("ready", "ready", False, True, "stop-refused"),
+        ("terminal", "terminal", False, False, "stop-refused"),
+        ("terminal", "accepted-terminal", False, False, "stop-accepted"),
+        ("terminal", "terminal", True, False, "stop-terminal"),
+        ("terminal", "terminal", True, True, "stop-refused"),
+    ],
+)
+def test_private_stop_requires_durable_ready_and_coalesces_transport_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    mailbox: str,
+    done: bool,
+    failed: bool,
+    expected: str,
+) -> None:
+    from palimpsest_local.oci_monitor_control import MonitorStopControl
+
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, phase)
+    snapshot = lease.snapshot
+    control = MonitorStopControl()
+    if mailbox in {"ready", "observed-terminal", "terminal", "accepted-terminal", "control-lost"}:
+        control.mark_ready()
+    if mailbox == "accepted-terminal":
+        assert control.request() == "stop-accepted"
+    if mailbox in {"observed-terminal", "terminal", "accepted-terminal"}:
+        control.mark_observed_terminal()
+    if mailbox in {"terminal", "accepted-terminal"}:
+        control.mark_terminal()
+    if mailbox == "control-lost":
+        control.mark_control_lost()
+    completion = threading.Event()
+    if done:
+        completion.set()
+    worker = None if mailbox == "inert" else SimpleNamespace(done=completion, failed=failed, stop_control=control)
+    requests = iter(
+        [
+            ipc._request_message(ipc.MonitorIPCOperation.STOP, _identity(), _writer(), str(uuid.uuid4()))
+            for _ in range(2)
+        ]
+    )
+    replies = []
+
+    class Channel:
+        def settimeout(self, _timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Listener:
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            if len(replies) == 2:
+                raise OSError("end test service")
+            return Channel(), None
+
+    bound = SimpleNamespace(validate=lambda: None, listener=Listener())
+    monkeypatch.setattr(ipc, "_recv_frame", lambda _channel: next(requests))
+    monkeypatch.setattr(ipc, "_authorize_peer", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_send_frame", lambda _channel, value: replies.append(value))
+    try:
+        with pytest.raises(ipc.MonitorIPCError):
+            ipc._serve_committed(bound, _identity(), _writer(), 1, lease, worker)
+        assert [reply["state"] for reply in replies] == [expected, expected]
+        assert replies[0]["request_id"] != replies[1]["request_id"]
+        assert lease.snapshot == snapshot
+        assert control.accepted is (expected == "stop-accepted")
+        if expected == "stop-accepted" and phase == "ready":
+            assert control.take_stop() is True
+            assert control.take_stop() is False
+            assert control.request() == "stop-accepted"
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+def test_unauthorized_stop_peer_cannot_admit_worker_mailbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from palimpsest_local.oci_monitor_control import MonitorStopControl
+
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, "ready")
+    snapshot = lease.snapshot
+    control = MonitorStopControl()
+    control.mark_ready()
+    worker = SimpleNamespace(done=threading.Event(), failed=False, stop_control=control)
+
+    class Channel:
+        def settimeout(self, _timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class Listener:
+        calls = 0
+
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            self.calls += 1
+            if self.calls > 1:
+                raise OSError("end test service")
+            return Channel(), None
+
+    def reject(*_args):
+        raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.UNAUTHORIZED_PEER)
+
+    bound = SimpleNamespace(validate=lambda: None, listener=Listener())
+    request = ipc._request_message(ipc.MonitorIPCOperation.STOP, _identity(), _writer(), str(uuid.uuid4()))
+    monkeypatch.setattr(ipc, "_recv_frame", lambda _channel: request)
+    monkeypatch.setattr(ipc, "_authorize_peer", reject)
+    monkeypatch.setattr(ipc, "_send_frame", lambda *_args: pytest.fail("unauthorized peer must not receive response"))
+    try:
+        with pytest.raises(ipc.MonitorIPCError):
+            ipc._serve_committed(bound, _identity(), _writer(), 1, lease, worker)
+        assert not control.accepted
+        assert lease.snapshot == snapshot
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
 @pytest.mark.parametrize("phase", ["committed", "activating", "active", "ready", "terminal"])
 def test_discovery_accepts_only_same_owner_monotonic_activation_revisions(
     tmp_path: Path,

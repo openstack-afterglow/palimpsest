@@ -190,11 +190,12 @@ def test_peer_authorization_accepts_exact_kernel_and_proc_identity() -> None:
         right.close()
 
 
-def test_protocol_has_no_ready_stop_or_domain_mutation_command() -> None:
+def test_protocol_stop_is_fixed_private_operation_without_ready_or_domain_mutation_command() -> None:
     assert set(ipc.MonitorIPCOperation) == {
         ipc.MonitorIPCOperation.DESCRIBE,
         ipc.MonitorIPCOperation.PING,
         ipc.MonitorIPCOperation.SHUTDOWN,
+        ipc.MonitorIPCOperation.STOP,
     }
     source = Path(ipc.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -203,6 +204,94 @@ def test_protocol_has_no_ready_stop_or_domain_mutation_command() -> None:
     }
     assert not any(name.endswith(("oci_root_runtime", "kvm", "libvirt")) for name in imports)
     assert not any(isinstance(node, ast.Name) and node.id == "MonitorLease" for node in ast.walk(tree))
+
+
+@pytest.mark.parametrize("extra", [{"signal": 9}, {"grace_seconds": 1}, {"stop_request_id": str(uuid.uuid4())}])
+def test_private_stop_rejects_caller_signal_grace_and_guest_request_id(extra: dict[str, object]) -> None:
+    request = ipc._request_message(ipc.MonitorIPCOperation.STOP, _identity(), _process(), str(uuid.uuid4()))
+    assert ipc._decode_request(request, _identity())[0] is ipc.MonitorIPCOperation.STOP
+    with pytest.raises(ipc.MonitorIPCError) as failure:
+        ipc._decode_request({**request, **extra}, _identity())
+    assert failure.value.category is ipc.MonitorIPCErrorCategory.INVALID_FRAME
+
+
+@pytest.mark.parametrize(
+    "state", ["stop-accepted", "stop-terminal", "stop-refused", "terminal", "accepted", None, [], {}]
+)
+def test_stop_client_accepts_only_exact_path_free_response_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: object,
+) -> None:
+    from types import SimpleNamespace
+
+    directory_fd = _directory(tmp_path / "run")
+    endpoint = ipc.MonitorExecEndpoint(_identity(), _process(), 12, 34)
+    request_id = uuid.uuid4()
+
+    class Channel:
+        def __init__(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    response = ipc._response_message(ipc.MonitorIPCOperation.STOP, _identity(), _process(), str(request_id))
+    response["state"] = state
+    monkeypatch.setattr(ipc.socket, "socket", Channel)
+    monkeypatch.setattr(ipc, "current_process_identity", _process)
+    monkeypatch.setattr(ipc.uuid, "uuid4", lambda: request_id)
+    monkeypatch.setattr(ipc, "_visible_socket", lambda *_args: SimpleNamespace(st_dev=12, st_ino=34))
+    monkeypatch.setattr(ipc, "_authorize_peer", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_connect_socket", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_send_frame", lambda *_args: None)
+    monkeypatch.setattr(ipc, "_recv_frame", lambda *_args: response)
+    try:
+        if state in ("stop-accepted", "stop-terminal", "stop-refused"):
+            assert ipc.request_monitor(directory_fd, endpoint, ipc.MonitorIPCOperation.STOP).state == state
+        else:
+            with pytest.raises(ipc.MonitorIPCError) as failure:
+                ipc.request_monitor(directory_fd, endpoint, ipc.MonitorIPCOperation.STOP)
+            assert failure.value.category is ipc.MonitorIPCErrorCategory.BINDING_MISMATCH
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_stop_mailbox_is_forwarded_only_to_launch_worker_thread(fail: bool) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from palimpsest_local.oci_monitor_control import MonitorStopControl
+
+    events = []
+
+    class Authority:
+        def run(self, _fd, _binding, _lease, *, stop_control):
+            assert threading.current_thread() is not threading.main_thread()
+            assert type(stop_control) is MonitorStopControl
+            events.append(stop_control)
+            if fail:
+                raise RuntimeError("private failure")
+
+        def close(self):
+            events.append("closed")
+
+    worker = ipc._LaunchWorker(
+        Authority(), 123, _binding(), SimpleNamespace(snapshot=SimpleNamespace(phase="committed"))
+    )
+    worker.start()
+    worker.join()
+    assert worker.done.is_set()
+    assert worker.failed is fail
+    assert events == [worker.stop_control, "closed"]
+    assert worker.stop_control.request() == ("control-lost" if fail else "stop-refused")
 
 
 def test_in_memory_endpoint_receipt_is_exact_canonical_and_rejects_tamper() -> None:

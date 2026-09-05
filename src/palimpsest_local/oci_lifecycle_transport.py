@@ -25,6 +25,7 @@ from .oci_control_protocol_v2 import (
     OCIControlV2FrameDecoder,
     encode_frame,
 )
+from .oci_monitor_control import MonitorStopControl
 from .runtime_types import ProcessExit, ProcessExitCategory
 
 OCI_ROOT_HANDOFF_SCHEMA = "palimpsest.oci-root-handoff.v1"
@@ -119,10 +120,14 @@ def _send_all(
     deadline: float | None,
     monotonic: Callable[[], float],
     wait_writable: Callable[[float], None],
+    before_send: Callable[[], None] | None = None,
 ) -> None:
     offset = 0
     while offset < len(payload):
         _remaining(deadline, monotonic)
+        if before_send is not None:
+            before_send()
+            _remaining(deadline, monotonic)
         try:
             sent = stream.send(payload[offset:])
         except Exception:
@@ -143,14 +148,27 @@ def _receive_one(
     deadline: float | None,
     monotonic: Callable[[], float],
     wait: Callable[[float], None],
+    control_poll: Callable[[bool], None] | None = None,
 ) -> OCIControlV2Envelope:
     while not pending:
+        if control_poll is not None:
+            control_poll(False)
         _remaining(deadline, monotonic)
         try:
             chunk = stream.recv(_READ_SIZE)
         except Exception:
             raise OCILifecycleTransportError("OCI-root lifecycle stream receive failed") from None
         if chunk == -2:
+            if control_poll is not None:
+                # A consumed four-byte header has zero buffered_bytes but
+                # still awaits a payload. finish() also checks that state.
+                try:
+                    decoder.finish()
+                except OCIControlProtocolV2Error:
+                    frame_boundary = False
+                else:
+                    frame_boundary = True
+                control_poll(frame_boundary)
             _pause(deadline, monotonic, wait)
             continue
         if chunk in {b"", 0}:
@@ -205,6 +223,8 @@ def complete_initial_lifecycle_handoff(
     wait_writable: Callable[[float], None] | None = None,
     before_stream_close: Callable[[], None] | None = None,
     session: HostOCIControlV2Session | None = None,
+    stop_control: MonitorStopControl | None = None,
+    before_stop_send: Callable[[], None] | None = None,
 ) -> OCILifecycleHandoffReceipt:
     """Drive HELLO/BOOTSTRAP/KEY_ACK/READY through authenticated TERMINAL.
 
@@ -246,6 +266,10 @@ def complete_initial_lifecycle_handoff(
             raise OCILifecycleTransportError("OCI-root lifecycle terminal timeout is invalid")
         if not callable(on_ready):
             raise OCILifecycleTransportError("OCI-root lifecycle ready callback is invalid")
+        if stop_control is not None and (
+            type(stop_control) is not MonitorStopControl or not callable(before_stop_send)
+        ):
+            raise OCILifecycleTransportError("OCI-root lifecycle STOP control is invalid")
         if not callable(monotonic) or not callable(wait):
             raise OCILifecycleTransportError("OCI-root lifecycle timing callback is invalid")
         if wait_writable is None:
@@ -303,8 +327,41 @@ def complete_initial_lifecycle_handoff(
             terminal_deadline = monotonic() + float(terminal_timeout_seconds)
             if not math.isfinite(terminal_deadline):
                 raise OCILifecycleTransportError("OCI-root lifecycle clock result is invalid")
+
+        def poll_stop(can_send: bool) -> None:
+            if stop_control is None:
+                return
+            stop_deadline = stop_control.deadline
+            if stop_deadline is not None:
+                _remaining(stop_deadline, monotonic)
+            if not can_send or not stop_control.take_stop():
+                return
+            stop_deadline = stop_control.deadline
+            if stop_deadline is None:
+                raise OCILifecycleTransportError("OCI-root lifecycle STOP deadline is missing")
+            _remaining(stop_deadline, monotonic)
+            stop = session.stop()
+            encoded_stop = encode_frame(stop)
+            deadlines = [value for value in (terminal_deadline, stop_deadline) if value is not None]
+            _send_all(
+                stream,
+                encoded_stop,
+                deadline=min(deadlines) if deadlines else None,
+                monotonic=monotonic,
+                wait_writable=wait_writable,
+                before_send=before_stop_send,
+            )
+            observed_tags.add(stop.tag or "")
+            transcript.append(session.transcript_projection(stop, encoded_stop))
+
         terminal_envelope = _receive_one(
-            stream, decoder, pending, deadline=terminal_deadline, monotonic=monotonic, wait=wait
+            stream,
+            decoder,
+            pending,
+            deadline=terminal_deadline,
+            monotonic=monotonic,
+            wait=wait,
+            control_poll=poll_stop,
         )
         try:
             session.accept(terminal_envelope)
@@ -312,6 +369,8 @@ def complete_initial_lifecycle_handoff(
             raise OCILifecycleTransportError("OCI-root lifecycle TERMINAL was rejected") from None
         if session.state != "terminal" or terminal_envelope.body.kind != "TERMINAL":
             raise OCILifecycleTransportError("OCI-root lifecycle terminal status is invalid")
+        if stop_control is not None:
+            stop_control.mark_observed_terminal()
         if pending:
             raise OCILifecycleTransportError("OCI-root lifecycle TERMINAL had trailing frame data")
         try:
@@ -331,12 +390,16 @@ def complete_initial_lifecycle_handoff(
         )
     except BaseException as exc:
         failure = exc
+        if stop_control is not None and type(stop_control) is MonitorStopControl:
+            stop_control.mark_control_lost()
     if isinstance(failure, OCILifecycleStreamCallbackCleanupError):
         raise failure
     if before_stream_close is not None:
         try:
             before_stream_close()
         except Exception:
+            if stop_control is not None and type(stop_control) is MonitorStopControl:
+                stop_control.mark_control_lost()
             raise OCILifecycleStreamCallbackCleanupError(
                 "OCI-root lifecycle stream event cleanup failed; stream retained"
             ) from None
@@ -351,6 +414,8 @@ def complete_initial_lifecycle_handoff(
     if failure is not None:
         raise failure
     if close_failed:
+        if stop_control is not None and type(stop_control) is MonitorStopControl:
+            stop_control.mark_control_lost()
         raise OCILifecycleTransportError("OCI-root lifecycle stream cleanup failed")
     if result is None:
         raise OCILifecycleTransportError("OCI-root lifecycle handoff did not complete")

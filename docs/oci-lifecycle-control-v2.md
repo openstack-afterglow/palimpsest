@@ -1,8 +1,25 @@
 # OCI lifecycle control v2 guest/KVM activation
 
 This protocol is active in the pre-production guest PID 1, domain plan, and
-native-KVM qualification path. The production runtime still has no lifecycle
-owner, so `create/start/run/-d` remains disabled.
+native-KVM qualification path. A private fresh-exec monitor now owns lifecycle
+launch and STOP; public `create/start/run/-d` remains disabled.
+
+## Private live-worker STOP
+
+Private monitor IPC STOP is a fixed SIGTERM request, not transport SHUTDOWN.
+The owner-authenticated IPC thread only admits a single child-local control
+request after durable READY. Repeated requests coalesce without extending the
+deadline. The worker alone owns the session/key and sends the signed frame,
+rechecking the exact active VM and held authority before every write attempt.
+
+The IPC acceptance reply is not guest acknowledgement or exit evidence. Guest
+TERMINAL must authenticate and pass the existing identity/causality checks;
+natural exit may win the race. Exit mapping remains the signed guest process
+result, not an assumed SIGTERM status. Only durable run/journal terminal state
+permits a terminal IPC response. Failed or ambiguous accepted STOP, including
+deadline expiry, preserves control-lost/cleanup-required rather than force
+killing the VM. Reconnect and recovery from a dead monitor are not connected
+to this private transport; stored receipts cannot recover its memory-only key.
 
 ## Bootstrap trust boundary
 

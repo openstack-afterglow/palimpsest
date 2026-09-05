@@ -40,6 +40,7 @@ from .oci_monitor import (
     current_process_identity,
     probe_process_liveness,
 )
+from .oci_monitor_control import MonitorStopControl
 from .runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
 
 if TYPE_CHECKING:
@@ -124,6 +125,7 @@ class MonitorIPCOperation(StrEnum):
     DESCRIBE = "describe"
     PING = "ping"
     SHUTDOWN = "shutdown"
+    STOP = "stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1640,6 +1642,7 @@ def _response_message(
             MonitorIPCOperation.DESCRIBE: "committed",
             MonitorIPCOperation.PING: "pong",
             MonitorIPCOperation.SHUTDOWN: "shutting-down",
+            MonitorIPCOperation.STOP: "stop-refused",
         }[operation]
     )
     return {
@@ -1688,6 +1691,7 @@ class _LaunchWorker:
     ) -> None:
         self.done = threading.Event()
         self.failed = False
+        self.stop_control = MonitorStopControl()
         self._authority = authority
         self._directory_fd = directory_fd
         self._binding = binding
@@ -1708,10 +1712,11 @@ class _LaunchWorker:
 
     def _run(self) -> None:
         try:
-            self._authority.run(self._directory_fd, self._binding, self._lease)
+            self._authority.run(self._directory_fd, self._binding, self._lease, stop_control=self.stop_control)
         except Exception:
             # Never expose an exception string, path, or lifecycle secret.
             self.failed = True
+            self.stop_control.mark_control_lost()
             try:
                 if self._lease.snapshot.phase in _ACTIVATION_PHASES:
                     self._lease.mark_control_lost()
@@ -1756,7 +1761,24 @@ def _serve_committed(
                 snapshot = lease.snapshot
                 terminal_shutdown = snapshot.phase == "terminal" and worker is not None and worker.done.is_set()
                 state = None
-                if operation is MonitorIPCOperation.SHUTDOWN:
+                if operation is MonitorIPCOperation.STOP:
+                    state = "stop-refused"
+                    if worker is not None and not worker.failed:
+                        if terminal_shutdown:
+                            state = "stop-terminal"
+                        elif snapshot.phase == "terminal" and not worker.done.is_set() and worker.stop_control.accepted:
+                            # Durable completion can precede worker descriptor
+                            # cleanup. Preserve only an already-accepted STOP;
+                            # a natural terminal never admits a first request.
+                            state = "stop-accepted"
+                        elif snapshot.phase == "ready" and not worker.done.is_set():
+                            # The mailbox never touches libvirt/session state.
+                            # READY in the durable journal is the admission
+                            # fence; terminal observation can only revoke it.
+                            requested = worker.stop_control.request()
+                            if requested == "stop-accepted":
+                                state = requested
+                elif operation is MonitorIPCOperation.SHUTDOWN:
                     if worker is not None and not worker.done.is_set():
                         state = "shutdown-refused"
                     elif terminal_shutdown:
@@ -2267,6 +2289,11 @@ def request_monitor(
     *,
     timeout: float = 5.0,
 ) -> MonitorIPCReply:
+    """Send an authenticated private request.
+
+    STOP acceptance means one coalesced request is queued for the worker, not
+    that its guest signal has been delivered or the VM has terminated.
+    """
     if (
         not isinstance(endpoint, MonitorExecEndpoint)
         or not isinstance(operation, MonitorIPCOperation)
@@ -2299,6 +2326,12 @@ def request_monitor(
         expected["state"] = value["state"]
     elif operation is MonitorIPCOperation.SHUTDOWN and value.get("state") == "shutdown-refused":
         expected["state"] = "shutdown-refused"
+    elif operation is MonitorIPCOperation.STOP and value.get("state") in (
+        "stop-accepted",
+        "stop-terminal",
+        "stop-refused",
+    ):
+        expected["state"] = value["state"]
     if value != expected:
         raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
     if expected["state"] == "shutdown-refused":
@@ -2312,7 +2345,11 @@ def shutdown_monitor_exec(
     *,
     timeout: float = 5.0,
 ) -> MonitorPreactivationJournalSnapshot:
-    """Request graceful inert-monitor shutdown and verify durable abandonment."""
+    """Retire inert or completed-terminal transport without stopping a VM.
+
+    Inert retirement verifies abandonment; completed launch retirement keeps
+    the exact durable terminal journal and removes only its owned socket.
+    """
 
     loaded = _read_preactivation_journal(directory_fd, endpoint.identity)
     assert loaded is not None

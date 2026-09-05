@@ -188,10 +188,12 @@ def test_directory_and_binding_must_match_selected_authority(inputs):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inputs, monkeypatch, fail):
+@pytest.mark.parametrize("controlled", [False, True])
+def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inputs, monkeypatch, fail, controlled):
     from palimpsest_local import oci_root_runtime as runtime
 
     events = []
+    stop_control = launch.MonitorStopControl() if controlled else None
 
     class Connection:
         def close(self):
@@ -211,6 +213,10 @@ def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inp
         assert kwargs["monitor_binding"] == inputs[-1]
         assert kwargs["monitor_lease"] == "lease"
         assert kwargs["conn"] is connection
+        if controlled:
+            assert kwargs["stop_control"] is stop_control
+        else:
+            assert "stop_control" not in kwargs
         kwargs["authority_guard"]()
         if fail:
             raise StateError("failure")
@@ -223,13 +229,31 @@ def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inp
     descriptors = authority.pass_fds
     if fail:
         with pytest.raises(StateError, match="failure"):
-            authority.run(frame["entries"]["monitor"]["fd"], inputs[-1], "lease")
+            authority.run(frame["entries"]["monitor"]["fd"], inputs[-1], "lease", stop_control=stop_control)
     else:
-        assert authority.run(frame["entries"]["monitor"]["fd"], inputs[-1], "lease") == "terminal"
+        assert (
+            authority.run(frame["entries"]["monitor"]["fd"], inputs[-1], "lease", stop_control=stop_control)
+            == "terminal"
+        )
     assert events == ["connect", "launch", "closed"]
     for fd in descriptors:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+@pytest.mark.parametrize("stop_control", [object(), {}, True])
+def test_untyped_stop_control_is_rejected_before_worker_connect(inputs, monkeypatch, stop_control):
+    from palimpsest_local import oci_root_runtime as runtime
+
+    authority = launch.prepare_monitor_launch_authority(*inputs)
+    frame = authority.to_dict()
+    descriptors = authority.pass_fds
+    monkeypatch.setattr(runtime, "connect_oci_root_libvirt", lambda _: pytest.fail("must not connect"))
+    with pytest.raises(StateError):
+        authority.run(frame["entries"]["monitor"]["fd"], inputs[-1], "lease", stop_control=stop_control)
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_invalid_authority_never_connects(inputs, monkeypatch):

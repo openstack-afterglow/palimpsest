@@ -340,7 +340,7 @@ def _install_qualification(root: Path) -> None:
         domain.create = create
         return proxy
 
-    def run(self, directory_fd, binding, lease):
+    def run(self, directory_fd, binding, lease, *, stop_control=None):
         original_socket_connect = socket.socket.connect
         try:
             context["resources"] = self._rebuild()
@@ -348,7 +348,7 @@ def _install_qualification(root: Path) -> None:
             socket.socket.connect = _guard_lifecycle_connect(
                 original_socket_connect, context["resources"][0].runs / binding.record.name / "lifecycle.sock"
             )
-            return original_run(self, directory_fd, binding, lease)
+            return original_run(self, directory_fd, binding, lease, stop_control=stop_control)
         except BaseException as error:
             # Qualification evidence only: traceback lines, no captured locals.
             try:
