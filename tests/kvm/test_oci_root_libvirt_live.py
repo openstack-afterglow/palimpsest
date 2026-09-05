@@ -2681,6 +2681,18 @@ def test_exact_cleanup_revalidates_active_domain_before_destroy(
     assert domain.undefine_calls == 1
 
 
+def _console_marker_count(console: str, marker: str) -> int:
+    """Match whole progress lines across Linux console LF/CRLF translation."""
+    return console.splitlines().count(marker)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_console_marker_count_matches_exact_lines_with_terminal_newlines(newline: str) -> None:
+    marker = "palimpsest workload proof: signal handlers armed"
+    console = newline.join(("kernel output", marker, marker + " forged", "prefix " + marker, marker, ""))
+    assert _console_marker_count(console, marker) == 2
+
+
 def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=False):
     launched = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
@@ -2731,7 +2743,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
                 # This non-secret marker is only a timing barrier: termination
                 # itself must still be proved by the authenticated transcript.
                 console = _qualification_console_tail(root / "console.log")
-                if "palimpsest workload proof: signal handlers armed\n" in console:
+                if _console_marker_count(console, "palimpsest workload proof: signal handlers armed") == 1:
                     assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
                     for _ in range(3):
                         response = monitor_ipc.request_monitor(
@@ -3067,7 +3079,7 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_
         assert "tag" not in repr(lifecycle)
         console_tail = _qualification_console_tail(console_path)
         if stop_workload:
-            assert console_tail.count("palimpsest workload proof: stop observed\n") == 1
+            assert _console_marker_count(console_tail, "palimpsest workload proof: stop observed") == 1
         for marker in (ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, LIFECYCLE_READY_COMMITTED_MARKER):
             assert marker.decode("ascii") in console_tail, (
                 f"qualification console is missing {marker!r}; tail:\n{console_tail}"
