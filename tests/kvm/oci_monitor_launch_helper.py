@@ -218,7 +218,7 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
     return diagnosed_metadata
 
 
-def _install_qualification(root: Path) -> None:
+def _install_qualification(root: Path, *, product_io: bool = False) -> None:
     # The qualified server supplies libvirt-python outside the test venv.
     # Production intentionally does not inherit or infer this search path.
     sys.path.append("/usr/lib/python3/dist-packages")
@@ -255,9 +255,10 @@ def _install_qualification(root: Path) -> None:
             expected_status="defined",
         )
         uid, gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
-        broker = fixture["_QualificationDACBroker"](
-            root, uid, fixture["_qualification_acl_specifications"](root, resolved.xml)
-        )
+        specifications = fixture["_qualification_acl_specifications"](root, resolved.xml)
+        if product_io:
+            specifications = fixture["_without_runtime_io_grants"](specifications, roots.runs / binding.record.name)
+        broker = fixture["_QualificationDACBroker"](root, uid, specifications)
         context["broker"] = broker
         proxy = fixture["_ActivationConnectionProxy"](conn, binding.domain_uuid, broker)
         original_apply = broker.apply
@@ -367,9 +368,10 @@ def _install_qualification(root: Path) -> None:
     oci_root_kvm._verified_lower_path = lower
     oci_root_runtime.connect_oci_root_libvirt = connect
     authority_module._validate_entry_metadata = metadata
-    oci_runtime_io._validate_runtime_io_metadata = fixture["_qualification_runtime_io_adapter"](
-        original_io_metadata, lambda: context.get("broker")
-    )
+    if not product_io:
+        oci_runtime_io._validate_runtime_io_metadata = fixture["_qualification_runtime_io_adapter"](
+            original_io_metadata, lambda: context.get("broker")
+        )
     authority_module.MonitorLaunchAuthority.run = run
 
 
@@ -377,8 +379,8 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
     from palimpsest_local import oci_monitor_ipc as ipc
 
-    if sys.argv[1] == "child":
-        _install_qualification(Path(sys.argv[2]))
+    if sys.argv[1] in {"child", "child-product-io"}:
+        _install_qualification(Path(sys.argv[2]), product_io=sys.argv[1] == "child-product-io")
         return ipc._entrypoint([__file__, *sys.argv[-3:]])
 
     from palimpsest_local.oci_monitor_launch import prepare_monitor_launch_authority
@@ -413,7 +415,14 @@ def main() -> int:
 
             def popen(argv, **kwargs):
                 return subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "child", str(root), *argv[1:]], **kwargs
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "child-product-io" if payload.get("product_io", False) else "child",
+                        str(root),
+                        *argv[1:],
+                    ],
+                    **kwargs,
                 )
 
             import uuid

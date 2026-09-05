@@ -1435,6 +1435,44 @@ Durable ACL grant/recovery, socket/run reclamation, public foreground/`run -d`,
 and Gate 2 remain subsequent work. Shared lower artifacts and existing VM
 definitions are outside this path-isolation change.
 
+### PR 4 slice 30P: durable grants for the isolated runtime I/O
+
+The private access boundary covers exactly `io/` and `io/console.log`. It
+derives the non-root, non-owner QEMU UID/GID from the explicit libvirt
+connection's canonical DAC/KVM capability. Under the existing run lock it
+binds the monitor attempt, committed plan, I/O receipt, target identities and
+complete baseline/granted ACLs in a separate `oci_runtime_access` intent
+before any permission mutation. Console `rw-` is granted first, then directory
+`-wx`; exact full-ACL readback and fsync precede completion. Unknown ACLs,
+default ACLs, replacements and unexpected modes are refused, not repaired.
+
+The Linux backend uses fixed executables, a sanitized environment and
+inherited `/proc/self/fd` arguments, with an explicit mask and full ACL
+replacement. Interrupted intent permits only the saved baseline or exact
+grant. Completed replay verifies without rewriting. Runtime I/O checks and
+fresh-exec authority v3 accept expanded mode bits only with the completed
+receipt and exact actual ACLs; owner-only checks remain for ungranted runs.
+Authority validation uses already-held descriptors without taking a run lock.
+
+Revocation is a separate durable `revoking`/`revoked` operation: completed 30L
+cleanup, the original STALE writer, exclusive existing journal ownership and
+both domain name/UUID absent are required throughout. Directory access is
+removed before console access. Only recorded grant/baseline states may resume;
+completed revocation cannot be implicitly regranted. Neither endpoint, journal,
+socket, lifecycle outcome, disk nor lower lease is deleted by this operation.
+No-journal early-abandon revocation is intentionally unsupported: a prepared
+but unspawned launch authority needs a separate invalidation contract.
+
+Native qualification selects production I/O grants for the stale-cleanup
+child boot, omitting both targets from the test broker and using no test I/O
+validator adapter for that child. It checks actual ACLs while active, LIVE
+writer refusal after terminal, exact restoration after 30L, idempotent replay
+and console/journal/socket preservation. The other natural-exit, STOP and
+retained-root successor boots retain explicitly test-only access adapters.
+Ancestors, BOOT artifacts, root disks, lower exports and libvirt relabeling
+are still qualification-only on every path. This is not complete production
+filesystem provisioning or public OCI-root dispatch.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1453,8 +1491,9 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add durable production filesystem access provisioning over the isolated
-   runtime-I/O boundary, then connect explicit
+1. Extend the durable runtime-I/O grant boundary to production ancestor,
+   BOOT/shared-artifact and root-disk access with explicit relabel policy,
+   then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
    cleanup and completed lower-lease handoff boundaries. Preserve lower pins
    whenever replacement ownership has not been durably established.

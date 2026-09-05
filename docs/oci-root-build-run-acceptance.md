@@ -373,10 +373,36 @@ defines `mode="bind"` as a local server endpoint. The existing
 [security-label policy](https://libvirt.org/formatdomain.html#security-label)
 is unchanged by this layout isolation.
 
-This does not promote the test DAC broker to production. Production still
-requires strict owner-only metadata; only the qualification adapter verifies
-the exact recorded named-user ACL before normalizing its mode bits. Durable
-grant/recovery and explicit removal of runtime I/O remain unimplemented.
+Slice 30P adds a narrow production ACL boundary for the isolated directory
+and console only. An explicit connection supplies the canonical DAC/KVM
+principal (root/current owner are rejected). A run-locked durable intent binds
+the monitor attempt, plan, I/O inode receipt and full baseline/granted ACLs
+before console `rw-`, then directory `-wx` access is applied. Fixed Linux ACL
+tools operate on inherited descriptors with sanitized environment; every
+full-ACL replacement has exact readback and fsync. No default/extra ACL or
+unknown inode is adopted. See the upstream
+[setfacl full-ACL and mask contract](https://man7.org/linux/man-pages/man1/setfacl.1.html).
+
+Runtime validation admits the resulting `0730`/`0660` only with the completed
+access receipt and exact actual ACLs. Fresh-exec launch authority v3 carries
+that receipt and verifies held FDs without acquiring another run lock.
+No-grant paths retain owner-only validation. Interrupted intent/revocation
+resumes only from the recorded grant or baseline; replay is read-only and
+revoked access is terminal. Recovery requires completed 30L cleanup, original
+STALE writer, exclusive existing journal lock and both domain name/UUID absent,
+and removes directory access before console access. It never removes files,
+socket/journal evidence, disks, leases or lifecycle outcomes. Early-abandon
+revocation without a monitor journal remains unsupported.
+
+The stale-cleanup child boot uses this production I/O grant with both targets
+excluded from the fixture broker and no test I/O metadata adapter. Actual
+ACLs are checked during activity; LIVE-writer revoke refusal after terminal,
+restoration/replay after 30L, and console inode/bytes plus journal/socket
+preservation are required. The natural-exit, STOP and retained-root successor
+boots remain explicitly test-adapted. Ancestors, BOOT/shared artifacts, root
+disks and relabel handling are fixture-only even for the production-I/O boot.
+This does not promote the whole test broker to production; public dispatch,
+full provisioning, endpoint removal and Gate 2 remain disabled.
 
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the

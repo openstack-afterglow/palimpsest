@@ -912,17 +912,97 @@ def _qualification_runtime_io_adapter(original, get_broker):
     return metadata
 
 
-def _assert_qualification_io_boundary(broker, run_root: Path) -> None:
+def _without_runtime_io_grants(specifications, run_root: Path):
+    """Keep fixture BOOT/ancestor access separate from the production IO grant."""
+    selected = {run_root / "io", run_root / "io" / "console.log"}
+    assert {path for path, _, _ in specifications if path in selected} == selected
+    return tuple(item for item in specifications if item[0] not in selected)
+
+
+class _QualificationProductIOState:
+    """Fixture grants are not evidence that production access was restored."""
+
+    def __init__(self):
+        self.pending = False
+
+    def grant(self, action):
+        # A failure may occur after a durable intent or partial ACL mutation.
+        self.pending = True
+        return action()
+
+    def mark_revoked(self):
+        self.pending = False
+
+
+@pytest.mark.parametrize("failure", ["partial-grant", "replay"])
+def test_product_io_failure_before_spawn_retains_pending_authority(failure):
+    state = _QualificationProductIOState()
+    events = []
+
+    def grant():
+        events.extend(("intent", "console-grant"))
+        if failure == "partial-grant":
+            raise RuntimeError("ambiguous grant")
+
+    with pytest.raises((RuntimeError, AssertionError)):
+        state.grant(grant)
+        assert failure != "replay", "replay failed before spawn"
+    assert events == ["intent", "console-grant"]
+    assert state.pending  # finally must preserve the fixture, regardless of the test broker.
+    state.mark_revoked()
+    assert not state.pending
+
+
+def _assert_product_io_acl(run_root: Path, uid: int, *, granted: bool) -> None:
+    from palimpsest_local.oci_acl import LinuxFdACLBackend, baseline_acl, grant_acl
+
+    backend = LinuxFdACLBackend()
+    for path, directory in ((run_root / "io", True), (run_root / "io" / "console.log", False)):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_DIRECTORY if directory else 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            expected = baseline_acl(directory=directory)
+            if granted:
+                expected = grant_acl(expected, uid)
+            assert backend.read_acl(descriptor) == expected
+            visible = path.lstat()
+            assert (visible.st_dev, visible.st_ino) == (opened.st_dev, opened.st_ino)
+        finally:
+            os.close(descriptor)
+
+
+def test_product_io_filter_removes_only_exact_two_owned_targets(tmp_path):
+    run = tmp_path / "run"
+    specifications = (
+        (run, "directory", "--x"),
+        (run / "io", "directory", "-wx"),
+        (run / "io" / "console.log", "regular", "rw-"),
+        (tmp_path / "other" / "io", "directory", "-wx"),
+        (tmp_path / "boot", "regular", "r--"),
+    )
+    assert _without_runtime_io_grants(specifications, run) == (specifications[0], specifications[3], specifications[4])
+    with pytest.raises(AssertionError):
+        _without_runtime_io_grants(specifications[:2], run)
+
+
+def _assert_qualification_io_boundary(broker, run_root: Path, *, product_io: bool = False) -> None:
     """Check the effective named-QEMU grants while a real VM uses them."""
     assert broker.applied and not broker.restored
     io_directory = run_root / "io"
     assert [
         target.path for target in broker.targets if stat.S_ISDIR(target.opened.st_mode) and "w" in target.permission
-    ] == [io_directory]
-    for path, permission in ((run_root, "--x"), (io_directory, "-wx")):
+    ] == ([] if product_io else [io_directory])
+    checks = ((run_root, "--x"),) if product_io else ((run_root, "--x"), (io_directory, "-wx"))
+    for path, permission in checks:
         targets = [target for target in broker.targets if target.path == path]
         assert len(targets) == 1 and targets[0].permission == permission
         assert broker._getfacl(targets[0]).named_users == ((broker.uid, permission),)
+    if product_io:
+        assert not any(target.path.is_relative_to(io_directory) for target in broker.targets)
+        assert stat.S_IMODE(io_directory.stat().st_mode) == 0o730
+        assert stat.S_IMODE((io_directory / "console.log").stat().st_mode) == 0o660
+        _assert_product_io_acl(run_root, broker.uid, granted=True)
     assert run_root.stat().st_mode & 0o022 == 0
     monitor_directory = run_root / "monitor-private"
     assert stat.S_IMODE(monitor_directory.stat().st_mode) == 0o700
@@ -3066,7 +3146,9 @@ def test_completed_monitor_retirement_pins_pid_and_refuses_identity_drift(monkey
             assert events[-1] == "close"
 
 
-def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, broker, stop_workload=False, stale_cleanup=False):
+def _launch_in_exec_monitor(
+    root, roots, binding, boot, conn, *, broker, stop_workload=False, stale_cleanup=False, product_io=False
+):
     launched = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
         input=json.dumps(
@@ -3077,6 +3159,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, broker, stop_wo
                 "initramfs": str(boot.initramfs.path),
                 "kernel_digest": boot.kernel.digest,
                 "initramfs_digest": boot.initramfs.digest,
+                "product_io": product_io,
             }
         ),
         text=True,
@@ -3098,7 +3181,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, broker, stop_wo
         while time.monotonic() < deadline:
             snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
             if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
-                _assert_qualification_io_boundary(broker, roots.runs / binding.record.name)
+                _assert_qualification_io_boundary(broker, roots.runs / binding.record.name, product_io=product_io)
                 # The clean launcher has already exited. Its child owns a real
                 # VM and must still answer IPC while its worker waits in create.
                 assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
@@ -3160,6 +3243,11 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, broker, stop_wo
                     before_refusal = read_run_ledger_snapshot(roots, binding.record.name).state
                     with pytest.raises(PalimpsestError):
                         reconcile_inactive_monitor_domain(roots, binding, conn=conn)
+                    if product_io:
+                        from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
+
+                        with pytest.raises(PalimpsestError):
+                            revoke_oci_runtime_access(roots, binding, conn=conn)
                     assert read_run_ledger_snapshot(roots, binding.record.name).state == before_refusal
                     assert monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0] == snapshot
                     assert conn.lookupByUUIDString(binding.domain_uuid).isActive() == 0
@@ -3700,6 +3788,7 @@ def test_live_oci_root(
     monitor_lease: monitor_ipc._PreactivationJournalLease | None = None
     monitor_socket: monitor_ipc._BoundMonitorSocket | None = None
     retain_qualification_state = False
+    product_access = _QualificationProductIOState()
     try:
         with reserve_new_run(
             roots,
@@ -3767,16 +3856,16 @@ def test_live_oci_root(
         # Create this before the broker pins parent directory link counts.
         monitor_directory = roots.runs / name / "monitor-private"
         monitor_directory.mkdir(mode=0o700)
-        broker = _QualificationDACBroker(
-            qualification_root,
-            qemu_uid,
-            _qualification_acl_specifications(qualification_root, resolved.xml),
-        )
-        monkeypatch.setattr(
-            oci_runtime_io_module,
-            "_validate_runtime_io_metadata",
-            _qualification_runtime_io_adapter(oci_runtime_io_module._validate_runtime_io_metadata, lambda: broker),
-        )
+        specifications = _qualification_acl_specifications(qualification_root, resolved.xml)
+        if stale_cleanup:
+            specifications = _without_runtime_io_grants(specifications, roots.runs / name)
+        broker = _QualificationDACBroker(qualification_root, qemu_uid, specifications)
+        if not stale_cleanup:
+            monkeypatch.setattr(
+                oci_runtime_io_module,
+                "_validate_runtime_io_metadata",
+                _qualification_runtime_io_adapter(oci_runtime_io_module._validate_runtime_io_metadata, lambda: broker),
+            )
         direct_connect_attempts: list[object] = []
         original_connect = socket.socket.connect
 
@@ -3817,6 +3906,14 @@ def test_live_oci_root(
             )
         assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
         assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
+        if stale_cleanup:
+            from palimpsest_local.oci_runtime_access import grant_oci_runtime_access
+
+            access = product_access.grant(lambda: grant_oci_runtime_access(roots, monitor_binding, conn=conn))
+            assert access.phase == "granted"
+            granted_state = read_run_ledger_snapshot(roots, name)
+            assert grant_oci_runtime_access(roots, monitor_binding, conn=conn) == access
+            assert read_run_ledger_snapshot(roots, name) == granted_state
         # The host monitor must not share the guest-accessible lifecycle
         # directory: the qualification DAC broker grants QEMU access there.
         if not child_owned:
@@ -3846,6 +3943,7 @@ def test_live_oci_root(
                     broker=broker,
                     stop_workload=stop_workload,
                     stale_cleanup=stale_cleanup,
+                    product_io=stale_cleanup,
                 )
             else:
                 completed = launch_defined_oci_root_domain(
@@ -3870,7 +3968,7 @@ def test_live_oci_root(
             _annotate_qualification_console_failure(exc, console_path)
             raise
         assert completed.domain_id > 0
-        _assert_qualification_io_boundary(broker, roots.runs / name)
+        _assert_qualification_io_boundary(broker, roots.runs / name, product_io=stale_cleanup)
         assert monitor_snapshot.phase == "terminal"
         assert monitor_snapshot.revision == 7
         assert monitor_snapshot.active_binding is not None
@@ -3971,6 +4069,24 @@ def test_live_oci_root(
                 assert reconcile_inactive_monitor_domain(roots, monitor_binding, conn=counted_conn) == receipt
                 assert counted_conn.undefine_calls == 1
                 assert read_run_ledger_snapshot(roots, name).state == after
+                from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
+
+                console_identity = (console_path.stat().st_dev, console_path.stat().st_ino)
+                console_digest = _sha256_file(console_path)
+                revoked = revoke_oci_runtime_access(roots, monitor_binding, conn=counted_conn)
+                assert revoked.phase == "revoked"
+                revoked_state = read_run_ledger_snapshot(roots, name).state
+                revoke_ignored = {"oci_runtime_access", "lifecycle_revision"}
+                assert {key: value for key, value in revoked_state.items() if key not in revoke_ignored} == {
+                    key: value for key, value in after.items() if key not in revoke_ignored
+                }
+                assert revoke_oci_runtime_access(roots, monitor_binding, conn=counted_conn) == revoked
+                assert read_run_ledger_snapshot(roots, name).state == revoked_state
+                assert stat.S_IMODE((roots.runs / name / "io").stat().st_mode) == 0o700
+                assert stat.S_IMODE(console_path.stat().st_mode) == 0o600
+                assert (console_path.stat().st_dev, console_path.stat().st_ino) == console_identity
+                assert _sha256_file(console_path) == console_digest
+                _assert_product_io_acl(roots.runs / name, qemu_uid, granted=False)
                 assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
                 current_socket = socket_path.lstat()
                 assert stat.S_ISSOCK(current_socket.st_mode)
@@ -3980,6 +4096,7 @@ def test_live_oci_root(
                 )
                 assert _sha256_file(root_path) == original_disk_digest
                 assert {path: _sha256_file(path) for path in preserved_files} == original_file_digests
+                product_access.mark_revoked()
                 return
             _remove_exact_owned_domain(
                 conn,
@@ -4058,6 +4175,8 @@ def test_live_oci_root(
             assert store.list_lease_set_intents(prepared.transaction.owner) == ()
             prepared = None
     finally:
+        if product_access.pending:
+            retain_qualification_state = True
         if monitor_socket is not None:
             monitor_socket.close(preserve_path=True)
         if monitor_lease is not None:

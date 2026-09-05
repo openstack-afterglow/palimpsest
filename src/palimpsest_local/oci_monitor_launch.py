@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v2"
+_SCHEMA = "palimpsest.monitor-launch-authority.v3"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -208,6 +208,7 @@ class MonitorLaunchAuthority:
                 "profile",
                 "timeout_seconds",
                 "terminal_timeout_seconds",
+                "runtime_access",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -286,6 +287,24 @@ class MonitorLaunchAuthority:
                 type(binding) is not MonitorPreActivationBinding or binding.to_dict() != selected.to_dict()
             ):
                 raise _invalid()
+            access = self._frame["runtime_access"]
+            if access is not None:
+                from .oci_runtime_access import RuntimeAccessReceipt, verify_runtime_access
+
+                access = RuntimeAccessReceipt.from_dict(access)
+                if access.binding != selected:
+                    raise _invalid()
+                io_entry = self._frame["entries"]["runtime_io"]
+                console_entry = self._frame["entries"]["runtime_console"]
+                verify_runtime_access(
+                    access,
+                    access.runtime_io,
+                    io_entry["fd"],
+                    console_entry["fd"],
+                    os.stat(io_entry["path"], follow_symlinks=False),
+                    os.stat(console_entry["path"], follow_symlinks=False),
+                    run_directory_fd=self._frame["entries"]["run"]["fd"],
+                )
             for key, entry in self._frame["entries"].items():
                 is_directory = key not in {"kernel", "initramfs", "runtime_console"}
                 opened = os.fstat(entry["fd"])
@@ -297,7 +316,15 @@ class MonitorLaunchAuthority:
                     visible = os.fstat(visible_fd)
                 finally:
                     os.close(visible_fd)
-                _validate_entry_metadata(key, entry, opened, visible, selected.owner_uid)
+                if access is not None and key in {"runtime_io", "runtime_console"}:
+                    # Full ACL+target policy above is mandatory, not a generic writable-mode exception.
+                    for info in (opened, visible):
+                        if (info.st_dev, info.st_ino) != (entry["device"], entry["inode"]):
+                            raise _invalid()
+                        if (info.st_uid, info.st_gid, info.st_mode) != (entry["uid"], entry["gid"], entry["mode"]):
+                            raise _invalid()
+                else:
+                    _validate_entry_metadata(key, entry, opened, visible, selected.owner_uid)
             if directory_fd is not None:
                 if type(directory_fd) is not int or directory_fd < 3:
                     raise _invalid()
@@ -412,6 +439,7 @@ def prepare_monitor_launch_authority(
         entries = {}
         with locked_existing_run(roots, binding.record.name) as mutation:
             with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
+                runtime_access = mutation.mutable_state().get("oci_runtime_access")
                 for name, path in paths.items():
                     path = _path(str(path))
                     fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console"})
@@ -430,6 +458,7 @@ def prepare_monitor_launch_authority(
             },
             "timeout_seconds": _timeout(timeout_seconds),
             "terminal_timeout_seconds": _timeout(terminal_timeout_seconds),
+            "runtime_access": runtime_access,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

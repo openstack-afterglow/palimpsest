@@ -215,14 +215,29 @@ class RuntimeIOGuard:
             raise _invalid()
         try:
             _verify_parent(self._mutation)
-            for directory, console in (
-                (os.fstat(self._descriptors.directory), os.fstat(self._descriptors.console)),
-                (
-                    os.stat(OCI_RUNTIME_DIRECTORY, dir_fd=self._mutation._run_fd, follow_symlinks=False),
-                    os.stat(OCI_RUNTIME_CONSOLE_FILENAME, dir_fd=self._descriptors.directory, follow_symlinks=False),
-                ),
-            ):
-                _validate_runtime_io_metadata(directory, console, self._receipt)
+            visible_directory = os.stat(OCI_RUNTIME_DIRECTORY, dir_fd=self._mutation._run_fd, follow_symlinks=False)
+            visible_console = os.stat(
+                OCI_RUNTIME_CONSOLE_FILENAME, dir_fd=self._descriptors.directory, follow_symlinks=False
+            )
+            access = self._mutation.snapshot.state.get("oci_runtime_access")
+            if "oci_runtime_access" in self._mutation.snapshot.state:
+                from .oci_runtime_access import verify_runtime_access
+
+                verify_runtime_access(
+                    access,
+                    self._receipt,
+                    self._descriptors.directory,
+                    self._descriptors.console,
+                    visible_directory,
+                    visible_console,
+                    run_directory_fd=self._mutation._run_fd,
+                )
+            else:
+                for directory, console in (
+                    (os.fstat(self._descriptors.directory), os.fstat(self._descriptors.console)),
+                    (visible_directory, visible_console),
+                ):
+                    _validate_runtime_io_metadata(directory, console, self._receipt)
             if require_socket_absent:
                 try:
                     os.stat(OCI_RUNTIME_LIFECYCLE_FILENAME, dir_fd=self._descriptors.directory, follow_symlinks=False)
@@ -303,8 +318,19 @@ def runtime_io_guard(
             _verify_parent(mutation)
         else:
             console = os.stat(OCI_RUNTIME_CONSOLE_FILENAME, dir_fd=directory_fd, follow_symlinks=False)
-            _validate_runtime_io_metadata(opened, console, receipt)
-            _validate_runtime_io_metadata(visible, console, receipt)
+            access = mutation.snapshot.state.get("oci_runtime_access")
+            if "oci_runtime_access" in mutation.snapshot.state:
+                from .oci_runtime_access import RuntimeAccessReceipt, _validate_target
+
+                access = RuntimeAccessReceipt.from_dict(access)
+                if access.phase != "granted" or access.runtime_io != receipt:
+                    raise _invalid()
+                _validate_target(opened, access.directory, access.directory.granted)
+                _validate_target(visible, access.directory, access.directory.granted)
+                _validate_target(console, access.console, access.console.granted)
+            else:
+                _validate_runtime_io_metadata(opened, console, receipt)
+                _validate_runtime_io_metadata(visible, console, receipt)
             _verify_parent(mutation)
         flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         flags |= os.O_RDWR | os.O_CREAT | os.O_EXCL if create else os.O_RDONLY
