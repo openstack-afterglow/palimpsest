@@ -2877,7 +2877,10 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         assert stat.S_IMODE(monitor_directory.stat().st_mode) == 0o700
         # This test holds the real journal in the qualification process; it
         # does not claim fresh-exec child ownership or runtime IPC service.
-        monitor_socket.close(preserve_path=True)
+        # Terminal ownership was verified above. Remove only our exact socket
+        # before the regular-file/directory qualification tree cleanup.
+        monitor_socket.unlink_exact_and_fsync()
+        monitor_socket.close()
         monitor_socket = None
         monitor_lease.close()
         monitor_lease = None
