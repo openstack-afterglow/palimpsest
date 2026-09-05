@@ -1,11 +1,10 @@
-"""Production-inert fresh-exec and IPC foundation for a future OCI monitor.
+"""Inert fresh-exec IPC and a promotable OCI monitor ownership journal.
 
-This module owns no libvirt connection, lifecycle key, domain, or active
-``MonitorLease``. The child proves a fresh-exec process and reciprocal local
-peer binding, then owns a durable preactivation-v2 claim in the same per-run
-lock/journal namespace as the active v1 owner. That claim permits exact
-committed-monitor discovery and stale socket reconciliation without granting
-any VM mutation capability.
+The fresh-exec child remains inert: it receives no libvirt connection,
+lifecycle key, or VM execution capability. Its v2 journal lease shares the
+per-run lock/journal namespace with the active v1 owner. A private synchronous
+runtime can promote a held v2 lease to record exact active VM ownership;
+inert discovery, shutdown, and stale cleanup cannot erase activation evidence.
 """
 
 from __future__ import annotations
@@ -35,6 +34,7 @@ from .errors import PalimpsestError
 from .oci_monitor import (
     _JOURNAL_NAME,
     _LOCK_NAME,
+    MonitorBinding,
     MonitorProcessIdentity,
     ProcessLiveness,
     _parse_proc_start_ticks,
@@ -63,8 +63,21 @@ _DIGEST_RE = __import__("re").compile(r"^sha256:[0-9a-f]{64}$")
 _NONCE_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 _SPAWN_LOCK = threading.Lock()
 _PREACTIVATION_PHASES = frozenset(
-    {"claiming", "prepared", "committed", "aborting", "adopting", "control-lost", "abandoned"}
+    {
+        "claiming",
+        "prepared",
+        "committed",
+        "aborting",
+        "adopting",
+        "control-lost",
+        "abandoned",
+        "activating",
+        "active",
+        "ready",
+        "terminal",
+    }
 )
+_ACTIVATION_PHASES = frozenset({"activating", "active", "ready", "terminal"})
 _RENAME_NOREPLACE = 1
 
 
@@ -331,6 +344,7 @@ class MonitorPreactivationJournalSnapshot:
     socket_name: str
     socket_device: int | None
     socket_inode: int | None
+    active_binding: MonitorBinding | None = None
 
     def __post_init__(self) -> None:
         socket_absent = self.socket_device is None and self.socket_inode is None
@@ -352,9 +366,14 @@ class MonitorPreactivationJournalSnapshot:
             or self.socket_name != _socket_name_for_generation(self.identity.generation)
             or not (socket_absent or socket_present)
             or (self.phase == "claiming" and not socket_absent)
-            or (self.phase in {"prepared", "committed"} and not socket_present)
+            or (self.phase in {"prepared", "committed"} | _ACTIVATION_PHASES and not socket_present)
+            or (self.phase in {"active", "ready", "terminal"} and self.active_binding is None)
+            or (self.active_binding is not None and not socket_present)
+            or (self.phase not in {"active", "ready", "terminal", "control-lost"} and self.active_binding is not None)
         ):
             raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+        if self.active_binding is not None:
+            _validate_active_binding(self.active_binding, self.identity.binding)
 
     @property
     def endpoint(self) -> MonitorExecEndpoint:
@@ -370,7 +389,7 @@ class MonitorPreactivationJournalSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "active_binding": None,
+            "active_binding": None if self.active_binding is None else self.active_binding.to_dict(),
             "binding": self.identity.binding.to_dict(),
             "binding_digest": self.identity.binding_digest,
             "monitor_generation": self.identity.generation,
@@ -385,6 +404,54 @@ class MonitorPreactivationJournalSnapshot:
             },
             "writer": self.writer.to_dict(),
         }
+
+
+def _validate_active_binding(binding: MonitorBinding, expected: MonitorPreActivationBinding) -> None:
+    if type(binding) is not MonitorBinding:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+    try:
+        binding.__post_init__()
+        raw = binding.to_dict()
+        expected_raw = expected.to_dict()
+        expected_raw.pop("schema")
+        expected_raw["definition_projection_digest"] = expected_raw.pop("expected_definition_projection_digest")
+        expected_raw["domain_id"] = binding.domain_id
+        if any(type(raw[key]) is not type(value) or raw[key] != value for key, value in expected_raw.items()):
+            raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+    except PalimpsestError:
+        raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH) from None
+
+
+def _active_binding_from_dict(value: object, expected: MonitorPreActivationBinding) -> MonitorBinding | None:
+    if value is None:
+        return None
+    template = expected.to_dict()
+    template.pop("schema")
+    template["definition_projection_digest"] = template.pop("expected_definition_projection_digest")
+    if type(value) is not dict or set(value) != set(template) | {"domain_id"}:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
+    if any(type(value[key]) is not type(item) or value[key] != item for key, item in template.items()):
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
+    try:
+        binding = MonitorBinding(
+            expected.record,
+            value["owner_uid"],
+            value["plan_digest"],
+            value["definition_projection_digest"],
+            value["stage1_artifact_digest"],
+            value["domain_uuid"],
+            value["domain_id"],
+            value["boot_attempt_id"],
+            value["libvirt_uri"],
+        )
+        _validate_active_binding(binding, expected)
+        return binding
+    except PalimpsestError:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL) from None
+
+
+def _has_activation_evidence(snapshot: MonitorPreactivationJournalSnapshot) -> bool:
+    return snapshot.phase in _ACTIVATION_PHASES or snapshot.active_binding is not None
 
 
 def _nonce_digest(nonce: str) -> str:
@@ -421,8 +488,11 @@ def _decode_preactivation_snapshot(
         type(raw) is not dict
         or set(raw) != expected_fields
         or raw.get("schema") != _PREACTIVATION_JOURNAL_SCHEMA
-        or raw.get("active_binding") is not None
         or raw.get("binding") != binding.to_dict()
+        or (
+            type(raw.get("binding")) is dict
+            and any(type(raw["binding"].get(key)) is not type(value) for key, value in binding.to_dict().items())
+        )
         or raw.get("binding_digest") != binding.digest
         or type(socket_value) is not dict
         or set(socket_value) != {"device", "inode", "name"}
@@ -442,6 +512,7 @@ def _decode_preactivation_snapshot(
             socket_value["name"],
             socket_value["device"],
             socket_value["inode"],
+            _active_binding_from_dict(raw["active_binding"], binding),
         )
     except (KeyError, MonitorIPCError, TypeError, ValueError, RecursionError):
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL) from None
@@ -633,7 +704,7 @@ class _PreactivationJournalLease:
                 lease._publish(snapshot, create=True)
             else:
                 previous, previous_bytes = loaded
-                if previous.phase != "abandoned":
+                if previous.phase != "abandoned" or _has_activation_evidence(previous):
                     raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
                 try:
                     os.stat(previous.socket_name, dir_fd=lease._directory_fd, follow_symlinks=False)
@@ -666,6 +737,8 @@ class _PreactivationJournalLease:
             loaded = lease._read(missing_ok=False)
             if loaded != (expected, expected_bytes):
                 raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
+            if _has_activation_evidence(expected) or expected.phase == "control-lost":
+                raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
             try:
                 liveness = liveness_probe(expected.writer)
             except Exception:
@@ -693,6 +766,45 @@ class _PreactivationJournalLease:
     def mark_committed(self) -> MonitorPreactivationJournalSnapshot:
         return self._transition("committed", allowed={"prepared"})
 
+    def validate_directory_binding(self, directory_fd: int) -> None:
+        self._require_authority()
+        if type(directory_fd) is not int:
+            raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+        _validate_directory(directory_fd)
+        if _journal_identity(os.fstat(directory_fd)) != self._directory_identity:
+            raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+
+    def validate_launch_binding(
+        self,
+        binding: MonitorPreActivationBinding,
+        *,
+        directory_fd: int,
+        activating: bool = False,
+    ) -> None:
+        self.validate_directory_binding(directory_fd)
+        assert self._snapshot is not None
+        if type(binding) is not MonitorPreActivationBinding or type(activating) is not bool:
+            raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+        binding.__post_init__()
+        if binding != self._identity.binding:
+            raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+        phase = "activating" if activating else "committed"
+        if self._snapshot.phase != phase or self._snapshot.active_binding is not None:
+            raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_TRANSITION)
+
+    def mark_activating(self) -> MonitorPreactivationJournalSnapshot:
+        return self._transition("activating", allowed={"committed"})
+
+    def promote_active(self, binding: MonitorBinding) -> MonitorPreactivationJournalSnapshot:
+        _validate_active_binding(binding, self._identity.binding)
+        return self._transition("active", allowed={"activating"}, active_binding=binding)
+
+    def mark_ready(self) -> MonitorPreactivationJournalSnapshot:
+        return self._transition("ready", allowed={"active"})
+
+    def mark_terminal(self) -> MonitorPreactivationJournalSnapshot:
+        return self._transition("terminal", allowed={"ready"})
+
     def mark_aborting(self) -> MonitorPreactivationJournalSnapshot:
         return self._transition("aborting", allowed={"claiming", "prepared", "committed"})
 
@@ -700,7 +812,7 @@ class _PreactivationJournalLease:
         return self._transition("abandoned", allowed={"aborting", "adopting"})
 
     def mark_control_lost(self) -> MonitorPreactivationJournalSnapshot:
-        return self._transition("control-lost", allowed={"aborting", "adopting"})
+        return self._transition("control-lost", allowed={"aborting", "adopting"} | _ACTIVATION_PHASES)
 
     def _take_over(self, writer: MonitorProcessIdentity) -> MonitorPreactivationJournalSnapshot:
         """Publish stale adoption without requiring authority from the stale writer."""
@@ -717,7 +829,12 @@ class _PreactivationJournalLease:
         except Exception:
             self._poisoned = True
             raise MonitorIPCError(MonitorIPCErrorCategory.UNAUTHORIZED_PEER) from None
-        if current != writer or self._snapshot is None or self._snapshot.phase in {"abandoned", "control-lost"}:
+        if (
+            current != writer
+            or self._snapshot is None
+            or self._snapshot.phase in {"abandoned", "control-lost"}
+            or _has_activation_evidence(self._snapshot)
+        ):
             self._poisoned = True
             raise MonitorIPCError(MonitorIPCErrorCategory.UNAUTHORIZED_PEER)
         candidate = MonitorPreactivationJournalSnapshot(
@@ -740,6 +857,7 @@ class _PreactivationJournalLease:
         allowed: set[str] | None = None,
         writer: MonitorProcessIdentity | None = None,
         socket_identity: tuple[int, int] | None = None,
+        active_binding: MonitorBinding | None = None,
     ) -> MonitorPreactivationJournalSnapshot:
         self._require_authority()
         assert self._snapshot is not None
@@ -759,6 +877,7 @@ class _PreactivationJournalLease:
             self._snapshot.socket_name,
             device,
             inode,
+            self._snapshot.active_binding if active_binding is None else active_binding,
         )
         self._publish(candidate, create=False)
         return candidate
@@ -1553,6 +1672,8 @@ def _serve_committed(
             except MonitorIPCError:
                 continue
             if operation is MonitorIPCOperation.SHUTDOWN:
+                if _has_activation_evidence(lease.snapshot) or lease.snapshot.phase == "control-lost":
+                    continue
                 lease.mark_aborting()
             _send_frame(channel, _response_message(operation, identity, writer, request_id))
         if operation is MonitorIPCOperation.SHUTDOWN:
@@ -1688,7 +1809,14 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
                     pass
         if bound is not None:
             try:
-                bound.close(preserve_path=lease is not None and lease._poisoned)
+                preserve = lease is not None and (
+                    lease._poisoned
+                    or (
+                        lease._snapshot is not None
+                        and (_has_activation_evidence(lease._snapshot) or lease._snapshot.phase == "control-lost")
+                    )
+                )
+                bound.close(preserve_path=preserve)
             except MonitorIPCError:
                 pass
         if lease is not None:
@@ -2005,6 +2133,10 @@ def shutdown_monitor_exec(
 ) -> MonitorPreactivationJournalSnapshot:
     """Request graceful inert-monitor shutdown and verify durable abandonment."""
 
+    loaded = _read_preactivation_journal(directory_fd, endpoint.identity)
+    assert loaded is not None
+    if _has_activation_evidence(loaded[0]) or loaded[0].phase == "control-lost":
+        raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
     reply = request_monitor(directory_fd, endpoint, MonitorIPCOperation.SHUTDOWN, timeout=timeout)
     if reply.state != "shutting-down":
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
@@ -2118,6 +2250,8 @@ def _cleanup_stale_socket(
     directory_fd: int,
     snapshot: MonitorPreactivationJournalSnapshot,
 ) -> bool:
+    if _has_activation_evidence(snapshot) or snapshot.phase == "control-lost":
+        return False
     if snapshot.socket_device is None or snapshot.socket_inode is None:
         # CLAIMING deliberately precedes bind, so no durable inode authority
         # exists for a pathname observed after a crash. Absence is safe; any
@@ -2238,7 +2372,7 @@ def reconcile_stale_monitor_exec(
         except OSError:
             raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST) from None
         raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
-    if snapshot.phase == "control-lost":
+    if snapshot.phase == "control-lost" or _has_activation_evidence(snapshot):
         raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
     try:
         liveness = liveness_probe(snapshot.writer)

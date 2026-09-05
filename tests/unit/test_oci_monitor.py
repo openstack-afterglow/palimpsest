@@ -629,7 +629,7 @@ def test_process_liveness_requires_exact_host_boot_and_start_ticks(
     assert monitor.probe_process_liveness(_process()) is expected
 
 
-def test_monitor_foundation_remains_unreachable_from_public_or_synchronous_runtime() -> None:
+def test_active_lease_remains_unreachable_from_public_or_synchronous_runtime() -> None:
     package = Path(monitor.__file__).parent
     forbidden_importers = {
         "__init__.py",
@@ -650,5 +650,13 @@ def test_monitor_foundation_remains_unreachable_from_public_or_synchronous_runti
                 (node.module is not None and node.module.endswith("oci_monitor"))
                 or any(alias.name == "oci_monitor" for alias in node.names)
             ):
+                if (
+                    name == "oci_root_runtime.py"
+                    and node.module == "oci_monitor"
+                    and {alias.name for alias in node.names} == {"MonitorBinding"}
+                ):
+                    # Private launch shares the immutable active identity, not
+                    # the independent v1 lease/lock acquisition path.
+                    continue
                 importers.append(name)
     assert importers == []

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,403 @@ def _directory(path: Path) -> int:
 
 def _linux_peercred() -> bool:
     return sys.platform == "linux" and hasattr(socket, "SO_PEERCRED") and hasattr(os, "O_PATH")
+
+
+def _advance_lease(lease: ipc._PreactivationJournalLease, phase: str) -> None:
+    if phase == "claiming":
+        return
+    lease.mark_prepared(12, 34)
+    if phase == "prepared":
+        return
+    lease.mark_committed()
+    if phase == "committed":
+        return
+    lease.mark_activating()
+    if phase == "activating":
+        return
+    if phase == "activation-control-lost":
+        lease.mark_control_lost()
+        return
+    lease.promote_active(_active_binding())
+    if phase == "active":
+        return
+    if phase == "active-control-lost":
+        lease.mark_control_lost()
+        return
+    lease.mark_ready()
+    if phase != "ready":
+        lease.mark_terminal()
+
+
+def test_same_v2_lease_promotes_and_preserves_active_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        _advance_lease(lease, "committed")
+        lease.validate_launch_binding(_binding(), directory_fd=directory_fd)
+        assert lease.mark_activating().active_binding is None
+        lease.validate_launch_binding(_binding(), directory_fd=directory_fd, activating=True)
+        active = lease.promote_active(_active_binding())
+        assert (active.phase, active.revision, active.active_binding) == ("active", 5, _active_binding())
+        for transition, phase in (
+            (lease.mark_ready, "ready"),
+            (lease.mark_terminal, "terminal"),
+            (lease.mark_control_lost, "control-lost"),
+        ):
+            snapshot = transition()
+            assert snapshot.phase == phase
+            assert snapshot.active_binding == _active_binding()
+            assert snapshot.identity == _identity()
+            assert snapshot.writer == _writer()
+            loaded = ipc._read_preactivation_journal(directory_fd, _identity())
+            assert loaded is not None and loaded[0] == snapshot
+            assert json.loads(loaded[1])["active_binding"] == _active_binding().to_dict()
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("phase", ["claiming", "prepared", "committed", "activating", "active", "ready", "terminal"])
+def test_activation_transition_graph_refuses_skips_and_inert_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        _advance_lease(lease, phase)
+        before = (directory / monitor._JOURNAL_NAME).read_bytes()
+        transitions = [
+            (lease.mark_activating, "committed"),
+            (lambda: lease.promote_active(_active_binding()), "activating"),
+            (lease.mark_ready, "active"),
+            (lease.mark_terminal, "ready"),
+        ]
+        if phase in ipc._ACTIVATION_PHASES:
+            transitions += [(lease.mark_aborting, "never"), (lease.mark_abandoned, "never")]
+        for transition, allowed in transitions:
+            if phase == allowed:
+                continue
+            with pytest.raises(ipc.MonitorIPCError) as error:
+                transition()
+            assert error.value.category is ipc.MonitorIPCErrorCategory.INVALID_TRANSITION
+            assert (directory / monitor._JOURNAL_NAME).read_bytes() == before
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("owner_uid", float(os.geteuid())),
+        ("owner_uid", True),
+        ("domain_id", 7.0),
+        ("domain_id", True),
+        ("domain_id", 0),
+        ("domain_id", 2**31),
+        ("plan_digest", "sha256:" + "f" * 64),
+        ("definition_projection_digest", "sha256:" + "f" * 64),
+        ("stage1_artifact_digest", "sha256:" + "f" * 64),
+        ("domain_uuid", str(uuid.uuid4())),
+        ("boot_attempt_id", str(uuid.uuid4())),
+        ("run_id", str(uuid.uuid4())),
+        ("name", "another-run"),
+        ("backend", "qemu"),
+        ("runtime_kind", "container"),
+        ("libvirt_uri", "qemu:///session"),
+        ("lifecycle_protocol", "other"),
+        ("unexpected", "field"),
+    ],
+)
+def test_active_journal_rejects_noncanonical_or_mismatched_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, "active")
+    lease.close()
+    journal = directory / monitor._JOURNAL_NAME
+    raw = json.loads(journal.read_bytes())
+    raw["active_binding"][field] = value
+    content = ipc._canonical_bytes(raw) + b"\n"
+    journal.write_bytes(content)
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            ipc._read_preactivation_journal(directory_fd, _binding())
+        assert error.value.category is ipc.MonitorIPCErrorCategory.INVALID_JOURNAL
+        assert journal.read_bytes() == content
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    ("phase", "has_binding"),
+    [
+        ("active", False),
+        ("ready", False),
+        ("terminal", False),
+        ("claiming", True),
+        ("prepared", True),
+        ("committed", True),
+        ("activating", True),
+        ("aborting", True),
+        ("adopting", True),
+        ("abandoned", True),
+    ],
+)
+def test_journal_phase_and_active_binding_must_agree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    has_binding: bool,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        with pytest.raises(ipc.MonitorIPCError):
+            replace(
+                lease.snapshot,
+                phase=phase,
+                socket_device=12,
+                socket_inode=34,
+                active_binding=_active_binding() if has_binding else None,
+            )
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    "phase", ["activating", "active", "ready", "terminal", "activation-control-lost", "active-control-lost"]
+)
+def test_stale_activation_is_never_adopted_rearmed_or_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, phase)
+    snapshot = lease.snapshot
+    lease.close()
+    journal = directory / monitor._JOURNAL_NAME
+    before = journal.read_bytes()
+    socket_path = directory / snapshot.socket_name
+    socket_path.write_bytes(b"activation evidence")
+    monkeypatch.setattr(ipc, "request_monitor", lambda *_args, **_kwargs: pytest.fail("must not send shutdown"))
+    monkeypatch.setattr(ipc, "_cleanup_stale_socket", lambda *_args: pytest.fail("must not clean activation"))
+    try:
+        operations = [
+            lambda: ipc.reconcile_stale_monitor_exec(
+                directory_fd, _binding(), liveness_probe=lambda _writer: monitor.ProcessLiveness.STALE
+            ),
+            lambda: ipc._PreactivationJournalLease.adopt_stale(
+                directory_fd, _identity(), snapshot, before, _writer(), lambda _writer: monitor.ProcessLiveness.STALE
+            ),
+            lambda: ipc._PreactivationJournalLease.create(
+                directory_fd, _identity(str(uuid.uuid4())), "2" * 64, _writer()
+            ),
+            lambda: ipc.shutdown_monitor_exec(directory_fd, snapshot.endpoint),
+        ]
+        for operation in operations:
+            with pytest.raises(ipc.MonitorIPCError):
+                operation()
+            assert journal.read_bytes() == before
+            assert socket_path.read_bytes() == b"activation evidence"
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("activation", [False, True])
+@pytest.mark.parametrize("failure", ["file-fsync", "directory-fsync"])
+def test_activation_publish_failure_poisons_lease_without_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    activation: bool,
+    failure: str,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    _advance_lease(lease, "activating" if activation else "committed")
+    before = (directory / monitor._JOURNAL_NAME).read_bytes()
+    original_fsync = os.fsync
+
+    def fail_fsync(descriptor: int) -> None:
+        is_directory = descriptor == lease._directory_fd
+        if is_directory == (failure == "directory-fsync"):
+            raise OSError("injected fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(ipc.os, "fsync", fail_fsync)
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            lease.promote_active(_active_binding()) if activation else lease.mark_activating()
+        assert error.value.category is ipc.MonitorIPCErrorCategory.JOURNAL_IO
+        after = (directory / monitor._JOURNAL_NAME).read_bytes()
+        if failure == "file-fsync":
+            assert after == before
+        else:
+            assert json.loads(after)["phase"] == ("active" if activation else "activating")
+        for operation in (lease.mark_aborting, lease.mark_abandoned, lease.mark_control_lost):
+            with pytest.raises(ipc.MonitorIPCError) as poisoned:
+                operation()
+            assert poisoned.value.category is ipc.MonitorIPCErrorCategory.POISONED
+            assert (directory / monitor._JOURNAL_NAME).read_bytes() == after
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+def test_launch_lease_binding_directory_phase_and_writer_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory_fd = _directory(tmp_path / "run")
+    wrong_fd = _directory(tmp_path / "wrong")
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        _advance_lease(lease, "committed")
+        lease.validate_launch_binding(_binding(), directory_fd=directory_fd)
+        for binding, fd, activating in [
+            (_binding(), wrong_fd, False),
+            (replace(_binding(), boot_attempt_id=str(uuid.uuid4())), directory_fd, False),
+            (_binding(), directory_fd, 1),
+            (_binding(), directory_fd, True),
+        ]:
+            with pytest.raises(ipc.MonitorIPCError):
+                lease.validate_launch_binding(binding, directory_fd=fd, activating=activating)
+        forged = _binding()
+        object.__setattr__(forged, "owner_uid", float(os.geteuid()))
+        with pytest.raises(ipc.MonitorIPCError):
+            lease.validate_launch_binding(forged, directory_fd=directory_fd)
+        lease.mark_activating()
+        lease.validate_launch_binding(_binding(), directory_fd=directory_fd, activating=True)
+        monkeypatch.setattr(ipc, "current_process_identity", lambda: replace(_writer(), start_ticks=999))
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            lease.validate_directory_binding(directory_fd)
+        assert error.value.category is ipc.MonitorIPCErrorCategory.UNAUTHORIZED_PEER
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            lease.mark_control_lost()
+        assert error.value.category is ipc.MonitorIPCErrorCategory.POISONED
+    finally:
+        lease.close()
+        os.close(directory_fd)
+        os.close(wrong_fd)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("owner_uid", float(os.geteuid())),
+        ("domain_id", True),
+        ("domain_id", 7.0),
+        ("definition_projection_digest", "sha256:" + "f" * 64),
+    ],
+)
+def test_promote_active_revalidates_forged_binding_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        _advance_lease(lease, "activating")
+        before = (directory / monitor._JOURNAL_NAME).read_bytes()
+        binding = _active_binding()
+        object.__setattr__(binding, field, value)
+        with pytest.raises(ipc.MonitorIPCError):
+            lease.promote_active(binding)
+        assert lease.snapshot.phase == "activating"
+        assert (directory / monitor._JOURNAL_NAME).read_bytes() == before
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+def test_active_lease_journal_tamper_poisons_authority_and_preserves_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    try:
+        _advance_lease(lease, "active")
+        journal = directory / monitor._JOURNAL_NAME
+        raw = json.loads(journal.read_bytes())
+        raw["active_binding"]["domain_id"] += 1
+        tampered = ipc._canonical_bytes(raw) + b"\n"
+        journal.write_bytes(tampered)
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            lease.validate_directory_binding(directory_fd)
+        assert error.value.category is ipc.MonitorIPCErrorCategory.INVALID_JOURNAL
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            lease.mark_ready()
+        assert error.value.category is ipc.MonitorIPCErrorCategory.POISONED
+        assert journal.read_bytes() == tampered
+    finally:
+        lease.close()
+        os.close(directory_fd)
+
+
+@pytest.mark.skipif(not _linux_peercred(), reason="requires Linux O_PATH sockets")
+@pytest.mark.parametrize("promoted", [False, True])
+def test_stale_activation_keeps_real_socket_inode_and_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    promoted: bool,
+) -> None:
+    directory = tmp_path / "run"
+    directory_fd = _directory(directory)
+    monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    lease = ipc._PreactivationJournalLease.create(directory_fd, _identity(), "1" * 64, _writer())
+    bound = ipc._BoundMonitorSocket(directory_fd, lease.snapshot.socket_name)
+    lease.mark_prepared(*bound.identity)
+    lease.mark_committed()
+    lease.mark_activating()
+    if promoted:
+        lease.promote_active(_active_binding())
+    snapshot = lease.snapshot
+    before = (directory / monitor._JOURNAL_NAME).read_bytes()
+    socket_path = directory / snapshot.socket_name
+    inode = socket_path.stat().st_ino
+    bound.close(preserve_path=True)
+    lease.close()
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            ipc.reconcile_stale_monitor_exec(
+                directory_fd, _binding(), liveness_probe=lambda _writer: monitor.ProcessLiveness.STALE
+            )
+        assert error.value.category is ipc.MonitorIPCErrorCategory.CONTROL_LOST
+        assert socket_path.stat().st_ino == inode
+        assert (directory / monitor._JOURNAL_NAME).read_bytes() == before
+    finally:
+        socket_path.unlink()
+        os.close(directory_fd)
 
 
 def test_v2_journal_is_canonical_path_free_and_nonce_digest_only(

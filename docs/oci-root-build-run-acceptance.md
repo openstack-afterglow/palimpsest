@@ -235,6 +235,22 @@ Its expected projection is the observed post-definition digest, not authored
 XML's digest. Child-owned define/create, active journal promotion, lifecycle/IPC
 event scheduling, public `run -d`, and Gate 2 require subsequent integration.
 
+Slice 30I connects the same held v2 journal lease to the private synchronous
+launch. Its `activating` intent is durable before create, and the verified live
+domain ID promotes the immutable preactivation identity into `active_binding`.
+READY and TERMINAL advance the journal after their durable run-state records.
+The live qualification asserts the terminal journal and exact domain/boot
+identity, without claiming that its launch runs in the fresh-exec IPC child.
+
+The owner-only journal directory is `monitor-private` beneath the pinned run,
+separate from the guest-accessible lifecycle directory. FD identity checks
+reject a matching journal held in a different directory. Activation evidence
+cannot use inert stale socket cleanup, abandoned transitions, or inert monitor
+shutdown. Loss of journal authority prevents destructive launch cleanup;
+terminal publication failure preserves an already-durable `exited` state.
+Trusted authority transfer and child-owned libvirt/event execution remain
+unimplemented, as do public `run -d`, authenticated VM STOP, and Gate 2.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

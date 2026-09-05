@@ -1,6 +1,6 @@
-"""Production-inert libvirt definition boundary for committed OCI-root runs.
+"""Private libvirt definition and launch boundary for committed OCI-root runs.
 
-This module intentionally defines but never starts a domain.  Public runtime
+This module supports explicit private lifecycle launches. Public runtime
 dispatch remains disabled until the privileged lifecycle handshake is ready.
 """
 
@@ -13,7 +13,7 @@ import re
 import threading
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,7 +33,8 @@ from .oci_lifecycle_transport import (
     OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
 )
-from .oci_monitor_ipc import MonitorPreActivationBinding
+from .oci_monitor import MonitorBinding
+from .oci_monitor_ipc import MonitorPreActivationBinding, _PreactivationJournalLease
 from .oci_root_kvm import (
     ResolvedOCIRootDomainPlan,
     VerifiedHostBootArtifacts,
@@ -1325,6 +1326,7 @@ def _handle_launch_failure(
     ledger_phase: str,
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
     expected_projection_digest: str,
+    monitor_lease: _PreactivationJournalLease | None = None,
 ) -> str:
     with locked_existing_run(roots, name) as mutation:
         ledger_domain_id = None if ledger_phase == "activating" else domain_id
@@ -1346,6 +1348,13 @@ def _handle_launch_failure(
                 domain_uuid,
                 domain_id,
                 expected_projection_digest,
+                before_mutation=(
+                    None
+                    if monitor_lease is None
+                    else lambda: _verify_monitor_lease_directory(
+                        mutation, monitor_lease, allowed_phases=frozenset({"activating", "active", "ready"})
+                    )
+                ),
             )
         except _LaunchControlAmbiguity:
             cleanup_phase = "cleanup-not-attempted"
@@ -1376,6 +1385,8 @@ def _record_launch_cleanup_required(
     boot_attempt_id: str,
     ledger_phase: str,
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
+    *,
+    journal_authority_lost: bool = False,
 ) -> None:
     with locked_existing_run(roots, name) as mutation:
         ledger_domain_id = None if ledger_phase == "activating" else domain_id
@@ -1390,7 +1401,11 @@ def _record_launch_cleanup_required(
             ready_lifecycle,
         )
         data = mutation.mutable_state()
-        data["error"] = "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
+        data["error"] = (
+            "OCI-root monitor journal authority lost; cleanup is required"
+            if journal_authority_lost
+            else "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
+        )
         handoff = data.get("oci_root_handoff")
         if not isinstance(handoff, dict):
             raise StateError("OCI-root launch ledger changed before failure publication")
@@ -1436,6 +1451,8 @@ def _cleanup_exact_launch_domain(
     expected_uuid: str,
     expected_domain_id: int | None,
     expected_projection_digest: str,
+    *,
+    before_mutation: Callable[[], None] | None = None,
 ) -> None:
     try:
         domain = _exact_domain(conn, resolved, expected_uuid)
@@ -1455,6 +1472,8 @@ def _cleanup_exact_launch_domain(
             expected_projection_digest,
             active=True,
         )
+        if before_mutation is not None:
+            before_mutation()
         try:
             domain.destroy()
         except Exception as exc:
@@ -1467,6 +1486,8 @@ def _cleanup_exact_launch_domain(
         expected_projection_digest,
         active=False,
     )
+    if before_mutation is not None:
+        before_mutation()
     try:
         domain.undefine()
     except Exception as exc:
@@ -1499,6 +1520,39 @@ def _valid_lifecycle_stream_surface(stream: Any) -> bool:
     return all(callable(operation) for operation in required) and (optional_free is None or callable(optional_free))
 
 
+def _verify_monitor_lease_directory(
+    mutation: Any,
+    lease: _PreactivationJournalLease,
+    binding: MonitorPreActivationBinding | None = None,
+    *,
+    activating: bool = False,
+    allowed_phases: frozenset[str] = frozenset({"committed", "activating", "active", "ready"}),
+) -> None:
+    """Bind held journal authority to the pinned run's actual private directory."""
+
+    mutation.verify_binding()
+    try:
+        directory_fd = os.open("monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=mutation._run_fd)
+    except OSError:
+        raise StateError("OCI-root monitor journal directory is unavailable") from None
+    try:
+        if binding is None:
+            lease.validate_directory_binding(directory_fd)
+        else:
+            lease.validate_launch_binding(binding, directory_fd=directory_fd, activating=activating)
+        if lease.snapshot.phase not in allowed_phases:
+            raise StateError("OCI-root monitor journal phase does not authorize launch")
+        opened = os.fstat(directory_fd)
+        current = os.stat("monitor-private", dir_fd=mutation._run_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise StateError("OCI-root monitor journal directory changed")
+        mutation.verify_binding()
+    except (OSError, PalimpsestError):
+        raise StateError("OCI-root monitor journal authority is invalid") from None
+    finally:
+        os.close(directory_fd)
+
+
 def launch_defined_oci_root_domain(
     roots: StatePaths,
     name: str,
@@ -1511,6 +1565,7 @@ def launch_defined_oci_root_domain(
     timeout_seconds: float = DEFAULT_HANDOFF_TIMEOUT_SECONDS,
     terminal_timeout_seconds: float | None = None,
     monitor_binding: MonitorPreActivationBinding | None = None,
+    monitor_lease: _PreactivationJournalLease | None = None,
 ) -> CompletedOCIRootHandoff:
     """Privately launch an exact defined domain and synchronously observe exit.
 
@@ -1518,6 +1573,8 @@ def launch_defined_oci_root_domain(
     not implement detached operation, reconnect, stop, exec, or log delivery.
     """
 
+    if monitor_lease is not None and (type(monitor_lease) is not _PreactivationJournalLease or monitor_binding is None):
+        raise StateError("OCI-root monitor launch requires an exact bound journal lease")
     if monitor_binding is not None:
         if type(monitor_binding) is not MonitorPreActivationBinding:
             raise StateError("OCI-root monitor launch binding type is invalid")
@@ -1543,6 +1600,8 @@ def launch_defined_oci_root_domain(
         if _EVENT_DRIVER_POISONED:
             raise StateError("libvirt default event implementation is poisoned")
     started_intent = False
+    journal_activation_attempted = False
+    terminal_durable = False
     resolved: ResolvedOCIRootDomainPlan | None = None
     domain_uuid: str | None = None
     domain_id: int | None = None
@@ -1586,6 +1645,8 @@ def launch_defined_oci_root_domain(
                 monitor_binding.boot_attempt_id,
             ):
                 raise StateError("OCI-root monitor launch binding does not match the defined run")
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease, monitor_binding)
             libvirt = event_libvirt
             flags = getattr(libvirt, "VIR_STREAM_NONBLOCK", None)
             inactive_flag = getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", None)
@@ -1647,6 +1708,10 @@ def launch_defined_oci_root_domain(
                     domain, current_resolved, current_uuid, expected_projection_digest=current_projection
                 )
                 mutation.verify_binding()
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease)
+                journal_activation_attempted = True
+                monitor_lease.mark_activating()
             data = mutation.mutable_state()
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
@@ -1660,6 +1725,8 @@ def launch_defined_oci_root_domain(
             if result.get("status") != "starting":
                 raise StateError("OCI-root activation intent was not durably recorded")
             started_intent = True
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease, monitor_binding, activating=True)
             try:
                 domain.create()
             except Exception:
@@ -1670,6 +1737,21 @@ def launch_defined_oci_root_domain(
             domain_id = captured_domain_id
             domain = _exact_domain(conn, resolved, domain_uuid)
             _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"activating"}))
+                monitor_lease.promote_active(
+                    MonitorBinding(
+                        monitor_binding.record,
+                        monitor_binding.owner_uid,
+                        monitor_binding.plan_digest,
+                        monitor_binding.expected_definition_projection_digest,
+                        monitor_binding.stage1_artifact_digest,
+                        domain_uuid,
+                        domain_id,
+                        boot_attempt_id,
+                        libvirt_uri,
+                    )
+                )
             data = mutation.mutable_state()
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
@@ -1685,8 +1767,14 @@ def launch_defined_oci_root_domain(
             ledger_phase = "starting"
 
         try:
+            if monitor_lease is not None:
+                with locked_existing_run(roots, name) as mutation:
+                    _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
             domain = _exact_domain(conn, resolved, domain_uuid)
             _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
+            if monitor_lease is not None:
+                with locked_existing_run(roots, name) as mutation:
+                    _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
             try:
                 opened = domain.openChannel(channel_name, stream, 0)
             except Exception:
@@ -1703,6 +1791,8 @@ def launch_defined_oci_root_domain(
         def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
             nonlocal ledger_phase, ready_lifecycle
             with locked_existing_run(roots, name) as mutation:
+                if monitor_lease is not None:
+                    _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
                 current_uuid, current_digest, current_projection_digest = _definition_ledger(
                     mutation.snapshot.state, profile
                 )
@@ -1736,6 +1826,8 @@ def launch_defined_oci_root_domain(
                     domain_id,
                     definition_projection_digest,
                 )
+                if monitor_lease is not None:
+                    _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
                 data = mutation.mutable_state()
                 data.pop("error", None)
                 data["oci_root_handoff"] = _handoff_ledger(
@@ -1752,6 +1844,8 @@ def launch_defined_oci_root_domain(
                     raise StateError("OCI-root READY was not durably recorded")
                 ready_lifecycle = lifecycle
                 ledger_phase = "ready"
+                if monitor_lease is not None:
+                    monitor_lease.mark_ready()
 
         stream_handed_off = True
         handoff_failure: BaseException | None = None
@@ -1788,6 +1882,8 @@ def launch_defined_oci_root_domain(
             raise StateError("OCI-root lifecycle terminal result is missing")
 
         with locked_existing_run(roots, name) as mutation:
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
             current_uuid, current_digest, current_projection_digest = _definition_ledger(
                 mutation.snapshot.state, profile
             )
@@ -1830,6 +1926,8 @@ def launch_defined_oci_root_domain(
                     definition_projection_digest,
                     active=True,
                 )
+                if monitor_lease is not None:
+                    _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
                 try:
                     domain.destroy()
                 except Exception:
@@ -1842,6 +1940,8 @@ def launch_defined_oci_root_domain(
                 definition_projection_digest,
                 active=False,
             )
+            if monitor_lease is not None:
+                _verify_monitor_lease_directory(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
             data = mutation.mutable_state()
             data.pop("error", None)
             data["oci_root_handoff"] = _handoff_ledger(
@@ -1856,6 +1956,9 @@ def launch_defined_oci_root_domain(
             result = mutation.write_state("exited", data)
             if result.get("status") != "exited":
                 raise StateError("OCI-root TERMINAL was not durably recorded")
+            terminal_durable = True
+            if monitor_lease is not None:
+                monitor_lease.mark_terminal()
         return CompletedOCIRootHandoff(
             resolved.plan.run_id,
             resolved.plan.run_name,
@@ -1869,6 +1972,13 @@ def launch_defined_oci_root_domain(
     except BaseException as launch_failure:
         if stream is not None and not stream_handed_off:
             _close_unowned_stream(stream)
+        if terminal_durable:
+            if monitor_lease is not None:
+                try:
+                    monitor_lease.mark_control_lost()
+                except BaseException:
+                    pass
+            raise
         if (
             started_intent
             and resolved is not None
@@ -1877,7 +1987,16 @@ def launch_defined_oci_root_domain(
             and definition_projection_digest is not None
         ):
             try:
-                if isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError):
+                journal_authority_valid = True
+                if monitor_lease is not None:
+                    try:
+                        with locked_existing_run(roots, name) as mutation:
+                            _verify_monitor_lease_directory(
+                                mutation, monitor_lease, allowed_phases=frozenset({"activating", "active", "ready"})
+                            )
+                    except BaseException:
+                        journal_authority_valid = False
+                if not journal_authority_valid or isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError):
                     _record_launch_cleanup_required(
                         roots,
                         name,
@@ -1888,6 +2007,7 @@ def launch_defined_oci_root_domain(
                         boot_attempt_id,
                         ledger_phase,
                         ready_lifecycle,
+                        journal_authority_lost=not journal_authority_valid,
                     )
                     cleanup_phase = "cleanup-required"
                 else:
@@ -1903,14 +2023,26 @@ def launch_defined_oci_root_domain(
                         ledger_phase,
                         ready_lifecycle,
                         definition_projection_digest,
+                        monitor_lease,
                     )
             except Exception:
                 raise StateError("OCI-root launch state changed; cleanup was not attempted") from None
+            finally:
+                if monitor_lease is not None and journal_activation_attempted:
+                    try:
+                        monitor_lease.mark_control_lost()
+                    except BaseException:
+                        pass
             if cleanup_phase == "cleanup-not-attempted":
                 raise StateError("OCI-root launch control is ambiguous; cleanup was not attempted") from None
             if cleanup_phase == "cleanup-required":
                 raise StateError("OCI-root launch cleanup failed; cleanup is required") from None
             raise StateError("OCI-root launch failed") from None
+        if monitor_lease is not None and journal_activation_attempted:
+            try:
+                monitor_lease.mark_control_lost()
+            except BaseException:
+                pass
         raise
 
 

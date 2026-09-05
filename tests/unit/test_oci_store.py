@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 
 import palimpsest_local.artifact_store as artifact_store_module
+import palimpsest_local.oci_monitor as monitor_module
+import palimpsest_local.oci_monitor_ipc as monitor_ipc_module
 import palimpsest_local.oci_root_kvm as oci_root_kvm_module
 import palimpsest_local.oci_root_prepare as oci_root_prepare_module
 import palimpsest_local.oci_root_runtime as oci_root_runtime_module
@@ -3405,11 +3407,30 @@ def _handoff_receipt(
     )
 
 
-@pytest.mark.parametrize("use_monitor_binding", [False, True])
+def _committed_monitor_lease(roots, name, binding, monkeypatch, request, *, directory=None):
+    directory = directory or roots.runs / name / "monitor-private"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    writer = monitor_module.MonitorProcessIdentity(os.getpid(), str(uuid.uuid4()), 202)
+    monkeypatch.setattr(monitor_ipc_module, "current_process_identity", lambda: writer)
+    try:
+        lease = monitor_ipc_module._PreactivationJournalLease.create(
+            directory_fd, monitor_ipc_module.MonitorExecIdentity(binding, str(uuid.uuid4())), "1" * 64, writer
+        )
+        request.addfinalizer(lease.close)
+        lease.mark_prepared(12, 34)
+        lease.mark_committed()
+        return lease
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("use_monitor_binding", [False, True, "lease"])
 def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    use_monitor_binding: bool,
+    request: pytest.FixtureRequest,
+    use_monitor_binding: bool | str,
 ) -> None:
     name = "launch-complete"
     roots, store, tools, boot, profile, _prepared, plan = _committed_oci_domain(tmp_path, name)
@@ -3424,12 +3445,21 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         if use_monitor_binding
         else None
     )
+    lease = (
+        _committed_monitor_lease(roots, name, monitor_binding, monkeypatch, request)
+        if use_monitor_binding == "lease"
+        else None
+    )
     event_order: list[str] = []
     domain_for_order = conn.domains[name]
     original_open_channel = domain_for_order.openChannel
     original_event_add = conn.stream.eventAddCallback
 
     def open_channel(*args, **kwargs):
+        if lease is not None:
+            assert lease.snapshot.phase == "active"
+            assert lease.snapshot.active_binding.domain_id == 7
+            assert lease.snapshot.active_binding.boot_attempt_id == chosen_attempt
         event_order.append("open-channel")
         return original_open_channel(*args, **kwargs)
 
@@ -3475,6 +3505,8 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         assert starting["oci_root_handoff"]["domain_id"] == 7
         assert starting["oci_root_handoff"]["boot_attempt_id"] == session.boot_attempt_id
         on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+        if lease is not None:
+            assert lease.snapshot.phase == "ready"
         observed_statuses.append(read_run_ledger_snapshot(roots, name).state["status"])
         assert callable(wait) and callable(wait_writable)
         before_stream_close()
@@ -3493,6 +3525,7 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
         runner=tools,
         timeout_seconds=9,
         monitor_binding=monitor_binding,
+        monitor_lease=lease,
     )
 
     domain = conn.domains[name]
@@ -3525,6 +3558,221 @@ def test_oci_root_private_launch_records_ready_and_terminal_before_exited(
     }
     assert "boot_key" not in repr(handoff_ledger)
     assert "tag" not in repr(handoff_ledger)
+    if lease is not None:
+        assert (lease.snapshot.phase, lease.snapshot.revision) == ("terminal", 7)
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong-directory", "binding", "closed", "uncommitted", "invalid-type", "without-binding", "symlink"]
+)
+def test_oci_root_monitor_lease_rejected_before_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, failure: str
+) -> None:
+    name = "lease-reject"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    private = roots.runs / name / "monitor-private"
+    private.mkdir(mode=0o700)
+    lease = _committed_monitor_lease(
+        roots,
+        name,
+        replace(binding, boot_attempt_id=str(uuid.uuid4())) if failure == "binding" else binding,
+        monkeypatch,
+        request,
+        directory=tmp_path / "unrelated" if failure == "wrong-directory" else private,
+    )
+    if failure == "closed":
+        lease.close()
+    elif failure == "uncommitted":
+        lease.mark_aborting()
+    elif failure == "invalid-type":
+        lease = object()
+    elif failure == "without-binding":
+        binding = None
+    elif failure == "symlink":
+        private.rename(tmp_path / "moved-monitor")
+        private.symlink_to(tmp_path / "moved-monitor", target_is_directory=True)
+    before = (roots.runs / name / "state.json").read_bytes()
+    with pytest.raises(StateError):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding, monitor_lease=lease
+        )
+    assert conn.stream_flags == []
+    assert conn.domains[name].create_calls == conn.domains[name].destroy_calls == conn.domains[name].undefine_calls == 0
+    assert (roots.runs / name / "state.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("failed_phase", ["activating", "active", "ready", "terminal"])
+def test_oci_root_monitor_journal_publication_failure_preserves_safe_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, failed_phase: str
+) -> None:
+    name = "lease-publication"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    original_publish = monitor_ipc_module._PreactivationJournalLease._publish
+    publication_states = []
+
+    def publish(self, snapshot, *, create):
+        publication_states.append((snapshot.phase, read_run_ledger_snapshot(roots, name).state["status"]))
+        if snapshot.phase == failed_phase:
+            self._poisoned = True
+            raise monitor_ipc_module.MonitorIPCError(monitor_ipc_module.MonitorIPCErrorCategory.JOURNAL_IO)
+        return original_publish(self, snapshot, create=create)
+
+    def handoff(stream, _binding, *, on_ready, session, before_stream_close, **_kwargs):
+        try:
+            on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+            return _handoff_receipt(
+                "terminal", ProcessExit(0, 0, None, ProcessExitCategory.EXITED), boot_attempt_id=session.boot_attempt_id
+            )
+        finally:
+            before_stream_close()
+            stream.abort()
+            stream.free()
+
+    monkeypatch.setattr(monitor_ipc_module._PreactivationJournalLease, "_publish", publish)
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
+    with pytest.raises((StateError, monitor_ipc_module.MonitorIPCError)):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding, monitor_lease=lease
+        )
+    domain = conn.domains[name]
+    assert domain.create_calls == (0 if failed_phase == "activating" else 1)
+    assert domain.destroy_calls == (1 if failed_phase == "terminal" else 0)
+    assert domain.undefine_calls == 0
+    state = read_run_ledger_snapshot(roots, name).state
+    expected_status = (
+        "defined" if failed_phase == "activating" else "exited" if failed_phase == "terminal" else "failed"
+    )
+    assert state["status"] == expected_status
+    if failed_phase in {"active", "ready"}:
+        assert state["oci_root_handoff"]["phase"] == "cleanup-required"
+        assert "journal authority lost" in state["error"]
+        assert domain.isActive() == 1
+    if failed_phase == "terminal":
+        assert state["oci_root_handoff"]["phase"] == "terminal"
+        assert "error" not in state
+    assert publication_states[:1] == [("activating", "defined")]
+    if failed_phase in {"ready", "terminal"}:
+        assert ("ready", "running") in publication_states
+    if failed_phase == "terminal":
+        assert ("terminal", "exited") in publication_states
+
+
+def test_oci_root_monitor_lease_loss_after_starting_intent_does_not_create_or_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    name = "lease-precreate"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    original_write = state_module.ExistingRunMutation.write_state
+
+    def write_state(self, status, state):
+        result = original_write(self, status, state)
+        if status == "starting":
+            lease.close()
+        return result
+
+    monkeypatch.setattr(state_module.ExistingRunMutation, "write_state", write_state)
+    with pytest.raises(StateError, match="cleanup is required"):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding, monitor_lease=lease
+        )
+    domain = conn.domains[name]
+    assert domain.create_calls == domain.destroy_calls == domain.undefine_calls == 0
+    assert conn.stream.calls[-2:] == [("abort",), ("free",)]
+    assert read_run_ledger_snapshot(roots, name).state["oci_root_handoff"]["phase"] == "cleanup-required"
+
+
+@pytest.mark.parametrize("boundary", ["channel", "ready", "terminal", "cleanup-destroy", "cleanup-undefine"])
+@pytest.mark.parametrize("revocation", ["close", "control-lost"])
+def test_oci_root_monitor_rechecks_journal_after_last_domain_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, boundary: str, revocation: str
+) -> None:
+    name = "lease-last-read"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots, name, store, boot, profile, conn=conn, boot_attempt_id=str(uuid.uuid4()), runner=tools
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    domain = conn.domains[name]
+    original_id = domain.ID
+    original_destroy = domain.destroy
+    armed = False
+    id_reads = 0
+    invalidated = False
+
+    def domain_id():
+        nonlocal id_reads, invalidated
+        result = original_id()
+        id_reads += 1
+        if not invalidated and (armed or (boundary == "channel" and id_reads == 3)):
+            if revocation == "close":
+                lease.close()
+            else:
+                lease.mark_control_lost()
+            invalidated = True
+        return result
+
+    def destroy():
+        nonlocal armed
+        result = original_destroy()
+        if boundary == "cleanup-undefine":
+            armed = True
+        return result
+
+    def handoff(stream, _binding, *, on_ready, session, before_stream_close, **_kwargs):
+        nonlocal armed
+        try:
+            if boundary == "ready":
+                armed = True
+            on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+            if boundary in {"terminal", "cleanup-destroy"}:
+                armed = True
+            if boundary.startswith("cleanup-"):
+                raise StateError("injected handoff failure")
+            return _handoff_receipt(
+                "terminal", ProcessExit(0, 0, None, ProcessExitCategory.EXITED), boot_attempt_id=session.boot_attempt_id
+            )
+        finally:
+            before_stream_close()
+            stream.abort()
+            stream.free()
+
+    domain.ID = domain_id
+    domain.destroy = destroy
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
+    with pytest.raises(StateError, match="cleanup is required"):
+        launch_defined_oci_root_domain(
+            roots, name, store, boot, profile, conn=conn, runner=tools, monitor_binding=binding, monitor_lease=lease
+        )
+    assert invalidated
+    assert domain.create_calls == 1
+    assert domain.destroy_calls == (1 if boundary == "cleanup-undefine" else 0)
+    assert domain.undefine_calls == 0
+    if boundary == "channel":
+        assert domain.open_channel_calls == []
+    state = read_run_ledger_snapshot(roots, name).state
+    assert state["status"] == "failed"
+    assert state["oci_root_handoff"]["phase"] == "cleanup-required"
+    if boundary == "ready":
+        assert "lifecycle" not in state["oci_root_handoff"]
 
 
 def test_oci_root_monitor_binding_uses_actual_post_definition_projection(

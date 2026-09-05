@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+import palimpsest_local.oci_monitor_ipc as monitor_ipc
 import palimpsest_local.oci_root_kvm as oci_root_kvm_module
 from palimpsest_local import kvm, oci_root_runtime, platforms
 from palimpsest_local._oci_stage1_kvm_proof import (
@@ -2723,6 +2724,8 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
     plan_digest: str | None = None
     expected_inactive_projection_digest: str | None = None
     broker: _QualificationDACBroker | None = None
+    monitor_lease: monitor_ipc._PreactivationJournalLease | None = None
+    monitor_socket: monitor_ipc._BoundMonitorSocket | None = None
     retain_qualification_state = False
     try:
         with reserve_new_run(
@@ -2785,6 +2788,9 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         definition = read_run_ledger_snapshot(roots, name).state["oci_root_definition"]
         assert definition["schema"] == "palimpsest.oci-root-definition.v2"
         expected_inactive_projection_digest = definition["projection_digest"]
+        # Create this before the broker pins parent directory link counts.
+        monitor_directory = roots.runs / name / "monitor-private"
+        monitor_directory.mkdir(mode=0o700)
         broker = _QualificationDACBroker(
             qualification_root,
             qemu_uid,
@@ -2830,6 +2836,19 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
             )
         assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
         assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
+        # The host monitor must not share the guest-accessible lifecycle
+        # directory: the qualification DAC broker grants QEMU access there.
+        monitor_fd = os.open(monitor_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            monitor_identity = monitor_ipc.MonitorExecIdentity(monitor_binding, str(uuid.uuid4()))
+            monitor_lease = monitor_ipc._PreactivationJournalLease.create(
+                monitor_fd, monitor_identity, secrets.token_hex(32), monitor_ipc.current_process_identity()
+            )
+            monitor_socket = monitor_ipc._BoundMonitorSocket(monitor_fd, monitor_lease.snapshot.socket_name)
+            monitor_lease.mark_prepared(*monitor_socket.identity)
+            monitor_lease.mark_committed()
+        finally:
+            os.close(monitor_fd)
         try:
             completed = launch_defined_oci_root_domain(
                 roots,
@@ -2841,11 +2860,27 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
                 timeout_seconds=45,
                 terminal_timeout_seconds=45,
                 monitor_binding=monitor_binding,
+                monitor_lease=monitor_lease,
             )
         except BaseException as exc:
             _annotate_qualification_console_failure(exc, console_path)
             raise
         assert completed.domain_id > 0
+        monitor_snapshot = monitor_lease.snapshot
+        assert monitor_snapshot.phase == "terminal"
+        assert monitor_snapshot.revision == 7
+        assert monitor_snapshot.active_binding is not None
+        assert monitor_snapshot.active_binding.domain_id == completed.domain_id
+        assert monitor_snapshot.active_binding.domain_uuid == completed.domain_uuid
+        assert monitor_snapshot.active_binding.boot_attempt_id == expected_boot_attempt_id
+        assert monitor_snapshot.active_binding.definition_projection_digest == expected_inactive_projection_digest
+        assert stat.S_IMODE(monitor_directory.stat().st_mode) == 0o700
+        # This test holds the real journal in the qualification process; it
+        # does not claim fresh-exec child ownership or runtime IPC service.
+        monitor_socket.close(preserve_path=True)
+        monitor_socket = None
+        monitor_lease.close()
+        monitor_lease = None
         owned_domain_id = -1
         assert expected_inactive_projection_digest is not None
 
@@ -2947,6 +2982,10 @@ def test_live_oci_root(monkeypatch: pytest.MonkeyPatch) -> None:
         assert store.list_lease_set_intents(prepared.transaction.owner) == ()
         prepared = None
     finally:
+        if monitor_socket is not None:
+            monitor_socket.close(preserve_path=True)
+        if monitor_lease is not None:
+            monitor_lease.close()
         if (
             not retain_qualification_state
             and owned_uuid is not None
