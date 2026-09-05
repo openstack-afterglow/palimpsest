@@ -313,6 +313,25 @@ idempotency and evidence preservation. Only the fixture subsequently retires
 its exact socket and temporary tree. Production access provisioning, explicit resource reclamation,
 public run/`-d` and Gate 2 remain gated.
 
+Slice 30M adds private retained-root detachment after completed 30L cleanup.
+Only a root originally prepared with retention policy `retain` is eligible.
+The original monitor must remain stale, the old domain absent, and the exact
+preparation/definition/volume generation and durable lower leases unchanged.
+Intent and completion preserve the old run's lifecycle evidence. A completed
+retention receipt is historical and cannot authorize detaching a newer VM's
+attachment. Live qualification includes a second VM boot from the same
+writable root under a new run identity.
+Its executable exists only in the retained upper layer, inserted by the host
+fixture after the first domain is absent and selected by a private process
+override. This is a root-reuse proof, not a public command-override feature or
+a test of guest-created application data persistence.
+
+Retention deliberately keeps the old run ledger and lower lease set. An
+OCI-root disk contains the OverlayFS upper and still needs its immutable lower
+graph to boot. The new run must acquire its own lower leases before claiming
+the retained disk; automatic retirement of the old pins, standalone disk
+export, and removal of the old run are not provided by this boundary.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

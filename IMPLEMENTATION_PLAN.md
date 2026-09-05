@@ -1325,6 +1325,40 @@ disk/volume reclamation, production filesystem access provisioning, public
 stop/run/`-d`, and Gate 2 remain gated. Running control cannot be recovered from
 a dead monitor's stored journal or receipts.
 
+### PR 4 slice 30M: guarded retained-root detachment and reuse
+
+After completed inactive-definition cleanup, an explicit private retention API
+detaches only a root originally prepared with `retention_policy=retain`. It
+requires the same stale monitor authority, original journal, completed 30L
+receipt, and continued absence of the old domain by both name and UUID. It
+does not convert a delete-policy root into a reusable retained root.
+
+The old preparation transaction, committed domain plan, exact volume owner and
+generation, and durable lower lease set must agree. A separate retention
+intent/completion record preserves the rest of the old run ledger. Volume
+record and backing inode checks occur under the volume lock; the retained
+transition clears the owner and advances the generation once. Interrupted
+retention resumes only against the same expected backing inode and transition.
+A completed receipt is historical evidence: replay must not detach or modify a
+disk already claimed by a newer VM.
+
+The root disk is an OverlayFS writable upper, not a self-contained copy of the
+image. The old run ledger and original lower leases therefore remain pinned
+after retention. Reuse prepares a new run with the same lower graph and acquires
+that run's own lower leases before exclusively claiming the retained root.
+Retirement or transfer of the old pins requires a later explicit ownership
+handoff; this slice does not remove the old run or release its leases.
+
+Live qualification extends the stale-monitor case with retained-root detachment
+and a second real VM boot from the same writable disk under a new run identity.
+The fixture inserts a unique upper-only proof executable after the first VM is
+absent; the second run selects it through a private process override. This
+proves upper-layer reuse at `/`, not public override support or persistence of
+guest-created application data.
+Definition, ACL, and temporary-fixture cleanup remain separately validated.
+Production access provisioning, root deletion, socket/run reclamation, public
+foreground/`-d` dispatch, and local build-to-run Gate 2 remain gated.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1343,8 +1377,11 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add production filesystem access provisioning and connect explicit resource
-   reclamation to the proven inactive-domain cleanup boundary. Authenticated control requires
+1. Add production filesystem access provisioning and explicit retained-volume
+   lower-lease handoff before reclaiming old run resources. Keep the old lower
+   pins until their replacement ownership is durably established. Connect
+   deletion/socket reclamation to the proven inactive-domain cleanup boundary.
+   Authenticated control requires
    the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
    alone cannot recover running control.
 2. Connect foreground-default `run` and detached `run -d` to that monitor,

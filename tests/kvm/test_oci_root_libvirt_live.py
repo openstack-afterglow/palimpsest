@@ -3050,6 +3050,253 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
         os.close(directory_fd)
 
 
+def _inject_reuse_only_executable(root_path: Path) -> str:
+    # Fixture-only offline edit, after the first domain is proven absent. The
+    # already-proven packaged ELF is placed at a unique upper-only pathname;
+    # executing it in the next guest proves the retained upper is its real /.
+    load_proof_filesystems()
+    executable = Path(__file__).with_name("assets") / "workload-proof.x86_64"
+    assert _sha256_file(executable) == "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c"
+    assert not any(character.isspace() for character in str(executable))
+    basename = f"palimpsest-retained-proof-{uuid.uuid4().hex}"
+    upper_path = f"/.palimpsest/upper/{basename}"
+    for command in (f"write {executable} {upper_path}", f"set_inode_field {upper_path} mode 0100755"):
+        result = subprocess.run(
+            ["debugfs", "-w", "-R", command, str(root_path)], capture_output=True, text=True, check=False, timeout=15
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "File not found" not in result.stderr
+    result = subprocess.run(
+        ["debugfs", "-R", f"stat {upper_path}", str(root_path)], capture_output=True, text=True, check=False, timeout=15
+    )
+    assert result.returncode == 0 and "Type: regular" in result.stdout and re.search(r"Mode:\s+0755\b", result.stdout)
+    return basename
+
+
+@pytest.mark.parametrize("bad_mode", [False, True])
+def test_reuse_fixture_injects_pinned_elf_only_into_unique_upper_path(monkeypatch, bad_mode):
+    from types import SimpleNamespace
+
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        assert kwargs["check"] is False and kwargs["timeout"] == 15
+        return SimpleNamespace(
+            returncode=0, stderr="", stdout="Type: regular  Mode:  0644" if bad_mode else "Type: regular  Mode:  0755"
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    if bad_mode:
+        with pytest.raises(AssertionError):
+            _inject_reuse_only_executable(Path("/fixture/root.raw"))
+    else:
+        basename = _inject_reuse_only_executable(Path("/fixture/root.raw"))
+        assert basename.startswith("palimpsest-retained-proof-")
+        assert commands[0][0:3] == ["debugfs", "-w", "-R"]
+        assert commands[0][3].endswith(f" /.palimpsest/upper/{basename}")
+        assert commands[1][3] == f"set_inode_field /.palimpsest/upper/{basename} mode 0100755"
+        assert commands[2] == ["debugfs", "-R", f"stat /.palimpsest/upper/{basename}", "/fixture/root.raw"]
+
+
+def _qualify_retained_root_reuse(
+    monkeypatch, root, roots, store, materialization, boot, profile, conn, qemu_uid, first, first_binding, first_monitor
+):
+    from palimpsest_local import oci_root_prepare as preparation
+    from palimpsest_local.oci_monitor_retention import retain_inactive_monitor_root
+    from palimpsest_local.oci_root_volume import release_oci_root_volume
+
+    root_path = first.root_volume.path
+    assert _lookup_domain(conn, first_binding.record.name) is None
+    assert _lookup_domain_uuid(conn, first_binding.domain_uuid) is None
+    basename = _inject_reuse_only_executable(root_path)
+    source = load_oci_root_volume(roots, first.transaction.volume_id).record
+    metadata, before_digest = root_path.stat(), _sha256_file(root_path)
+    original_state = read_run_ledger_snapshot(roots, first_binding.record.name).state
+    original_leases = store.list_lease_set_intents(first.transaction.owner)
+    monitor_directory = roots.runs / first_binding.record.name / "monitor-private"
+    original_journal = (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes()
+    socket_path = monitor_directory / first_monitor.socket_name
+    socket_metadata = socket_path.lstat()
+    receipt = retain_inactive_monitor_root(roots, first_binding, store, conn=conn)
+    assert receipt.phase == "completed"
+    retained = load_oci_root_volume(roots, first.transaction.volume_id).record
+    assert retained.status == "retained" and retained.generation == source.generation + 1
+    assert retained.attached_run_id is None and retained.attached_run_name is None
+    assert retained.retention_policy == "retain"
+    assert (root_path.stat().st_dev, root_path.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+    assert _sha256_file(root_path) == before_digest
+    after_retention = read_run_ledger_snapshot(roots, first_binding.record.name).state
+    assert after_retention["oci_monitor_root_retention"] == receipt.to_dict()
+    ignored = {"oci_monitor_root_retention", "lifecycle_revision"}
+    assert {key: value for key, value in after_retention.items() if key not in ignored} == {
+        key: value for key, value in original_state.items() if key not in ignored
+    }
+    assert store.list_lease_set_intents(first.transaction.owner) == original_leases
+    assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
+    assert (socket_path.lstat().st_dev, socket_path.lstat().st_ino) == (socket_metadata.st_dev, socket_metadata.st_ino)
+
+    second_name = f"r-{uuid.uuid4().hex[:6]}"
+    # A private qualification command override changes the run process, not
+    # the immutable source image/config/lower graph or its verified receipts.
+    second_materialization = replace(
+        materialization,
+        process=replace(materialization.process, argv=(f"/{basename}", "deliberately-not-the-proof-invocation")),
+    )
+    original_claim = preparation.claim_oci_root_volume
+    claim_checks = []
+
+    def claim_with_new_leases(*args, **kwargs):
+        transaction = preparation.OCIRootPreparationTransaction.from_dict(
+            read_run_ledger_snapshot(roots, second_name).state["oci_root"]
+        )
+        leases = store.load_lease_set(
+            transaction.lower_lease_set_id, transaction.owner, plan_digest=transaction.boot_plan_digest
+        )
+        assert leases.owner != first.transaction.owner
+        assert leases.lease_set_id != first.transaction.lower_lease_set_id
+        assert store.list_lease_set_intents(first.transaction.owner) == original_leases
+        claim_checks.append(leases.lease_set_id)
+        return original_claim(*args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(preparation, "claim_oci_root_volume", claim_with_new_leases)
+        with reserve_new_run(roots, second_name, DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)) as reservation:
+            second = prepare_oci_root_run(
+                reservation,
+                second_materialization,
+                store,
+                root_volume_size_bytes=_ROOT_SIZE_BYTES,
+                retained_volume_id=first.transaction.volume_id,
+                retention_policy="retain",
+            )
+    assert claim_checks == [second.transaction.lower_lease_set_id]
+    assert second.root_volume.claimed_from_retained and not second.root_volume.created
+    assert second.transaction.lower_graph_digest == first.transaction.lower_graph_digest
+    assert second.root_volume.path == root_path
+    assert (root_path.stat().st_dev, root_path.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+    assert _sha256_file(root_path) == before_digest
+    second_record = load_oci_root_volume(roots, second.transaction.volume_id).record
+    assert second_record.attached_run_id == second.transaction.owner.run_id
+    assert second_record.generation == retained.generation + 1
+    assert retain_inactive_monitor_root(roots, first_binding, store, conn=conn) == receipt
+    assert load_oci_root_volume(roots, second.transaction.volume_id).record == second_record
+    assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_retention
+
+    resolved = build_oci_root_domain_plan(roots, second, store, boot, profile, memory_mib=512, vcpus=1, network=None)
+    plan = commit_oci_root_domain_plan(roots, resolved, store)
+    defined = define_committed_oci_root_domain(roots, second_name, store, boot, profile, conn=conn)
+    second_monitor = roots.runs / second_name / "monitor-private"
+    second_monitor.mkdir(mode=0o700)
+    broker = _QualificationDACBroker(root, qemu_uid, _qualification_acl_specifications(root, resolved.xml))
+    activation = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
+    binding = prepare_oci_root_monitor_binding(
+        roots, second_name, store, boot, profile, conn=activation, boot_attempt_id=str(uuid.uuid4())
+    )
+    fd = os.open(second_monitor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    lease = None
+    transport = None
+    try:
+        identity = monitor_ipc.MonitorExecIdentity(binding, str(uuid.uuid4()))
+        lease = monitor_ipc._PreactivationJournalLease.create(
+            fd, identity, secrets.token_hex(32), monitor_ipc.current_process_identity()
+        )
+        transport = monitor_ipc._BoundMonitorSocket(fd, lease.snapshot.socket_name)
+        lease.mark_prepared(*transport.identity)
+        lease.mark_committed()
+        original_connect = socket.socket.connect
+        lifecycle_path = roots.runs / second_name / "lifecycle.sock"
+
+        def reject_direct_lifecycle(instance, address):
+            assert address not in (lifecycle_path, os.fspath(lifecycle_path)), "reuse boot bypassed libvirt openChannel"
+            return original_connect(instance, address)
+
+        console_before = _qualification_console_tail(root / "console.log")
+        with monkeypatch.context() as scoped:
+            scoped.setattr(socket.socket, "connect", reject_direct_lifecycle)
+            completed = launch_defined_oci_root_domain(
+                roots,
+                second_name,
+                store,
+                boot,
+                profile,
+                conn=activation,
+                timeout_seconds=45,
+                terminal_timeout_seconds=45,
+                monitor_binding=binding,
+                monitor_lease=lease,
+            )
+        assert completed.terminal.returncode == 101 and completed.terminal.exit_code == 101
+        assert completed.terminal.signal_number is None
+        assert lease.snapshot.phase == "terminal"
+        assert completed.lifecycle.boot_attempt_id == binding.boot_attempt_id
+        console_after = _qualification_console_tail(root / "console.log")
+        for marker in (ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, LIFECYCLE_READY_COMMITTED_MARKER):
+            assert console_after.count(marker.decode("ascii")) == console_before.count(marker.decode("ascii")) + 1
+        assert [entry["kind"] for entry in completed.lifecycle.to_dict()["transcript"]] == [
+            "HELLO",
+            "BOOTSTRAP",
+            "KEY_ACK",
+            "READY",
+            "TERMINAL",
+        ]
+        assert plan.process.argv[0] == f"/{basename}"
+        assert (root_path.stat().st_dev, root_path.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
+        assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_retention
+        assert store.list_lease_set_intents(first.transaction.owner) == original_leases
+        assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
+        assert (socket_path.lstat().st_dev, socket_path.lstat().st_ino) == (
+            socket_metadata.st_dev,
+            socket_metadata.st_ino,
+        )
+        transport.unlink_exact_and_fsync()
+        transport.close()
+        transport = None
+        lease.close()
+        lease = None
+
+        def absent():
+            return _lookup_domain(conn, second_name) is None and _lookup_domain_uuid(conn, defined.domain_uuid) is None
+
+        _remove_inactive_domain_then_restore(
+            broker,
+            lambda: _remove_exact_owned_domain(
+                conn,
+                second_name,
+                defined.domain_uuid,
+                plan.run_id,
+                plan.digest,
+                -1,
+                binding.expected_definition_projection_digest,
+            ),
+            absent,
+        )
+        assert absent() and _lookup_domain_uuid(conn, first_binding.domain_uuid) is None
+        assert broker.restored and not broker.ambiguous
+        broker.close()
+        # Only fixture teardown deletes this exact second-owned disk, after
+        # both domains are absent. Production retain never calls deletion.
+        release_oci_root_volume(
+            roots,
+            second.transaction.volume_id,
+            owner=second.transaction.owner,
+            lower_graph_digest=second.transaction.lower_graph_digest,
+            delete=True,
+        )
+        assert not root_path.exists()
+        for transaction in (first.transaction, second.transaction):
+            store.rollback_lease_set(
+                transaction.lower_lease_set_id, transaction.owner, plan_digest=transaction.boot_plan_digest
+            )
+            assert store.list_lease_set_intents(transaction.owner) == ()
+    finally:
+        if transport is not None:
+            transport.close(preserve_path=True)
+        if lease is not None:
+            lease.close()
+        os.close(fd)
+
+
 @pytest.mark.parametrize(
     ("child_owned", "stop_workload", "stale_cleanup"),
     [
@@ -3135,6 +3382,7 @@ def test_live_oci_root(
                 materialization,
                 store,
                 root_volume_size_bytes=_ROOT_SIZE_BYTES,
+                retention_policy="retain" if stale_cleanup else "delete",
             )
         root_path = prepared.root_volume.path
         before_digest = _sha256_file(root_path)
@@ -3423,13 +3671,6 @@ def test_live_oci_root(
         owned_domain_id = None
         assert broker.restored is True
         assert broker.ambiguous is False
-        if stale_cleanup:
-            try:
-                assert prove_terminal_domain_absent()
-                _remove_completed_fixture_socket(monitor_directory, monitor_snapshot)
-            except BaseException:
-                retain_qualification_state = True
-                raise
 
         verified_root = load_oci_root_volume(roots, prepared.transaction.volume_id)
         assert verified_root.path == root_path
@@ -3446,14 +3687,38 @@ def test_live_oci_root(
         assert debugfs.returncode == 0, debugfs.stderr[-2000:]
         assert "Type: directory" in debugfs.stdout
 
-        release_prepared_oci_root_run(roots, prepared, store)
-        assert read_run_ledger_snapshot(roots, name).state["status"] == "removed"
-        assert _lookup_domain(conn, name) is None
-        with pytest.raises(StateError, match="record is missing"):
-            load_oci_root_volume(roots, prepared.transaction.volume_id)
-        assert not root_path.exists()
-        assert store.list_lease_set_intents(prepared.transaction.owner) == ()
-        prepared = None
+        if stale_cleanup:
+            try:
+                assert prove_terminal_domain_absent()
+                broker.close()
+                _qualify_retained_root_reuse(
+                    monkeypatch,
+                    qualification_root,
+                    roots,
+                    store,
+                    materialization,
+                    boot,
+                    profile,
+                    conn,
+                    qemu_uid,
+                    prepared,
+                    monitor_binding,
+                    monitor_snapshot,
+                )
+                _remove_completed_fixture_socket(monitor_directory, monitor_snapshot)
+            except BaseException:
+                retain_qualification_state = True
+                raise
+            prepared = None
+        else:
+            release_prepared_oci_root_run(roots, prepared, store)
+            assert read_run_ledger_snapshot(roots, name).state["status"] == "removed"
+            assert _lookup_domain(conn, name) is None
+            with pytest.raises(StateError, match="record is missing"):
+                load_oci_root_volume(roots, prepared.transaction.volume_id)
+            assert not root_path.exists()
+            assert store.list_lease_set_intents(prepared.transaction.owner) == ()
+            prepared = None
     finally:
         if monitor_socket is not None:
             monitor_socket.close(preserve_path=True)

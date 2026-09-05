@@ -7,15 +7,18 @@ is not an OS sandbox against a malicious same-UID process rewriting its state.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
+import threading
 import uuid
-from collections.abc import Iterator
+import weakref
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,96 @@ MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS = 4096
 MAX_OCI_ROOT_VOLUME_GENERATION = 10**MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS - 1
 _RECORD_BYTES = 64 * 1024
 _HEX_RE = re.compile(r"^[0-9a-f]{32}$")
+_RETENTION_FORK_LOCK = threading.Lock()
+_RETENTION_LOCKS: weakref.WeakSet[_RetentionVolumeLock] = weakref.WeakSet()
+
+
+def _close_retention_locks_after_fork() -> None:
+    try:
+        for lock in tuple(_RETENTION_LOCKS):
+            lock._close_descriptors()
+        _RETENTION_LOCKS.clear()
+    finally:
+        _RETENTION_FORK_LOCK.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_RETENTION_FORK_LOCK.acquire,
+        after_in_parent=_RETENTION_FORK_LOCK.release,
+        after_in_child=_close_retention_locks_after_fork,
+    )
+
+
+class _RetentionVolumeLock:
+    """Existing-only lock for guarded retention, without chmod or symlink following."""
+
+    def __init__(self, roots: StatePaths, path: Path):
+        self.roots, self.path, self.pid = roots, path, os.getpid()
+        self.directory_fd = self.lock_fd = -1
+        _RETENTION_FORK_LOCK.acquire()
+        try:
+            self.directory_fd = os.open(roots.locks, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            self.lock_fd = os.open(
+                path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=self.directory_fd
+            )
+            self.directory_identity = os.fstat(self.directory_fd)
+            self.lock_identity = os.fstat(self.lock_fd)
+            self.verify()
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise StateError("root retention volume lock is busy") from None
+            self.verify()
+            _RETENTION_LOCKS.add(self)
+        except BaseException:
+            self._close_descriptors()
+            raise
+        finally:
+            _RETENTION_FORK_LOCK.release()
+
+    def verify(self) -> None:
+        if os.getpid() != self.pid or self.lock_fd < 0:
+            raise StateError("root retention lock authority changed")
+        for held_fd, visible, expected, directory in (
+            (self.directory_fd, os.stat(self.roots.locks, follow_symlinks=False), self.directory_identity, True),
+            (
+                self.lock_fd,
+                os.stat(self.path.name, dir_fd=self.directory_fd, follow_symlinks=False),
+                self.lock_identity,
+                False,
+            ),
+        ):
+            for info in (os.fstat(held_fd), visible):
+                if (
+                    not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600)
+                    or (not directory and info.st_nlink != 1)
+                    or (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino)
+                ):
+                    raise StateError("root retention lock authority changed")
+
+    def _close_descriptors(self) -> None:
+        for name in ("lock_fd", "directory_fd"):
+            descriptor = getattr(self, name)
+            setattr(self, name, -1)
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        with _RETENTION_FORK_LOCK:
+            _RETENTION_LOCKS.discard(self)
+            self._close_descriptors()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
 
 
 def _canonical_uuid(value: str) -> str:
@@ -577,6 +670,102 @@ def load_oci_root_volume(
             if file_fd is not None:
                 os.close(file_fd)
         return VerifiedOCIRootVolume(record, path, filesystem_uuid)
+
+
+def _retain_exact_oci_root_volume(
+    roots: StatePaths,
+    expected: OCIRootVolumeRecord,
+    *,
+    filesystem_uuid: str,
+    before_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
+    after_retention: Callable[[OCIRootVolumeRecord, tuple[int, int]], None],
+    runner: CommandRunner = _default_runner,
+) -> OCIRootVolumeRecord:
+    """Private retain-only CAS; callbacks run inside the volume lock.
+
+    The caller owns run/journal authority and must persist intent before the
+    detach. Callbacks must not reacquire this volume lock. An exact retained
+    successor is exposed to the callback solely for intent-based crash resume.
+    """
+    if type(expected) is not OCIRootVolumeRecord:
+        raise StateError("exact root retention record is invalid")
+    expected.__post_init__()
+    if expected.retention_policy != "retain" or expected.status != "attached":
+        raise StateError("exact root retention requires an originally retained attachment")
+    retained = replace(
+        expected,
+        status="retained",
+        attached_run_id=None,
+        attached_run_name=None,
+        generation=expected.generation + 1,
+    )
+    path, record_path, lock_path = _paths(roots, expected.volume_id)
+    with _RetentionVolumeLock(roots, lock_path) as volume_lock, _root_authority(roots) as directory_fd:
+        directory_identity = os.fstat(directory_fd)
+        current = _read_record(directory_fd, record_path)
+        if current not in (expected, retained):
+            raise StateError("root retention attachment generation changed")
+        file_fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(file_fd)
+            identity = (opened.st_dev, opened.st_ino)
+            fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+
+            def verify(expected_current: OCIRootVolumeRecord) -> None:
+                volume_lock.verify()
+                held_directory = os.fstat(directory_fd)
+                visible_directory = os.stat(roots.oci_root_volumes, follow_symlinks=False)
+                if any(
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) & 0o022 != 0
+                    or (info.st_dev, info.st_ino) != (directory_identity.st_dev, directory_identity.st_ino)
+                    for info in (held_directory, visible_directory)
+                ):
+                    raise StateError("root retention volume directory changed")
+                held, visible = os.fstat(file_fd), os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                    or opened.st_nlink != 1
+                    or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_size != expected.size_bytes
+                    or any(
+                        getattr(info, field) != getattr(opened, field) for info in (held, visible) for field in fields
+                    )
+                    or _read_record(directory_fd, record_path) != expected_current
+                ):
+                    raise StateError("root retention volume authority changed")
+                verify_ext4_superblock(
+                    os.pread(file_fd, EXT4_SUPERBLOCK_BYTES, EXT4_SUPERBLOCK_OFFSET),
+                    device_size=expected.size_bytes,
+                    volume_id=expected.volume_id,
+                    filesystem_uuid=filesystem_uuid,
+                )
+
+            verify(current)
+            _verify_kvm_path(path, expected.size_bytes, oci_root_volume_label(expected.volume_id), runner)
+            verify(current)
+            before_retention(current, identity)
+            verify(current)
+            if current == expected:
+                _write_record(directory_fd, record_path, retained)
+            verify(retained)
+            after_retention(retained, identity)
+            verify(retained)
+            return retained
+        finally:
+            os.close(file_fd)
 
 
 def release_oci_root_volume(
