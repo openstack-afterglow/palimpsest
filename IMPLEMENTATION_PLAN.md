@@ -1035,6 +1035,38 @@ Scope boundary: this launch path remains a synchronous private qualification
 surface. Public create/start/run/`-d`, a restart-safe monitor, runtime STOP,
 exec/log readiness, and Gate 2 remain disabled.
 
+### PR 4 slice 30E: restart-bound monitor ownership foundation
+
+- A new production-inert OCI-root monitor ownership journal binds the exact
+  durable run owner, host UID, plan digest, definition-projection digest,
+  stage-1 artifact digest, libvirt URI, domain UUID and active domain ID, guest
+  boot-attempt UUID, and writer process incarnation. The process incarnation is
+  the Linux host boot UUID plus PID plus `/proc` start ticks, so a recycled PID
+  or host reboot cannot impersonate the recorded writer.
+- The owner-only per-run lock file is the live single-writer lease. The exact,
+  canonical, secret-free JSON journal is the restart intent. Each transition is
+  published through an owner-only temporary inode, file `fsync`, atomic
+  link/replace, and directory `fsync`. Failure before replacement preserves the
+  preceding journal; failure after replacement never reports success and
+  poisons the still-lock-holding handle because either old or new state may be
+  durable after a crash. Fork children immediately close inherited lock and
+  directory descriptors and poison their copied handles, so they cannot retain
+  or impersonate the parent's monitor authority.
+- Explicit adoption first acquires the OS lease and accepts only the same exact
+  launch binding whose prior process is provably stale. A live writer, unknown
+  process state, malformed journal, terminal state, or binding drift fails
+  closed. Adoption commits only `adopting` recovery ownership.
+- Lifecycle v2's per-boot authentication key remains memory-only. Consequently
+  a replacement monitor cannot authenticate a running guest merely from this
+  journal: `adopting` cannot transition to `running` and may only commit
+  `control-lost` for a future exact cleanup/reconciliation path. This is an
+  ownership foundation, not recovery execution, reconnect, STOP, or a daemon.
+
+Scope boundary: no existing runtime, supervisor, dispatcher, CLI, or libvirt
+launch module imports this foundation. Public create/start/run/`-d`, monitor
+process spawning, authenticated reconnect/STOP, adoption cleanup, logs/exec,
+and Gate 2 remain disabled.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1053,9 +1085,10 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add the restart-safe long-lived host monitor and authenticated STOP/control
-   ownership, including recovery from durable `activating`, `starting`, and
-   `running` states.
+1. Build the long-lived host monitor process on the 30E ownership journal and
+   add exact-domain cleanup for stale ownership. Authenticated STOP/control may
+   be resumed only by a live monitor retaining its in-memory lifecycle v2 boot
+   key; a dead monitor's journal alone cannot recover running control.
 2. Connect foreground-default `run` and detached `run -d` to that monitor,
    preserving public fail-closed behavior until both paths are qualified.
 3. Add lifecycle/exec/log readiness and activate the opt-in local build-to-run

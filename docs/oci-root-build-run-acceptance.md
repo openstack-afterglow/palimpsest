@@ -133,6 +133,22 @@ removed before stream abort/free on every normal or exceptional handoff path.
 This remains a synchronous private qualification surface; public create,
 start, run, and detached dispatch stay disabled.
 
+A separate production-inert monitor-ownership foundation now records an exact,
+secret-free per-run binding for the run owner, plan and definition projection,
+stage-1 artifact, libvirt URI, domain UUID and active ID, guest boot attempt, and
+the writer's host-boot/PID/start-tick incarnation. An owner-only flock permits
+one writer. Canonical JSON transitions use file `fsync`, atomic publication, and
+directory `fsync`; an uncertain post-replace sync poisons the live handle and
+does not report a committed transition. A fork child drops inherited monitor
+descriptors and permanently invalidates its copied handle.
+
+Stale adoption is deliberately recovery ownership, not running lifecycle
+recovery. The lifecycle v2 boot key is memory-only, so a replacement process
+cannot reconstruct authenticated STOP/reconnect authority from the journal.
+It may commit only `adopting` then `control-lost` for a future exact cleanup
+path. No runtime, supervisor, dispatcher, CLI, or libvirt launch code imports
+this module yet, so public run/`-d` remains disabled.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
