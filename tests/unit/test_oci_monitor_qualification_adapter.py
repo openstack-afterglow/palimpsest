@@ -155,6 +155,44 @@ def test_directory_ctime_can_change_after_grant_for_normal_state_writes():
     adapter("run", entry, current, current, os.geteuid())
 
 
+@pytest.mark.parametrize("tamper", [None, "inode", "owner", "mode", "acl"])
+def test_runtime_console_can_grow_but_retains_exact_identity_and_named_grant(tamper):
+    original = _stat(st_mode=stat.S_IFREG | 0o600, st_size=0)
+    granted = _stat(st_mode=stat.S_IFREG | 0o660, st_size=0, st_ctime_ns=40)
+    broker = Broker(original, granted, False)
+    broker.targets[0].permission = "rw-"
+    broker.targets[0].original_acl = ACL("rw-", (), "---", None, "---")
+    broker.acl = ACL("rw-", ((broker.uid, "rw-"),), "---", "rw-", "---")
+    current = SimpleNamespace(**{**vars(granted), "st_size": 90, "st_mtime_ns": 100, "st_ctime_ns": 101})
+    broker.current = current
+    entry = {
+        name: getattr(original, field)
+        for name, field in (
+            ("device", "st_dev"),
+            ("inode", "st_ino"),
+            ("uid", "st_uid"),
+            ("gid", "st_gid"),
+            ("nlink", "st_nlink"),
+            ("mode", "st_mode"),
+            ("size", "st_size"),
+            ("mtime_ns", "st_mtime_ns"),
+            ("ctime_ns", "st_ctime_ns"),
+        )
+    }
+    context = {"broker": broker, "granted": {(1, 2): granted}}
+    adapter = _HELPER["_qualification_metadata_adapter"](_validate_entry_metadata, context, ACL, _acl_mode)
+    if tamper == "acl":
+        broker.acl = replace(broker.acl, named_users=((broker.uid + 1, "rw-"),))
+    elif tamper is not None:
+        field = {"inode": "st_ino", "owner": "st_uid", "mode": "st_mode"}[tamper]
+        setattr(current, field, getattr(current, field) + 1)
+    if tamper is None:
+        adapter("runtime_console", entry, current, current, os.geteuid())
+    else:
+        with pytest.raises((StateError, ValueError)):
+            adapter("runtime_console", entry, current, current, os.geteuid())
+
+
 @pytest.mark.parametrize("case", ["no-broker", "not-applied", "not-target", "monitor"])
 def test_nonbroker_and_monitor_entries_always_use_strict_policy(case):
     adapter, broker, entry, _original, granted = _setup(directory=True)

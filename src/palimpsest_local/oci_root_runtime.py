@@ -14,6 +14,7 @@ import threading
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +42,7 @@ from .oci_root_kvm import (
     VerifiedHostBootArtifacts,
     resolve_committed_oci_root_domain_plan,
 )
+from .oci_runtime_io import runtime_io_guard
 from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .project_volumes import CommandRunner, _default_runner
@@ -1035,7 +1037,7 @@ def define_committed_oci_root_domain(
 
     if conn is None:
         raise StateError("OCI-root domain definition requires an explicit libvirt connection")
-    with locked_existing_run(roots, name) as mutation:
+    with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
         libvirt_uri = _connection_uri(conn, profile)
         resolved = resolve_committed_oci_root_domain_plan(
             roots,
@@ -1045,12 +1047,16 @@ def define_committed_oci_root_domain(
             profile,
             runner=runner,
         )
+        runtime_io = io_guards.enter_context(
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
+        )
         if _lookup(conn, name) is not None:
             raise StateError(f"libvirt domain name is already reserved: {name}")
         attempted = False
         domain_uuid: str | None = None
         try:
             mutation.verify_binding()
+            runtime_io.verify(require_socket_absent=True)
             attempted = True
             domain = conn.defineXML(resolved.xml)
             if domain is None:
@@ -1061,6 +1067,7 @@ def define_committed_oci_root_domain(
                 raise StateError("defined OCI-root domain is missing")
             projection_digest = _validate_defined_domain(current, resolved, domain_uuid, conn=conn)
             mutation.verify_binding()
+            runtime_io.verify(require_socket_absent=True)
             data = mutation.mutable_state()
             data["oci_root_definition"] = {
                 "domain_uuid": domain_uuid,
@@ -1202,11 +1209,14 @@ def prepare_oci_root_monitor_binding(
     """
 
     _validate_monitor_boot_attempt(boot_attempt_id)
-    with locked_existing_run(roots, name) as mutation:
+    with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
         libvirt_uri = _connection_uri(conn, profile)
         domain_uuid, definition_digest, projection_digest = _definition_ledger(mutation.snapshot.state, profile)
         resolved = resolve_committed_oci_root_domain_plan(
             roots, mutation.snapshot, store, boot_artifacts, profile, runner=runner, expected_status="defined"
+        )
+        runtime_io = io_guards.enter_context(
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
         )
         if definition_digest != resolved.plan.digest:
             raise StateError("OCI-root durable definition plan binding is invalid")
@@ -1216,6 +1226,7 @@ def prepare_oci_root_monitor_binding(
             mutation.snapshot, resolved, domain_uuid, projection_digest, libvirt_uri, boot_attempt_id
         )
         mutation.verify_binding()
+        runtime_io.verify(require_socket_absent=True)
         return binding
 
 
@@ -1600,6 +1611,9 @@ def launch_defined_oci_root_domain(
 
     def verify_monitor_lease(mutation: Any, lease: _PreactivationJournalLease, *args: Any, **kwargs: Any) -> None:
         _verify_monitor_lease_directory(mutation, lease, *args, authority_guard=authority_guard, **kwargs)
+        if resolved is not None:
+            with runtime_io_guard(mutation, plan_digest=resolved.plan.digest):
+                pass
 
     if monitor_binding is not None:
         if type(monitor_binding) is not MonitorPreActivationBinding:
@@ -1639,7 +1653,7 @@ def launch_defined_oci_root_domain(
     ready_lifecycle: OCILifecycleHandoffReceipt | None = None
     definition_projection_digest: str | None = None
     try:
-        with locked_existing_run(roots, name) as mutation:
+        with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
             libvirt_uri = _connection_uri(conn, profile)
             domain_uuid, definition_digest, definition_projection_digest = _definition_ledger(
                 mutation.snapshot.state, profile
@@ -1652,6 +1666,9 @@ def launch_defined_oci_root_domain(
                 profile,
                 runner=runner,
                 expected_status="defined",
+            )
+            runtime_io = io_guards.enter_context(
+                runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
             )
             if definition_digest != resolved.plan.digest:
                 raise StateError("OCI-root durable definition plan binding is invalid")
@@ -1753,6 +1770,7 @@ def launch_defined_oci_root_domain(
             started_intent = True
             if monitor_lease is not None:
                 verify_monitor_lease(mutation, monitor_lease, monitor_binding, activating=True)
+            runtime_io.verify(require_socket_absent=True)
             try:
                 domain.create()
             except Exception:
@@ -1763,6 +1781,7 @@ def launch_defined_oci_root_domain(
             domain_id = captured_domain_id
             domain = _exact_domain(conn, resolved, domain_uuid)
             _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
+            runtime_io.verify()
             if monitor_lease is not None:
                 verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"activating"}))
                 monitor_lease.promote_active(
@@ -1801,10 +1820,13 @@ def launch_defined_oci_root_domain(
             if monitor_lease is not None:
                 with locked_existing_run(roots, name) as mutation:
                     verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
-            try:
-                opened = domain.openChannel(channel_name, stream, 0)
-            except Exception:
-                raise StateError("OCI-root lifecycle channel open failed") from None
+            with locked_existing_run(roots, name) as mutation:
+                with runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io:
+                    runtime_io.verify()
+                    try:
+                        opened = domain.openChannel(channel_name, stream, 0)
+                    except Exception:
+                        raise StateError("OCI-root lifecycle channel open failed") from None
             if opened != 0:
                 raise StateError("OCI-root lifecycle channel open result is invalid")
         except BaseException:
@@ -1816,7 +1838,10 @@ def launch_defined_oci_root_domain(
 
         def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
             nonlocal ledger_phase, ready_lifecycle
-            with locked_existing_run(roots, name) as mutation:
+            with (
+                locked_existing_run(roots, name) as mutation,
+                runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io,
+            ):
                 if monitor_lease is not None:
                     verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
                 current_uuid, current_digest, current_projection_digest = _definition_ledger(
@@ -1854,6 +1879,7 @@ def launch_defined_oci_root_domain(
                 )
                 if monitor_lease is not None:
                     verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
+                runtime_io.verify()
                 data = mutation.mutable_state()
                 data.pop("error", None)
                 data["oci_root_handoff"] = _handoff_ledger(
@@ -1946,9 +1972,13 @@ def launch_defined_oci_root_domain(
         if terminal is None or lifecycle.phase != "terminal" or lifecycle.boot_attempt_id != boot_attempt_id:
             raise StateError("OCI-root lifecycle terminal result is missing")
 
-        with locked_existing_run(roots, name) as mutation:
+        with (
+            locked_existing_run(roots, name) as mutation,
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io,
+        ):
             if monitor_lease is not None:
                 verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+            runtime_io.verify()
             current_uuid, current_digest, current_projection_digest = _definition_ledger(
                 mutation.snapshot.state, profile
             )
@@ -1993,6 +2023,7 @@ def launch_defined_oci_root_domain(
                 )
                 if monitor_lease is not None:
                     verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+                runtime_io.verify()
                 try:
                     domain.destroy()
                 except Exception:
@@ -2007,6 +2038,7 @@ def launch_defined_oci_root_domain(
             )
             if monitor_lease is not None:
                 verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+            runtime_io.verify()
             data = mutation.mutable_state()
             data.pop("error", None)
             data["oci_root_handoff"] = _handoff_ledger(

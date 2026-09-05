@@ -12,17 +12,21 @@ from palimpsest_local import oci_monitor_launch as launch
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_monitor_ipc import MonitorPreActivationBinding
 from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
+from palimpsest_local.oci_runtime_io import runtime_io_guard
 from palimpsest_local.oci_store import OCIStore
 from palimpsest_local.platforms import DomainProfile
-from palimpsest_local.runtime_types import DispatchKey, ExistingRunRecord, RuntimeBackend, RuntimeKind
-from palimpsest_local.state import StatePaths
+from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from palimpsest_local.state import StatePaths, locked_existing_run, read_run_ledger_snapshot, reserve_new_run
 
 
 @pytest.fixture
 def inputs(tmp_path: Path):
     roots = StatePaths(tmp_path / "config", tmp_path / "state")
-    for path in (roots.config, roots.state, roots.runs, roots.runs / "demo", roots.runs / "demo" / "monitor-private"):
+    for path in (roots.config, roots.state, roots.runs, roots.locks):
         path.mkdir(mode=0o700)
+    with reserve_new_run(roots, "demo", DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)) as reservation:
+        reservation.write_state("defined", {})
+    (roots.runs / "demo" / "monitor-private").mkdir(mode=0o700)
     roots.runtime_packs.mkdir(mode=0o700)
     store = OCIStore(roots)
     kernel = tmp_path / "kernel"
@@ -46,9 +50,7 @@ def inputs(tmp_path: Path):
         "sata",
     )
     binding = MonitorPreActivationBinding(
-        ExistingRunRecord(
-            "demo", "11849d77-fdd8-4f65-92a0-bbc75ea80767", 2, DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
-        ),
+        read_run_ledger_snapshot(roots, "demo").record,
         os.geteuid(),
         "sha256:" + "a" * 64,
         "sha256:" + "b" * 64,
@@ -57,13 +59,18 @@ def inputs(tmp_path: Path):
         "31849d77-fdd8-4f65-92a0-bbc75ea80767",
         "qemu:///system",
     )
+    with locked_existing_run(roots, "demo") as mutation:
+        with runtime_io_guard(mutation, plan_digest=binding.plan_digest, create=True) as runtime_io:
+            data = mutation.mutable_state()
+            data["oci_runtime_io"] = runtime_io.receipt.to_dict()
+            mutation.write_state("defined", data)
     return roots, store, boot, profile, binding
 
 
 def test_authority_pins_complete_explicit_roots_and_readonly_boot(inputs):
     with launch.prepare_monitor_launch_authority(*inputs) as authority:
         frame = authority.to_dict()
-        assert len(authority.pass_fds) == len(set(authority.pass_fds)) == 19
+        assert len(authority.pass_fds) == len(set(authority.pass_fds)) == 21
         assert frame["binding"] == inputs[-1].to_dict()
         assert frame["store_identity"] == inputs[1].identity
         assert frame["boot"] == inputs[2].to_dict()
@@ -135,6 +142,8 @@ def test_bootstrap_rejects_collision_with_control_descriptors(inputs):
         "runs",
         "run",
         "monitor",
+        "runtime_io",
+        "runtime_console",
         "store",
         "derived",
         "derived_records",
@@ -167,6 +176,36 @@ def test_boot_bytes_change_invalidates_authority(inputs):
         inputs[2].kernel.path.chmod(0o600)
         inputs[2].kernel.path.write_bytes(b"\0" * 0x202 + b"HdrS" + b"changed")
         inputs[2].kernel.path.chmod(0o400)
+        with pytest.raises(StateError):
+            authority.validate()
+
+
+def test_console_output_is_mutable_but_its_inode_remains_pinned(inputs):
+    with launch.prepare_monitor_launch_authority(*inputs) as authority:
+        console = Path(authority.to_dict()["entries"]["runtime_console"]["path"])
+        console.write_bytes(b"untrusted guest console output\n")
+        authority.validate()
+        replacement = console.with_name("replacement")
+        replacement.write_bytes(console.read_bytes())
+        replacement.chmod(0o600)
+        replacement.replace(console)
+        with pytest.raises(StateError):
+            authority.validate()
+
+
+def test_bootstrap_v1_is_not_reinterpreted_as_runtime_io_authority(inputs):
+    with launch.prepare_monitor_launch_authority(*inputs) as authority:
+        frame = authority.to_dict()
+        frame["schema"] = "palimpsest.monitor-launch-authority.v1"
+        with pytest.raises(StateError):
+            launch.MonitorLaunchAuthority.from_dict(frame)
+
+
+@pytest.mark.parametrize("key", ["runtime_io", "runtime_console"])
+def test_bootstrap_never_accepts_generic_qemu_group_write_modes(inputs, key):
+    with launch.prepare_monitor_launch_authority(*inputs) as authority:
+        path = Path(authority.to_dict()["entries"][key]["path"])
+        path.chmod(0o730 if key == "runtime_io" else 0o660)
         with pytest.raises(StateError):
             authority.validate()
 

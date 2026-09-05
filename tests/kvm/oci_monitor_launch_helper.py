@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -176,7 +175,12 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
             current = _validate_qualified_boot_relabel(key, entry, opened, visible, target, granted, boot_policy)
         if broker._getfacl(target) != expected or any(
             value.st_mode != granted.st_mode
-            or (boot_policy is None and not stat.S_ISDIR(value.st_mode) and value.st_ctime_ns != granted.st_ctime_ns)
+            or (
+                boot_policy is None
+                and key != "runtime_console"
+                and not stat.S_ISDIR(value.st_mode)
+                and value.st_ctime_ns != granted.st_ctime_ns
+            )
             for value in (opened, visible, current)
         ):
             raise ValueError("qualified monitor ACL changed")
@@ -219,19 +223,16 @@ def _install_qualification(root: Path) -> None:
     # Production intentionally does not inherit or infer this search path.
     sys.path.append("/usr/lib/python3/dist-packages")
     import palimpsest_local.oci_monitor_launch as authority_module
-    from palimpsest_local import oci_root_kvm, oci_root_runtime
+    from palimpsest_local import oci_root_kvm, oci_root_runtime, oci_runtime_io
     from palimpsest_local.state import read_run_ledger_snapshot
 
     fixture = runpy.run_path(str(Path(__file__).with_name("test_oci_root_libvirt_live.py")))
-    original_xml = oci_root_kvm.build_oci_root_domain_xml
     original_lower = oci_root_kvm._verified_lower_path
     original_connect = oci_root_runtime.connect_oci_root_libvirt
     original_run = authority_module.MonitorLaunchAuthority.run
     original_metadata = authority_module._validate_entry_metadata
+    original_io_metadata = oci_runtime_io._validate_runtime_io_metadata
     context: dict = {}
-
-    def xml(spec, profile):
-        return original_xml(replace(spec, console_log=root / "console.log"), profile)
 
     def lower(roots, digest, size):
         return fixture["_stage_qualified_lower"](original_lower(roots, digest, size), digest, size, root / "l")
@@ -346,7 +347,7 @@ def _install_qualification(root: Path) -> None:
             context["resources"] = self._rebuild()
             context["binding"] = binding
             socket.socket.connect = _guard_lifecycle_connect(
-                original_socket_connect, context["resources"][0].runs / binding.record.name / "lifecycle.sock"
+                original_socket_connect, context["resources"][0].runs / binding.record.name / "io" / "lifecycle.sock"
             )
             return original_run(self, directory_fd, binding, lease, stop_control=stop_control)
         except BaseException as error:
@@ -363,10 +364,12 @@ def _install_qualification(root: Path) -> None:
         finally:
             socket.socket.connect = original_socket_connect
 
-    oci_root_kvm.build_oci_root_domain_xml = xml
     oci_root_kvm._verified_lower_path = lower
     oci_root_runtime.connect_oci_root_libvirt = connect
     authority_module._validate_entry_metadata = metadata
+    oci_runtime_io._validate_runtime_io_metadata = fixture["_qualification_runtime_io_adapter"](
+        original_io_metadata, lambda: context.get("broker")
+    )
     authority_module.MonitorLaunchAuthority.run = run
 
 

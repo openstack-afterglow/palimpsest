@@ -1975,7 +1975,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert plan.stage1_transport["target"] == "vdb"
     assert plan.to_dict()["lifecycle_control"] == {
         "channel_name": "org.palimpsest.oci.lifecycle.0",
-        "endpoint": "run-private/lifecycle.sock",
+        "endpoint": "run-private/io/lifecycle.sock",
         "protocol": "palimpsest.oci-lifecycle-control.v2",
         "transport": "virtio-serial",
     }
@@ -2148,8 +2148,10 @@ def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
         ET.SubElement(pm, "suspend-to-disk", {"enabled": "no"})
         devices = root.find("./devices")
         ET.SubElement(devices, "controller", {"type": "pci", "index": "0", "model": "pcie-root"})
-        serial = ET.SubElement(devices, "serial", {"type": "pty"})
-        ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+        serial = ET.SubElement(devices, "serial", {"type": "file"})
+        serial.append(deepcopy(root.find("./devices/console/source")))
+        serial_target = ET.SubElement(serial, "target", {"type": "isa-serial", "port": "0"})
+        ET.SubElement(serial_target, "model", {"name": "isa-serial"})
         ET.SubElement(devices, "input", {"type": "keyboard", "bus": "ps2"})
         ET.SubElement(devices, "memballoon", {"model": "virtio"})
         return ET.tostring(root, encoding="unicode")
@@ -2180,9 +2182,10 @@ def test_oci_root_disk_projection_binds_exact_dac_no_relabel_sources(tmp_path: P
     assert disks
     assert all(disk[4] == (("model", "dac"), ("relabel", "no")) for disk in disks)
     assert projection["console"] == (
-        (("type", "pty"),),
-        None,
+        (("type", "file"),),
+        (("append", "on"), ("path", str(roots.runs / "disk-source-seclabel" / "io" / "console.log"))),
         (("port", "0"), ("type", "serial")),
+        (("model", "dac"), ("relabel", "no")),
     )
 
     root = ET.fromstring(xml)
@@ -2349,6 +2352,8 @@ def test_oci_root_projection_rejects_noncanonical_file_console_seclabel(
     target = root.find("./devices/console/target")
     assert console is not None and target is not None
     console.attrib = {"type": "file"}
+    for prior_source in console.findall("./source"):
+        console.remove(prior_source)
     source = ET.Element("source", {"path": os.fspath((tmp_path / "console.log").resolve()), "append": "on"})
     label = ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
     console.insert(0, source)
@@ -3197,7 +3202,7 @@ def test_oci_root_define_rejects_live_authority_tamper_before_libvirt_mutation(
         payload[0] ^= 1
         boot.kernel.path.write_bytes(payload)
     elif tamper == "socket":
-        (roots.runs / f"tamper-{tamper}" / "lifecycle.sock").symlink_to(tmp_path / "foreign.sock")
+        (roots.runs / f"tamper-{tamper}" / "io" / "lifecycle.sock").symlink_to(tmp_path / "foreign.sock")
     else:
         selected_profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "aarch64")
     conn = _DefinitionConnection()

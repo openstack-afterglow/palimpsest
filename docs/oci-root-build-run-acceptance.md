@@ -349,6 +349,35 @@ Live qualification now boots the upper-only executable after old-pin retirement,
 with the new pins intact and still blocking collection. Disk data, lifecycle
 evidence, and the original journal/socket remain outside this reclamation scope.
 
+Slice 30O isolates QEMU-created `io/lifecycle.sock` and the host-precreated
+`io/console.log` from the trusted run root. Commit exclusively creates and
+fsyncs the directory and console, then binds both inode identities to the
+run/domain plan in a trusted ledger receipt. Definition/activation and the
+fresh-exec authority reject replaced resources; the prelaunch socket must be
+absent. Console bytes and timestamps remain untrusted mutable output.
+The I/O guard invalidates inherited authority after fork and does not close a
+descriptor reused by the child during subsequent teardown.
+I/O identity failures prevent normal lifecycle publication and never authorize
+endpoint deletion. Existing exact-domain launch-failure cleanup remains a
+separate policy, including the private synchronous path's verified VM cleanup.
+
+Qualification now uses the production per-run console path. It verifies that
+only `io` receives named-QEMU directory write access, the trusted run root is
+traversal-only for QEMU, and `monitor-private` receives no grant. The retained
+root successor has a separate, initially empty console. Domain plan/core
+v15/v9 and launch authority v2 reject the old host path contracts; guest
+protocol and non-OCI console paths are unchanged.
+
+The [libvirt Unix socket contract](https://libvirt.org/formatdomain.html#unix-domain-socket-client-server)
+defines `mode="bind"` as a local server endpoint. The existing
+[security-label policy](https://libvirt.org/formatdomain.html#security-label)
+is unchanged by this layout isolation.
+
+This does not promote the test DAC broker to production. Production still
+requires strict owner-only metadata; only the qualification adapter verifies
+the exact recorded named-user ACL before normalizing its mode bits. Durable
+grant/recovery and explicit removal of runtime I/O remain unimplemented.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

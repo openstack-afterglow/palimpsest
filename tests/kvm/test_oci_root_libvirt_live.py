@@ -23,12 +23,14 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import palimpsest_local.oci_monitor_ipc as monitor_ipc
 import palimpsest_local.oci_root_kvm as oci_root_kvm_module
+import palimpsest_local.oci_runtime_io as oci_runtime_io_module
 from palimpsest_local import kvm, oci_root_runtime, platforms
 from palimpsest_local._oci_stage1_kvm_proof import (
     KERNEL_CONFIG_ENV,
@@ -867,6 +869,66 @@ class _QualificationDACBroker:
         self.targets.clear()
 
 
+def _qualification_runtime_io_adapter(original, get_broker):
+    """Admit only this test broker's exact grants; production stays owner-only."""
+
+    def metadata(directory, console, receipt):
+        broker = get_broker()
+        if broker is None or not broker.applied or broker.restored:
+            return original(directory, console, receipt)
+        normalized = []
+        for info, permission, mode in ((directory, "-wx", 0o700), (console, "rw-", 0o600)):
+            targets = [
+                target
+                for target in broker.targets
+                if (target.opened.st_dev, target.opened.st_ino) == (info.st_dev, info.st_ino)
+            ]
+            if len(targets) != 1 or targets[0].permission != permission:
+                raise ValueError("qualified runtime I/O has no exact grant")
+            target = targets[0]
+            current = broker._verify_held(target)
+            acl = target.original_acl
+            expected = _ACLStructure(acl.user, ((broker.uid, permission),), acl.group, permission, acl.other)
+            expected_mode = stat.S_IFMT(target.opened.st_mode) | mode | (_acl_mode(permission) << 3)
+            if (
+                stat.S_IMODE(target.opened.st_mode) != mode
+                or broker._getfacl(target) != expected
+                or info.st_mode != expected_mode
+                or current.st_mode != expected_mode
+                or any(
+                    getattr(info, field) != getattr(current, field)
+                    for field in ("st_dev", "st_ino", "st_uid", "st_gid", "st_nlink")
+                )
+            ):
+                raise ValueError("qualified runtime I/O grant changed")
+            normalized.append(
+                SimpleNamespace(
+                    **{field: getattr(info, field) for field in ("st_dev", "st_ino", "st_uid", "st_gid", "st_nlink")},
+                    st_mode=stat.S_IFMT(info.st_mode) | mode,
+                )
+            )
+        return original(*normalized, receipt)
+
+    return metadata
+
+
+def _assert_qualification_io_boundary(broker, run_root: Path) -> None:
+    """Check the effective named-QEMU grants while a real VM uses them."""
+    assert broker.applied and not broker.restored
+    io_directory = run_root / "io"
+    assert [
+        target.path for target in broker.targets if stat.S_ISDIR(target.opened.st_mode) and "w" in target.permission
+    ] == [io_directory]
+    for path, permission in ((run_root, "--x"), (io_directory, "-wx")):
+        targets = [target for target in broker.targets if target.path == path]
+        assert len(targets) == 1 and targets[0].permission == permission
+        assert broker._getfacl(targets[0]).named_users == ((broker.uid, permission),)
+    assert run_root.stat().st_mode & 0o022 == 0
+    monitor_directory = run_root / "monitor-private"
+    assert stat.S_IMODE(monitor_directory.stat().st_mode) == 0o700
+    assert not any(target.path.is_relative_to(monitor_directory) for target in broker.targets)
+
+
 class _ActivationDomainProxy:
     def __init__(self, domain: Any, domain_uuid: str, broker: _QualificationDACBroker) -> None:
         self._domain = domain
@@ -1001,6 +1063,21 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
             lifecycle_parents.add(Path(source.attrib["path"]).parent)
     if len(lifecycle_parents) != 1:
         raise ValueError("qualification lifecycle socket binding is ambiguous")
+    io_directory = next(iter(lifecycle_parents))
+    if (
+        io_directory.name != "io"
+        or console_path != io_directory / "console.log"
+        or any(path != console_path and path.is_relative_to(io_directory) for path in files)
+    ):
+        raise ValueError("qualification QEMU runtime I/O boundary is invalid")
+    lifecycle_sources = [
+        channel.find("./source")
+        for channel in channels
+        if channel.find("./target") is not None
+        and channel.find("./target").get("name") == "org.palimpsest.oci.lifecycle.0"
+    ]
+    if len(lifecycle_sources) != 1 or lifecycle_sources[0].get("path") != str(io_directory / "lifecycle.sock"):
+        raise ValueError("qualification QEMU runtime I/O endpoint is invalid")
     directories: dict[Path, str] = {root: "--x"}
     for path in (*files, *lifecycle_parents):
         try:
@@ -1619,6 +1696,63 @@ def test_acl_parser_accepts_gnu_getfacl_trailing_blank_line_and_compares_structu
     assert _parse_acl(extended) == _ACLStructure("rw-", ((107, "r--"),), "r--", "r--", "---")
 
 
+@pytest.mark.parametrize("tamper", [None, "growth", "other-user", "permission", "mode", "inode", "links", "owner"])
+def test_runtime_io_adapter_requires_exact_grant_and_keeps_identity_checks(tmp_path, tamper):
+    io_directory = tmp_path / "io"
+    io_directory.mkdir(mode=0o700)
+    console = _create_qualification_console(io_directory)
+    directory_stat, console_stat = io_directory.stat(), console.stat()
+    receipt = oci_runtime_io_module.RuntimeIOReceipt(
+        "palimpsest.oci-runtime-io.v1",
+        str(uuid.uuid4()),
+        "proof",
+        "sha256:" + "a" * 64,
+        directory_stat.st_dev,
+        directory_stat.st_ino,
+        console_stat.st_dev,
+        console_stat.st_ino,
+    )
+    runner = _FakeACLRunner()
+    broker = _QualificationDACBroker(
+        tmp_path,
+        os.geteuid() + 1,
+        ((io_directory, "directory", "-wx"), (console, "regular", "rw-")),
+        runner=runner,
+    )
+    original = oci_runtime_io_module._validate_runtime_io_metadata
+    adapter = _qualification_runtime_io_adapter(original, lambda: broker)
+    adapter(directory_stat, console_stat, receipt)
+    broker.apply()
+    try:
+        if tamper == "growth":
+            console.write_bytes(b"untrusted QEMU output\n")
+        info = console.stat()
+        if tamper in {"mode", "inode", "links", "owner"}:
+            values = {
+                field: getattr(info, field) for field in ("st_dev", "st_ino", "st_uid", "st_gid", "st_nlink", "st_mode")
+            }
+            field = {"mode": "st_mode", "inode": "st_ino", "links": "st_nlink", "owner": "st_uid"}[tamper]
+            values[field] += 1
+            info = SimpleNamespace(**values)
+        elif tamper == "permission":
+            broker.targets[1].permission = "r--"
+        elif tamper == "other-user":
+            target = broker.targets[1]
+            acl = _parse_acl(runner.acls[target.descriptor])
+            runner.acls[target.descriptor] = replace(acl, named_users=((broker.uid + 1, "rw-"),)).setfile_text()
+        with pytest.raises(StateError):
+            original(io_directory.stat(), console.stat(), receipt)
+        if tamper in {None, "growth"}:
+            adapter(io_directory.stat(), info, receipt)
+        else:
+            with pytest.raises((StateError, ValueError)):
+                adapter(io_directory.stat(), info, receipt)
+    finally:
+        broker.restore()
+        broker.close()
+    adapter(io_directory.stat(), console.stat(), receipt)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1771,16 +1905,21 @@ def test_qualification_dac_broker_failure_restores_or_retains_exact_state(
     broker.close()
 
 
-def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tamper", [None, "trusted-run", "outside-console", "other-socket"])
+def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(
+    tmp_path: Path, tamper: str | None
+) -> None:
     run = tmp_path / "run"
     run.mkdir()
+    io_directory = run / "io"
+    io_directory.mkdir()
     paths = {
         "kernel": tmp_path / "k",
         "initrd": tmp_path / "i",
         "root": tmp_path / "root.raw",
         "stage1": run / "stage1.raw",
         "layer": tmp_path / "layer.raw",
-        "console": tmp_path / "console.log",
+        "console": io_directory / "console.log",
     }
     for path in paths.values():
         path.write_bytes(b"x")
@@ -1795,16 +1934,30 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(t
         f'<console type="file"><source path="{paths["console"]}" append="on">'
         '<seclabel model="dac" relabel="no"/></source>'
         '<target type="serial" port="0"/></console>'
-        f'<channel><source mode="bind" path="{run / "lifecycle.sock"}"/>'
+        f'<channel><source mode="bind" path="{io_directory / "lifecycle.sock"}"/>'
         '<target type="virtio" name="org.palimpsest.oci.lifecycle.0"/></channel>'
         "</devices></domain>"
     )
 
+    if tamper == "trusted-run":
+        xml = xml.replace(str(io_directory), str(run))
+    elif tamper == "outside-console":
+        xml = xml.replace(str(paths["console"]), str(run / "console.log"))
+    elif tamper == "other-socket":
+        xml = xml.replace("lifecycle.sock", "foreign.sock")
+    if tamper is not None:
+        with pytest.raises(ValueError, match="runtime I/O"):
+            _qualification_acl_specifications(tmp_path, xml)
+        return
     specifications = _qualification_acl_specifications(tmp_path, xml)
     actual = {(path, kind): permission for path, kind, permission in specifications}
 
     assert actual[(tmp_path, "directory")] == "--x"
-    assert actual[(run, "directory")] == "-wx"
+    assert actual[(run, "directory")] == "--x"
+    assert actual[(io_directory, "directory")] == "-wx"
+    assert [path for (path, kind), permission in actual.items() if kind == "directory" and "w" in permission] == [
+        io_directory
+    ]
     assert actual[(paths["root"], "regular")] == "rw-"
     assert actual[(paths["console"], "regular")] == "rw-"
     for name in ("kernel", "initrd", "stage1", "layer"):
@@ -2913,7 +3066,7 @@ def test_completed_monitor_retirement_pins_pid_and_refuses_identity_drift(monkey
             assert events[-1] == "close"
 
 
-def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=False, stale_cleanup=False):
+def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, broker, stop_workload=False, stale_cleanup=False):
     launched = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
         input=json.dumps(
@@ -2945,6 +3098,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
         while time.monotonic() < deadline:
             snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
             if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
+                _assert_qualification_io_boundary(broker, roots.runs / binding.record.name)
                 # The clean launcher has already exited. Its child owns a real
                 # VM and must still answer IPC while its worker waits in create.
                 assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
@@ -2962,7 +3116,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
             if stop_workload and snapshot.phase == "ready" and not stop_requested:
                 # This non-secret marker is only a timing barrier: termination
                 # itself must still be proved by the authenticated transcript.
-                console = _qualification_console_tail(root / "console.log")
+                console = _qualification_console_tail(roots.runs / binding.record.name / "io" / "console.log")
                 if _console_marker_count(console, "palimpsest workload proof: signal handlers armed") == 1:
                     assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
                     for _ in range(3):
@@ -3345,6 +3499,11 @@ def _qualify_retained_root_reuse(
     second_monitor = roots.runs / second_name / "monitor-private"
     second_monitor.mkdir(mode=0o700)
     broker = _QualificationDACBroker(root, qemu_uid, _qualification_acl_specifications(root, resolved.xml))
+    monkeypatch.setattr(
+        oci_runtime_io_module,
+        "_validate_runtime_io_metadata",
+        _qualification_runtime_io_adapter(oci_runtime_io_module._validate_runtime_io_metadata, lambda: broker),
+    )
     activation = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
     binding = prepare_oci_root_monitor_binding(
         roots, second_name, store, boot, profile, conn=activation, boot_attempt_id=str(uuid.uuid4())
@@ -3361,13 +3520,15 @@ def _qualify_retained_root_reuse(
         lease.mark_prepared(*transport.identity)
         lease.mark_committed()
         original_connect = socket.socket.connect
-        lifecycle_path = roots.runs / second_name / "lifecycle.sock"
+        lifecycle_path = roots.runs / second_name / "io" / "lifecycle.sock"
+        console_path = roots.runs / second_name / "io" / "console.log"
 
         def reject_direct_lifecycle(instance, address):
             assert address not in (lifecycle_path, os.fspath(lifecycle_path)), "reuse boot bypassed libvirt openChannel"
             return original_connect(instance, address)
 
-        console_before = _qualification_console_tail(root / "console.log")
+        console_before = _qualification_console_tail(console_path)
+        assert console_before == ""
         with monkeypatch.context() as scoped:
             scoped.setattr(socket.socket, "connect", reject_direct_lifecycle)
             try:
@@ -3384,13 +3545,14 @@ def _qualify_retained_root_reuse(
                     monitor_lease=lease,
                 )
             except BaseException as exc:
-                _annotate_qualification_console_failure(exc, root / "console.log")
+                _annotate_qualification_console_failure(exc, console_path)
                 raise
         assert completed.terminal.returncode == 101 and completed.terminal.exit_code == 101
+        _assert_qualification_io_boundary(broker, roots.runs / second_name)
         assert completed.terminal.signal_number is None
         assert lease.snapshot.phase == "terminal"
         assert completed.lifecycle.boot_attempt_id == binding.boot_attempt_id
-        console_after = _qualification_console_tail(root / "console.log")
+        console_after = _qualification_console_tail(console_path)
         for marker in (ROOT_TRANSITION_MARKER, WORKLOAD_STARTED_MARKER, LIFECYCLE_READY_COMMITTED_MARKER):
             assert console_after.count(marker.decode("ascii")) == console_before.count(marker.decode("ascii")) + 1
         assert [entry["kind"] for entry in completed.lifecycle.to_dict()["transcript"]] == [
@@ -3507,17 +3669,6 @@ def test_live_oci_root(
         roots = init_resolved_roots(StatePaths(qualification_root / "c", qualification_root / "s"))
         store = OCIStore(roots, repair_min_age_seconds=0)
         materialization = _proof_materialization(store, stop_workload=stop_workload)
-        console_path = _create_qualification_console(qualification_root)
-        original_build_oci_root_domain_xml = oci_root_kvm_module.build_oci_root_domain_xml
-
-        def build_qualification_domain_xml(spec: kvm.OCIRootDomainSpec, profile_value: platforms.DomainProfile) -> str:
-            return original_build_oci_root_domain_xml(replace(spec, console_log=console_path), profile_value)
-
-        monkeypatch.setattr(
-            oci_root_kvm_module,
-            "build_oci_root_domain_xml",
-            build_qualification_domain_xml,
-        )
         lower_stage_root = qualification_root / "l"
         lower_stage_root.mkdir(mode=0o700)
         original_verified_lower_path = oci_root_kvm_module._verified_lower_path
@@ -3528,7 +3679,8 @@ def test_live_oci_root(
 
         monkeypatch.setattr(oci_root_kvm_module, "_verified_lower_path", stage_verified_lower)
         name = f"p-{uuid.uuid4().hex[:6]}"
-        lifecycle_path = roots.runs / name / "lifecycle.sock"
+        lifecycle_path = roots.runs / name / "io" / "lifecycle.sock"
+        console_path = roots.runs / name / "io" / "console.log"
         assert len(os.fsencode(lifecycle_path)) <= kvm.LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES - 10
         conn = connect_oci_root_libvirt(profile.uri)
         qemu_uid, qemu_gid = _parse_qemu_dac_baselabel(conn.getCapabilities())
@@ -3574,6 +3726,8 @@ def test_live_oci_root(
             network=None,
         )
         plan = commit_oci_root_domain_plan(roots, resolved, store)
+        assert resolved.spec.console_log == console_path
+        assert console_path.read_bytes() == b""
         plan_digest = plan.digest
         assert _lookup_domain(conn, name) is None
         collision = conn.defineXML(resolved.xml)
@@ -3617,6 +3771,11 @@ def test_live_oci_root(
             qualification_root,
             qemu_uid,
             _qualification_acl_specifications(qualification_root, resolved.xml),
+        )
+        monkeypatch.setattr(
+            oci_runtime_io_module,
+            "_validate_runtime_io_metadata",
+            _qualification_runtime_io_adapter(oci_runtime_io_module._validate_runtime_io_metadata, lambda: broker),
         )
         direct_connect_attempts: list[object] = []
         original_connect = socket.socket.connect
@@ -3684,6 +3843,7 @@ def test_live_oci_root(
                     monitor_binding,
                     boot,
                     conn,
+                    broker=broker,
                     stop_workload=stop_workload,
                     stale_cleanup=stale_cleanup,
                 )
@@ -3710,6 +3870,7 @@ def test_live_oci_root(
             _annotate_qualification_console_failure(exc, console_path)
             raise
         assert completed.domain_id > 0
+        _assert_qualification_io_boundary(broker, roots.runs / name)
         assert monitor_snapshot.phase == "terminal"
         assert monitor_snapshot.revision == 7
         assert monitor_snapshot.active_binding is not None

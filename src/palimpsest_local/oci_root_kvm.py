@@ -38,6 +38,13 @@ from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
 from .oci_root_volume import MAX_OCI_ROOT_VOLUME_GENERATION, load_oci_root_volume
+from .oci_runtime_io import (
+    OCI_RUNTIME_CONSOLE_FILENAME,
+    OCI_RUNTIME_DIRECTORY,
+    OCI_RUNTIME_LIFECYCLE_FILENAME,
+    runtime_io_guard,
+    runtime_io_paths,
+)
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import (
     OCI_STAGE1_TRANSPORT_FILENAME,
@@ -51,11 +58,12 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v14"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v8"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v15"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v9"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
-OCI_ROOT_LIFECYCLE_ENDPOINT = "run-private/lifecycle.sock"
-OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = "lifecycle.sock"
+OCI_ROOT_LIFECYCLE_ENDPOINT = f"run-private/{OCI_RUNTIME_DIRECTORY}/{OCI_RUNTIME_LIFECYCLE_FILENAME}"
+OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = OCI_RUNTIME_LIFECYCLE_FILENAME
+OCI_ROOT_CONSOLE_ENDPOINT = f"run-private/{OCI_RUNTIME_DIRECTORY}/{OCI_RUNTIME_CONSOLE_FILENAME}"
 _MAX_KERNEL_BYTES = 256 * 1024 * 1024
 _MAX_INITRAMFS_BYTES = 1024 * 1024 * 1024
 _SERIAL_RE = re.compile(r"^[0-9a-f]{20}$")
@@ -133,6 +141,7 @@ def _domain_core_dict(
 ) -> dict[str, Any]:
     return {
         "boot_artifacts": _plain_json(boot_artifacts),
+        "console": {"append": True, "endpoint": OCI_ROOT_CONSOLE_ENDPOINT, "transport": "file"},
         "layers": _plain_json(layers),
         "lower_graph_digest": lower_graph_digest,
         "lower_lease_set_id": lower_lease_set_id,
@@ -522,6 +531,7 @@ class OCIRootDomainPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "boot_artifacts": _plain_json(self.boot_artifacts),
+            "console": {"append": True, "endpoint": OCI_ROOT_CONSOLE_ENDPOINT, "transport": "file"},
             "domain_core_digest": self.domain_core_digest,
             "kernel_cmdline": self.kernel_cmdline,
             "layers": _plain_json(self.layers),
@@ -560,11 +570,13 @@ class OCIRootDomainPlan:
             "palimpsest.oci-root-domain-plan.v11",
             "palimpsest.oci-root-domain-plan.v12",
             "palimpsest.oci-root-domain-plan.v13",
+            "palimpsest.oci-root-domain-plan.v14",
         }:
             version = str(value["schema"]).rsplit(".", 1)[-1]
             raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")
         expected = {
             "boot_artifacts",
+            "console",
             "domain_core_digest",
             "kernel_cmdline",
             "layers",
@@ -604,6 +616,8 @@ class OCIRootDomainPlan:
                 "transport": "virtio-serial",
             }
             or not isinstance(value.get("layers"), list)
+            or value.get("console") != {"append": True, "endpoint": OCI_ROOT_CONSOLE_ENDPOINT, "transport": "file"}
+            or type(value["console"].get("append")) is not bool
         ):
             raise StateError("OCI-root domain plan dispatch is invalid")
         try:
@@ -873,7 +887,8 @@ def build_oci_root_domain_plan(
         network=network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
-        lifecycle_socket=run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME,
+        lifecycle_socket=runtime_io_paths(run_paths(roots, plan.run_name).root).lifecycle_socket,
+        console_log=runtime_io_paths(run_paths(roots, plan.run_name).root).console_log,
     )
     try:
         xml = build_oci_root_domain_xml(spec, profile)
@@ -1013,7 +1028,8 @@ def commit_oci_root_domain_plan(
         network=plan.network,
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
-        lifecycle_socket=run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME,
+        lifecycle_socket=runtime_io_paths(run_paths(roots, plan.run_name).root).lifecycle_socket,
+        console_log=runtime_io_paths(run_paths(roots, plan.run_name).root).console_log,
     )
     try:
         expected_xml = build_oci_root_domain_xml(expected_spec, resolved.profile)
@@ -1036,7 +1052,10 @@ def commit_oci_root_domain_plan(
         data.pop("status", None)
         data.pop("lifecycle_revision", None)
         data["oci_root_domain"] = {"digest": plan.digest, "plan": plan.to_dict()}
-        mutation.write_state("creating", data)
+        with runtime_io_guard(mutation, plan_digest=plan.digest, create=True, require_socket_absent=True) as runtime_io:
+            data["oci_runtime_io"] = runtime_io.receipt.to_dict()
+            runtime_io.verify(require_socket_absent=True)
+            mutation.write_state("creating", data)
     return plan
 
 
@@ -1201,7 +1220,7 @@ def resolve_committed_oci_root_domain_plan(
     )
     if verified_transport.plan != expected_stage1:
         raise StateError("OCI-root stage-1 transport changed before domain definition")
-    lifecycle_socket = run_paths(roots, plan.run_name).root / OCI_ROOT_LIFECYCLE_SOCKET_FILENAME
+    lifecycle_socket = runtime_io_paths(run_paths(roots, plan.run_name).root).lifecycle_socket
     try:
         lifecycle_socket.lstat()
     except FileNotFoundError:
@@ -1231,6 +1250,7 @@ def resolve_committed_oci_root_domain_plan(
         run_id=plan.run_id,
         boot_contract_digest=plan.digest,
         lifecycle_socket=lifecycle_socket,
+        console_log=runtime_io_paths(run_paths(roots, plan.run_name).root).console_log,
     )
     try:
         xml = build_oci_root_domain_xml(spec, profile)

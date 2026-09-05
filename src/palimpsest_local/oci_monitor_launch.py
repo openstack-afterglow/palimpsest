@@ -19,11 +19,12 @@ from .errors import PalimpsestError, StateError
 from .oci_monitor_control import MonitorStopControl
 from .oci_monitor_ipc import MonitorPreActivationBinding
 from .oci_root_kvm import VerifiedHostBootArtifacts, verify_host_boot_artifacts
+from .oci_runtime_io import runtime_io_guard, runtime_io_paths
 from .oci_store import OCIStore
 from .platforms import DomainProfile
-from .state import StatePaths
+from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v1"
+_SCHEMA = "palimpsest.monitor-launch-authority.v2"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -96,8 +97,11 @@ def _validate_entry_metadata(
     owner_uid: int,
 ) -> None:
     """Check immutable metadata independently of path traversal and FD rights."""
-    is_directory = key not in {"kernel", "initramfs"}
+    is_directory = key not in {"kernel", "initramfs", "runtime_console"}
     fields = ("device", "inode", "uid", "gid", "mode") if is_directory else tuple(_ENTRY_FIELDS - {"fd", "path"})
+    if key == "runtime_console":
+        # QEMU output is not trusted state: content, size and timestamps may change.
+        fields = ("device", "inode", "uid", "gid", "mode", "nlink")
     for info in (opened, visible):
         values = {
             "device": info.st_dev,
@@ -117,6 +121,14 @@ def _validate_entry_metadata(
                 raise _invalid()
             if key not in {"config", "state", "runs", "run", "runtime_packs"} and stat.S_IMODE(info.st_mode) != 0o700:
                 raise _invalid()
+        elif key == "runtime_console":
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != owner_uid
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_nlink != 1
+            ):
+                raise _invalid()
         elif (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid not in {0, owner_uid}
@@ -127,12 +139,15 @@ def _validate_entry_metadata(
 
 
 def _paths(roots: StatePaths, name: str) -> dict[str, Path]:
+    runtime_paths = runtime_io_paths(roots.runs / name)
     result = {
         "config": roots.config,
         "state": roots.state,
         "runs": roots.runs,
         "run": roots.runs / name,
         "monitor": roots.runs / name / "monitor-private",
+        "runtime_io": runtime_paths.root,
+        "runtime_console": runtime_paths.console_log,
         "store": roots.store,
         "runtime_packs": roots.runtime_packs,
         "derived": roots.oci_derived_store,
@@ -272,7 +287,7 @@ class MonitorLaunchAuthority:
             ):
                 raise _invalid()
             for key, entry in self._frame["entries"].items():
-                is_directory = key not in {"kernel", "initramfs"}
+                is_directory = key not in {"kernel", "initramfs", "runtime_console"}
                 opened = os.fstat(entry["fd"])
                 flags = fcntl.fcntl(entry["fd"], fcntl.F_GETFL)
                 if flags & os.O_ACCMODE != os.O_RDONLY or flags & getattr(os, "O_PATH", 0):
@@ -395,11 +410,14 @@ def prepare_monitor_launch_authority(
         paths = _paths(roots, binding.record.name)
         paths.update(kernel=boot_artifacts.kernel.path, initramfs=boot_artifacts.initramfs.path)
         entries = {}
-        for name, path in paths.items():
-            path = _path(str(path))
-            fd = _open(path, directory=name not in {"kernel", "initramfs"})
-            opened.append(fd)
-            entries[name] = _entry(path, fd)
+        with locked_existing_run(roots, binding.record.name) as mutation:
+            with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
+                for name, path in paths.items():
+                    path = _path(str(path))
+                    fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console"})
+                    opened.append(fd)
+                    entries[name] = _entry(path, fd)
+                runtime_io.verify(require_socket_absent=True)
         frame = {
             "schema": _SCHEMA,
             "binding": binding.to_dict(),

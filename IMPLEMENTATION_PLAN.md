@@ -1391,6 +1391,50 @@ and verifies the successor pins block artifact collection. The upper-only
 executable then runs from the same root. This is not old-run/socket removal,
 root deletion, production filesystem access provisioning, or public dispatch.
 
+### PR 4 slice 30O: isolate QEMU runtime I/O from trusted run state
+
+The lifecycle socket and OCI console now use the run's dedicated `io/`
+directory. A QEMU socket server needs directory write access; granting that on
+the trusted run root would also permit replacing its ledger and monitor entries.
+The qualified ACL broker therefore grants directory write/search only on `io`,
+traversal only on its trusted ancestors, and no access to `monitor-private`.
+This is a prerequisite for production access provisioning, not its activation.
+
+Domain-plan commit exclusively creates `io` at `0700` and its empty
+`console.log` at `0600`, fsyncs them, and records both inode identities with the
+run and plan binding in a separate trusted `oci_runtime_io` receipt. Existing
+or ambiguous paths are not adopted, chmod-repaired, or recursively removed.
+Failed publication preserves the uncommitted files and fails closed on retry.
+Subsequent definition and launch reopen only the recorded directory and console
+under the held run mutation lock; the lifecycle socket must be absent before
+activation. The private fresh-exec bootstrap also pins both I/O resources.
+Existing receipts are validated before opening their endpoints; fresh creation
+rechecks the captured directory inode before creating the console. The I/O
+guard is process-local and closes inherited descriptors after fork without
+closing file-descriptor numbers reused by the child.
+
+Console contents, length, and timestamps are untrusted mutable output, never
+lifecycle authority. File type, owner, permissions, link count and recorded
+inode identity remain checked. Production metadata checks continue to require
+owner-only modes. Qualification alone verifies the exact named-QEMU ACL grant
+before adapting its mode bits; no generic group-write exemption is introduced.
+The existing boot-file relabel adapter remains test-only.
+I/O drift blocks normal lifecycle publication; the pre-existing exact-domain
+launch-failure cleanup policy is unchanged. In particular, the private
+synchronous path may still clean its independently verified VM after an I/O
+failure, but does not unlink or adopt the changed I/O files.
+
+The host domain plan/core advance to v15/v9 and the private launch authority to
+v2, rejecting the prior contracts instead of silently reinterpreting their
+endpoints. Guest stage-1/lifecycle protocol and ordinary cloud/Lima console
+paths are unchanged. Live qualification uses the production console path,
+checks the restricted grants while the child-owned VM is active, and verifies
+the retained-root successor has its own initially empty console.
+
+Durable ACL grant/recovery, socket/run reclamation, public foreground/`run -d`,
+and Gate 2 remain subsequent work. Shared lower artifacts and existing VM
+definitions are outside this path-isolation change.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1409,7 +1453,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Add production filesystem access provisioning, then connect explicit
+1. Add durable production filesystem access provisioning over the isolated
+   runtime-I/O boundary, then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
    cleanup and completed lower-lease handoff boundaries. Preserve lower pins
    whenever replacement ownership has not been durably established.
