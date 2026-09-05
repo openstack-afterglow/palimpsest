@@ -1351,8 +1351,9 @@ handoff; this slice does not remove the old run or release its leases.
 
 Live qualification extends the stale-monitor case with retained-root detachment
 and a second real VM boot from the same writable disk under a new run identity.
-The fixture inserts a unique upper-only proof executable after the first VM is
-absent; the second run selects it through a private process override. This
+After the first VM is absent, the fixture replays any pending ext4 journal
+before its offline edit and inserts a unique upper-only proof executable;
+the second run selects it through a private process override. This
 proves upper-layer reuse at `/`, not public override support or persistence of
 guest-created application data.
 Definition, ACL, and temporary-fixture cleanup remain separately validated.

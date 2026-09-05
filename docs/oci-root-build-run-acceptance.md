@@ -322,7 +322,8 @@ retention receipt is historical and cannot authorize detaching a newer VM's
 attachment. Live qualification includes a second VM boot from the same
 writable root under a new run identity.
 Its executable exists only in the retained upper layer, inserted by the host
-fixture after the first domain is absent and selected by a private process
+fixture after the first domain is absent and its pending ext4 journal has been
+replayed before the offline edit. It is selected by a private process
 override. This is a root-reuse proof, not a public command-override feature or
 a test of guest-created application data persistence.
 

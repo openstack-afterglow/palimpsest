@@ -2241,7 +2241,7 @@ def _require_live_host(tmp_path: Path):
     config_value = os.environ.get(KERNEL_CONFIG_ENV)
     if not kernel_value or not config_value:
         pytest.fail(f"{KERNEL_ENV} and {KERNEL_CONFIG_ENV} must explicitly select qualified artifacts")
-    for executable in ("qemu-img", "mkfs.ext4", "debugfs", "getfacl", "setfacl"):
+    for executable in ("qemu-img", "mkfs.ext4", "debugfs", "e2fsck", "getfacl", "setfacl"):
         if shutil.which(executable) is None:
             pytest.fail(f"required live OCI-root tool is unavailable: {executable}")
     if not Path("/proc/self/fd").is_dir():
@@ -3050,7 +3050,7 @@ def _launch_in_exec_monitor(root, roots, binding, boot, conn, *, stop_workload=F
         os.close(directory_fd)
 
 
-def _inject_reuse_only_executable(root_path: Path) -> str:
+def _inject_reuse_only_executable(root_path: Path, *, prove_absent: Callable[[], bool]) -> str:
     # Fixture-only offline edit, after the first domain is proven absent. The
     # already-proven packaged ELF is placed at a unique upper-only pathname;
     # executing it in the next guest proves the retained upper is its real /.
@@ -3058,45 +3058,148 @@ def _inject_reuse_only_executable(root_path: Path) -> str:
     executable = Path(__file__).with_name("assets") / "workload-proof.x86_64"
     assert _sha256_file(executable) == "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c"
     assert not any(character.isspace() for character in str(executable))
-    basename = f"palimpsest-retained-proof-{uuid.uuid4().hex}"
-    upper_path = f"/.palimpsest/upper/{basename}"
-    for command in (f"write {executable} {upper_path}", f"set_inode_field {upper_path} mode 0100755"):
+    assert prove_absent(), "fixture root still has a domain"
+    descriptor = os.open(root_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        selected = os.fstat(descriptor)
+        identity_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink", "st_size")
+
+        def verify():
+            held, visible = os.fstat(descriptor), root_path.lstat()
+            assert stat.S_ISREG(held.st_mode) and stat.S_IMODE(held.st_mode) == 0o600
+            assert held.st_uid == os.geteuid() and held.st_nlink == 1 and held.st_size == _ROOT_SIZE_BYTES
+            assert tuple(getattr(held, field) for field in identity_fields) == tuple(
+                getattr(selected, field) for field in identity_fields
+            )
+            assert tuple(getattr(visible, field) for field in identity_fields) == tuple(
+                getattr(selected, field) for field in identity_fields
+            )
+            assert prove_absent(), "fixture domain reappeared during offline root editing"
+
+        verify()
+        fd_path = f"/proc/self/fd/{descriptor}"
+        # PID 1 syncfs proves data durability but leaves a mounted ext4
+        # journal. Replay only that journal before debugfs edits, otherwise a
+        # later mount may overwrite the fixture's offline directory updates.
+        # This is NOT part of production retain/detach, whose bytes stay fixed.
         result = subprocess.run(
-            ["debugfs", "-w", "-R", command, str(root_path)], capture_output=True, text=True, check=False, timeout=15
+            ["e2fsck", "-p", "-E", "journal_only", fd_path],
+            pass_fds=(descriptor,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
         )
-        assert result.returncode == 0, result.stderr[-2000:]
-        assert "File not found" not in result.stderr
-    result = subprocess.run(
-        ["debugfs", "-R", f"stat {upper_path}", str(root_path)], capture_output=True, text=True, check=False, timeout=15
-    )
-    assert result.returncode == 0 and "Type: regular" in result.stdout and re.search(r"Mode:\s+0755\b", result.stdout)
-    return basename
+        # e2fsck documents 0=no errors, 1=errors corrected. Reboot-required,
+        # uncorrected, operational and canceled results all fail closed.
+        assert result.returncode in {0, 1}, result.stderr[-2000:]
+        verify()
+        basename = f"palimpsest-retained-proof-{uuid.uuid4().hex}"
+        upper_path = f"/.palimpsest/upper/{basename}"
+        for command in (f"write {executable} {upper_path}", f"set_inode_field {upper_path} mode 0100755"):
+            verify()
+            result = subprocess.run(
+                ["debugfs", "-w", "-R", command, fd_path],
+                pass_fds=(descriptor,),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            assert result.returncode == 0, result.stderr[-2000:]
+            assert "File not found" not in result.stderr
+            verify()
+        result = subprocess.run(
+            ["debugfs", "-R", f"stat {upper_path}", fd_path],
+            pass_fds=(descriptor,),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert (
+            result.returncode == 0 and "Type: regular" in result.stdout and re.search(r"Mode:\s+0755\b", result.stdout)
+        )
+        os.fsync(descriptor)
+        verify()
+        return basename
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize("bad_mode", [False, True])
-def test_reuse_fixture_injects_pinned_elf_only_into_unique_upper_path(monkeypatch, bad_mode):
+@pytest.mark.parametrize("replay_code", [0, 1])
+def test_reuse_fixture_injects_pinned_elf_only_into_unique_upper_path(tmp_path, monkeypatch, bad_mode, replay_code):
     from types import SimpleNamespace
 
     commands = []
+    root_path = tmp_path / "root.raw"
+    with root_path.open("wb") as stream:
+        stream.truncate(_ROOT_SIZE_BYTES)
+    root_path.chmod(0o600)
 
     def run(argv, **kwargs):
         commands.append(argv)
         assert kwargs["check"] is False and kwargs["timeout"] == 15
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        (descriptor,) = kwargs["pass_fds"]
+        assert argv[-1] == f"/proc/self/fd/{descriptor}"
+        assert os.fstat(descriptor).st_size == _ROOT_SIZE_BYTES
         return SimpleNamespace(
-            returncode=0, stderr="", stdout="Type: regular  Mode:  0644" if bad_mode else "Type: regular  Mode:  0755"
+            returncode=replay_code if argv[0] == "e2fsck" else 0,
+            stderr="",
+            stdout="Type: regular  Mode:  0644" if bad_mode else "Type: regular  Mode:  0755",
         )
 
     monkeypatch.setattr(subprocess, "run", run)
     if bad_mode:
         with pytest.raises(AssertionError):
-            _inject_reuse_only_executable(Path("/fixture/root.raw"))
+            _inject_reuse_only_executable(root_path, prove_absent=lambda: True)
     else:
-        basename = _inject_reuse_only_executable(Path("/fixture/root.raw"))
+        basename = _inject_reuse_only_executable(root_path, prove_absent=lambda: True)
         assert basename.startswith("palimpsest-retained-proof-")
-        assert commands[0][0:3] == ["debugfs", "-w", "-R"]
-        assert commands[0][3].endswith(f" /.palimpsest/upper/{basename}")
-        assert commands[1][3] == f"set_inode_field /.palimpsest/upper/{basename} mode 0100755"
-        assert commands[2] == ["debugfs", "-R", f"stat /.palimpsest/upper/{basename}", "/fixture/root.raw"]
+        assert commands[0][:4] == ["e2fsck", "-p", "-E", "journal_only"]
+        fd_path = commands[0][-1]
+        assert fd_path.startswith("/proc/self/fd/")
+        assert commands[1][0:3] == ["debugfs", "-w", "-R"]
+        assert commands[1][3].endswith(f" /.palimpsest/upper/{basename}")
+        assert commands[2][3] == f"set_inode_field /.palimpsest/upper/{basename} mode 0100755"
+        assert commands[3] == ["debugfs", "-R", f"stat /.palimpsest/upper/{basename}", fd_path]
+
+
+@pytest.mark.parametrize("failure", [2, 4, 8, 16, 32, 128, "replacement", "domain-live"])
+def test_reuse_fixture_replay_failure_prevents_offline_injection(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+
+    root_path = tmp_path / "root.raw"
+    with root_path.open("wb") as stream:
+        stream.truncate(_ROOT_SIZE_BYTES)
+    root_path.chmod(0o600)
+    absent = True
+    calls = []
+
+    def run(argv, **_kwargs):
+        nonlocal absent
+        calls.append(argv)
+        assert argv[0] == "e2fsck", "failed journal replay must never reach debugfs insertion"
+        if failure == "replacement":
+            root_path.rename(tmp_path / "held-original.raw")
+            root_path.write_bytes(b"foreign replacement")
+            root_path.chmod(0o600)
+        elif failure == "domain-live":
+            absent = False
+        return SimpleNamespace(returncode=failure if type(failure) is int else 0, stderr="fixture failure")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(AssertionError):
+        _inject_reuse_only_executable(root_path, prove_absent=lambda: absent)
+    assert len(calls) == 1
+    if failure == "replacement":
+        assert root_path.read_bytes() == b"foreign replacement"
+        assert (tmp_path / "held-original.raw").stat().st_size == _ROOT_SIZE_BYTES
 
 
 def _qualify_retained_root_reuse(
@@ -3109,7 +3212,13 @@ def _qualify_retained_root_reuse(
     root_path = first.root_volume.path
     assert _lookup_domain(conn, first_binding.record.name) is None
     assert _lookup_domain_uuid(conn, first_binding.domain_uuid) is None
-    basename = _inject_reuse_only_executable(root_path)
+    basename = _inject_reuse_only_executable(
+        root_path,
+        prove_absent=lambda: (
+            _lookup_domain(conn, first_binding.record.name) is None
+            and _lookup_domain_uuid(conn, first_binding.domain_uuid) is None
+        ),
+    )
     source = load_oci_root_volume(roots, first.transaction.volume_id).record
     metadata, before_digest = root_path.stat(), _sha256_file(root_path)
     original_state = read_run_ledger_snapshot(roots, first_binding.record.name).state
@@ -3214,18 +3323,22 @@ def _qualify_retained_root_reuse(
         console_before = _qualification_console_tail(root / "console.log")
         with monkeypatch.context() as scoped:
             scoped.setattr(socket.socket, "connect", reject_direct_lifecycle)
-            completed = launch_defined_oci_root_domain(
-                roots,
-                second_name,
-                store,
-                boot,
-                profile,
-                conn=activation,
-                timeout_seconds=45,
-                terminal_timeout_seconds=45,
-                monitor_binding=binding,
-                monitor_lease=lease,
-            )
+            try:
+                completed = launch_defined_oci_root_domain(
+                    roots,
+                    second_name,
+                    store,
+                    boot,
+                    profile,
+                    conn=activation,
+                    timeout_seconds=45,
+                    terminal_timeout_seconds=45,
+                    monitor_binding=binding,
+                    monitor_lease=lease,
+                )
+            except BaseException as exc:
+                _annotate_qualification_console_failure(exc, root / "console.log")
+                raise
         assert completed.terminal.returncode == 101 and completed.terminal.exit_code == 101
         assert completed.terminal.signal_number is None
         assert lease.snapshot.phase == "terminal"
