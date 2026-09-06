@@ -553,23 +553,28 @@ def test_lima_process_profiles_refuse_before_any_probe(
     assert captured.value.operation is operation
 
 
-def test_oci_root_refusal_precedes_every_cloud_capability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_oci_root_unsupported_operation_precedes_every_cloud_capability_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
     monkeypatch.setattr(platforms.shutil, "which", lambda _name: pytest.fail("cloud tool probe reached"))
     monkeypatch.setattr(Path, "exists", lambda _path: pytest.fail("KVM device probe reached"))
 
     with pytest.raises(RuntimeCapabilityError) as captured:
-        platforms.capability_profile(key, RuntimeOperation.RUN)
+        platforms.capability_profile(key, RuntimeOperation.EXEC)
 
     assert captured.value.code == "runtime-operation-unavailable"
-    assert captured.value.operation is RuntimeOperation.RUN
+    assert captured.value.operation is RuntimeOperation.EXEC
     assert platforms.capability_profile(key, RuntimeOperation.PS).requirements == ()
 
 
-def test_oci_root_capability_matrix_refuses_every_operation_except_ps() -> None:
+def test_oci_root_capability_matrix_refuses_unimplemented_operations() -> None:
     key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
 
-    for operation in set(RuntimeOperation) - {RuntimeOperation.PS}:
+    for operation in set(RuntimeOperation) - {
+        RuntimeOperation.RUN,
+        RuntimeOperation.STOP,
+        RuntimeOperation.RM,
+        RuntimeOperation.PS,
+    }:
         with pytest.raises(RuntimeCapabilityError) as captured:
             platforms.capability_profile(key, operation)
         assert captured.value.operation is operation

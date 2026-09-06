@@ -2,7 +2,65 @@
 
 The user prioritized public foreground `run`, Docker-like `run -d`, and the
 local build-to-run Gate 2 over further isolated infrastructure slices. This
-document is the execution order, not a claim that those commands are enabled.
+document records the execution order and the deliberately limited public surface.
+
+## First public local OCI lifecycle (five-stage integration)
+
+The CLI now connects explicit host admission, typed local intake, completed-run
+removal, the native launch adapter and foreground/detached dispatch. Linux
+x86_64 KVM with `qemu:///system` is the only initial target. Public OCI operations
+are `run`, `run -d`, `ps`, `stop` and `rm`; additional guest `exec`, `start`,
+`logs`, TTY/stdin and network attachment remain unsupported. Gate 2 is unchanged
+and still pending real additional guest exec.
+
+Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
+`PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
+`PALIMPSEST_OCI_KERNEL_DIGEST` / `PALIMPSEST_OCI_KERNEL_CONFIG_DIGEST` SHA-256 pins.
+Use the qualified kernel/config pair, required built-in drivers, KVM/libvirt,
+ACL tools, qemu-img, mkfs.ext4 and a supported mksquashfs (4.6+). The Python
+environment must import libvirt without `PYTHONPATH`. Digest pins identify the
+operator-qualified pair; they do not prove how a kernel was compiled.
+
+Create a new short, dedicated runtime parent whose existing ancestors already
+permit search (simple ACLs only); never change the user's home permissions:
+
+```sh
+palimpsest oci init-runtime /tmp/my-oci-runtime
+export PALIMPSEST_STATE_HOME=/tmp/my-oci-runtime/state
+palimpsest run app.oci.tar --name app -d
+palimpsest stop app
+palimpsest rm app
+```
+
+Set the five host variables before `run`. Existing parent paths are not adopted
+or chmodded. Local layouts require `--runtime-kind oci-root`; `.oci.tar`/`.oci`
+files select OCI automatically. `--manifest sha256:…` selects an explicit root
+descriptor. Cloud-image layout directories keep their prior meaning. OCI
+network defaults to none; explicit `--network none` is equivalent. Other OCI
+network values and process overrides are not supported in this first surface.
+
+Foreground returns the actual workload exit and combined VM-console output
+(boot plus workload, not separated guest stdout/stderr). INT/TERM requests
+authenticated STOP. Startup signals are queued outside lock/receipt mutations;
+before activation they preserve an inactive exact run, and after READY they
+request a bounded completed STOP. SIGKILL/crash is not an automatic cleanup
+promise. `-d` returns the name only after READY; an already exited workload is
+not reported as a live detached service. Closing a reader alone only detaches.
+
+Normal `rm` verifies terminal completion, inactive exact domain and stale
+monitor ownership before revoking access and releasing leases/root resources.
+The default root is VM-exclusive and deleted with normal removal. The existing
+retained-root API remains; public retention/reboot UX is deferred. Failed
+pre-activation grants or ambiguous/stale terminal socket state are preserved
+and may require recovery beyond normal `rm`; never manufacture terminal proof
+or delete a guessed VM to make a failure appear clean.
+
+`tests/kvm/test_oci_public_cli_live.py` is a separate opt-in public-command proof
+(`PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1`). It compiles a tiny syscall-only test image,
+materializes actual OCI layers, checks guest OverlayFS `/` and an image-only
+marker, finite exit, detached survival, STOP, foreground SIGINT and normal rm.
+It does not replace the Palimpsest-build/additional-exec Gate 2. Run this exact
+file during public adapter edits, not the entire native/portable suite.
 
 ## Connected prerequisites
 
@@ -35,11 +93,10 @@ The noninteractive process session follows bounded, receipt-pinned VM-console
 bytes and drains them before returning that result. This console combines boot
 diagnostics and workload output; it does not provide separate guest stdout and
 stderr, stdin, TTY or remote exec. INT/TERM enqueue lifecycle STOP outside run
-locks; closing a reader only detaches it. Public adapter wiring remains pending.
+locks; closing a reader only detaches it. The public adapter now uses this path.
 
-The remaining public lifecycle integration includes qualified host/runtime-root
-setup, public request/adapter wiring and stop/remove orchestration.
-Recovery must cover pre-spawn grant
+The first public lifecycle connects host/runtime-root setup, request/adapter
+wiring and normal stop/remove orchestration. Further recovery must cover pre-spawn grant
 failure and stale terminal sockets without fabricating terminal evidence.
 
 ## Milestone 1: a complete public lifecycle

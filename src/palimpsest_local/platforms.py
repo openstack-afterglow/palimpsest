@@ -147,9 +147,14 @@ def capability_profile(
     kind = dispatch_key.runtime_kind
     backend = dispatch_key.backend
     if kind is RuntimeKind.OCI_ROOT:
-        if operation is not RuntimeOperation.PS:
+        if operation is RuntimeOperation.RUN:
+            identifiers = ("host.kvm-device", "tool.qemu-img", "tool.qemu-system", "python.libvirt")
+        elif operation is RuntimeOperation.RM:
+            identifiers = ("python.libvirt",)
+        elif operation in {RuntimeOperation.STOP, RuntimeOperation.PS}:
+            identifiers = ()
+        else:
             raise RuntimeCapabilityError(operation, dispatch_key)
-        identifiers: tuple[str, ...] = ()
     elif backend is RuntimeBackend.KVM:
         if operation is RuntimeOperation.RUN:
             identifiers = _KVM_CREATE_REQUIREMENTS

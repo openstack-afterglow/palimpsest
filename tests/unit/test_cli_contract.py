@@ -132,6 +132,7 @@ def test_cli_uses_only_stdlib_and_package_imports():
         "pathlib",
         "re",
         "select",
+        "shlex",
         "shutil",
         "signal",
         "subprocess",
@@ -1453,7 +1454,10 @@ def test_cli_inspect_json_does_not_serialize_internal_ledger_fields(
     assert "ssh_config_file" not in rendered
 
 
-@pytest.mark.parametrize(("operation", "target_name", "argv", "_expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
+@pytest.mark.parametrize(
+    ("operation", "target_name", "argv", "_expected_kwargs"),
+    [item for item in _CLI_EXISTING_RUN_OPERATIONS if item[0] not in {"stop", "rm"}],
+)
 def test_cli_oci_root_existing_operations_fail_typed_before_backend_subprocess_or_file_side_effects(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

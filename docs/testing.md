@@ -110,6 +110,16 @@ partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification
 
+The first public OCI lifecycle has a separately addressable native smoke:
+`tests/kvm/test_oci_public_cli_live.py`. Set `PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1`
+and the five explicit host BOOT/packer variables documented in
+[the runtime roadmap](oci-public-runtime-roadmap.md). Use a normal Python
+environment with libvirt importable without `PYTHONPATH`. The old native-live
+flag alone does not enable this new proof. Its successful run checks foreground,
+detached, Ctrl-C and completed cleanup, not additional guest exec or Gate 2.
+New host/request/adapter/CLI unit files are in host-runtime; normal removal is
+in oci-monitor. Each file can also be run directly for a smaller edit loop.
+
 - Per edit: relevant lane(s), regression tests for the change, lint and format.
 - Before push: inspect the changed-file plan and run the affected portable
   lanes; include the required native/build proof for changed runtime surfaces.

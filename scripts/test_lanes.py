@@ -37,7 +37,8 @@ PORTABLE_FILES = {
     """),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
-        platforms process_session project project_adapter project_runtime project_volumes
+        platforms process_session project project_adapter project_runtime project_volumes oci_host
+        oci_run_request oci_run_adapter oci_public_cli
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
     "oci-store": _units("""
@@ -54,7 +55,7 @@ PORTABLE_FILES = {
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
         oci_monitor_ipc oci_monitor_ipc_journal oci_monitor_launch oci_monitor_coordinator
         oci_monitor_client oci_process_session
-        oci_monitor_recovery oci_monitor_retention oci_supervisor
+        oci_monitor_recovery oci_monitor_retention oci_supervisor oci_run_cleanup
     """),
     "oci-access": _units("""
         oci_acl oci_boot_access oci_boot_access_launch oci_boot_exports
@@ -67,7 +68,7 @@ PORTABLE_FILES = {
     "qualification": _units("oci_monitor_qualification_adapter"),
 }
 SPECIAL_FILES = {
-    "native-live": (),
+    "native-live": ("tests/kvm/test_oci_public_cli_live.py",),
     "guest-kvm": ("tests/kvm/test_oci_guest_stage1_live.py",),
     "guest-binary": ("tests/integration/test_oci_guest_stage1_binary.py",),
     "filesystem": (),
@@ -76,7 +77,7 @@ SPECIAL_FILES = {
     "hub": tuple(f"hub/tests/test_{name}.py" for name in ("auth", "hub_api", "image_exports", "migrate")),
 }
 SPECIAL_NOTES = {
-    "native-live": "Explicit native libvirt qualification; requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1 and host fixtures.",
+    "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1 and explicit host BOOT config. Without that flag the public proof is skipped, not qualified.",
     "guest-kvm": "Explicit KVM guest proof; requires PALIMPSEST_REQUIRE_STAGE1_KVM=1 and proof fixtures.",
     "guest-binary": "Runs guest ELF under Docker when its existing prerequisites permit it.",
     "filesystem": "Privileged Linux filesystem proof; PALIMPSEST_REQUIRE_OCI_FS=1 makes prerequisites mandatory.",
@@ -196,6 +197,11 @@ LANES = (*PORTABLE, *SPECIAL_FILES)
 # an import graph or a guarantee. Shared infrastructure/unknown changes fall
 # back to every portable lane. Suggested external proofs still need opt-in.
 DEPENDENCIES = (
+    (
+        "oci_host oci_run_request oci_run_adapter oci_run_cleanup",
+        ("host-runtime", "core-cli", "oci-store", "oci-guest", "oci-monitor", "oci-access", "qualification"),
+        ("native-live", "gate2"),
+    ),
     ("build buildkit hub registry refs", ("build-registry", "core-cli", "host-runtime", "oci-store"), ("gate1", "hub")),
     (
         "cloud_runtime cloudinit guest lima project project_adapter project_runtime project_volumes platforms kvm",

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal as signal_module
 import subprocess
@@ -34,6 +35,7 @@ from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
 from .oci_materializer import materialize_image_hard
 from .oci_packer import discover_squashfs_toolchain
+from .oci_run_request import resolve_local_oci_run_request
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
 from .oci_store import OCIStore
 from .project import (
@@ -625,6 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     oci = commands.add_parser("oci")
     oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
+    oci_init_runtime = oci_commands.add_parser("init-runtime")
+    oci_init_runtime.add_argument("path", type=Path)
     oci_materialize = oci_commands.add_parser("materialize")
     oci_materialize.add_argument("source", type=Path)
     oci_materialize.add_argument("--manifest", help="pin a root descriptor; required when the local index is ambiguous")
@@ -755,8 +759,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--layer", action="append", default=[])
     run.add_argument("--memory", type=int, default=4096)
     run.add_argument("--vcpus", type=int, default=2)
-    run.add_argument("--network", default="default")
+    run.add_argument("--network", default=None)
     run.add_argument("--backend", choices=("auto", "kvm", "lima-vz", "libvirt-hvf"), default="auto")
+    run.add_argument("--runtime-kind", choices=("cloud-image", "oci-root"))
+    run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
+    run.add_argument("--manifest", help="pin the root descriptor of a local OCI image")
 
     compose = commands.add_parser("compose")
     compose.add_argument("-f", "--file", dest="project_file", type=Path)
@@ -847,7 +854,7 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if args.operation == "ui":
         if args.port != 0 and not 1024 <= args.port <= 65535:
             parser.error("--port must be 0 or between 1024 and 65535")
-    if args.operation == "oci" and not 0 < args.timeout < float("inf"):
+    if args.operation == "oci" and args.oci_operation == "materialize" and not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be a positive finite number")
     if args.operation == "exec":
         if args.command[:1] == ["--"]:
@@ -1390,6 +1397,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
     if op == "completion":
         print(completion.generate_completion_script(args.shell))
+        return 0
+    if op == "oci" and args.oci_operation == "init-runtime":
+        from .oci_host import create_runtime_parent
+
+        try:
+            selected = args.path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise PalimpsestError("OCI runtime parent path is invalid") from None
+        runtime_parent = create_runtime_parent(selected)
+        print("PALIMPSEST_STATE_HOME=" + shlex.quote(str(runtime_parent / "state")))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
     roots = resolve_roots() if op in read_only_root_operations else init_roots()
@@ -2021,6 +2038,40 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return _dispatch_compose(args, roots, store)
 
     elif op == "run":
+        source = Path(args.image_or_bundle).expanduser()
+        explicit_kind = getattr(args, "runtime_kind", None)
+        local_oci = explicit_kind == "oci-root" or (
+            explicit_kind is None
+            and source.is_file()
+            and (source.name.endswith(".oci.tar") or source.name.endswith(".oci"))
+        )
+        if local_oci:
+            if args.layer:
+                raise PalimpsestError("OCI-root run does not accept cloud --layer attachments")
+            if args.backend not in {"auto", "kvm"}:
+                raise PalimpsestError("OCI-root run supports only the KVM backend")
+            if args.network not in {None, "none"}:
+                raise PalimpsestError("OCI-root run networking is not available yet; use --network none")
+            request = resolve_local_oci_run_request(
+                source,
+                name=args.name,
+                manifest_digest=require_digest(args.manifest) if args.manifest is not None else None,
+                detached=args.detach,
+                memory_mib=args.memory,
+                vcpus=args.vcpus,
+            )
+            result = runtime_dispatch.run_local_oci(request, roots=roots)
+            if args.detach:
+                if result.terminal is not None:
+                    raise PalimpsestError("OCI-root workload exited before detached launch completed")
+                print(result.record.name)
+                return 0
+            if result.session is None:
+                raise PalimpsestError("OCI-root foreground launch is missing its process session")
+            return _run_process_session(result.session, interactive=False)
+        if getattr(args, "detach", False) or getattr(args, "manifest", None) is not None:
+            raise PalimpsestError("--detach and --manifest are supported only for local OCI-root runs")
+        network = args.network if args.network is not None else "default"
         stack = _resolve_runtime_stack(
             store,
             args.image_or_bundle,
@@ -2028,14 +2079,14 @@ def dispatch_args(args: argparse.Namespace) -> int:
             args.url,
             requested_backend=args.backend,
             preflight_for_run=True,
-            run_network=args.network,
+            run_network=network,
         )
         run_spec = RunSpec(
             name=args.name,
             stack=stack,
             memory_mib=args.memory,
             vcpus=args.vcpus,
-            network=args.network,
+            network=network,
         )
         request = runtime_dispatch.resolve_run_request(run_spec, requested_backend=args.backend)
         preflight = runtime_dispatch.preflight_run_request(request)

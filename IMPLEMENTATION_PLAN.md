@@ -1881,3 +1881,24 @@ handoff is incomplete. Authenticated control still requires the live monitor's
 in-memory boot key; a dead journal alone cannot recover running control.
 Public operation gates remain closed until their own vertical proof passes;
 test partitioning by itself does not enable them.
+
+### PR 4 five-stage public lifecycle integration
+
+1. Explicit host kernel/config pins, clean libvirt Python and conservative
+   ancestor admission; create-only `oci init-runtime` never chmods a home.
+2. Typed local OCI request and real snapshot/materialization, preserving the
+   image process contract and existing cloud-image RunSpec boundary.
+3. Normal completed-run removal: terminal/domain/monitor evidence before
+   access revocation, shared traversal departure, root/lease release and delete.
+4. Product launch adapter joins BOOT/lower exports, exact native projection,
+   grants, fresh coordinator, authenticated READY and foreground session.
+   Queued startup cancellation does not interrupt lock/receipt mutations.
+5. Public local OCI `run`, `-d`, `ps`, `stop`, `rm` dispatch and a separately
+   opt-in public CLI native proof, including actual OverlayFS `/`, finite exit,
+   detached STOP, foreground SIGINT and normal cleanup.
+
+Only Linux amd64 KVM/system libvirt, no network, no process overrides and
+combined VM-console output are currently in this public scope. Additional
+guest exec and the unchanged Gate 2 remain the next milestone. Pre-activation
+grant-failure/stale-socket recovery, public retained-root UX and multi-VM data
+volumes remain explicitly pending; failures preserve owned resources.

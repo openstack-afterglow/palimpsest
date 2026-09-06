@@ -17,6 +17,7 @@ from typing import Any
 
 from . import cloud_runtime, lima, log_stream, platforms, state
 from .errors import StateError
+from .oci_run_request import LocalOCIRunRequest
 from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
     ALLOWED_RUNTIME_STATUSES,
@@ -628,10 +629,35 @@ def require_existing_preflight(
 
 def _adapter_for(record: ExistingRunRecord, operation: RuntimeOperation) -> Any:
     if record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
+        if operation in {RuntimeOperation.STOP, RuntimeOperation.RM}:
+            return _oci_adapter()
         raise RuntimeCapabilityError(operation, record.dispatch_key)
     if record.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
         return lima
     return cloud_runtime
+
+
+def _oci_adapter() -> Any:
+    # The private launcher owns host/BOOT preflight and never accepts cloud RunSpec.
+    from . import oci_run_adapter
+
+    return oci_run_adapter
+
+
+def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
+    """Enter the distinct typed local-image launcher, with its own host preflight."""
+    if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
+        raise TypeError("local OCI create requires a typed request and state paths")
+    platforms.capability_profile(request.dispatch_key, RuntimeOperation.RUN, network=None)
+    result = _oci_adapter().run_local_oci(roots, request)
+    if (
+        not isinstance(result.record, ExistingRunRecord)
+        or result.record.name != request.name
+        or result.record.dispatch_key != request.dispatch_key
+    ):
+        raise StateError("OCI adapter returned an invalid run identity")
+    _revalidate_bound_record(result.record, roots)
+    return result
 
 
 def _revalidate_bound_record(record: ExistingRunRecord, roots: StatePaths) -> None:
@@ -783,6 +809,15 @@ def _dispatch_lifecycle(
     before = state.read_run_ledger_snapshot(resolved_roots, name)
     record = before.record
     _require_expected_identity(record, expected_identity)
+    if record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
+        if operation is RuntimeOperation.RM and volumes:
+            raise StateError("OCI-root rm --volumes is unavailable; root retention follows the owned run policy")
+        adapter = _preflight_existing_adapter(record, operation, resolved_roots)
+        if operation is RuntimeOperation.STOP:
+            return adapter.stop_oci_run(resolved_roots, name, expected_record=record)
+        if operation is RuntimeOperation.RM:
+            return adapter.rm_oci_run(resolved_roots, name, expected_record=record)
+        raise RuntimeCapabilityError(operation, record.dispatch_key)
     previous_status = before.state.get("status")
     previous_revision = state.lifecycle_revision(before)
     _validate_lifecycle_source(operation, previous_status)
