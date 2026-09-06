@@ -454,9 +454,22 @@ def release_prepared_oci_root_run(
     """Durably release a prepared run, retaining its root only by policy."""
     if not isinstance(prepared, PreparedOCIRootRun):
         raise StateError("prepared OCI-root release input is invalid")
-    snapshot = read_run_ledger_snapshot(roots, prepared.transaction.owner.run_name)
+    release_oci_root_transaction(roots, prepared.transaction, store, runner=runner)
+
+
+def release_oci_root_transaction(
+    roots: StatePaths,
+    transaction: OCIRootPreparationTransaction,
+    store: OCIStore,
+    *,
+    runner: CommandRunner = _default_runner,
+) -> None:
+    """Release an exact durable ready transaction without reconstructing its source."""
+    if not isinstance(transaction, OCIRootPreparationTransaction) or transaction.phase != "resources-ready":
+        raise StateError("prepared OCI-root release transaction is invalid")
+    snapshot = read_run_ledger_snapshot(roots, transaction.owner.run_name)
     current = _transaction_from_snapshot(snapshot)
-    if current != prepared.transaction:
+    if current != transaction:
         raise StateError("prepared OCI-root release ledger changed")
     releasing = replace(current, phase="release-required")
     with locked_existing_run(
@@ -468,7 +481,8 @@ def release_prepared_oci_root_run(
         created_at = data.get("created_at")
         if not isinstance(created_at, str):
             raise StateError("OCI-root preparation creation time is invalid")
-        mutation.write_state("removing", _ledger_data(releasing, created_at=created_at))
+        data.update(_ledger_data(releasing, created_at=created_at))
+        mutation.write_state("removing", data)
     _finish_release(roots, releasing, store, runner=runner)
     after_release = read_run_ledger_snapshot(roots, current.owner.run_name)
     _commit_released_ledger(roots, after_release, releasing)
@@ -528,7 +542,8 @@ def _commit_released_ledger(
         created_at = data.get("created_at")
         if not isinstance(created_at, str):
             raise StateError("OCI-root preparation creation time is invalid")
-        mutation.write_state("removed", _ledger_data(released, created_at=created_at))
+        data.update(_ledger_data(released, created_at=created_at))
+        mutation.write_state("removed", data)
     return released
 
 
@@ -645,4 +660,5 @@ __all__ = [
     "prepare_oci_root_run",
     "reconcile_oci_root_preparation",
     "release_prepared_oci_root_run",
+    "release_oci_root_transaction",
 ]
