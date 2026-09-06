@@ -1944,3 +1944,10 @@ supervisor authority from image rootfs and UID 0, documents the actual layered
 controls and existing proof limits, and presents nonweakening follow-up options.
 Changing the root-proof criterion or providing a full-root VM mode remains a
 separate decision; this explanation request does not authorize those changes.
+
+The Docker-coexistent follow-up is implemented and independently reviewed at
+`61cc1bf99ed5653155f530727bcaad50cbd151ab`, with 69 focused tests passing both
+locally and on the exact-SHA server checkout. The explicit Gate 2 now reaches
+the original guest probe and fails at protected `/proc/1/root`, not the Docker
+host prerequisite. All six failure-cleanup/source-preservation checks passed.
+See the acceptance document for preserved evidence; Gate 2 is not complete.

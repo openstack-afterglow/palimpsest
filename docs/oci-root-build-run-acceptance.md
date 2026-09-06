@@ -86,6 +86,30 @@ The default suite still skips this opt-in test. Public run and exec have their
 own successful native proofs; that does not imply Gate 2 passed. Its remaining
 root-probe criterion is separately tracked, and PID 1 protection is not relaxed.
 
+### Docker-coexistent host verification (2026-09-07)
+
+Implementation commit `61cc1bf99ed5653155f530727bcaad50cbd151ab` was pushed,
+then fetched and checked out on `pieroot-server`. Focused acceptance-harness
+and lane tests passed locally (69 passed, one opt-in live skip) and on the
+server (69 passed). Ruff, formatting and independent review also passed.
+These counts are not a full-suite or Gate 2 pass.
+
+The explicit Gate 2 run reused the unchanged Palimpsest-built OCI archive and
+the original baked probe. It reached a running detached VM and public `exec`,
+then failed with `Permission denied` reading
+`/proc/1/root/palimpsest-e2e-root-marker` (one failure, 16.80 seconds).
+All six post-failure checks passed: stop, rm, successful domain enumeration
+showing absence, effective run-root absence, unchanged source archive, and
+no invocation of the guarded Docker CLI. Docker socket presence was allowed;
+neither the guest protection nor the probe criterion was changed.
+
+Detailed server evidence is preserved at
+`/tmp/palimpsest-33-gate2-61cc1bf.log` and
+`/tmp/pytest-of-pieroot/pytest-157/test_local_build_runs_detached0/command-evidence`.
+The selected state root was `/tmp/p-g33a/state`; the immutable source SHA-256
+was `3987bfb8f337ba5333b041b719abf3f377f5cfd623b0894a05a5dfc858d6d4ec`.
+Gate 2 remains unresolved pending the separate root-proof/protection decision.
+
 ## Lifecycle channel contract checkpoint
 
 OCI-root domain plans now reserve exactly one fixed virtio-serial lifecycle
