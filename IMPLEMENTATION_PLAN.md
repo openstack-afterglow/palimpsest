@@ -1926,3 +1926,21 @@ probe. The current pieroot-server has Docker sockets, and dereferencing
 hide sockets, stop unrelated services or relax PID 1 protections for a green
 test. See [the exec contract and evidence](docs/oci-additional-exec.md).
 Actual public CLI and Gate 2 results are recorded separately from engine proof.
+
+### Follow-up: Docker-coexistent Gate 2 and PID 1 protection report
+
+The user now permits Docker on the KVM host, even if a future workflow requires
+it. This supersedes the earlier daemonless-host prerequisite, not the original
+PID 1 root probe or guest security policy. Do not introduce an unnecessary
+Docker dependency into the current native KVM run/exec implementation.
+
+Batch the host-acceptance update, failure/cleanup evidence improvements, and a
+read-only PID 1 protection audit. Gate 2 should retain its Docker CLI fallback
+audit, allow socket presence, use actual selected state roots and verify cleanup
+even after probe failure. No Docker services are stopped and no sockets hidden.
+
+The [Korean PID 1 report](docs/oci-pid1-protection.ko.md) distinguishes guest
+supervisor authority from image rootfs and UID 0, documents the actual layered
+controls and existing proof limits, and presents nonweakening follow-up options.
+Changing the root-proof criterion or providing a full-root VM mode remains a
+separate decision; this explanation request does not authorize those changes.

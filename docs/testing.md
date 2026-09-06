@@ -105,7 +105,7 @@ This exercises fresh coordinator, live console, separate-client STOP, cleanup
 and retained-root reuse in one case; it is not the public build-to-run Gate 2.
 
 Gate 1 verifies the Palimpsest local OCI build. Gate 2 retains the full public
-`run -d → exec → stop → rm` contract on a Docker-daemonless KVM host. Test
+`run -d → exec → stop → rm` contract on a qualified KVM host; Docker may coexist. Test
 partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification

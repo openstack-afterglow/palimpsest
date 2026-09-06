@@ -65,7 +65,7 @@ PORTABLE_FILES = {
         oci_shared_root_claim oci_shared_root_traversal oci_shared_traversal
         oci_shared_traversal_init oci_stage1_access oci_stage1_access_launch oci_stage1_access_shared
     """),
-    "qualification": _units("oci_monitor_qualification_adapter"),
+    "qualification": _units("oci_monitor_qualification_adapter oci_build_run_acceptance"),
 }
 SPECIAL_FILES = {
     "native-live": (

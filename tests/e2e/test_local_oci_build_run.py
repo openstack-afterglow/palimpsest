@@ -9,9 +9,12 @@ import shutil
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from palimpsest_local import state
 
 pytestmark = [
     pytest.mark.oci_root_e2e,
@@ -22,6 +25,46 @@ pytestmark = [
 ]
 
 _SUCCESS = "PALIMPSEST_OCI_ROOT_OK"
+_EVIDENCE_LIMIT = 65536
+
+
+def _bounded(value: str | bytes | None) -> str:
+    encoded = value if isinstance(value, bytes) else (value or "").encode("utf-8", errors="replace")
+    normalized = encoded[:_EVIDENCE_LIMIT].decode("utf-8", errors="replace").encode("utf-8")
+    return normalized[:_EVIDENCE_LIMIT].decode("utf-8", errors="ignore")
+
+
+def _record_command(
+    directory: Path,
+    label: str,
+    arguments: list[str],
+    call: Callable[[], subprocess.CompletedProcess[str]],
+) -> subprocess.CompletedProcess[str]:
+    evidence: dict[str, object] = {"arguments": arguments, "stream_limit_bytes": _EVIDENCE_LIMIT}
+    primary: BaseException | None = None
+    try:
+        result = call()
+        evidence.update(
+            returncode=result.returncode,
+            stdout=_bounded(result.stdout),
+            stderr=_bounded(result.stderr),
+        )
+        return result
+    except BaseException as exc:
+        primary = exc
+        evidence.update(error=_bounded(str(exc)), error_type=type(exc).__name__)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            evidence.update(stdout=_bounded(exc.stdout), stderr=_bounded(exc.stderr))
+        raise
+    finally:
+        try:
+            (directory / (label + ".json")).write_text(json.dumps(evidence, ensure_ascii=True), encoding="utf-8")
+        except Exception as exc:
+            if primary is None:
+                raise
+            primary.add_note(
+                f"Command evidence persistence failed ({label}): {type(exc).__name__}: {_bounded(str(exc))}"
+            )
 
 
 def _run(
@@ -38,7 +81,7 @@ def _run(
 
 
 def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> None:
-    """Consume a Palimpsest-built artifact on a Docker-daemonless KVM host."""
+    """Consume a Palimpsest-built artifact on KVM, including Docker-present hosts."""
     artifact_value = os.environ.get("PALIMPSEST_OCI_ROOT_E2E_ARTIFACT_DIR")
     if not artifact_value:
         pytest.fail("PALIMPSEST_OCI_ROOT_E2E_ARTIFACT_DIR must name the transferred build-gate artifact")
@@ -78,9 +121,6 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
         local_docker_sockets.append(Path(xdg_runtime) / "docker.sock")
-    assert not any(path.exists() for path in local_docker_sockets), (
-        "OCI-root runtime acceptance requires a Docker-daemonless KVM host; build through a remote network-none builder"
-    )
     runtime_environment = {
         **environment,
         "DOCKER_HOST": "unix:///palimpsest-e2e-forbidden-docker.sock",
@@ -89,47 +129,104 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
     virsh = shutil.which("virsh", path=runtime_environment["PATH"])
     assert virsh is not None, "OCI-root KVM acceptance requires virsh"
     libvirt_uri = os.environ.get("PALIMPSEST_OCI_ROOT_E2E_LIBVIRT_URI", "qemu:///system")
+    roots = state.resolve_roots(runtime_environment)
+    evidence = tmp_path / "command-evidence"
+    evidence.mkdir()
+    (evidence / "runtime.json").write_text(
+        json.dumps(
+            {
+                "run_name": run_name,
+                "state_root": os.fspath(roots.state),
+                "docker_host": runtime_environment["DOCKER_HOST"],
+                "observed_docker_sockets": [os.fspath(path) for path in local_docker_sockets if path.exists()],
+                "docker_guard_scope": "PATH docker CLI and configured DOCKER_HOST; not all socket connections",
+            }
+        ),
+        encoding="utf-8",
+    )
 
+    def command(label: str, arguments: list[str], timeout: float = 60):
+        return _record_command(
+            evidence, label, arguments, lambda: _run(arguments, environment=runtime_environment, timeout=timeout)
+        )
+
+    def domain_command(label: str, arguments: list[str]):
+        argv = [virsh, "-c", libvirt_uri, *arguments]
+        return _record_command(
+            evidence,
+            label,
+            argv,
+            lambda: subprocess.run(
+                argv, check=False, capture_output=True, text=True, timeout=30, env=runtime_environment
+            ),
+        )
+
+    primary: BaseException | None = None
     try:
-        launched = _run(
+        launched = command(
+            "run",
             ["run", os.fspath(archive), "--name", run_name, "--backend", "kvm", "-d"],
-            environment=runtime_environment,
             timeout=180,
         )
         assert launched.returncode == 0, launched.stderr
-        domain = subprocess.run(
-            [virsh, "-c", libvirt_uri, "dominfo", run_name],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=runtime_environment,
-        )
+        domain = domain_command("domain-running", ["dominfo", run_name])
         assert domain.returncode == 0, domain.stderr
         assert "running" in domain.stdout.lower()
-        executed = _run(
+        executed = command(
+            "exec",
             ["exec", run_name, "--", "/usr/local/bin/palimpsest-e2e-probe"],
-            environment=runtime_environment,
             timeout=60,
         )
         assert executed.returncode == 0, executed.stderr
         assert executed.stdout.strip() == f"{_SUCCESS}:{marker}"
-        assert not docker_audit.exists(), "OCI-root run/exec must not delegate execution to Docker"
-    finally:
-        stopped = _run(["stop", run_name], environment=runtime_environment, timeout=60)
-        removed = _run(["rm", run_name], environment=runtime_environment, timeout=60)
+    except BaseException as exc:
+        primary = exc
 
-    assert stopped.returncode == 0, stopped.stderr
-    assert removed.returncode == 0, removed.stderr
-    removed_domain = subprocess.run(
-        [virsh, "-c", libvirt_uri, "dominfo", run_name],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=runtime_environment,
-    )
-    assert removed_domain.returncode != 0, "removing the run must undefine its libvirt domain"
+    checks: dict[str, str] = {}
 
-    assert archive.is_file(), "removing a VM must not remove its immutable local source image"
-    assert not (tmp_path / "xdg-state" / "palimpsest" / "runs" / run_name).exists()
+    def check(label: str, operation: Callable[[], None]) -> None:
+        try:
+            operation()
+            checks[label] = "passed"
+        except Exception as exc:
+            checks[label] = f"failed: {type(exc).__name__}: {_bounded(str(exc))}"
+
+    def successful_command(label: str) -> None:
+        result = command(label, [label, run_name])
+        assert result.returncode == 0, result.stderr
+
+    def domain_absent() -> None:
+        result = domain_command("domain-removed", ["list", "--all", "--name"])
+        assert result.returncode == 0, result.stderr
+        assert run_name not in result.stdout.splitlines(), "removing the run must undefine its libvirt domain"
+
+    def run_absent() -> None:
+        # lexists also rejects a dangling replacement entry at the effective root.
+        assert not os.path.lexists(roots.runs / run_name), f"run entry remains in effective state root {roots.state}"
+
+    def archive_preserved() -> None:
+        assert archive.is_file(), "removing a VM must not remove its immutable local source image"
+        assert receipt["archive_sha256"] == f"sha256:{hashlib.sha256(archive.read_bytes()).hexdigest()}"
+
+    def docker_not_invoked() -> None:
+        assert not docker_audit.exists(), "runtime commands must not invoke the guarded Docker CLI"
+
+    check("stop", lambda: successful_command("stop"))
+    check("rm", lambda: successful_command("rm"))
+    check("domain-absent", domain_absent)
+    check("run-absent", run_absent)
+    check("archive-preserved", archive_preserved)
+    check("docker-cli-not-invoked", docker_not_invoked)
+    summary = f"Gate 2 evidence: {evidence}\n" + "\n".join(f"{label}: {result}" for label, result in checks.items())
+    try:
+        (evidence / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+    except Exception as exc:
+        failure = f"Cleanup evidence persistence failed: {type(exc).__name__}: {_bounded(str(exc))}"
+        if primary is None:
+            exc.add_note(summary)
+            raise
+        primary.add_note(failure)
+    if primary is not None:
+        primary.add_note(summary)
+        raise primary.with_traceback(primary.__traceback__)
+    assert all(result == "passed" for result in checks.values()), summary

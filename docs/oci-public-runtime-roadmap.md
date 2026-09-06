@@ -11,7 +11,7 @@ removal, the native launch adapter and foreground/detached dispatch. Linux
 x86_64 KVM with `qemu:///system` is the only initial target. Public OCI operations
 are `run`, `run -d`, `ps`, `stop`, `rm` and bounded noninteractive guest `exec`;
 `start`, `logs`, TTY/stdin and network attachment remain unsupported. Gate 2
-remains a separate, unchanged acceptance contract; see the additional-exec
+remains a separate acceptance contract; see the additional-exec
 qualification and remaining host/probe constraints below.
 
 Public exec CLI qualification passed at
@@ -21,6 +21,12 @@ Gate 2 was separately executed and failed its Docker-socket prerequisite before
 VM launch. The image-baked PID 1 probe also returned permission denied in the
 separate public exec proof. These are recorded failures/constraints, not skips
 or Gate 2 success.
+
+Subsequent user decision: Docker may coexist on the KVM host. Gate 2 no longer
+rejects a host merely for having Docker sockets; its CLI fallback audit remains.
+The original PID 1 root probe and supervisor protection have not been changed.
+See [the PID 1 protection report](oci-pid1-protection.ko.md) before deciding how
+to reconcile that criterion with the managed-workload security boundary.
 
 Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
 `PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
@@ -168,7 +174,7 @@ guest `/`; foreground returns the workload result; `-d` survives caller exit;
 a separate CLI can stop/remove only its exact VM; source archives remain.
 Exercise failure and interruption cleanup as well as successful shutdown.
 
-## Milestone 2: additional guest exec and the unchanged Gate 2
+## Milestone 2: additional guest exec and Gate 2
 
 Authenticated `EXEC`, `EXEC_OUTPUT` and `EXEC_EXIT` now use the original boot
 authority. `exec-00000001` remains the main workload; additional commands use
@@ -184,17 +190,17 @@ and STOP during exec. Public CLI proof is separately opt-in. See
 [the additional-exec contract](oci-additional-exec.md) for delivery, abandoned
 result and qualification details. This does not itself pass Gate 2.
 
-The current pieroot-server has Docker sockets, so it does not meet Gate 2's
-daemonless-host prerequisite. The baked `/proc/1/root` probe also conflicts with
-the existing non-dumpable PID 1 supervisor boundary. Do not stop unrelated
-Docker services, hide sockets or weaken PID 1 protection to pass the gate.
-Resolve these acceptance prerequisites explicitly.
+Docker sockets on the current test host are now permitted by user decision.
+The baked `/proc/1/root` probe still conflicts with the existing non-dumpable
+PID 1 supervisor boundary. Do not stop unrelated Docker services, hide sockets
+or weaken PID 1 protection to pass the gate. Resolve the remaining root-proof
+criterion explicitly; the user requested a protection report, not its removal.
 
-Then require `tests/e2e/test_local_oci_build_run.py` without weakening it:
+Then require `tests/e2e/test_local_oci_build_run.py` with its original root probe:
 
 ```text
 Palimpsest build → immutable OCI archive + receipt
-→ transfer to Docker-daemonless qualified KVM host
+→ transfer to qualified KVM host (Docker may coexist)
 → public run -d → separate public exec of the image probe
 → verify image marker and actual / / PID 1 root
 → stop → rm → no domain/run state, source archive preserved

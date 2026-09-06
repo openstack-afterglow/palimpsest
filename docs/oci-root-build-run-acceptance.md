@@ -36,16 +36,31 @@ A standard OCI layout directory can replace the archive path. The command select
 
 ## Gate 2: OCI root `/` in a detached VM
 
-Gate 2 is intentionally opt-in until the OCI-root KVM adapter is implemented. It is split across two hosts so the runtime proof cannot reach Docker:
+Gate 2 remains opt-in. The public OCI-root KVM run/exec adapter now exists.
+The build artifact may be transferred between hosts; Docker may also be
+installed and running on the KVM host. The user explicitly accepted that
+configuration. Docker is not a new required dependency of this KVM runtime.
+The original PID 1 root probe remains unchanged pending the separate protection
+decision explained in [the PID 1 report](oci-pid1-protection.ko.md).
 
 1. On the isolated BuildKit host, `tests/e2e/prepare_local_oci_build.py` builds from a digest-pinned local OCI layout through `palimpsest build`.
 2. The build job retains the OCI archive, independent rootfs proof, and a receipt binding the archive SHA-256, manifest digest, platform, and random marker.
-3. CI transfers that immutable artifact directory to a separate KVM host without a Docker daemon/socket.
+3. Transfer that immutable artifact directory to the qualified KVM host, which may have Docker installed.
 4. `tests/e2e/test_local_oci_build_run.py` verifies the transferred receipt and starts the archive through `palimpsest run ... --backend kvm -d`.
 5. `palimpsest exec` runs the image-baked probe, which proves the random marker is visible both at `/` and through `/proc/1/root/`.
 6. The test requires a running libvirt domain, stops and removes the VM, and proves the domain and run-owned state are gone while the immutable archive remains.
 
-The gate must not be enabled merely because layer materialization succeeds. Local OCI archive/layout intake and ordered materialization now exist, but activation additionally requires durable boot-plan leases, a bootable OCI-root KVM request, host kernel/initramfs policy, VM-specific writable root volume ownership, the OCI init supervisor, detached lifecycle support, and `exec` readiness. The KVM runtime job rejects standard local Docker sockets, replaces `docker` in `PATH` with a failing audit shim, and points `DOCKER_HOST` at a nonexistent socket. It also requires a running libvirt domain with the run name and verifies that removal undefines it.
+The gate must not pass merely because layer materialization succeeds. It still
+requires the actual VM, guest probe, normal shutdown/removal and immutable
+source preservation. The runtime test replaces `docker` in `PATH` with a
+failing audit shim and points `DOCKER_HOST` at a nonexistent socket. These are
+checks against Docker CLI fallback, not proof that arbitrary absolute executables
+or direct socket connections are impossible. Socket presence is recorded, not
+rejected; no host daemon is stopped or socket hidden.
+
+Cleanup checks must run even when the original guest probe fails, preserve that
+primary failure, and report cleanup failures too. Verify the selected product
+state root, including `PALIMPSEST_STATE_HOME`, rather than an assumed XDG path.
 
 On the BuildKit host, provide a bootable local OCI base pinned as `PATH@sha256:<manifest>` and create the transfer artifact:
 
@@ -56,7 +71,9 @@ uv run python tests/e2e/prepare_local_oci_build.py \
   --output-dir "$RUNNER_TEMP/oci-root-build"
 ```
 
-After transferring that directory to the daemonless KVM host, run:
+After transferring that directory to the qualified KVM host, set the five host
+BOOT variables and use `palimpsest oci init-runtime` for a new traversable runtime
+parent, then export its printed `PALIMPSEST_STATE_HOME` setting and run:
 
 ```sh
 PALIMPSEST_OCI_ROOT_E2E=1 \
@@ -65,7 +82,9 @@ PALIMPSEST_OCI_ROOT_E2E_LIBVIRT_URI=qemu:///system \
 uv run pytest -q tests/e2e/test_local_oci_build_run.py
 ```
 
-Until those runtime prerequisites exist, the default suite skips Gate 2. This skip is a visible missing capability, not evidence that local OCI images can already boot as `/`.
+The default suite still skips this opt-in test. Public run and exec have their
+own successful native proofs; that does not imply Gate 2 passed. Its remaining
+root-probe criterion is separately tracked, and PID 1 protection is not relaxed.
 
 ## Lifecycle channel contract checkpoint
 
