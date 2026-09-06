@@ -1,6 +1,6 @@
 """Private, exact-FD Linux ACL I/O; no ownership or lifecycle decisions.
 
-Only the two OCI runtime I/O ACL shapes are understood. The caller owns the
+Only private baselines, OCI I/O grants, and run-search grants are understood. The caller owns the
 descriptor, identity checks, durable intent, fsync and any recovery policy.
 Command failure is ambiguous and never triggers an implicit restoration.
 """
@@ -56,14 +56,14 @@ class ACLStructure:
                 raise _invalid()
             return
         entry = self.named_users[0]
-        permission = "-wx" if self.user == "rwx" else "rw-"
+        permissions = {"-wx", "--x"} if self.user == "rwx" else {"rw-"}
         if (
             type(entry) is not tuple
             or len(entry) != 2
             or type(entry[0]) is not int
             or not 0 <= entry[0] <= _MAX_DAC_ID
-            or entry[1] != permission
-            or self.mask != permission
+            or entry[1] not in permissions
+            or self.mask != entry[1]
         ):
             raise _invalid()
 
@@ -118,6 +118,13 @@ def grant_acl(baseline: ACLStructure, uid: int) -> ACLStructure:
     return ACLStructure(baseline.user, ((uid, permission),), "---", permission, "---")
 
 
+def traversal_acl(baseline: ACLStructure, uid: int) -> ACLStructure:
+    """Exactly search-only access to a VM-exclusive owner-private run directory."""
+    if type(baseline) is not ACLStructure or baseline != baseline_acl(directory=True):
+        raise _invalid()
+    return ACLStructure("rwx", ((uid, "--x"),), "---", "--x", "---")
+
+
 def parse_acl(payload: str) -> ACLStructure:
     """Parse only canonical numeric GNU getfacl output, including one blank tail."""
     if type(payload) is not str or not payload.endswith("\n") or len(payload) > _MAX_ACL_BYTES or "\r" in payload:
@@ -134,8 +141,8 @@ def parse_acl(payload: str) -> ACLStructure:
     named: tuple[tuple[int, str], ...] = ()
     mask = None
     if len(lines) == 5:
-        entry = re.fullmatch(r"user:(0|[1-9][0-9]{0,9}):(-wx|rw-)", lines[1])
-        mask_entry = re.fullmatch(r"mask::(-wx|rw-)", lines[3])
+        entry = re.fullmatch(r"user:(0|[1-9][0-9]{0,9}):(-wx|rw-|--x)", lines[1])
+        mask_entry = re.fullmatch(r"mask::(-wx|rw-|--x)", lines[3])
         if entry is None or mask_entry is None or lines[2] != "group::---":
             raise _invalid()
         named = ((int(entry.group(1)), entry.group(2)),)

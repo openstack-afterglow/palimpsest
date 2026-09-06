@@ -1473,6 +1473,50 @@ Ancestors, BOOT artifacts, root disks, lower exports and libvirt relabeling
 are still qualification-only on every path. This is not complete production
 filesystem provisioning or public OCI-root dispatch.
 
+### PR 4 slice 30Q: make the VM-exclusive run root traversal-only
+
+The same private access transaction now includes the exact VM-owned run
+directory. Its only QEMU permission is named-user `--x` with an exact `--x`
+mask, temporarily exposing mode `0710`; read, write, listing, entry mutation
+and access to the owner-only ledger or `monitor-private` remain unavailable.
+The grant sequence is console `rw-`, I/O directory `-wx`, then run traversal
+last. Revocation removes run traversal first, then restores the I/O directory
+and console. This ensures a partial grant cannot expose an unusable parent
+before its children are ready and a partial revoke blocks guest traversal
+before restoring descendants.
+
+Access receipt v2 binds all three inodes and launch authority v4 carries that
+receipt. Prior private v1/v3 contracts fail closed instead of being silently
+reinterpreted; no public user state has been activated on this path. The run
+target pins device, inode, owner, group, type and complete ACL while permitting
+normal directory link-count, size and timestamp changes caused by owner-side
+monitor setup. I/O-directory and console link-count rules stay strict. All
+verification uses the already-pinned run/entry descriptors, repeats visible
+identity checks after external ACL/libvirt calls and never reacquires the run
+lock.
+
+Fresh or interrupted grant accepts only the exact prefix states
+`BBB -> BBG -> BGG -> GGG` for `(run, io, console)`; revocation accepts only
+`GGG -> BGG -> BBG -> BBB`. Unknown mixtures, principals, ACLs or namespace
+changes are preserved and refused. Incomplete operations fsync all three
+desired target descriptors before completion even when a preceding attempt
+already changed an ACL. Completed grant/revoke replay remains read-only.
+Revocation retains the 30P requirement for completed 30L cleanup, the original
+terminal STALE writer, the exclusive existing monitor journal and simultaneous
+domain name/UUID absence. It deletes no run entry, journal, socket, I/O file,
+disk or lease.
+
+Native qualification removes the exact run root, I/O directory and console
+from the fixture broker for the selected stale-cleanup child. It verifies the
+three production ACLs while the real VM is active and the exact owner-only
+baselines after recovery. Unrelated ledger fields and the existing journal,
+socket, console and root-volume identities remain preserved; the access and
+lifecycle ledger updates are intentional. Shared `state`/`runs` and host
+ancestors, BOOT artifacts, root disk,
+lower exports and libvirt relabel handling remain explicitly fixture-only.
+The other four boots remain unchanged test-adapted coverage. This slice is one
+more production access segment, not complete host-path provisioning.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1491,8 +1535,10 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable runtime-I/O grant boundary to production ancestor,
-   BOOT/shared-artifact and root-disk access with explicit relabel policy,
+1. Extend the durable access boundary to shared ancestor traversal with
+   aggregate multi-VM grant lifetime, then VM-root-disk access under its
+   volume generation lock, and finally BOOT/shared-artifact exports with an
+   explicit relabel policy,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
    cleanup and completed lower-lease handoff boundaries. Preserve lower pins

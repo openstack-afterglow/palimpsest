@@ -1,4 +1,4 @@
-"""Real durable access grants carried into private exec launch authority v3."""
+"""Real durable traversal/I/O grants carried into private exec authority v4."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from palimpsest_local import oci_runtime_access as access
 from palimpsest_local import oci_runtime_io as io
 from palimpsest_local import state
 from palimpsest_local.errors import StateError
-from palimpsest_local.oci_acl import baseline_acl, grant_acl
+from palimpsest_local.oci_acl import baseline_acl, grant_acl, traversal_acl
 
 
 @pytest.fixture
@@ -33,8 +33,9 @@ def test_completed_grant_survives_prepared_and_serialized_authority(granted):
     before_writes = list(granted.backend.writes)
     with _prepare(granted) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v3"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v4"
         assert frame["runtime_access"] == granted.receipt.to_dict()
+        assert frame["runtime_access"]["schema"] == "palimpsest.oci-runtime-access.v2"
         assert frame["runtime_access"]["phase"] == "granted"
         for entry in frame["entries"].values():
             entry["fd"] = os.dup(entry["fd"])
@@ -97,6 +98,11 @@ def test_preparation_and_held_run_validation_do_not_reacquire_run_lock(granted, 
     "change",
     [
         lambda frame: frame["runtime_access"].update(qemu_uid=12347),
+        lambda frame: frame["runtime_access"]["run"].update(inode=True),
+        lambda frame: frame["runtime_access"]["run"]["granted"].update(mask="-wx"),
+        lambda frame: frame["runtime_access"].pop("run"),
+        lambda frame: frame["runtime_access"].update(run=None),
+        lambda frame: frame["runtime_access"].update(schema="palimpsest.oci-runtime-access.v1"),
         lambda frame: frame["runtime_access"]["directory"].update(inode=True),
         lambda frame: frame["runtime_access"]["console"].update(inode=1),
         lambda frame: frame["runtime_access"]["runtime_io"].update(plan_digest="sha256:" + "f" * 64),
@@ -104,6 +110,7 @@ def test_preparation_and_held_run_validation_do_not_reacquire_run_lock(granted, 
         lambda frame: frame.update(runtime_access=None),
         lambda frame: frame.pop("runtime_access"),
         lambda frame: frame.update(schema="palimpsest.monitor-launch-authority.v2"),
+        lambda frame: frame.update(schema="palimpsest.monitor-launch-authority.v3"),
     ],
 )
 def test_serialized_authority_rejects_tampered_or_omitted_grant(granted, change):
@@ -116,10 +123,10 @@ def test_serialized_authority_rejects_tampered_or_omitted_grant(granted, change)
         authority.validate()
 
 
-@pytest.mark.parametrize("role", ["runtime_io", "runtime_console"])
+@pytest.mark.parametrize("role", ["run", "runtime_io", "runtime_console"])
 def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_path, role):
     replacement = tmp_path / "unrelated"
-    if role == "runtime_io":
+    if role != "runtime_console":
         replacement.mkdir(mode=0o700)
         fd = os.open(replacement, os.O_RDONLY | os.O_DIRECTORY)
     else:
@@ -127,9 +134,9 @@ def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_p
     try:
         # Keep type, owner, mode and full ACL valid. Only the inherited inode
         # identity differs, so a generic mode/ACL rejection cannot mask this test.
-        os.fchmod(fd, 0o730 if role == "runtime_io" else 0o660)
+        os.fchmod(fd, {"run": 0o710, "runtime_io": 0o730, "runtime_console": 0o660}[role])
         info = os.fstat(fd)
-        target = granted.receipt.directory if role == "runtime_io" else granted.receipt.console
+        target = getattr(granted.receipt, {"run": "run", "runtime_io": "directory", "runtime_console": "console"}[role])
         granted.backend.acls[info.st_dev, info.st_ino] = target.granted
         with _prepare(granted) as authority:
             frame = authority.to_dict()
@@ -142,7 +149,7 @@ def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_p
         os.close(fd)
 
 
-@pytest.mark.parametrize("role", ["directory", "console"])
+@pytest.mark.parametrize("role", ["run", "directory", "console"])
 @pytest.mark.parametrize("drift", ["baseline", "other-user"])
 def test_exact_live_acl_is_rechecked_without_mode_only_acceptance(granted, role, drift):
     target = getattr(granted.receipt, role)
@@ -153,7 +160,7 @@ def test_exact_live_acl_is_rechecked_without_mode_only_acceptance(granted, role,
         granted.backend.acls[key] = (
             baseline_acl(directory=target.directory)
             if drift == "baseline"
-            else grant_acl(target.baseline, granted.receipt.qemu_uid + 1)
+            else (traversal_acl if role == "run" else grant_acl)(target.baseline, granted.receipt.qemu_uid + 1)
         )
         with pytest.raises(StateError):
             authority.validate()

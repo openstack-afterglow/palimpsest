@@ -142,7 +142,7 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
 
     def metadata(key, entry, opened, visible, owner_uid):
         # The control socket and ownership journal are never QEMU resources.
-        if key == "monitor":
+        if key == "monitor" or (context.get("product_io", False) and key in {"run", "runtime_io", "runtime_console"}):
             return original_metadata(key, entry, opened, visible, owner_uid)
         broker = context.get("broker")
         target = (
@@ -232,7 +232,7 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
     original_run = authority_module.MonitorLaunchAuthority.run
     original_metadata = authority_module._validate_entry_metadata
     original_io_metadata = oci_runtime_io._validate_runtime_io_metadata
-    context: dict = {}
+    context: dict = {"product_io": product_io}
 
     def lower(roots, digest, size):
         return fixture["_stage_qualified_lower"](original_lower(roots, digest, size), digest, size, root / "l")

@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v3"
+_SCHEMA = "palimpsest.monitor-launch-authority.v4"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -304,6 +304,7 @@ class MonitorLaunchAuthority:
                     os.stat(io_entry["path"], follow_symlinks=False),
                     os.stat(console_entry["path"], follow_symlinks=False),
                     run_directory_fd=self._frame["entries"]["run"]["fd"],
+                    runs_directory_fd=self._frame["entries"]["runs"]["fd"],
                 )
             for key, entry in self._frame["entries"].items():
                 is_directory = key not in {"kernel", "initramfs", "runtime_console"}

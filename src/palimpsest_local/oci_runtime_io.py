@@ -231,6 +231,7 @@ class RuntimeIOGuard:
                     visible_directory,
                     visible_console,
                     run_directory_fd=self._mutation._run_fd,
+                    runs_directory_fd=self._mutation._runs_fd,
                 )
             else:
                 for directory, console in (

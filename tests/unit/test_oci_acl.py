@@ -19,6 +19,25 @@ CAPABILITIES = """<capabilities><host><secmodel><model>dac</model><doi>0</doi>
 </secmodel></host></capabilities>"""
 
 
+def test_traversal_acl_is_exact_search_only_and_roundtrips():
+    value = acl.traversal_acl(acl.baseline_acl(directory=True), 107)
+    assert value.named_users == ((107, "--x"),) and value.mask == "--x"
+    assert value.user == "rwx" and value.group == value.other == "---"
+    assert acl.parse_acl(value.setfile_text()) == value
+    assert acl.ACLStructure.from_dict(value.to_dict()) == value
+    with pytest.raises(acl.OCIACLError):
+        acl.traversal_acl(acl.baseline_acl(directory=False), 107)
+
+
+@pytest.mark.parametrize(
+    "owner,permission,mask",
+    [("rw-", "--x", "--x"), ("rwx", "--x", "-wx"), ("rwx", "--x", "r-x"), ("rwx", "r-x", "r-x")],
+)
+def test_traversal_parser_rejects_file_execute_or_broader_masks(owner, permission, mask):
+    with pytest.raises(acl.OCIACLError):
+        acl.parse_acl(f"user::{owner}\nuser:107:{permission}\ngroup::---\nmask::{mask}\nother::---\n")
+
+
 @pytest.mark.parametrize("directory", [False, True])
 @pytest.mark.parametrize("extended", [False, True])
 @pytest.mark.parametrize("blank_tail", [False, True])

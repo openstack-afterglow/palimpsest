@@ -1,6 +1,6 @@
-"""Private, durable access to exactly two untrusted OCI QEMU I/O inodes.
+"""Private, durable access to untrusted OCI I/O and traversal of its exact run.
 
-No ancestor, boot artifact, root volume, monitor socket or run ledger ACL is
+No shared ancestor, boot artifact, root volume, monitor socket or run ledger ACL is
 changed here. Interrupted grants resume only while no monitor journal exists;
 restoration requires a stale terminal writer and completed inactive cleanup.
 """
@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from .errors import PalimpsestError, StateError
-from .oci_acl import ACLStructure, LinuxFdACLBackend, baseline_acl, grant_acl, parse_qemu_dac_baselabel
+from .oci_acl import ACLStructure, LinuxFdACLBackend, baseline_acl, grant_acl, parse_qemu_dac_baselabel, traversal_acl
 from .oci_monitor import probe_process_liveness
 from .oci_monitor_ipc import MonitorPreActivationBinding
 from .oci_monitor_recovery import (
@@ -39,7 +39,7 @@ from .oci_runtime_io import (
 from .state import StatePaths, locked_existing_run
 
 OCI_RUNTIME_ACCESS_STATE_KEY = "oci_runtime_access"
-_SCHEMA = "palimpsest.oci-runtime-access.v1"
+_SCHEMA = "palimpsest.oci-runtime-access.v2"
 
 
 def _invalid() -> StateError:
@@ -110,6 +110,7 @@ class RuntimeAccessReceipt:
     runtime_io: RuntimeIOReceipt
     qemu_uid: int
     qemu_gid: int
+    run: RuntimeAccessTarget
     directory: RuntimeAccessTarget
     console: RuntimeAccessTarget
     cleanup_digest: str | None = None
@@ -127,6 +128,7 @@ class RuntimeAccessReceipt:
             or type(self.runtime_io) is not RuntimeIOReceipt
             or any(type(value) is not int or not 0 < value < 2**32 - 1 for value in (self.qemu_uid, self.qemu_gid))
             or type(self.directory) is not RuntimeAccessTarget
+            or type(self.run) is not RuntimeAccessTarget
             or type(self.console) is not RuntimeAccessTarget
         ):
             raise _invalid()
@@ -136,6 +138,11 @@ class RuntimeAccessReceipt:
             (self.runtime_io.run_id, self.runtime_io.run_name, self.runtime_io.plan_digest)
             != (self.binding.record.run_id, self.binding.record.name, self.binding.plan_digest)
             or self.qemu_uid == self.binding.owner_uid
+            or not self.run.directory
+            or self.run.nlink < 2
+            or self.run.uid != self.binding.owner_uid
+            or self.run.granted != traversal_acl(self.run.baseline, self.qemu_uid)
+            or len({(target.device, target.inode) for target in (self.run, self.directory, self.console)}) != 3
             or not self.directory.directory
             or self.console.directory
             or (self.directory.device, self.directory.inode)
@@ -168,6 +175,7 @@ class RuntimeAccessReceipt:
             "runtime_io": self.runtime_io.to_dict(),
             "qemu_uid": self.qemu_uid,
             "qemu_gid": self.qemu_gid,
+            "run": self.run.to_dict(),
             "directory": self.directory.to_dict(),
             "console": self.console.to_dict(),
             "cleanup_digest": self.cleanup_digest,
@@ -189,6 +197,7 @@ class RuntimeAccessReceipt:
                 RuntimeIOReceipt.from_dict(value["runtime_io"]),
                 value["qemu_uid"],
                 value["qemu_gid"],
+                RuntimeAccessTarget.from_dict(value["run"]),
                 RuntimeAccessTarget.from_dict(value["directory"]),
                 RuntimeAccessTarget.from_dict(value["console"]),
                 value["cleanup_digest"],
@@ -197,11 +206,15 @@ class RuntimeAccessReceipt:
             raise _invalid() from None
 
 
-def _validate_target(info, target, acl):
-    mode = (0o700 if target.directory else 0o600) if acl == target.baseline else (0o730 if target.directory else 0o660)
+def _validate_target(info, target, acl, *, run_directory=False):
+    mode = (
+        (0o700 if target.directory else 0o600)
+        if acl == target.baseline
+        else (0o710 if run_directory else (0o730 if target.directory else 0o660))
+    )
     if (
-        (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_nlink)
-        != (target.device, target.inode, target.uid, target.gid, target.nlink)
+        (info.st_dev, info.st_ino, info.st_uid, info.st_gid) != (target.device, target.inode, target.uid, target.gid)
+        or (info.st_nlink < 2 if run_directory else info.st_nlink != target.nlink)
         or stat.S_IMODE(info.st_mode) != mode
         or (not stat.S_ISDIR(info.st_mode) if target.directory else not stat.S_ISREG(info.st_mode))
         or target.uid != os.geteuid()
@@ -211,7 +224,16 @@ def _validate_target(info, target, acl):
 
 
 def verify_runtime_access(
-    receipt, runtime_io, directory_fd, console_fd, directory_stat, console_stat, *, run_directory_fd, acl_backend=None
+    receipt,
+    runtime_io,
+    directory_fd,
+    console_fd,
+    directory_stat,
+    console_stat,
+    *,
+    run_directory_fd,
+    runs_directory_fd,
+    acl_backend=None,
 ):
     """Read-only exact granted ACL verifier; safe beneath existing run locks."""
     if type(receipt) is not RuntimeAccessReceipt:
@@ -220,29 +242,43 @@ def verify_runtime_access(
     if receipt.phase != "granted" or receipt.runtime_io != runtime_io:
         raise _invalid()
     backend = acl_backend or LinuxFdACLBackend()
-    for target, fd, visible in (
-        (receipt.directory, directory_fd, directory_stat),
-        (receipt.console, console_fd, console_stat),
+    for target, fd, visible, run_directory in (
+        (
+            receipt.run,
+            run_directory_fd,
+            os.stat(receipt.binding.record.name, dir_fd=runs_directory_fd, follow_symlinks=False),
+            True,
+        ),
+        (receipt.directory, directory_fd, directory_stat, False),
+        (receipt.console, console_fd, console_stat, False),
     ):
-        _validate_target(os.fstat(fd), target, target.granted)
-        _validate_target(visible, target, target.granted)
+        _validate_target(os.fstat(fd), target, target.granted, run_directory=run_directory)
+        _validate_target(visible, target, target.granted, run_directory=run_directory)
         if backend.read_acl(fd) != target.granted:
             raise _invalid()
-        _validate_target(os.fstat(fd), target, target.granted)
-    for target, fd, current in (
+        _validate_target(os.fstat(fd), target, target.granted, run_directory=run_directory)
+    for target, fd, current, run_directory in (
+        (
+            receipt.run,
+            run_directory_fd,
+            os.stat(receipt.binding.record.name, dir_fd=runs_directory_fd, follow_symlinks=False),
+            True,
+        ),
         (
             receipt.directory,
             directory_fd,
             os.stat(OCI_RUNTIME_DIRECTORY, dir_fd=run_directory_fd, follow_symlinks=False),
+            False,
         ),
         (
             receipt.console,
             console_fd,
             os.stat(OCI_RUNTIME_CONSOLE_FILENAME, dir_fd=directory_fd, follow_symlinks=False),
+            False,
         ),
     ):
-        _validate_target(os.fstat(fd), target, target.granted)
-        _validate_target(current, target, target.granted)
+        _validate_target(os.fstat(fd), target, target.granted, run_directory=run_directory)
+        _validate_target(current, target, target.granted, run_directory=run_directory)
 
 
 @contextmanager
@@ -356,6 +392,12 @@ def _verify_pinned(mutation, descriptors, receipt, backend, expected):
         raise _invalid()
     for role, target, fd, visible in (
         (
+            "run",
+            receipt.run,
+            mutation._run_fd,
+            os.stat(mutation.record.name, dir_fd=mutation._runs_fd, follow_symlinks=False),
+        ),
+        (
             "directory",
             receipt.directory,
             descriptors.directory,
@@ -369,8 +411,8 @@ def _verify_pinned(mutation, descriptors, receipt, backend, expected):
         ),
     ):
         acl = expected[role]
-        _validate_target(os.fstat(fd), target, acl)
-        _validate_target(visible, target, acl)
+        _validate_target(os.fstat(fd), target, acl, run_directory=role == "run")
+        _validate_target(visible, target, acl, run_directory=role == "run")
         if backend.read_acl(fd) != acl:
             raise _invalid()
     _verify_pinned_metadata(mutation, descriptors, receipt, expected)
@@ -379,6 +421,12 @@ def _verify_pinned(mutation, descriptors, receipt, backend, expected):
 def _verify_pinned_metadata(mutation, descriptors, receipt, expected):
     _verify_parent(mutation)
     for role, target, fd, current in (
+        (
+            "run",
+            receipt.run,
+            mutation._run_fd,
+            os.stat(mutation.record.name, dir_fd=mutation._runs_fd, follow_symlinks=False),
+        ),
         (
             "directory",
             receipt.directory,
@@ -392,8 +440,8 @@ def _verify_pinned_metadata(mutation, descriptors, receipt, expected):
             os.stat(OCI_RUNTIME_CONSOLE_FILENAME, dir_fd=descriptors.directory, follow_symlinks=False),
         ),
     ):
-        _validate_target(os.fstat(fd), target, expected[role])
-        _validate_target(current, target, expected[role])
+        _validate_target(os.fstat(fd), target, expected[role], run_directory=role == "run")
+        _validate_target(current, target, expected[role], run_directory=role == "run")
     _verify_parent(mutation)
 
 
@@ -414,7 +462,7 @@ def _write_state(mutation, receipt):
 def grant_oci_runtime_access(
     roots: StatePaths, binding: MonitorPreActivationBinding, *, conn, qemu_uid=None, qemu_gid=None, acl_backend=None
 ):
-    """Grant file-rw then directory-wx to libvirt's exact DAC/KVM principal."""
+    """Grant console-rw, I/O-wx, then run-search to the exact DAC/KVM principal."""
     try:
         if type(roots) is not StatePaths or type(binding) is not MonitorPreActivationBinding:
             raise _invalid()
@@ -433,7 +481,11 @@ def grant_oci_runtime_access(
                 saved = mutation.snapshot.state.get(OCI_RUNTIME_ACCESS_STATE_KEY)
                 if not has_saved:
                     targets = []
-                    for fd, directory in ((descriptors.directory, True), (descriptors.console, False)):
+                    for fd, directory, run_directory in (
+                        (mutation._run_fd, True, True),
+                        (descriptors.directory, True, False),
+                        (descriptors.console, False, False),
+                    ):
                         info = os.fstat(fd)
                         acl = backend.read_acl(fd)
                         if acl != baseline_acl(directory=directory):
@@ -446,9 +498,9 @@ def grant_oci_runtime_access(
                             info.st_nlink,
                             directory,
                             acl,
-                            grant_acl(acl, principal[0]),
+                            traversal_acl(acl, principal[0]) if run_directory else grant_acl(acl, principal[0]),
                         )
-                        _validate_target(info, target, acl)
+                        _validate_target(info, target, acl, run_directory=run_directory)
                         targets.append(target)
                     receipt = RuntimeAccessReceipt(
                         str(uuid.uuid4()), "intent", binding, runtime_io, *principal, *targets
@@ -465,14 +517,19 @@ def grant_oci_runtime_access(
                 expected_record = receipt if has_saved else None
                 expected = {
                     role: backend.read_acl(fd)
-                    for role, fd in (("directory", descriptors.directory), ("console", descriptors.console))
+                    for role, fd in (
+                        ("run", mutation._run_fd),
+                        ("directory", descriptors.directory),
+                        ("console", descriptors.console),
+                    )
                 }
                 allowed = [
-                    (receipt.directory.baseline, receipt.console.baseline),
-                    (receipt.directory.baseline, receipt.console.granted),
-                    (receipt.directory.granted, receipt.console.granted),
+                    (receipt.run.baseline, receipt.directory.baseline, receipt.console.baseline),
+                    (receipt.run.baseline, receipt.directory.baseline, receipt.console.granted),
+                    (receipt.run.baseline, receipt.directory.granted, receipt.console.granted),
+                    (receipt.run.granted, receipt.directory.granted, receipt.console.granted),
                 ]
-                if (expected["directory"], expected["console"]) not in (
+                if (expected["run"], expected["directory"], expected["console"]) not in (
                     allowed if receipt.phase == "intent" else allowed[-1:]
                 ):
                     raise _invalid()
@@ -503,6 +560,7 @@ def grant_oci_runtime_access(
                 for role, target, fd in (
                     ("console", receipt.console, descriptors.console),
                     ("directory", receipt.directory, descriptors.directory),
+                    ("run", receipt.run, mutation._run_fd),
                 ):
                     if expected[role] != target.granted:
                         verify()
@@ -531,7 +589,7 @@ def revoke_oci_runtime_access(
     acl_backend=None,
     liveness_probe=probe_process_liveness,
 ):
-    """Restore directory then console only after stale terminal monitor cleanup."""
+    """Close run traversal first, then I/O and console after stale terminal cleanup."""
     authority = None
     try:
         if type(roots) is not StatePaths or type(binding) is not MonitorPreActivationBinding:
@@ -571,19 +629,24 @@ def revoke_oci_runtime_access(
             with _pinned_io(mutation, runtime_io) as descriptors:
                 expected = {
                     role: backend.read_acl(fd)
-                    for role, fd in (("directory", descriptors.directory), ("console", descriptors.console))
+                    for role, fd in (
+                        ("run", mutation._run_fd),
+                        ("directory", descriptors.directory),
+                        ("console", descriptors.console),
+                    )
                 }
                 allowed = [
-                    (receipt.directory.granted, receipt.console.granted),
-                    (receipt.directory.baseline, receipt.console.granted),
-                    (receipt.directory.baseline, receipt.console.baseline),
+                    (receipt.run.granted, receipt.directory.granted, receipt.console.granted),
+                    (receipt.run.baseline, receipt.directory.granted, receipt.console.granted),
+                    (receipt.run.baseline, receipt.directory.baseline, receipt.console.granted),
+                    (receipt.run.baseline, receipt.directory.baseline, receipt.console.baseline),
                 ]
                 choices = (
                     allowed
                     if receipt.phase == "revoking"
                     else (allowed[:1] if receipt.phase == "granted" else allowed[-1:])
                 )
-                if (expected["directory"], expected["console"]) not in choices:
+                if (expected["run"], expected["directory"], expected["console"]) not in choices:
                     raise _invalid()
 
                 def verify():
@@ -631,6 +694,7 @@ def revoke_oci_runtime_access(
                     expected_record = receipt
                     verify()
                 for role, target, fd in (
+                    ("run", receipt.run, mutation._run_fd),
                     ("directory", receipt.directory, descriptors.directory),
                     ("console", receipt.console, descriptors.console),
                 ):

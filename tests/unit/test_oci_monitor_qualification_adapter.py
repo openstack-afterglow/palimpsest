@@ -108,6 +108,26 @@ def test_only_exact_recorded_named_qemu_grant_is_accepted(directory):
     adapter(key, entry, granted, granted, os.geteuid())
 
 
+@pytest.mark.parametrize("key", ["run", "runtime_io", "runtime_console"])
+def test_product_targets_are_never_normalized_by_fixture_metadata_adapter(key):
+    directory = key != "runtime_console"
+    _adapter, broker, entry, _original, granted = _setup(directory)
+    seen = []
+
+    def unchanged(candidate_key, candidate_entry, opened, visible, owner_uid):
+        seen.append((candidate_key, candidate_entry, opened, visible, owner_uid))
+        assert opened is visible is granted
+        assert candidate_entry is entry
+        raise StateError("production verifier must decide")
+
+    context = {"product_io": True, "broker": broker, "granted": {(1, 2): granted}}
+    adapter = _HELPER["_qualification_metadata_adapter"](unchanged, context, ACL, _acl_mode)
+    with pytest.raises(ValueError, match="metadata rejected") as captured:
+        adapter(key, entry, granted, granted, os.geteuid())
+    assert str(captured.value.__cause__) == "production verifier must decide"
+    assert len(seen) == 1
+
+
 @pytest.mark.parametrize(
     "change",
     [

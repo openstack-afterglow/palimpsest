@@ -404,6 +404,32 @@ disks and relabel handling are fixture-only even for the production-I/O boot.
 This does not promote the whole test broker to production; public dispatch,
 full provisioning, endpoint removal and Gate 2 remain disabled.
 
+Slice 30Q extends that same private access receipt to the VM-exclusive run
+root. The only added QEMU right is named-user traversal `--x` with the exact
+mask, producing `0710`; QEMU still cannot list or mutate entries, read the
+owner-only ledger, or enter `monitor-private`. Grant makes the children usable
+first (`console -> io -> run`), while recovery blocks traversal first
+(`run -> io -> console`). Receipt v2 and fresh-exec authority v4 bind all three
+targets. The old private v1/v3 formats are rejected without implicit migration.
+
+The run target pins its device/inode, owner/group, directory type and complete
+ACL but deliberately does not freeze link count, size or timestamps, since the
+owner may create `monitor-private` before launch. Descendant link-count rules
+remain unchanged. Partial grant/revoke resumes only from the exact ordered ACL
+prefixes saved by its durable intent; all desired target FDs are fsynced before
+an interrupted operation completes. Completed replay does not write ACLs,
+target FDs or the ledger. Every external command/domain check is followed by
+held and visible identity plus durable-member validation.
+
+The stale-cleanup live child now removes run root, I/O directory and console
+from the test ACL broker and uses production validation for all three. It
+checks exact active grants, LIVE refusal, 30L+STALE recovery to `0700/0700/0600`
+and preservation of ledger, monitor journal/socket, console and root volume.
+The shared parent chain is still fixture-provided. So are BOOT/root-disk/lower
+access and libvirt relabel behavior, and the other four actual boots continue
+to use their explicit qualification adapters. This remains short of complete
+production filesystem provisioning and does not activate public dispatch.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from
