@@ -57,6 +57,54 @@ to the durable boot lifecycle transcript. Public process sessions deliver
 separate guest stdout/stderr and the actual completed exit code; truncation,
 timeout and cancellation are explicit failures even if a leader exited zero.
 
+## Refusal diagnostics, not result recovery
+
+The exec client now distinguishes validated mailbox lifecycle states before
+submitting a command. Refusal closes the client without submitting, polling,
+acknowledging or taking over another command. Invalid status fields are rejected
+as a typed state error, including a non-string lifecycle state.
+
+| Reported condition | Meaning and safe next step |
+|---|---|
+| Not ready | Check the run and wait for authenticated READY. |
+| Stopping | New exec admission is closed; wait for shutdown and examine the existing results. |
+| Terminal | This run has ended; inspect its terminal result. |
+| Control lost | Preserve run evidence and any original client output. A command's outcome can be unknown; do not rerun it on the assumption that it never executed. |
+| Ready but occupied | The previous command may still be running **or** its result may be unacknowledged. Let the original client finish consuming its result if it is available. |
+
+Occupied status does not prove that a client is abandoned. There is no new
+result-list, takeover, discard or recovery command. A disconnected client does
+not authorize a fresh client to acknowledge its result. Diagnostics do not
+change the one-command mailbox, authentication, result retention or STOP policy.
+
+## Host resource diagnostics
+
+Worker/packer process creation failures with `EAGAIN` or `ENOMEM` have an
+explicit resource diagnostic instead of an undifferentiated spawn error.
+Missing executables and permission failures are not mislabeled as resource
+exhaustion. The isolated worker still exports only a fixed error category,
+not raw exception text, source paths or command contents.
+
+The diagnostic suggests checking applicable process/thread and memory limits;
+it does not claim which limit was reached or count available process slots.
+Linux has multiple possible reasons for these errors, including UID-wide,
+cgroup and system limits, and memory or PID-namespace conditions. See
+[fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html) and
+[pthread_create(3)](https://man7.org/linux/man-pages/man3/pthread_create.3.html).
+
+No resource limit is raised, no unrelated process is stopped and no automatic
+retry is introduced. The worker's configured process ceiling remains 256
+(or a lower inherited limit); this is not a dedicated process-tree quota.
+Packer failures that only report a generic nonzero exit are not promoted to a
+specific resource diagnosis by guessing from stderr.
+
+Partial helper-thread startup now retains ownership of the already spawned
+worker and attempts bounded termination. Confirmed worker/group exit permits
+scratch cleanup; an uncertain exit or failed deferred reaper preserves scratch
+evidence. An interrupted thread start is not treated as proof that no thread
+exists, so cleanup does not close a pin already handed to a possible reaper.
+This does not promise automatic recovery when the host cannot start a reaper.
+
 ## Qualification and Gate 2 boundary
 
 `tests/kvm/test_oci_exec_live.py` is an explicit engine proof using public

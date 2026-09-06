@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -36,6 +37,19 @@ SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
 SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v2"
 SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v2"
 SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
+
+
+def process_resource_failure(exc: BaseException) -> bool:
+    """Recognize resource errors without guessing which host limit was reached."""
+    return isinstance(exc, MemoryError) or isinstance(exc, OSError) and exc.errno in {errno.EAGAIN, errno.ENOMEM}
+
+
+def process_resource_detail(exc: BaseException) -> str:
+    reason = errno.errorcode[exc.errno] if isinstance(exc, OSError) else "memory allocation failure"
+    return (
+        f"process creation failed ({reason}); check process/thread, memory, and service/cgroup limits; "
+        "no automatic retry or limit change was attempted"
+    )
 
 
 class SquashFSPackError(ArtifactValidationError):
@@ -236,7 +250,9 @@ def _discover_dependency_paths(packer_path: Path) -> tuple[Path, ...]:
             env=_fixed_env(),
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, MemoryError, subprocess.TimeoutExpired) as exc:
+        if process_resource_failure(exc):
+            raise SquashFSPackError("oci-packer-resource", process_resource_detail(exc)) from None
         raise SquashFSPackError("oci-packer-toolchain", "dynamic dependencies cannot be inspected") from None
     if _bind_toolchain_file(inspector.path) != inspector:
         raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector changed")
@@ -283,7 +299,9 @@ def discover_squashfs_toolchain(
             env=_fixed_env(),
             timeout=min(30.0, float(policy.packer_timeout_seconds)),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, MemoryError, subprocess.TimeoutExpired) as exc:
+        if process_resource_failure(exc):
+            raise SquashFSPackError("oci-packer-resource", process_resource_detail(exc)) from None
         raise SquashFSPackError("oci-packer-version", "filesystem packer version check failed") from None
     match = re.search(rb"mksquashfs version (\d+)\.(\d+)(?:\.(\d+))?", result.stdout + result.stderr, re.I)
     if result.returncode != 0 or match is None:
@@ -505,7 +523,9 @@ def _run_pinned(
                 pass_fds=(executable_fd, cwd_fd),
                 start_new_session=not execution.inherit_process_group,
             )
-        except OSError:
+        except (OSError, MemoryError) as exc:
+            if process_resource_failure(exc):
+                raise SquashFSPackError("oci-packer-resource", process_resource_detail(exc)) from None
             raise SquashFSPackError("oci-packer-spawn", "filesystem packer could not be started") from None
         try:
             return_code = process.wait(timeout=timeout_seconds)

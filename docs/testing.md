@@ -110,6 +110,22 @@ partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification
 
+For worker/packer resource failures and additional-exec diagnostics, keep the
+two feedback loops separate:
+
+```sh
+uv run pytest -q tests/unit/test_oci_worker_protocol.py tests/unit/test_oci_converter_first_pass.py
+uv run pytest -q tests/unit/test_oci_exec_session.py tests/unit/test_oci_exec_control.py tests/unit/test_oci_exec_client.py tests/unit/test_oci_exec_public_routing.py
+```
+
+The worker file includes real bounded subprocess failure cases; the converter
+file contains Linux-only pinned-packer cases. macOS skips do not verify those
+Linux paths: run the selected files on the exact pushed server SHA too.
+After changes to these paths, run the separate public exec CLI native file
+below with the existing immutable Palimpsest-built image. This exercises real
+cold materialization and public run/exec/stop/rm without running the entire
+native suite. It still does not substitute for Gate 2.
+
 The first public OCI lifecycle has a separately addressable native smoke:
 `tests/kvm/test_oci_public_cli_live.py`. Set `PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1`
 and the five explicit host BOOT/packer variables documented in

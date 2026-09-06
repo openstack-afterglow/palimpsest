@@ -1951,3 +1951,17 @@ locally and on the exact-SHA server checkout. The explicit Gate 2 now reaches
 the original guest probe and fails at protected `/proc/1/root`, not the Docker
 host prerequisite. All six failure-cleanup/source-preservation checks passed.
 See the acceptance document for preserved evidence; Gate 2 is not complete.
+
+### Follow-up: resource failure ownership and exec refusal diagnostics
+
+Proceed independently of the unresolved PID 1 proof decision: distinguish
+worker/packer resource spawn failures and make partial helper-thread startup
+transactional, while preserving the existing resource limits and exact worker
+cleanup authority. In parallel, distinguish exec lifecycle/occupied refusals
+and reject malformed mailbox state without submitting or acknowledging work.
+
+These are diagnostics and failure-path corrections, not result takeover,
+automatic replay, relaxed guest isolation, or a changed Gate 2 probe. Verify
+the selected worker/packer and exec tests separately, then push and execute the
+public exec native proof on the exact server SHA. Full suites are not the
+per-edit requirement; recovery UX and root-proof policy remain separate work.

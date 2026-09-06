@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import io
 import json
 import os
 import signal
@@ -13,11 +15,13 @@ from pathlib import Path
 import pytest
 
 import palimpsest_local.oci_materializer as materializer
+import palimpsest_local.oci_materializer_worker as worker
 from palimpsest_local.oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from palimpsest_local.oci_materializer import OCIHardWorkerError
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
+    SquashFSPackError,
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
 )
@@ -181,6 +185,284 @@ def test_parent_worker_boundary_starts_a_new_session_and_binds_stdin(tmp_path: P
     value = json.loads(output)
     assert return_code == 0
     assert value == {"bytes": len(request.to_json_bytes()), "pid": process.pid, "pgrp": process.pid}
+
+
+@pytest.mark.parametrize("number", [errno.EAGAIN, errno.ENOMEM, errno.EACCES, errno.ENOENT])
+def test_worker_spawn_classifies_only_known_resource_errors(tmp_path, monkeypatch, number):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(kwargs)
+        raise OSError(number, "/private/host/detail")
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", fail)
+    with pytest.raises(OCIHardWorkerError) as raised:
+        materializer._spawn_and_exchange(_request(), scratch=tmp_path, timeout_seconds=1, grace_seconds=0.1)
+    resource = number in {errno.EAGAIN, errno.ENOMEM}
+    assert raised.value.code == ("oci-worker-resource" if resource else "oci-worker-spawn")
+    assert "/private/host/detail" not in str(raised.value)
+    if resource:
+        assert errno.errorcode[number] in str(raised.value)
+        assert "no automatic retry or limit change" in str(raised.value)
+    assert len(calls) == 1 and calls[0]["start_new_session"] is True
+
+
+@pytest.mark.parametrize("failed_start", [1, 2])
+def test_partial_helper_start_failure_reaps_owned_worker(tmp_path, monkeypatch, failed_start):
+    original_start = materializer.threading.Thread.start
+    starts = []
+
+    def start(thread):
+        starts.append(thread)
+        if len(starts) == failed_start:
+            raise RuntimeError("can't start new thread")
+        return original_start(thread)
+
+    monkeypatch.setattr(materializer.threading.Thread, "start", start)
+    with pytest.raises(materializer._WorkerBoundaryFailure) as raised:
+        materializer._spawn_and_exchange(
+            _request(),
+            scratch=tmp_path,
+            timeout_seconds=2,
+            grace_seconds=0.5,
+            command=(sys.executable, "-c", "import sys,time;sys.stdin.buffer.read();time.sleep(30)"),
+        )
+    failure = raised.value
+    assert failure.code == "oci-worker-resource" and failure.reaped
+    assert failure.process.poll() is not None
+    assert failure.process.stdin.closed and failure.process.stdout.closed
+    assert all(not thread.is_alive() for thread in starts)
+
+
+def test_helper_constructor_failure_also_reaps_owned_worker(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise MemoryError
+
+    monkeypatch.setattr(materializer.threading, "Thread", fail)
+    with pytest.raises(materializer._WorkerBoundaryFailure) as raised:
+        materializer._spawn_and_exchange(
+            _request(),
+            scratch=tmp_path,
+            timeout_seconds=2,
+            grace_seconds=0.5,
+            command=(sys.executable, "-c", "import time;time.sleep(30)"),
+        )
+    assert raised.value.reaped and raised.value.process.poll() is not None
+    assert raised.value.process.stdin.closed and raised.value.process.stdout.closed
+
+
+def test_interrupted_start_after_actual_thread_creation_reaps_and_joins(tmp_path, monkeypatch):
+    original_start = materializer.threading.Thread.start
+    original_spawn = materializer.subprocess.Popen
+    processes = []
+    threads = []
+
+    def spawn(*args, **kwargs):
+        process = original_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def start(thread):
+        threads.append(thread)
+        original_start(thread)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", spawn)
+    monkeypatch.setattr(materializer.threading.Thread, "start", start)
+    with pytest.raises(KeyboardInterrupt):
+        materializer._spawn_and_exchange(
+            _request(),
+            scratch=tmp_path,
+            timeout_seconds=2,
+            grace_seconds=0.5,
+            command=(sys.executable, "-c", "import time;time.sleep(30)"),
+        )
+    assert processes[0].poll() is not None
+    assert processes[0].stdin.closed and processes[0].stdout.closed
+    assert not threads[0].is_alive()
+
+
+def test_request_serialization_failure_precedes_worker_spawn(tmp_path, monkeypatch):
+    def fail(request):
+        raise MemoryError
+
+    monkeypatch.setattr(OCIWorkerRequest, "to_json_bytes", fail)
+    monkeypatch.setattr(materializer.subprocess, "Popen", lambda *a, **k: pytest.fail("worker spawned"))
+    with pytest.raises(MemoryError):
+        materializer._spawn_and_exchange(_request(), scratch=tmp_path, timeout_seconds=1, grace_seconds=0.1)
+
+
+def test_unreaped_helper_failure_retains_process_and_open_pipes(tmp_path, monkeypatch):
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO()
+
+    process = Process()
+
+    def fail(thread):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", lambda *a, **k: process)
+    monkeypatch.setattr(materializer.threading.Thread, "start", fail)
+    monkeypatch.setattr(materializer, "_terminate_worker", lambda *a: False)
+    with pytest.raises(materializer._WorkerBoundaryFailure) as raised:
+        materializer._spawn_and_exchange(_request(), scratch=tmp_path, timeout_seconds=1, grace_seconds=0.1)
+    assert raised.value.process is process and not raised.value.reaped
+    assert "cleanup is deferred" in str(raised.value)
+    assert not process.stdin.closed and not process.stdout.closed
+
+
+def test_termination_error_during_startup_failure_preserves_unknown_worker_ownership(tmp_path, monkeypatch):
+    class Process:
+        stdin = io.BytesIO()
+        stdout = io.BytesIO()
+
+    process = Process()
+    primary = RuntimeError("can't start new thread")
+
+    def fail(thread):
+        raise primary
+
+    def cleanup(*args):
+        raise OSError(errno.EIO, "uncertain wait")
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", lambda *a, **k: process)
+    monkeypatch.setattr(materializer.threading.Thread, "start", fail)
+    monkeypatch.setattr(materializer, "_terminate_worker", cleanup)
+    with pytest.raises(materializer._WorkerBoundaryFailure) as raised:
+        materializer._spawn_and_exchange(_request(), scratch=tmp_path, timeout_seconds=1, grace_seconds=0.1)
+    assert raised.value.process is process and not raised.value.reaped
+    assert raised.value.__cause__ is primary
+    assert not process.stdin.closed and not process.stdout.closed
+
+
+def test_reaper_start_failure_retains_scratch_but_releases_untransferred_pin(tmp_path, monkeypatch):
+    scratch = tmp_path / "owned-scratch"
+    scratch.mkdir()
+    (scratch / "evidence").write_text("retain")
+    descriptor = os.open(scratch, os.O_RDONLY)
+
+    def fail(thread):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(materializer.threading.Thread, "start", fail)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        materializer._background_reap(object(), scratch, descriptor, tmp_path)
+    assert (scratch / "evidence").read_text() == "retain"
+    with pytest.raises(OSError) as raised:
+        os.fstat(descriptor)
+    assert raised.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("start interrupted"), MemoryError(), KeyboardInterrupt()])
+def test_reaper_exception_after_actual_start_does_not_close_transferred_pin(tmp_path, monkeypatch, failure):
+    scratch = tmp_path / "owned-scratch"
+    scratch.mkdir()
+    descriptor = os.open(scratch, os.O_RDONLY)
+    release = materializer.threading.Event()
+    original_start = materializer.threading.Thread.start
+    threads = []
+    closed = []
+
+    class Process:
+        pid = 12345
+
+        def wait(self):
+            assert release.wait(timeout=2)
+
+    def start(thread):
+        threads.append(thread)
+        original_start(thread)
+        raise failure
+
+    def cleanup(path, fd, parent):
+        os.fstat(fd)
+        closed.append(fd)
+        os.close(fd)
+
+    monkeypatch.setattr(materializer.threading.Thread, "start", start)
+    monkeypatch.setattr(materializer, "_group_exists", lambda pid: False)
+    monkeypatch.setattr(materializer, "_cleanup_scratch", cleanup)
+    try:
+        with pytest.raises(type(failure)) as raised:
+            materializer._background_reap(Process(), scratch, descriptor, tmp_path)
+        assert raised.value is failure
+        os.fstat(descriptor)
+        assert closed == []
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+    assert closed == [descriptor]
+    with pytest.raises(OSError) as raised:
+        os.fstat(descriptor)
+    assert raised.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("failure_point", ["wait", "group"])
+def test_reaper_uncertain_liveness_preserves_scratch_and_releases_pin(tmp_path, monkeypatch, failure_point):
+    scratch = tmp_path / "owned-scratch"
+    scratch.mkdir()
+    descriptor = os.open(scratch, os.O_RDONLY)
+    targets = []
+
+    class Thread:
+        def __init__(self, *, target, **kwargs):
+            targets.append(target)
+
+        def start(self):
+            pass
+
+    class Process:
+        pid = 12345
+
+        def wait(self):
+            if failure_point == "wait":
+                raise OSError(errno.EIO, "uncertain wait")
+
+    def group(pid):
+        raise OSError(errno.EIO, "uncertain group")
+
+    monkeypatch.setattr(materializer.threading, "Thread", Thread)
+    monkeypatch.setattr(materializer, "_group_exists", group)
+    monkeypatch.setattr(materializer, "_cleanup_scratch", lambda *a: pytest.fail("scratch deleted"))
+    materializer._background_reap(Process(), scratch, descriptor, tmp_path)
+    with pytest.raises(OSError, match="uncertain"):
+        targets[0]()
+    assert scratch.is_dir()
+    with pytest.raises(OSError) as raised:
+        os.fstat(descriptor)
+    assert raised.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (OSError(errno.EAGAIN, "private"), "resource"),
+        (OSError(errno.ENOMEM, "private"), "resource"),
+        (MemoryError(), "resource"),
+        (OSError(errno.EACCES, "private"), "internal"),
+        (SquashFSPackError("oci-packer-resource", "private"), "resource"),
+        (SquashFSPackError("oci-packer-spawn", "private"), "pack"),
+    ],
+)
+def test_worker_resource_classification_is_path_free_and_precise(failure, category):
+    assert worker._category(failure) == category
+
+
+def test_worker_process_cap_and_other_limits_are_not_relaxed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker.resource, "getrlimit", lambda limit: (worker.resource.RLIM_INFINITY,) * 2)
+    monkeypatch.setattr(worker.resource, "setrlimit", lambda limit, bounds: calls.append((limit, bounds)))
+    worker._apply_resource_limits(30)
+    assert (worker.resource.RLIMIT_CORE, (0, 0)) in calls
+    assert (worker.resource.RLIMIT_CPU, (30, 30)) in calls
+    assert (worker.resource.RLIMIT_NOFILE, (256, 256)) in calls
+    assert (worker.resource.RLIMIT_FSIZE, (40 * 1024**3,) * 2) in calls
+    if hasattr(worker.resource, "RLIMIT_NPROC"):
+        assert (worker.resource.RLIMIT_NPROC, (256, 256)) in calls
+    if hasattr(worker.resource, "RLIMIT_AS"):
+        assert (worker.resource.RLIMIT_AS, (40 * 1024**3,) * 2) in calls
 
 
 def test_parent_worker_boundary_caps_response_bytes(tmp_path: Path) -> None:

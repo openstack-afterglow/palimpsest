@@ -19,6 +19,7 @@ from .oci_packer import (
     SquashFSPackExecution,
     discover_squashfs_toolchain,
     pack_staged_squashfs,
+    process_resource_failure,
 )
 from .oci_source import SnapshottedOCIImage, SourceCAS, SourceLeaseError, SourceSnapshot
 from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, OCIStore, OCIStoreError
@@ -136,6 +137,8 @@ def _category(exc: BaseException) -> str:
     if isinstance(exc, LayerIntakeError):
         return "intake"
     if isinstance(exc, SquashFSPackError):
+        if exc.code == "oci-packer-resource":
+            return "resource"
         return "toolchain" if exc.code.startswith("oci-packer-toolchain") else "pack"
     if isinstance(exc, ArtifactStoreError):
         return "store"
@@ -143,7 +146,7 @@ def _category(exc: BaseException) -> str:
         return "authority" if "authority" in exc.code or "root" in exc.code else "store"
     if isinstance(exc, ArtifactValidationError):
         return "source"
-    if isinstance(exc, (MemoryError, OSError)):
+    if process_resource_failure(exc):
         return "resource"
     return "internal"
 

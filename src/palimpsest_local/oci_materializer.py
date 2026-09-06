@@ -25,6 +25,8 @@ from .oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
     VerifiedSquashFSToolchain,
+    process_resource_detail,
+    process_resource_failure,
 )
 from .oci_process import OCIProcessSpec
 from .oci_provenance import Descriptor, canonical_json_bytes
@@ -246,15 +248,33 @@ def _background_reap(
     expected_parent: Path,
 ) -> None:
     def reap() -> None:
+        reaped = False
         try:
             process.wait()
             while _group_exists(process.pid):
                 _signal_group(process, signal.SIGKILL)
                 time.sleep(0.05)
+            reaped = True
         finally:
-            _cleanup_scratch(scratch, scratch_fd, expected_parent)
+            if reaped:
+                _cleanup_scratch(scratch, scratch_fd, expected_parent)
+            else:
+                os.close(scratch_fd)
 
-    threading.Thread(target=reap, name="palimpsest-oci-worker-reaper", daemon=True).start()
+    try:
+        thread = threading.Thread(target=reap, name="palimpsest-oci-worker-reaper", daemon=True)
+    except BaseException:
+        os.close(scratch_fd)
+        raise
+    try:
+        thread.start()
+    except BaseException as exc:
+        # As with the I/O helpers, start() can fail after creating a thread.
+        # Only proven native creation failure leaves this pin caller-owned;
+        # an actual or pending reaper must remain its exclusive closer.
+        if thread.ident is None and isinstance(exc, RuntimeError) and str(exc) == "can't start new thread":
+            os.close(scratch_fd)
+        raise
 
 
 def _spawn_and_exchange(
@@ -265,6 +285,11 @@ def _spawn_and_exchange(
     grace_seconds: float,
     command: tuple[str, ...] | None = None,
 ) -> tuple[bytes, int, subprocess.Popen[bytes]]:
+    request_bytes = request.to_json_bytes()
+    output = bytearray()
+    output_overflow = threading.Event()
+    threads: tuple[threading.Thread, ...] = ()
+    start_attempts = 0
     selected_command = command or (sys.executable, "-I", "-m", _WORKER_MODULE)
     try:
         process = subprocess.Popen(
@@ -277,20 +302,22 @@ def _spawn_and_exchange(
             close_fds=True,
             start_new_session=True,
         )
-    except OSError:
+    except (OSError, MemoryError) as exc:
+        if process_resource_failure(exc):
+            raise OCIHardWorkerError("oci-worker-resource", process_resource_detail(exc)) from None
         raise OCIHardWorkerError("oci-worker-spawn", "materializer worker could not be started") from None
-
-    request_bytes = request.to_json_bytes()
-    output = bytearray()
-    output_overflow = threading.Event()
 
     def write_request() -> None:
         assert process.stdin is not None
         try:
             process.stdin.write(request_bytes)
-            process.stdin.close()
         except (BrokenPipeError, OSError):
             pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
 
     def read_response() -> None:
         assert process.stdout is not None
@@ -307,11 +334,61 @@ def _spawn_and_exchange(
                 output.extend(chunk)
         except OSError:
             return
+        finally:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
-    writer = threading.Thread(target=write_request, name="palimpsest-oci-worker-stdin", daemon=True)
-    reader = threading.Thread(target=read_response, name="palimpsest-oci-worker-stdout", daemon=True)
-    writer.start()
-    reader.start()
+    try:
+        writer = threading.Thread(target=write_request, name="palimpsest-oci-worker-stdin", daemon=True)
+        reader = threading.Thread(target=read_response, name="palimpsest-oci-worker-stdout", daemon=True)
+        threads = (writer, reader)
+        for thread in threads:
+            start_attempts += 1
+            thread.start()
+    except BaseException as primary:
+        reaped = False
+        cleanup_failed = False
+        try:
+            reaped = _terminate_worker(process, grace_seconds)
+            if reaped:
+                for index, stream in enumerate((process.stdin, process.stdout)):
+                    if index < start_attempts:
+                        # start() can be interrupted after creating a thread.
+                        # Its owner closes the stream; never contend on that
+                        # buffered lock if actual startup cannot be established.
+                        if threads[index].ident is not None:
+                            threads[index].join(timeout=grace_seconds)
+                        elif (
+                            index == start_attempts - 1
+                            and isinstance(primary, RuntimeError)
+                            and str(primary) == "can't start new thread"
+                        ):
+                            # CPython emits this exact error when native thread
+                            # creation fails, before the thread owns its pipe.
+                            # An asynchronous interruption is not this contract.
+                            if stream is not None:
+                                stream.close()
+                    elif stream is not None:
+                        stream.close()
+        except BaseException:
+            cleanup_failed = True
+        resource_failure = process_resource_failure(primary) or (
+            isinstance(primary, RuntimeError) and str(primary) == "can't start new thread"
+        )
+        if resource_failure or not reaped or cleanup_failed:
+            failure = _WorkerBoundaryFailure(
+                "oci-worker-resource" if resource_failure else "oci-worker-interrupted",
+                "materializer helper thread could not start; check process/thread and memory limits; "
+                + ("worker was reaped" if reaped else "worker cleanup is deferred"),
+                process=process,
+                reaped=reaped,
+            )
+            if cleanup_failed:
+                failure.add_note("helper startup cleanup raised; original worker ownership is retained")
+            raise failure from primary
+        raise
     try:
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -434,7 +511,13 @@ def materialize_layer_hard(
         if response.status == "failed":
             raise OCIHardWorkerError(
                 f"oci-worker-{response.error_category}",
-                "materializer worker failed inside its isolated boundary",
+                (
+                    "materializer worker reported a resource failure; check process/thread, memory, and "
+                    "service/cgroup limits; worker RLIMIT_NPROC remains capped at 256; "
+                    "the exact limiting resource is not identified"
+                    if response.error_category == "resource"
+                    else "materializer worker failed inside its isolated boundary"
+                ),
             )
         if response.result is None:
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker omitted its result")
@@ -452,13 +535,23 @@ def materialize_layer_hard(
         process = exc.process
         deferred_cleanup = not exc.reaped
         if deferred_cleanup:
-            _background_reap(process, scratch, scratch_fd, scratch_parent)
+            try:
+                _background_reap(process, scratch, scratch_fd, scratch_parent)
+            except BaseException:
+                exc.add_note(
+                    "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
+                )
         raise exc
     except OCIHardWorkerError as exc:
         if process is not None and process.poll() is None:
             deferred_cleanup = not _terminate_worker(process, float(terminate_grace_seconds))
             if deferred_cleanup:
-                _background_reap(process, scratch, scratch_fd, scratch_parent)
+                try:
+                    _background_reap(process, scratch, scratch_fd, scratch_parent)
+                except BaseException:
+                    exc.add_note(
+                        "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
+                    )
         raise exc
     finally:
         if not deferred_cleanup:

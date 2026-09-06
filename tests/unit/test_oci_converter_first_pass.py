@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import gzip
 import hashlib
 import io
@@ -681,6 +682,47 @@ def test_packer_interruption_terminates_and_reaps_the_process_group(
 
     assert process.waits == 2
     assert signals == [(process.pid, oci_packer.signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("number", [errno.EAGAIN, errno.ENOMEM, errno.EACCES, errno.ENOENT])
+@pytest.mark.parametrize("entry", ["pinned", "version", "dependencies"])
+def test_packer_process_admission_reports_resource_errno_without_retry(tmp_path, monkeypatch, number, entry):
+    packer = tmp_path / "mksquashfs"
+    packer.write_bytes(b"packer")
+    bound = oci_packer._bind_toolchain_file(packer)
+    monkeypatch.setattr(oci_packer, "_bind_toolchain_file", lambda *a: bound)
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(kwargs)
+        raise OSError(number, "/private/host/detail")
+
+    monkeypatch.setattr(oci_packer.subprocess, "run", fail)
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", fail)
+    monkeypatch.setattr(oci_packer.sys, "platform", "linux")
+    if entry == "dependencies":
+        monkeypatch.setattr(Path, "is_file", lambda path: True)
+    with pytest.raises(SquashFSPackError) as raised:
+        if entry == "pinned":
+            oci_packer._run_pinned(
+                1, ["-version"], cwd_fd=2, stdin=-3, timeout_seconds=1, grace_seconds=0.1, capture_output=True
+            )
+        elif entry == "version":
+            oci_packer.discover_squashfs_toolchain(packer, expected_packer_sha256=bound.digest.removeprefix("sha256:"))
+        else:
+            oci_packer._discover_dependency_paths(packer)
+    expected = (
+        "oci-packer-resource"
+        if number in {errno.EAGAIN, errno.ENOMEM}
+        else {"pinned": "oci-packer-spawn", "version": "oci-packer-version", "dependencies": "oci-packer-toolchain"}[
+            entry
+        ]
+    )
+    assert raised.value.code == expected
+    assert "/private/host/detail" not in str(raised.value)
+    assert len(calls) == 1
+    if entry == "pinned":
+        assert calls[0]["stdout"].closed
 
 
 def test_supervised_packer_inherits_outer_group_and_terminates_only_child(

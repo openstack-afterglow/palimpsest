@@ -28,6 +28,7 @@ def case(monkeypatch):
         reason="completed",
         terminal_none=False,
         mutate=lambda x: x,
+        mutate_status=lambda x: x,
     )
     value.control.mark_ready()
 
@@ -52,6 +53,8 @@ def case(monkeypatch):
                         value.reason,
                     )
             result = getattr(value.control, operation)(**payload)
+            if operation == "status":
+                return value.mutate_status(result)
             return value.mutate(result) if operation == "poll" else result
 
         def close(self):
@@ -142,6 +145,65 @@ def test_closed_reader_does_not_reexec_or_stop_guest(case):
     with pytest.raises(StateError):
         open_session()
     assert len([call for call in case.calls if isinstance(call, tuple) and call[0] == "submit"]) == 1
+
+
+@pytest.mark.parametrize("occupied", [False, True])
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [
+        ("not-ready", "check the run status and wait for authenticated READY"),
+        ("stopping", "wait for shutdown and inspect existing results"),
+        ("terminal", "run has ended; inspect the run's terminal result"),
+        ("control-lost", "do not rerun a command whose outcome is unknown"),
+    ],
+)
+def test_lifecycle_refusal_is_specific_and_never_submits_or_acknowledges(case, state, occupied, message):
+    case.mutate_status = lambda result: {**result, "state": state, "occupied": occupied}
+    with pytest.raises(StateError, match=message):
+        open_session()
+    assert case.calls == ["client", ("status", {}), "close"]
+
+
+@pytest.mark.parametrize("phase", ["queued", "running", "completed"])
+def test_occupied_does_not_claim_abandonment_or_take_over_a_result(case, phase):
+    original = open_session()
+    if phase != "queued":
+        job = case.control.take_exec()
+        if phase == "completed":
+            case.control.complete(job, {"exit_code": 0, "signal": None}, 0, 0, "completed")
+    before = case.control.status()
+    case.calls.clear()
+    with pytest.raises(StateError, match="may still be active or its result may be unacknowledged") as exc:
+        open_session()
+    assert "original client" in str(exc.value)
+    assert "result takeover is not supported" in str(exc.value)
+    assert "unknown outcome must not be rerun" in str(exc.value)
+    assert "abandoned" not in str(exc.value)
+    assert case.calls == ["client", ("status", {}), "close"]
+    assert case.control.status() == before
+    original.close()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        None,
+        [],
+        {},
+        {"state": "ready", "next_sequence": 1, "occupied": False, "extra": True},
+        *({"state": state, "next_sequence": 1, "occupied": False} for state in ("unknown", None, [], {}, 1)),
+        *(
+            {"state": "ready", "next_sequence": sequence, "occupied": False}
+            for sequence in (True, 0, sessions.MAX_EXEC_SEQUENCE + 1, "1")
+        ),
+        {"state": "ready", "next_sequence": 1, "occupied": 0},
+    ],
+)
+def test_invalid_status_is_rejected_without_submit_or_ack(case, status):
+    case.mutate_status = lambda result: status
+    with pytest.raises(StateError, match="mailbox status is invalid"):
+        open_session()
+    assert case.calls == ["client", ("status", {}), "close"]
 
 
 def test_same_vm_accepts_next_exec_only_after_previous_result_is_acknowledged(case):

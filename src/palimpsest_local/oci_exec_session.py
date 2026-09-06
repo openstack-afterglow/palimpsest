@@ -53,8 +53,7 @@ class OCIExecProcessSession:
             self._client = MonitorClient(roots, binding, endpoint)
             status = self._request("status", {})
             self._validate_status(status)
-            if status["state"] != "ready" or status["occupied"]:
-                raise StateError("OCI exec is not ready or another result is still owned")
+            self._require_ready(status)
             self._sequence = status["next_sequence"]
             self._decode(self._request("submit", {**self._identity(), "argv": list(argv), "timeout_ms": timeout_ms}))
         except BaseException:
@@ -78,12 +77,33 @@ class OCIExecProcessSession:
         if (
             type(value) is not dict
             or set(value) != {"state", "next_sequence", "occupied"}
+            or type(value["state"]) is not str
             or value["state"] not in {"not-ready", "ready", "stopping", "terminal", "control-lost"}
             or type(value["next_sequence"]) is not int
             or not 1 <= value["next_sequence"] <= MAX_EXEC_SEQUENCE
             or type(value["occupied"]) is not bool
         ):
             raise StateError("OCI exec mailbox status is invalid")
+
+    @staticmethod
+    def _require_ready(status):
+        refusals = {
+            "not-ready": "OCI exec is not ready; check the run status and wait for authenticated READY",
+            "stopping": "OCI exec is unavailable while the run is stopping; wait for shutdown and inspect existing results",
+            "terminal": "OCI exec is unavailable because the run has ended; inspect the run's terminal result",
+            "control-lost": (
+                "OCI exec control was lost; preserve the run evidence and inspect the original client's result; "
+                "do not rerun a command whose outcome is unknown"
+            ),
+        }
+        if status["state"] != "ready":
+            raise StateError(refusals[status["state"]])
+        if status["occupied"]:
+            raise StateError(
+                "OCI exec is occupied: a previous command may still be active or its result may be unacknowledged; "
+                "let the original client finish consuming its result; result takeover is not supported, "
+                "and a command with an unknown outcome must not be rerun"
+            )
 
     def _decode(self, value):
         expected = {
