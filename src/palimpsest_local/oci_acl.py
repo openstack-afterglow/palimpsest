@@ -1,7 +1,8 @@
 """Private, exact-FD Linux ACL I/O; no ownership or lifecycle decisions.
 
-Only private baselines, OCI I/O grants, and run-search grants are understood. The caller owns the
-descriptor, identity checks, durable intent, fsync and any recovery policy.
+Only private baselines, OCI I/O/run-search grants, and immutable stage-1 read
+grants are understood. The caller owns the descriptor, identity checks,
+durable intent, fsync and any recovery policy.
 Command failure is ambiguous and never triggers an implicit restoration.
 """
 
@@ -44,7 +45,7 @@ class ACLStructure:
             or type(self.group) is not str
             or type(self.other) is not str
             or (self.mask is not None and type(self.mask) is not str)
-            or self.user not in {"rwx", "rw-"}
+            or self.user not in {"rwx", "rw-", "r--"}
             or self.group != "---"
             or self.other != "---"
         ):
@@ -56,7 +57,7 @@ class ACLStructure:
                 raise _invalid()
             return
         entry = self.named_users[0]
-        permissions = {"-wx", "--x"} if self.user == "rwx" else {"rw-"}
+        permissions = {"-wx", "--x"} if self.user == "rwx" else {self.user}
         if (
             type(entry) is not tuple
             or len(entry) != 2
@@ -112,7 +113,7 @@ def grant_acl(baseline: ACLStructure, uid: int) -> ACLStructure:
     if type(baseline) is not ACLStructure:
         raise _invalid()
     baseline.__post_init__()
-    if baseline.named_users:
+    if baseline.named_users or baseline.user not in {"rwx", "rw-"}:
         raise _invalid()
     permission = "-wx" if baseline.user == "rwx" else "rw-"
     return ACLStructure(baseline.user, ((uid, permission),), "---", permission, "---")
@@ -125,6 +126,14 @@ def traversal_acl(baseline: ACLStructure, uid: int) -> ACLStructure:
     return ACLStructure("rwx", ((uid, "--x"),), "---", "--x", "---")
 
 
+def readonly_baseline_acl() -> ACLStructure:
+    return ACLStructure("r--", (), "---", None, "---")
+
+
+def readonly_grant_acl(uid: int) -> ACLStructure:
+    return ACLStructure("r--", ((uid, "r--"),), "---", "r--", "---")
+
+
 def parse_acl(payload: str) -> ACLStructure:
     """Parse only canonical numeric GNU getfacl output, including one blank tail."""
     if type(payload) is not str or not payload.endswith("\n") or len(payload) > _MAX_ACL_BYTES or "\r" in payload:
@@ -135,14 +144,14 @@ def parse_acl(payload: str) -> ACLStructure:
         lines.pop()
     if len(lines) not in {3, 5}:
         raise _invalid()
-    user = re.fullmatch(r"user::(rwx|rw-)", lines[0])
+    user = re.fullmatch(r"user::(rwx|rw-|r--)", lines[0])
     if user is None:
         raise _invalid()
     named: tuple[tuple[int, str], ...] = ()
     mask = None
     if len(lines) == 5:
-        entry = re.fullmatch(r"user:(0|[1-9][0-9]{0,9}):(-wx|rw-|--x)", lines[1])
-        mask_entry = re.fullmatch(r"mask::(-wx|rw-|--x)", lines[3])
+        entry = re.fullmatch(r"user:(0|[1-9][0-9]{0,9}):(-wx|rw-|--x|r--)", lines[1])
+        mask_entry = re.fullmatch(r"mask::(-wx|rw-|--x|r--)", lines[3])
         if entry is None or mask_entry is None or lines[2] != "group::---":
             raise _invalid()
         named = ((int(entry.group(1)), entry.group(2)),)

@@ -12,7 +12,7 @@ import json
 import os
 import stat
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -250,6 +250,7 @@ def verify_stage1_transport_file(
     receipt: OCIStage1TransportReceipt,
     *,
     expected_stage1_plan: OCIStage1Plan,
+    access_validator: Callable[[int], None] | None = None,
 ) -> VerifiedOCIStage1Transport:
     """Pin a run-owned raw transport and verify it through one descriptor."""
 
@@ -270,12 +271,15 @@ def verify_stage1_transport_file(
             raise StateError("stage-1 transport metadata is unsafe")
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
         opened = os.fstat(descriptor)
+        if access_validator is not None:
+            access_validator(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
             or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
             or opened.st_uid != os.geteuid()
             or opened.st_nlink != 1
-            or stat.S_IMODE(opened.st_mode) != 0o400
+            or stat.S_IMODE(opened.st_mode) not in {0o400, 0o440}
+            or (access_validator is None and stat.S_IMODE(opened.st_mode) != 0o400)
             or opened.st_size != receipt.artifact_size_bytes
         ):
             raise StateError("stage-1 transport metadata is unsafe")
@@ -312,6 +316,12 @@ def verify_stage1_transport_file(
 
         if stable(after) != stable(opened) or stable(final) != stable(opened):
             raise StateError("stage-1 transport changed during verification")
+        if access_validator is not None:
+            access_validator(descriptor)
+            if stable(os.fstat(descriptor)) != stable(opened) or stable(path.stat(follow_symlinks=False)) != stable(
+                opened
+            ):
+                raise StateError("stage-1 transport changed during access verification")
         return VerifiedOCIStage1Transport(path, receipt, plan, opened.st_dev, opened.st_ino)
     except FileNotFoundError:
         raise StateError("stage-1 transport is missing") from None

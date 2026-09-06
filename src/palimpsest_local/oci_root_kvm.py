@@ -1077,11 +1077,11 @@ def load_oci_root_domain_plan(roots: StatePaths, name: str) -> OCIRootDomainPlan
     except (ArtifactValidationError, KeyError, TypeError):
         raise StateError("OCI-root stage-1 transport ledger binding is invalid") from None
     expected_stage1 = OCIStage1Plan.from_domain_plan(plan)
-    verified_transport = verify_stage1_transport_file(
-        run_paths(roots, name).root / OCI_STAGE1_TRANSPORT_FILENAME,
-        transport_receipt,
-        expected_stage1_plan=expected_stage1,
-    )
+    from .oci_stage1_access import verify_run_stage1_transport
+
+    verified_transport = verify_run_stage1_transport(roots, snapshot, plan)
+    if verified_transport.receipt != transport_receipt:
+        raise StateError("OCI-root stage-1 transport receipt changed")
     if verified_transport.plan != expected_stage1:
         raise StateError("OCI-root stage-1 transport ledger projection is invalid")
     return plan
@@ -1217,11 +1217,11 @@ def resolve_committed_oci_root_domain_plan(
     if _plain_json(plan.stage1_transport) != transport_contract:
         raise StateError("OCI-root stage-1 transport projection is invalid")
     transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
-    verified_transport = verify_stage1_transport_file(
-        transport_path,
-        built_transport.receipt,
-        expected_stage1_plan=expected_stage1,
-    )
+    from .oci_stage1_access import verify_run_stage1_transport
+
+    verified_transport = verify_run_stage1_transport(roots, snapshot, plan)
+    if verified_transport.receipt != built_transport.receipt:
+        raise StateError("OCI-root stage-1 transport receipt changed")
     if verified_transport.plan != expected_stage1:
         raise StateError("OCI-root stage-1 transport changed before domain definition")
     lifecycle_socket = runtime_io_paths(run_paths(roots, plan.run_name).root).lifecycle_socket

@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v7"
+_SCHEMA = "palimpsest.monitor-launch-authority.v8"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -97,7 +97,7 @@ def _validate_entry_metadata(
     owner_uid: int,
 ) -> None:
     """Check immutable metadata independently of path traversal and FD rights."""
-    is_directory = key not in {"kernel", "initramfs", "runtime_console"}
+    is_directory = key not in {"kernel", "initramfs", "runtime_console", "stage1_transport"}
     fields = ("device", "inode", "uid", "gid", "mode") if is_directory else tuple(_ENTRY_FIELDS - {"fd", "path"})
     if key == "runtime_console":
         # QEMU output is not trusted state: content, size and timestamps may change.
@@ -214,6 +214,7 @@ class MonitorLaunchAuthority:
                 "runtime_access",
                 "shared_traversal",
                 "root_access",
+                "stage1_access",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -229,6 +230,10 @@ class MonitorLaunchAuthority:
             paths = _paths(roots, binding.record.name)
             if value["shared_traversal"] is not None:
                 paths["root_volumes"] = roots.oci_root_volumes
+            if value["stage1_access"] is not None:
+                from .oci_stage1_transport import OCI_STAGE1_TRANSPORT_FILENAME
+
+                paths["stage1_transport"] = roots.runs / binding.record.name / OCI_STAGE1_TRANSPORT_FILENAME
             if value["root_access"] is not None:
                 from .oci_root_access import RootAccessReceipt
                 from .oci_root_volume import _paths as volume_paths
@@ -302,6 +307,18 @@ class MonitorLaunchAuthority:
                 raise _invalid()
             access = self._frame["runtime_access"]
             root_access = self._frame["root_access"]
+            stage1_access = self._frame["stage1_access"]
+            from .oci_stage1_access import verify_stage1_launch
+
+            stage1_stamp = verify_stage1_launch(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                stage1_access,
+                self._frame["entries"]["run"]["fd"],
+                self._frame["entries"].get("stage1_transport", {}).get("fd"),
+                binding=selected,
+            )
             from .oci_root_access import verify_root_launch_member
 
             verify_root_launch_member(
@@ -355,7 +372,7 @@ class MonitorLaunchAuthority:
                     runs_directory_fd=self._frame["entries"]["runs"]["fd"],
                 )
             for key, entry in self._frame["entries"].items():
-                is_directory = key not in {"kernel", "initramfs", "runtime_console", "root_disk"}
+                is_directory = key not in {"kernel", "initramfs", "runtime_console", "root_disk", "stage1_transport"}
                 opened = os.fstat(entry["fd"])
                 flags = fcntl.fcntl(entry["fd"], fcntl.F_GETFL)
                 if flags & os.O_ACCMODE != os.O_RDONLY or flags & getattr(os, "O_PATH", 0):
@@ -407,6 +424,17 @@ class MonitorLaunchAuthority:
                 runs_fd=self._frame["entries"]["runs"]["fd"],
                 root_volumes_fd=self._frame["entries"].get("root_volumes", {}).get("fd"),
                 run_fd=self._frame["entries"]["run"]["fd"],
+            )
+            verify_stage1_launch(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                stage1_access,
+                self._frame["entries"]["run"]["fd"],
+                self._frame["entries"].get("stage1_transport", {}).get("fd"),
+                binding=selected,
+                metadata_only=True,
+                expected_stamp=stage1_stamp,
             )
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
@@ -520,6 +548,11 @@ def prepare_monitor_launch_authority(
                 if shared_traversal is not None:
                     paths["root_volumes"] = roots.oci_root_volumes
                 root_access = mutation.mutable_state().get("oci_root_access")
+                stage1_access = mutation.mutable_state().get("oci_stage1_access")
+                if stage1_access is not None:
+                    from .oci_stage1_transport import OCI_STAGE1_TRANSPORT_FILENAME
+
+                    paths["stage1_transport"] = roots.runs / binding.record.name / OCI_STAGE1_TRANSPORT_FILENAME
                 if root_access is not None:
                     from .oci_root_access import RootAccessReceipt
                     from .oci_root_volume import _paths as volume_paths
@@ -528,7 +561,11 @@ def prepare_monitor_launch_authority(
                     paths["root_disk"] = volume_paths(roots, member.volume.volume_id)[0]
                 for name, path in paths.items():
                     path = _path(str(path))
-                    fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console", "root_disk"})
+                    fd = _open(
+                        path,
+                        directory=name
+                        not in {"kernel", "initramfs", "runtime_console", "root_disk", "stage1_transport"},
+                    )
                     opened.append(fd)
                     entries[name] = _entry(path, fd)
                 runtime_io.verify(require_socket_absent=True)
@@ -547,6 +584,7 @@ def prepare_monitor_launch_authority(
             "runtime_access": runtime_access,
             "shared_traversal": shared_traversal,
             "root_access": root_access,
+            "stage1_access": stage1_access,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

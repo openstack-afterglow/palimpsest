@@ -522,6 +522,29 @@ two-member lifetime and survivor authority are portable evidence. BOOT/shared
 exports, external host ancestors, relabeling, public dispatch and Gate 2 remain
 outside this slice.
 
+Slice 30U manages the exact run-owned `stage1-plan.raw` as the first immutable
+BOOT access target. Its owner-read-only baseline is0400; a distinct policy grants
+named-QEMU `r--` as0440, without any write permission. Content hashes, transport
+framing, plan provenance, single-link identity and exact ACL checks remain
+mandatory. The legacy verifier does not accept0440 by mode alone.
+
+The run-bound durable access receipt and fresh-exec v8 transport FD must agree
+with current run state. Missing/null/older launch evidence cannot bypass a
+later managed grant. After inactive-domain cleanup, the original terminal
+writer must be stale before revocation can restore0400. Stage-1 revoke precedes
+root revoke, runtime I/O revoke and shared leave; an outstanding stage-1 grant
+blocks shared departure.
+An immutable metadata snapshot, including ctime, spans later callbacks as well
+as final payload verification, rejecting same-mode ACL principal drift.
+
+The stale-cleanup native child now has eight product ACL targets, including
+stage-1 in both fixture-broker exclusion sets. It verifies active read access,
+LIVE-writer refusal, unchanged bytes/ownership and final baseline recovery.
+The retained successor remains fixture-adapted. Stage-1 already has source
+DAC `relabel=no`; kernel/initramfs relabeling, shared lower exports and their
+membership/GC policy are not implemented by this slice. Canonical CAS remains
+owner-private, and public dispatch and Gate 2 remain disabled.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

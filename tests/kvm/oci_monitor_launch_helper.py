@@ -144,7 +144,7 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
         # The control socket and ownership journal are never QEMU resources.
         if key == "monitor" or (
             context.get("product_io", False)
-            and key in {"run", "runtime_io", "runtime_console", "root_disk", "root_volumes"}
+            and key in {"run", "runtime_io", "runtime_console", "root_disk", "root_volumes", "stage1_transport"}
         ):
             return original_metadata(key, entry, opened, visible, owner_uid)
         broker = context.get("broker")

@@ -77,7 +77,7 @@ def test_acl_exact_roundtrip(directory, extended, blank_tail):
         "user::rw-\nuser:107:rw-\t#effective:r--\ngroup::---\nmask::rw-\nother::---\n",
         "user::rw-\ngroup::r--\nother::---\n",
         "user::rw-\ngroup::---\nother::r--\n",
-        "user::r--\ngroup::---\nother::---\n",
+        "user::r--\nuser:107:rw-\ngroup::---\nmask::rw-\nother::---\n",
         "user::rw-\nmask::rw-\ngroup::---\nother::---\n",
         "user::rw-\ngroup::---\nmask::---\nother::---\n",
         "user::rw-\ngroup::---\nother::--- \n",

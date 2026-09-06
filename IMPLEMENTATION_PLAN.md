@@ -1656,6 +1656,47 @@ simultaneous two-member lifetime is covered by portable tests. External host
 ancestors, BOOT/shared immutable exports, relabel policy, public dispatch and
 Gate 2 remain subsequent work.
 
+### PR 4 slice 30U: manage read-only stage-1 transport access
+
+The first immutable BOOT access slice covers only the exact run-owned
+`stage1-plan.raw`. Its baseline remains owner-read-only mode0400. A separate
+read-only ACL policy grants the selected QEMU identity exactly `r--` with
+mode0440, never owner or QEMU write permission. Existing mutable root and I/O
+grant policies remain separate.
+
+A run-bound access receipt ties the monitor attempt, committed domain plan,
+transport receipt, content digest and held file identity to durable grant and
+revocation phases. Full transport framing and provenance checks remain in
+place. The unmanaged file verifier still requires its original owner-only
+policy; mode0440 is not accepted without explicit managed authority.
+
+Fresh-exec authority v8 carries the managed stage-1 transport FD and receipt.
+Current run evidence is checked against omitted/null/old frames, with a final
+callback-free validation after external lookups. Earlier private v7 frames
+fail closed; this is not a public state migration.
+The immutable metadata snapshot, including ctime, bridges the original ACL
+check and later callbacks so an ACL principal change with unchanged mode and
+bytes is also refused. Final content verification does not substitute for this
+metadata continuity check.
+
+Teardown revokes stage-1 access after completed inactive-domain cleanup and
+proof that the terminal journal writer is stale, before runtime traversal is
+retired. The workflow is stage-1 revoke, root revoke, runtime I/O revoke,
+shared leave, then retain/reclaim. Shared departure refuses an outstanding
+managed stage-1 grant; completed left replay remains historical.
+
+Native qualification promotes this file to the eighth product ACL target in
+both parent and fresh-exec child. It checks active read-only ACLs, live-writer
+revocation refusal, final baseline restoration and unchanged file identity and
+bytes. The retained-root successor still uses fixture access.
+
+Kernel/initramfs and lower-image exports remain subsequent work: canonical
+CAS objects must not be chmod-opened to QEMU, shared exports need their own
+membership and reclamation contract, and BOOT ownership/relabeling must be
+selected before committing the domain projection. The existing stage-1 disk
+continues to use explicit source DAC `relabel=no`; this does not resolve BOOT
+relabel policy or enable public dispatch or Gate 2.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1674,7 +1715,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable access boundary to BOOT/shared-artifact exports with an
+1. Extend the durable access boundary to kernel/initramfs and shared lower-artifact exports with an
    explicit relabel policy,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
