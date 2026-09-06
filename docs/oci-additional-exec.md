@@ -107,6 +107,29 @@ This does not promise automatic recovery when the host cannot start a reaper.
 
 ## Qualification and Gate 2 boundary
 
+### Resource/diagnostic follow-up verification (2026-09-07)
+
+Implementation `a4903d0e24572058689c285c0b3326809dc628d8` was independently
+reviewed, pushed and fetched on `pieroot-server`. Focused local tests passed
+239 cases, with seven Linux-only skips. The same seven selected files passed
+all 246 cases on the server in 14.63 seconds, including worker/helper/reaper
+failure injection and pinned-packer errno cases. Ruff, formatting and test-lane
+manifest checks passed; this is not a full-suite result.
+
+The separate public CLI native test passed at that exact implementation SHA
+(one test, 20.13 seconds). A new runtime state directory forced cold layer
+materialization from the existing immutable Palimpsest-built archive. Real
+run/exec/stop/rm preserved literal argv, split output, exit statuses, image root
+marker, failure recovery and source archive contents. The original PID 1 probe
+still produced the expected access denial in this isolation check; Gate 2 was
+not rerun or declared passed. No guest policy, root-proof criterion, resource
+limit, Docker service or source artifact was changed.
+
+Server logs: `/tmp/palimpsest-34-selected-a4903d0.log` and
+`/tmp/palimpsest-34-public-exec-a4903d0.log`. The successful public fixture
+`/tmp/p-execcli-c40a2261` was removed by the test after normal VM removal.
+Pre-existing failure evidence was not targeted.
+
 `tests/kvm/test_oci_exec_live.py` is an explicit engine proof using public
 run/stop/rm and the production exec process API. It requires
 `PALIMPSEST_OCI_EXEC_LIVE=1`, `PALIMPSEST_OCI_EXEC_LIVE_IMAGE` pointing to a

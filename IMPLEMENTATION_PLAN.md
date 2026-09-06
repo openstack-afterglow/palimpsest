@@ -1965,3 +1965,11 @@ automatic replay, relaxed guest isolation, or a changed Gate 2 probe. Verify
 the selected worker/packer and exec tests separately, then push and execute the
 public exec native proof on the exact server SHA. Full suites are not the
 per-edit requirement; recovery UX and root-proof policy remain separate work.
+
+Implemented and independently reviewed at
+`a4903d0e24572058689c285c0b3326809dc628d8`. The exact pushed server checkout
+passed 246 selected tests (14.63 s) and the separate cold public exec CLI native
+proof (20.13 s). Local focused checks passed 239 with seven Linux-only skips;
+server checks covered those seven. Gate 2's known protection/probe conflict
+remains unresolved. The user-approved prior Docker/PID 1 summary was recorded
+and read back in Notion section 17.85, without operational paths or process IDs.
