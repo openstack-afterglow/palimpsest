@@ -71,6 +71,21 @@ def _file(name: str, payload: bytes = b"payload") -> tuple[tarfile.TarInfo, byte
     return member, payload
 
 
+def _assert_single_file_normalized_tar(
+    tar_snapshot: bytes,
+    member: tarfile.TarInfo,
+    payload: bytes,
+) -> None:
+    with tarfile.open(fileobj=io.BytesIO(tar_snapshot), mode="r:") as archive:
+        assert archive.getnames() == [".", member.name]
+        assert archive.getmember(".").isdir()
+        packed_member = archive.getmember(member.name)
+        packed_payload = archive.extractfile(packed_member)
+        assert packed_member.isfile()
+        assert packed_payload is not None
+        assert packed_payload.read() == payload
+
+
 def _descriptor(payload: bytes, media_type: str) -> Descriptor:
     return Descriptor(
         media_type=media_type,
@@ -838,6 +853,19 @@ def test_pinned_version_caller_preserves_popen_memoryerror_stage_without_invente
     assert calls[0]["stdout"].closed
 
 
+def test_portable_normalized_tar_snapshot_synthesizes_root_and_preserves_payload(tmp_path: Path) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    normalized = io.BytesIO()
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        receipt = staged.emit_overlay_tar(normalized)
+
+    assert receipt.entries == 2
+    _assert_single_file_normalized_tar(normalized.getvalue(), member, payload)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer caller requires Linux")
 def test_pack_staged_caller_assigns_final_popen_stage_without_invented_errno(
     tmp_path: Path,
@@ -869,13 +897,7 @@ def test_pack_staged_caller_assigns_final_popen_stage_without_invented_errno(
         assert stdin_stat.st_size <= 64 * 1024
         tar_snapshot = os.pread(stdin_fd, stdin_stat.st_size, 0)
         assert len(tar_snapshot) == stdin_stat.st_size
-        with tarfile.open(fileobj=io.BytesIO(tar_snapshot), mode="r:") as archive:
-            assert archive.getnames() == [member.name]
-            packed_member = archive.getmember(member.name)
-            packed_payload = archive.extractfile(packed_member)
-            assert packed_member.isfile()
-            assert packed_payload is not None
-            assert packed_payload.read() == payload
+        _assert_single_file_normalized_tar(tar_snapshot, member, payload)
         assert stdin_stat.st_nlink == 0
         assert kwargs["executable"] == oci_packer._fd_path(kwargs["pass_fds"][0])
         assert kwargs["cwd"] == oci_packer._fd_path(kwargs["pass_fds"][1])
