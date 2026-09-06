@@ -851,9 +851,7 @@ def test_stopping_boundary_after_accepted_reconnect_preserves_stop_causality() -
             "last_attempted_g2h_wire_sequence": 5,
             "lifecycle_state": stopping,
             "previous_epoch": 2,
-            "state_digest": lifecycle_state_digest(
-                "stopping", stop_request_id=stop.body.request_id, terminal=None
-            ),
+            "state_digest": lifecycle_state_digest("stopping", stop_request_id=stop.body.request_id, terminal=None),
         },
     )
     next_ack = sign_message(next_ack_body, KEY, carrier=OCI_CONTROL_CONSOLE_CARRIER)

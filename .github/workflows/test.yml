@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  pure:
-    name: Pure contracts (Python 3.12)
+  checks:
+    name: Lint, manifests, and package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,11 +24,39 @@ jobs:
       - run: uv run python tests/fixtures/oci-root/generate_fixtures.py --check
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run python -m pytest tests/unit -v
-      - run: uv run python -m pytest tests/oci_fs -m "not oci_fs" -v
+      - run: uv run python scripts/test_lanes.py list --check
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz
+
+  portable-linux:
+    name: Portable Linux (${{ matrix.shard }}/6)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - run: uv run python scripts/test_lanes.py run portable --shard ${{ matrix.shard }}/6
+
+  pure:
+    name: Pure contracts (Python 3.12)
+    if: always()
+    needs: [checks, portable-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every portable shard and package check
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          PORTABLE_RESULT: ${{ needs.portable-linux.result }}
+        run: test "$CHECKS_RESULT" = success && test "$PORTABLE_RESULT" = success
 
   oci-fs-proof:
     name: OCI filesystem proof (privileged Linux)
@@ -112,9 +140,14 @@ jobs:
         run: uv run python tests/kvm/assets/check_filesystem_fixtures.py
 
 
-  unit-macos:
-    name: Unit tests (macOS 15)
+  portable-macos:
+    name: Portable macOS (${{ matrix.shard }}/4)
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -123,7 +156,18 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --extra dev
       - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
-      - run: uv run python -m pytest tests/unit -v
+      - run: uv run python scripts/test_lanes.py run portable --shard ${{ matrix.shard }}/4
+
+  unit-macos:
+    name: Unit tests (macOS 15)
+    if: always()
+    needs: [portable-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every macOS portable shard
+        env:
+          PORTABLE_RESULT: ${{ needs.portable-macos.result }}
+        run: test "$PORTABLE_RESULT" = success
   hub:
     name: Hub tests, lint, and build
     runs-on: ubuntu-latest

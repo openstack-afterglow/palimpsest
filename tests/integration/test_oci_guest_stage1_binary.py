@@ -274,9 +274,7 @@ def test_freestanding_binary_requires_canonical_default_path_projection(
 ) -> None:
     plan = _plan()
     value = plan.to_dict()
-    value["process"]["environment"] = [
-        item for item in value["process"]["environment"] if item["name"] != "PATH"
-    ]
+    value["process"]["environment"] = [item for item in value["process"]["environment"] if item["name"] != "PATH"]
     artifact = _envelope(canonical_json_bytes(value))
     bindings = parse_guest_kernel_cmdline(_cmdline(plan, f"sha256:{hashlib.sha256(artifact).hexdigest()}"))
     with pytest.raises(ArtifactValidationError, match="semantics"):
@@ -296,9 +294,13 @@ def test_freestanding_binary_accepts_exact_process_byte_limit_with_omitted_group
     built = build_stage1_transport(plan)
     _write_fixture(tmp_path, plan, built.artifact)
 
-    assert sum(len(value.encode("utf-8")) + 1 for value in process.argv) + sum(
-        len(name.encode()) + len(value.encode("utf-8")) + 2 for name, value in process.environment
-    ) + len(process.cwd.encode("utf-8")) + len(str(process.user.to_dict()).encode()) == MAX_PROCESS_BYTES
+    assert (
+        sum(len(value.encode("utf-8")) + 1 for value in process.argv)
+        + sum(len(name.encode()) + len(value.encode("utf-8")) + 2 for name, value in process.environment)
+        + len(process.cwd.encode("utf-8"))
+        + len(str(process.user.to_dict()).encode())
+        == MAX_PROCESS_BYTES
+    )
     assert _run(scratch_image, tmp_path).returncode == 0
 
 

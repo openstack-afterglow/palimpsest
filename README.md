@@ -365,9 +365,19 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
-uv run python -m pytest tests/unit tests/integration -q
+uv run python scripts/test_lanes.py list --check
+uv run python scripts/test_lanes.py plan --changed HEAD
+uv run python scripts/test_lanes.py run --changed HEAD --dry-run
 uv build
 ```
+
+Use the suggested functional lanes during development, rather than rerunning
+every test after each edit. For example, `run oci-monitor` exercises monitor
+contracts, and `run portable --shard 1/6` runs one deterministic sixth of the
+portable test cases. `run full` remains an explicit broad regression command;
+native KVM, privileged filesystem, BuildKit and Gate 2 proofs are separate
+opt-in lanes, not substitutes for portable tests. See the
+[test workflow](docs/testing.md) for selection rules and release checks.
 
 ## Project references
 

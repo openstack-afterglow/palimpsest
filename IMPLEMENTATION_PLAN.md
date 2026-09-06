@@ -1763,20 +1763,49 @@ palimpsest build local-pinned-base → OCI archive
 
 Gate 2 activation requires all of the following, not merely successful layer conversion: local OCI archive/layout intake, bootable OCI-root run request and KVM adapter, host kernel/initramfs policy, guest stage-1/root assembly, init supervision, detached `-d` lifecycle, exec readiness, VM-specific writable root disk/volume ownership, and safe stop/remove recovery.
 
-### Next implementation order
+### PR 4 slice 30W: shorter test feedback and public-runtime priority
 
-1. Extend the durable access boundary to shared lower-artifact exports with
-   explicit membership, lease and reclamation contracts,
-   then connect explicit
-   deletion/socket and old-run reclamation to the proven inactive-domain
-   cleanup and completed lower-lease handoff boundaries. Preserve lower pins
-   whenever replacement ownership has not been durably established.
-   Authenticated control requires
-   the live monitor's in-memory lifecycle v2 boot key; a dead monitor's journal
-   alone cannot recover running control.
-2. Connect foreground-default `run` and detached `run -d` to that monitor,
-   preserving public fail-closed behavior until both paths are qualified.
-3. Add lifecycle/exec/log readiness and activate the opt-in local build-to-run
-   gate on a qualified self-hosted Linux
-   KVM runner and require it before claiming production OCI-image-to-VM-root
-   readiness.
+At the user's request, per-edit verification uses explicit functional test
+lanes and changed-file recommendations instead of repeating the complete
+server suite. CI still covers all portable cases through deterministic case
+shards (function identity plus parameter indices, not random display IDs),
+including large modules; unknown test files fail classification.
+Native, BuildKit and privileged proofs remain separate explicit gates. Full
+regression remains an integration/release requirement. See
+[the testing workflow](docs/testing.md).
+
+### Next implementation order: two public acceptance milestones
+
+The next implementation is a vertical public lifecycle, not completion of
+all future shared-cache machinery before a user can run a VM. The initial
+qualified target is local OCI archive/layout input on Linux x86_64 KVM.
+Docker Hub intake and multi-VM data volumes remain goals, not removed scope.
+The complete rationale and executable acceptance criteria are in
+[the public-runtime critical path](docs/oci-public-runtime-roadmap.md).
+
+1. **Public run lifecycle.** Resolve and pin the local OCI manifest, prepare
+   the first-party BOOT inputs and run-owned sealed lower copies, and connect
+   the existing plan/define/access/monitor machinery to public foreground
+   `run`, `run -d`, authenticated `stop`, and exact `rm`. Keep logical lower
+   digest/occurrence graphs and lease sets unchanged. Per-run lower copies
+   avoid making shared-export registry/GC a prerequisite for this milestone;
+   never hardlink or chmod-open canonical CAS. Validate an explicitly prepared
+   traversable runtime root rather than silently changing `$HOME` permissions.
+   Definition/ACL setup and fresh monitor spawning retain the existing clean
+   process boundary. READY, exit/signal forwarding, exact cleanup, access
+   revocation and retained-root ownership are acceptance requirements, not
+   deferred after enabling the corresponding public operation.
+2. **Noninteractive exec and Gate 2.** Implement one authenticated additional
+   guest command with argv, bounded stdout/stderr and exit status, then pass
+   the existing local-build archive → public `run -d` → `exec` root probe →
+   `stop` → `rm` gate on a Docker-daemonless KVM host. Existing lifecycle v2
+   has no remote EXEC operation: its main-workload cgroup name is not an exec
+   implementation. Do not replace this gate with a boot-only test or return
+   the expected probe output from the host.
+
+Shared lower exports/GC optimization, multi-VM data-volume sharing, TTY and
+parallel exec follow these milestones. Preserve lower pins whenever ownership
+handoff is incomplete. Authenticated control still requires the live monitor's
+in-memory boot key; a dead journal alone cannot recover running control.
+Public operation gates remain closed until their own vertical proof passes;
+test partitioning by itself does not enable them.
