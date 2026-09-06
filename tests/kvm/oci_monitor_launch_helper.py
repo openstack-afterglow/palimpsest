@@ -257,7 +257,9 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
         uid, gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
         specifications = fixture["_qualification_acl_specifications"](root, resolved.xml)
         if product_io:
-            specifications = fixture["_without_runtime_io_grants"](specifications, roots.runs / binding.record.name)
+            specifications = fixture["_without_product_access_grants"](
+                specifications, roots, roots.runs / binding.record.name
+            )
         broker = fixture["_QualificationDACBroker"](root, uid, specifications)
         context["broker"] = broker
         proxy = fixture["_ActivationConnectionProxy"](conn, binding.domain_uuid, broker)
