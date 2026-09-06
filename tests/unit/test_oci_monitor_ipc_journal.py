@@ -281,7 +281,13 @@ def test_private_stop_requires_durable_ready_and_coalesces_transport_retries(
     completion = threading.Event()
     if done:
         completion.set()
-    worker = None if mailbox == "inert" else SimpleNamespace(done=completion, failed=failed, stop_control=control)
+    worker = (
+        None
+        if mailbox == "inert"
+        else SimpleNamespace(
+            done=completion, failed=failed, stop_control=control, exec_control=ipc.MonitorExecControl()
+        )
+    )
     requests = iter(
         [
             ipc._request_message(ipc.MonitorIPCOperation.STOP, _identity(), _writer(), str(uuid.uuid4()))
@@ -342,7 +348,9 @@ def test_unauthorized_stop_peer_cannot_admit_worker_mailbox(
     snapshot = lease.snapshot
     control = MonitorStopControl()
     control.mark_ready()
-    worker = SimpleNamespace(done=threading.Event(), failed=False, stop_control=control)
+    worker = SimpleNamespace(
+        done=threading.Event(), failed=False, stop_control=control, exec_control=ipc.MonitorExecControl()
+    )
 
     class Channel:
         def settimeout(self, _timeout):

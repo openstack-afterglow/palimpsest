@@ -433,9 +433,10 @@ def test_stop_mailbox_is_forwarded_only_to_launch_worker_thread(fail: bool) -> N
     events = []
 
     class Authority:
-        def run(self, _fd, _binding, _lease, *, stop_control):
+        def run(self, _fd, _binding, _lease, *, stop_control, exec_control):
             assert threading.current_thread() is not threading.main_thread()
             assert type(stop_control) is MonitorStopControl
+            assert type(exec_control) is ipc.MonitorExecControl
             events.append(stop_control)
             if fail:
                 raise RuntimeError("private failure")

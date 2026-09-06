@@ -629,6 +629,10 @@ def require_existing_preflight(
 
 def _adapter_for(record: ExistingRunRecord, operation: RuntimeOperation) -> Any:
     if record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
+        if operation is RuntimeOperation.EXEC:
+            from . import oci_exec_session
+
+            return oci_exec_session
         if operation in {RuntimeOperation.STOP, RuntimeOperation.RM}:
             return _oci_adapter()
         raise RuntimeCapabilityError(operation, record.dispatch_key)

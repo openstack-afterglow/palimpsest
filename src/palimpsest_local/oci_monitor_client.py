@@ -274,3 +274,31 @@ class MonitorClient:
             result = self._wait(deadline, ready=False).terminal
             assert result is not None
             return result
+
+    def exec_request(self, operation, payload, *, timeout=5.0):
+        """Bind each mailbox exchange to the same pinned boot; retry only identical logical requests."""
+        with _stable_errors():
+            deadline = _Deadline(timeout)
+            self._read(deadline)
+            try:
+                result = ipc.request_monitor_exec(
+                    self._fd,
+                    self._endpoint,
+                    operation,
+                    payload,
+                    timeout=min(2.0, deadline.remaining(minimum=0.2) / 2),
+                )
+            except ipc.MonitorIPCError as exc:
+                if exc.category is not ipc.MonitorIPCErrorCategory.TIMEOUT:
+                    raise
+                # No new sequence/token: a lost reply must never cause another
+                # guest command. The caller may also retry this exact payload.
+                result = ipc.request_monitor_exec(
+                    self._fd,
+                    self._endpoint,
+                    operation,
+                    payload,
+                    timeout=min(5.0, deadline.remaining(minimum=0.1)),
+                )
+            self._read(deadline)
+            return result

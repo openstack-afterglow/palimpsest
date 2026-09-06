@@ -25,6 +25,9 @@ struct span { const char *p; usize n; };
 #define SYS_pread64 17
 #define SYS_ioctl 16
 #define SYS_poll 7
+#define SYS_fcntl 72
+#define SYS_dup3 292
+#define SYS_close_range 436
 #define SYS_rt_sigprocmask 14
 #define SYS_pause 34
 #define SYS_getpid 39
@@ -237,8 +240,10 @@ struct span { const char *p; usize n; };
 #define LIFECYCLE_CONSOLE_CARRIER "console-line"
 #define LIFECYCLE_BOUNDARY_PREFIX "palimpsest guest stage1: lifecycle boundary ack "
 #define CONTROL_PAYLOAD_MAX 65532
-#define CONTROL_GUEST_BODY_MAX 2048
-#define CONTROL_GUEST_OUTPUT_MAX 4096
+#define CONTROL_GUEST_BODY_MAX 4096
+#define CONTROL_GUEST_OUTPUT_MAX 8192
+#define EXEC_ARGV_BYTES_MAX 8192
+#define EXEC_OUTPUT_BYTES_MAX 65536
 #define LIFECYCLE_CONNECTION_MAX 16
 #define LIFECYCLE_REQUEST_LEDGER_MAX 17
 #define LIFECYCLE_DISCONNECTED 0
@@ -385,6 +390,7 @@ struct lifecycle_session {
     u64 last_hello_request_id;
     u64 hello_request_id;
     u64 stop_request_id;
+    u64 last_exec_request_id;
     u64 epoch;
     u64 last_accepted_host_wire;
     u64 connection_opener_request_id;
@@ -959,6 +965,20 @@ struct guest_process {
     usize used;
     char arena[PROCESS_MAX_LOCAL + 1];
 };
+
+/* One additional command, independent of the image's permanent main leaf. */
+struct remote_exec_job {
+    struct guest_process process;
+    struct exec_session session;
+    u64 request_id, deadline, cleanup_deadline;
+    i64 pid;
+    int pending, active, phase, reaped, status, reason, killed;
+    int output[2], isolation, errors, release;
+    u32 bytes[2];
+    usize wire_used, wire_sent;
+    u8 wire[CONTROL_GUEST_OUTPUT_MAX];
+};
+static struct remote_exec_job remote_exec;
 
 static u8 passwd_database[ACCOUNT_DATABASE_MAX_LOCAL];
 static u8 group_database[ACCOUNT_DATABASE_MAX_LOCAL];
@@ -2265,6 +2285,7 @@ static int nonce_seen(const struct lifecycle_session *session, const char nonce[
 
 static int request_seen(const struct lifecycle_session *session, u64 request_id) {
     u32 i;
+    if (request_id && request_id <= session->last_exec_request_id) return 1;
     for (i = 0; i < session->request_count; i++)
         if (session->seen_request_ids[i] == request_id) return 1;
     return 0;
@@ -2332,7 +2353,8 @@ static int parse_signed_host(struct lifecycle_session *session, usize size, int 
     const u8 *body_start, *body_end;
     char nonce_candidate[65];
     u64 epoch, request_id = 0, reply_to, wire, signal_value = 0;
-    const char *kind = expected_kind == 0 ? "KEY_ACK" : (expected_kind == 1 ? "RECONNECT" : "STOP");
+    const char *kind = expected_kind == 0 ? "KEY_ACK" : (expected_kind == 1 ? "RECONNECT" :
+                        (expected_kind == 2 ? "STOP" : "EXEC"));
     struct parser *j = &control_parser;
     memset(j, 0, sizeof(*j)); j->p = control_payload; j->end = control_payload + size;
     if ((expected_kind != 1 && !session->connection_has_hello) ||
@@ -2359,6 +2381,31 @@ static int parse_signed_host(struct lifecycle_session *session, usize size, int 
             boundary_id.n != 36 || !bytes_equal(boundary_id.p, session->boundary_id, 36)) return 0;
     } else if (expected_kind == 2) {
         if (!key(j, "signal") || !uint_value(j, &signal_value) || signal_value != 15) return 0;
+    } else if (expected_kind == 3) {
+        const u8 *argv_start;
+        struct span argument;
+        usize decoded;
+        u32 argc = 0;
+        if (session->state != LIFECYCLE_READY || session->stop_request_id ||
+            remote_exec.pending || remote_exec.active) return 0;
+        remote_exec.process = workload;
+        remote_exec.process.used = 0;
+        if (!key(j, "argv")) return 0;
+        argv_start = j->p;
+        if (!take_char(j, '[') || take_char(j, ']')) return 0;
+        for (;;) {
+            if (argc >= 64 || !json_string(j, &argument, &decoded, 0) ||
+                (argc == 0 && !decoded) || j->p - argv_start > EXEC_ARGV_BYTES_MAX ||
+                !decode_process_string(&remote_exec.process, argument, &remote_exec.process.argv[argc])) return 0;
+            argc++;
+            if (take_char(j, ']')) break;
+            if (!take_char(j, ',')) return 0;
+        }
+        if (j->p - argv_start > EXEC_ARGV_BYTES_MAX || !take_char(j, ',') ||
+            !key(j, "timeout_ms") || !uint_value(j, &signal_value) ||
+            !signal_value || signal_value > 30000) return 0;
+        remote_exec.process.argc = argc;
+        remote_exec.process.argv[argc] = 0;
     }
     if (!take_char(j, '}')) return 0;
     if (!take_char(j, ',') || !key(j, "reply_to")) return 0;
@@ -2405,6 +2452,20 @@ static int parse_signed_host(struct lifecycle_session *session, usize size, int 
     }
     if (request_id_out) *request_id_out = request_id;
     if (wire_out) *wire_out = wire;
+    if (expected_kind == 3) {
+        if (request_seen(session, request_id)) return 0;
+        remote_exec.request_id = request_id;
+        remote_exec.deadline = monotonic_millis() + signal_value;
+    }
+    return 1;
+}
+
+static int parse_exec(struct lifecycle_session *session, usize size) {
+    u64 request_id, wire;
+    if (!parse_signed_host(session, size, 3, &request_id, &wire)) return 0;
+    session->last_exec_request_id = request_id;
+    session->last_accepted_host_wire = wire;
+    remote_exec.pending = 1;
     return 1;
 }
 
@@ -2545,10 +2606,10 @@ static int verify_lifecycle_mac(const struct lifecycle_session *session,
 
 static int write_signed_message(struct lifecycle_session *session, const u8 *body, usize body_size,
                                 const char *direction, const char *carrier, int console) {
-    u8 tag[32]; char tag_text[65]; usize used = console ? 0 : 4;
+    u8 tag[32]; char tag_text[65]; usize used = console == 1 ? 0 : 4;
     if (!lifecycle_mac(session, (const char *)body, body_size, direction, carrier, tag)) return 0;
     hex32(tag, tag_text);
-    if (console && !append_control(control_output, sizeof(control_output), &used, LIFECYCLE_BOUNDARY_PREFIX)) return 0;
+    if (console == 1 && !append_control(control_output, sizeof(control_output), &used, LIFECYCLE_BOUNDARY_PREFIX)) return 0;
     if (!append_control(control_output, sizeof(control_output), &used, "{\"body\":") ||
         used + body_size > sizeof(control_output)) return 0;
     memcpy(control_output + used, body, body_size); used += body_size;
@@ -2558,7 +2619,7 @@ static int write_signed_message(struct lifecycle_session *session, const u8 *bod
         !append_control(control_output, sizeof(control_output), &used, tag_text) ||
         !append_control(control_output, sizeof(control_output), &used, "\"}}")) return 0;
     secure_zero(tag, sizeof(tag)); secure_zero(tag_text, sizeof(tag_text));
-    if (console) {
+    if (console == 1) {
         i64 n;
         usize prefix_size = slen(LIFECYCLE_BOUNDARY_PREFIX);
         digest_text(control_output + prefix_size, used - prefix_size, session->boundary_digest);
@@ -2571,6 +2632,13 @@ static int write_signed_message(struct lifecycle_session *session, const u8 *bod
         u32 payload = (u32)(used - 4);
         control_output[0] = (u8)(payload >> 24); control_output[1] = (u8)(payload >> 16);
         control_output[2] = (u8)(payload >> 8); control_output[3] = (u8)payload;
+    }
+    if (console == 2) {
+        if (remote_exec.wire_used) return 0;
+        memcpy(remote_exec.wire, control_output, used);
+        remote_exec.wire_used = used; remote_exec.wire_sent = 0;
+        secure_zero(control_output, used);
+        return 1;
     }
     if (!session->connection_has_hello || !control_io_exact(session->fd, control_output, used, 1)) {
         u64 now = monotonic_millis();
@@ -2789,7 +2857,7 @@ static int lifecycle_pump(struct lifecycle_session *session,
             if (!lifecycle_current_snapshot(session, result)) return 0;
         } else {
             int stop = parse_stop(session, size);
-            if (!stop) { session->poisoned = 1; return 0; }
+            if (!stop && !parse_exec(session, size)) { session->poisoned = 1; return 0; }
             if (stop == 1) *dispatch_stop = 1;
             else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);
         }
@@ -4008,13 +4076,13 @@ static int create_exec_session(struct workload_agent *agent, struct exec_session
     session->id = 0;
     session->name[0] = 0;
     session->active = 0;
-    if (agent->active_sessions || !agent->next_session_id ||
+    if (agent->active_sessions >= 2 || !agent->next_session_id ||
         !format_exec_session_name(session->name, agent->next_session_id)) return 0;
     session->id = agent->next_session_id++;
     created = sc3(SYS_mkdirat, agent->parent.dir_fd, (i64)session->name, 0755);
     if (created != 0 || !open_cgroup_node(agent->parent.dir_fd, session->name, &session->leaf)) return 0;
     session->active = 1;
-    agent->active_sessions = 1;
+    agent->active_sessions++;
     return 1;
 }
 
@@ -4044,9 +4112,9 @@ rejected:
 }
 
 static int move_pid_to_exec_session(struct workload_agent *agent, struct exec_session *session, i64 pid) {
-    char pid_text[16], proc_path[64];
-    usize used = 0, proc_used = 0;
-    if (!session->active || session->id != 1 || agent->active_sessions != 1 ||
+    char pid_text[16], proc_path[64], expected[96];
+    usize used = 0, proc_used = 0, expected_used = 0;
+    if (!session->active || !session->id || !agent->active_sessions || agent->active_sessions > 2 ||
         pid <= 1 || pid > 0xffffffffu || !append_u32(pid_text, &used, (u32)pid) ||
         used + 2 > sizeof(pid_text)) return 0;
     pid_text[used++] = '\n';
@@ -4056,7 +4124,10 @@ static int move_pid_to_exec_session(struct workload_agent *agent, struct exec_se
     proc_path[0] = 0;
     if (!append_text(proc_path, &proc_used, "/proc/") || !append_u32(proc_path, &proc_used, (u32)pid) ||
         !append_text(proc_path, &proc_used, "/cgroup")) return 0;
-    return read_exact_attr(proc_path, "0::/palimpsest.agent/exec-00000001\n") &&
+    expected[0] = 0;
+    if (!append_text(expected, &expected_used, "0::/palimpsest.agent/") ||
+        !append_text(expected, &expected_used, session->name) || !append_text(expected, &expected_used, "\n")) return 0;
+    return read_exact_attr(proc_path, expected) &&
            cgroup_populated(&session->leaf, "populated 1\n") &&
            cgroup_populated(&agent->parent, "populated 1\n") &&
            cgroup_procs_empty(&agent->parent) && read_exact_attr("/proc/1/cgroup", "0::/\n");
@@ -4067,16 +4138,21 @@ static int kill_exec_session(struct exec_session *session) {
            sc3(SYS_write, session->leaf.kill_fd, (i64)"1\n", 2) == 2;
 }
 
-static int remove_empty_exec_session_and_agent(struct workload_agent *agent,
-                                               struct exec_session *session) {
-    int valid = session->active && agent->active_sessions == 1 &&
+static int remove_empty_exec_session(struct workload_agent *agent, struct exec_session *session) {
+    int valid = session->active && agent->active_sessions &&
         cgroup_populated(&session->leaf, "populated 0\n") && cgroup_procs_empty(&session->leaf);
     if (!close_cgroup_node(&session->leaf)) valid = 0;
     if (valid && sc3(SYS_unlinkat, agent->parent.dir_fd, (i64)session->name, AT_REMOVEDIR) != 0) valid = 0;
     if (valid) {
         session->active = 0;
-        agent->active_sessions = 0;
+        agent->active_sessions--;
     }
+    return valid;
+}
+
+static int remove_empty_exec_session_and_agent(struct workload_agent *agent,
+                                               struct exec_session *session) {
+    int valid = agent->active_sessions == 1 && remove_empty_exec_session(agent, session);
     if (valid && (!cgroup_populated(&agent->parent, "populated 0\n") ||
                   !cgroup_procs_empty(&agent->parent))) valid = 0;
     if (!close_cgroup_node(&agent->parent)) valid = 0;
@@ -4102,6 +4178,261 @@ static __attribute__((noreturn)) void child_fail(int fd, u32 stage, i64 error) {
     exit_now(127);
 }
 
+static int queue_exec_frame(struct lifecycle_session *lifecycle, const char *kind,
+                            const u8 *payload, usize payload_size) {
+    usize used = 0;
+    u64 sequence = lifecycle->next_sequence++;
+#define EXEC_TEXT(value) do { if (!append_control(control_body, sizeof(control_body), &used, value)) return 0; } while (0)
+#define EXEC_NUMBER(value) do { if (!append_control_u64(control_body, sizeof(control_body), &used, value)) return 0; } while (0)
+    EXEC_TEXT("{\"boot_attempt_id\":\""); EXEC_TEXT(lifecycle->boot_attempt_id);
+    EXEC_TEXT("\",\"boot_generation\":\""); EXEC_TEXT(lifecycle->boot_generation);
+    EXEC_TEXT("\",\"domain_core_digest\":\""); EXEC_TEXT(lifecycle_binding.core);
+    EXEC_TEXT("\",\"epoch\":"); EXEC_NUMBER(lifecycle->epoch);
+    EXEC_TEXT(",\"host_nonce\":\""); EXEC_TEXT(lifecycle->host_nonce);
+    EXEC_TEXT("\",\"kind\":\""); EXEC_TEXT(kind); EXEC_TEXT("\",\"payload\":");
+    if (used + payload_size > sizeof(control_body)) return 0;
+    memcpy(control_body + used, payload, payload_size); used += payload_size;
+    EXEC_TEXT(",\"reply_to\":"); EXEC_NUMBER(remote_exec.request_id);
+    EXEC_TEXT(",\"run_id\":\""); EXEC_TEXT(lifecycle_binding.run_id);
+    EXEC_TEXT("\",\"schema\":\""); EXEC_TEXT(LIFECYCLE_PROTOCOL);
+    EXEC_TEXT("\",\"stage1_artifact_digest\":\""); EXEC_TEXT(lifecycle_binding.stage1);
+    EXEC_TEXT("\",\"wire_sequence\":"); EXEC_NUMBER(sequence); EXEC_TEXT("}");
+#undef EXEC_TEXT
+#undef EXEC_NUMBER
+    if (!write_signed_message(lifecycle, control_body, used, "guest-to-host", LIFECYCLE_CHANNEL_CARRIER, 2)) return 0;
+    secure_zero(control_body, used);
+    return 1;
+}
+
+static int queue_exec_output(struct lifecycle_session *lifecycle, int stream, const u8 *bytes, usize size) {
+    u8 payload[2304]; usize used = 0, i;
+    if (!append_control(payload, sizeof(payload), &used, "{\"data_hex\":\"")) return 0;
+    for (i = 0; i < size; i++) {
+        if (used + 2 > sizeof(payload)) return 0;
+        payload[used++] = (u8)hex_digit(bytes[i] >> 4); payload[used++] = (u8)hex_digit(bytes[i] & 15);
+    }
+    if (!append_control(payload, sizeof(payload), &used, "\",\"offset\":") ||
+        !append_control_u64(payload, sizeof(payload), &used, remote_exec.bytes[stream]) ||
+        !append_control(payload, sizeof(payload), &used, stream ? ",\"stream\":\"stderr\"}" : ",\"stream\":\"stdout\"}") ||
+        !queue_exec_frame(lifecycle, "EXEC_OUTPUT", payload, used)) return 0;
+    remote_exec.bytes[stream] += (u32)size;
+    return 1;
+}
+
+static int queue_exec_exit(struct lifecycle_session *lifecycle) {
+    static const char *reasons[] = {"completed", "timeout", "output-limit", "cancelled"};
+    u8 payload[256]; usize used = 0;
+    u32 signal = (u32)(remote_exec.status & 0x7f);
+    if (!append_control(payload, sizeof(payload), &used, "{\"reason\":\"") ||
+        !append_control(payload, sizeof(payload), &used, reasons[remote_exec.reason]) ||
+        !append_control(payload, sizeof(payload), &used, "\",\"stderr_bytes\":") ||
+        !append_control_u64(payload, sizeof(payload), &used, remote_exec.bytes[1]) ||
+        !append_control(payload, sizeof(payload), &used, ",\"stdout_bytes\":") ||
+        !append_control_u64(payload, sizeof(payload), &used, remote_exec.bytes[0]) ||
+        !append_control(payload, sizeof(payload), &used, ",\"terminal\":")) return 0;
+    if (remote_exec.phase == 3) {
+        return remote_exec.reason == 3 && !remote_exec.pid &&
+               !remote_exec.bytes[0] && !remote_exec.bytes[1] &&
+               append_control(payload, sizeof(payload), &used, "null}") &&
+               queue_exec_frame(lifecycle, "EXEC_EXIT", payload, used);
+    }
+    if (!append_control(payload, sizeof(payload), &used, "{\"exit_code\":")) return 0;
+    if (signal) {
+        if (!append_control(payload, sizeof(payload), &used, "null,\"signal\":") ||
+            !append_control_u64(payload, sizeof(payload), &used, signal)) return 0;
+    } else if (!append_control_u64(payload, sizeof(payload), &used, (u32)(remote_exec.status >> 8) & 255) ||
+               !append_control(payload, sizeof(payload), &used, ",\"signal\":null")) return 0;
+    return append_control(payload, sizeof(payload), &used, "}}") &&
+           queue_exec_frame(lifecycle, "EXEC_EXIT", payload, used);
+}
+
+static void close_exec_fd(int *fd) {
+    if (*fd >= 0) sc1(SYS_close, *fd);
+    *fd = -1;
+}
+
+static void wipe_child_control_authority(struct lifecycle_session *lifecycle) {
+    secure_zero(lifecycle, sizeof(*lifecycle));
+    secure_zero(&lifecycle_binding, sizeof(lifecycle_binding));
+    secure_zero(control_payload, sizeof(control_payload));
+    secure_zero(control_output, sizeof(control_output));
+    secure_zero(control_body, sizeof(control_body));
+    secure_zero(&control_parser, sizeof(control_parser));
+    secure_zero(remote_exec.wire, sizeof(remote_exec.wire));
+}
+
+/* Fixed child capabilities survive close_range only until the release barrier.
+ * No inherited supervisor FD or authenticated control memory reaches the image. */
+static __attribute__((noreturn)) void exec_child(struct lifecycle_session *lifecycle,
+                                                int error, int isolation, int release,
+                                                int output, int errors) {
+    struct child_error_local failure;
+    u64 empty_mask = 0;
+    u8 token = 1;
+    i64 operation;
+    if (sc3(SYS_dup3, error, 100, O_CLOEXEC) != 100 ||
+        sc3(SYS_dup3, isolation, 101, O_CLOEXEC) != 101 ||
+        sc3(SYS_dup3, release, 102, O_CLOEXEC) != 102) exit_now(127);
+    if (sc3(SYS_dup3, output, 1, 0) != 1 || sc3(SYS_dup3, errors, 2, 0) != 2 ||
+        sc3(SYS_close_range, 3, 99, 0) != 0 || sc3(SYS_close_range, 103, 0xffffffffU, 0) != 0)
+        child_fail(100, 40, EIO);
+    sc1(SYS_close, 0);
+    wipe_child_control_authority(lifecycle);
+    if (sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8) != 0 ||
+        sc2(SYS_setpgid, 0, 0) != 0) child_fail(100, 40, EIO);
+    if (!prepare_workload_isolation(&remote_exec.process, &failure))
+        child_fail(100, failure.stage, failure.error);
+    if (sc3(SYS_open, (i64)"/dev/null", O_RDONLY | O_NOFOLLOW, 0) != 0) child_fail(100, 40, EIO);
+    if (sc3(SYS_write, 101, (i64)&token, 1) != 1 || sc1(SYS_close, 101) != 0)
+        child_fail(100, 40, EIO);
+    token = 0;
+    if (sc3(SYS_read, 102, (i64)&token, 1) != 1 || token != 1 || sc1(SYS_close, 102) != 0)
+        child_fail(100, 40, EIO);
+    operation = sc1(SYS_chdir, (i64)remote_exec.process.cwd);
+    if (operation != 0) child_fail(100, 6, operation);
+    operation = exec_workload(&remote_exec.process);
+    child_fail(100, 7, operation);
+}
+
+static int start_remote_exec(struct workload_agent *agent, struct lifecycle_session *lifecycle) {
+    int pipes[5][2]; u32 i, count = 0; i64 pid;
+    remote_exec.pending = 0; remote_exec.active = 1; remote_exec.phase = 1;
+    remote_exec.pid = 0; remote_exec.reaped = 0; remote_exec.reason = 0; remote_exec.killed = 0;
+    remote_exec.bytes[0] = remote_exec.bytes[1] = 0;
+    remote_exec.output[0] = remote_exec.output[1] = -1;
+    remote_exec.isolation = remote_exec.errors = remote_exec.release = -1;
+    if (!create_exec_session(agent, &remote_exec.session)) return 0;
+    for (i = 0; i < 5; i++) {
+        if (sc2(SYS_pipe2, (i64)pipes[i], O_CLOEXEC) != 0) goto failed;
+        count++;
+        if (sc3(SYS_fcntl, pipes[i][0], 4, O_NONBLOCK) != 0) goto failed;
+    }
+    /* The child's release read is intentionally blocking, under a parent deadline. */
+    if (sc3(SYS_fcntl, pipes[4][0], 4, 0) != 0) goto failed;
+    pid = sc0(SYS_fork);
+    if (pid == 0) exec_child(lifecycle, pipes[3][1], pipes[2][1], pipes[4][0], pipes[0][1], pipes[1][1]);
+    if (pid < 0) goto failed;
+    remote_exec.pid = pid;
+    for (i = 0; i < 4; i++) sc1(SYS_close, pipes[i][1]);
+    sc1(SYS_close, pipes[4][0]);
+    remote_exec.output[0] = pipes[0][0]; remote_exec.output[1] = pipes[1][0];
+    remote_exec.isolation = pipes[2][0]; remote_exec.errors = pipes[3][0]; remote_exec.release = pipes[4][1];
+    if (sc2(SYS_setpgid, pid, pid) != 0 || !move_pid_to_exec_session(agent, &remote_exec.session, pid)) {
+        sc2(SYS_kill, pid, SIGKILL);
+        return 0;
+    }
+    return 1;
+failed:
+    for (i = 0; i < count; i++) { sc1(SYS_close, pipes[i][0]); sc1(SYS_close, pipes[i][1]); }
+    if (remote_exec.session.active) (void)remove_empty_exec_session(agent, &remote_exec.session);
+    remote_exec.active = 0;
+    return 0;
+}
+
+static int cancel_remote_exec(int reason) {
+    if (remote_exec.pending && !remote_exec.active) {
+        remote_exec.pending = 0; remote_exec.active = 1; remote_exec.phase = 3;
+        remote_exec.reason = reason ? reason : 3; remote_exec.status = 0; remote_exec.pid = 0;
+        remote_exec.bytes[0] = remote_exec.bytes[1] = 0;
+        remote_exec.wire_used = remote_exec.wire_sent = 0;
+        return 1;
+    }
+    if (remote_exec.phase == 3) return 1;
+    if (!remote_exec.active || remote_exec.phase == 4) return 1;
+    if (reason && !remote_exec.reason) remote_exec.reason = reason;
+    if (!remote_exec.killed) {
+        if (!kill_exec_session(&remote_exec.session)) return 0;
+        remote_exec.killed = 1;
+        remote_exec.cleanup_deadline = monotonic_millis() + 5000;
+        close_exec_fd(&remote_exec.release);
+    }
+    return 1;
+}
+
+static void remote_exec_reaped(i64 pid, int status) {
+    if (remote_exec.active && pid == remote_exec.pid) {
+        remote_exec.reaped = 1; remote_exec.status = status;
+    }
+}
+
+/* Called from the PID1 poll loop, never a nested blocking supervisor. */
+static int pump_remote_exec(struct workload_agent *agent, struct lifecycle_session *lifecycle) {
+    i64 n; u32 stream; u8 bytes[1024];
+    if (remote_exec.pending) {
+        if (lifecycle->state != LIFECYCLE_READY) { if (!cancel_remote_exec(3)) return 0; }
+        else if (!start_remote_exec(agent, lifecycle)) return 0;
+    }
+    if (!remote_exec.active) return 1;
+    if (remote_exec.phase == 3) {
+        if (lifecycle->connection != LIFECYCLE_CONNECTED) return 1;
+        if (!queue_exec_exit(lifecycle)) return 0;
+        remote_exec.phase = 4;
+    }
+    if (lifecycle->connection != LIFECYCLE_CONNECTED) {
+        secure_zero(remote_exec.wire, sizeof(remote_exec.wire));
+        remote_exec.wire_used = remote_exec.wire_sent = 0;
+        if (!cancel_remote_exec(3)) return 0;
+    }
+    if (remote_exec.wire_used) {
+        n = sc3(SYS_write, lifecycle->fd, (i64)(remote_exec.wire + remote_exec.wire_sent),
+                remote_exec.wire_used - remote_exec.wire_sent);
+        if (n > 0) remote_exec.wire_sent += (usize)n;
+        else if (n != -EAGAIN && n != -EINTR) return 0;
+        if (remote_exec.wire_sent == remote_exec.wire_used) {
+            secure_zero(remote_exec.wire, remote_exec.wire_used);
+            remote_exec.wire_used = remote_exec.wire_sent = 0;
+        }
+    }
+    if (remote_exec.phase == 4) {
+        if (!remote_exec.wire_used) remote_exec.active = 0;
+        return 1;
+    }
+    if (monotonic_millis() >= remote_exec.deadline && !cancel_remote_exec(1)) return 0;
+    if (remote_exec.reaped && !cancel_remote_exec(0)) return 0;
+    if (remote_exec.phase == 1 && !remote_exec.killed) {
+        u8 ready = 0;
+        n = sc3(SYS_read, remote_exec.isolation, (i64)&ready, 1);
+        if (n == 1) {
+            if (ready != 1 || !verify_workload_isolation_status(remote_exec.pid, &remote_exec.process) ||
+                sc3(SYS_write, remote_exec.release, (i64)&ready, 1) != 1) return 0;
+            close_exec_fd(&remote_exec.isolation); close_exec_fd(&remote_exec.release);
+            remote_exec.phase = 2;
+        } else if (n == 0) { close_exec_fd(&remote_exec.isolation); remote_exec.phase = 2; }
+        else if (n != -EAGAIN && n != -EINTR) return 0;
+    }
+    if (remote_exec.errors >= 0) {
+        struct child_error_local failure;
+        n = sc3(SYS_read, remote_exec.errors, (i64)&failure, sizeof(failure));
+        if (n == 0 || n == sizeof(failure)) close_exec_fd(&remote_exec.errors);
+        else if (n != -EAGAIN && n != -EINTR) return 0;
+    }
+    for (stream = 0; stream < 2 && !remote_exec.wire_used; stream++) {
+        u32 total = remote_exec.bytes[0] + remote_exec.bytes[1];
+        usize capacity = total < EXEC_OUTPUT_BYTES_MAX ? EXEC_OUTPUT_BYTES_MAX - total : 1;
+        if (capacity > sizeof(bytes)) capacity = sizeof(bytes);
+        if (remote_exec.output[stream] < 0) continue;
+        n = sc3(SYS_read, remote_exec.output[stream], (i64)bytes, capacity);
+        if (!n) close_exec_fd(&remote_exec.output[stream]);
+        else if (n > 0) {
+            if (total == EXEC_OUTPUT_BYTES_MAX) {
+                if (!cancel_remote_exec(2)) return 0;
+                close_exec_fd(&remote_exec.output[0]); close_exec_fd(&remote_exec.output[1]);
+            } else if (lifecycle->connection == LIFECYCLE_CONNECTED &&
+                       !queue_exec_output(lifecycle, (int)stream, bytes, (usize)n)) return 0;
+        } else if (n != -EAGAIN && n != -EINTR) return 0;
+    }
+    if (remote_exec.reaped && remote_exec.output[0] < 0 && remote_exec.output[1] < 0 &&
+        !remote_exec.wire_used && cgroup_populated(&remote_exec.session.leaf, "populated 0\n") &&
+        cgroup_procs_empty(&remote_exec.session.leaf)) {
+        if (!remove_empty_exec_session(agent, &remote_exec.session)) return 0;
+        close_exec_fd(&remote_exec.isolation); close_exec_fd(&remote_exec.errors); close_exec_fd(&remote_exec.release);
+        if (lifecycle->connection == LIFECYCLE_CONNECTED && !queue_exec_exit(lifecycle)) return 0;
+        remote_exec.phase = 4;
+    }
+    if (remote_exec.killed && remote_exec.phase != 4 && monotonic_millis() >= remote_exec.cleanup_deadline) return 0;
+    return 1;
+}
+
 static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent *agent,
                               struct exec_session *session,
                               struct supervisor_result *result, struct lifecycle_session *lifecycle) {
@@ -4110,6 +4441,7 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent
     u64 deadline = monotonic_millis() + 5000;
     struct pollfd_local pollfds[2];
     struct signalfd_siginfo_local info;
+    if (!cancel_remote_exec(3)) return 0;
     /* Allow children already handling the forwarded signal to report their
      * own terminal status before enforcing the bounded teardown policy. */
     pollfds[0].fd = signal_fd; pollfds[0].events = POLLIN;
@@ -4117,14 +4449,20 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent
     while (monotonic_millis() < deadline) {
         int dispatch_stop = 0;
         i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
-        if (reaped > 0) { record_reaped_child(result, reaped, main_pid, status); continue; }
-        if (reaped == -ECHILD) {
-            int cleaned = kill_exec_session(session) &&
-                          remove_empty_exec_session_and_agent(agent, session);
-            return cleaned ? (lifecycle_failed ? 2 : 1) : 0;
+        if (reaped > 0) {
+            remote_exec_reaped(reaped, status);
+            if (!(remote_exec.active && reaped == remote_exec.pid)) record_reaped_child(result, reaped, main_pid, status);
         }
-        if (reaped < 0 && reaped != -EINTR) return 0;
+        if (lifecycle && !pump_remote_exec(agent, lifecycle)) return 0;
+        if (reaped == -ECHILD) {
+            if (!remote_exec.active) {
+                int cleaned = kill_exec_session(session) && remove_empty_exec_session_and_agent(agent, session);
+                return cleaned ? (lifecycle_failed ? 2 : 1) : 0;
+            }
+        }
+        if (reaped < 0 && reaped != -EINTR && reaped != -ECHILD) return 0;
         pollfds[0].revents = 0; pollfds[1].revents = 0;
+        pollfds[1].events = POLLIN | (remote_exec.wire_used ? POLLOUT : 0);
         {
             int count = lifecycle && lifecycle->state >= LIFECYCLE_READY &&
                         lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1;
@@ -4135,7 +4473,7 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent
             if (polled < 0 && polled != -EINTR) return 0;
         }
         if (pollfds[0].revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
-        if (lifecycle && lifecycle->state >= LIFECYCLE_READY) {
+        if (lifecycle && lifecycle->state >= LIFECYCLE_READY && !lifecycle->natural_terminal_frozen) {
             int was_disconnected = lifecycle->connection == LIFECYCLE_DISCONNECTED;
             if (!lifecycle_failed && !lifecycle_pump(lifecycle, result, &dispatch_stop))
                 lifecycle_failed = 1;
@@ -4146,6 +4484,7 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent
             }
         }
     }
+    if (remote_exec.active || remote_exec.pending) return 0;
     if (!kill_exec_session(session)) return 0;
     for (;;) {
         i64 reaped = sc4(SYS_wait4, -1, (i64)&status, 0, 0);
@@ -4166,7 +4505,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     struct workload_agent agent;
     struct exec_session session;
     i64 signal_fd, main_pid, n;
-    struct pollfd_local pollfds[2];
+    struct pollfd_local pollfds[6];
     struct signalfd_siginfo_local info;
     usize error_bytes = 0;
     i64 error_read = 0;
@@ -4414,7 +4753,10 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         int dispatch_stop = 0;
         for (;;) {
             i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
-            if (reaped > 0) record_reaped_child(result, reaped, main_pid, status);
+            if (reaped > 0) {
+                remote_exec_reaped(reaped, status);
+                if (!(remote_exec.active && reaped == remote_exec.pid)) record_reaped_child(result, reaped, main_pid, status);
+            }
             if (reaped == main_pid) {
                 main_done = 1;
                 result->main_status = workload_status(status);
@@ -4424,10 +4766,29 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             if (reaped <= 0) break;
         }
         if (main_done) break;
+        if (!pump_remote_exec(&agent, lifecycle)) {
+            set_workload_failure(failure, 40, EIO);
+            (void)terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+            close_workload_agent(&agent, &session);
+            sc1(SYS_close, signal_fd);
+            return -2;
+        }
         pollfds[0].revents = 0; pollfds[1].revents = 0;
+        pollfds[1].fd = lifecycle->connection == LIFECYCLE_CONNECTED ? lifecycle->fd : -1;
+        pollfds[1].events = POLLIN | (remote_exec.wire_used ? POLLOUT : 0);
+        {
+            u32 i;
+            for (i = 2; i < 6; i++) { pollfds[i].fd = -1; pollfds[i].events = POLLIN; pollfds[i].revents = 0; }
+            if (remote_exec.active && remote_exec.phase < 3) {
+                pollfds[2].fd = remote_exec.wire_used ? -1 : remote_exec.output[0];
+                pollfds[3].fd = remote_exec.wire_used ? -1 : remote_exec.output[1];
+                pollfds[4].fd = remote_exec.phase == 1 ? remote_exec.isolation : -1;
+                pollfds[5].fd = remote_exec.errors;
+            }
+        }
         n = sc3(SYS_poll, (i64)pollfds,
-                lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1,
-                lifecycle_poll_timeout(lifecycle, -1));
+                remote_exec.active ? 6 : (lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1),
+                lifecycle_poll_timeout(lifecycle, remote_exec.active ? 100 : -1));
         if (n == -EINTR) continue;
         if (n < 0) {
             set_workload_failure(failure, 21, n);
@@ -4456,6 +4817,10 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             }
         }
         if (dispatch_stop) {
+            if (!cancel_remote_exec(3)) {
+                set_workload_failure(failure, 40, EIO);
+                return -2;
+            }
             n = sc2(SYS_kill, -main_pid, process->stop_signal);
             if (n == -ESRCH) {
                 /* STOP was authenticated and committed, but the workload may
@@ -4517,8 +4882,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             return n ? -2 : -1;
         }
     }
-    n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result,
-                           lifecycle->stop_request_id ? lifecycle : 0);
+    n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
     if (!n) {
         set_workload_failure(failure, 18, EIO);
         close_workload_agent(&agent, &session);

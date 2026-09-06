@@ -10,11 +10,13 @@ import pytest
 from palimpsest_local.oci_control_protocol_v2 import (
     HostOCIControlV2Session,
     OCIControlV2Binding,
+    OCIControlV2FrameDecoder,
     OCIControlV2Message,
     decode_frame,
     encode_frame,
     sign_message,
 )
+from palimpsest_local.oci_exec_control import MonitorExecControl
 from palimpsest_local.oci_lifecycle_transport import (
     OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
@@ -161,6 +163,176 @@ class _GuestStream:
 
     def free(self) -> None:
         self.free_calls += 1
+
+
+class _ExecGuestStream(_GuestStream):
+    def __init__(self, *, no_exec_response=False, tamper=False):
+        super().__init__(await_stop=True)
+        self.decoder = OCIControlV2FrameDecoder()
+        self.no_exec_response = no_exec_response
+        self.tamper = tamper
+        self.events = []
+
+    def send(self, payload):
+        count = super().send(payload)
+        if count == -2:
+            return count
+        for envelope in self.decoder.feed(payload[:count]):
+            kind = envelope.body.kind
+            self.events.append(kind)
+            if kind == "EXEC" and not self.no_exec_response:
+                for wire, stream, offset, data in (
+                    (3, "stdout", 0, b"out\xff"),
+                    (4, "stderr", 0, b"err"),
+                    (5, "stdout", 4, b"!"),
+                ):
+                    message = OCIControlV2Message(
+                        "EXEC_OUTPUT",
+                        BINDING,
+                        ATTEMPT_ID,
+                        NONCE,
+                        1,
+                        wire,
+                        {"stream": stream, "offset": offset, "data_hex": data.hex()},
+                        boot_generation=BOOT_GENERATION,
+                        reply_to=envelope.body.request_id,
+                    )
+                    self.guest.append(encode_frame(sign_message(message, b"x" * 32 if self.tamper else KEY)))
+                self.guest.append(
+                    encode_frame(
+                        sign_message(
+                            OCIControlV2Message(
+                                "EXEC_EXIT",
+                                BINDING,
+                                ATTEMPT_ID,
+                                NONCE,
+                                1,
+                                6,
+                                {
+                                    "terminal": {"exit_code": 7, "signal": None},
+                                    "stdout_bytes": 5,
+                                    "stderr_bytes": 3,
+                                    "reason": "completed",
+                                },
+                                boot_generation=BOOT_GENERATION,
+                                reply_to=envelope.body.request_id,
+                            ),
+                            KEY,
+                        )
+                    )
+                )
+            elif kind == "STOP":
+                prior = decode_frame(self.guest.pop())
+                self.guest.append(encode_frame(sign_message(replace(prior.body, wire_sequence=7), KEY)))
+        return count
+
+
+@pytest.mark.parametrize("stop_during_output", [False, True])
+def test_exec_transport_keeps_bounded_streams_separate_and_stop_is_not_starved(stop_during_output):
+    stream = _ExecGuestStream()
+    stop = MonitorStopControl()
+
+    # Production admission deliberately requires the exact mailbox type.
+    mailbox = MonitorExecControl()
+    original_append, original_complete = mailbox.append_output, mailbox.complete
+
+    def append(*args):
+        original_append(*args)
+        stream.events.append("output")
+        if stop_during_output:
+            stop.request()
+
+    def complete(*args):
+        original_complete(*args)
+        stream.events.append("exec-complete")
+        stop.request()
+
+    mailbox.append_output, mailbox.complete = append, complete
+
+    def ready(_):
+        stop.mark_ready()
+        mailbox.mark_ready()
+        mailbox.submit(1, RUN_ID, ("/bin/probe",), 30000)
+
+    result = complete_initial_lifecycle_handoff(
+        stream,
+        BINDING,
+        on_ready=ready,
+        session=_session(BINDING),
+        terminal_timeout_seconds=None,
+        stop_control=stop,
+        exec_control=mailbox,
+        before_stop_send=lambda: stream.events.append("guard"),
+    )
+    reply = mailbox.poll(1, RUN_ID)
+    assert bytes.fromhex(reply["stdout_hex"]) == b"out\xff!"
+    assert bytes.fromhex(reply["stderr_hex"]) == b"err"
+    assert reply["terminal"] == {"exit_code": 7, "signal": None}
+    assert result.terminal.signal_number == 15
+    assert [entry["kind"] for entry in result.transcript] == [
+        "HELLO",
+        "BOOTSTRAP",
+        "KEY_ACK",
+        "READY",
+        "STOP",
+        "TERMINAL",
+    ]
+    assert "out" not in json.dumps(result.to_dict())
+    if stop_during_output:
+        assert stream.events.index("STOP") < stream.events.index("exec-complete")
+    assert stream.events.index("guard") < stream.events.index("EXEC")
+
+
+def test_exec_transport_rejects_bad_mac_without_publishing_untrusted_output():
+    stream = _ExecGuestStream(tamper=True)
+    stop, mailbox = MonitorStopControl(), MonitorExecControl()
+
+    def ready(_):
+        stop.mark_ready()
+        mailbox.mark_ready()
+        mailbox.submit(1, RUN_ID, ("/bin/probe",), 30000)
+
+    with pytest.raises(OCILifecycleTransportError, match="rejected"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            stop_control=stop,
+            exec_control=mailbox,
+            before_stop_send=lambda: None,
+        )
+    reply = mailbox.poll(1, RUN_ID)
+    assert reply["stdout_size"] == reply["stderr_size"] == 0
+    assert reply["state"] == "control-lost" and reply["terminal"] is None
+
+
+def test_exec_deadline_does_not_fabricate_exit_when_guest_silent():
+    stream = _ExecGuestStream(no_exec_response=True)
+    stop, mailbox = MonitorStopControl(), MonitorExecControl()
+    clock = [0.0]
+
+    def ready(_):
+        stop.mark_ready()
+        mailbox.mark_ready()
+        mailbox.submit(1, RUN_ID, ("/bin/probe",), 1)
+
+    with pytest.raises(OCILifecycleTransportError, match="timed out"):
+        complete_initial_lifecycle_handoff(
+            stream,
+            BINDING,
+            on_ready=ready,
+            session=_session(BINDING),
+            terminal_timeout_seconds=None,
+            stop_control=stop,
+            exec_control=mailbox,
+            before_stop_send=lambda: None,
+            monotonic=lambda: clock[0],
+            wait=lambda seconds: clock.__setitem__(0, clock[0] + 1),
+            wait_writable=lambda seconds: clock.__setitem__(0, clock[0] + 1),
+        )
+    assert mailbox.poll(1, RUN_ID)["terminal"] is None
+    assert mailbox.status()["state"] == "control-lost"
 
 
 def test_stop_is_worker_signed_once_with_guard_before_every_partial_send():

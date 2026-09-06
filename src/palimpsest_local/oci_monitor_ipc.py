@@ -30,6 +30,8 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from .errors import PalimpsestError
+from .oci_exec_control import MonitorExecControl, MonitorExecControlError, validate_exec_request
+from .oci_exec_control import _identity as _exec_identity
 from .oci_monitor import (
     _JOURNAL_NAME,
     _LOCK_NAME,
@@ -51,6 +53,9 @@ _CONFIG_SCHEMA = "palimpsest.oci-monitor-exec-config.v2"
 _SPAWN_SCHEMA = "palimpsest.oci-monitor-spawn.v2"
 _REQUEST_SCHEMA = "palimpsest.oci-monitor-ipc-request.v1"
 _RESPONSE_SCHEMA = "palimpsest.oci-monitor-ipc-response.v1"
+_EXEC_REQUEST_SCHEMA = "palimpsest.oci-monitor-job-request.v1"
+_EXEC_RESPONSE_SCHEMA = "palimpsest.oci-monitor-job-response.v1"
+_EXEC_OPERATIONS = frozenset({"status", "submit", "poll", "acknowledge"})
 _RECEIPT_SCHEMA_V1 = "palimpsest.oci-monitor-exec-receipt.v1"
 _RECEIPT_SCHEMA = "palimpsest.oci-monitor-exec-receipt.v2"
 _PREACTIVATION_SCHEMA = "palimpsest.oci-monitor-preactivation.v1"
@@ -1705,6 +1710,81 @@ def _decode_request(
     return operation, request_id, _process_from_dict(value["client"])
 
 
+def _exec_request_message(identity, client, request_id, operation, payload):
+    result = _request_message(MonitorIPCOperation.DESCRIBE, identity, client, request_id)
+    result.update(schema=_EXEC_REQUEST_SCHEMA, operation=operation, payload=payload)
+    return result
+
+
+def _decode_exec_request(value, identity):
+    if type(value) is not dict or "payload" not in value or value.get("schema") != _EXEC_REQUEST_SCHEMA:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
+    operation, payload = value.get("operation"), value["payload"]
+    if type(operation) is not str or operation not in _EXEC_OPERATIONS or type(payload) is not dict:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
+    base = {key: item for key, item in value.items() if key != "payload"}
+    base.update(schema=_REQUEST_SCHEMA, operation=MonitorIPCOperation.DESCRIBE.value)
+    _unused, request_id, client = _decode_request(base, identity)
+    expected = {
+        "status": set(),
+        "submit": {"sequence", "token", "argv", "timeout_ms"},
+        "poll": {"sequence", "token", "stdout_offset", "stderr_offset"},
+        "acknowledge": {"sequence", "token"},
+    }[operation]
+    if set(payload) != expected:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
+    try:
+        if operation != "status":
+            _exec_identity(payload["sequence"], payload["token"])
+        if operation == "submit":
+            validate_exec_request(payload["argv"], payload["timeout_ms"])
+        if operation == "poll" and any(
+            type(payload[key]) is not int or not 0 <= payload[key] <= 65536
+            for key in ("stdout_offset", "stderr_offset")
+        ):
+            raise ValueError
+    except (MonitorExecControlError, ValueError):
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME) from None
+    return operation, request_id, client, payload
+
+
+def _exec_response_message(identity, writer, request_id, operation, payload, error=None):
+    value = _response_message(MonitorIPCOperation.DESCRIBE, identity, writer, request_id)
+    value.pop("state")
+    value.update(schema=_EXEC_RESPONSE_SCHEMA, operation=operation, payload=payload, error=error)
+    return value
+
+
+def _serve_exec_request(request, channel, bound, identity, writer, lease, worker):
+    operation, request_id, client, payload = _decode_exec_request(request, identity)
+    _authorize_peer(channel, client, identity.owner_uid)
+    bound.validate()
+    result, error = None, None
+    with lease._mutex:
+        try:
+            if worker is None:
+                raise MonitorExecControlError("not-ready")
+            if worker.failed:
+                worker.exec_control.close_to_exec("control-lost")
+            elif lease.snapshot.phase == "terminal":
+                worker.exec_control.close_to_exec("terminal")
+            elif lease.snapshot.phase == "ready" and not worker.done.is_set() and not worker.stop_control.accepted:
+                worker.exec_control.mark_ready()
+            if operation == "submit":
+                if (
+                    lease.snapshot.phase != "ready"
+                    or worker.failed
+                    or worker.done.is_set()
+                    or worker.stop_control.accepted
+                ):
+                    raise MonitorExecControlError("not-ready")
+                worker.exec_control.mark_ready()
+            result = getattr(worker.exec_control, operation)(**payload)
+        except MonitorExecControlError as exc:
+            error = exc.category
+    _send_frame(channel, _exec_response_message(identity, writer, request_id, operation, result, error))
+
+
 class _LaunchWorker:
     """One child-local worker; IPC stays responsive during blocking lifecycle IO."""
 
@@ -1718,6 +1798,7 @@ class _LaunchWorker:
         self.done = threading.Event()
         self.failed = False
         self.stop_control = MonitorStopControl()
+        self.exec_control = MonitorExecControl()
         self._authority = authority
         self._directory_fd = directory_fd
         self._binding = binding
@@ -1738,11 +1819,18 @@ class _LaunchWorker:
 
     def _run(self) -> None:
         try:
-            self._authority.run(self._directory_fd, self._binding, self._lease, stop_control=self.stop_control)
+            self._authority.run(
+                self._directory_fd,
+                self._binding,
+                self._lease,
+                stop_control=self.stop_control,
+                exec_control=self.exec_control,
+            )
         except Exception:
             # Never expose an exception string, path, or lifecycle secret.
             self.failed = True
             self.stop_control.mark_control_lost()
+            self.exec_control.close_to_exec("control-lost")
             try:
                 if self._lease.snapshot.phase in _ACTIVATION_PHASES:
                     self._lease.mark_control_lost()
@@ -1776,6 +1864,9 @@ def _serve_committed(
             channel.settimeout(timeout)
             try:
                 request = _recv_frame(channel)
+                if request.get("schema") == _EXEC_REQUEST_SCHEMA:
+                    _serve_exec_request(request, channel, bound, identity, writer, lease, worker)
+                    continue
                 operation, request_id, client = _decode_request(request, identity)
                 _authorize_peer(channel, client, identity.owner_uid)
                 bound.validate()
@@ -1803,6 +1894,7 @@ def _serve_committed(
                             # fence; terminal observation can only revoke it.
                             requested = worker.stop_control.request()
                             if requested == "stop-accepted":
+                                worker.exec_control.close_to_exec("stopping")
                                 state = requested
                 elif operation is MonitorIPCOperation.SHUTDOWN:
                     if worker is not None and not worker.done.is_set():
@@ -2392,6 +2484,67 @@ def request_monitor(
     if expected["state"] == "shutdown-refused":
         raise MonitorIPCError(MonitorIPCErrorCategory.CONTROL_LOST)
     return MonitorIPCReply(operation, expected["state"], endpoint.writer)
+
+
+def request_monitor_exec(directory_fd, endpoint, operation, payload, *, timeout=5.0):
+    """One bounded authenticated mailbox exchange; a lost submit never means retry with a new token."""
+    if (
+        type(endpoint) is not MonitorExecEndpoint
+        or type(timeout) not in {int, float}
+        or not _MIN_TIMEOUT_SECONDS <= timeout <= _MAX_TIMEOUT_SECONDS
+    ):
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+    client, request_id = current_process_identity(), str(uuid.uuid4())
+    request = _exec_request_message(endpoint.identity, client, request_id, operation, payload)
+    _decode_exec_request(request, endpoint.identity)
+    if len(_canonical_bytes(request)) > _MAX_FRAME_BYTES:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
+    deadline = time.monotonic() + timeout
+    _validate_directory(directory_fd)
+    metadata = _visible_socket(directory_fd, endpoint.socket_name)
+    if (metadata.st_dev, metadata.st_ino) != (endpoint.socket_device, endpoint.socket_inode):
+        raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        timed = _RequestDeadlineSocket(channel, deadline)
+        timed._remaining()
+        _connect_socket(channel, directory_fd, endpoint.socket_name)
+        _authorize_peer(channel, endpoint.writer, endpoint.identity.owner_uid)
+        current = _visible_socket(directory_fd, endpoint.socket_name)
+        if (current.st_dev, current.st_ino) != (endpoint.socket_device, endpoint.socket_inode):
+            raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
+        _send_frame(timed, request)
+        response = _recv_frame(timed)
+        timed._remaining()
+    result, error = response.get("payload"), response.get("error")
+    expected = _exec_response_message(endpoint.identity, endpoint.writer, request_id, operation, result, error)
+    if (
+        response != expected
+        or (
+            error is not None
+            and (
+                type(error) is not str
+                or error
+                not in {
+                    "not-ready",
+                    "stale-sequence",
+                    "busy",
+                    "unknown-job",
+                    "invalid-offset",
+                    "not-completed",
+                    "invalid-request",
+                    "invalid-state",
+                    "invalid-output",
+                    "invalid-result",
+                }
+            )
+        )
+        or (error is not None and result is not None)
+        or (error is None and type(result) is not dict)
+    ):
+        raise MonitorIPCError(MonitorIPCErrorCategory.BINDING_MISMATCH)
+    if error is not None:
+        raise MonitorExecControlError(error)
+    return result
 
 
 def shutdown_monitor_exec(

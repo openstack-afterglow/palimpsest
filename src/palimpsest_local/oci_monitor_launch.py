@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import PalimpsestError, StateError
+from .oci_exec_control import MonitorExecControl
 from .oci_monitor_control import MonitorStopControl
 from .oci_monitor_ipc import MonitorPreActivationBinding
 from .oci_root_kvm import VerifiedHostBootArtifacts, verify_host_boot_artifacts
@@ -539,6 +540,7 @@ class MonitorLaunchAuthority:
         lease: Any,
         *,
         stop_control: MonitorStopControl | None = None,
+        exec_control: MonitorExecControl | None = None,
     ) -> Any:
         # This import is intentionally worker-local: no libvirt/event state is
         # inherited from the spawning process or initialized by the IPC loop.
@@ -547,6 +549,8 @@ class MonitorLaunchAuthority:
         connection = None
         try:
             if stop_control is not None and type(stop_control) is not MonitorStopControl:
+                raise _invalid()
+            if exec_control is not None and (type(exec_control) is not MonitorExecControl or stop_control is None):
                 raise _invalid()
             self.validate(directory_fd, binding)
             roots, store, boot, profile = self._rebuild()
@@ -565,6 +569,7 @@ class MonitorLaunchAuthority:
                 terminal_timeout_seconds=self._frame["terminal_timeout_seconds"],
                 authority_guard=lambda: self.validate(directory_fd, binding),
                 **({"stop_control": stop_control} if stop_control is not None else {}),
+                **({"exec_control": exec_control} if exec_control is not None else {}),
             )
         finally:
             try:

@@ -29,14 +29,32 @@ OCI_CONTROL_CONSOLE_CARRIER = "console-line"
 OCI_CONTROL_BOUNDARY_PREFIX = b"palimpsest guest stage1: lifecycle boundary ack "
 MAX_OCI_CONTROL_FRAME_BYTES = 64 * 1024
 MAX_OCI_CONTROL_CONNECTIONS = 16
+MAX_OCI_EXEC_ARGV_BYTES = 8192
+MAX_OCI_EXEC_ARGS = 64
+MAX_OCI_EXEC_OUTPUT_BYTES = 65536
+MAX_OCI_EXEC_CHUNK_BYTES = 1024
+MAX_OCI_EXEC_TIMEOUT_MS = 30000
 _MAX_PAYLOAD_BYTES = MAX_OCI_CONTROL_FRAME_BYTES - 4
 _MAX_COUNTER = (1 << 63) - 1
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 _KINDS = frozenset(
-    {"HELLO", "BOOTSTRAP", "KEY_ACK", "RECONNECT", "BOUNDARY_ACK", "READY", "SNAPSHOT", "STOP", "TERMINAL"}
+    {
+        "HELLO",
+        "BOOTSTRAP",
+        "KEY_ACK",
+        "RECONNECT",
+        "BOUNDARY_ACK",
+        "READY",
+        "SNAPSHOT",
+        "STOP",
+        "TERMINAL",
+        "EXEC",
+        "EXEC_OUTPUT",
+        "EXEC_EXIT",
+    }
 )
-_HOST_KINDS = frozenset({"HELLO", "KEY_ACK", "RECONNECT", "STOP"})
+_HOST_KINDS = frozenset({"HELLO", "KEY_ACK", "RECONNECT", "STOP", "EXEC"})
 _BODY_FIELDS = {
     "boot_attempt_id",
     "domain_core_digest",
@@ -53,6 +71,29 @@ _BODY_FIELDS = {
 
 class OCIControlProtocolV2Error(ArtifactValidationError):
     """Stable fail-closed v2 wire or state-machine validation failure."""
+
+
+def validate_exec_argv(argv: Any) -> tuple[str, ...]:
+    if type(argv) not in {list, tuple} or not 1 <= len(argv) <= MAX_OCI_EXEC_ARGS:
+        raise OCIControlProtocolV2Error("exec argv is invalid")
+    if any(type(item) is not str or "\0" in item for item in argv) or not argv[0]:
+        raise OCIControlProtocolV2Error("exec argv is invalid")
+    try:
+        # Reject unpaired surrogates even if a JSON implementation escapes them.
+        for item in argv:
+            item.encode("utf-8")
+        encoded = canonical_json_bytes(list(argv))
+    except (UnicodeError, ValueError):
+        raise OCIControlProtocolV2Error("exec argv encoding is invalid") from None
+    if len(encoded) > MAX_OCI_EXEC_ARGV_BYTES:
+        raise OCIControlProtocolV2Error("exec argv exceeds its byte limit")
+    return tuple(argv)
+
+
+def validate_exec_timeout(timeout_ms: Any) -> int:
+    if type(timeout_ms) is not int or not 1 <= timeout_ms <= MAX_OCI_EXEC_TIMEOUT_MS:
+        raise OCIControlProtocolV2Error("exec timeout is invalid")
+    return timeout_ms
 
 
 def _exact(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -158,7 +199,7 @@ class OCIControlV2Message:
                 raise OCIControlProtocolV2Error("HELLO fields are invalid")
         else:
             _uuid(self.boot_generation, "boot generation")
-            if self.kind in {"RECONNECT", "STOP"}:
+            if self.kind in {"RECONNECT", "STOP", "EXEC"}:
                 _counter(self.request_id, "request ID")
                 if self.reply_to is not None:
                     raise OCIControlProtocolV2Error(f"{self.kind} fields are invalid")
@@ -262,6 +303,45 @@ class OCIControlV2Message:
                         _counter(stop_id, "snapshot STOP request ID")
                 else:
                     raise OCIControlProtocolV2Error("SNAPSHOT state is invalid")
+            elif self.kind == "EXEC":
+                _exact(payload, {"argv", "timeout_ms"}, "EXEC payload")
+                payload["argv"] = validate_exec_argv(payload["argv"])
+                validate_exec_timeout(payload["timeout_ms"])
+            elif self.kind == "EXEC_OUTPUT":
+                _counter(self.reply_to, "exec reply request ID")
+                _exact(payload, {"stream", "offset", "data_hex"}, "EXEC_OUTPUT payload")
+                if type(payload["stream"]) is not str or payload["stream"] not in {"stdout", "stderr"}:
+                    raise OCIControlProtocolV2Error("exec output stream is invalid")
+                if type(payload["offset"]) is not int or not 0 <= payload["offset"] < MAX_OCI_EXEC_OUTPUT_BYTES:
+                    raise OCIControlProtocolV2Error("exec output offset is invalid")
+                data = payload["data_hex"]
+                if type(data) is not str or re.fullmatch(r"(?:[0-9a-f]{2}){1,1024}", data) is None:
+                    raise OCIControlProtocolV2Error("exec output encoding is invalid")
+                if payload["offset"] + len(data) // 2 > MAX_OCI_EXEC_OUTPUT_BYTES:
+                    raise OCIControlProtocolV2Error("exec output exceeds its byte limit")
+            elif self.kind == "EXEC_EXIT":
+                _counter(self.reply_to, "exec reply request ID")
+                _exact(payload, {"terminal", "stdout_bytes", "stderr_bytes", "reason"}, "EXEC_EXIT payload")
+                if payload["terminal"] is not None:
+                    payload["terminal"] = _terminal(payload["terminal"])
+                if type(payload["reason"]) is not str or payload["reason"] not in {
+                    "completed",
+                    "timeout",
+                    "output-limit",
+                    "cancelled",
+                }:
+                    raise OCIControlProtocolV2Error("exec completion reason is invalid")
+                if any(
+                    type(payload[key]) is not int or not 0 <= payload[key] <= MAX_OCI_EXEC_OUTPUT_BYTES
+                    for key in ("stdout_bytes", "stderr_bytes")
+                ):
+                    raise OCIControlProtocolV2Error("exec output count is invalid")
+                if payload["stdout_bytes"] + payload["stderr_bytes"] > MAX_OCI_EXEC_OUTPUT_BYTES:
+                    raise OCIControlProtocolV2Error("exec combined output exceeds its byte limit")
+                if payload["terminal"] is None and (
+                    payload["reason"] != "cancelled" or payload["stdout_bytes"] or payload["stderr_bytes"]
+                ):
+                    raise OCIControlProtocolV2Error("unstarted exec cancellation must have no output or invented exit")
             elif self.kind == "TERMINAL":
                 payload["terminal"] = _terminal(_exact(payload, {"terminal"}, "TERMINAL payload")["terminal"])
                 if self.reply_to is not None:
@@ -288,7 +368,7 @@ class OCIControlV2Message:
             "stage1_artifact_digest": self.binding.stage1_artifact_digest,
             "wire_sequence": self.wire_sequence,
         }
-        if self.kind in {"HELLO", "RECONNECT", "STOP"}:
+        if self.kind in {"HELLO", "RECONNECT", "STOP", "EXEC"}:
             value["request_id"] = self.request_id
         if self.kind != "HELLO":
             value.update(boot_generation=self.boot_generation, reply_to=self.reply_to)
@@ -300,7 +380,7 @@ class OCIControlV2Message:
             raise OCIControlProtocolV2Error("lifecycle message kind is invalid")
         kind = value["kind"]
         fields = set(_BODY_FIELDS)
-        if kind in {"HELLO", "RECONNECT", "STOP"}:
+        if kind in {"HELLO", "RECONNECT", "STOP", "EXEC"}:
             fields.add("request_id")
         if kind != "HELLO":
             fields |= {"boot_generation", "reply_to"}
@@ -654,6 +734,9 @@ class HostOCIControlV2Session:
         self._stop_wire_candidates: set[int] = set()
         self._retry_reconnect_request: int | None = None
         self._reconnect_from: str | None = None
+        self._exec_request: int | None = None
+        self._exec_wire: int | None = None
+        self._exec_counts = {"stdout": 0, "stderr": 0}
         self.state = "new"
 
     @property
@@ -752,6 +835,8 @@ class HostOCIControlV2Session:
         return envelope
 
     def admit_boundary(self, envelope: OCIControlV2Envelope, encoded_line: bytes) -> None:
+        if self._exec_request is not None:
+            raise OCIControlProtocolV2Error("exec reconnect is unsupported; command outcome is uncertain")
         if self._key is None or self._boot_generation is None:
             raise OCIControlProtocolV2Error("BOUNDARY_ACK arrived before BOOTSTRAP")
         verify_message_authentication(envelope, self._key, carrier=OCI_CONTROL_CONSOLE_CARRIER)
@@ -901,6 +986,8 @@ class HostOCIControlV2Session:
             self._reconnect_expected_state = None
 
     def reconnect(self) -> OCIControlV2Envelope:
+        if self._exec_request is not None:
+            raise OCIControlProtocolV2Error("exec reconnect is unsupported")
         if self._key is None or self._boot_generation is None or self._boundary is None:
             raise OCIControlProtocolV2Error("RECONNECT requires authenticated BOUNDARY_ACK")
         if self.state not in {"ready", "stop-sent", "terminal"}:
@@ -936,6 +1023,39 @@ class HostOCIControlV2Session:
             ),
             self._key,
         )
+
+    def exec(self, argv: tuple[str, ...], *, timeout_ms: int = MAX_OCI_EXEC_TIMEOUT_MS) -> OCIControlV2Envelope:
+        argv = validate_exec_argv(argv)
+        validate_exec_timeout(timeout_ms)
+        if (
+            self.state != "ready"
+            or self._key is None
+            or self._boot_generation is None
+            or self._exec_request is not None
+        ):
+            raise OCIControlProtocolV2Error("exec requires ready state and no outstanding command")
+        if self._request >= _MAX_COUNTER or self._host_wire >= _MAX_COUNTER:
+            raise OCIControlProtocolV2Error("exec sequence is exhausted")
+        envelope = sign_message(
+            OCIControlV2Message(
+                "EXEC",
+                self.binding,
+                self.boot_attempt_id,
+                self._nonce or "",
+                self._epoch,
+                self._host_wire + 1,
+                {"argv": argv, "timeout_ms": timeout_ms},
+                request_id=self._request + 1,
+                boot_generation=self._boot_generation,
+            ),
+            self._key,
+        )
+        self._request += 1
+        self._host_wire += 1
+        self._exec_request = self._request
+        self._exec_wire = self._host_wire
+        self._exec_counts = {"stdout": 0, "stderr": 0}
+        return envelope
 
     def stop(self) -> OCIControlV2Envelope:
         if self.state != "ready" or self._key is None or self._boot_generation is None:
@@ -1023,6 +1143,32 @@ class HostOCIControlV2Session:
             raise OCIControlProtocolV2Error("guest lifecycle nonce or epoch is stale")
         if message.wire_sequence <= self._guest_wire:
             raise OCIControlProtocolV2Error("guest lifecycle wire ordering is stale")
+        if message.kind in {"EXEC_OUTPUT", "EXEC_EXIT"}:
+            if (
+                self.state not in {"ready", "stop-sent"}
+                or self._exec_request is None
+                or message.reply_to != self._exec_request
+            ):
+                raise OCIControlProtocolV2Error("guest exec request identity is stale")
+            if message.kind == "EXEC_OUTPUT":
+                stream = message.payload["stream"]
+                count = len(message.payload["data_hex"]) // 2
+                if message.payload["offset"] != self._exec_counts[stream]:
+                    raise OCIControlProtocolV2Error("guest exec output offset is not contiguous")
+                if sum(self._exec_counts.values()) + count > MAX_OCI_EXEC_OUTPUT_BYTES:
+                    raise OCIControlProtocolV2Error("guest exec combined output exceeds limit")
+                self._exec_counts[stream] += count
+            else:
+                if any(
+                    message.payload[stream + "_bytes"] != self._exec_counts[stream] for stream in ("stdout", "stderr")
+                ):
+                    raise OCIControlProtocolV2Error("guest exec completion output counts differ")
+                self._exec_request = None
+            self._guest_wire = message.wire_sequence
+            self._accepted_host_wire = max(self._accepted_host_wire, self._exec_wire or 0)
+            return
+        if message.kind == "TERMINAL" and self._exec_request is not None:
+            raise OCIControlProtocolV2Error("VM terminal preceded exec completion; command outcome uncertain")
         accepted_host_wire_candidates: frozenset[int] | None = None
         if self.state == "key-ack-sent" and message.kind == "READY" and message.reply_to == self._host_wire:
             next_state = "ready"

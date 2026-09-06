@@ -25,6 +25,7 @@ from .oci_control_protocol_v2 import (
     OCIControlV2FrameDecoder,
     encode_frame,
 )
+from .oci_exec_control import MonitorExecControl
 from .oci_monitor_control import MonitorStopControl
 from .runtime_types import ProcessExit, ProcessExitCategory
 
@@ -225,6 +226,7 @@ def complete_initial_lifecycle_handoff(
     session: HostOCIControlV2Session | None = None,
     stop_control: MonitorStopControl | None = None,
     before_stop_send: Callable[[], None] | None = None,
+    exec_control: MonitorExecControl | None = None,
 ) -> OCILifecycleHandoffReceipt:
     """Drive HELLO/BOOTSTRAP/KEY_ACK/READY through authenticated TERMINAL.
 
@@ -270,6 +272,10 @@ def complete_initial_lifecycle_handoff(
             type(stop_control) is not MonitorStopControl or not callable(before_stop_send)
         ):
             raise OCILifecycleTransportError("OCI-root lifecycle STOP control is invalid")
+        if exec_control is not None and (
+            type(exec_control) is not MonitorExecControl or stop_control is None or not callable(before_stop_send)
+        ):
+            raise OCILifecycleTransportError("OCI-root lifecycle EXEC control is invalid")
         if not callable(monotonic) or not callable(wait):
             raise OCILifecycleTransportError("OCI-root lifecycle timing callback is invalid")
         if wait_writable is None:
@@ -328,14 +334,40 @@ def complete_initial_lifecycle_handoff(
             if not math.isfinite(terminal_deadline):
                 raise OCILifecycleTransportError("OCI-root lifecycle clock result is invalid")
 
+        exec_job = None
+        exec_deadline = None
+
         def poll_stop(can_send: bool) -> None:
+            nonlocal exec_job, exec_deadline
+            if exec_deadline is not None:
+                _remaining(exec_deadline, monotonic)
             if stop_control is None:
                 return
             stop_deadline = stop_control.deadline
             if stop_deadline is not None:
                 _remaining(stop_deadline, monotonic)
-            if not can_send or not stop_control.take_stop():
+            if not can_send:
                 return
+            if not stop_control.take_stop():
+                if exec_control is not None and not stop_control.accepted and exec_job is None and not pending:
+                    job = exec_control.take_exec()
+                    if job is not None:
+                        exec_job = job
+                        # Guest enforces its execution deadline; the host allows
+                        # bounded drain/cleanup time but never guesses an exit.
+                        exec_deadline = monotonic() + job.timeout_ms / 1000 + 15
+                        request = session.exec(job.argv, timeout_ms=job.timeout_ms)
+                        _send_all(
+                            stream,
+                            encode_frame(request),
+                            deadline=min(exec_deadline, monotonic() + 5),
+                            monotonic=monotonic,
+                            wait_writable=wait_writable,
+                            before_send=before_stop_send,
+                        )
+                return
+            if exec_control is not None:
+                exec_control.close_to_exec("stopping")
             stop_deadline = stop_control.deadline
             if stop_deadline is None:
                 raise OCILifecycleTransportError("OCI-root lifecycle STOP deadline is missing")
@@ -354,23 +386,59 @@ def complete_initial_lifecycle_handoff(
             observed_tags.add(stop.tag or "")
             transcript.append(session.transcript_projection(stop, encoded_stop))
 
-        terminal_envelope = _receive_one(
-            stream,
-            decoder,
-            pending,
-            deadline=terminal_deadline,
-            monotonic=monotonic,
-            wait=wait,
-            control_poll=poll_stop,
-        )
-        try:
-            session.accept(terminal_envelope)
-        except OCIControlProtocolV2Error:
-            raise OCILifecycleTransportError("OCI-root lifecycle TERMINAL was rejected") from None
+        after_exec_output = False
+        while True:
+            # Continuous output must not starve an accepted STOP. A decoded
+            # complete frame is a safe send boundary even without EAGAIN.
+            try:
+                decoder.finish()
+            except OCIControlProtocolV2Error:
+                can_send = False
+            else:
+                can_send = after_exec_output
+            poll_stop(can_send)
+            terminal_envelope = _receive_one(
+                stream,
+                decoder,
+                pending,
+                deadline=terminal_deadline,
+                monotonic=monotonic,
+                wait=wait,
+                control_poll=poll_stop,
+            )
+            try:
+                session.accept(terminal_envelope)
+            except OCIControlProtocolV2Error:
+                raise OCILifecycleTransportError("OCI-root lifecycle TERMINAL or exec response was rejected") from None
+            kind = terminal_envelope.body.kind
+            if kind not in {"EXEC_OUTPUT", "EXEC_EXIT"}:
+                break
+            if exec_control is None or exec_job is None:
+                raise OCILifecycleTransportError("OCI-root guest exec result has no owned request")
+            payload = terminal_envelope.body.payload
+            if kind == "EXEC_OUTPUT":
+                exec_control.append_output(
+                    exec_job, payload["stream"], payload["offset"], bytes.fromhex(payload["data_hex"])
+                )
+            else:
+                exec_control.complete(
+                    exec_job,
+                    None if payload["terminal"] is None else dict(payload["terminal"]),
+                    payload["stdout_bytes"],
+                    payload["stderr_bytes"],
+                    payload["reason"],
+                )
+                exec_job = None
+                exec_deadline = None
+            after_exec_output = kind == "EXEC_OUTPUT"
+            # Command content/output stays in the bounded volatile mailbox.
+            # It is not part of the durable boot lifecycle transcript.
         if session.state != "terminal" or terminal_envelope.body.kind != "TERMINAL":
             raise OCILifecycleTransportError("OCI-root lifecycle terminal status is invalid")
         if stop_control is not None:
             stop_control.mark_observed_terminal()
+        if exec_control is not None:
+            exec_control.close_to_exec("terminal")
         if pending:
             raise OCILifecycleTransportError("OCI-root lifecycle TERMINAL had trailing frame data")
         try:
@@ -392,6 +460,8 @@ def complete_initial_lifecycle_handoff(
         failure = exc
         if stop_control is not None and type(stop_control) is MonitorStopControl:
             stop_control.mark_control_lost()
+        if exec_control is not None and type(exec_control) is MonitorExecControl:
+            exec_control.close_to_exec("control-lost")
     if isinstance(failure, OCILifecycleStreamCallbackCleanupError):
         raise failure
     if before_stream_close is not None:

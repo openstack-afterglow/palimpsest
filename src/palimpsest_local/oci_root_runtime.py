@@ -25,6 +25,7 @@ from .oci_control_protocol_v2 import (
     HostOCIControlV2Session,
     OCIControlV2Binding,
 )
+from .oci_exec_control import MonitorExecControl
 from .oci_layout import canonical_json
 from .oci_lifecycle_transport import (
     DEFAULT_HANDOFF_TIMEOUT_SECONDS,
@@ -1643,6 +1644,7 @@ def launch_defined_oci_root_domain(
     monitor_lease: _PreactivationJournalLease | None = None,
     authority_guard: Callable[[], None] | None = None,
     stop_control: MonitorStopControl | None = None,
+    exec_control: MonitorExecControl | None = None,
 ) -> CompletedOCIRootHandoff:
     """Privately launch an exact defined domain and synchronously observe exit.
 
@@ -1659,6 +1661,8 @@ def launch_defined_oci_root_domain(
         type(stop_control) is not MonitorStopControl or monitor_lease is None or authority_guard is None
     ):
         raise StateError("OCI-root STOP control requires an exact guarded monitor lease")
+    if exec_control is not None and (type(exec_control) is not MonitorExecControl or stop_control is None):
+        raise StateError("OCI-root EXEC control requires an exact guarded monitor lease")
 
     def verify_monitor_lease(mutation: Any, lease: _PreactivationJournalLease, *args: Any, **kwargs: Any) -> None:
         _verify_monitor_lease_directory(mutation, lease, *args, authority_guard=authority_guard, **kwargs)
@@ -1951,6 +1955,8 @@ def launch_defined_oci_root_domain(
                     monitor_lease.mark_ready()
                 if stop_control is not None:
                     stop_control.mark_ready()
+                if exec_control is not None:
+                    exec_control.mark_ready()
 
         def before_stop_send() -> None:
             # This callback runs only on the lifecycle worker, immediately
@@ -1998,6 +2004,7 @@ def launch_defined_oci_root_domain(
                 wait=event_pump.wait_readable,
                 wait_writable=event_pump.wait_writable,
                 before_stream_close=event_pump.close,
+                **({"exec_control": exec_control} if exec_control is not None else {}),
                 **(
                     {"stop_control": stop_control, "before_stop_send": before_stop_send}
                     if stop_control is not None

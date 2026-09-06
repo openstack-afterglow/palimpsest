@@ -328,7 +328,9 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert 'exact_string(&j, "palimpsest.guest-stage1.v15")' in source
     assert 'exact_string(&j, "first-party-pid1-supervisor.v9")' in source
     assert '"palimpsest.agent"' in source
-    assert '"0::/palimpsest.agent/exec-00000001\\n"' in source
+    assert 'append_text(expected, &expected_used, "0::/palimpsest.agent/")' in source
+    assert "append_text(expected, &expected_used, session->name)" in source
+    assert "return read_exact_attr(proc_path, expected)" in source
     assert "struct workload_agent" in source
     assert "struct exec_session" in source
     assert "static int create_exec_session(" in source
@@ -340,7 +342,8 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "agent->next_session_id++" in source
     assert "u32 divisor = 1000000000" in source
     assert "divisor <= 10000000" in source
-    assert "agent->active_sessions != 1" in source
+    assert "agent->active_sessions >= 2" in source
+    assert "agent->active_sessions == 1 && remove_empty_exec_session(agent, session)" in source
     assert 'cgroup_populated(&agent->parent, "populated 1\\n")' in source
     assert "cgroup_procs_empty(&agent->parent)" in source
     assert "kill_exec_session(session)" in source
@@ -372,12 +375,13 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "value.n != 36" in source
     assert "for (i = 0; i < nonce.n; i++) if (!is_hex" in source
     assert 'memcpy(name_path + 24 + slen(selected), "/name", 6)' in source
-    assert "lifecycle_poll_timeout(lifecycle, -1)" in source
+    assert "lifecycle_poll_timeout(lifecycle, remote_exec.active ? 100 : -1)" in source
     assert "lifecycle_poll_timeout(session, -1)" in source
     assert "session->outbound_failed" in source
     assert "lifecycle_connection_lost(session);" in source
     assert "n != 0 && n != -ESRCH" in source
-    assert "lifecycle->stop_request_id ? lifecycle : 0" in source
+    assert "lifecycle->state >= LIFECYCLE_READY && !lifecycle->natural_terminal_frozen" in source
+    assert "terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle)" in source
     assert "if (session->state == LIFECYCLE_TERMINAL)" in source
     assert "session->natural_late_stop_allowed = 0;" in source
     assert "lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;" in source
