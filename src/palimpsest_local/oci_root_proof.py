@@ -17,6 +17,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_root_kvm import load_oci_root_domain_plan
 from .oci_root_runtime import _domain_projection, _projection_digest, connect_oci_root_libvirt
 from .oci_run_cleanup import _read_run_journal
+from .oci_runtime_access import LinuxFdACLBackend, RuntimeAccessReceipt, _validate_target
 from .state import RunLedgerSnapshot, StatePaths, read_run_ledger_snapshot
 
 OCI_ROOT_PROOF_SCHEMA = "palimpsest.oci-root-proof.v1"
@@ -97,13 +98,14 @@ class _PinnedRunRead:
                 or not stat.S_ISDIR(info.st_mode)
                 or not stat.S_ISDIR(visible.st_mode)
                 or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) != 0o700
+                or stat.S_IMODE(info.st_mode) not in (0o700, 0o710)
                 or (info.st_dev, info.st_ino) != (visible.st_dev, visible.st_ino)
             ):
                 raise StateError("OCI-root proof run binding is invalid")
             self._runs_identity = (runs_open.st_dev, runs_open.st_ino)
             self._runs_metadata = (runs_open.st_uid, stat.S_IMODE(runs_open.st_mode))
             self._run_identity = (info.st_dev, info.st_ino)
+            self._run_metadata = (info.st_uid, stat.S_IMODE(info.st_mode))
         except Exception:
             self.close()
             raise
@@ -122,13 +124,43 @@ class _PinnedRunRead:
                 (item.st_uid, stat.S_IMODE(item.st_mode)) != self._runs_metadata
                 for item in (runs_open, runs_visible)
             )
-            or any(item.st_uid != os.geteuid() for item in (run_open, run_visible))
-            or any(stat.S_IMODE(item.st_mode) != 0o700 for item in (run_open, run_visible))
+            or any(
+                (item.st_uid, stat.S_IMODE(item.st_mode)) != self._run_metadata
+                for item in (run_open, run_visible)
+            )
             or any((item.st_dev, item.st_ino) != self._runs_identity for item in (runs_open, runs_visible))
             or any((item.st_dev, item.st_ino) != self._run_identity for item in (run_open, run_visible))
             or read_run_ledger_snapshot(self.roots, self.record.name) != self.snapshot
         ):
             raise StateError("OCI-root proof run ledger changed")
+
+    def verify_authorized_mode(self, binding: Any) -> None:
+        """Require private owner mode or the exact durable active QEMU ACL grant."""
+        self.verify_binding()
+        info = os.fstat(self._run_fd)
+        if stat.S_IMODE(info.st_mode) == 0o700:
+            return
+        try:
+            receipt = RuntimeAccessReceipt.from_dict(self.snapshot.state["oci_runtime_access"])
+            receipt_binding = receipt.binding
+            binding_fields = (
+                "record", "owner_uid", "plan_digest", "expected_definition_projection_digest",
+                "stage1_artifact_digest", "domain_uuid", "boot_attempt_id", "libvirt_uri",
+            )
+            if receipt.phase != "granted" or any(
+                getattr(receipt_binding, field) != getattr(binding, field) for field in binding_fields
+            ):
+                raise ValueError
+            visible = os.stat(self.record.name, dir_fd=self._runs_fd, follow_symlinks=False)
+            backend = LinuxFdACLBackend()
+            for current in (info, visible):
+                _validate_target(current, receipt.run, receipt.run.granted, run_directory=True)
+            if backend.read_acl(self._run_fd) != receipt.run.granted:
+                raise ValueError
+            _validate_target(os.fstat(self._run_fd), receipt.run, receipt.run.granted, run_directory=True)
+        except Exception:
+            raise StateError("OCI-root proof run binding is invalid") from None
+        self.verify_binding()
 
     def close(self) -> None:
         if self._run_fd >= 0:
@@ -157,6 +189,7 @@ def root_proof(roots: StatePaths, name: str, *, conn: Any | None = None) -> Mapp
         try:
             journal = _read_run_journal(mutation)
             binding = journal.identity.binding
+            mutation.verify_authorized_mode(binding)
             handoff = snapshot.state.get("oci_root_handoff")
             if (
                 journal.phase != "ready"

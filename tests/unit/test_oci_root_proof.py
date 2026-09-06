@@ -14,6 +14,7 @@ import pytest
 
 from palimpsest_local import oci_root_proof as proof_module
 from palimpsest_local.errors import StateError
+from palimpsest_local.oci_acl import baseline_acl, grant_acl, traversal_acl
 from palimpsest_local.oci_control_protocol_v2 import (
     OCI_CONTROL_CHANNEL_CARRIER,
     OCIControlV2Binding,
@@ -22,8 +23,12 @@ from palimpsest_local.oci_control_protocol_v2 import (
     sign_message,
     transcript_projection,
 )
+from palimpsest_local.oci_monitor_ipc import MonitorPreActivationBinding
 from palimpsest_local.oci_root_proof import _PinnedRunRead, _ready_body, root_proof
-from palimpsest_local.state import StatePaths
+from palimpsest_local.oci_runtime_access import RuntimeAccessReceipt, RuntimeAccessTarget
+from palimpsest_local.oci_runtime_io import RuntimeIOReceipt
+from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from palimpsest_local.state import ExistingRunRecord, StatePaths
 
 IDENTITY = {
     "schema": "palimpsest.oci-root-identity.v1",
@@ -124,6 +129,87 @@ def test_pinned_reader_rejects_runs_ancestor_permission_drift(tmp_path: Path) ->
         reader.close()
 
 
+def _runtime_access_receipt(run: Path) -> tuple[RuntimeAccessReceipt, MonitorPreActivationBinding]:
+    record = ExistingRunRecord(
+        "demo", "f6f546e2-e734-4920-9eff-1762b348a249", 2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+    binding = MonitorPreActivationBinding(
+        record, os.geteuid(), "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+        "sha256:" + "c" * 64, "de305d54-75b4-431b-adb2-eb6b9e546014",
+        "aca88126-d991-4de8-b66b-90dc07904dff", "qemu:///system",
+    )
+    info = run.stat()
+    qemu_uid = 12345 if os.geteuid() != 12345 else 12346
+    qemu_gid = qemu_uid + 1
+    directory_baseline = baseline_acl(directory=True)
+    file_baseline = baseline_acl(directory=False)
+    run_target = RuntimeAccessTarget(
+        info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_nlink, True,
+        directory_baseline, traversal_acl(directory_baseline, qemu_uid),
+    )
+    directory_target = RuntimeAccessTarget(
+        info.st_dev, info.st_ino + 1, info.st_uid, info.st_gid, 2, True,
+        directory_baseline, grant_acl(directory_baseline, qemu_uid),
+    )
+    console_target = RuntimeAccessTarget(
+        info.st_dev, info.st_ino + 2, info.st_uid, info.st_gid, 1, False,
+        file_baseline, grant_acl(file_baseline, qemu_uid),
+    )
+    runtime_io = RuntimeIOReceipt(
+        "palimpsest.oci-runtime-io.v1", record.run_id, record.name, binding.plan_digest,
+        directory_target.device, directory_target.inode, console_target.device, console_target.inode,
+    )
+    return RuntimeAccessReceipt(
+        str(uuid.uuid4()), "granted", binding, runtime_io, qemu_uid, qemu_gid,
+        run_target, directory_target, console_target,
+    ), binding
+
+
+@pytest.mark.parametrize(
+    "mutation", ["valid", "missing", "malformed", "phase", "boot", "target", "acl"]
+)
+def test_pinned_reader_requires_exact_authorized_0710_receipt_and_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    runs = tmp_path / "state" / "runs"
+    run = runs / "demo"
+    run.mkdir(parents=True, mode=0o710)
+    run.chmod(0o710)
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    receipt, binding = _runtime_access_receipt(run)
+    serialized = receipt.to_dict()
+    if mutation == "missing":
+        state = {}
+    else:
+        state = {"oci_runtime_access": serialized}
+        if mutation == "malformed":
+            serialized.pop("schema")
+        elif mutation == "phase":
+            serialized["phase"] = "intent"
+        elif mutation == "boot":
+            serialized["binding"]["boot_attempt_id"] = str(uuid.uuid4())
+        elif mutation == "target":
+            serialized["run"]["inode"] += 3
+            assert RuntimeAccessReceipt.from_dict(serialized).run.inode == receipt.run.inode + 3
+    snapshot = SimpleNamespace(record=binding.record, state=_freeze(state))
+    current_acl = receipt.run.baseline if mutation == "acl" else receipt.run.granted
+    monkeypatch.setattr(
+        proof_module, "LinuxFdACLBackend",
+        lambda: SimpleNamespace(read_acl=lambda fd: current_acl),
+    )
+    monkeypatch.setattr(proof_module, "read_run_ledger_snapshot", lambda roots, name: snapshot)
+    reader = _PinnedRunRead(roots, snapshot)  # type: ignore[arg-type]
+    try:
+        if mutation == "valid":
+            reader.verify_authorized_mode(binding)
+        else:
+            with pytest.raises(StateError, match="binding is invalid"):
+                reader.verify_authorized_mode(binding)
+    finally:
+        reader.close()
+
+
 def _freeze(value):
     if isinstance(value, dict):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -202,6 +288,9 @@ def proof_case(monkeypatch: pytest.MonkeyPatch):
             self._run_fd = 10
 
         def verify_binding(self):
+            return None
+
+        def verify_authorized_mode(self, binding):
             return None
 
         def close(self):
