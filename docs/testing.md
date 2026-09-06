@@ -95,6 +95,15 @@ against an existing user VM or delete retained failure evidence to speed up a
 test. A native change still requires its actual native proof; a focused unit
 pass is not a replacement.
 
+The coordinated native case additionally requires the invoking Python to import
+both the installed project and libvirt normally: clean product children do not
+inherit `PYTHONPATH`. Use a qualified system-Python venv with
+`--system-site-packages` and the current project installed, and unset
+`PYTHONPATH`. Its targeted selector is
+`tests/kvm/test_oci_root_libvirt_live.py::test_live_oci_root[True-True-True-True]`.
+This exercises fresh coordinator, live console, separate-client STOP, cleanup
+and retained-root reuse in one case; it is not the public build-to-run Gate 2.
+
 Gate 1 verifies the Palimpsest local OCI build. Gate 2 retains the full public
 `run -d → exec → stop → rm` contract on a Docker-daemonless KVM host. Test
 partitioning neither enables Gate 2 nor changes its acceptance criteria.

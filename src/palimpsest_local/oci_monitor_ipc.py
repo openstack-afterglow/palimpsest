@@ -2312,6 +2312,28 @@ def _read_start_ticks_for_spawn(pid: int) -> int:
         raise MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED) from None
 
 
+class _RequestDeadlineSocket:
+    """Limit the whole client exchange, including a peer's partial writes."""
+
+    def __init__(self, channel: socket.socket, deadline: float):
+        self.channel = channel
+        self.deadline = deadline
+
+    def _remaining(self) -> None:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise MonitorIPCError(MonitorIPCErrorCategory.TIMEOUT)
+        self.channel.settimeout(remaining)
+
+    def send(self, data: bytes) -> int:
+        self._remaining()
+        return self.channel.send(data)
+
+    def recv(self, size: int) -> bytes:
+        self._remaining()
+        return self.channel.recv(size)
+
+
 def request_monitor(
     directory_fd: int,
     endpoint: MonitorExecEndpoint,
@@ -2327,10 +2349,11 @@ def request_monitor(
     if (
         not isinstance(endpoint, MonitorExecEndpoint)
         or not isinstance(operation, MonitorIPCOperation)
-        or isinstance(timeout, bool)
+        or type(timeout) not in {int, float}
         or not _MIN_TIMEOUT_SECONDS <= timeout <= _MAX_TIMEOUT_SECONDS
     ):
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
+    deadline = time.monotonic() + timeout
     _validate_directory(directory_fd)
     assert endpoint.socket_name is not None
     metadata = _visible_socket(directory_fd, endpoint.socket_name)
@@ -2339,14 +2362,16 @@ def request_monitor(
     client = current_process_identity()
     request_id = str(uuid.uuid4())
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-        channel.settimeout(timeout)
+        timed = _RequestDeadlineSocket(channel, deadline)
+        timed._remaining()
         _connect_socket(channel, directory_fd, endpoint.socket_name)
         _authorize_peer(channel, endpoint.writer, endpoint.identity.owner_uid)
         current = _visible_socket(directory_fd, endpoint.socket_name)
         if (current.st_dev, current.st_ino) != (endpoint.socket_device, endpoint.socket_inode):
             raise MonitorIPCError(MonitorIPCErrorCategory.SOCKET_CHANGED)
-        _send_frame(channel, _request_message(operation, endpoint.identity, client, request_id))
-        value = _recv_frame(channel)
+        _send_frame(timed, _request_message(operation, endpoint.identity, client, request_id))
+        value = _recv_frame(timed)
+        timed._remaining()
     expected = _response_message(operation, endpoint.identity, endpoint.writer, request_id)
     if (
         operation is MonitorIPCOperation.DESCRIBE

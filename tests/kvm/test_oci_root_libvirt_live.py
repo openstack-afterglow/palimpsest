@@ -3883,7 +3883,19 @@ def _launch_in_exec_monitor(
     directory_fd = os.open(
         roots.runs / binding.record.name / "monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     )
+    foreground_session = None
+    foreground_result = None
     try:
+        if coordinated:
+            from palimpsest_local.oci_monitor_client import MonitorClient
+            from palimpsest_local.oci_process_session import OCIMonitorProcessSession
+
+            with MonitorClient(roots, binding, endpoint) as client:
+                ready = client.wait_ready(timeout=45)
+                assert ready.phase == "ready" and ready.terminal is None
+            # Closing the readiness client is detach only: the monitor and its
+            # workload remain live, and a different process can request STOP.
+            foreground_session = OCIMonitorProcessSession(roots, binding, endpoint)
         deadline = time.monotonic() + 75
         observed_active = False
         stop_requested = False
@@ -3933,11 +3945,56 @@ def _launch_in_exec_monitor(
                 console = _qualification_console_tail(roots.runs / binding.record.name / "io" / "console.log")
                 if _console_marker_count(console, "palimpsest workload proof: signal handlers armed") == 1:
                     assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
-                    for _ in range(3):
-                        response = monitor_ipc.request_monitor(
-                            directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP
+                    if coordinated:
+                        from palimpsest_local.runtime_types import ProcessOutputEvent, ProcessStatusEvent
+
+                        events = foreground_session.events()
+                        first_output = next(events)
+                        assert isinstance(first_output, ProcessOutputEvent)
+                        assert conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1
+                        stopped = subprocess.run(
+                            [sys.executable, str(Path(__file__).with_name("oci_monitor_client_helper.py"))],
+                            input=json.dumps(
+                                {
+                                    "config": str(roots.config),
+                                    "state": str(roots.state),
+                                    "binding": binding.to_dict(),
+                                    "endpoint": endpoint.to_dict(),
+                                }
+                            ),
+                            text=True,
+                            capture_output=True,
+                            timeout=45,
+                            check=False,
                         )
-                        assert response.state in {"stop-accepted", "stop-terminal"}
+                        assert stopped.returncode == 0, stopped.stderr[-8000:]
+                        result = json.loads(stopped.stdout)
+                        assert result["pid"] not in {os.getpid(), endpoint.writer.pid}
+                        output = bytearray(first_output.data)
+                        statuses = []
+                        for event in events:
+                            if isinstance(event, ProcessOutputEvent):
+                                assert len(event.data) <= 65536
+                                output.extend(event.data)
+                                assert len(output) <= 512 * 1024
+                            else:
+                                assert isinstance(event, ProcessStatusEvent)
+                                statuses.append(event.result)
+                        assert len(statuses) == 1
+                        foreground_result = statuses[0]
+                        assert foreground_session.wait() == foreground_result
+                        assert result["returncode"] == foreground_result.returncode
+                        assert result["exit_code"] == foreground_result.exit_code
+                        assert result["signal_number"] == foreground_result.signal_number
+                        assert result["category"] == foreground_result.category.value
+                        assert b"palimpsest workload proof: signal handlers armed" in output
+                        foreground_session.close()
+                    else:
+                        for _ in range(3):
+                            response = monitor_ipc.request_monitor(
+                                directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP
+                            )
+                            assert response.state in {"stop-accepted", "stop-terminal"}
                     assert (
                         monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.PING).state
                         == "pong"
@@ -4054,6 +4111,8 @@ def _launch_in_exec_monitor(
             exit_data["signal_number"],
             ProcessExitCategory(exit_data["category"]),
         )
+        if coordinated:
+            assert foreground_result == terminal
         lifecycle = OCILifecycleHandoffReceipt(
             receipt["boot_attempt_id"],
             receipt["boot_generation"],
@@ -4073,6 +4132,8 @@ def _launch_in_exec_monitor(
             lifecycle,
         ), snapshot
     finally:
+        if foreground_session is not None:
+            foreground_session.close()
         os.close(directory_fd)
 
 

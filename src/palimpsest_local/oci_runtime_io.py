@@ -210,6 +210,27 @@ class RuntimeIOGuard:
             raise _invalid()
         return self._descriptors.directory
 
+    def read_console(self, offset: int, limit: int = 64 * 1024) -> bytes:
+        """Read bounded, untrusted VM-console bytes under this short run guard.
+
+        Appends are expected. Replaced inodes, invalid access and truncation
+        behind the consumed offset are not. No read changes the file offset.
+        """
+        if type(offset) is not int or not 0 <= offset <= 2**63 - 1 or type(limit) is not int or not 1 <= limit <= 65536:
+            raise _invalid()
+        self.verify()
+        try:
+            descriptor = self._descriptors.console
+            if os.fstat(descriptor).st_size < offset:
+                raise _invalid()
+            content = os.pread(descriptor, limit, offset)
+            if os.fstat(descriptor).st_size < offset + len(content):
+                raise _invalid()
+            self.verify()
+            return content
+        except OSError:
+            raise _invalid() from None
+
     def verify(self, *, require_socket_absent: bool = False) -> None:
         if self._closed or self._descriptors.pid != os.getpid() or type(require_socket_absent) is not bool:
             raise _invalid()

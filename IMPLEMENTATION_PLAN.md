@@ -1817,6 +1817,35 @@ this is not yet public host setup or public `run/-d` acceptance.
 The coordinator test file belongs to the explicit `oci-monitor` lane. Per-edit
 verification remains selected tests; public CLI and Gate 2 gates stay closed.
 
+### PR 4 slice 30Z: monitor-backed foreground and completed STOP
+
+`MonitorClient` binds the existing run, private-directory inode, generation,
+writer, socket, monotonic journal and lifecycle identity. READY may race natural
+terminal completion, which is returned explicitly rather than disguised as a
+live detached run. A STOP acceptance is not a result: completed STOP requires
+the matching terminal ledger/journal and authenticated worker-completion reply.
+Actual guest exit/signal fields are validated and returned without synthesizing
+a successful status from console text. Ambiguity preserves the run's evidence.
+
+The noninteractive `OCIMonitorProcessSession` follows bounded VM-console reads
+through the existing runtime I/O receipt and access guards, then drains output
+before a single actual process status. Output is the combined VM console,
+including boot diagnostics, not independent guest stdout/stderr. Reader close
+only detaches. INT/TERM handling only enqueues a coalesced lifecycle STOP;
+the event loop sends it outside run locks to avoid signal-handler reentrancy.
+Stdin, TTY, resize, HANGUP and additional guest exec remain unsupported.
+
+Optional bounded existing-run lock acquisition preserves the default blocking
+behavior for old callers. Private client IPC uses a single exchange deadline
+instead of extending its budget for each partial peer write. The native
+coordinated case reads console bytes while the guest is live, uses a separate
+unpatched process to call completed STOP, and compares the session exit with
+the real terminal receipt before existing cleanup and retained-root reuse.
+
+These are product components for the public adapter, not public CLI activation.
+Host BOOT/runtime-root setup, typed OCI request/dispatch, run flags and remove
+orchestration/recovery still precede public `run/-d` and unchanged Gate 2.
+
 ### Next implementation order: two public acceptance milestones
 
 The next implementation is a vertical public lifecycle, not completion of

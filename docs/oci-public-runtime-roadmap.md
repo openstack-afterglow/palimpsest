@@ -28,8 +28,17 @@ existing monitor spawn protocol; its return means launch accepted, not READY.
 An explicit null terminal timeout permits a service lifetime while the default
 45-second terminal timeout and bounded boot/STOP deadlines remain unchanged.
 
+The monitor client now pins the exact run and monitor directory and separates
+READY, STOP acceptance, durable TERMINAL and worker completion. A finite
+stop-and-wait returns the validated guest exit result, not a fabricated success.
+The noninteractive process session follows bounded, receipt-pinned VM-console
+bytes and drains them before returning that result. This console combines boot
+diagnostics and workload output; it does not provide separate guest stdout and
+stderr, stdin, TTY or remote exec. INT/TERM enqueue lifecycle STOP outside run
+locks; closing a reader only detaches it. Public adapter wiring remains pending.
+
 The remaining public lifecycle integration includes qualified host/runtime-root
-setup, foreground output/exit forwarding, and stop/remove orchestration.
+setup, public request/adapter wiring and stop/remove orchestration.
 Recovery must cover pre-spawn grant
 failure and stale terminal sockets without fabricating terminal evidence.
 

@@ -53,6 +53,7 @@ PORTABLE_FILES = {
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
         oci_monitor_ipc oci_monitor_ipc_journal oci_monitor_launch oci_monitor_coordinator
+        oci_monitor_client oci_process_session
         oci_monitor_recovery oci_monitor_retention oci_supervisor
     """),
     "oci-access": _units("""
@@ -207,7 +208,7 @@ DEPENDENCIES = (
         ("filesystem", "guest-binary", "guest-kvm", "native-live", "gate1", "gate2"),
     ),
     (
-        "oci_boot_access oci_boot_exports oci_lower_exports oci_lower_access oci_stage1_access oci_monitor oci_monitor_control oci_monitor_ipc oci_monitor_launch oci_monitor_coordinator",
+        "oci_boot_access oci_boot_exports oci_lower_exports oci_lower_access oci_stage1_access oci_monitor oci_monitor_control oci_monitor_ipc oci_monitor_launch oci_monitor_coordinator oci_monitor_client oci_process_session",
         ("oci-access", "oci-monitor", "qualification"),
         ("native-live", "gate2"),
     ),

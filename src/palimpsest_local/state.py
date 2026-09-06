@@ -5,10 +5,12 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat as stat_module
 import tempfile
+import time
 import tomllib
 import uuid
 from collections.abc import Iterator, Mapping
@@ -1259,7 +1261,12 @@ class _NewRunNameLock:
 
 
 @contextmanager
-def _new_run_name_lock(roots: StatePaths, name: str) -> Iterator[_NewRunNameLock]:
+def _new_run_name_lock(roots: StatePaths, name: str, *, lock_timeout: float | None = None) -> Iterator[_NewRunNameLock]:
+    if lock_timeout is not None and (
+        type(lock_timeout) not in {int, float} or not math.isfinite(lock_timeout) or lock_timeout <= 0
+    ):
+        raise StateError("invalid run lock timeout")
+    deadline = None if lock_timeout is None else time.monotonic() + lock_timeout
     locks_fd = _open_readonly_no_follow(roots.locks, directory=True)
     if locks_fd is None:
         raise StateError("cannot securely lock new run name")
@@ -1311,7 +1318,18 @@ def _new_run_name_lock(roots: StatePaths, name: str) -> Iterator[_NewRunNameLock
         ):
             raise StateError("cannot securely lock new run name")
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            else:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StateError("run lock timed out")
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(min(0.01, remaining))
         except OSError:
             raise StateError("cannot securely lock new run name") from None
         current = _safe_stat(filename, directory_fd=locks_fd)
@@ -2201,10 +2219,11 @@ def locked_existing_run(
     *,
     expected: ExistingRunRecord | None = None,
     expected_snapshot: RunLedgerSnapshot | None = None,
+    lock_timeout: float | None = None,
 ) -> Iterator[ExistingRunMutation]:
     """Lock first, then pin and re-read one existing run mutation authority."""
     paths = _new_run_paths(roots, name)
-    with _new_run_name_lock(roots, name) as name_lock:
+    with _new_run_name_lock(roots, name, lock_timeout=lock_timeout) as name_lock:
         runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
         if runs_fd is None:
             raise StateError("cannot securely open existing runs")
