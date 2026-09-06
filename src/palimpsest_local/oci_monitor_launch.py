@@ -195,6 +195,11 @@ def _timeout(value: object) -> float:
     return float(value)
 
 
+def _terminal_timeout(value: object) -> float | None:
+    """An explicit None permits a service lifetime, not unbounded boot/STOP."""
+    return None if value is None else _timeout(value)
+
+
 class MonitorLaunchAuthority:
     """Own only the explicit descriptors in one validated private bootstrap."""
 
@@ -299,7 +304,7 @@ class MonitorLaunchAuthority:
                 raise _invalid()
             _profile(value["profile"])
             _timeout(value["timeout_seconds"])
-            _timeout(value["terminal_timeout_seconds"])
+            _terminal_timeout(value["terminal_timeout_seconds"])
             authority = cls(value)
             authority.validate()
             authority._rebuild()
@@ -595,7 +600,7 @@ def prepare_monitor_launch_authority(
     binding: MonitorPreActivationBinding,
     *,
     timeout_seconds: float = 45,
-    terminal_timeout_seconds: float = 45,
+    terminal_timeout_seconds: float | None = 45,
 ) -> MonitorLaunchAuthority:
     """Pin a caller-selected filesystem set for an optional fresh-exec launch."""
     opened: list[int] = []
@@ -668,7 +673,7 @@ def prepare_monitor_launch_authority(
                 for key in _PROFILE_FIELDS
             },
             "timeout_seconds": _timeout(timeout_seconds),
-            "terminal_timeout_seconds": _timeout(terminal_timeout_seconds),
+            "terminal_timeout_seconds": _terminal_timeout(terminal_timeout_seconds),
             "runtime_access": runtime_access,
             "shared_traversal": shared_traversal,
             "root_access": root_access,

@@ -3813,29 +3813,73 @@ def _launch_in_exec_monitor(
     product_io=False,
     root_disk=None,
     boot_granted=None,
+    coordinated=False,
 ):
-    launched = subprocess.run(
-        [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
-        input=json.dumps(
-            {
-                "root": str(root),
-                "binding": binding.to_dict(),
-                "kernel": str(boot.kernel.path),
-                "initramfs": str(boot.initramfs.path),
-                "kernel_digest": boot.kernel.digest,
-                "initramfs_digest": boot.initramfs.digest,
-                "product_io": product_io,
-            }
-        ),
-        text=True,
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
-    assert launched.returncode == 0, launched.stderr[-8000:]
-    response = json.loads(launched.stdout)
-    endpoint = monitor_ipc.MonitorExecEndpoint.from_dict(response["endpoint"])
-    assert endpoint.writer.pid not in {os.getpid(), response["launcher_pid"]}
+    if coordinated:
+        import threading
+
+        from palimpsest_local.oci_monitor_coordinator import spawn_monitor_coordinator
+        from palimpsest_local.oci_monitor_launch import prepare_monitor_launch_authority
+
+        assert product_io and stop_workload and stale_cleanup
+        # Only this fixture-owned outer ancestor still needs a search grant.
+        # Every VM resource below it uses its recorded product ACL authority.
+        assert [target.path for target in broker.targets] == [root]
+        broker.apply()
+        entered, release = threading.Event(), threading.Event()
+
+        def other_thread():
+            entered.set()
+            release.wait(60)
+
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        try:
+            assert entered.wait(5)
+            assert "libvirt" in sys.modules and thread.is_alive()
+            with prepare_monitor_launch_authority(
+                roots,
+                OCIStore(roots),
+                boot,
+                platforms.resolve_domain_profile("kvm", "x86_64"),
+                binding,
+                timeout_seconds=60,
+                terminal_timeout_seconds=None,
+            ) as authority:
+                endpoint = spawn_monitor_coordinator(
+                    monitor_ipc.MonitorExecIdentity(binding, str(uuid.uuid4())),
+                    authority,
+                    timeout=15,
+                    coordinator_timeout=30,
+                )
+            assert endpoint.writer.pid != os.getpid()
+        finally:
+            release.set()
+            thread.join(5)
+            assert not thread.is_alive()
+    else:
+        launched = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("oci_monitor_launch_helper.py")), "spawn"],
+            input=json.dumps(
+                {
+                    "root": str(root),
+                    "binding": binding.to_dict(),
+                    "kernel": str(boot.kernel.path),
+                    "initramfs": str(boot.initramfs.path),
+                    "kernel_digest": boot.kernel.digest,
+                    "initramfs_digest": boot.initramfs.digest,
+                    "product_io": product_io,
+                }
+            ),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert launched.returncode == 0, launched.stderr[-8000:]
+        response = json.loads(launched.stdout)
+        endpoint = monitor_ipc.MonitorExecEndpoint.from_dict(response["endpoint"])
+        assert endpoint.writer.pid not in {os.getpid(), response["launcher_pid"]}
     directory_fd = os.open(
         roots.runs / binding.record.name / "monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     )
@@ -3845,7 +3889,11 @@ def _launch_in_exec_monitor(
         stop_requested = False
         while time.monotonic() < deadline:
             snapshot = _read_live_monitor_journal(directory_fd, endpoint)[0]
-            if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
+            if (
+                not observed_active
+                and snapshot.phase == ("ready" if coordinated else "activating")
+                and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1
+            ):
                 _assert_qualification_io_boundary(broker, roots.runs / binding.record.name, product_io=product_io)
                 if product_io:
                     assert root_disk is not None
@@ -3871,13 +3919,14 @@ def _launch_in_exec_monitor(
                     monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.PING).state
                     == "pong"
                 )
-                if stop_workload:
+                if stop_workload and not coordinated:
                     assert (
                         monitor_ipc.request_monitor(directory_fd, endpoint, monitor_ipc.MonitorIPCOperation.STOP).state
                         == "stop-refused"
                     )
                 observed_active = True
-                (root / "continue-monitor").write_bytes(b"continue\n")
+                if not coordinated:
+                    (root / "continue-monitor").write_bytes(b"continue\n")
             if stop_workload and snapshot.phase == "ready" and not stop_requested:
                 # This non-secret marker is only a timing barrier: termination
                 # itself must still be proved by the authenticated transcript.
@@ -4460,16 +4509,17 @@ def _qualify_retained_root_reuse(
 
 
 @pytest.mark.parametrize(
-    ("child_owned", "stop_workload", "stale_cleanup"),
+    ("child_owned", "stop_workload", "stale_cleanup", "coordinated"),
     [
-        (False, False, False),
-        (True, False, False),
-        (True, True, False),
-        (True, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (True, True, False, False),
+        (True, False, True, False),
+        (True, True, True, True),
     ],
 )
 def test_live_oci_root(
-    monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_workload: bool, stale_cleanup: bool
+    monkeypatch: pytest.MonkeyPatch, child_owned: bool, stop_workload: bool, stale_cleanup: bool, coordinated: bool
 ) -> None:
     if os.environ.get(_ENABLE_ENV) != "1":
         pytest.skip(f"set {_ENABLE_ENV}=1 on the qualified native Linux/KVM libvirt runner")
@@ -4651,8 +4701,9 @@ def test_live_oci_root(
                 raise AssertionError("production handoff bypassed libvirt openChannel")
             return original_connect(instance, address)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
-        activation_conn = _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
+        if not coordinated:
+            monkeypatch.setattr(socket.socket, "connect", reject_direct_lifecycle_connect)
+        activation_conn = conn if coordinated else _ActivationConnectionProxy(conn, defined.domain_uuid, broker)
         expected_boot_attempt_id = str(uuid.uuid4())
         monitor_binding = prepare_oci_root_monitor_binding(
             roots,
@@ -4788,7 +4839,8 @@ def test_live_oci_root(
                 # The child applies the identical named-QEMU ACL grant. Keep
                 # the parent's original held snapshots for restoration only
                 # after the exact terminal domain has been removed.
-                broker.applied = True
+                if not coordinated:
+                    broker.applied = True
                 completed, monitor_snapshot = _launch_in_exec_monitor(
                     qualification_root,
                     roots,
@@ -4801,6 +4853,7 @@ def test_live_oci_root(
                     product_io=stale_cleanup,
                     root_disk=root_path,
                     boot_granted=boot_granted if stale_cleanup else None,
+                    coordinated=coordinated,
                 )
             else:
                 completed = launch_defined_oci_root_domain(

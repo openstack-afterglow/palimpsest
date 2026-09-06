@@ -95,6 +95,36 @@ def test_child_reconstructs_only_explicit_duplicated_descriptors(inputs):
         authority.validate()
 
 
+@pytest.mark.parametrize("terminal_timeout", [None, 0.1, 3600])
+def test_explicit_service_lifetime_roundtrips_without_relaxing_boot_deadline(inputs, terminal_timeout):
+    with launch.prepare_monitor_launch_authority(*inputs, terminal_timeout_seconds=terminal_timeout) as authority:
+        frame = authority.to_dict()
+        assert frame["terminal_timeout_seconds"] == terminal_timeout
+        assert frame["timeout_seconds"] == 45.0
+        for entry in frame["entries"].values():
+            entry["fd"] = os.dup(entry["fd"])
+        with launch.MonitorLaunchAuthority.from_dict(frame) as child:
+            assert child.to_dict()["terminal_timeout_seconds"] == terminal_timeout
+            assert child.to_dict()["timeout_seconds"] == 45.0
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 3601, "none", float("nan"), float("inf")])
+def test_service_lifetime_rejects_invalid_non_null_values(inputs, value):
+    with pytest.raises(StateError):
+        launch.prepare_monitor_launch_authority(*inputs, terminal_timeout_seconds=value)
+    with launch.prepare_monitor_launch_authority(*inputs) as authority:
+        frame = authority.to_dict()
+        frame["terminal_timeout_seconds"] = value
+        with pytest.raises(StateError):
+            launch.MonitorLaunchAuthority.from_dict(frame)
+        authority.validate()
+
+
+def test_unbounded_boot_is_still_rejected_for_services(inputs):
+    with pytest.raises(StateError):
+        launch.prepare_monitor_launch_authority(*inputs, timeout_seconds=None, terminal_timeout_seconds=None)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -228,7 +258,10 @@ def test_directory_and_binding_must_match_selected_authority(inputs):
 
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("controlled", [False, True])
-def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inputs, monkeypatch, fail, controlled):
+@pytest.mark.parametrize("terminal_timeout", [45, None])
+def test_worker_connects_only_after_validation_and_closes_connection_and_fds(
+    inputs, monkeypatch, fail, controlled, terminal_timeout
+):
     from palimpsest_local import oci_root_runtime as runtime
 
     events = []
@@ -252,6 +285,8 @@ def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inp
         assert kwargs["monitor_binding"] == inputs[-1]
         assert kwargs["monitor_lease"] == "lease"
         assert kwargs["conn"] is connection
+        assert kwargs["terminal_timeout_seconds"] == terminal_timeout
+        assert kwargs["timeout_seconds"] == 45.0
         if controlled:
             assert kwargs["stop_control"] is stop_control
         else:
@@ -263,7 +298,7 @@ def test_worker_connects_only_after_validation_and_closes_connection_and_fds(inp
 
     monkeypatch.setattr(runtime, "connect_oci_root_libvirt", connect)
     monkeypatch.setattr(runtime, "launch_defined_oci_root_domain", run)
-    authority = launch.prepare_monitor_launch_authority(*inputs)
+    authority = launch.prepare_monitor_launch_authority(*inputs, terminal_timeout_seconds=terminal_timeout)
     frame = authority.to_dict()
     descriptors = authority.pass_fds
     if fail:

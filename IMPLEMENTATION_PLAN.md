@@ -1796,6 +1796,27 @@ closed. This is a prerequisite connection, not public `run/-d` or Gate 2
 activation. The public coordinator, session and failure-cleanup integration
 remain the next work, ahead of shared-cache optimization.
 
+### PR 4 slice 30Y: fresh coordinator and explicit service lifetime
+
+The private coordinator accepts exact pinned launch authority from an existing
+threaded/libvirt caller and delivers it through a bounded private socket and
+descriptor allowlist to a clean Python child. It preserves the original monitor
+spawn boundary, checks the returned generation against authenticated discovery,
+and reaps the coordinator before returning. Acceptance is not guest READY;
+uncertain outcomes preserve the exact monitor journal and ownership evidence.
+
+Explicit `terminal_timeout_seconds=None` permits a service to run until terminal
+completion or authenticated STOP. The default remains 45 seconds, with bounded
+boot and STOP deadlines independent of service lifetime. The native coordinated
+case uses a real imported-libvirt/threaded caller without the old launch helper
+or first-boot worker/path monkeypatches. It waits for READY, exercises STOP and
+the existing exact stale/inactive cleanup and retained-root second boot. The
+outer qualification directory still needs its fixture-only traversal grant;
+this is not yet public host setup or public `run/-d` acceptance.
+
+The coordinator test file belongs to the explicit `oci-monitor` lane. Per-edit
+verification remains selected tests; public CLI and Gate 2 gates stay closed.
+
 ### Next implementation order: two public acceptance milestones
 
 The next implementation is a vertical public lifecycle, not completion of

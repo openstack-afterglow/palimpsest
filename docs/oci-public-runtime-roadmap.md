@@ -22,11 +22,15 @@ The private v10 launch envelope includes at most 24 additional distinct lower
 file descriptors. Its existing 1 MiB encoded size cap is an admission limit:
 oversized combinations of long/escaped paths are rejected before spawn.
 
-The remaining public lifecycle integration includes a fresh coordinator,
-qualified host/runtime-root setup, foreground output/exit forwarding, and
-stop/remove orchestration. Workload lifetime must be explicitly unbounded for
-long-running services (the existing private launch timeout is finite), while
-boot and STOP deadlines remain bounded. Recovery must cover pre-spawn grant
+The fresh coordinator now accepts pinned launch authority from a caller that
+already imports libvirt or uses threads. Only its clean child invokes the
+existing monitor spawn protocol; its return means launch accepted, not READY.
+An explicit null terminal timeout permits a service lifetime while the default
+45-second terminal timeout and bounded boot/STOP deadlines remain unchanged.
+
+The remaining public lifecycle integration includes qualified host/runtime-root
+setup, foreground output/exit forwarding, and stop/remove orchestration.
+Recovery must cover pre-spawn grant
 failure and stale terminal sockets without fabricating terminal evidence.
 
 ## Milestone 1: a complete public lifecycle
