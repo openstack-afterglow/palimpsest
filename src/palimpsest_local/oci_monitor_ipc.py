@@ -59,6 +59,12 @@ _LIFECYCLE_PROTOCOL = "palimpsest.oci-lifecycle-control.v2"
 _FRAME_LENGTH = struct.Struct(">I")
 _PEER_CREDENTIALS = struct.Struct("3i")
 _MAX_FRAME_BYTES = 16 * 1024
+# Only the initial inherited CONFIG socket carries filesystem authority.
+# v9 has at most 24 FD paths plus one emulator path, each <=4096 characters.
+# Worst-case JSON escaping costs 6 bytes/character (600KiB total); 424KiB
+# remains for the bounded, fixed-shape receipts and metadata. Lower disks are
+# reloaded from the ledger, not expanded in this envelope. Control stays16KiB.
+_MAX_CONFIG_FRAME_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 16 * 1024
 _MIN_TIMEOUT_SECONDS = 0.1
 _MAX_TIMEOUT_SECONDS = 30.0
@@ -1246,11 +1252,30 @@ def _recv_exact(channel: socket.socket, size: int) -> bytes:
     return bytes(content)
 
 
-def _recv_frame(channel: socket.socket) -> dict[str, Any]:
+def _recv_bounded_frame(channel: socket.socket, maximum: int) -> dict[str, Any]:
     (size,) = _FRAME_LENGTH.unpack(_recv_exact(channel, _FRAME_LENGTH.size))
-    if not 1 <= size <= _MAX_FRAME_BYTES:
+    if not 1 <= size <= maximum:
         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
     return _decode_frame(_recv_exact(channel, size))
+
+
+def _recv_frame(channel: socket.socket) -> dict[str, Any]:
+    return _recv_bounded_frame(channel, _MAX_FRAME_BYTES)
+
+
+def _encode_config_frame(value: Mapping[str, Any]) -> bytes:
+    """Preflight the exact private CONFIG bytes before creating a child/socket."""
+    _identity_from_config(value)
+    payload = _canonical_bytes(value)
+    if not payload or len(payload) > _MAX_CONFIG_FRAME_BYTES:
+        raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_FRAME)
+    return payload
+
+
+def _recv_config_frame(channel: socket.socket) -> dict[str, Any]:
+    value = _recv_bounded_frame(channel, _MAX_CONFIG_FRAME_BYTES)
+    _identity_from_config(value)
+    return value
 
 
 def _process_to_dict(identity: MonitorProcessIdentity) -> dict[str, Any]:
@@ -1867,7 +1892,7 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
     worker: _LaunchWorker | None = None
     try:
         config.settimeout(_MAX_TIMEOUT_SECONDS)
-        value = _recv_frame(config)
+        value = _recv_config_frame(config)
         identity, parent, nonce, timeout = _identity_from_config(value)
         if "launch_authority" in value:
             from .oci_monitor_launch import MonitorLaunchAuthority
@@ -2137,6 +2162,20 @@ def spawn_monitor_exec(
         try:
             parent = current_process_identity()
             nonce = os.urandom(32).hex()
+        except Exception:
+            raise MonitorIPCError(MonitorIPCErrorCategory.SPAWN_FAILED) from None
+        config_value = {
+            "binding": identity.binding.to_dict(),
+            "generation": identity.generation,
+            "nonce": nonce,
+            "parent": _process_to_dict(parent),
+            "schema": _CONFIG_SCHEMA,
+            "timeout_ms": int(timeout * 1000),
+        }
+        if launch_authority is not None:
+            config_value["launch_authority"] = launch_authority.to_dict()
+        config_payload = _encode_config_frame(config_value)
+        try:
             local, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except Exception:
             raise MonitorIPCError(MonitorIPCErrorCategory.SPAWN_FAILED) from None
@@ -2167,17 +2206,7 @@ def spawn_monitor_exec(
                 raise MonitorIPCError(MonitorIPCErrorCategory.SPAWN_FAILED) from None
             child.close()
             local.settimeout(timeout)
-            config_value = {
-                "binding": identity.binding.to_dict(),
-                "generation": identity.generation,
-                "nonce": nonce,
-                "parent": _process_to_dict(parent),
-                "schema": _CONFIG_SCHEMA,
-                "timeout_ms": int(timeout * 1000),
-            }
-            if launch_authority is not None:
-                config_value["launch_authority"] = launch_authority.to_dict()
-            _send_frame(local, config_value)
+            _send_all(local, config_payload)
             if _recv_frame(local) != {"kind": "bound", "schema": _SPAWN_SCHEMA}:
                 raise MonitorIPCError(MonitorIPCErrorCategory.CHILD_FAILED)
             socket_name = _socket_name_for_generation(identity.generation)

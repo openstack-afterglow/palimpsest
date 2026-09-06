@@ -117,6 +117,166 @@ def test_frames_are_bounded_canonical_and_fragment_safe() -> None:
         right.close()
 
 
+def _config_value(binding=None):
+    return {
+        "schema": ipc._CONFIG_SCHEMA,
+        "binding": (binding or _binding()).to_dict(),
+        "generation": _GENERATION,
+        "nonce": "1" * 64,
+        "parent": _process().to_dict(),
+        "timeout_ms": 5000,
+    }
+
+
+class _FrameMemoryChannel:
+    def __init__(self):
+        self.buffer = bytearray()
+        self.reads = []
+
+    def send(self, payload):
+        self.buffer.extend(payload)
+        return len(payload)
+
+    def recv(self, size):
+        self.reads.append(size)
+        payload = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return payload
+
+
+def test_private_config_exact_byte_limit_roundtrips_but_control_limit_is_unchanged():
+    assert ipc._MAX_FRAME_BYTES == 16 * 1024
+    assert ipc._MAX_CONFIG_FRAME_BYTES == 1024 * 1024
+    value = _config_value()
+    # Framing tests only; child authority validation independently rejects this placeholder.
+    value["launch_authority"] = {"padding": ""}
+    value["launch_authority"]["padding"] = "x" * (ipc._MAX_CONFIG_FRAME_BYTES - len(ipc._canonical_bytes(value)))
+    payload = ipc._encode_config_frame(value)
+    assert len(payload) == ipc._MAX_CONFIG_FRAME_BYTES
+    channel = _FrameMemoryChannel()
+    ipc._send_all(channel, payload)
+    assert ipc._recv_config_frame(channel) == value
+    assert not channel.buffer
+    with pytest.raises(ipc.MonitorIPCError) as ordinary:
+        ipc._send_frame(channel, value)
+    assert ordinary.value.category is ipc.MonitorIPCErrorCategory.INVALID_FRAME
+    assert not channel.buffer
+    value["launch_authority"]["padding"] += "x"
+    with pytest.raises(ipc.MonitorIPCError) as large:
+        ipc._encode_config_frame(value)
+    assert large.value.category is ipc.MonitorIPCErrorCategory.INVALID_FRAME
+
+
+@pytest.mark.parametrize("config", [False, True])
+@pytest.mark.parametrize("delta", [1, 0xFFFFFFFF])
+def test_oversized_frame_header_is_rejected_before_body_read(config, delta):
+    maximum = ipc._MAX_CONFIG_FRAME_BYTES if config else ipc._MAX_FRAME_BYTES
+    size = maximum + 1 if delta == 1 else delta
+    channel = _FrameMemoryChannel()
+    channel.buffer.extend(struct.pack(">I", size))
+    with pytest.raises(ipc.MonitorIPCError) as error:
+        (ipc._recv_config_frame if config else ipc._recv_frame)(channel)
+    assert error.value.category is ipc.MonitorIPCErrorCategory.INVALID_FRAME
+    assert channel.reads == [4]
+
+
+def test_ordinary_control_exact_limit_still_roundtrips():
+    value = {"padding": ""}
+    value["padding"] = "x" * (ipc._MAX_FRAME_BYTES - len(ipc._canonical_bytes(value)))
+    channel = _FrameMemoryChannel()
+    ipc._send_frame(channel, value)
+    assert ipc._recv_frame(channel) == value
+
+
+@pytest.mark.parametrize("damage", ["noncanonical", "wrong-schema", "wrong-nonce"])
+def test_private_config_larger_budget_does_not_relax_canonical_or_envelope_validation(damage):
+    value = _config_value()
+    if damage == "wrong-schema":
+        value["schema"] = ipc._REQUEST_SCHEMA
+    elif damage == "wrong-nonce":
+        value["nonce"] = "not-a-nonce"
+    payload = json.dumps(value).encode() if damage == "noncanonical" else ipc._canonical_bytes(value)
+    channel = _FrameMemoryChannel()
+    ipc._send_all(channel, payload)
+    with pytest.raises(ipc.MonitorIPCError):
+        ipc._recv_config_frame(channel)
+
+
+def test_oversized_config_rejected_before_socket_or_process_creation(tmp_path, monkeypatch):
+    from palimpsest_local.oci_monitor_launch import MonitorLaunchAuthority
+
+    directory_fd = _directory(tmp_path / "run")
+    authority = object.__new__(MonitorLaunchAuthority)
+    monkeypatch.setattr(MonitorLaunchAuthority, "validate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MonitorLaunchAuthority, "pass_fds", property(lambda _self: (401, 402)))
+    monkeypatch.setattr(MonitorLaunchAuthority, "to_dict", lambda _self: {"padding": "x" * ipc._MAX_CONFIG_FRAME_BYTES})
+    monkeypatch.setattr(ipc, "_require_spawn_boundary", lambda: None)
+    monkeypatch.setattr(ipc, "current_process_identity", _process)
+    monkeypatch.setattr(ipc.socket, "socketpair", lambda *_args: pytest.fail("oversized CONFIG created sockets"))
+    try:
+        with pytest.raises(ipc.MonitorIPCError) as error:
+            ipc.spawn_monitor_exec(
+                directory_fd,
+                _identity(),
+                launch_authority=authority,
+                popen_factory=lambda *_args, **_kwargs: pytest.fail("oversized CONFIG created child"),
+            )
+        assert error.value.category is ipc.MonitorIPCErrorCategory.INVALID_FRAME
+    finally:
+        os.close(directory_fd)
+
+
+def test_real_v9_all_grants_config_exceeds_control_budget_and_roundtrips(tmp_path, monkeypatch):
+    import test_oci_boot_access as boot_tests
+    import test_oci_root_access as root_tests
+    import test_oci_shared_traversal as shared_tests
+    import test_oci_stage1_access as stage_tests
+
+    from palimpsest_local import oci_monitor_launch as launch
+
+    case = boot_tests.case.__wrapped__(tmp_path, monkeypatch)
+    case = boot_tests.shared_case.__wrapped__(case, monkeypatch)
+    stage_tests._install_stage1_backend(case, monkeypatch)
+    boot_tests.grant(case)
+    root_tests.grant(case)
+    stage_tests.grant(case)
+    shared_tests._join(case)
+    (case.run_root / "monitor-private").mkdir(mode=0o700)
+    with launch.prepare_monitor_launch_authority(
+        case.roots, case.store, case.boot, case.profile, case.binding
+    ) as authority:
+        value = _config_value(case.binding)
+        value["launch_authority"] = authority.to_dict()
+        frame = value["launch_authority"]
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v9"
+        assert len(frame["entries"]) == 24
+        assert all(
+            frame[key] is not None
+            for key in (
+                "runtime_access",
+                "shared_traversal",
+                "root_access",
+                "stage1_access",
+                "boot_exports",
+                "boot_access",
+            )
+        )
+        payload = ipc._encode_config_frame(value)
+        assert ipc._MAX_FRAME_BYTES < len(payload) <= ipc._MAX_CONFIG_FRAME_BYTES
+        channel = _FrameMemoryChannel()
+        ipc._send_all(channel, payload)
+        reconstructed = ipc._recv_config_frame(channel)
+        assert reconstructed == value
+        authority.validate()
+        # Conservative lexical envelope: 25 max-length paths with JSON's worst
+        # six-byte escaping still fit. Actual filesystem validation remains separate.
+        worst = json.loads(payload)
+        for entry in worst["launch_authority"]["entries"].values():
+            entry["path"] = "/" + "\x01" * 4095
+        worst["launch_authority"]["profile"]["emulator"] = "/" + "\x01" * 4095
+        assert len(ipc._encode_config_frame(worst)) < ipc._MAX_CONFIG_FRAME_BYTES
+
+
 @pytest.mark.parametrize("field", ["run_id", "generation", "binding_digest"])
 def test_request_rejects_wrong_identity_binding(field: str) -> None:
     identity = _identity()
@@ -435,6 +595,15 @@ def test_parent_activation_fence_follows_exact_committed_reread(
     monkeypatch.setattr(ipc.socket, "socketpair", lambda *_args: (Channel(), Channel()))
     monkeypatch.setattr(ipc.socket, "socket", Channel)
     monkeypatch.setattr(ipc, "_send_frame", lambda _channel, value: events.append(value.get("kind", "config")))
+    monkeypatch.setattr(
+        ipc,
+        "_send_all",
+        lambda _channel, payload: (
+            events.append("config")
+            if json.loads(payload)["schema"] == ipc._CONFIG_SCHEMA
+            else pytest.fail("non-CONFIG payload used private sender")
+        ),
+    )
     monkeypatch.setattr(ipc, "_recv_frame", receive)
     monkeypatch.setattr(ipc, "_visible_socket", lambda *_args: SimpleNamespace(st_dev=12, st_ino=34))
     monkeypatch.setattr(ipc, "_connect_socket", lambda *_args: None)

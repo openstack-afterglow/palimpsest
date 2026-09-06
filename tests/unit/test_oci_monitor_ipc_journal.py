@@ -573,6 +573,7 @@ def test_child_requires_post_committed_activation_fence_and_keeps_lost_ack_owner
     monkeypatch.setattr(MonitorLaunchAuthority, "from_dict", classmethod(lambda _cls, value, **kwargs: authority))
     monkeypatch.setattr(ipc.socket, "socket", lambda **_kwargs: Channel())
     monkeypatch.setattr(ipc, "current_process_identity", _writer)
+    monkeypatch.setattr(ipc, "_recv_config_frame", receive)
     monkeypatch.setattr(ipc, "_recv_frame", receive)
     monkeypatch.setattr(ipc, "_send_frame", send)
     monkeypatch.setattr(ipc, "_accept_precommit", lambda *_args: Channel())

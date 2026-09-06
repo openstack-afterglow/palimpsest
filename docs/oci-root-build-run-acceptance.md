@@ -667,6 +667,13 @@ different serial source, target, model, or policy. The stored projection retains
 fingerprint, so later removal, duplication, source rebinding, or structural
 change fails closed. A file serial remains forbidden for the default PTY.
 
+The private fresh-exec initial CONFIG carries the full descriptor authority,
+including runtime, shared traversal, root, stage-1 and BOOT receipts. This
+single inherited-socket message has a 1 MiB cap checked before process/socket
+creation and before the child reads its body. Normal control frames and
+journals keep their 16 KiB cap. Exceeding the CONFIG cap is not an invitation
+to truncate receipts or launch without them; it fails before spawning.
+
 Qualification-root deletion similarly binds the expected device/inode through
 an open descriptor and a random quarantine rename, then walks and removes
 children relative to held directory descriptors while rechecking the root

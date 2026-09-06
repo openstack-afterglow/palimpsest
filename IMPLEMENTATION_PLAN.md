@@ -1729,6 +1729,14 @@ for both forms: the global-policy console lacks the legacy per-source label
 tuple. Only the initial generated serial count is normalized; the strict
 mirror parser and subsequent stored projection still reject device drift.
 
+The initial inherited-socket CONFIG envelope has a separate 1 MiB limit for
+the complete v9 descriptor/receipt authority. Its exact canonical bytes are
+validated before creating a socket or child, and the child enforces the same
+limit before reading the body. The fixed role set has at most 24 descriptor
+paths; individual lower disks are reloaded from the ledger, not serialized
+into this envelope. Ordinary control frames and journals remain capped at
+16 KiB, with unchanged typed parsing, identity and descriptor validation.
+
 After inactive-domain cleanup and proof that the original terminal writer is
 stale, revoke BOOT access before stage-1, root, runtime I/O and shared traversal
 retirement. Native qualification excludes the pair from both fixture brokers,
