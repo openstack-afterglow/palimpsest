@@ -330,14 +330,16 @@ def test_held_managed_directory_swap_during_initialization_is_rejected(managed, 
 def test_native_managed_initialization_preserves_exact_acl(managed, monkeypatch):
     case, member = managed
     backend = LinuxFdACLBackend()
-    fds = [os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW) for path in (case.roots.state, case.roots.runs)]
+    paths = (case.roots.state, case.roots.runs, case.roots.oci_root_volumes)
+    targets = (member.state, member.runs, member.root_volumes)
+    fds = [os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW) for path in paths]
     try:
-        for fd, target in zip(fds, (member.state, member.runs), strict=True):
+        for fd, target in zip(fds, targets, strict=True):
             os.fchmod(fd, 0o700)
             backend.write_acl(fd, target.granted)
         monkeypatch.setattr(shared, "LinuxFdACLBackend", lambda: backend)
         state.init_resolved_roots(case.roots)
-        assert [backend.read_acl(fd) for fd in fds] == [member.state.granted, member.runs.granted]
+        assert [backend.read_acl(fd) for fd in fds] == [target.granted for target in targets]
     finally:
         for fd in fds:
             try:
