@@ -72,3 +72,58 @@ behavior. On the exact pushed server SHA, execute the public command and the
 separate cold public exec native proof. Guest code and Gate 2 criteria are not
 changed by this slice, so the unchanged full guest boot matrix is not a per-edit
 requirement.
+
+## Implementation and verification outcome — 2026-09-07
+
+Implementation `5cd3d36c72273bdbd81c21bd5809840d20126d96` was independently
+reviewed, pushed and checked out at that exact SHA on `pieroot-server`.
+Astra managed planning/review/verification; GPT 5.6 Sol authored code and tests.
+
+- Local selected `core-cli`, `host-runtime` and `oci-store` lanes: 2,551 passed,
+  nine platform skips, one existing multi-threaded-fork deprecation warning
+  (75.86 s). Final AST-gate tightening was separately rechecked: 30 passed
+  (1.13 s). These overlapping selections are not a full-suite result.
+- The first sandboxed lane run could not bind sockets/create a PTY and exposed
+  stale pre-public-OCI expectations. Normal-permission checks resolved the
+  environment failures. Five project/UI/facade assertions were corrected to
+  current fail-closed contracts without changing product lifecycle behavior;
+  evidence-preservation and narrow AST rejection regressions remain enforced.
+- Exact-SHA server selection: eight diagnostic/CLI/worker/converter/lane/
+  project/facade/UI files, 354 passed (33.88 s). This covered the focused
+  worker/converter cases skipped on macOS.
+- Actual Linux public command: versioned allowlist JSON, no BOOT settings,
+  no pre-initialized runtime and no product config/state directories created.
+  The observation was 238 visible matching threads with projected worker soft
+  limit 256; it was not used as an admission decision. The actual macOS CLI
+  returned the typed unsupported error and likewise created no product state.
+
+### Required cold native proof: failed, still pending
+
+The separate public exec CLI test failed before VM creation with
+`oci-worker-resource` (2.29 s). Do not treat selected unit tests or the advisory
+report as native qualification of this commit. The prior successful Gate 2 at
+`36cf897` is historical evidence, not a replacement for this failed proof.
+
+The worker started and reported its common resource category. That category
+can represent internal EAGAIN/ENOMEM, MemoryError or packer process creation
+failures; it does not retain the exact stage/errno. Post-failure read-only
+checks found no PID-limit/OOM events in the inspected user cgroup ancestors
+and substantial available/commit memory, but cannot reconstruct the earlier
+failure or rule out races, other accounting scopes or per-process limits.
+The packer uses one processor; no CPU-count-based thread fan-out is inferred.
+
+Preserved server evidence:
+
+- Selected tests: `/tmp/palimpsest-g36-server-selected-5cd3d36.log`.
+- Public observation: `/tmp/palimpsest-g36-status.ylVk4H/report.json`.
+- Native failure: `/tmp/palimpsest-g36-public-exec-5cd3d36.log` and
+  `/tmp/p-execcli-0b710ea6` (including completed cached layers and launch error).
+
+No VM or run was created; the libvirt domain list remained empty. Source archive
+SHA-256 remained `862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+No unrelated service was stopped, no resource limit was raised, and no unchanged
+cold retry was attempted. Native verification remains blocked on obtaining
+useful failure attribution or a deliberately changed test condition. Proposed
+next slice: bounded allowlisted worker stage/errno diagnostics, then a separately
+reviewed fresh cold proof. It is not implemented here and does not authorize
+raw stderr/environment disclosure, automatic replay or result takeover.

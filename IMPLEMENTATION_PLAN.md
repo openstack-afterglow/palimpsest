@@ -2022,3 +2022,18 @@ Astra manages scope, review and exact-SHA server verification; GPT 5.6 Sol
 implements the command, bounded reader, focused tests and lane classification.
 Control-lost/unacknowledged-result takeover, automatic replay and public
 retained-root operations remain separate work, not implied authorization.
+
+Implementation `5cd3d36` is independently approved and pushed. The exact server
+SHA passed 354 selected tests and the real read-only command created no product
+state. Local three-lane coverage passed 2,551 with nine platform skips; final
+AST tightening separately passed 30 tests. See the diagnostic contract for
+non-additive counts, environment failures and corrected legacy test contracts.
+
+Required cold public exec verification is **not complete**: materialization
+failed before VM creation with the common worker-resource category. The failed
+runtime and original image are preserved, with no limit changes, service stops
+or unchanged retries. Read-only host observations cannot recover the discarded
+failure stage/errno. Next proposed work is a bounded worker failure-attribution
+contract and a new controlled cold proof; retain this verification blocker
+until that proof actually passes. Earlier Gate 2 success is not reused as this
+commit's native qualification.
