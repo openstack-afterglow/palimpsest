@@ -3710,8 +3710,7 @@ def _assert_live_apparmor_profile(domain, domain_uuid):
             isinstance(item, (tuple, list))
             and len(item) == 2
             and item[0] == labels[0].text
-            and type(item[1]) is int
-            and item[1] == 1
+            and (item[1] is True or type(item[1]) is int and item[1] == 1)
             for item in runtime_labels
         )
         == 1
@@ -3740,6 +3739,26 @@ def test_live_apparmor_proof_requires_exact_enforcing_runtime_label(damage):
         securityLabelList=lambda: runtime,
     )
     if damage is None:
+        _assert_live_apparmor_profile(domain, domain_uuid)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_live_apparmor_profile(domain, domain_uuid)
+
+
+@pytest.mark.parametrize(
+    ("flag", "accepted"),
+    [(True, True), (1, True), (False, False), (0, False), (1.0, False), ("1", False), (2, False), (object(), False)],
+)
+def test_live_apparmor_proof_accepts_only_explicit_boolean_or_integer_enforcement(flag, accepted):
+    domain_uuid = "00000000-0000-4000-8000-000000000001"
+    label = f"libvirt-{domain_uuid}"
+    domain = SimpleNamespace(
+        UUIDString=lambda: domain_uuid,
+        isActive=lambda: 1,
+        XMLDesc=lambda: f'<domain><seclabel model="apparmor"><label>{label}</label></seclabel></domain>',
+        securityLabelList=lambda: [[label, flag], ["+64055:+994", False]],
+    )
+    if accepted:
         _assert_live_apparmor_profile(domain, domain_uuid)
     else:
         with pytest.raises(AssertionError):
