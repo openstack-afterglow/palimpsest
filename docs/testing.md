@@ -110,6 +110,19 @@ partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification
 
+The read-only NPROC diagnostic has a small independent feedback loop:
+
+```sh
+uv run pytest -q tests/unit/test_oci_resource_status.py tests/unit/test_oci_public_cli.py tests/unit/test_test_lanes.py
+```
+
+See [the advisory contract](oci-resource-status.md). Its fixtures cover actual
+descriptor-based reads, partial/invalid observations and no state creation or
+worker launch. Changes to the shared worker limit constant additionally select
+worker/store coverage and require the separate cold public exec proof below;
+the diagnostic alone does not require rebuilding the unchanged guest or
+rerunning the full guest boot matrix.
+
 For worker/packer resource failures and additional-exec diagnostics, keep the
 two feedback loops separate:
 

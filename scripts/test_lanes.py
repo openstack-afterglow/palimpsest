@@ -38,7 +38,7 @@ PORTABLE_FILES = {
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
         platforms process_session project project_adapter project_runtime project_volumes oci_host
-        oci_run_request oci_run_adapter oci_public_cli
+        oci_run_request oci_run_adapter oci_public_cli oci_resource_status
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
     "oci-store": _units("""
@@ -202,6 +202,8 @@ LANES = (*PORTABLE, *SPECIAL_FILES)
 # an import graph or a guarantee. Shared infrastructure/unknown changes fall
 # back to every portable lane. Suggested external proofs still need opt-in.
 DEPENDENCIES = (
+    ("oci_resource_status", ("host-runtime", "core-cli"), ()),
+    ("oci_worker_limits", ("host-runtime", "oci-store"), ("native-live",)),
     (
         "oci_exec_control oci_exec_session",
         ("oci-monitor", "oci-guest", "oci-access", "qualification", "core-cli", "host-runtime"),

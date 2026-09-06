@@ -342,7 +342,7 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
 
 
 @pytest.mark.parametrize(("operation", "target_name", "method", "path", "_expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
-def test_ui_oci_vm_lifecycle_returns_typed_409_before_backend_side_effects(
+def test_ui_oci_vm_lifecycle_fails_closed_with_typed_409_before_backend_side_effects(
     server_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
@@ -382,7 +382,12 @@ def test_ui_oci_vm_lifecycle_returns_typed_409_before_backend_side_effects(
     status, _, payload = _request(server_env["port"], method, path, headers=headers)
 
     assert status == 409
-    assert payload == {"error": f"runtime operation '{operation}' is unavailable for oci-root/kvm"}
+    expected_error = {
+        "start": "runtime operation 'start' is unavailable for oci-root/kvm",
+        "stop": "OCI run removal could not be verified; preserve the run evidence",
+        "rm": "OCI-root rm --volumes is unavailable; root retention follows the owned run policy",
+    }[operation]
+    assert payload == {"error": expected_error}
     assert effects == []
     assert before == (
         rpaths.owner.read_bytes(),

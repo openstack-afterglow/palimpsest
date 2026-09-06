@@ -638,6 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
     oci_materialize.add_argument("--output", type=Path)
     oci_root_proof = oci_commands.add_parser("root-proof")
     oci_root_proof.add_argument("name")
+    oci_commands.add_parser("resource-status")
 
     build = commands.add_parser("build")
     build.add_argument("context", nargs="?", type=Path)
@@ -1410,10 +1411,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
         runtime_parent = create_runtime_parent(selected)
         print("PALIMPSEST_STATE_HOME=" + shlex.quote(str(runtime_parent / "state")))
         return 0
+    if op == "oci" and args.oci_operation == "resource-status":
+        from .oci_resource_status import resource_status
+
+        print(json.dumps(resource_status(), indent=2, sort_keys=True))
+        return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
-    roots = resolve_roots() if op in read_only_root_operations or (
-        op == "oci" and args.oci_operation == "root-proof"
-    ) else init_roots()
+    roots = (
+        resolve_roots()
+        if op in read_only_root_operations or (op == "oci" and args.oci_operation == "root-proof")
+        else init_roots()
+    )
 
     if op == "oci":
         if args.oci_operation == "root-proof":

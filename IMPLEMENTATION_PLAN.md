@@ -2008,3 +2008,17 @@ Notion section 17.86 now records the approved criterion, implementation roles,
 separate verification results and remaining limits. The sanitized update was
 independently reviewed, written and read back; operational paths and process
 identifiers were not included.
+
+### Next slice: bounded, read-only worker NPROC observations
+
+Prioritize the concrete materializer resource failure observed during Gate 2
+work. Add Linux-only `oci resource-status` without state initialization, process
+creation or limit changes. Report inherited/prospective worker limits and
+bounded visible real-UID procfs observations with partial/race/namespace
+limitations; do not predict admission or expose per-process details.
+See [the diagnostic contract](docs/oci-resource-status.md).
+
+Astra manages scope, review and exact-SHA server verification; GPT 5.6 Sol
+implements the command, bounded reader, focused tests and lane classification.
+Control-lost/unacknowledged-result takeover, automatic replay and public
+retained-root operations remain separate work, not implied authorization.

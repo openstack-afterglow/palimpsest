@@ -103,6 +103,19 @@ def test_security_boundary_dependencies_include_consumers_and_suggest_native(mod
     assert {"native-live", "gate2"} <= set(result.suggested)
 
 
+@pytest.mark.parametrize(
+    ("module", "expected", "suggested"),
+    [
+        ("oci_resource_status", {"host-runtime", "core-cli"}, ()),
+        ("oci_worker_limits", {"host-runtime", "oci-store"}, ("native-live",)),
+    ],
+)
+def test_resource_status_sources_select_only_exact_consumers(module, expected, suggested):
+    result = lanes.select_changed((f"src/palimpsest_local/{module}.py",))
+    assert set(result.lanes) == expected
+    assert result.suggested == suggested
+
+
 def test_documentation_and_empty_changes_explain_no_tests():
     for paths in ((), ("README.md", "docs/acceptance.md")):
         selection = lanes.select_changed(paths)

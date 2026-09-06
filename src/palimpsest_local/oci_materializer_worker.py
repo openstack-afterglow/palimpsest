@@ -23,6 +23,7 @@ from .oci_packer import (
 )
 from .oci_source import SnapshottedOCIImage, SourceCAS, SourceLeaseError, SourceSnapshot
 from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, OCIStore, OCIStoreError
+from .oci_worker_limits import OCI_WORKER_NPROC_LIMIT
 from .oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
     OCIWorkerProtocolError,
@@ -34,7 +35,7 @@ from .state import StatePaths
 _MAX_WORKER_ADDRESS_SPACE = 40 * 1024**3
 _MAX_WORKER_FILE_SIZE = 40 * 1024**3
 _MAX_WORKER_FDS = 256
-_MAX_WORKER_PROCESSES = 256
+_MAX_WORKER_PROCESSES = OCI_WORKER_NPROC_LIMIT
 
 
 def _limit(resource_name: int, soft_limit: int) -> None:

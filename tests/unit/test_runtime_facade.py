@@ -100,6 +100,34 @@ def _is_routing_alias_value(node: ast.AST, aliases: set[str]) -> bool:
     return chain is not None and (chain[0] in aliases or any(part in _ROUTING_ATTRIBUTES for part in chain[1:]))
 
 
+def _is_public_oci_backend_validation(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If) or node.orelse or len(node.body) != 1 or not isinstance(node.body[0], ast.Raise):
+        return False
+    test = node.test
+    raised = node.body[0].exc
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or not isinstance(test.ops[0], ast.NotIn):
+        return False
+    if (
+        not isinstance(raised, ast.Call)
+        or not isinstance(raised.func, ast.Name)
+        or raised.func.id != "PalimpsestError"
+        or len(raised.args) != 1
+        or raised.keywords
+        or not isinstance(raised.args[0], ast.Constant)
+        or raised.args[0].value != "OCI-root run supports only the KVM backend"
+        or node.body[0].cause is not None
+    ):
+        return False
+    chain = _attribute_chain(test.left)
+    comparator = test.comparators[0]
+    return (
+        chain == ("args", "backend")
+        and isinstance(comparator, ast.Set)
+        and {item.value for item in comparator.elts if isinstance(item, ast.Constant)} == {"auto", "kvm"}
+        and len(comparator.elts) == 2
+    )
+
+
 def _assigned_names(node: ast.AST) -> set[str]:
     return {candidate.id for candidate in ast.walk(node) if isinstance(candidate, ast.Name)}
 
@@ -109,6 +137,7 @@ def _cli_architecture_violations(source: str) -> tuple[str, ...]:
     violations: list[str] = []
     routing_aliases: set[str] = set()
     run_path_aliases = {"run_paths"}
+    allowed_backend_validations = {id(node.test) for node in ast.walk(tree) if _is_public_oci_backend_validation(node)}
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -138,9 +167,17 @@ def _cli_architecture_violations(source: str) -> tuple[str, ...]:
             chain = _attribute_chain(node.func)
             if chain is not None and chain[-1] in run_path_aliases:
                 violations.append(f"run-path-heuristic:{node.lineno}")
-        elif isinstance(node, ast.Compare) and _expression_uses_routing(node, routing_aliases):
+        elif (
+            isinstance(node, ast.Compare)
+            and _expression_uses_routing(node, routing_aliases)
+            and id(node) not in allowed_backend_validations
+        ):
             violations.append(f"routing-comparison:{node.lineno}")
-        elif isinstance(node, (ast.If, ast.IfExp, ast.While)) and _expression_uses_routing(node.test, routing_aliases):
+        elif (
+            isinstance(node, (ast.If, ast.IfExp, ast.While))
+            and _expression_uses_routing(node.test, routing_aliases)
+            and id(node.test) not in allowed_backend_validations
+        ):
             violations.append(f"routing-control:{node.lineno}")
         elif isinstance(node, ast.Match):
             if _expression_uses_routing(node.subject, routing_aliases):
@@ -287,6 +324,10 @@ def test_cli_has_no_backend_lifecycle_escape_hatches() -> None:
         "import palimpsest_local.cloud_runtime as adapter\nadapter.run(spec)",
         "from .state import run_paths as paths\npaths(roots, name)",
         'print("limactl shell demo")',
+        'if args.backend not in {"auto", "kvm"}:\n    pass',
+        'if args.backend not in {"auto", "kvm"}:\n    raise PalimpsestError("different")',
+        'if args.backend not in {"auto", "kvm"}:\n    raise PalimpsestError("OCI-root run supports only the KVM backend", detail="x")',
+        'if args.backend not in {"auto", "kvm"}:\n    raise PalimpsestError("OCI-root run supports only the KVM backend") from cause',
     ],
 )
 def test_cli_architecture_gate_rejects_nested_alias_and_control_flow_bypasses(source: str) -> None:

@@ -12,6 +12,7 @@ import pytest
 
 from palimpsest_local import project_adapter, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
+from palimpsest_local.oci_run_cleanup import OCIRunRemovalError
 from palimpsest_local.project import Project, load_project
 from palimpsest_local.project_runtime import (
     ExternalRunStatus,
@@ -1213,6 +1214,7 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
     roots = _roots(tmp_path)
     run_name = service_run_name(project, "api")
     rpaths = _write_run_ledger(roots, run_name, backend="kvm", runtime_kind="oci-root")
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
     callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
     effects: list[str] = []
 
@@ -1258,9 +1260,16 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
             return callbacks.remove(run_name)
         return list(callbacks.logs(run_name, False))
 
-    with pytest.raises(RuntimeCapabilityError):
+    expected_error = {
+        "inspect": RuntimeCapabilityError,
+        "start": RuntimeCapabilityError,
+        "stop": OCIRunRemovalError,
+        "remove": StateError,
+    }[operation]
+    with pytest.raises(expected_error):
         invoke()
     assert effects == []
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
 
     rpaths.state.write_text('{"schema_version":"corrupt"}\n', encoding="utf-8")
     with pytest.raises(StateError, match="invalid run state schema"):
