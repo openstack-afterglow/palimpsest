@@ -566,6 +566,10 @@ The domain explicitly selects static DAC with `relabel=no` and the canonical
 numeric QEMU label. This controls DAC ownership changes only; it does not turn
 off other host security drivers. The [libvirt security-label documentation](https://libvirt.org/formatdomain.html#security-label)
 defines that distinction. The qualified server uses AppArmor as well as DAC.
+Global `relabel=no` and per-source label overrides are mutually exclusive in
+libvirt. The managed form requires zero disk/console source labels beneath the
+exact global policy; the legacy form still requires its exact per-source DAC
+labels. Neither arbitrary global labels nor unprotected legacy sources pass.
 When AppArmor is advertised, the active native child must report its exact
 UUID-based profile in live XML and an enforcing match from libvirt's runtime
 security-label API. Capability advertisement alone is not sufficient evidence.

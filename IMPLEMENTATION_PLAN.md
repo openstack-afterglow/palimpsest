@@ -1720,6 +1720,10 @@ exact top-level static DAC label and `relabel=no`. This is DAC-specific, not a
 request to disable AppArmor or SELinux. The deployed host must qualify the
 resulting inactive XML and actual boot without changing export ownership or
 the immutable metadata. See the official [libvirt security-label contract](https://libvirt.org/formatdomain.html#security-label).
+Libvirt forbids per-source label overrides when domain-level relabeling is
+disabled: this exact global policy therefore omits disk and console DAC
+overrides. Legacy domains without the global policy retain their mandatory
+per-source `relabel=no` labels. The two XML forms are validated separately.
 
 After inactive-domain cleanup and proof that the original terminal writer is
 stale, revoke BOOT access before stage-1, root, runtime I/O and shared traversal

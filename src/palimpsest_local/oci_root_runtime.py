@@ -315,9 +315,30 @@ def _text(parent: ET.Element, path: str, message: str) -> str:
     return value
 
 
+def _source_dac_projection(source: ET.Element, *, domain_dac: bool, context: str) -> tuple[tuple[str, str], ...]:
+    children = list(source)
+    if (source.text or "").strip():
+        raise StateError(f"defined OCI-root {context} DAC policy is invalid")
+    if domain_dac:
+        if children:
+            raise StateError(f"defined OCI-root {context} cannot override domain DAC policy")
+        return ()
+    if (
+        len(children) != 1
+        or children[0].tag != "seclabel"
+        or children[0].attrib != {"model": "dac", "relabel": "no"}
+        or list(children[0])
+        or (children[0].text or "").strip()
+        or (children[0].tail or "").strip()
+    ):
+        raise StateError(f"defined OCI-root {context} DAC policy is invalid")
+    return tuple(sorted(children[0].attrib.items()))
+
+
 def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
     projected: list[tuple[Any, ...]] = []
     seen_targets: set[str] = set()
+    domain_dac = _dac_projection(root) is not None
     for disk in root.findall("./devices/disk"):
         source = _single(disk, "./source", "defined OCI-root disk source is invalid")
         target = _single(disk, "./target", "defined OCI-root disk target is invalid")
@@ -326,7 +347,7 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
         readonly_count = len(disk.findall("./readonly"))
         shareable_count = len(disk.findall("./shareable"))
         backing_stores = disk.findall("./backingStore")
-        source_labels = source.findall("./seclabel")
+        source_policy = _source_dac_projection(source, domain_dac=domain_dac, context="disk projection")
         if any(
             child.tag
             not in {"address", "alias", "backingStore", "driver", "readonly", "serial", "shareable", "source", "target"}
@@ -351,13 +372,6 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
             or not isinstance(serials[0].text, str)
             or readonly_count > 1
             or shareable_count > 1
-            or len(source_labels) != 1
-            or len(list(source)) != 1
-            or source_labels[0].attrib != {"model": "dac", "relabel": "no"}
-            or list(source_labels[0])
-            or (source.text or "").strip()
-            or (source_labels[0].text or "").strip()
-            or (source_labels[0].tail or "").strip()
             or list(target)
             or list(driver)
             or serials[0].attrib
@@ -373,7 +387,7 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
                 source.get("file"),
                 serials[0].text,
                 tuple(sorted(driver.attrib.items())),
-                tuple(sorted(source_labels[0].attrib.items())),
+                source_policy,
                 readonly_count == 1,
                 shareable_count == 1,
             )
@@ -381,10 +395,11 @@ def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
     return tuple(sorted(projected))
 
 
-def _validate_file_console_serial_mirror(serial: ET.Element, console_source: ET.Element | None) -> None:
+def _validate_file_console_serial_mirror(
+    serial: ET.Element, console_source: ET.Element | None, *, domain_dac: bool = False
+) -> None:
     sources = serial.findall("./source")
     targets = serial.findall("./target")
-    source_labels = sources[0].findall("./seclabel") if sources else []
     models = targets[0].findall("./model") if targets else []
     if (
         console_source is None
@@ -393,33 +408,32 @@ def _validate_file_console_serial_mirror(serial: ET.Element, console_source: ET.
         or len(sources) != 1
         or len(targets) != 1
         or sources[0].attrib != console_source.attrib
-        or len(source_labels) != 1
-        or len(list(sources[0])) != 1
-        or source_labels[0].attrib != {"model": "dac", "relabel": "no"}
         or targets[0].attrib != {"port": "0", "type": "isa-serial"}
         or [child.tag for child in targets[0]] != ["model"]
         or len(models) != 1
         or models[0].attrib != {"name": "isa-serial"}
-        or list(source_labels[0])
         or list(models[0])
         or (serial.text or "").strip()
         or (serial.tail or "").strip()
         or (sources[0].text or "").strip()
         or (sources[0].tail or "").strip()
-        or (source_labels[0].text or "").strip()
-        or (source_labels[0].tail or "").strip()
         or (targets[0].text or "").strip()
         or (targets[0].tail or "").strip()
         or (models[0].text or "").strip()
         or (models[0].tail or "").strip()
     ):
         raise StateError("defined OCI-root generated file serial mirror is invalid")
+    if _source_dac_projection(
+        sources[0], domain_dac=domain_dac, context="generated file serial mirror"
+    ) != _source_dac_projection(console_source, domain_dac=domain_dac, context="console contract"):
+        raise StateError("defined OCI-root generated file serial mirror DAC policy is invalid")
 
 
 def _validate_devices_surface(
     devices: ET.Element,
     *,
     file_console_source: ET.Element | None = None,
+    domain_dac: bool = False,
 ) -> tuple[tuple[str, int], ...]:
     """Reject host-resource devices; admit only bounded inert normalization.
 
@@ -492,7 +506,7 @@ def _validate_devices_surface(
             raise StateError("defined OCI-root generated panic device is invalid")
         if tag == "serial":
             if child.get("type") == "file":
-                _validate_file_console_serial_mirror(child, file_console_source)
+                _validate_file_console_serial_mirror(child, file_console_source, domain_dac=domain_dac)
                 counts[tag] = generated_counts[tag]
             else:
                 targets = child.findall("./target")
@@ -630,6 +644,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     if root.tag != "domain" or root.attrib != {"type": "kvm"}:
         raise StateError("defined OCI-root domain root is invalid")
     _validate_top_level_surface(root)
+    domain_dac = _dac_projection(root) is not None
     metadata = _single(root, "./metadata", "defined OCI-root metadata contract is invalid")
     if (
         metadata.attrib
@@ -743,11 +758,11 @@ def _domain_projection(xml: str) -> dict[str, Any]:
     console = consoles[0]
     console_targets = console.findall("./target")
     console_sources = console.findall("./source")
-    console_source_label: ET.Element | None = None
+    console_source_policy = None
     if console_sources:
-        source_labels = console_sources[0].findall("./seclabel")
-        if len(source_labels) == 1:
-            console_source_label = source_labels[0]
+        console_source_policy = _source_dac_projection(
+            console_sources[0], domain_dac=domain_dac, context="console contract"
+        )
     if (
         len(console_targets) != 1
         or len(console_sources) > 1
@@ -759,7 +774,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         or (console.text or "").strip()
         or (console_targets[0].text or "").strip()
         or any((child.tail or "").strip() for child in console)
-        or (not console_sources and (console.attrib != {"type": "pty"} or console_source_label is not None))
+        or (not console_sources and console.attrib != {"type": "pty"})
         or (
             console_sources
             and (
@@ -768,13 +783,6 @@ def _domain_projection(xml: str) -> dict[str, Any]:
                 or console_sources[0].get("append") != "on"
                 or not isinstance(console_sources[0].get("path"), str)
                 or not console_sources[0].get("path", "").startswith("/")
-                or len(list(console_sources[0])) != 1
-                or console_source_label is None
-                or console_source_label.attrib != {"model": "dac", "relabel": "no"}
-                or list(console_source_label)
-                or (console_sources[0].text or "").strip()
-                or (console_source_label.text or "").strip()
-                or (console_source_label.tail or "").strip()
             )
         )
     ):
@@ -787,8 +795,8 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
         tuple(sorted(console_targets[0].attrib.items())),
     )
-    if console_source_label is not None:
-        console_projection += (tuple(sorted(console_source_label.attrib.items())),)
+    if console_source_policy:
+        console_projection += (console_source_policy,)
     return {
         "channels": tuple(channel_projection),
         **({"dac_label": _dac_projection(root)} if root.find("./seclabel") is not None else {}),
@@ -796,7 +804,8 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "disks": _disk_projection(root),
         "device_counts": _validate_devices_surface(
             _single(root, "./devices", "defined OCI-root devices are invalid"),
-            file_console_source=console_sources[0] if console_source_label is not None else None,
+            file_console_source=console_sources[0] if console_sources else None,
+            domain_dac=domain_dac,
         ),
         "domain_type": root.get("type"),
         "emulator": emulator.text,

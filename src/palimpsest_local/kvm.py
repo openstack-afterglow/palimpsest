@@ -403,7 +403,9 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
     )
     devices = ET.SubElement(domain, "devices")
     ET.SubElement(devices, "emulator").text = str(profile.emulator)
-    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False, dac_no_relabel=True)
+    # libvirt forbids per-source label overrides when domain relabeling is off.
+    source_dac_override = spec.dac_label is None
+    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False, dac_no_relabel=source_dac_override)
     ET.SubElement(root, "serial").text = spec.root_serial
     transport_disk = _disk(
         devices,
@@ -411,7 +413,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         transport.target_dev,
         "raw",
         readonly=True,
-        dac_no_relabel=True,
+        dac_no_relabel=source_dac_override,
     )
     ET.SubElement(transport_disk, "serial").text = transport.serial
     for layer in spec.layers:
@@ -422,7 +424,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
             "raw",
             readonly=True,
             shareable=True,
-            dac_no_relabel=True,
+            dac_no_relabel=source_dac_override,
         )
         ET.SubElement(disk, "serial").text = layer.serial
     ET.SubElement(devices, "controller", {"type": "virtio-serial", "index": "0"})
@@ -446,7 +448,8 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
     else:
         console = ET.SubElement(devices, "console", {"type": "file"})
         console_source = ET.SubElement(console, "source", {"path": str(spec.console_log), "append": "on"})
-        ET.SubElement(console_source, "seclabel", {"model": "dac", "relabel": "no"})
+        if source_dac_override:
+            ET.SubElement(console_source, "seclabel", {"model": "dac", "relabel": "no"})
     ET.SubElement(console, "target", {"type": "serial", "port": "0"})
     return ET.tostring(domain, encoding="unicode")
 

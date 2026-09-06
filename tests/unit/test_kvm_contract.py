@@ -126,7 +126,73 @@ def test_oci_root_optional_dac_policy_is_exact_static_and_preserves_legacy_proje
     assert "dac_label" not in _domain_projection(legacy)
     managed_projection = _domain_projection(managed)
     assert managed_projection.pop("dac_label") == "+12345:+12346"
-    assert managed_projection == _domain_projection(legacy)
+    legacy_projection = _domain_projection(legacy)
+    for managed_disk, legacy_disk in zip(managed_projection["disks"], legacy_projection["disks"], strict=True):
+        assert managed_disk[4] == ()
+        assert legacy_disk[4] == (("model", "dac"), ("relabel", "no"))
+        assert managed_disk[:4] + managed_disk[5:] == legacy_disk[:4] + legacy_disk[5:]
+    managed_projection["disks"] = legacy_projection["disks"]
+    assert managed_projection == legacy_projection
+
+
+def _oci_root_source_policy_xml(managed):
+    from dataclasses import replace
+
+    spec = replace(
+        _oci_root_spec(),
+        console_log=Path("/var/lib/palimpsest/runs/oci-demo/console.log"),
+        dac_label="+12345:+12346" if managed else None,
+    )
+    root = ET.fromstring(build_oci_root_domain_xml(spec, _X86_PROFILE))
+    serial = ET.SubElement(root.find("./devices"), "serial", {"type": "file"})
+    serial.append(ET.fromstring(ET.tostring(root.find("./devices/console/source"))))
+    target = ET.SubElement(serial, "target", {"port": "0", "type": "isa-serial"})
+    ET.SubElement(target, "model", {"name": "isa-serial"})
+    return root
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_oci_root_file_console_serial_and_all_disks_use_exact_selected_dac_scope(managed):
+    from palimpsest_local.oci_root_runtime import _domain_projection
+
+    root = _oci_root_source_policy_xml(managed)
+    sources = [
+        *root.findall("./devices/disk/source"),
+        root.find("./devices/console/source"),
+        root.find("./devices/serial/source"),
+    ]
+    assert all(len(list(source)) == (0 if managed else 1) for source in sources)
+    projection = _domain_projection(ET.tostring(root, encoding="unicode"))
+    assert dict(projection["device_counts"])["serial"] == 1
+    assert len(projection["console"]) == (3 if managed else 4)
+
+
+@pytest.mark.parametrize("kind", ["root", "stage1", "lower", "console", "serial"])
+@pytest.mark.parametrize("managed", [False, True])
+def test_oci_root_source_label_cannot_be_omitted_in_legacy_or_override_global_policy(kind, managed):
+    from palimpsest_local.oci_root_runtime import _domain_projection
+
+    root = _oci_root_source_policy_xml(managed)
+    if kind in {"root", "stage1", "lower"}:
+        source = root.findall("./devices/disk/source")[["root", "stage1", "lower"].index(kind)]
+    else:
+        source = root.find(f"./devices/{kind}/source")
+    if managed:
+        ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
+    else:
+        source.remove(source.find("seclabel"))
+    with pytest.raises(StateError):
+        _domain_projection(ET.tostring(root, encoding="unicode"))
+
+
+@pytest.mark.parametrize("kind", ["disk", "console", "serial"])
+def test_oci_root_global_dac_rejects_unrelated_source_children(kind):
+    from palimpsest_local.oci_root_runtime import _domain_projection
+
+    root = _oci_root_source_policy_xml(True)
+    ET.SubElement(root.find(f"./devices/{kind}/source"), "unapproved")
+    with pytest.raises(StateError):
+        _domain_projection(ET.tostring(root, encoding="unicode"))
 
 
 @pytest.mark.parametrize("value", ["12345:12346", "+0:+12346", "+01:+2", "+4294967295:+2", "+1:+" + "1" * 5000])

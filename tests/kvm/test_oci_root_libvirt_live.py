@@ -1403,8 +1403,46 @@ class _ActivationConnectionProxy:
         return getattr(self._connection, name)
 
 
+def _qualification_global_dac_no_relabel(xml):
+    labels = xml.findall("./seclabel")
+    if not labels:
+        return False
+    node = labels[0]
+    if (
+        len(labels) != 1
+        or node.attrib != {"type": "static", "model": "dac", "relabel": "no"}
+        or len(list(node)) != 1
+        or node[0].tag != "label"
+        or (node.text or "").strip()
+        or (node.tail or "").strip()
+    ):
+        raise ValueError("qualification domain DAC policy is invalid")
+    text = _strict_scalar(node[0])
+    match = _DAC_BASELABEL_RE.fullmatch(text)
+    if len(text) > 23 or match is None or any(not 0 < int(value) <= _MAX_DAC_ID for value in match.groups()):
+        raise ValueError("qualification domain DAC principal is invalid")
+    return True
+
+
+def _qualification_source_dac_is_exact(source, global_no_relabel):
+    if (source.text or "").strip():
+        return False
+    children = list(source)
+    if global_no_relabel:
+        return not children
+    return (
+        len(children) == 1
+        and children[0].tag == "seclabel"
+        and children[0].attrib == {"model": "dac", "relabel": "no"}
+        and not list(children[0])
+        and not (children[0].text or "").strip()
+        and not (children[0].tail or "").strip()
+    )
+
+
 def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tuple[Path, str, str], ...]:
     xml = ET.fromstring(domain_xml)
+    global_no_relabel = _qualification_global_dac_no_relabel(xml)
     files: dict[Path, str] = {}
     for element_name in ("kernel", "initrd"):
         value = xml.findtext(f"./os/{element_name}")
@@ -1415,19 +1453,12 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
     for disk in xml.findall("./devices/disk"):
         source = disk.find("./source")
         target = disk.find("./target")
-        labels = source.findall("./seclabel") if source is not None else []
         if (
             source is None
             or target is None
             or set(source.attrib) != {"file"}
             or set(target.attrib) != {"dev", "bus"}
-            or len(labels) != 1
-            or len(list(source)) != 1
-            or labels[0].attrib != {"model": "dac", "relabel": "no"}
-            or list(labels[0])
-            or (source.text or "").strip()
-            or (labels[0].text or "").strip()
-            or (labels[0].tail or "").strip()
+            or not _qualification_source_dac_is_exact(source, global_no_relabel)
         ):
             raise ValueError("qualification disk binding is invalid")
         permission = "rw-" if target.get("dev") == "vda" else "r--"
@@ -1444,7 +1475,6 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
     console = consoles[0]
     console_sources = console.findall("./source")
     console_targets = console.findall("./target")
-    console_labels = console_sources[0].findall("./seclabel") if console_sources else []
     if (
         console.attrib != {"type": "file"}
         or len(console_sources) != 1
@@ -1453,15 +1483,10 @@ def _qualification_acl_specifications(root: Path, domain_xml: str) -> tuple[tupl
         or console_sources[0].attrib.get("append") != "on"
         or set(console_sources[0].attrib) != {"append", "path"}
         or console_targets[0].attrib != {"port": "0", "type": "serial"}
-        or len(console_labels) != 1
-        or len(list(console_sources[0])) != 1
-        or console_labels[0].attrib != {"model": "dac", "relabel": "no"}
-        or list(console_labels[0])
+        or not _qualification_source_dac_is_exact(console_sources[0], global_no_relabel)
         or list(console_targets[0])
         or (console.text or "").strip()
         or (console_sources[0].text or "").strip()
-        or (console_labels[0].text or "").strip()
-        or (console_labels[0].tail or "").strip()
         or (console_targets[0].text or "").strip()
         or (console_targets[0].tail or "").strip()
     ):
@@ -2324,8 +2349,9 @@ def test_qualification_dac_broker_failure_restores_or_retains_exact_state(
 
 
 @pytest.mark.parametrize("tamper", [None, "trusted-run", "outside-console", "other-socket"])
+@pytest.mark.parametrize("global_dac", [False, True])
 def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(
-    tmp_path: Path, tamper: str | None
+    tmp_path: Path, tamper: str | None, global_dac: bool
 ) -> None:
     run = tmp_path / "run"
     run.mkdir()
@@ -2357,6 +2383,12 @@ def test_qualification_acl_specifications_bind_exact_xml_paths_and_permissions(
         "</devices></domain>"
     )
 
+    if global_dac:
+        xml = xml.replace('<seclabel model="dac" relabel="no"/>', "")
+        xml = xml.replace(
+            "<domain>",
+            '<domain><seclabel type="static" model="dac" relabel="no"><label>+64055:+994</label></seclabel>',
+        )
     if tamper == "trusted-run":
         xml = xml.replace(str(io_directory), str(run))
     elif tamper == "outside-console":
@@ -2473,6 +2505,41 @@ def test_qualification_acl_specifications_reject_malformed_console(
 
     with pytest.raises(ValueError, match="console binding"):
         _qualification_acl_specifications(tmp_path, ET.tostring(xml, encoding="unicode"))
+
+
+@pytest.mark.parametrize("global_dac", [False, True])
+@pytest.mark.parametrize("child", ["", '<seclabel model="dac" relabel="no"/>', '<seclabel model="dac" relabel="yes"/>'])
+def test_qualification_source_dac_policy_has_no_ambiguous_override(global_dac, child):
+    source = ET.fromstring(f"<source>{child}</source>")
+    expected = child == "" if global_dac else child == '<seclabel model="dac" relabel="no"/>'
+    assert _qualification_source_dac_is_exact(source, global_dac) is expected
+
+
+@pytest.mark.parametrize("damage", [None, "relabel", "dynamic", "model", "principal", "zero", "extra", "duplicate"])
+def test_qualification_global_dac_policy_is_exact(damage):
+    root = ET.fromstring(
+        '<domain><seclabel type="static" model="dac" relabel="no"><label>+64055:+994</label></seclabel></domain>'
+    )
+    node = root[0]
+    if damage == "relabel":
+        node.set("relabel", "yes")
+    elif damage == "dynamic":
+        node.set("type", "dynamic")
+    elif damage == "model":
+        node.set("model", "apparmor")
+    elif damage == "principal":
+        node[0].text = "64055:994"
+    elif damage == "zero":
+        node[0].text = "+0:+994"
+    elif damage == "extra":
+        ET.SubElement(node, "imagelabel")
+    elif damage == "duplicate":
+        root.append(ET.fromstring(ET.tostring(node, encoding="unicode")))
+    if damage is None:
+        assert _qualification_global_dac_no_relabel(root) is True
+    else:
+        with pytest.raises(ValueError):
+            _qualification_global_dac_no_relabel(root)
 
 
 def test_qualification_acl_specifications_require_exact_dac_no_relabel(tmp_path: Path) -> None:
