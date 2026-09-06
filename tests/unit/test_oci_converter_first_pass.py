@@ -705,7 +705,14 @@ def test_packer_process_admission_reports_resource_errno_without_retry(tmp_path,
     with pytest.raises(SquashFSPackError) as raised:
         if entry == "pinned":
             oci_packer._run_pinned(
-                1, ["-version"], cwd_fd=2, stdin=-3, timeout_seconds=1, grace_seconds=0.1, capture_output=True
+                1,
+                ["-version"],
+                cwd_fd=2,
+                stdin=-3,
+                timeout_seconds=1,
+                grace_seconds=0.1,
+                capture_output=True,
+                resource_failure_stage="packer-final-spawn",
             )
         elif entry == "version":
             oci_packer.discover_squashfs_toolchain(packer, expected_packer_sha256=bound.digest.removeprefix("sha256:"))
@@ -721,8 +728,174 @@ def test_packer_process_admission_reports_resource_errno_without_retry(tmp_path,
     assert raised.value.code == expected
     assert "/private/host/detail" not in str(raised.value)
     assert len(calls) == 1
+    if number in {errno.EAGAIN, errno.ENOMEM}:
+        expected_stage = {
+            "pinned": "packer-final-spawn",
+            "version": "packer-toolchain-version",
+            "dependencies": "packer-dependency-inspection",
+        }[entry]
+        assert raised.value.failure_stage == expected_stage
+        assert raised.value.failure_errno == number
+    else:
+        assert raised.value.failure_stage is None
+        assert raised.value.failure_errno is None
     if entry == "pinned":
         assert calls[0]["stdout"].closed
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected_stage"),
+    [
+        ("dependencies", "packer-dependency-inspection"),
+        ("version", "packer-toolchain-version"),
+    ],
+)
+def test_subprocess_run_communication_memoryerror_uses_coarse_operation_without_errno_or_spawn_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    expected_stage: str,
+) -> None:
+    packer = tmp_path / "mksquashfs"
+    packer.write_bytes(b"packer")
+    bound = oci_packer._bind_toolchain_file(packer)
+    calls: list[dict[str, object]] = []
+
+    class CommunicatingProcess:
+        returncode = None
+
+        def __init__(self, **kwargs) -> None:
+            calls.append(kwargs)
+            self.killed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def communicate(self, *_args, **_kwargs):
+            raise MemoryError("private-communication-secret")
+
+        def kill(self) -> None:
+            self.killed = True
+
+    monkeypatch.setattr(oci_packer, "_bind_toolchain_file", lambda *_args: bound)
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", lambda *args, **kwargs: CommunicatingProcess(**kwargs))
+    monkeypatch.setattr(oci_packer.sys, "platform", "linux")
+    if entry == "dependencies":
+        monkeypatch.setattr(Path, "is_file", lambda _path: True)
+
+    with pytest.raises(SquashFSPackError) as raised:
+        if entry == "dependencies":
+            oci_packer._discover_dependency_paths(packer)
+        else:
+            oci_packer.discover_squashfs_toolchain(
+                packer,
+                expected_packer_sha256=bound.digest.removeprefix("sha256:"),
+            )
+
+    assert raised.value.code == "oci-packer-resource"
+    assert raised.value.failure_stage == expected_stage
+    assert raised.value.failure_errno is None
+    assert "spawn" not in raised.value.failure_stage
+    assert "creation" not in str(raised.value)
+    assert "private-communication-secret" not in str(raised.value)
+    assert len(calls) == 1
+
+
+def test_pinned_version_caller_preserves_popen_memoryerror_stage_without_invented_errno(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packer = tmp_path / "mksquashfs"
+    packer.write_bytes(b"packer")
+    directory_fd = os.open(tmp_path, os.O_RDONLY)
+    packer_fd = os.open(packer, os.O_RDONLY)
+    calls: list[dict[str, object]] = []
+
+    def fail(*_args, **kwargs):
+        calls.append(kwargs)
+        raise MemoryError("private-memory-secret")
+
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", fail)
+    try:
+        with pytest.raises(SquashFSPackError) as raised:
+            oci_packer._packer_version(
+                packer_fd,
+                directory_fd,
+                oci_packer.DEFAULT_SQUASHFS_PACK_POLICY,
+            )
+    finally:
+        os.close(packer_fd)
+        os.close(directory_fd)
+
+    assert raised.value.code == "oci-packer-resource"
+    assert raised.value.failure_stage == "packer-pinned-version"
+    assert raised.value.failure_errno is None
+    assert "private-memory-secret" not in str(raised.value)
+    assert len(calls) == 1
+    assert calls[0]["stdout"].closed
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer caller requires Linux")
+def test_pack_staged_caller_assigns_final_popen_stage_without_invented_errno(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    member, payload = _file("value", b"payload")
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    packer, packer_digest = _fake_mksquashfs(tmp_path)
+    bound = oci_packer._bind_toolchain_file(packer)
+    identity = oci_packer.SquashFSToolchainIdentity("4.7.5", bound.digest, ())
+    toolchain = oci_packer.VerifiedSquashFSToolchain(identity, packer.resolve(), ())
+    scratch = tmp_path / "worker-scratch"
+    scratch.mkdir(mode=0o700)
+    execution = SquashFSPackExecution(scratch_root=scratch.resolve(), inherit_process_group=True)
+    original_popen = oci_packer.subprocess.Popen
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    final_fds: tuple[int, ...] = ()
+
+    def popen(*args, **kwargs):
+        nonlocal final_fds
+        arguments = args[0]
+        calls.append((arguments, kwargs))
+        if arguments[1:] == ["-version"]:
+            return original_popen(*args, **kwargs)
+        stdin_fd = kwargs["stdin"].fileno()
+        final_fds = (stdin_fd, *kwargs["pass_fds"])
+        assert os.pread(stdin_fd, len(b"value"), 0) == b"value"
+        assert os.fstat(stdin_fd).st_nlink == 0
+        assert kwargs["executable"] == oci_packer._fd_path(kwargs["pass_fds"][0])
+        assert kwargs["cwd"] == oci_packer._fd_path(kwargs["pass_fds"][1])
+        for fd in kwargs["pass_fds"]:
+            os.fstat(fd)
+        raise MemoryError("private-memory-secret")
+
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path: ())
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", popen)
+    with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
+        with pytest.raises(SquashFSPackError) as raised:
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+                toolchain=toolchain,
+                execution=execution,
+            ):
+                pytest.fail("final packer spawn unexpectedly succeeded")
+
+    assert raised.value.code == "oci-packer-resource"
+    assert raised.value.failure_stage == "packer-final-spawn"
+    assert raised.value.failure_errno is None
+    assert "private-memory-secret" not in str(raised.value)
+    assert len(calls) == 2
+    assert calls[0][0][1:] == ["-version"]
+    assert calls[1][0][1:3] == ["-", "layer.squashfs"]
+    for fd in final_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 def test_supervised_packer_inherits_outer_group_and_terminates_only_child(

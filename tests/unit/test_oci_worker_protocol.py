@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
 import json
 import os
 import signal
+import struct
 import sys
+import tarfile
+import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import palimpsest_local.oci_materializer as materializer
 import palimpsest_local.oci_materializer_worker as worker
+import palimpsest_local.oci_store as oci_store
 from palimpsest_local.oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
+from palimpsest_local.oci_image import OCIImageRef
 from palimpsest_local.oci_materializer import OCIHardWorkerError
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
+    SQUASHFS_STRUCTURAL_VERIFIER_ID,
+    LeasedSquashFS,
+    PackedSquashFSReceipt,
     SquashFSPackError,
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
@@ -33,18 +44,23 @@ from palimpsest_local.oci_provenance import (
     Platform,
     ProvenanceSource,
 )
+from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
 from palimpsest_local.oci_store import (
     DerivedLayerOccurrence,
     DerivedLayerReceipt,
     DerivedSquashFSKey,
     MaterializationResult,
+    OCIStore,
 )
 from palimpsest_local.oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
+    OCI_WORKER_LEGACY_RESPONSE_SCHEMA,
+    OCI_WORKER_RESPONSE_SCHEMA,
     OCIWorkerProtocolError,
     OCIWorkerRequest,
     OCIWorkerResponse,
 )
+from palimpsest_local.state import StatePaths, init_resolved_roots
 
 
 def _digest(character: str) -> str:
@@ -114,12 +130,146 @@ def _result(request: OCIWorkerRequest) -> MaterializationResult:
     )
 
 
+def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
+    layer_stream = io.BytesIO()
+    member = tarfile.TarInfo("value")
+    member.mode = 0o644
+    member.size = len(b"fixture")
+    with tarfile.open(fileobj=layer_stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        archive.addfile(member, io.BytesIO(b"fixture"))
+    layer_payload = layer_stream.getvalue()
+
+    layout = tmp_path / "layout"
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}', encoding="utf-8")
+
+    def add_blob(payload: bytes, media_type: str) -> Descriptor:
+        descriptor = Descriptor(
+            media_type=media_type,
+            digest=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+            size=len(payload),
+        )
+        (blobs / descriptor.digest.removeprefix("sha256:")).write_bytes(payload)
+        return descriptor
+
+    layer = add_blob(layer_payload, OCI_LAYER_MEDIA_TYPE)
+    config_payload = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    config = add_blob(config_payload, OCI_IMAGE_CONFIG_MEDIA_TYPE)
+    manifest_payload = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": config.to_dict(),
+            "layers": [layer.to_dict()],
+        },
+        separators=(",", ":"),
+    ).encode()
+    manifest = add_blob(manifest_payload, OCI_IMAGE_MANIFEST_MEDIA_TYPE)
+    (layout / "index.json").write_text(
+        json.dumps({"schemaVersion": 2, "manifests": [manifest.to_dict()]}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    source_cas_root = tmp_path / "source-cas"
+    cas = SourceCAS(source_cas_root)
+    reference = OCIImageRef(
+        registry="registry.example.com",
+        repository="team/app",
+        requested_reference="registry.example.com/team/app:latest",
+    )
+    image = LocalLayoutSource.parse(f"oci-layout://{layout}@{manifest.digest}").snapshot(reference, cas)
+    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    store = OCIStore(roots)
+    packer = (tmp_path / "mksquashfs").resolve()
+    packer.write_bytes(b"fixture-mksquashfs")
+    packer.chmod(0o500)
+    executable_digest = f"sha256:{hashlib.sha256(packer.read_bytes()).hexdigest()}"
+    identity = SquashFSToolchainIdentity("4.7.5", executable_digest, ())
+    toolchain = VerifiedSquashFSToolchain(identity, packer, ())
+    return SimpleNamespace(
+        cas=cas,
+        image=image,
+        packer=packer,
+        roots=roots,
+        source_cas_root=source_cas_root,
+        store=store,
+        toolchain=toolchain,
+    )
+
+
+def _fixture_worker_request(fixture: SimpleNamespace) -> OCIWorkerRequest:
+    occurrence = DerivedLayerOccurrence.from_image(fixture.image, 0)
+    key = DerivedSquashFSKey.for_occurrence(
+        occurrence,
+        intake_policy_id=LAYER_INTAKE_POLICY_ID,
+        intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
+        pack_policy_id=SQUASHFS_PACK_POLICY_ID,
+        pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+        toolchain=fixture.toolchain,
+    )
+    return OCIWorkerRequest(
+        nonce=str(uuid.uuid4()),
+        config_root=fixture.roots.config,
+        state_root=fixture.roots.state,
+        expected_store_id=fixture.store.identity,
+        source_cas_root=fixture.source_cas_root,
+        expected_source_cas_id=fixture.cas.identity,
+        source=fixture.image.image.source,
+        occurrence=occurrence,
+        key=key,
+        key_digest=key.digest,
+        packer_path=fixture.packer,
+        packer_sha256=fixture.toolchain.identity.executable_digest.removeprefix("sha256:"),
+        cpu_limit_seconds=30,
+    )
+
+
+def _minimal_squashfs() -> bytes:
+    payload = b"payload" + b"\0" * 57
+    bytes_used = 96 + len(payload)
+    image_size = ((bytes_used + 511) // 512) * 512
+    superblock = struct.pack(
+        "<5I6H8Q",
+        0x73717368,
+        1,
+        0,
+        131072,
+        0,
+        1,
+        17,
+        0,
+        1,
+        4,
+        0,
+        0,
+        bytes_used,
+        144,
+        2**64 - 1,
+        96,
+        112,
+        2**64 - 1,
+        2**64 - 1,
+    )
+    return superblock + payload + b"\0" * (image_size - bytes_used)
+
+
 def test_request_and_success_response_round_trip_as_canonical_json() -> None:
     request = _request()
     response = OCIWorkerResponse(request.nonce, request.digest, "succeeded", _result(request), None)
 
     assert OCIWorkerRequest.from_json_bytes(request.to_json_bytes()) == request
     assert OCIWorkerResponse.from_json_bytes(response.to_json_bytes()) == response
+    assert response.schema == OCI_WORKER_RESPONSE_SCHEMA
+    assert response.to_dict()["failure_stage"] is None
+    assert response.to_dict()["failure_errno"] is None
     assert (
         request.to_json_bytes()
         == json.dumps(request.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -157,14 +307,260 @@ def test_request_rejects_unknown_fields_and_digest_or_path_tampering() -> None:
             OCIWorkerRequest.from_dict(value)
 
 
-def test_failed_response_exposes_only_a_stable_category() -> None:
+def test_v3_failed_response_exposes_only_allowlisted_fixed_resource_facts() -> None:
     request = _request()
-    response = OCIWorkerResponse(request.nonce, request.digest, "failed", None, "pack")
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        "failed",
+        None,
+        "resource",
+        failure_stage="packer-final-spawn",
+        failure_errno=errno.EAGAIN,
+    )
 
     assert OCIWorkerResponse.from_json_bytes(response.to_json_bytes()) == response
     assert "/" not in response.to_json_bytes().decode()
     with pytest.raises(OCIWorkerProtocolError):
         replace(response, error_category="/tmp/private-detail")
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed"])
+def test_legacy_v2_response_round_trips_its_original_canonical_shape(status: str) -> None:
+    request = _request()
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        status,
+        _result(request) if status == "succeeded" else None,
+        None if status == "succeeded" else "resource",
+        schema=OCI_WORKER_LEGACY_RESPONSE_SCHEMA,
+    )
+    payload = response.to_json_bytes()
+
+    assert b'"failure_errno"' not in payload and b'"failure_stage"' not in payload
+    decoded = OCIWorkerResponse.from_json_bytes(payload)
+    assert decoded == response
+    assert decoded.to_json_bytes() == payload
+    assert set(decoded.to_dict()) == {"error_category", "nonce", "request_digest", "result", "schema", "status"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("failure_stage", "unknown-stage"),
+        ("failure_stage", True),
+        ("failure_stage", {}),
+        ("failure_errno", True),
+        ("failure_errno", errno.EACCES),
+        ("failure_errno", {}),
+    ],
+)
+def test_v3_response_rejects_unknown_boolean_and_object_failure_facts(field, value) -> None:
+    request = _request()
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        "failed",
+        None,
+        "resource",
+        failure_stage="source",
+    )
+    payload = response.to_dict()
+    payload[field] = value
+
+    with pytest.raises(OCIWorkerProtocolError):
+        OCIWorkerResponse.from_json_bytes(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("failure_stage", []),
+        ("failure_stage", {}),
+        ("failure_errno", []),
+        ("failure_errno", {}),
+    ],
+)
+def test_response_constructor_rejects_unhashable_failure_facts_with_path_free_typed_error(field, value) -> None:
+    arguments = {"failure_stage": "source", "failure_errno": None}
+    arguments[field] = value
+
+    with pytest.raises(OCIWorkerProtocolError) as raised:
+        OCIWorkerResponse(
+            _request().nonce,
+            _digest("9"),
+            "failed",
+            None,
+            "resource",
+            **arguments,
+        )
+
+    assert "/" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(extra=None),
+        lambda value: value.update(schema="palimpsest.oci-materialize-worker-response.v1"),
+        lambda value: value.update(schema="palimpsest.oci-materialize-worker-response.v99"),
+        lambda value: value.update(schema={}),
+        lambda value: value.update(error_category="pack", failure_stage="packing"),
+        lambda value: value.update(failure_stage=None, failure_errno=errno.ENOMEM),
+    ],
+)
+def test_response_rejects_extra_unknown_schema_and_wrong_fact_combinations(mutate) -> None:
+    request = _request()
+    value = OCIWorkerResponse(request.nonce, request.digest, "failed", None, "resource").to_dict()
+    mutate(value)
+
+    with pytest.raises(OCIWorkerProtocolError):
+        OCIWorkerResponse.from_json_bytes(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        )
+
+
+def test_materialize_layer_hard_rejects_valid_success_with_resource_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+
+    def exchange(request: OCIWorkerRequest, **_kwargs):
+        value = OCIWorkerResponse(request.nonce, request.digest, "succeeded", _result(request), None).to_dict()
+        value["failure_stage"] = "source"
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        return payload, 0, SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    with pytest.raises(OCIHardWorkerError) as raised:
+        materializer.materialize_layer_hard(
+            fixture.image,
+            0,
+            source_cas_root=fixture.source_cas_root,
+            roots=fixture.roots,
+            store=fixture.store,
+            packer_path=fixture.packer,
+            toolchain=fixture.toolchain,
+        )
+
+    assert raised.value.code == "oci-worker-protocol"
+    assert "response is invalid" in str(raised.value)
+
+
+def test_response_rejects_noncanonical_json_and_legacy_shape_extensions() -> None:
+    request = _request()
+    response = OCIWorkerResponse(request.nonce, request.digest, "failed", None, "resource")
+    with pytest.raises(OCIWorkerProtocolError):
+        OCIWorkerResponse.from_json_bytes(b" " + response.to_json_bytes())
+
+    legacy = replace(response, schema=OCI_WORKER_LEGACY_RESPONSE_SCHEMA).to_dict()
+    legacy["failure_stage"] = None
+    with pytest.raises(OCIWorkerProtocolError):
+        OCIWorkerResponse.from_json_bytes(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode())
+
+
+def test_response_request_binding_fields_remain_exact() -> None:
+    request = _request()
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        "failed",
+        None,
+        "resource",
+        failure_stage="source",
+        failure_errno=errno.ENOMEM,
+    )
+    decoded = OCIWorkerResponse.from_json_bytes(response.to_json_bytes())
+
+    assert decoded.nonce == request.nonce
+    assert decoded.request_digest == request.digest
+    materializer._validate_worker_response_binding(decoded, request)
+    for tampered in (
+        replace(decoded, nonce=str(uuid.uuid4())),
+        replace(decoded, request_digest=_digest("9")),
+    ):
+        with pytest.raises(OCIHardWorkerError, match="response binding is invalid"):
+            materializer._validate_worker_response_binding(tampered, request)
+
+
+@pytest.mark.parametrize("tampered_field", ["nonce", "request_digest"])
+def test_materialize_layer_hard_rejects_tampered_detailed_failure_before_rendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_field: str,
+) -> None:
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+
+    def exchange(request: OCIWorkerRequest, **_kwargs):
+        response = OCIWorkerResponse(
+            nonce=str(uuid.uuid4()) if tampered_field == "nonce" else request.nonce,
+            request_digest=_digest("9") if tampered_field == "request_digest" else request.digest,
+            status="failed",
+            result=None,
+            error_category="resource",
+            failure_stage="packer-dependency-inspection",
+            failure_errno=errno.ENOMEM,
+        )
+        return response.to_json_bytes(), 0, SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    with pytest.raises(OCIHardWorkerError) as raised:
+        materializer.materialize_layer_hard(
+            fixture.image,
+            0,
+            source_cas_root=fixture.source_cas_root,
+            roots=fixture.roots,
+            store=fixture.store,
+            packer_path=fixture.packer,
+            toolchain=fixture.toolchain,
+        )
+
+    assert raised.value.code == "oci-worker-protocol"
+    assert "response binding is invalid" in str(raised.value)
+    assert "dependency inspection" not in str(raised.value)
+    assert "ENOMEM" not in str(raised.value)
+
+
+def test_materialize_layer_hard_accepts_bound_detailed_failure_and_renders_fixed_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+
+    def exchange(request: OCIWorkerRequest, **_kwargs):
+        response = OCIWorkerResponse(
+            nonce=request.nonce,
+            request_digest=request.digest,
+            status="failed",
+            result=None,
+            error_category="resource",
+            failure_stage="packer-dependency-inspection",
+            failure_errno=errno.ENOMEM,
+        )
+        return response.to_json_bytes(), 0, SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    with pytest.raises(OCIHardWorkerError) as raised:
+        materializer.materialize_layer_hard(
+            fixture.image,
+            0,
+            source_cas_root=fixture.source_cas_root,
+            roots=fixture.roots,
+            store=fixture.store,
+            packer_path=fixture.packer,
+            toolchain=fixture.toolchain,
+        )
+
+    assert raised.value.code == "oci-worker-resource"
+    assert "dependency inspection" in str(raised.value)
+    assert "ENOMEM" in str(raised.value)
 
 
 def test_parent_worker_boundary_starts_a_new_session_and_binds_stdin(tmp_path: Path) -> None:
@@ -448,6 +844,277 @@ def test_reaper_uncertain_liveness_preserves_scratch_and_releases_pin(tmp_path, 
 )
 def test_worker_resource_classification_is_path_free_and_precise(failure, category):
     assert worker._category(failure) == category
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_errno"),
+    [
+        (OSError(errno.EAGAIN, "/private/eagain-secret"), errno.EAGAIN),
+        (OSError(errno.ENOMEM, "/private/enomem-secret"), errno.ENOMEM),
+        (MemoryError("private-memory-secret"), None),
+    ],
+)
+def test_worker_operation_boundary_preserves_only_actual_resource_errno(failure, expected_errno):
+    def fail():
+        raise failure
+
+    with pytest.raises(worker._WorkerResourceError) as raised:
+        worker._resource_boundary("staging", fail)
+    assert worker._failure_details(raised.value, "resource") == ("staging", expected_errno)
+    assert "private" not in str(raised.value)
+
+
+def test_worker_operation_boundary_does_not_reclassify_nonresource_oserror() -> None:
+    failure = OSError(errno.EACCES, "/private/access-secret")
+
+    def fail():
+        raise failure
+
+    with pytest.raises(OSError) as raised:
+        worker._resource_boundary("source", fail)
+    assert raised.value is failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "category", "stage", "expected_errno"),
+    [
+        (OSError(errno.EAGAIN, "/private/limit-secret"), "resource", "limits", errno.EAGAIN),
+        (MemoryError("private-limit-secret"), "resource", "limits", None),
+        (OSError(errno.EACCES, "/private/limit-secret"), "internal", None, None),
+    ],
+)
+def test_worker_main_writes_v3_fixed_shape_without_exception_text(
+    monkeypatch, failure, category, stage, expected_errno
+) -> None:
+    request = _request()
+    output = io.BytesIO()
+
+    def fail(_seconds):
+        raise failure
+
+    monkeypatch.setattr(worker.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(request.to_json_bytes())))
+    monkeypatch.setattr(worker.sys, "stdout", SimpleNamespace(buffer=output))
+    monkeypatch.setattr(worker.os, "umask", lambda _mode: 0o022)
+    monkeypatch.setattr(worker, "_apply_resource_limits", fail)
+    monkeypatch.setattr(worker, "_materialize", lambda _request: pytest.fail("materialization started"))
+
+    assert worker.main() == 0
+    response = OCIWorkerResponse.from_json_bytes(output.getvalue())
+    assert response.schema == OCI_WORKER_RESPONSE_SCHEMA
+    assert response.error_category == category
+    assert response.failure_stage == stage
+    assert response.failure_errno == expected_errno
+    assert b"private" not in output.getvalue()
+
+
+@pytest.mark.parametrize("failure_boundary", ["publication", "producer-teardown"])
+def test_real_store_publication_and_producer_teardown_memoryerror_remain_coarse_store_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+) -> None:
+    fixture = _materialization_fixture(tmp_path)
+    request = _fixture_worker_request(fixture)
+    worker_scratch = tmp_path / "worker-scratch"
+    worker_scratch.mkdir(mode=0o700)
+    monkeypatch.chdir(worker_scratch)
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *_args, **_kwargs: fixture.toolchain)
+
+    captured: dict[str, object] = {}
+    original_lease_layer = worker.SourceCAS.lease_layer
+    original_stage_layer = worker.stage_layer
+    original_verify_structure = oci_store.ArtifactStore._verify_structure
+
+    @contextmanager
+    def observed_lease_layer(source_cas, *args, **kwargs):
+        with original_lease_layer(source_cas, *args, **kwargs) as source:
+            captured["source_fd"] = source._file_fd
+            yield source
+
+    @contextmanager
+    def observed_stage_layer(*args, **kwargs):
+        with original_stage_layer(*args, **kwargs) as staged:
+            captured["staged"] = staged
+            captured["staged_fd"] = staged._spool.fileno()
+            yield staged
+
+    class DescriptorBackedPackedFile:
+        def __init__(self, payload: bytes, *, fail_on_close: bool) -> None:
+            self._file = tempfile.TemporaryFile(mode="w+b")
+            self._file.write(payload)
+            self._file.seek(0)
+            self._fail_on_close = fail_on_close
+
+        def fileno(self) -> int:
+            return self._file.fileno()
+
+        def seek(self, *args):
+            return self._file.seek(*args)
+
+        def read(self, *args):
+            return self._file.read(*args)
+
+        def close(self) -> None:
+            self._file.close()
+            if self._fail_on_close:
+                raise MemoryError("private-teardown-secret")
+
+    @contextmanager
+    def packed_fixture(staged, **_kwargs):
+        image = _minimal_squashfs()
+        identity = fixture.toolchain.identity
+        receipt = PackedSquashFSReceipt(
+            policy_id=SQUASHFS_PACK_POLICY_ID,
+            policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+            source_ordinal=staged.receipt.ordinal,
+            source_diff_id=staged.receipt.diff_id,
+            normalized_tar_digest=_digest("8"),
+            normalized_tar_size=staged.receipt.uncompressed_size,
+            entries=staged.receipt.members,
+            packer_version=identity.version,
+            packer_sha256=identity.executable_digest.removeprefix("sha256:"),
+            image_digest=f"sha256:{hashlib.sha256(image).hexdigest()}",
+            image_size=len(image),
+            structural_verifier=SQUASHFS_STRUCTURAL_VERIFIER_ID,
+            toolchain_fingerprint=identity.fingerprint,
+            toolchain_dependency_digests=identity.dependency_digests,
+        )
+        packed_file = DescriptorBackedPackedFile(image, fail_on_close=failure_boundary == "producer-teardown")
+        captured["packed_fd"] = packed_file.fileno()
+        packed = LeasedSquashFS(packed_file, receipt)
+        captured["packed"] = packed
+        try:
+            yield packed
+        finally:
+            close_error = packed._close()
+            if close_error is not None:
+                raise close_error
+
+    def fail_publication(fd: int, size: int, maximum: int) -> None:
+        captured["publication_fd"] = fd
+        original_verify_structure(fd, size, maximum)
+        if failure_boundary == "publication":
+            raise MemoryError("private-publication-secret")
+        raise oci_store.ArtifactStoreError("artifact-structure", "injected publication rejection")
+
+    monkeypatch.setattr(worker.SourceCAS, "lease_layer", observed_lease_layer)
+    monkeypatch.setattr(worker, "stage_layer", observed_stage_layer)
+    monkeypatch.setattr(worker, "pack_staged_squashfs", packed_fixture)
+    monkeypatch.setattr(oci_store.ArtifactStore, "_verify_structure", staticmethod(fail_publication))
+
+    with pytest.raises(worker._WorkerResourceError) as raised:
+        worker._materialize(request)
+
+    assert raised.value.failure_stage == "store"
+    assert raised.value.failure_errno is None
+    assert "private" not in str(raised.value)
+    assert captured["staged"]._closed
+    assert captured["packed"]._closed
+    for name in ("source_fd", "staged_fd", "packed_fd", "publication_fd"):
+        with pytest.raises(OSError):
+            os.fstat(captured[name])
+
+    monkeypatch.setattr(oci_store.ArtifactStore, "_verify_structure", staticmethod(original_verify_structure))
+    with fixture.store._authority() as authority:
+        assert fixture.store._record_from_index(authority, request.key) is None
+    with pytest.raises(oci_store.ArtifactStoreError) as unpublished:
+        fixture.store._artifacts.verify_squashfs(
+            captured["packed"].receipt.image_digest,
+            captured["packed"].receipt.image_size,
+            maximum=oci_store.MAX_OCI_STORE_IMAGE_BYTES,
+        )
+    assert unpublished.value.code == "artifact-missing"
+
+
+@pytest.mark.parametrize(
+    ("stage", "number", "fragment"),
+    [
+        ("packer-dependency-inspection", errno.EAGAIN, "dependency inspection"),
+        ("packer-toolchain-version", errno.ENOMEM, "toolchain version check"),
+        ("packer-pinned-version", None, "pinned filesystem-packer version spawn"),
+        ("packer-final-spawn", errno.EAGAIN, "final filesystem-packer spawn"),
+    ],
+)
+def test_parent_resource_detail_uses_only_fixed_stage_and_errno_text(stage, number, fragment):
+    request = _request()
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        "failed",
+        None,
+        "resource",
+        failure_stage=stage,
+        failure_errno=number,
+    )
+
+    detail = materializer._reported_worker_resource_detail(response)
+
+    assert fragment in detail
+    assert (errno.errorcode[number] in detail) if number is not None else "no operating-system errno" in detail
+    assert "no automatic retry or limit change" in detail
+
+
+def test_parent_resource_detail_preserves_generic_no_details_rendering() -> None:
+    request = _request()
+    response = OCIWorkerResponse(request.nonce, request.digest, "failed", None, "resource")
+
+    detail = materializer._reported_worker_resource_detail(response)
+
+    assert "exact limiting resource is not identified" in detail
+    assert "during" not in detail
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("failure_stage", []),
+        ("failure_stage", {}),
+        ("failure_errno", []),
+        ("failure_errno", {}),
+    ],
+)
+def test_materialize_layer_hard_rejects_malformed_decoder_resource_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+    original_decode = materializer.OCIWorkerResponse.from_json_bytes
+
+    def exchange(request: OCIWorkerRequest, **_kwargs):
+        response = OCIWorkerResponse(request.nonce, request.digest, "failed", None, "resource")
+        return response.to_json_bytes(), 0, SimpleNamespace(poll=lambda: 0)
+
+    def malformed_decode(payload: bytes):
+        response = original_decode(payload)
+        facts = {"failure_stage": response.failure_stage, "failure_errno": response.failure_errno}
+        facts[field] = value
+        return SimpleNamespace(
+            nonce=response.nonce,
+            request_digest=response.request_digest,
+            status=response.status,
+            result=response.result,
+            error_category=response.error_category,
+            **facts,
+        )
+
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    monkeypatch.setattr(materializer.OCIWorkerResponse, "from_json_bytes", staticmethod(malformed_decode))
+    with pytest.raises(OCIHardWorkerError) as raised:
+        materializer.materialize_layer_hard(
+            fixture.image,
+            0,
+            source_cas_root=fixture.source_cas_root,
+            roots=fixture.roots,
+            store=fixture.store,
+            packer_path=fixture.packer,
+            toolchain=fixture.toolchain,
+        )
+
+    assert raised.value.code == "oci-worker-protocol"
+    assert "/" not in str(raised.value)
 
 
 def test_worker_process_cap_and_other_limits_are_not_relaxed(monkeypatch):

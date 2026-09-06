@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import resource
 import sys
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 from .artifact_store import ArtifactStoreError
 from .errors import ArtifactValidationError, UnsupportedPlatformError
@@ -19,6 +21,7 @@ from .oci_packer import (
     SquashFSPackExecution,
     discover_squashfs_toolchain,
     pack_staged_squashfs,
+    process_resource_errno,
     process_resource_failure,
 )
 from .oci_source import SnapshottedOCIImage, SourceCAS, SourceLeaseError, SourceSnapshot
@@ -36,6 +39,24 @@ _MAX_WORKER_ADDRESS_SPACE = 40 * 1024**3
 _MAX_WORKER_FILE_SIZE = 40 * 1024**3
 _MAX_WORKER_FDS = 256
 _MAX_WORKER_PROCESSES = OCI_WORKER_NPROC_LIMIT
+
+
+class _WorkerResourceError(Exception):
+    """Internal fixed-fact carrier; never serialized as exception text."""
+
+    def __init__(self, failure_stage: str, failure_errno: int | None):
+        self.failure_stage = failure_stage
+        self.failure_errno = failure_errno
+        super().__init__("OCI worker resource operation failed")
+
+
+def _resource_boundary[T](failure_stage: str, operation: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    try:
+        return operation(*args, **kwargs)
+    except BaseException as exc:
+        if process_resource_failure(exc):
+            raise _WorkerResourceError(failure_stage, process_resource_errno(exc)) from None
+        raise
 
 
 def _limit(resource_name: int, soft_limit: int) -> None:
@@ -88,18 +109,22 @@ def _reconstruct_image(request: OCIWorkerRequest, cas: SourceCAS) -> Snapshotted
 
 def _materialize(request: OCIWorkerRequest):
     roots = StatePaths(request.config_root, request.state_root)
-    store = OCIStore(roots)
+    store = _resource_boundary("store", OCIStore, roots)
     if store.identity != request.expected_store_id:
         raise OCIStoreError("oci-store-authority", "worker derived store identity does not match")
 
     @contextmanager
     def producer():
-        cas = SourceCAS.open_existing(
+        cas = _resource_boundary(
+            "source",
+            SourceCAS.open_existing,
             request.source_cas_root,
             expected_cas_id=request.expected_source_cas_id,
         )
-        snapshot = _reconstruct_image(request, cas)
-        toolchain = discover_squashfs_toolchain(
+        snapshot = _resource_boundary("source", _reconstruct_image, request, cas)
+        toolchain = _resource_boundary(
+            "packing",
+            discover_squashfs_toolchain,
             request.packer_path,
             expected_packer_sha256=request.packer_sha256,
             policy=DEFAULT_SQUASHFS_PACK_POLICY,
@@ -115,22 +140,40 @@ def _materialize(request: OCIWorkerRequest):
         if computed_key != request.key:
             raise OCIStoreError("oci-store-key", "worker recipe does not match the verified toolchain")
         execution = SquashFSPackExecution(scratch_root=Path.cwd(), inherit_process_group=True)
-        with cas.lease_layer(snapshot, request.occurrence.ordinal) as source:
-            with stage_layer(source, limits=DEFAULT_LAYER_CONVERSION_LIMITS) as staged:
-                with pack_staged_squashfs(
+        with ExitStack() as stack:
+            source = _resource_boundary(
+                "source",
+                stack.enter_context,
+                cas.lease_layer(snapshot, request.occurrence.ordinal),
+            )
+            staged = _resource_boundary(
+                "staging",
+                stack.enter_context,
+                stage_layer(source, limits=DEFAULT_LAYER_CONVERSION_LIMITS),
+            )
+            packed = _resource_boundary(
+                "packing",
+                stack.enter_context,
+                pack_staged_squashfs(
                     staged,
                     packer_path=request.packer_path,
                     expected_packer_sha256=request.packer_sha256,
                     policy=DEFAULT_SQUASHFS_PACK_POLICY,
                     toolchain=toolchain,
                     execution=execution,
-                ) as packed:
-                    yield staged.receipt, packed
+                ),
+            )
+            # Exceptions from store publication are thrown back through this
+            # yield. ExitStack cleanup deliberately runs outside every phase
+            # boundary so it cannot be mislabeled as source, staging or pack.
+            yield staged.receipt, packed
 
-    return store.materialize_observed(request.occurrence, request.key, producer)
+    return _resource_boundary("store", store.materialize_observed, request.occurrence, request.key, producer)
 
 
 def _category(exc: BaseException) -> str:
+    if isinstance(exc, _WorkerResourceError):
+        return "resource"
     if isinstance(exc, UnsupportedPlatformError):
         return "unsupported"
     if isinstance(exc, SourceLeaseError):
@@ -152,6 +195,16 @@ def _category(exc: BaseException) -> str:
     return "internal"
 
 
+def _failure_details(exc: BaseException, category: str) -> tuple[str | None, int | None]:
+    if category != "resource":
+        return None, None
+    if isinstance(exc, _WorkerResourceError):
+        return exc.failure_stage, exc.failure_errno
+    if isinstance(exc, SquashFSPackError) and exc.code == "oci-packer-resource":
+        return exc.failure_stage, exc.failure_errno
+    return None, None
+
+
 def main() -> int:
     os.umask(0o077)
     payload = sys.stdin.buffer.read(MAX_OCI_WORKER_MESSAGE_BYTES + 1)
@@ -160,7 +213,7 @@ def main() -> int:
     except OCIWorkerProtocolError:
         return 2
     try:
-        _apply_resource_limits(request.cpu_limit_seconds)
+        _resource_boundary("limits", _apply_resource_limits, request.cpu_limit_seconds)
         result = _materialize(request)
         response = OCIWorkerResponse(
             nonce=request.nonce,
@@ -170,12 +223,16 @@ def main() -> int:
             error_category=None,
         )
     except BaseException as exc:
+        category = _category(exc)
+        failure_stage, failure_errno = _failure_details(exc, category)
         response = OCIWorkerResponse(
             nonce=request.nonce,
             request_digest=request.digest,
             status="failed",
             result=None,
-            error_category=_category(exc),
+            error_category=category,
+            failure_stage=failure_stage,
+            failure_errno=failure_errno,
         )
     output = response.to_json_bytes()
     try:

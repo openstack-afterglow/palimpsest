@@ -205,6 +205,20 @@ DEPENDENCIES = (
     ("oci_resource_status", ("host-runtime", "core-cli"), ()),
     ("oci_worker_limits", ("host-runtime", "oci-store"), ("native-live",)),
     (
+        "oci_materializer oci_materializer_worker oci_packer oci_worker_protocol",
+        (
+            "core-cli",
+            "host-runtime",
+            "oci-store",
+            "oci-guest",
+            "oci-monitor",
+            "oci-access",
+            "qualification",
+            "build-registry",
+        ),
+        ("filesystem", "guest-binary", "guest-kvm", "native-live", "gate1", "gate2"),
+    ),
+    (
         "oci_exec_control oci_exec_session",
         ("oci-monitor", "oci-guest", "oci-access", "qualification", "core-cli", "host-runtime"),
         ("native-live", "gate2"),
@@ -221,7 +235,7 @@ DEPENDENCIES = (
         ("native-live", "guest-kvm", "gate2"),
     ),
     (
-        "oci_changeset oci_convert oci_converter oci_image oci_layout oci_materializer oci_materializer_worker oci_metrics oci_packer oci_provenance oci_source oci_tar_emitter oci_worker_protocol",
+        "oci_changeset oci_convert oci_converter oci_image oci_layout oci_metrics oci_provenance oci_source oci_tar_emitter",
         ("oci-store", "oci-guest", "oci-monitor", "oci-access", "qualification", "build-registry"),
         ("filesystem", "guest-binary", "guest-kvm", "native-live", "gate1", "gate2"),
     ),

@@ -116,6 +116,26 @@ def test_resource_status_sources_select_only_exact_consumers(module, expected, s
     assert result.suggested == suggested
 
 
+@pytest.mark.parametrize(
+    "module",
+    ["oci_materializer", "oci_materializer_worker", "oci_packer", "oci_worker_protocol"],
+)
+def test_materializer_worker_sources_preserve_broad_consumers_and_suggest_external_proofs(module):
+    result = lanes.select_changed((f"src/palimpsest_local/{module}.py",))
+
+    assert set(result.lanes) == {
+        "build-registry",
+        "core-cli",
+        "host-runtime",
+        "oci-access",
+        "oci-guest",
+        "oci-monitor",
+        "oci-store",
+        "qualification",
+    }
+    assert result.suggested == ("native-live", "guest-kvm", "guest-binary", "filesystem", "gate1", "gate2")
+
+
 def test_documentation_and_empty_changes_explain_no_tests():
     for paths in ((), ("README.md", "docs/acceptance.md")):
         selection = lanes.select_changed(paths)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import math
 import os
@@ -42,6 +43,21 @@ from .state import StatePaths
 
 _WORKER_MODULE = "palimpsest_local.oci_materializer_worker"
 _SCRATCH_PREFIX = ".oci-materializer-worker-"
+_WORKER_RESOURCE_STAGE_DETAILS = {
+    "limits": "worker resource-limit setup",
+    "packing": "SquashFS packing",
+    "packer-dependency-inspection": "packer dependency inspection",
+    "packer-final-spawn": "final filesystem-packer spawn",
+    "packer-pinned-version": "pinned filesystem-packer version spawn",
+    "packer-toolchain-version": "toolchain version check",
+    "source": "source access",
+    "staging": "layer staging",
+    "store": "derived-store operation",
+}
+_WORKER_RESOURCE_ERRNO_DETAILS = {
+    errno.EAGAIN: "EAGAIN",
+    errno.ENOMEM: "ENOMEM",
+}
 
 
 class OCIHardWorkerError(ArtifactValidationError):
@@ -66,6 +82,39 @@ class _WorkerBoundaryFailure(OCIHardWorkerError):
         self.process = process
         self.reaped = reaped
         super().__init__(code, detail)
+
+
+def _reported_worker_resource_detail(response: OCIWorkerResponse) -> str:
+    """Render only parent-owned fixed text after an independent allowlist check."""
+    stage = response.failure_stage
+    failure_errno = response.failure_errno
+    if stage is None and failure_errno is None:
+        return (
+            "materializer worker reported a resource failure; check process/thread, memory, and "
+            "service/cgroup limits; worker RLIMIT_NPROC remains capped at 256; "
+            "the exact limiting resource is not identified"
+        )
+    if not isinstance(stage, str) or stage not in _WORKER_RESOURCE_STAGE_DETAILS:
+        raise OCIHardWorkerError("oci-worker-protocol", "materializer worker failure stage is invalid")
+    if failure_errno is not None and (
+        type(failure_errno) is not int or failure_errno not in _WORKER_RESOURCE_ERRNO_DETAILS
+    ):
+        raise OCIHardWorkerError("oci-worker-protocol", "materializer worker failure errno is invalid")
+    errno_detail = (
+        f"; operating-system errno {_WORKER_RESOURCE_ERRNO_DETAILS[failure_errno]}"
+        if failure_errno is not None
+        else "; no operating-system errno was reported"
+    )
+    return (
+        f"materializer worker reported a resource failure during {_WORKER_RESOURCE_STAGE_DETAILS[stage]}"
+        f"{errno_detail}; check process/thread, memory, and service/cgroup limits; "
+        "worker RLIMIT_NPROC remains capped at 256; no automatic retry or limit change was attempted"
+    )
+
+
+def _validate_worker_response_binding(response: OCIWorkerResponse, request: OCIWorkerRequest) -> None:
+    if response.nonce != request.nonce or response.request_digest != request.digest:
+        raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response binding is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,15 +555,18 @@ def materialize_layer_hard(
             response = OCIWorkerResponse.from_json_bytes(output)
         except OCIWorkerProtocolError:
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response is invalid") from None
-        if response.nonce != request.nonce or response.request_digest != request.digest:
-            raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response binding is invalid")
+        _validate_worker_response_binding(response, request)
         if response.status == "failed":
+            if response.error_category != "resource" and (
+                response.failure_stage is not None or response.failure_errno is not None
+            ):
+                raise OCIHardWorkerError(
+                    "oci-worker-protocol", "non-resource worker response carried resource failure details"
+                )
             raise OCIHardWorkerError(
                 f"oci-worker-{response.error_category}",
                 (
-                    "materializer worker reported a resource failure; check process/thread, memory, and "
-                    "service/cgroup limits; worker RLIMIT_NPROC remains capped at 256; "
-                    "the exact limiting resource is not identified"
+                    _reported_worker_resource_detail(response)
                     if response.error_category == "resource"
                     else "materializer worker failed inside its isolated boundary"
                 ),

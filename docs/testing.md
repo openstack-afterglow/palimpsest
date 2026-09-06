@@ -131,6 +131,19 @@ uv run pytest -q tests/unit/test_oci_worker_protocol.py tests/unit/test_oci_conv
 uv run pytest -q tests/unit/test_oci_exec_session.py tests/unit/test_oci_exec_control.py tests/unit/test_oci_exec_client.py tests/unit/test_oci_exec_public_routing.py
 ```
 
+For the bounded worker-attribution change, also run the direct public consumers:
+
+```sh
+uv run pytest -q tests/unit/test_oci_run_request.py tests/unit/test_oci_run_adapter.py tests/unit/test_oci_public_cli.py tests/unit/test_oci_resource_status.py
+```
+
+Attribution tests must exercise canonical request/response validation and real
+file/descriptor boundaries, with faults injected at the relevant operation.
+Synthetic exception wrappers alone do not verify parent acceptance, publication
+or teardown. Whole-module dependency mappings remain conservative; a reviewed
+attribution-only edit may use these explicit files without claiming all mapped
+consumers or the full guest matrix were exercised.
+
 The worker file includes real bounded subprocess failure cases; the converter
 file contains Linux-only pinned-packer cases. macOS skips do not verify those
 Linux paths: run the selected files on the exact pushed server SHA too.

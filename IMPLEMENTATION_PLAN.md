@@ -2037,3 +2037,9 @@ failure stage/errno. Next proposed work is a bounded worker failure-attribution
 contract and a new controlled cold proof; retain this verification blocker
 until that proof actually passes. Earlier Gate 2 success is not reused as this
 commit's native qualification.
+
+The user has now approved the bounded failure-attribution follow-up and a fresh
+cold proof. Implement fixed stage/errno facts in the versioned worker response,
+retain strict legacy no-details behavior and existing binding, and preserve
+limits/cleanup. Follow the diagnostic contract; do not interpret approval as
+permission to raise limits, stop services or replay unacknowledged app commands.

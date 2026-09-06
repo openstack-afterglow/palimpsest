@@ -127,3 +127,36 @@ useful failure attribution or a deliberately changed test condition. Proposed
 next slice: bounded allowlisted worker stage/errno diagnostics, then a separately
 reviewed fresh cold proof. It is not implemented here and does not authorize
 raw stderr/environment disclosure, automatic replay or result takeover.
+
+## Approved follow-up: bounded failure attribution
+
+The user approved adding failure-stage/errno diagnostics and performing a new
+cold proof. Astra owns the contract, review and verification; GPT 5.6 Sol owns
+implementation. The previous failed proof and its evidence remain open until
+new verification actually succeeds.
+
+The writer advances to response v3 while a strictly shaped canonical legacy
+v2 response remains readable as no-details evidence. Existing nonce/request
+digest binding is unchanged. Only resource failures may carry attribution;
+success and other failure categories cannot. Stage names and errno values are
+fixed allowlists, never arbitrary exception text, paths, arguments or stderr.
+Only an actual EAGAIN/ENOMEM maps to that errno. A Python MemoryError must not
+be represented as a fabricated operating-system errno, and absent facts stay
+unknown.
+
+Facts must be captured at the actual operation boundary before wrapping can
+discard them. Include worker setup/materialization and the distinct dependency
+inspector, version-probe and final packer spawn boundaries. Context-manager
+publication and cleanup must not be incorrectly attributed to the preceding
+packing operation. These facts locate an observed failure; they still cannot
+identify which kernel, process, cgroup or service limit caused it.
+
+Coarse operation labels are intentional: a subprocess-run boundary includes
+communication as well as creation, and the store transaction includes producer
+teardown. Only a catch around process creation itself may claim a spawn phase.
+
+Do not change resource limits, privilege boundaries, success/cache behavior or
+process cleanup. Do not introduce retries, per-process telemetry, raw exception
+cause traversal or result takeover. Verify protocol rejection, legacy behavior,
+sanitization and actual boundary error paths in focused files, then independent
+review, push and exact-SHA Linux tests plus a separate fresh cold public proof.

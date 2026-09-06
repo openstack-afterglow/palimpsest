@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -21,7 +22,8 @@ from .oci_store import (
 )
 
 OCI_WORKER_REQUEST_SCHEMA = "palimpsest.oci-materialize-worker-request.v1"
-OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v2"
+OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v3"
+OCI_WORKER_LEGACY_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v2"
 MAX_OCI_WORKER_MESSAGE_BYTES = 256 * 1024
 MAX_OCI_WORKER_JSON_DEPTH = 12
 OCI_WORKER_ERROR_CATEGORIES = frozenset(
@@ -38,6 +40,20 @@ OCI_WORKER_ERROR_CATEGORIES = frozenset(
         "unsupported",
     }
 )
+OCI_WORKER_FAILURE_STAGES = frozenset(
+    {
+        "limits",
+        "packing",
+        "packer-dependency-inspection",
+        "packer-final-spawn",
+        "packer-pinned-version",
+        "packer-toolchain-version",
+        "source",
+        "staging",
+        "store",
+    }
+)
+OCI_WORKER_FAILURE_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM})
 
 _SOURCE_CAS_ID_RE = re.compile(r"^source-cas-v1:[0-9a-f]{64}$")
 _OCI_STORE_ID_RE = re.compile(r"^oci-store-v1:[0-9a-f]{64}$")
@@ -259,6 +275,8 @@ class OCIWorkerResponse:
     result: MaterializationResult | None
     error_category: str | None
     schema: str = OCI_WORKER_RESPONSE_SCHEMA
+    failure_stage: str | None = None
+    failure_errno: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "nonce", _canonical_uuid(self.nonce, "response.nonce"))
@@ -267,21 +285,45 @@ class OCIWorkerResponse:
             or re.fullmatch(r"sha256:[0-9a-f]{64}", self.request_digest) is None
         ):
             raise OCIWorkerProtocolError("response.request_digest is invalid")
-        if self.schema != OCI_WORKER_RESPONSE_SCHEMA:
+        if not isinstance(self.schema, str) or self.schema not in {
+            OCI_WORKER_RESPONSE_SCHEMA,
+            OCI_WORKER_LEGACY_RESPONSE_SCHEMA,
+        }:
             raise OCIWorkerProtocolError("OCI worker response schema is unsupported")
+        if self.schema == OCI_WORKER_LEGACY_RESPONSE_SCHEMA and (
+            self.failure_stage is not None or self.failure_errno is not None
+        ):
+            raise OCIWorkerProtocolError("legacy OCI worker response cannot carry failure details")
+        if self.failure_stage is not None and (
+            not isinstance(self.failure_stage, str) or self.failure_stage not in OCI_WORKER_FAILURE_STAGES
+        ):
+            raise OCIWorkerProtocolError("OCI worker failure stage is invalid")
+        if self.failure_errno is not None and (
+            type(self.failure_errno) is not int or self.failure_errno not in OCI_WORKER_FAILURE_ERRNOS
+        ):
+            raise OCIWorkerProtocolError("OCI worker failure errno is invalid")
+        if self.failure_errno is not None and self.failure_stage is None:
+            raise OCIWorkerProtocolError("OCI worker failure errno requires a known stage")
         if self.status == "succeeded":
-            if not isinstance(self.result, MaterializationResult) or self.error_category is not None:
+            if (
+                not isinstance(self.result, MaterializationResult)
+                or self.error_category is not None
+                or self.failure_stage is not None
+                or self.failure_errno is not None
+            ):
                 raise OCIWorkerProtocolError("successful OCI worker response is invalid")
         elif self.status == "failed":
             if self.result is not None or not isinstance(self.error_category, str):
                 raise OCIWorkerProtocolError("failed OCI worker response is invalid")
             if self.error_category not in OCI_WORKER_ERROR_CATEGORIES:
                 raise OCIWorkerProtocolError("OCI worker error category is invalid")
+            if self.error_category != "resource" and (self.failure_stage is not None or self.failure_errno is not None):
+                raise OCIWorkerProtocolError("non-resource OCI worker response cannot carry failure details")
         else:
             raise OCIWorkerProtocolError("OCI worker response status is invalid")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "error_category": self.error_category,
             "nonce": self.nonce,
             "request_digest": self.request_digest,
@@ -289,6 +331,10 @@ class OCIWorkerResponse:
             "schema": self.schema,
             "status": self.status,
         }
+        if self.schema == OCI_WORKER_RESPONSE_SCHEMA:
+            value["failure_errno"] = self.failure_errno
+            value["failure_stage"] = self.failure_stage
+        return value
 
     def to_json_bytes(self) -> bytes:
         return _canonical_json(self.to_dict())
@@ -296,7 +342,24 @@ class OCIWorkerResponse:
     @classmethod
     def from_json_bytes(cls, payload: bytes) -> OCIWorkerResponse:
         value = _load_strict_json(payload)
-        fields = {"error_category", "nonce", "request_digest", "result", "schema", "status"}
+        if not isinstance(value, dict):
+            raise OCIWorkerProtocolError("OCI worker response must be an object")
+        schema = value.get("schema")
+        if schema == OCI_WORKER_RESPONSE_SCHEMA:
+            fields = {
+                "error_category",
+                "failure_errno",
+                "failure_stage",
+                "nonce",
+                "request_digest",
+                "result",
+                "schema",
+                "status",
+            }
+        elif schema == OCI_WORKER_LEGACY_RESPONSE_SCHEMA:
+            fields = {"error_category", "nonce", "request_digest", "result", "schema", "status"}
+        else:
+            raise OCIWorkerProtocolError("OCI worker response schema is unsupported")
         data = _exact_fields(value, fields, "OCI worker response")
         try:
             result = None if data["result"] is None else MaterializationResult.from_dict(data["result"])
@@ -308,6 +371,8 @@ class OCIWorkerResponse:
             status=data["status"],
             result=result,
             error_category=data["error_category"],
+            failure_stage=data.get("failure_stage"),
+            failure_errno=data.get("failure_errno"),
             schema=data["schema"],
         )
         if response.to_json_bytes() != payload:
@@ -360,6 +425,9 @@ def _load_strict_json(payload: bytes) -> Any:
 __all__ = [
     "MAX_OCI_WORKER_MESSAGE_BYTES",
     "OCI_WORKER_ERROR_CATEGORIES",
+    "OCI_WORKER_FAILURE_ERRNOS",
+    "OCI_WORKER_FAILURE_STAGES",
+    "OCI_WORKER_LEGACY_RESPONSE_SCHEMA",
     "OCI_WORKER_REQUEST_SCHEMA",
     "OCI_WORKER_RESPONSE_SCHEMA",
     "OCIWorkerProtocolError",
