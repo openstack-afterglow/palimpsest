@@ -3385,6 +3385,153 @@ def test_completed_monitor_retirement_pins_pid_and_refuses_identity_drift(monkey
             assert events[-1] == "close"
 
 
+def _read_live_monitor_journal(directory_fd, endpoint):
+    """Qualification-only observation retry for a safe atomic journal replacement."""
+    for attempt in range(8):
+        before = os.stat(monitor_ipc._JOURNAL_NAME, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            loaded = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)
+            if loaded[0].endpoint != endpoint:
+                raise monitor_ipc.MonitorIPCError(monitor_ipc.MonitorIPCErrorCategory.INVALID_JOURNAL)
+            return loaded
+        except monitor_ipc.MonitorIPCError as failure:
+            if failure.category is not monitor_ipc.MonitorIPCErrorCategory.INVALID_JOURNAL or attempt == 7:
+                raise
+            try:
+                after = os.stat(monitor_ipc._JOURNAL_NAME, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                raise failure from None
+            if (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino) or any(
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or not 0 < info.st_size <= monitor_ipc._MAX_JOURNAL_BYTES
+                for info in (before, after)
+            ):
+                raise
+    raise AssertionError("unreachable journal polling attempt")
+
+
+@contextmanager
+def _live_journal_poll_fixture(tmp_path):
+    from palimpsest_local.oci_monitor import MonitorProcessIdentity
+    from palimpsest_local.runtime_types import ExistingRunRecord
+
+    directory = tmp_path / "journal-poll"
+    directory.mkdir(mode=0o700)
+    binding = monitor_ipc.MonitorPreActivationBinding(
+        ExistingRunRecord("poll-test", str(uuid.uuid4()), 2, DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)),
+        os.geteuid(),
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+        "sha256:" + "c" * 64,
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+        "qemu:///system",
+    )
+    identity = monitor_ipc.MonitorExecIdentity(binding, str(uuid.uuid4()))
+    snapshot = monitor_ipc.MonitorPreactivationJournalSnapshot(
+        identity,
+        "sha256:" + "d" * 64,
+        "prepared",
+        2,
+        MonitorProcessIdentity(os.getpid(), str(uuid.uuid4()), 123),
+        monitor_ipc._socket_name_for_generation(identity.generation),
+        0,
+        42,
+    )
+    path = directory / monitor_ipc._JOURNAL_NAME
+    path.write_bytes(monitor_ipc._canonical_bytes(snapshot.to_dict()) + b"\n")
+    path.chmod(0o600)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield SimpleNamespace(directory=directory, path=path, fd=fd, identity=identity, snapshot=snapshot)
+    finally:
+        os.close(fd)
+
+
+def test_live_journal_poll_retries_actual_open_replace_race(tmp_path, monkeypatch):
+    with _live_journal_poll_fixture(tmp_path) as case:
+        successor = replace(case.snapshot, phase="committed", revision=3)
+        next_path = case.directory / "next.json"
+        next_path.write_bytes(monitor_ipc._canonical_bytes(successor.to_dict()) + b"\n")
+        next_path.chmod(0o600)
+        old = case.path.stat()
+        original = os.fstat
+        replaced = False
+
+        def fstat(fd):
+            nonlocal replaced
+            info = original(fd)
+            if not replaced and (info.st_dev, info.st_ino) == (old.st_dev, old.st_ino):
+                replaced = True
+                os.replace(next_path, case.path)
+            return original(fd)
+
+        monkeypatch.setattr(os, "fstat", fstat)
+        snapshot, _ = _read_live_monitor_journal(case.fd, case.snapshot.endpoint)
+        assert replaced
+        assert snapshot == successor
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "stable-corruption",
+        "unsafe-replacement",
+        "wrong-identity",
+        "wrong-writer",
+        "wrong-socket",
+        "continuous-replacement",
+    ],
+)
+def test_live_journal_poll_does_not_accept_invalid_journal(tmp_path, monkeypatch, damage):
+    with _live_journal_poll_fixture(tmp_path) as case:
+        reader = monitor_ipc._read_preactivation_journal
+        attempts = []
+        if damage == "stable-corruption":
+            case.path.write_bytes(b"{}")
+
+        def read(fd, expected):
+            attempts.append(expected)
+            if damage != "stable-corruption" and (len(attempts) == 1 or damage == "continuous-replacement"):
+                next_path = case.directory / "next.json"
+                snapshot = case.snapshot
+                if damage == "wrong-identity":
+                    replacement_identity = replace(case.identity, generation=str(uuid.uuid4()))
+                    snapshot = replace(
+                        snapshot,
+                        identity=replacement_identity,
+                        socket_name=monitor_ipc._socket_name_for_generation(replacement_identity.generation),
+                    )
+                elif damage == "wrong-writer":
+                    snapshot = replace(snapshot, writer=replace(snapshot.writer, pid=snapshot.writer.pid + 1))
+                elif damage == "wrong-socket":
+                    snapshot = replace(snapshot, socket_inode=snapshot.socket_inode + 1)
+                next_path.write_bytes(monitor_ipc._canonical_bytes(snapshot.to_dict()) + b"\n")
+                next_path.chmod(0o640 if damage == "unsafe-replacement" else 0o600)
+                os.replace(next_path, case.path)
+                raise monitor_ipc.MonitorIPCError(monitor_ipc.MonitorIPCErrorCategory.INVALID_JOURNAL)
+            return reader(fd, expected)
+
+        monkeypatch.setattr(monitor_ipc, "_read_preactivation_journal", read)
+        with pytest.raises(monitor_ipc.MonitorIPCError):
+            _read_live_monitor_journal(case.fd, case.snapshot.endpoint)
+        assert (
+            len(attempts)
+            == {
+                "stable-corruption": 1,
+                "unsafe-replacement": 1,
+                "wrong-identity": 2,
+                "wrong-writer": 2,
+                "wrong-socket": 2,
+                "continuous-replacement": 8,
+            }[damage]
+        )
+        assert all(expected == case.identity for expected in attempts)
+
+
 def _launch_in_exec_monitor(
     root,
     roots,
@@ -3428,7 +3575,7 @@ def _launch_in_exec_monitor(
         observed_active = False
         stop_requested = False
         while time.monotonic() < deadline:
-            snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
+            snapshot = _read_live_monitor_journal(directory_fd, endpoint)[0]
             if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
                 _assert_qualification_io_boundary(broker, roots.runs / binding.record.name, product_io=product_io)
                 if product_io:
