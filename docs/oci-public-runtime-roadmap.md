@@ -62,6 +62,17 @@ marker, finite exit, detached survival, STOP, foreground SIGINT and normal rm.
 It does not replace the Palimpsest-build/additional-exec Gate 2. Run this exact
 file during public adapter edits, not the entire native/portable suite.
 
+Qualified on pieroot-server at `88a8e95b77dd0b6b6983af7ed1f00d2da10e0f6a`:
+the public proof file passed both tests in 39.50 s, including three real VM
+launches and public removal. Foreground exited 23; service STOP and foreground
+SIGINT exited 42 after the guest observed PID 1's SIGTERM. No domain or monitor
+remained. Eight selected host/request/adapter/CLI/lane modules passed 637 tests
+in 30.07 s. These selected results are not a full suite or Gate 2 result.
+The first attempt failed before VM creation because host tool discovery omitted
+`/usr/sbin`; a fixed standard system search path and regression test corrected
+it. Failed evidence `/tmp/p-pub-87cfaadb` remains; the successful owned fixture
+was removed only after all three normal public `rm` operations completed.
+
 ## Connected prerequisites
 
 Local OCI intake now selects a unique root descriptor within the same secure
