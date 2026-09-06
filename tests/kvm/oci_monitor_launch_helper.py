@@ -142,19 +142,23 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
 
     def metadata(key, entry, opened, visible, owner_uid):
         # The control socket and ownership journal are never QEMU resources.
-        if key == "monitor" or (
-            context.get("product_io", False)
-            and key
-            in {
-                "run",
-                "runtime_io",
-                "runtime_console",
-                "root_disk",
-                "root_volumes",
-                "stage1_transport",
-                "kernel",
-                "initramfs",
-            }
+        if (
+            key == "monitor"
+            or (context.get("product_io", False) and key.startswith("lower_"))
+            or (
+                context.get("product_io", False)
+                and key
+                in {
+                    "run",
+                    "runtime_io",
+                    "runtime_console",
+                    "root_disk",
+                    "root_volumes",
+                    "stage1_transport",
+                    "kernel",
+                    "initramfs",
+                }
+            )
         ):
             return original_metadata(key, entry, opened, visible, owner_uid)
         broker = context.get("broker")
@@ -397,6 +401,8 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
         if product_io:
             import xml.etree.ElementTree as ET
 
+            from palimpsest_local.oci_lower_exports import load_oci_lower_exports
+
             root_source = ET.fromstring(resolved.xml).find("./devices/disk/target[@dev='vda']/../source")
             assert root_source is not None
             specifications = fixture["_without_product_access_grants"](
@@ -405,6 +411,7 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
                 roots.runs / binding.record.name,
                 Path(root_source.attrib["file"]),
                 boot_paths=(boot.kernel.path, boot.initramfs.path),
+                lower_paths=tuple(load_oci_lower_exports(roots, binding.record.name).values()),
             )
         broker = fixture["_QualificationDACBroker"](root, uid, specifications)
         context["broker"] = broker
@@ -515,7 +522,8 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
         finally:
             socket.socket.connect = original_socket_connect
 
-    oci_root_kvm._verified_lower_path = lower
+    if not product_io:
+        oci_root_kvm._verified_lower_path = lower
     oci_root_runtime.connect_oci_root_libvirt = connect
     authority_module._validate_entry_metadata = metadata
     oci_stage1_access.verify_stage1_launch = _qualification_stage1_adapter(

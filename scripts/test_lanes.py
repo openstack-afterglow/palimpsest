@@ -57,6 +57,7 @@ PORTABLE_FILES = {
     """),
     "oci-access": _units("""
         oci_acl oci_boot_access oci_boot_access_launch oci_boot_exports
+        oci_lower_exports oci_lower_access oci_lower_access_launch
         oci_root_access oci_root_access_lifecycle oci_root_volume oci_runtime_access
         oci_runtime_access_launch oci_runtime_io oci_runtime_io_integration
         oci_shared_root_claim oci_shared_root_traversal oci_shared_traversal
@@ -104,6 +105,7 @@ MIXED = {
             test_product_acl_observer_does_not_normalize_or_write_unrecorded_target
             test_product_access_filter_removes_only_exact_eight_owned_targets
             test_product_access_filter_requires_exact_boot_pair
+            test_product_access_filter_requires_exact_lower_exports
             test_qemu_dac_baselabel_parser_accepts_one_exact_kvm_identity
             test_qemu_dac_baselabel_parser_rejects_ambiguous_or_noncanonical_input
             test_qualification_acl_target_requires_owned_stable_tmp_descendant
@@ -205,7 +207,7 @@ DEPENDENCIES = (
         ("filesystem", "guest-binary", "guest-kvm", "native-live", "gate1", "gate2"),
     ),
     (
-        "oci_boot_access oci_boot_exports oci_stage1_access oci_monitor oci_monitor_control oci_monitor_ipc oci_monitor_launch",
+        "oci_boot_access oci_boot_exports oci_lower_exports oci_lower_access oci_stage1_access oci_monitor oci_monitor_control oci_monitor_ipc oci_monitor_launch",
         ("oci-access", "oci-monitor", "qualification"),
         ("native-live", "gate2"),
     ),

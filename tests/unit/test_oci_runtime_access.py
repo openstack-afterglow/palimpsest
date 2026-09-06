@@ -237,7 +237,7 @@ def test_launch_capture_uses_product_acl_verifier_without_run_lock_recursion(cas
     ) as authority:
         frame = authority.to_dict()
         assert frame["runtime_access"] == receipt.to_dict()
-        assert frame["schema"].endswith(".v9")
+        assert frame["schema"].endswith(".v10")
         case.paths.console_log.write_bytes(b"untrusted output")
         monkeypatch.setattr(launch, "locked_existing_run", lambda *_args, **_kwargs: pytest.fail("recursive run lock"))
         authority.validate()

@@ -60,10 +60,11 @@ _FRAME_LENGTH = struct.Struct(">I")
 _PEER_CREDENTIALS = struct.Struct("3i")
 _MAX_FRAME_BYTES = 16 * 1024
 # Only the initial inherited CONFIG socket carries filesystem authority.
-# v9 has at most 24 FD paths plus one emulator path, each <=4096 characters.
-# Worst-case JSON escaping costs 6 bytes/character (600KiB total); 424KiB
-# remains for the bounded, fixed-shape receipts and metadata. Lower disks are
-# reloaded from the ledger, not expanded in this envelope. Control stays16KiB.
+# v10 adds up to 24 distinct lower FD paths to the previous maximum of 24.
+# The 1MiB encoded envelope is an admission limit, not a promise that every
+# combination of maximum-length/JSON-escaped paths fits. Validate its exact
+# bytes before creating a socket or child; do not silently truncate authority.
+# Lower lease graphs are still reloaded from the ledger. Control stays 16KiB.
 _MAX_CONFIG_FRAME_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 16 * 1024
 _MIN_TIMEOUT_SECONDS = 0.1

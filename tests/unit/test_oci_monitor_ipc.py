@@ -248,7 +248,7 @@ def test_real_v9_all_grants_config_exceeds_control_budget_and_roundtrips(tmp_pat
         value = _config_value(case.binding)
         value["launch_authority"] = authority.to_dict()
         frame = value["launch_authority"]
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v9"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v10"
         assert len(frame["entries"]) == 24
         assert all(
             frame[key] is not None

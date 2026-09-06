@@ -913,10 +913,12 @@ def _qualification_runtime_io_adapter(original, get_broker):
 
 
 def _without_product_access_grants(
-    specifications, roots: StatePaths, run_root: Path, root_disk: Path, *, boot_paths=()
+    specifications, roots: StatePaths, run_root: Path, root_disk: Path, *, boot_paths=(), lower_paths=()
 ):
     """Keep fixture access separate from the exact production ACL targets."""
     assert boot_paths == () or boot_paths == (run_root / "boot-kernel", run_root / "boot-initramfs")
+    assert len(set(lower_paths)) == len(lower_paths)
+    assert all(path.parent == run_root and re.fullmatch(r"lower-[0-9a-f]{64}", path.name) for path in lower_paths)
     selected = {
         roots.state,
         roots.runs,
@@ -927,6 +929,7 @@ def _without_product_access_grants(
         root_disk,
         run_root / "stage1-plan.raw",
         *boot_paths,
+        *lower_paths,
     }
     assert {path for path, _, _ in specifications if path in selected} == selected
     return tuple(item for item in specifications if item[0] not in selected)
@@ -1180,6 +1183,7 @@ class _QualificationProductACLBackend:
         root_disk: Path | None = None,
         stage1_transport: Path | None = None,
         boot_paths: tuple[Path, Path] = (),
+        lower_paths: tuple[Path, ...] = (),
         backend=None,
     ):
         from palimpsest_local.oci_acl import LinuxFdACLBackend
@@ -1195,6 +1199,7 @@ class _QualificationProductACLBackend:
             + ((("root_disk", root_disk),) if root_disk is not None else ())
             + ((("stage1_transport", stage1_transport),) if stage1_transport is not None else ())
             + (tuple(zip(("kernel", "initramfs"), boot_paths, strict=True)) if boot_paths else ())
+            + tuple((path.name, path) for path in lower_paths)
             + (
                 ("run", run_root),
                 ("directory", run_root / "io"),
@@ -1319,6 +1324,36 @@ def test_product_access_filter_requires_exact_boot_pair(tmp_path, damage):
     else:
         with pytest.raises(AssertionError):
             _without_product_access_grants(specifications, roots, run, root_disk, boot_paths=boot_paths)
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "outside", "duplicate", "bad-name"])
+def test_product_access_filter_requires_exact_lower_exports(tmp_path, damage):
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    run, root_disk = tmp_path / "run", tmp_path / "root.raw"
+    lower = run / ("lower-" + "a" * 64)
+    paths = (lower,)
+    specifications = (
+        tuple((path, "directory", "--x") for path in (roots.state, roots.runs, roots.oci_root_volumes, run, run / "io"))
+        + tuple(
+            (path, "regular", "r--") for path in (run / "io" / "console.log", root_disk, run / "stage1-plan.raw", lower)
+        )
+        + ((tmp_path / "unrelated", "regular", "r--"),)
+    )
+    if damage == "missing":
+        specifications = tuple(item for item in specifications if item[0] != lower)
+    elif damage == "outside":
+        paths = (tmp_path / lower.name,)
+    elif damage == "duplicate":
+        paths = (lower, lower)
+    elif damage == "bad-name":
+        paths = (run / "lower-not-a-digest",)
+    if damage is None:
+        assert _without_product_access_grants(specifications, roots, run, root_disk, lower_paths=paths) == (
+            (tmp_path / "unrelated", "regular", "r--"),
+        )
+    else:
+        with pytest.raises(AssertionError):
+            _without_product_access_grants(specifications, roots, run, root_disk, lower_paths=paths)
 
 
 def _assert_qualification_io_boundary(broker, run_root: Path, *, product_io: bool = False) -> None:
@@ -3890,12 +3925,16 @@ def _launch_in_exec_monitor(
                     before_refusal = read_run_ledger_snapshot(roots, binding.record.name).state
                     if product_io:
                         assert root_disk is not None
+                        from palimpsest_local.oci_lower_exports import load_oci_lower_exports
+
+                        lower_paths = tuple(load_oci_lower_exports(roots, binding.record.name).values())
                         preserved_paths = (
                             roots.runs / binding.record.name / "io" / "console.log",
                             root_disk,
                             roots.runs / binding.record.name / "stage1-plan.raw",
                             boot.kernel.path,
                             boot.initramfs.path,
+                            *lower_paths,
                         )
                         preserved = {
                             path: (path.stat().st_dev, path.stat().st_ino, _sha256_file(path))
@@ -3907,6 +3946,7 @@ def _launch_in_exec_monitor(
                         reconcile_inactive_monitor_domain(roots, binding, conn=conn)
                     if product_io:
                         from palimpsest_local.oci_boot_access import revoke_oci_boot_access
+                        from palimpsest_local.oci_lower_access import revoke_oci_lower_access
                         from palimpsest_local.oci_root_access import revoke_oci_root_access
                         from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
                         from palimpsest_local.oci_shared_traversal import leave_oci_shared_traversal
@@ -3922,6 +3962,10 @@ def _launch_in_exec_monitor(
                             revoke_oci_stage1_access(roots, binding, conn=conn)
                         with pytest.raises(PalimpsestError):
                             revoke_oci_boot_access(roots, binding, conn=conn)
+                        with pytest.raises(PalimpsestError):
+                            revoke_oci_lower_access(roots, binding, conn=conn)
+                        for path in lower_paths:
+                            _assert_product_readonly_acl(path, broker.uid, granted=True)
                         _assert_product_boot_acl(
                             roots.runs / binding.record.name, broker.uid, granted=True, expected=boot_granted
                         )
@@ -4456,7 +4500,8 @@ def test_live_oci_root(
             source = original_verified_lower_path(roots_value, digest, size)
             return _stage_qualified_lower(source, digest, size, lower_stage_root)
 
-        monkeypatch.setattr(oci_root_kvm_module, "_verified_lower_path", stage_verified_lower)
+        if not stale_cleanup:
+            monkeypatch.setattr(oci_root_kvm_module, "_verified_lower_path", stage_verified_lower)
         name = f"p-{uuid.uuid4().hex[:6]}"
         lifecycle_path = roots.runs / name / "io" / "lifecycle.sock"
         console_path = roots.runs / name / "io" / "console.log"
@@ -4498,6 +4543,7 @@ def test_live_oci_root(
         source_boot = boot
         if stale_cleanup:
             from palimpsest_local.oci_boot_exports import load_oci_boot_exports, publish_oci_boot_exports
+            from palimpsest_local.oci_lower_exports import load_oci_lower_exports, publish_oci_lower_exports
 
             source_boot_evidence = {
                 artifact.path: (artifact.path.stat(), _sha256_file(artifact.path))
@@ -4513,6 +4559,19 @@ def test_live_oci_root(
             for original, copied in ((source_boot.kernel, boot.kernel), (source_boot.initramfs, boot.initramfs)):
                 assert copied.digest == original.digest
                 assert (copied.device, copied.inode) != (original.device, original.inode)
+            source_lower_evidence = {
+                original_verified_lower_path(roots, item.image_digest, item.image_size): None
+                for item in prepared.transaction.receipts
+            }
+            source_lower_evidence = {path: (path.stat(), _sha256_file(path)) for path in source_lower_evidence}
+            lower_exports = publish_oci_lower_exports(roots, prepared, store, conn=conn)
+            assert lower_exports.phase == "ready"
+            lower_paths = tuple(load_oci_lower_exports(roots, name).values())
+            lower_baseline = {path: _assert_product_readonly_acl(path, qemu_uid, granted=False) for path in lower_paths}
+            assert all(path.parent == roots.runs / name for path in lower_paths)
+            assert not {(info.st_dev, info.st_ino) for info in lower_baseline.values()} & {
+                (info.st_dev, info.st_ino) for info, _digest in source_lower_evidence.values()
+            }
         resolved = build_oci_root_domain_plan(
             roots,
             prepared,
@@ -4574,7 +4633,7 @@ def test_live_oci_root(
         specifications = _qualification_acl_specifications(qualification_root, resolved.xml)
         if stale_cleanup:
             specifications = _without_product_access_grants(
-                specifications, roots, roots.runs / name, root_path, boot_paths=boot_paths
+                specifications, roots, roots.runs / name, root_path, boot_paths=boot_paths, lower_paths=lower_paths
             )
         broker = _QualificationDACBroker(qualification_root, qemu_uid, specifications)
         if not stale_cleanup:
@@ -4625,6 +4684,7 @@ def test_live_oci_root(
         assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
         if stale_cleanup:
             from palimpsest_local.oci_boot_access import grant_oci_boot_access
+            from palimpsest_local.oci_lower_access import grant_oci_lower_access
             from palimpsest_local.oci_root_access import grant_oci_root_access
             from palimpsest_local.oci_runtime_access import grant_oci_runtime_access
             from palimpsest_local.oci_shared_traversal import join_oci_shared_traversal
@@ -4670,6 +4730,16 @@ def test_live_oci_root(
             )
             assert boot_access.phase == "granted"
             assert [role for role, _acl in boot_backend.writes] == ["kernel", "initramfs"]
+            lower_backend = _QualificationProductACLBackend(roots.runs / name, lower_paths=lower_paths)
+            lower_access = product_access.grant(
+                lambda: grant_oci_lower_access(roots, monitor_binding, conn=conn, acl_backend=lower_backend)
+            )
+            assert lower_access.phase == "granted"
+            assert len(lower_backend.writes) == len(lower_paths)
+            for path in lower_paths:
+                _assert_product_readonly_acl(path, qemu_uid, granted=True)
+            assert grant_oci_lower_access(roots, monitor_binding, conn=conn, acl_backend=lower_backend) == lower_access
+            assert len(lower_backend.writes) == len(lower_paths)
             boot_granted = _assert_product_boot_acl(roots.runs / name, qemu_uid, granted=True)
             granted_state = read_run_ledger_snapshot(roots, name)
             assert grant_oci_boot_access(roots, monitor_binding, conn=conn, acl_backend=boot_backend) == boot_access
@@ -4857,6 +4927,7 @@ def test_live_oci_root(
                 assert counted_conn.undefine_calls == 1
                 assert read_run_ledger_snapshot(roots, name).state == after
                 from palimpsest_local.oci_boot_access import revoke_oci_boot_access
+                from palimpsest_local.oci_lower_access import revoke_oci_lower_access
                 from palimpsest_local.oci_root_access import revoke_oci_root_access
                 from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
                 from palimpsest_local.oci_shared_traversal import leave_oci_shared_traversal
@@ -4864,6 +4935,12 @@ def test_live_oci_root(
 
                 console_identity = (console_path.stat().st_dev, console_path.stat().st_ino)
                 console_digest = _sha256_file(console_path)
+                lower_revoked = revoke_oci_lower_access(
+                    roots, monitor_binding, conn=counted_conn, acl_backend=lower_backend
+                )
+                assert lower_revoked.phase == "revoked"
+                assert lower_revoked.access_id == lower_access.access_id
+                assert len(lower_backend.writes) == 2 * len(lower_paths)
                 _assert_product_boot_acl(roots.runs / name, qemu_uid, granted=True, expected=boot_granted)
                 boot_backend = _QualificationProductACLBackend(roots.runs / name, boot_paths=boot_paths)
                 boot_revoked = revoke_oci_boot_access(
@@ -4910,6 +4987,7 @@ def test_live_oci_root(
                     "oci_shared_traversal",
                     "oci_stage1_access",
                     "oci_boot_access",
+                    "oci_lower_access",
                     "lifecycle_revision",
                 }
                 assert {key: value for key, value in revoked_state.items() if key not in revoke_ignored} == {
@@ -4932,6 +5010,11 @@ def test_live_oci_root(
                     "root_volumes",
                 ]
                 assert read_run_ledger_snapshot(roots, name).state == revoked_state
+                assert (
+                    revoke_oci_lower_access(roots, monitor_binding, conn=counted_conn, acl_backend=lower_backend)
+                    == lower_revoked
+                )
+                assert len(lower_backend.writes) == 2 * len(lower_paths)
                 assert (
                     revoke_oci_root_access(roots, monitor_binding, conn=counted_conn, acl_backend=root_backend)
                     == root_revoked
@@ -4975,7 +5058,14 @@ def test_live_oci_root(
                         for field in ("st_dev", "st_ino", "st_uid", "st_gid", "st_nlink", "st_size", "st_mtime_ns")
                     )
                 assert {path: _sha256_file(path) for path in boot_paths} == boot_digests
-                for path, (original, digest) in source_boot_evidence.items():
+                for path in lower_paths:
+                    current = _assert_product_readonly_acl(path, qemu_uid, granted=False)
+                    assert all(
+                        getattr(current, field) == getattr(lower_baseline[path], field)
+                        for field in ("st_dev", "st_ino", "st_uid", "st_gid", "st_nlink", "st_size", "st_mtime_ns")
+                    )
+                    assert _sha256_file(path) == path.name.removeprefix("lower-")
+                for path, (original, digest) in {**source_boot_evidence, **source_lower_evidence}.items():
                     current = path.stat()
                     assert all(
                         getattr(current, field) == getattr(original, field)
@@ -5052,20 +5142,42 @@ def test_live_oci_root(
             try:
                 assert prove_terminal_domain_absent()
                 broker.close()
-                _qualify_retained_root_reuse(
-                    monkeypatch,
-                    qualification_root,
-                    roots,
-                    store,
-                    materialization,
-                    source_boot,
-                    profile,
-                    conn,
-                    qemu_uid,
-                    prepared,
-                    monitor_binding,
-                    monitor_snapshot,
-                )
+                # The retained-root comparison still uses the legacy fixture
+                # launch. Scope its lower copies to this separate boot only;
+                # never give its fixture ACL broker the canonical CAS paths.
+                with monkeypatch.context() as reuse_patches:
+                    reuse_patches.setattr(oci_root_kvm_module, "_verified_lower_path", stage_verified_lower)
+                    _qualify_retained_root_reuse(
+                        reuse_patches,
+                        qualification_root,
+                        roots,
+                        store,
+                        materialization,
+                        source_boot,
+                        profile,
+                        conn,
+                        qemu_uid,
+                        prepared,
+                        monitor_binding,
+                        monitor_snapshot,
+                    )
+                for path, (original, digest) in source_lower_evidence.items():
+                    current = path.stat()
+                    assert all(
+                        getattr(current, field) == getattr(original, field)
+                        for field in (
+                            "st_dev",
+                            "st_ino",
+                            "st_mode",
+                            "st_uid",
+                            "st_gid",
+                            "st_nlink",
+                            "st_size",
+                            "st_mtime_ns",
+                            "st_ctime_ns",
+                        )
+                    )
+                    assert _sha256_file(path) == digest
                 _remove_completed_fixture_socket(monitor_directory, monitor_snapshot)
             except BaseException:
                 retain_qualification_state = True

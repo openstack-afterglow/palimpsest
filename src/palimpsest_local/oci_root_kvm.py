@@ -791,6 +791,9 @@ def build_oci_root_domain_plan(
         "target": "vda",
         "volume_id": root.volume_id,
     }
+    from .oci_lower_exports import select_lower_exports
+
+    lower_exports = select_lower_exports(roots, read_run_ledger_snapshot(roots, transaction.owner.run_name))
     layers: list[dict[str, Any]] = []
     layer_disks: list[LayerDisk] = []
     serials = {root_serial}
@@ -801,7 +804,11 @@ def build_oci_root_domain_plan(
             raise StateError("OCI-root domain disk serial collision")
         serials.add(serial)
         target = f"vd{chr(ord('c') + member.ordinal)}"
-        path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        path = (
+            lower_exports[receipt.image_digest]
+            if lower_exports is not None
+            else _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        )
         layers.append(
             {
                 "image_digest": receipt.image_digest,
@@ -944,13 +951,20 @@ def commit_oci_root_domain_plan(
         transaction.owner,
         plan_digest=transaction.boot_plan_digest,
     )
+    from .oci_lower_exports import select_lower_exports
+
+    lower_exports = select_lower_exports(roots, snapshot)
     expected_layers: list[dict[str, Any]] = []
     expected_disks: list[LayerDisk] = []
     for member in leases.members:
         receipt = member.receipt
         serial = _serial("lower", receipt.occurrence_digest)
         target = f"vd{chr(ord('c') + member.ordinal)}"
-        path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        path = (
+            lower_exports[receipt.image_digest]
+            if lower_exports is not None
+            else _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        )
         expected_layers.append(
             {
                 "image_digest": receipt.image_digest,
@@ -1160,13 +1174,20 @@ def resolve_committed_oci_root_domain_plan(
         raise StateError("OCI-root domain lower lease authority is invalid") from exc
     if tuple(member.receipt for member in leases.members) != transaction.receipts:
         raise StateError("OCI-root domain lower lease binding is invalid")
+    from .oci_lower_exports import select_lower_exports
+
+    lower_exports = select_lower_exports(roots, snapshot)
     layers: list[dict[str, Any]] = []
     disks: list[LayerDisk] = []
     for member in leases.members:
         receipt = member.receipt
         serial = _serial("lower", receipt.occurrence_digest)
         target = f"vd{chr(ord('c') + member.ordinal)}"
-        path = _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        path = (
+            lower_exports[receipt.image_digest]
+            if lower_exports is not None
+            else _verified_lower_path(roots, receipt.image_digest, receipt.image_size)
+        )
         layers.append(
             {
                 "filesystem": receipt.filesystem,

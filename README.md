@@ -121,6 +121,20 @@ transfers/   Hub transfer progress
 
 ## Dockerfile cache and runtime-block workflow
 
+For a local standard OCI archive/layout, the experimental OCI-root converter
+can verify and materialize its layers without Docker:
+
+```sh
+palimpsest oci materialize ./image.oci.tar --output ./materialization.json
+# If the local index lists multiple roots, choose one explicitly:
+palimpsest oci materialize ./image-layout --manifest 'sha256:<root-digest>'
+```
+
+This requires the qualified SquashFS packer (`/usr/bin/mksquashfs` by default)
+and currently supports `linux/amd64`. It produces verified layer artifacts,
+not a running VM. Public OCI-root `run/-d` and Gate 2 remain under development;
+see the [public-runtime roadmap](docs/oci-public-runtime-roadmap.md).
+
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 
 ```sh

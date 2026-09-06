@@ -110,7 +110,18 @@ def test_only_exact_recorded_named_qemu_grant_is_accepted(directory):
 
 @pytest.mark.parametrize(
     "key",
-    ["run", "runtime_io", "runtime_console", "root_disk", "root_volumes", "stage1_transport", "kernel", "initramfs"],
+    [
+        "run",
+        "runtime_io",
+        "runtime_console",
+        "root_disk",
+        "root_volumes",
+        "stage1_transport",
+        "kernel",
+        "initramfs",
+        "lower_0",
+        "lower_23",
+    ],
 )
 def test_product_targets_are_never_normalized_by_fixture_metadata_adapter(key):
     directory = key in {"run", "runtime_io", "root_volumes"}

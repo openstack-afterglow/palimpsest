@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v9"
+_SCHEMA = "palimpsest.monitor-launch-authority.v10"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -97,7 +97,12 @@ def _validate_entry_metadata(
     owner_uid: int,
 ) -> None:
     """Check immutable metadata independently of path traversal and FD rights."""
-    is_directory = key not in {"kernel", "initramfs", "runtime_console", "stage1_transport"}
+    is_directory = not key.startswith("lower_") and key not in {
+        "kernel",
+        "initramfs",
+        "runtime_console",
+        "stage1_transport",
+    }
     fields = ("device", "inode", "uid", "gid", "mode") if is_directory else tuple(_ENTRY_FIELDS - {"fd", "path"})
     if key == "runtime_console":
         # QEMU output is not trusted state: content, size and timestamps may change.
@@ -217,6 +222,8 @@ class MonitorLaunchAuthority:
                 "stage1_access",
                 "boot_exports",
                 "boot_access",
+                "lower_exports",
+                "lower_access",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -235,6 +242,16 @@ class MonitorLaunchAuthority:
 
                 paths.update(
                     {role: roots.runs / binding.record.name / name for role, name in BOOT_EXPORT_FILENAMES.items()}
+                )
+            if value["lower_exports"] is not None:
+                from .oci_lower_exports import LowerExportReceipt, _filenames
+
+                lower_exports = LowerExportReceipt.from_dict(value["lower_exports"])
+                paths.update(
+                    {
+                        f"lower_{index}": roots.runs / binding.record.name / name
+                        for index, name in enumerate(_filenames(lower_exports).values())
+                    }
                 )
             if value["shared_traversal"] is not None:
                 paths["root_volumes"] = roots.oci_root_volumes
@@ -321,6 +338,15 @@ class MonitorLaunchAuthority:
             boot_roots = StatePaths(
                 _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
             )
+            from .oci_lower_access import verify_lower_launch
+
+            lower_stamp = verify_lower_launch(
+                boot_roots,
+                self._frame["lower_exports"],
+                self._frame["lower_access"],
+                self._frame["entries"],
+                binding=selected,
+            )
             boot_stamp = verify_boot_launch(
                 boot_roots,
                 self._frame["boot_exports"],
@@ -392,7 +418,13 @@ class MonitorLaunchAuthority:
                     runs_directory_fd=self._frame["entries"]["runs"]["fd"],
                 )
             for key, entry in self._frame["entries"].items():
-                is_directory = key not in {"kernel", "initramfs", "runtime_console", "root_disk", "stage1_transport"}
+                is_directory = not key.startswith("lower_") and key not in {
+                    "kernel",
+                    "initramfs",
+                    "runtime_console",
+                    "root_disk",
+                    "stage1_transport",
+                }
                 opened = os.fstat(entry["fd"])
                 flags = fcntl.fcntl(entry["fd"], fcntl.F_GETFL)
                 if flags & os.O_ACCMODE != os.O_RDONLY or flags & getattr(os, "O_PATH", 0):
@@ -464,6 +496,15 @@ class MonitorLaunchAuthority:
                 binding=selected,
                 metadata_only=True,
                 expected_stamp=boot_stamp,
+            )
+            verify_lower_launch(
+                boot_roots,
+                self._frame["lower_exports"],
+                self._frame["lower_access"],
+                self._frame["entries"],
+                binding=selected,
+                metadata_only=True,
+                expected_stamp=lower_stamp,
             )
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
@@ -578,6 +619,18 @@ def prepare_monitor_launch_authority(
                 paths.update(kernel=boot_artifacts.kernel.path, initramfs=boot_artifacts.initramfs.path)
                 boot_exports = mutation.mutable_state().get("oci_boot_exports")
                 boot_access = mutation.mutable_state().get("oci_boot_access")
+                lower_exports = mutation.mutable_state().get("oci_lower_exports")
+                lower_access = mutation.mutable_state().get("oci_lower_access")
+                if lower_exports is not None:
+                    from .oci_lower_exports import LowerExportReceipt, _filenames
+
+                    lower_receipt = LowerExportReceipt.from_dict(lower_exports)
+                    paths.update(
+                        {
+                            f"lower_{index}": roots.runs / binding.record.name / name
+                            for index, name in enumerate(_filenames(lower_receipt).values())
+                        }
+                    )
                 runtime_access = mutation.mutable_state().get("oci_runtime_access")
                 shared_traversal = mutation.mutable_state().get("oci_shared_traversal")
                 if shared_traversal is not None:
@@ -598,8 +651,8 @@ def prepare_monitor_launch_authority(
                     path = _path(str(path))
                     fd = _open(
                         path,
-                        directory=name
-                        not in {"kernel", "initramfs", "runtime_console", "root_disk", "stage1_transport"},
+                        directory=not name.startswith("lower_")
+                        and name not in {"kernel", "initramfs", "runtime_console", "root_disk", "stage1_transport"},
                     )
                     opened.append(fd)
                     entries[name] = _entry(path, fd)
@@ -622,6 +675,8 @@ def prepare_monitor_launch_authority(
             "stage1_access": stage1_access,
             "boot_exports": boot_exports,
             "boot_access": boot_access,
+            "lower_exports": lower_exports,
+            "lower_access": lower_access,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

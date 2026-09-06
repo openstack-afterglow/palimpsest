@@ -34,7 +34,7 @@ def test_v8_frame_reconstructs_exact_readonly_stage1_descriptors(granted):
     before = stage_tests._snapshot(granted)
     with _prepare(granted) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v9"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v10"
         assert frame["stage1_access"] == granted.receipt.to_dict()
         assert frame["entries"]["stage1_transport"]["inode"] == granted.receipt.target.inode
         for entry in frame["entries"].values():

@@ -34,7 +34,7 @@ def test_v9_reconstructs_exact_sealed_pair(granted):
     before = boot_tests.snapshot(granted)
     with prepare(granted) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v9"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v10"
         assert frame["boot_exports"] == granted.export_receipt.to_dict()
         assert frame["boot_access"] == granted.receipt.to_dict()
         for role, path in granted.export_paths.items():

@@ -4,6 +4,31 @@ The user prioritized public foreground `run`, Docker-like `run -d`, and the
 local build-to-run Gate 2 over further isolated infrastructure slices. This
 document is the execution order, not a claim that those commands are enabled.
 
+## Connected prerequisites
+
+Local OCI intake now selects a unique root descriptor within the same secure
+snapshot when no pin is supplied. `palimpsest oci materialize IMAGE.oci.tar`
+uses this path; `--manifest sha256:…` is still supported and is required for
+multiple root entries. A single image index delegates its internal platform
+selection to the existing verified image resolver. Discovery does not skip
+descriptor hashes, size limits, or archive safety checks.
+
+The run-owned lower provider connects sealed copies to domain planning,
+fresh-monitor descriptors and exact read-only ACL grant/revocation. Logical
+occurrence order and durable lease sets stay intact; repeated content is
+copied once per run. This removes shared export registry/GC from the initial
+launch dependency. It does not by itself provide the public adapter.
+The private v10 launch envelope includes at most 24 additional distinct lower
+file descriptors. Its existing 1 MiB encoded size cap is an admission limit:
+oversized combinations of long/escaped paths are rejected before spawn.
+
+The remaining public lifecycle integration includes a fresh coordinator,
+qualified host/runtime-root setup, foreground output/exit forwarding, and
+stop/remove orchestration. Workload lifetime must be explicitly unbounded for
+long-running services (the existing private launch timeout is finite), while
+boot and STOP deadlines remain bounded. Recovery must cover pre-spawn grant
+failure and stale terminal sockets without fabricating terminal evidence.
+
 ## Milestone 1: a complete public lifecycle
 
 Initial scope: a local OCI archive/layout, Linux x86_64 KVM, an explicitly

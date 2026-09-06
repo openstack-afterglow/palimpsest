@@ -1774,6 +1774,28 @@ Native, BuildKit and privileged proofs remain separate explicit gates. Full
 regression remains an integration/release requirement. See
 [the testing workflow](docs/testing.md).
 
+### PR 4 slice 30X: local auto-pin and run-owned lower delivery
+
+Local archive/layout snapshots can select exactly one root descriptor without
+a caller-supplied digest; the selected root is still fully content-verified.
+`oci materialize` exposes that path, while ambiguous root lists require
+`--manifest`. A missing pin is not permission to guess between image entries.
+
+Before domain planning, the run-owned lower provider copies distinct leased
+SquashFS digests into sealed owner-only files beside the BOOT exports. Durable
+receipts bind the exact target inodes, resource plan, lease graph and static
+QEMU principal. Domain resolution and fresh-exec authority consume those
+copies, not fixture-remapped paths or chmod-open CAS objects. Repeated lower
+occurrences retain their ordered disks and leases while sharing only their
+own run's physical copy. Explicit lower ACL grant/revoke and the shared
+traversal departure fence retain the existing inactive-domain/STALE proof.
+
+The private monitor authority advances to v10 with the exact lower descriptor
+set; the initial CONFIG envelope remains bounded. Old private frames fail
+closed. This is a prerequisite connection, not public `run/-d` or Gate 2
+activation. The public coordinator, session and failure-cleanup integration
+remain the next work, ahead of shared-cache optimization.
+
 ### Next implementation order: two public acceptance milestones
 
 The next implementation is a vertical public lifecycle, not completion of
