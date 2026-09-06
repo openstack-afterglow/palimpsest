@@ -865,8 +865,18 @@ def test_pack_staged_caller_assigns_final_popen_stage_without_invented_errno(
             return original_popen(*args, **kwargs)
         stdin_fd = kwargs["stdin"].fileno()
         final_fds = (stdin_fd, *kwargs["pass_fds"])
-        assert os.pread(stdin_fd, len(b"value"), 0) == b"value"
-        assert os.fstat(stdin_fd).st_nlink == 0
+        stdin_stat = os.fstat(stdin_fd)
+        assert stdin_stat.st_size <= 64 * 1024
+        tar_snapshot = os.pread(stdin_fd, stdin_stat.st_size, 0)
+        assert len(tar_snapshot) == stdin_stat.st_size
+        with tarfile.open(fileobj=io.BytesIO(tar_snapshot), mode="r:") as archive:
+            assert archive.getnames() == [member.name]
+            packed_member = archive.getmember(member.name)
+            packed_payload = archive.extractfile(packed_member)
+            assert packed_member.isfile()
+            assert packed_payload is not None
+            assert packed_payload.read() == payload
+        assert stdin_stat.st_nlink == 0
         assert kwargs["executable"] == oci_packer._fd_path(kwargs["pass_fds"][0])
         assert kwargs["cwd"] == oci_packer._fd_path(kwargs["pass_fds"][1])
         for fd in kwargs["pass_fds"]:
