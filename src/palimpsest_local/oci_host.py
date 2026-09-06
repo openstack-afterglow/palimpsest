@@ -22,6 +22,8 @@ from .errors import StateError
 from .oci_initramfs import build_bootstrap_initramfs
 from .oci_root_kvm import _verify_host_boot_artifact, verify_first_party_bootstrap_initramfs, verify_host_boot_artifacts
 
+_HOST_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
 
 @dataclass(frozen=True, slots=True)
 class OCIHostConfig:
@@ -167,7 +169,7 @@ def preflight_oci_host(config: OCIHostConfig, roots, name: str) -> None:
     config.__post_init__()
     verify_kvm_api()
     for executable in ("qemu-system-x86_64", "qemu-img", "mkfs.ext4", "getfacl", "setfacl"):
-        if shutil.which(executable, path=os.defpath) is None:
+        if shutil.which(executable, path=_HOST_TOOL_PATH) is None:
             raise StateError("OCI host tool is unavailable: " + executable)
     verify_runtime_parent(roots.state.parent)
     # Lifecycle pathname must leave libvirt's temporary binding suffix room.

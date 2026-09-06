@@ -193,3 +193,19 @@ def test_config_digest_change_refused(config, monkeypatch):
     config.kernel_config.write_text(config.kernel_config.read_text() + "\n# changed")
     with pytest.raises(StateError, match="config digest"):
         host.preflight_oci_host(config, StatePaths(Path("/tmp/c"), Path("/tmp/s")), "vm")
+
+
+def test_preflight_admits_system_sbin_tools_without_ambient_path(config, monkeypatch):
+    monkeypatch.setattr(host, "verify_kvm_api", lambda: 12)
+    monkeypatch.setattr(host, "verify_runtime_parent", lambda p: None)
+    monkeypatch.setattr(host.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    seen = []
+
+    def which(executable, *, path):
+        assert path == "/usr/sbin:/usr/bin:/sbin:/bin"
+        seen.append(executable)
+        return "/usr/sbin/" + executable
+
+    monkeypatch.setattr(host.shutil, "which", which)
+    host.preflight_oci_host(config, StatePaths(Path("/tmp/c"), Path("/tmp/s")), "vm")
+    assert "mkfs.ext4" in seen
