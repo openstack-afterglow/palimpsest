@@ -89,6 +89,62 @@ worker process-tree limit: [getrlimit(2)](https://man7.org/linux/man-pages/man2/
 `PALIMPSEST_OCI_EXEC_CLI_LIVE=1` and the same image/host settings. The engine
 opt-in does not enable this public CLI proof, and neither proof enables Gate 2.
 
+At `e2bdbf155941fa22370b747cca7a0867705531f5`, the public CLI proof passed on
+pieroot-server (1 test, 19.47 s). Public run/exec/stop/rm preserved literal argv,
+separate streams, exit 17, missing-command exit 127, recovery after that error,
+the image marker at `/` and `/proc/self/root`, and normal domain/run removal.
+The unchanged image-baked Gate 2 probe was separately executed inside that VM:
+it returned nonzero with no success output and `Permission denied` at the exact
+`/proc/1/root/palimpsest-e2e-root-marker` path. This is an isolation check and
+evidence of an acceptance conflict, not a substituted Gate 2 pass.
+
+The unchanged `tests/e2e/test_local_oci_build_run.py` was actually executed at
+the same SHA: 1 failure in 0.03 s, at its Docker-socket prerequisite before any
+VM launch. `/var/run/docker.sock` and `/run/docker.sock` existed. No daemon was
+stopped or socket hidden. A separate public `oci init-runtime` parent was
+provided through `PALIMPSEST_STATE_HOME`; that real root has no runs. This does
+not repair the gate's hardcoded XDG cleanup assertion for a future successful
+run: actual selected-root cleanup must also be verified when resolving the gate.
+
+Server logs are `/tmp/palimpsest-32-exec-02af287.log`,
+`/tmp/palimpsest-32-public-exec-e2bdbf1.log` and
+`/tmp/palimpsest-32-gate2-e2bdbf1.log`. The immutable product-build artifact is
+`/tmp/palimpsest-exec-image.NrprYU/image.oci.tar`, SHA-256
+`3987bfb8f337ba5333b041b719abf3f377f5cfd623b0894a05a5dfc858d6d4ec`.
+Its adjacent receipt and local independent rootfs proof remain preserved.
+Failed image/worker evidence remains at `/tmp/p-exec-a2325ee5` and
+`/tmp/p-exec-cfe70c49`; only successful, exactly owned proof fixtures were
+removed after normal public VM removal.
+
+At the same public code SHA, the existing public lifecycle file passed 2 tests
+in 37.88 s (foreground, detached STOP, SIGINT and removal). Thirteen selected
+exec/protocol/transport/guest/initramfs/platform/dispatch/CLI/lane unit modules
+passed 585 tests in 14.42 s; this is not the full suite. The first selected run
+had 584 passes and one asset-mode failure: checkout had used the server's
+group-writable umask, yielding `0664`. The exact owned packaged guest binary's
+SHA was verified and its required `0644` mode restored before the same tests
+passed; no test or artifact-content check was weakened. Future server checkout
+must set `umask 022` before Git, not only before pytest.
+Logs: `/tmp/palimpsest-32-public-lifecycle-e2bdbf1.log`,
+`/tmp/palimpsest-32-server-selected-e2bdbf1.log` (first failure), and
+`/tmp/palimpsest-32-server-selected-mode-e2bdbf1.log` (verified rerun).
+
+The first rejected-boot fixture retained a control-lost monitor after its exact
+domain was already absent. Normal transport shutdown intentionally refuses that
+state. After independent review, an operational cleanup revalidated its original
+PID 789325/start 112093680, generation, owned directory FD, typed journal,
+authenticated PING, and absence of both domain UUID and name. It sent SIGTERM
+through a pinned pidfd to that helper only. No domain mutation or file deletion
+was performed; the journal stayed byte-identical. Audit:
+`/tmp/palimpsest-32-failed-monitor-retirement.log`. This is a one-fixture cleanup,
+not implementation of the still-pending public control-lost recovery UX.
+
+Notion section 17.84 records the implementation and verification summary and
+was fetched again to confirm it. Detailed operational-path/process evidence
+was not sent there: that payload was rejected by the safety review, so the
+successful update omitted it. The detailed evidence remains in this workspace
+and the original server logs.
+
 The unchanged Gate 2 probe additionally reads `/proc/1/root`. That dereference
 requires ptrace-style access to PID 1 and conflicts with its intentionally
 non-dumpable, capability-protected supervisor namespace. Do not restore PID 1

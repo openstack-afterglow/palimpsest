@@ -14,6 +14,14 @@ are `run`, `run -d`, `ps`, `stop`, `rm` and bounded noninteractive guest `exec`;
 remains a separate, unchanged acceptance contract; see the additional-exec
 qualification and remaining host/probe constraints below.
 
+Public exec CLI qualification passed at
+`e2bdbf155941fa22370b747cca7a0867705531f5` on pieroot-server (19.47 s); the
+existing public lifecycle regression passed both tests at that SHA (37.88 s).
+Gate 2 was separately executed and failed its Docker-socket prerequisite before
+VM launch. The image-baked PID 1 probe also returned permission denied in the
+separate public exec proof. These are recorded failures/constraints, not skips
+or Gate 2 success.
+
 Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
 `PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
 `PALIMPSEST_OCI_KERNEL_DIGEST` / `PALIMPSEST_OCI_KERNEL_CONFIG_DIGEST` SHA-256 pins.
