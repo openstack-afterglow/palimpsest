@@ -559,11 +559,12 @@ def test_oci_root_unsupported_operation_precedes_every_cloud_capability_probe(mo
     monkeypatch.setattr(Path, "exists", lambda _path: pytest.fail("KVM device probe reached"))
 
     with pytest.raises(RuntimeCapabilityError) as captured:
-        platforms.capability_profile(key, RuntimeOperation.EXEC)
+        platforms.capability_profile(key, RuntimeOperation.SHELL)
 
     assert captured.value.code == "runtime-operation-unavailable"
-    assert captured.value.operation is RuntimeOperation.EXEC
+    assert captured.value.operation is RuntimeOperation.SHELL
     assert platforms.capability_profile(key, RuntimeOperation.PS).requirements == ()
+    assert platforms.capability_profile(key, RuntimeOperation.EXEC).requirements == ()
 
 
 def test_oci_root_capability_matrix_refuses_unimplemented_operations() -> None:
@@ -574,6 +575,7 @@ def test_oci_root_capability_matrix_refuses_unimplemented_operations() -> None:
         RuntimeOperation.STOP,
         RuntimeOperation.RM,
         RuntimeOperation.PS,
+        RuntimeOperation.EXEC,
     }:
         with pytest.raises(RuntimeCapabilityError) as captured:
             platforms.capability_profile(key, operation)

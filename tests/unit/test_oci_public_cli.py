@@ -232,7 +232,13 @@ def test_typed_create_dispatch_revalidates_adapter_identity(tmp_path, monkeypatc
 def test_oci_capability_matrix_opens_only_the_implemented_public_operations():
     key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
     for operation in RuntimeOperation:
-        if operation in {RuntimeOperation.RUN, RuntimeOperation.STOP, RuntimeOperation.RM, RuntimeOperation.PS}:
+        if operation in {
+            RuntimeOperation.RUN,
+            RuntimeOperation.STOP,
+            RuntimeOperation.RM,
+            RuntimeOperation.PS,
+            RuntimeOperation.EXEC,
+        }:
             profile = platforms.capability_profile(key, operation, network=None)
             identifiers = {item.capability_id for item in profile.requirements}
             assert not {"tool.ssh", "tool.cloud-localds", "tool.ssh-keygen"} & identifiers

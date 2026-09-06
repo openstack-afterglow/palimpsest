@@ -1,7 +1,8 @@
 """Opt-in public CLI exec proof; run only after native engine qualification.
 
 This is intentionally separate from unchanged Gate 2, whose PID 1 root probe
-has a distinct supervisor-isolation acceptance conflict.
+has a distinct supervisor-isolation acceptance conflict. The baked-probe denial
+below proves that conflict and the current protection, not Gate 2 acceptance.
 """
 
 from __future__ import annotations
@@ -90,6 +91,10 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         )
         _success(result)
         assert result.stdout == f"PUBLIC_EXEC_IMAGE_ROOT_OK:{marker}\n".encode() and result.stderr == b""
+        isolation = execute("pid1-isolation", "/bin/sh", "-c", "LC_ALL=C /usr/local/bin/palimpsest-e2e-probe")
+        assert isolation.returncode != 0 and isolation.stdout == b""
+        assert b"Permission denied" in isolation.stderr
+        assert b"/proc/1/root/palimpsest-e2e-root-marker" in isolation.stderr
         missing = execute("missing-command", "/palimpsest-no-such-executable")
         assert missing.returncode == 127 and missing.stdout == b""
         result = execute("after-error", "/bin/sh", "-c", "printf 'still-running'")

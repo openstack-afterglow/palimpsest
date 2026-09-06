@@ -9,9 +9,10 @@ document records the execution order and the deliberately limited public surface
 The CLI now connects explicit host admission, typed local intake, completed-run
 removal, the native launch adapter and foreground/detached dispatch. Linux
 x86_64 KVM with `qemu:///system` is the only initial target. Public OCI operations
-are `run`, `run -d`, `ps`, `stop` and `rm`; additional guest `exec`, `start`,
-`logs`, TTY/stdin and network attachment remain unsupported. Gate 2 is unchanged
-and still pending real additional guest exec.
+are `run`, `run -d`, `ps`, `stop`, `rm` and bounded noninteractive guest `exec`;
+`start`, `logs`, TTY/stdin and network attachment remain unsupported. Gate 2
+remains a separate, unchanged acceptance contract; see the additional-exec
+qualification and remaining host/probe constraints below.
 
 Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
 `PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
@@ -28,6 +29,7 @@ permit search (simple ACLs only); never change the user's home permissions:
 palimpsest oci init-runtime /tmp/my-oci-runtime
 export PALIMPSEST_STATE_HOME=/tmp/my-oci-runtime/state
 palimpsest run app.oci.tar --name app -d
+palimpsest exec app -- /bin/sh -c 'printf "hello from the guest\\n"'
 palimpsest stop app
 palimpsest rm app
 ```
@@ -160,15 +162,25 @@ Exercise failure and interruption cleanup as well as successful shutdown.
 
 ## Milestone 2: additional guest exec and the unchanged Gate 2
 
-The current lifecycle protocol has READY/SNAPSHOT/STOP/TERMINAL handling but no
-remote EXEC operation. A cgroup called `exec-00000001` currently represents the
-main workload, not a separate command API.
+Authenticated `EXEC`, `EXEC_OUTPUT` and `EXEC_EXIT` now use the original boot
+authority. `exec-00000001` remains the main workload; additional commands use
+separate monotonic leaf generations. One command can run at a time, with literal
+argv, separate stdout/stderr, real exit status, 30-second execution and 64-KiB
+combined output limits. Timeout/output-limit/STOP kill and clean the additional
+leaf without inventing success. Image credentials/environment/cwd and existing
+isolation apply; no stdin/TTY, overrides or parallel exec are provided.
 
-Add the minimum real noninteractive exec: one additional argv-based process
-while the main workload is alive, authenticated monitor-to-guest delivery,
-bounded output, stdout/stderr/exit propagation, and teardown with the VM.
-Bound request/output sizes, reject stale attempts and preserve process/user
-isolation. Interactive TTY/stdin and parallel exec are not prerequisites.
+The real engine proof passed at `02af2879bd79f19cdbfb02cd687d965e78283d55`
+on pieroot-server (1 test, 22.02 s), including post-timeout/output-limit recovery
+and STOP during exec. Public CLI proof is separately opt-in. See
+[the additional-exec contract](oci-additional-exec.md) for delivery, abandoned
+result and qualification details. This does not itself pass Gate 2.
+
+The current pieroot-server has Docker sockets, so it does not meet Gate 2's
+daemonless-host prerequisite. The baked `/proc/1/root` probe also conflicts with
+the existing non-dumpable PID 1 supervisor boundary. Do not stop unrelated
+Docker services, hide sockets or weaken PID 1 protection to pass the gate.
+Resolve these acceptance prerequisites explicitly.
 
 Then require `tests/e2e/test_local_oci_build_run.py` without weakening it:
 

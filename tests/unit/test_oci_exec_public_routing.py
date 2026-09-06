@@ -1,4 +1,4 @@
-"""Prepare public exec routing coverage without opening its capability gate."""
+"""Public exec routing through real exact-record capability preflight."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import test_runtime_dispatch as fixtures
 
-from palimpsest_local import cli, oci_exec_session, runtime_dispatch, state
+from palimpsest_local import cli, oci_exec_session, platforms, runtime_dispatch, state
 from palimpsest_local.errors import StateError
 from palimpsest_local.runtime_types import (
     ExpectedRunIdentity,
@@ -32,14 +32,20 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(roots.state))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(roots.config.parent))
 
-    # This is a routing-only unit seam. Native proof must pass before changing
-    # the real capability profile; no production gate is patched in this file.
-    def preflight(current, operation, selected_roots):
-        assert current == record and operation is RuntimeOperation.EXEC and selected_roots == roots
-        value.calls.append("preflight")
-        return runtime_dispatch._adapter_for(current, operation)
+    # Observe, but do not bypass, issuance, exact-record validation, and
+    # one-shot authentication/consumption of the real preflight report.
+    require_preflight = runtime_dispatch.require_existing_preflight
 
-    monkeypatch.setattr(runtime_dispatch, "_preflight_existing_adapter", preflight)
+    def preflight(current, operation, report, **kwargs):
+        assert current == record and operation is RuntimeOperation.EXEC
+        assert report.profile.requirements == () and report.checks == ()
+        require_preflight(current, operation, report, **kwargs)
+        value.calls.append("preflight")
+
+    monkeypatch.setattr(runtime_dispatch, "require_existing_preflight", preflight)
+    monkeypatch.setattr(
+        platforms, "_check_capability", lambda *a, **k: pytest.fail("ambient or cloud capability probe entered")
+    )
     monkeypatch.setattr(
         runtime_dispatch.cloud_runtime, "exec_session", lambda *a, **k: pytest.fail("cloud adapter entered")
     )

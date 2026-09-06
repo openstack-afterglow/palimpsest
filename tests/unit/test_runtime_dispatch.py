@@ -3508,9 +3508,9 @@ def test_lima_process_operations_are_typed_unavailable_before_probe_or_adapter(
 
 @pytest.mark.parametrize(
     ("operation", "dispatch"),
-    [(RuntimeOperation.EXEC, runtime_dispatch.exec), (RuntimeOperation.SHELL, runtime_dispatch.shell)],
+    [(RuntimeOperation.SHELL, runtime_dispatch.shell)],
 )
-def test_oci_process_operations_remain_typed_unavailable_before_adapter_spawn(
+def test_oci_shell_remains_typed_unavailable_before_adapter_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: RuntimeOperation,

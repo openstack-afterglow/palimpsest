@@ -1902,3 +1902,27 @@ combined VM-console output are currently in this public scope. Additional
 guest exec and the unchanged Gate 2 remain the next milestone. Pre-activation
 grant-failure/stale-socket recovery, public retained-root UX and multi-VM data
 volumes remain explicitly pending; failures preserve owned resources.
+
+### PR 4 parallel batch: bounded additional guest exec
+
+Guest process supervision, host mailbox/IPC/process sessions, protocol/transport
+integration and independent review were split into concurrent work slices.
+The authenticated additional-command engine is implemented and passed its real
+KVM engine proof at `02af2879bd79f19cdbfb02cd687d965e78283d55` (22.02 s).
+It preserves separate stdout/stderr and real status, literal bounded argv,
+one active command, image credentials and private mounts, finite time/output
+limits, descendant cleanup and STOP precedence. Acknowledged sessions close
+their local clients without stopping the VM. A lost reader leaves a bounded
+unacknowledged result rather than silently rerunning it.
+
+Public noninteractive `exec` is connected only after that engine proof. Its
+CLI-only native file is independently selectable from engine, existing public
+lifecycle and unchanged Gate 2 tests. Full suites are not a per-edit requirement;
+selected tests and the explicit proofs retain separate evidence.
+
+Gate 2 still requires a Docker-daemonless host and its original PID 1 root
+probe. The current pieroot-server has Docker sockets, and dereferencing
+`/proc/1/root` conflicts with the deliberately protected supervisor. Do not
+hide sockets, stop unrelated services or relax PID 1 protections for a green
+test. See [the exec contract and evidence](docs/oci-additional-exec.md).
+Actual public CLI and Gate 2 results are recorded separately from engine proof.

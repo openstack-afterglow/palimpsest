@@ -120,6 +120,16 @@ detached, Ctrl-C and completed cleanup, not additional guest exec or Gate 2.
 New host/request/adapter/CLI unit files are in host-runtime; normal removal is
 in oci-monitor. Each file can also be run directly for a smaller edit loop.
 
+Additional exec has two separately selectable files:
+`tests/kvm/test_oci_exec_live.py` uses the production exec engine and requires
+`PALIMPSEST_OCI_EXEC_LIVE=1`; `tests/kvm/test_oci_exec_cli_live.py` uses only public
+commands and requires `PALIMPSEST_OCI_EXEC_CLI_LIVE=1`. Both require
+`PALIMPSEST_OCI_EXEC_LIVE_IMAGE` pointing to the Palimpsest-built archive and
+adjacent acceptance receipt, plus the host BOOT settings. Run either file on its
+own; neither silently enables the other or substitutes for Gate 2. New exec
+protocol/mailbox/IPC/session/routing unit files belong to oci-monitor, while the
+actual guest C harness belongs to oci-guest with its own platform prerequisites.
+
 - Per edit: relevant lane(s), regression tests for the change, lint and format.
 - Before push: inspect the changed-file plan and run the affected portable
   lanes; include the required native/build proof for changed runtime surfaces.
