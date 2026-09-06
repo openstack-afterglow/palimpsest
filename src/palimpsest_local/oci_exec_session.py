@@ -191,6 +191,9 @@ class OCIExecProcessSession:
                 self._validate_status(status)
                 if status["next_sequence"] != self._sequence + 1:
                     raise StateError("OCI exec acknowledgement identity changed")
+                # All output and completion evidence are now local. Embedded
+                # CLI callers need not rely on process exit to release the pin.
+                self.close()
                 if reason != "completed":
                     raise StateError("OCI exec did not complete: " + reason)
                 code, number = terminal["exit_code"], terminal["signal"]

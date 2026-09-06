@@ -54,7 +54,7 @@ PORTABLE_FILES = {
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
         oci_monitor_ipc oci_monitor_ipc_journal oci_monitor_launch oci_monitor_coordinator
-        oci_monitor_client oci_process_session oci_exec_control oci_exec_protocol oci_exec_ipc oci_exec_session oci_exec_client
+        oci_monitor_client oci_process_session oci_exec_control oci_exec_protocol oci_exec_ipc oci_exec_session oci_exec_client oci_exec_public_routing
         oci_monitor_recovery oci_monitor_retention oci_supervisor oci_run_cleanup
     """),
     "oci-access": _units("""
@@ -68,7 +68,11 @@ PORTABLE_FILES = {
     "qualification": _units("oci_monitor_qualification_adapter"),
 }
 SPECIAL_FILES = {
-    "native-live": ("tests/kvm/test_oci_public_cli_live.py", "tests/kvm/test_oci_exec_live.py"),
+    "native-live": (
+        "tests/kvm/test_oci_public_cli_live.py",
+        "tests/kvm/test_oci_exec_live.py",
+        "tests/kvm/test_oci_exec_cli_live.py",
+    ),
     "guest-kvm": ("tests/kvm/test_oci_guest_stage1_live.py",),
     "guest-binary": ("tests/integration/test_oci_guest_stage1_binary.py",),
     "filesystem": (),
@@ -77,7 +81,7 @@ SPECIAL_FILES = {
     "hub": tuple(f"hub/tests/test_{name}.py" for name in ("auth", "hub_api", "image_exports", "migrate")),
 }
 SPECIAL_NOTES = {
-    "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec proof requires PALIMPSEST_OCI_EXEC_LIVE=1 and its image. Both require explicit host BOOT config; missing opt-ins skip their proof, not qualify it.",
+    "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec engine/public CLI proofs require PALIMPSEST_OCI_EXEC_LIVE=1 / PALIMPSEST_OCI_EXEC_CLI_LIVE=1 respectively and their image. All require explicit host BOOT config; missing opt-ins skip their proof, not qualify it.",
     "guest-kvm": "Explicit KVM guest proof; requires PALIMPSEST_REQUIRE_STAGE1_KVM=1 and proof fixtures.",
     "guest-binary": "Runs guest ELF under Docker when its existing prerequisites permit it.",
     "filesystem": "Privileged Linux filesystem proof; PALIMPSEST_REQUIRE_OCI_FS=1 makes prerequisites mandatory.",

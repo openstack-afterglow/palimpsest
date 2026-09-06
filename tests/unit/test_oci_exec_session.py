@@ -83,7 +83,7 @@ def test_split_exact_output_and_nonzero_exit_drain_before_ack(case):
     )
     assert events[-1].result == session.wait() == ProcessExit(23, 23, None, ProcessExitCategory.EXITED)
     assert case.control.status() == {"state": "ready", "next_sequence": 2, "occupied": False}
-    assert case.calls[-1][0] == "acknowledge"
+    assert case.calls[-2][0] == "acknowledge" and case.calls[-1] == "close"
     session.close()
     assert case.calls[-1] == "close"
 
@@ -166,3 +166,18 @@ def test_pre_fork_cancelled_job_is_acknowledged_without_a_fabricated_exit(case):
     assert case.control.status()["next_sequence"] == 2
     assert session._result is None
     session.close()
+
+
+def test_repeated_embedded_cli_exec_closes_each_client_after_ack(case, monkeypatch, tmp_path, capsys):
+    from palimpsest_local import cli, runtime_dispatch
+
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(runtime_dispatch, "exec", lambda *args, **kwargs: open_session())
+    for _ in range(2):
+        assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 23
+        captured = capsys.readouterr()
+        assert captured.out.encode() == case.output and captured.err.encode() == case.error
+    assert case.calls.count("client") == case.calls.count("close") == 2
+    assert case.control.status()["next_sequence"] == 3
+    assert not case.control.status()["occupied"]
