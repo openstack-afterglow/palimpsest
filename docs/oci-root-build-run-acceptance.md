@@ -430,6 +430,43 @@ access and libvirt relabel behavior, and the other four actual boots continue
 to use their explicit qualification adapters. This remains short of complete
 production filesystem provisioning and does not activate public dispatch.
 
+Slice 30R adds a separate shared traversal registry for exact `state` and
+`runs` only. Per-run memberships bind run UUID/access UUID and immutable target
+identities, not a mutable global revision. The first member grants `runs -> state`
+search; the last departing member restores `state -> runs`. Non-final departure
+does not write or fsync either ancestor and must leave the surviving VM valid.
+An empty epoch and per-run departure evidence remain durable. Normal leave drops
+its global member only after run-left is durable. Crash-orphaned left entries
+remain read-only on replay, pending future explicit repair. No join repairs an
+unrelated run. A 1 MiB preflight reserves pending/completed registry space and
+headroom for the largest active member's future leave intent.
+A permanent enrollment marker prevents a deleted registry from being mistaken
+for legacy unmanaged state; only the original explicit join may recover a valid
+marker-only baseline intent. Partial marker writes are preserved and refused.
+The private flow is
+`grant_oci_runtime_access -> join_oci_shared_traversal -> prepare/spawn`, followed
+after terminal STALE 30L cleanup by `revoke_oci_runtime_access -> leave_oci_shared_traversal`.
+
+Launch authority v5 requires an active membership for its own run when the
+namespace is managed, while preserving runtime-access receipt v2. Old v4 frames
+are rejected. Root initialization serializes with membership changes and verifies
+the managed full ACL instead of closing it through `chmod`. Only unmanaged roots
+retain legacy owner-held, non-symlink FD-based mode700 repair under the global lock;
+initial enrollment additionally requires full baseline
+ACLs and refuses ambiguous preexisting active ledgers. Preparation before the
+per-run grant remains owner-only and does not constitute launch admission.
+
+Portable acceptance covers two-member lifetime, exact partial prefixes,
+ACL/fsync/ledger crash recovery, read-only replay, concurrent joins/leaves,
+path/identity and full-ACL drift, initialization preservation and fresh-exec
+membership checks. Native validation promotes the existing stale-cleanup child
+to one real managed member and checks first grant, initialization preservation
+and final restore with Linux ACLs; simultaneous two-VM native lifetime remains
+future work. The registry
+does not supply an external trust anchor against wholesale same-UID offline
+replacement of state plus all evidence. Store/CAS, external parent paths, BOOT,
+root disks, relabeling, public dispatch and Gate 2 remain outside this segment.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

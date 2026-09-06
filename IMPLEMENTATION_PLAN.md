@@ -1517,6 +1517,65 @@ lower exports and libvirt relabel handling remain explicitly fixture-only.
 The other four boots remain unchanged test-adapted coverage. This slice is one
 more production access segment, not complete host-path provisioning.
 
+### PR 4 slice 30R: share exact state/runs traversal by membership
+
+The next private segment manages only the exact `StatePaths.state` and
+`StatePaths.runs` directories. A separate owner-only namespace registry under
+`locks` binds the two directory identities, complete baseline/granted ACLs and
+the canonical DAC QEMU UID/GID. It retains explicit members keyed by run UUID
+and access UUID, retaining an empty epoch and immutable per-run departure evidence.
+This is not a refcount and does not change runtime-access receipt v2.
+
+The explicit call order is per-run access grant, shared traversal join, then
+monitor preparation/launch. Cleanup first proves the existing 30L terminal
+STALE boundary and restores per-run access, then leaves the shared namespace.
+The global namespace flock precedes any run flock. First join grants `runs`
+search before `state` search; final leave restores `state` before `runs`.
+Other joins/leaves never write or fsync ancestor ACL targets. Durable registry
+intent precedes per-run intent and ACL changes; only the exact ordered ACL
+prefixes resume. Final registry publication precedes final per-run publication,
+so that crash window can finish without repeating a completed permission change.
+Completed replay is verification-only.
+Normal leave publishes registry-left, then run-left, and removes its own global
+member before returning. A crash may retain a left tombstone; replay accepts its
+exact presence or absence without writing. Repair of rare crash tombstones is a
+future explicit operation, never an unrelated VM's implicit mutation. Registry
+writes and join admission reserve space for completion and a future leave intent
+for the largest active member within the 1 MiB read cap.
+
+An owner-only permanent enrollment marker precedes the first registry and ACL
+mutation. Missing either half of enrolled evidence makes initialization and
+read-only launch validation fail closed, even in an empty epoch. Only the exact
+original join can resume a complete marker-only crash intent at full baseline;
+a partially written marker remains preserved and refused rather than adopted.
+
+Fresh-exec authority v5 carries the immutable per-run membership and reuses its
+existing state/runs FDs. A different VM's join or leave does not invalidate that
+identity. Managed launch requires the caller's own active membership; merely
+finding shared paths traversable does not authorize an unregistered run.
+Owner-only preparation without a per-run grant remains available so that a
+second VM can commit/define before obtaining its own grant and membership.
+Private v4 launch frames fail closed; no implicit migration is provided.
+
+Root initialization holds the same namespace lock, validates managed full ACLs
+and preserves them instead of applying `chmod700`. Only an unmanaged namespace
+retains legacy initialization repair: owner-held non-symlink directories are
+set to mode700 through pinned FDs under the global lock. Its first explicit join
+additionally checks full baseline ACLs and refuses other ambiguous active ledgers. Terminal
+retained ledgers are preserved. Final path components cannot be symlinks, while
+configured system ancestors such as macOS `/var` may be aliases. Wholesale
+same-UID offline replacement of the entire state tree and its registry is not
+claimed to be detectable without an external trust anchor.
+
+Portable qualification exercises two members, non-final leave preserving the
+survivor, final restore, interrupted ACL/fsync/ledger writes, membership
+tampering and fresh-exec validation. Native qualification promotes the existing
+stale-cleanup child to one real managed member, proving the first grant,
+initialization preservation and final restore with Linux ACLs; it does not yet
+claim a simultaneous two-VM native lifetime.
+Shared store/CAS paths, external ancestors, BOOT and root-disk access, relabeling,
+public dispatch, endpoint deletion and Gate 2 remain outside this slice.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1535,9 +1594,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable access boundary to shared ancestor traversal with
-   aggregate multi-VM grant lifetime, then VM-root-disk access under its
-   volume generation lock, and finally BOOT/shared-artifact exports with an
+1. Extend the durable access boundary to VM-root-disk access under its
+   volume generation lock, then BOOT/shared-artifact exports with an
    explicit relabel policy,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain

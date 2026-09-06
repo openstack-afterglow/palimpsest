@@ -466,27 +466,58 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
 
     if not isinstance(roots, StatePaths):
         raise TypeError("root initialization requires resolved StatePaths")
-    for directory in (
-        roots.config,
-        roots.state,
-        roots.store,
-        roots.runs,
-        roots.locks,
-        roots.transfers,
-        roots.tags,
-        roots.builds,
-        roots.build_cache,
-        roots.runtime_packs,
-        roots.oci_derived_store,
-        roots.oci_source_cas,
-        roots.projects,
-        roots.volumes,
-        roots.oci_root_volumes,
-    ):
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(directory, 0o700)
+    # Lazy import: the shared registry also uses StatePaths. Its guard owns safe
+    # state/runs/locks bootstrap and preserves authorized traversal ACLs.
+    from .oci_shared_traversal import shared_traversal_initialization
+
+    with shared_traversal_initialization(roots):
+        protected = {_identity(path.stat(follow_symlinks=False)) for path in (roots.state, roots.runs, roots.locks)}
+        for directory in (
+            roots.config,
+            roots.store,
+            roots.transfers,
+            roots.tags,
+            roots.builds,
+            roots.build_cache,
+            roots.runtime_packs,
+            roots.oci_derived_store,
+            roots.oci_source_cas,
+            roots.projects,
+            roots.volumes,
+            roots.oci_root_volumes,
+        ):
+            _initialize_private_root(directory, protected)
+    # This cleanup acquires run locks; never nest it under the shared lock.
     _retry_run_deletion_quarantines(roots)
     return roots
+
+
+def _initialize_private_root(directory: Path, protected: set[tuple[int, int]]) -> None:
+    """Keep private roots private without following aliases onto shared roots."""
+
+    directory_fd: int | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        visible = directory.stat(follow_symlinks=False)
+        if (
+            not stat_module.S_ISDIR(visible.st_mode)
+            or visible.st_uid != os.geteuid()
+            or _identity(visible) in protected
+        ):
+            raise StateError("invalid private root directory")
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        held = os.fstat(directory_fd)
+        if _identity(held) != _identity(visible):
+            raise StateError("private root directory changed")
+        os.fchmod(directory_fd, 0o700)
+        current = directory.stat(follow_symlinks=False)
+        if _identity(current) != _identity(held) or not stat_module.S_ISDIR(current.st_mode):
+            raise StateError("private root directory changed")
+    except OSError as exc:
+        raise StateError("cannot initialize private root directory") from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def write_state_root(roots: StatePaths, destination: Path) -> None:

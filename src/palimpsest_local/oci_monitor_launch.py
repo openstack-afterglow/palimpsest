@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v4"
+_SCHEMA = "palimpsest.monitor-launch-authority.v5"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -209,6 +209,7 @@ class MonitorLaunchAuthority:
                 "timeout_seconds",
                 "terminal_timeout_seconds",
                 "runtime_access",
+                "shared_traversal",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -288,6 +289,18 @@ class MonitorLaunchAuthority:
             ):
                 raise _invalid()
             access = self._frame["runtime_access"]
+            from .oci_shared_traversal import verify_shared_traversal
+
+            verify_shared_traversal(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                self._frame["shared_traversal"],
+                binding=selected,
+                access=access,
+                state_fd=self._frame["entries"]["state"]["fd"],
+                runs_fd=self._frame["entries"]["runs"]["fd"],
+            )
             if access is not None:
                 from .oci_runtime_access import RuntimeAccessReceipt, verify_runtime_access
 
@@ -441,6 +454,7 @@ def prepare_monitor_launch_authority(
         with locked_existing_run(roots, binding.record.name) as mutation:
             with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
                 runtime_access = mutation.mutable_state().get("oci_runtime_access")
+                shared_traversal = mutation.mutable_state().get("oci_shared_traversal")
                 for name, path in paths.items():
                     path = _path(str(path))
                     fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console"})
@@ -460,6 +474,7 @@ def prepare_monitor_launch_authority(
             "timeout_seconds": _timeout(timeout_seconds),
             "terminal_timeout_seconds": _timeout(terminal_timeout_seconds),
             "runtime_access": runtime_access,
+            "shared_traversal": shared_traversal,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

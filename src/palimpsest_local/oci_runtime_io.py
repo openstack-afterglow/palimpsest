@@ -233,6 +233,14 @@ class RuntimeIOGuard:
                     run_directory_fd=self._mutation._run_fd,
                     runs_directory_fd=self._mutation._runs_fd,
                 )
+                from .oci_shared_traversal import verify_shared_traversal
+
+                verify_shared_traversal(
+                    self._mutation._roots,
+                    self._mutation.snapshot.state.get("oci_shared_traversal"),
+                    access=access,
+                    runs_fd=self._mutation._runs_fd,
+                )
             else:
                 for directory, console in (
                     (os.fstat(self._descriptors.directory), os.fstat(self._descriptors.console)),

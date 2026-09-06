@@ -147,14 +147,14 @@ def test_new_run_reservation_supports_oci_root_kvm_identity(tmp_path: Path) -> N
 
 
 def test_new_run_reservation_uses_canonical_public_path_spelling(tmp_path: Path) -> None:
-    real_state = tmp_path / "real-state"
-    real_state.mkdir()
-    linked_state = tmp_path / "linked-state"
-    linked_state.symlink_to(real_state, target_is_directory=True)
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
     roots = state.init_roots(
         {
             "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
-            "PALIMPSEST_STATE_HOME": str(linked_state),
+            "PALIMPSEST_STATE_HOME": str(linked_parent / "state"),
         }
     )
 
@@ -684,15 +684,15 @@ def test_existing_run_delete_removes_only_pinned_run_tree(tmp_path: Path) -> Non
     assert not rpaths.root.exists()
 
 
-def test_existing_run_delete_supports_symlink_configured_state_root(tmp_path: Path) -> None:
-    real_state = tmp_path / "real-state"
-    real_state.mkdir()
-    linked_state = tmp_path / "linked-state"
-    linked_state.symlink_to(real_state, target_is_directory=True)
+def test_existing_run_delete_supports_symlink_configured_state_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
     roots = state.init_roots(
         {
             "XDG_CONFIG_HOME": str(tmp_path / "cfg"),
-            "PALIMPSEST_STATE_HOME": str(linked_state),
+            "PALIMPSEST_STATE_HOME": str(linked_parent / "state"),
         }
     )
     rpaths = state.run_paths(roots, "delete-linked-root")
@@ -1182,7 +1182,7 @@ def test_write_state_root_url_preservation(tmp_path: Path) -> None:
     config_file.parent.mkdir(parents=True)
     config_file.write_text("[hub]\nurl = 'https://hub.example.com'\n", encoding="utf-8")
 
-    env = {"XDG_CONFIG_HOME": str(cfg_dir)}
+    env = {"XDG_CONFIG_HOME": str(cfg_dir), "XDG_STATE_HOME": str(tmp_path / "st")}
     roots = state.init_roots(env)
 
     new_st = tmp_path / "new_state"
@@ -1199,6 +1199,6 @@ def test_write_state_root_url_preservation(tmp_path: Path) -> None:
 
 
 def test_write_state_root_requires_absolute_path(tmp_path: Path) -> None:
-    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg")})
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
     with pytest.raises(StateError, match="state root destination must be an absolute path"):
         state.write_state_root(roots, Path("relative/dest"))

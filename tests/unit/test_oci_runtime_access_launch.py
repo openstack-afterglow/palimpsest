@@ -1,16 +1,20 @@
-"""Real durable traversal/I/O grants carried into private exec authority v4."""
+"""Real per-run and shared traversal grants carried into private exec authority v5."""
 
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
-from test_oci_runtime_access import case as case
+import test_oci_runtime_access as access_tests
+import test_oci_shared_traversal as shared_tests
+from test_oci_shared_traversal import case as case
 
 from palimpsest_local import oci_monitor_launch as launch
 from palimpsest_local import oci_runtime_access as access
 from palimpsest_local import oci_runtime_io as io
+from palimpsest_local import oci_shared_traversal as shared
 from palimpsest_local import state
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_acl import baseline_acl, grant_acl, traversal_acl
@@ -21,6 +25,7 @@ def granted(case):
     # The shared fixture prepares, commits and defines a real OCI plan against
     # fake libvirt, with a deterministic FD ACL backend (no metadata bypass).
     case.receipt = access.grant_oci_runtime_access(case.roots, case.binding, conn=case.conn)
+    case.member = shared_tests._join(case)
     (case.paths.root.parent / "monitor-private").mkdir(mode=0o700)
     return case
 
@@ -33,7 +38,8 @@ def test_completed_grant_survives_prepared_and_serialized_authority(granted):
     before_writes = list(granted.backend.writes)
     with _prepare(granted) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v4"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v5"
+        assert frame["shared_traversal"] == granted.member.to_dict()
         assert frame["runtime_access"] == granted.receipt.to_dict()
         assert frame["runtime_access"]["schema"] == "palimpsest.oci-runtime-access.v2"
         assert frame["runtime_access"]["phase"] == "granted"
@@ -70,7 +76,7 @@ def test_preparation_and_held_run_validation_do_not_reacquire_run_lock(granted, 
         finally:
             depth -= 1
 
-    for module in (state, launch, access):
+    for module in (state, launch, access, shared):
         monkeypatch.setattr(module, "locked_existing_run", counted)
     with _prepare(granted) as authority:
         assert calls == 1
@@ -111,6 +117,7 @@ def test_preparation_and_held_run_validation_do_not_reacquire_run_lock(granted, 
         lambda frame: frame.pop("runtime_access"),
         lambda frame: frame.update(schema="palimpsest.monitor-launch-authority.v2"),
         lambda frame: frame.update(schema="palimpsest.monitor-launch-authority.v3"),
+        lambda frame: frame.update(schema="palimpsest.monitor-launch-authority.v4"),
     ],
 )
 def test_serialized_authority_rejects_tampered_or_omitted_grant(granted, change):
@@ -123,7 +130,7 @@ def test_serialized_authority_rejects_tampered_or_omitted_grant(granted, change)
         authority.validate()
 
 
-@pytest.mark.parametrize("role", ["run", "runtime_io", "runtime_console"])
+@pytest.mark.parametrize("role", ["state", "runs", "run", "runtime_io", "runtime_console"])
 def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_path, role):
     replacement = tmp_path / "unrelated"
     if role != "runtime_console":
@@ -134,9 +141,15 @@ def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_p
     try:
         # Keep type, owner, mode and full ACL valid. Only the inherited inode
         # identity differs, so a generic mode/ACL rejection cannot mask this test.
-        os.fchmod(fd, {"run": 0o710, "runtime_io": 0o730, "runtime_console": 0o660}[role])
+        os.fchmod(
+            fd, {"state": 0o710, "runs": 0o710, "run": 0o710, "runtime_io": 0o730, "runtime_console": 0o660}[role]
+        )
         info = os.fstat(fd)
-        target = getattr(granted.receipt, {"run": "run", "runtime_io": "directory", "runtime_console": "console"}[role])
+        target = (
+            getattr(granted.member, role)
+            if role in {"state", "runs"}
+            else getattr(granted.receipt, {"run": "run", "runtime_io": "directory", "runtime_console": "console"}[role])
+        )
         granted.backend.acls[info.st_dev, info.st_ino] = target.granted
         with _prepare(granted) as authority:
             frame = authority.to_dict()
@@ -149,10 +162,10 @@ def test_serialized_grant_cannot_be_applied_to_another_descriptor(granted, tmp_p
         os.close(fd)
 
 
-@pytest.mark.parametrize("role", ["run", "directory", "console"])
+@pytest.mark.parametrize("role", ["state", "runs", "run", "directory", "console"])
 @pytest.mark.parametrize("drift", ["baseline", "other-user"])
 def test_exact_live_acl_is_rechecked_without_mode_only_acceptance(granted, role, drift):
-    target = getattr(granted.receipt, role)
+    target = getattr(granted.member if role in {"state", "runs"} else granted.receipt, role)
     key = target.device, target.inode
     with _prepare(granted) as authority:
         frame = authority.to_dict()
@@ -160,7 +173,9 @@ def test_exact_live_acl_is_rechecked_without_mode_only_acceptance(granted, role,
         granted.backend.acls[key] = (
             baseline_acl(directory=target.directory)
             if drift == "baseline"
-            else (traversal_acl if role == "run" else grant_acl)(target.baseline, granted.receipt.qemu_uid + 1)
+            else (traversal_acl if role in {"state", "runs", "run"} else grant_acl)(
+                target.baseline, granted.receipt.qemu_uid + 1
+            )
         )
         with pytest.raises(StateError):
             authority.validate()
@@ -206,3 +221,123 @@ def test_console_output_remains_untrusted_but_allowed_after_grant(granted):
         granted.paths.console_log.write_bytes(b"guest console output must not become a signed ledger\n")
         authority.validate()
         assert authority.to_dict()["runtime_access"] == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda frame: frame.pop("shared_traversal"),
+        lambda frame: frame.update(shared_traversal=None),
+        lambda frame: frame["shared_traversal"].update(phase="joining"),
+        lambda frame: frame["shared_traversal"].update(phase="leaving"),
+        lambda frame: frame["shared_traversal"].update(phase="left"),
+        lambda frame: frame["shared_traversal"].update(namespace_id="00000000-0000-4000-8000-000000000001"),
+        lambda frame: frame["shared_traversal"].update(access_id="00000000-0000-4000-8000-000000000001"),
+        lambda frame: frame["shared_traversal"].update(epoch=True),
+        lambda frame: frame["shared_traversal"].update(epoch=999),
+        lambda frame: frame["shared_traversal"]["state"].update(inode=1),
+        lambda frame: frame["shared_traversal"]["runs"].update(inode=1),
+    ],
+)
+def test_managed_frame_requires_exact_active_membership(granted, change):
+    with _prepare(granted) as authority:
+        frame = authority.to_dict()
+        change(frame)
+        with pytest.raises(StateError):
+            launch.MonitorLaunchAuthority.from_dict(frame)
+        authority.validate()
+
+
+@pytest.mark.parametrize("phase", [None, "joining", "leaving", "left"])
+def test_managed_preparation_requires_current_run_membership(granted, phase):
+    with state.locked_existing_run(granted.roots, granted.binding.record.name) as mutation:
+        data = mutation.mutable_state()
+        if phase is None:
+            data.pop(shared.SHARED_TRAVERSAL_STATE_KEY)
+        else:
+            data[shared.SHARED_TRAVERSAL_STATE_KEY] = replace(granted.member, phase=phase).to_dict()
+        mutation.write_state("defined", data)
+    with pytest.raises(StateError):
+        _prepare(granted)
+
+
+@pytest.mark.parametrize("role", ["state", "runs"])
+@pytest.mark.parametrize("field", ["device", "inode", "uid", "gid", "mode"])
+def test_shared_entry_metadata_cannot_be_changed(granted, role, field):
+    with _prepare(granted) as authority:
+        frame = authority.to_dict()
+        frame["entries"][role][field] += 1
+        with pytest.raises(StateError):
+            launch.MonitorLaunchAuthority.from_dict(frame)
+        authority.validate()
+
+
+def test_existing_second_member_frame_survives_first_member_leave(granted, monkeypatch, request):
+    second = shared_tests._second(granted)
+    second.member = shared_tests._join(second)
+    (second.paths.root.parent / "monitor-private").mkdir(mode=0o700)
+    with _prepare(second) as authority:
+        frame = authority.to_dict()
+        registry_path = granted.roots.locks / shared._REGISTRY
+        before_registry = registry_path.read_bytes()
+        shared_tests._finish(granted, monkeypatch, request)
+        left = shared_tests._leave(granted)
+        assert left.phase == "left"
+        assert registry_path.read_bytes() != before_registry
+        authority.validate(binding=second.binding)
+        assert authority.to_dict() == frame
+        for entry in frame["entries"].values():
+            entry["fd"] = os.dup(entry["fd"])
+        try:
+            child = launch.MonitorLaunchAuthority.from_dict(frame)
+        except BaseException:
+            for entry in frame["entries"].values():
+                os.close(entry["fd"])
+            raise
+        with child:
+            child.validate(binding=second.binding)
+        assert second.domain.domain.create_calls == second.domain.domain.destroy_calls == 0
+
+
+@pytest.mark.parametrize("change", ["missing", "left", "replaced"])
+def test_captured_frame_rechecks_its_current_registry_member(granted, change):
+    second = shared_tests._second(granted)
+    shared_tests._join(second)
+    with _prepare(granted) as authority:
+        frame = authority.to_dict()
+        ns = shared._Namespace(granted.roots, locked=True)
+        try:
+            registry = dict(ns.registry)
+            registry["members"] = dict(registry["members"])
+            del registry["members"][shared._key(granted.member)]
+            if change != "missing":
+                replacement = replace(
+                    granted.member,
+                    **(
+                        {"phase": "left"} if change == "left" else {"access_id": "00000000-0000-4000-8000-000000000001"}
+                    ),
+                )
+                registry["members"][shared._key(replacement)] = replacement.to_dict()
+            ns.write(registry)
+        finally:
+            ns.close()
+        # B keeps the namespace ACL granted, while A's run/I/O ACL never
+        # changed. Refusal must therefore come from current set membership.
+        for target in (granted.member.state, granted.member.runs, granted.receipt.run):
+            assert granted.backend.acls[target.device, target.inode] == target.granted
+        with pytest.raises(StateError):
+            authority.validate()
+        with pytest.raises(StateError):
+            launch.MonitorLaunchAuthority.from_dict(frame)
+
+
+def test_legacy_registry_absent_qualification_still_has_explicit_null_member(tmp_path, monkeypatch):
+    legacy = access_tests.case.__wrapped__(tmp_path, monkeypatch)
+    access.grant_oci_runtime_access(legacy.roots, legacy.binding, conn=legacy.conn)
+    (legacy.paths.root.parent / "monitor-private").mkdir(mode=0o700)
+    assert not (legacy.roots.locks / shared._REGISTRY).exists()
+    with _prepare(legacy) as authority:
+        frame = authority.to_dict()
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v5"
+        assert frame["shared_traversal"] is None
+        authority.validate()
