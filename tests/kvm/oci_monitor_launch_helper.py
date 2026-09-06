@@ -221,12 +221,137 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
     return diagnosed_metadata
 
 
+def _qualification_stage1_adapter(original_verify, context, acl_structure):
+    """Observe only the legacy broker's exact immutable stage1 grant.
+
+    This is not a product access policy. Managed members and all pre-grant
+    calls retain the production validator, including its strict0400 baseline.
+    """
+    from palimpsest_local import oci_stage1_access as access
+    from palimpsest_local.oci_stage1_transport import OCIStage1Plan, verify_stage1_transport
+
+    def verify(roots, member, run_fd, fd, *, binding, metadata_only=False, expected_stamp=None):
+        def original():
+            return original_verify(
+                roots,
+                member,
+                run_fd,
+                fd,
+                binding=binding,
+                metadata_only=metadata_only,
+                expected_stamp=expected_stamp,
+            )
+
+        broker = context.get("broker")
+        if context.get("product_io", False) or member is not None or broker is None or not broker.applied:
+            return original()
+        state = access._read_pinned_json_object(run_fd, "state.json")
+        if access.OCI_STAGE1_ACCESS_STATE_KEY in state:
+            return original()
+        run_path = roots.runs / binding.record.name
+        path = run_path / "stage1-plan.raw"
+        targets = [target for target in broker.targets if target.path == path]
+        if not targets:
+            return original()
+        if len(targets) != 1 or broker.restored or broker.ambiguous or context.get("binding") != binding:
+            raise ValueError("qualified stage1 broker authority changed")
+        target = targets[0]
+        plan = access._plan(state, binding)
+        transport = access._transport(plan)
+        baseline = target.opened
+        granted = context.get("granted", {}).get((baseline.st_dev, baseline.st_ino))
+        if (
+            target.permission != "r--"
+            or target.original_acl != acl_structure("r--", (), "---", None, "---")
+            or not stat.S_ISREG(baseline.st_mode)
+            or stat.S_IMODE(baseline.st_mode) != 0o400
+            or baseline.st_uid != binding.owner_uid
+            or baseline.st_nlink != 1
+            or baseline.st_size != transport.artifact_size_bytes
+            or transport.artifact_digest != binding.stage1_artifact_digest
+            or granted is None
+        ):
+            raise ValueError("qualified stage1 baseline or transport changed")
+        stamp = access._immutable_stamp(granted)
+        if metadata_only and expected_stamp != stamp:
+            raise ValueError("qualified stage1 validation stamp changed")
+        run_identity = os.fstat(run_fd)
+
+        def tail():
+            if (
+                context.get("binding") != binding
+                or not broker.applied
+                or broker.restored
+                or broker.ambiguous
+                or context.get("broker") is not broker
+                or [item for item in broker.targets if item.path == path] != [target]
+            ):
+                raise ValueError("qualified stage1 broker authority changed")
+            visible_run = run_path.lstat()
+            if (
+                not stat.S_ISDIR(visible_run.st_mode)
+                or visible_run.st_uid != binding.owner_uid
+                or (visible_run.st_dev, visible_run.st_ino) != (run_identity.st_dev, run_identity.st_ino)
+            ):
+                raise ValueError("qualified stage1 run identity changed")
+            infos = [
+                os.fstat(target.descriptor),
+                path.lstat(),
+                os.stat(path.name, dir_fd=run_fd, follow_symlinks=False),
+            ]
+            if fd is not None:
+                infos.append(os.fstat(fd))
+            for info in infos:
+                if (
+                    access._immutable_stamp(info) != stamp
+                    or not stat.S_ISREG(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o440
+                    or (
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_uid,
+                        info.st_gid,
+                        info.st_nlink,
+                        info.st_size,
+                        info.st_mtime_ns,
+                    )
+                    != (
+                        baseline.st_dev,
+                        baseline.st_ino,
+                        baseline.st_uid,
+                        baseline.st_gid,
+                        1,
+                        baseline.st_size,
+                        baseline.st_mtime_ns,
+                    )
+                ):
+                    raise ValueError("qualified stage1 immutable metadata changed")
+            current = access._read_pinned_json_object(run_fd, "state.json")
+            if access.OCI_STAGE1_ACCESS_STATE_KEY in current or access._plan(current, binding) != plan:
+                raise ValueError("qualified stage1 ledger authority changed")
+
+        tail()
+        if not metadata_only and broker._getfacl(target) != acl_structure(
+            "r--", ((broker.uid, "r--"),), "---", "r--", "---"
+        ):
+            raise ValueError("qualified stage1 ACL changed")
+        verify_stage1_transport(
+            os.pread(target.descriptor, transport.artifact_size_bytes + 1, 0),
+            transport,
+            expected_stage1_plan=OCIStage1Plan.from_domain_plan(plan),
+        )
+        tail()
+        return stamp
+
+    return verify
+
+
 def _install_qualification(root: Path, *, product_io: bool = False) -> None:
     # The qualified server supplies libvirt-python outside the test venv.
     # Production intentionally does not inherit or infer this search path.
     sys.path.append("/usr/lib/python3/dist-packages")
     import palimpsest_local.oci_monitor_launch as authority_module
-    from palimpsest_local import oci_root_kvm, oci_root_runtime, oci_runtime_io
+    from palimpsest_local import oci_root_kvm, oci_root_runtime, oci_runtime_io, oci_stage1_access
     from palimpsest_local.state import read_run_ledger_snapshot
 
     fixture = runpy.run_path(str(Path(__file__).with_name("test_oci_root_libvirt_live.py")))
@@ -377,6 +502,9 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
     oci_root_kvm._verified_lower_path = lower
     oci_root_runtime.connect_oci_root_libvirt = connect
     authority_module._validate_entry_metadata = metadata
+    oci_stage1_access.verify_stage1_launch = _qualification_stage1_adapter(
+        oci_stage1_access.verify_stage1_launch, context, fixture["_ACLStructure"]
+    )
     if not product_io:
         oci_runtime_io._validate_runtime_io_metadata = fixture["_qualification_runtime_io_adapter"](
             original_io_metadata, lambda: context.get("broker")
