@@ -912,9 +912,9 @@ def _qualification_runtime_io_adapter(original, get_broker):
     return metadata
 
 
-def _without_product_access_grants(specifications, roots: StatePaths, run_root: Path):
-    """Keep fixture access separate from the five production ACL targets."""
-    selected = {roots.state, roots.runs, run_root, run_root / "io", run_root / "io" / "console.log"}
+def _without_product_access_grants(specifications, roots: StatePaths, run_root: Path, root_disk: Path):
+    """Keep fixture access separate from the six production ACL targets."""
+    selected = {roots.state, roots.runs, run_root, run_root / "io", run_root / "io" / "console.log", root_disk}
     assert {path for path, _, _ in specifications if path in selected} == selected
     return tuple(item for item in specifications if item[0] not in selected)
 
@@ -934,8 +934,29 @@ class _QualificationProductIOState:
         self.pending = False
 
 
+def _assert_product_root_acl(root_disk: Path, uid: int, *, granted: bool):
+    from palimpsest_local.oci_acl import LinuxFdACLBackend, baseline_acl, grant_acl
+
+    descriptor = os.open(root_disk, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        expected = baseline_acl(directory=False)
+        if granted:
+            expected = grant_acl(expected, uid)
+        assert LinuxFdACLBackend().read_acl(descriptor) == expected
+        after, visible = os.fstat(descriptor), root_disk.lstat()
+        for info in (before, after, visible):
+            assert stat.S_ISREG(info.st_mode)
+            assert stat.S_IMODE(info.st_mode) == (0o660 if granted else 0o600)
+            assert info.st_uid == os.geteuid() and info.st_nlink == 1
+            assert (info.st_dev, info.st_ino, info.st_size) == (before.st_dev, before.st_ino, before.st_size)
+    finally:
+        os.close(descriptor)
+
+
 @pytest.mark.parametrize(
-    "failure", ["console-grant", "io-grant", "run-grant", "shared-runs-grant", "shared-state-grant", "replay"]
+    "failure",
+    ["console-grant", "io-grant", "run-grant", "shared-runs-grant", "shared-state-grant", "root-grant", "replay"],
 )
 def test_product_access_failure_before_spawn_retains_pending_authority(failure):
     state = _QualificationProductIOState()
@@ -943,7 +964,14 @@ def test_product_access_failure_before_spawn_retains_pending_authority(failure):
 
     def grant():
         events.append("intent")
-        for stage in ("console-grant", "io-grant", "run-grant", "shared-runs-grant", "shared-state-grant"):
+        for stage in (
+            "console-grant",
+            "io-grant",
+            "run-grant",
+            "shared-runs-grant",
+            "shared-state-grant",
+            "root-grant",
+        ):
             events.append(stage)
             if failure == stage:
                 raise RuntimeError("ambiguous grant")
@@ -951,7 +979,15 @@ def test_product_access_failure_before_spawn_retains_pending_authority(failure):
     with pytest.raises((RuntimeError, AssertionError)):
         state.grant(grant)
         assert failure != "replay", "replay failed before spawn"
-    expected = ["intent", "console-grant", "io-grant", "run-grant", "shared-runs-grant", "shared-state-grant"]
+    expected = [
+        "intent",
+        "console-grant",
+        "io-grant",
+        "run-grant",
+        "shared-runs-grant",
+        "shared-state-grant",
+        "root-grant",
+    ]
     assert events == (expected if failure == "replay" else expected[: expected.index(failure) + 1])
     assert state.pending  # finally must preserve the fixture, regardless of the test broker.
     state.mark_revoked()
@@ -1043,17 +1079,23 @@ def _assert_product_private_metadata_boundary(run_root: Path, *, backend=None) -
 class _QualificationProductACLBackend:
     """Observe real product writes without changing ACL or metadata decisions."""
 
-    def __init__(self, run_root: Path, *, shared_roots: tuple[Path, Path] = (), backend=None):
+    def __init__(
+        self, run_root: Path, *, shared_roots: tuple[Path, Path] = (), root_disk: Path | None = None, backend=None
+    ):
         from palimpsest_local.oci_acl import LinuxFdACLBackend
 
         self.backend = backend or LinuxFdACLBackend()
         self.targets = {}
         self.writes = []
         shared_targets = (("state", shared_roots[0]), ("runs", shared_roots[1])) if shared_roots else ()
-        targets = shared_targets + (
-            ("run", run_root),
-            ("directory", run_root / "io"),
-            ("console", run_root / "io" / "console.log"),
+        targets = (
+            shared_targets
+            + ((("root_disk", root_disk),) if root_disk is not None else ())
+            + (
+                ("run", run_root),
+                ("directory", run_root / "io"),
+                ("console", run_root / "io" / "console.log"),
+            )
         )
         for role, path in targets:
             info = path.lstat()
@@ -1123,21 +1165,26 @@ def test_product_acl_observer_does_not_normalize_or_write_unrecorded_target(tmp_
         os.close(unrelated)
 
 
-def test_product_access_filter_removes_only_exact_five_owned_targets(tmp_path):
+def test_product_access_filter_removes_only_exact_six_owned_targets(tmp_path):
     roots = StatePaths(tmp_path / "config", tmp_path / "state")
     run = tmp_path / "run"
+    root_disk = tmp_path / "root.raw"
     specifications = (
         (roots.state, "directory", "--x"),
         (roots.runs, "directory", "--x"),
         (run, "directory", "--x"),
         (run / "io", "directory", "-wx"),
         (run / "io" / "console.log", "regular", "rw-"),
+        (root_disk, "regular", "rw-"),
         (tmp_path / "other" / "io", "directory", "-wx"),
         (tmp_path / "boot", "regular", "r--"),
     )
-    assert _without_product_access_grants(specifications, roots, run) == (specifications[5], specifications[6])
+    assert _without_product_access_grants(specifications, roots, run, root_disk) == (
+        specifications[6],
+        specifications[7],
+    )
     with pytest.raises(AssertionError):
-        _without_product_access_grants(specifications[:4], roots, run)
+        _without_product_access_grants(specifications[:5], roots, run, root_disk)
 
 
 def _assert_qualification_io_boundary(broker, run_root: Path, *, product_io: bool = False) -> None:
@@ -3349,6 +3396,10 @@ def _launch_in_exec_monitor(
             snapshot = monitor_ipc._read_preactivation_journal(directory_fd, endpoint.identity)[0]
             if snapshot.phase == "activating" and conn.lookupByUUIDString(binding.domain_uuid).isActive() == 1:
                 _assert_qualification_io_boundary(broker, roots.runs / binding.record.name, product_io=product_io)
+                if product_io:
+                    assert root_disk is not None
+                    assert all(target.path != root_disk for target in broker.targets)
+                    _assert_product_root_acl(root_disk, broker.uid, granted=True)
                 # The clean launcher has already exited. Its child owns a real
                 # VM and must still answer IPC while its worker waits in create.
                 assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
@@ -3420,6 +3471,7 @@ def _launch_in_exec_monitor(
                     with pytest.raises(PalimpsestError):
                         reconcile_inactive_monitor_domain(roots, binding, conn=conn)
                     if product_io:
+                        from palimpsest_local.oci_root_access import revoke_oci_root_access
                         from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
                         from palimpsest_local.oci_shared_traversal import leave_oci_shared_traversal
 
@@ -3427,8 +3479,11 @@ def _launch_in_exec_monitor(
                             revoke_oci_runtime_access(roots, binding, conn=conn)
                         with pytest.raises(PalimpsestError):
                             leave_oci_shared_traversal(roots, binding, conn=conn)
+                        with pytest.raises(PalimpsestError):
+                            revoke_oci_root_access(roots, binding, conn=conn)
                         _assert_product_io_acl(roots.runs / binding.record.name, broker.uid, granted=True)
                         _assert_product_shared_acl(roots, broker.uid, granted=True)
+                        _assert_product_root_acl(root_disk, broker.uid, granted=True)
                         _assert_product_private_metadata_boundary(roots.runs / binding.record.name)
                         assert {
                             path: (path.stat().st_dev, path.stat().st_ino, _sha256_file(path))
@@ -4049,7 +4104,7 @@ def test_live_oci_root(
         monitor_directory.mkdir(mode=0o700)
         specifications = _qualification_acl_specifications(qualification_root, resolved.xml)
         if stale_cleanup:
-            specifications = _without_product_access_grants(specifications, roots, roots.runs / name)
+            specifications = _without_product_access_grants(specifications, roots, roots.runs / name, root_path)
         broker = _QualificationDACBroker(qualification_root, qemu_uid, specifications)
         if not stale_cleanup:
             monkeypatch.setattr(
@@ -4098,6 +4153,7 @@ def test_live_oci_root(
         assert read_run_ledger_snapshot(roots, name).state["status"] == "defined"
         assert conn.lookupByUUIDString(defined.domain_uuid).isActive() == 0
         if stale_cleanup:
+            from palimpsest_local.oci_root_access import grant_oci_root_access
             from palimpsest_local.oci_runtime_access import grant_oci_runtime_access
             from palimpsest_local.oci_shared_traversal import join_oci_shared_traversal
 
@@ -4118,7 +4174,14 @@ def test_live_oci_root(
                 "runs",
                 "state",
             ]
+            root_backend = _QualificationProductACLBackend(roots.runs / name, root_disk=root_path)
+            root_access = product_access.grant(
+                lambda: grant_oci_root_access(roots, monitor_binding, conn=conn, acl_backend=root_backend)
+            )
+            assert [role for role, _acl in root_backend.writes] == ["root_disk"]
             granted_state = read_run_ledger_snapshot(roots, name)
+            assert grant_oci_root_access(roots, monitor_binding, conn=conn, acl_backend=root_backend) == root_access
+            assert [role for role, _acl in root_backend.writes] == ["root_disk"]
             assert grant_oci_runtime_access(roots, monitor_binding, conn=conn, acl_backend=product_backend) == access
             assert (
                 join_oci_shared_traversal(roots, monitor_binding, conn=conn, acl_backend=product_backend) == membership
@@ -4135,6 +4198,7 @@ def test_live_oci_root(
             assert read_run_ledger_snapshot(roots, name) == granted_state
             _assert_product_io_acl(roots.runs / name, qemu_uid, granted=True)
             _assert_product_shared_acl(roots, qemu_uid, granted=True)
+            _assert_product_root_acl(root_path, qemu_uid, granted=True)
         # The host monitor must not share the guest-accessible lifecycle
         # directory: the qualification DAC broker grants QEMU access there.
         if not child_owned:
@@ -4291,11 +4355,18 @@ def test_live_oci_root(
                 assert reconcile_inactive_monitor_domain(roots, monitor_binding, conn=counted_conn) == receipt
                 assert counted_conn.undefine_calls == 1
                 assert read_run_ledger_snapshot(roots, name).state == after
+                from palimpsest_local.oci_root_access import revoke_oci_root_access
                 from palimpsest_local.oci_runtime_access import revoke_oci_runtime_access
                 from palimpsest_local.oci_shared_traversal import leave_oci_shared_traversal
 
                 console_identity = (console_path.stat().st_dev, console_path.stat().st_ino)
                 console_digest = _sha256_file(console_path)
+                root_backend = _QualificationProductACLBackend(roots.runs / name, root_disk=root_path)
+                root_revoked = revoke_oci_root_access(
+                    roots, monitor_binding, conn=counted_conn, acl_backend=root_backend
+                )
+                assert root_revoked == root_access
+                assert [role for role, _acl in root_backend.writes] == ["root_disk"]
                 product_backend = _QualificationProductACLBackend(
                     roots.runs / name, shared_roots=(roots.state, roots.runs)
                 )
@@ -4336,6 +4407,11 @@ def test_live_oci_root(
                     "runs",
                 ]
                 assert read_run_ledger_snapshot(roots, name).state == revoked_state
+                assert (
+                    revoke_oci_root_access(roots, monitor_binding, conn=counted_conn, acl_backend=root_backend)
+                    == root_revoked
+                )
+                assert [role for role, _acl in root_backend.writes] == ["root_disk"]
                 assert stat.S_IMODE(roots.state.stat().st_mode) == 0o700
                 assert stat.S_IMODE(roots.runs.stat().st_mode) == 0o700
                 assert stat.S_IMODE((roots.runs / name).stat().st_mode) == 0o700
@@ -4345,6 +4421,7 @@ def test_live_oci_root(
                 assert _sha256_file(console_path) == console_digest
                 _assert_product_io_acl(roots.runs / name, qemu_uid, granted=False)
                 _assert_product_shared_acl(roots, qemu_uid, granted=False)
+                _assert_product_root_acl(root_path, qemu_uid, granted=False)
                 _assert_product_private_metadata_boundary(roots.runs / name)
                 assert (monitor_directory / monitor_ipc._JOURNAL_NAME).read_bytes() == original_journal
                 current_socket = socket_path.lstat()

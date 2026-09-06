@@ -142,7 +142,9 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
 
     def metadata(key, entry, opened, visible, owner_uid):
         # The control socket and ownership journal are never QEMU resources.
-        if key == "monitor" or (context.get("product_io", False) and key in {"run", "runtime_io", "runtime_console"}):
+        if key == "monitor" or (
+            context.get("product_io", False) and key in {"run", "runtime_io", "runtime_console", "root_disk"}
+        ):
             return original_metadata(key, entry, opened, visible, owner_uid)
         broker = context.get("broker")
         target = (
@@ -257,8 +259,12 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
         uid, gid = fixture["_parse_qemu_dac_baselabel"](conn.getCapabilities())
         specifications = fixture["_qualification_acl_specifications"](root, resolved.xml)
         if product_io:
+            import xml.etree.ElementTree as ET
+
+            root_source = ET.fromstring(resolved.xml).find("./devices/disk/target[@dev='vda']/../source")
+            assert root_source is not None
             specifications = fixture["_without_product_access_grants"](
-                specifications, roots, roots.runs / binding.record.name
+                specifications, roots, roots.runs / binding.record.name, Path(root_source.attrib["file"])
             )
         broker = fixture["_QualificationDACBroker"](root, uid, specifications)
         context["broker"] = broker

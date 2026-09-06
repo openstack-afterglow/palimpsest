@@ -467,6 +467,33 @@ does not supply an external trust anchor against wholesale same-UID offline
 replacement of state plus all evidence. Store/CAS, external parent paths, BOOT,
 root disks, relabeling, public dispatch and Gate 2 remain outside this segment.
 
+Slice 30S adds generation-bound access for the exact writable root raw file.
+An immutable run receipt and a durable per-volume fence bind the original
+monitor attempt, attached owner/generation, lower graph, filesystem UUID,
+file inode/size and QEMU principal. Enrollment evidence makes missing permission
+history a refusal rather than an ungranted fallback. Permission transitions
+hold the existing run lock followed by the volume lock.
+Unmanaged lifecycle transitions also verify owner-only file permissions, which
+prevents losing both access-evidence files from releasing a granted disk. This
+does not authenticate history after same-UID removal of all enrollment evidence
+and restoration of the private baseline.
+
+Grant publishes intent before the exact named-QEMU `rw-` ACL and completes
+only after readback/fsync. Revoke requires the completed 30L cleanup, original
+terminal STALE journal writer and both domain identifiers absent. Retain,
+release/delete and successor claim require restored permissions. The retained
+volume keeps its bytes and lower graph; a new generation has its own access
+authority. Fresh-exec pins a managed root FD and validates the current fence,
+while allowing guest content and timestamp changes.
+
+The native stale-cleanup child removes the root raw file from both fixture
+brokers, alongside the five 30R targets. It verifies product grants and
+restoration, LIVE-writer refusal and preserved root bytes during revoke, then
+boots the retained root through the existing successor qualification. That
+successor still uses fixture access. Root-volume parent traversal, BOOT and
+shared immutable exports, relabeling and public `run`/`run -d` remain subsequent
+work; this slice does not activate Gate 2 or a two-VM native shared lifetime.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

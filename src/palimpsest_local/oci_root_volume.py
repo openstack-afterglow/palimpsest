@@ -479,6 +479,9 @@ def claim_oci_root_volume(
             raise StateError("OCI-root volume artifact and owner record are inconsistent")
         if record_exists:
             record = _read_record(directory_fd, record_path)
+            from .oci_root_access import require_root_access_revoked
+
+            require_root_access_revoked(roots, record)
             if (
                 record.volume_id != volume_id
                 or record.size_bytes != size_bytes
@@ -551,6 +554,10 @@ def claim_oci_root_volume(
             _write_record(directory_fd, record_path, claimed)
             return ClaimedOCIRootVolume(claimed, path, False, True)
 
+        from .oci_root_access import _evidence
+
+        if _evidence(roots, volume_id) != (None, None):
+            raise StateError("enrolled OCI-root volume ID cannot be recreated")
         creating = OCIRootVolumeRecord(
             volume_id,
             size_bytes,
@@ -607,6 +614,7 @@ def load_oci_root_volume(
     volume_id: str,
     *,
     runner: CommandRunner = _default_runner,
+    root_access=None,
 ) -> VerifiedOCIRootVolume:
     path, record_path, lock_path = _paths(roots, volume_id)
     with file_lock(lock_path), _root_authority(roots) as directory_fd:
@@ -618,17 +626,31 @@ def load_oci_root_volume(
             entry = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
             file_fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
             opened = os.fstat(file_fd)
+            from .oci_root_access import verify_volume_root_access
+
+            managed = verify_volume_root_access(roots, record, file_fd, receipt=root_access)
             if (
                 not stat.S_ISREG(entry.st_mode)
                 or not stat.S_ISREG(opened.st_mode)
                 or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
                 or opened.st_uid != os.geteuid()
                 or opened.st_nlink != 1
-                or stat.S_IMODE(opened.st_mode) != 0o600
+                or (not managed and stat.S_IMODE(opened.st_mode) != 0o600)
                 or opened.st_size != record.size_bytes
             ):
                 raise StateError("OCI-root volume data file is unsafe")
-            _verify_kvm_path(path, record.size_bytes, oci_root_volume_label(volume_id), runner)
+
+            def verify_access():
+                if _read_record(directory_fd, record_path) != record:
+                    raise StateError("OCI-root volume generation changed")
+                verify_volume_root_access(roots, record, file_fd, receipt=root_access)
+
+            if managed:
+                _verify_kvm_path(
+                    path, record.size_bytes, oci_root_volume_label(volume_id), runner, access_validator=verify_access
+                )
+            else:
+                _verify_kvm_path(path, record.size_bytes, oci_root_volume_label(volume_id), runner)
             visible = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
             if (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
                 raise StateError("OCI-root volume data file changed during verification")
@@ -649,8 +671,8 @@ def load_oci_root_volume(
                 after.st_uid,
                 after.st_nlink,
                 after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
+                None if managed else after.st_mtime_ns,
+                None if managed else after.st_ctime_ns,
             ) != (
                 opened.st_dev,
                 opened.st_ino,
@@ -658,10 +680,12 @@ def load_oci_root_volume(
                 opened.st_uid,
                 opened.st_nlink,
                 opened.st_size,
-                opened.st_mtime_ns,
-                opened.st_ctime_ns,
+                None if managed else opened.st_mtime_ns,
+                None if managed else opened.st_ctime_ns,
             ) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
                 raise StateError("OCI-root volume data file changed during verification")
+            if managed:
+                verify_access()
         except StateError:
             raise
         except (OSError, ValueError, ArtifactValidationError):
@@ -702,6 +726,9 @@ def _locked_exact_root_volume(
     with _RetentionVolumeLock(roots, lock_path) as volume_lock, _root_authority(roots) as directory_fd:
         directory_identity = os.fstat(directory_fd)
         current = _read_record(directory_fd, record_path)
+        from .oci_root_access import require_root_access_revoked
+
+        require_root_access_revoked(roots, current)
         if current not in (expected, retained):
             raise StateError("root retention attachment generation changed")
         file_fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
@@ -722,6 +749,7 @@ def _locked_exact_root_volume(
 
             def verify(expected_current: OCIRootVolumeRecord) -> None:
                 volume_lock.verify()
+                require_root_access_revoked(roots, expected_current)
                 held_directory = os.fstat(directory_fd)
                 visible_directory = os.stat(roots.oci_root_volumes, follow_symlinks=False)
                 if any(
@@ -825,6 +853,9 @@ def release_oci_root_volume(
         ):
             raise StateError("OCI-root volume release binding is invalid")
         should_delete = record.retention_policy == "delete" if delete is None else delete
+        from .oci_root_access import require_root_access_revoked
+
+        require_root_access_revoked(roots, record, allow_deleting=should_delete)
         if not should_delete:
             if record.status != "attached":
                 raise StateError("deleting OCI-root volume cannot be retained")
@@ -856,6 +887,15 @@ def release_oci_root_volume(
                 record.generation + 1,
             )
             _write_record(directory_fd, record_path, deleting)
+        from .oci_root_access import validate_root_deletion_path
+
+        def validate_deletion(candidate):
+            if _read_record(directory_fd, record_path) != deleting:
+                raise StateError("OCI-root deletion generation changed")
+            validate_root_deletion_path(roots, deleting, candidate)
+            if _read_record(directory_fd, record_path) != deleting:
+                raise StateError("OCI-root deletion generation changed")
+
         _delete_ext4_raw_file_locked(
             path,
             deleting.size_bytes,
@@ -863,6 +903,7 @@ def release_oci_root_volume(
             volume_id,
             runner,
             quarantine_path=_deletion_quarantine(roots, volume_id),
+            access_validator=validate_deletion,
         )
         _remove_record(directory_fd, record_path)
         return None

@@ -961,7 +961,9 @@ def commit_oci_root_domain_plan(
         raise StateError("OCI-root domain plan lower lease binding is invalid")
     if plan.process != OCIProcessSpec.from_dict(transaction.boot_plan["process"]):
         raise StateError("OCI-root domain plan process binding is invalid")
-    verified_root = load_oci_root_volume(roots, transaction.volume_id, runner=runner)
+    verified_root = load_oci_root_volume(
+        roots, transaction.volume_id, runner=runner, root_access=snapshot.state.get("oci_root_access")
+    )
     root = verified_root.record
     expected_root = {
         "filesystem": "ext4",
@@ -1172,7 +1174,9 @@ def resolve_committed_oci_root_domain_plan(
     if plan.process != OCIProcessSpec.from_dict(transaction.boot_plan["process"]):
         raise StateError("OCI-root domain plan process binding is invalid")
 
-    verified_root = load_oci_root_volume(roots, transaction.volume_id, runner=runner)
+    verified_root = load_oci_root_volume(
+        roots, transaction.volume_id, runner=runner, root_access=snapshot.state.get("oci_root_access")
+    )
     root = verified_root.record
     root_contract = {
         "filesystem": "ext4",

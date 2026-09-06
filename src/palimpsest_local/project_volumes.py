@@ -246,7 +246,16 @@ def kvm_volume_label(project: str, name: str) -> str:
     return "pali-" + hashlib.sha256(f"palimpsest-kvm-volume-v1\0{project}\0{name}".encode()).hexdigest()[:8]
 
 
-def _verify_kvm_path(path: Path, size_bytes: int, expected_label: str, runner: CommandRunner) -> None:
+def _verify_kvm_path(
+    path: Path,
+    size_bytes: int,
+    expected_label: str,
+    runner: CommandRunner,
+    *,
+    access_validator: Callable[[], None] | None = None,
+) -> None:
+    if access_validator is not None:
+        access_validator()
     if path.is_symlink():
         raise StateError(f"KVM volume path must not be a symlink: {path}")
     try:
@@ -260,7 +269,7 @@ def _verify_kvm_path(path: Path, size_bytes: int, expected_label: str, runner: C
     if metadata.st_uid != os.getuid():
         raise StateError(f"KVM volume is not owned by the current user: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
-    if mode & 0o077 or mode & 0o600 != 0o600:
+    if access_validator is None and (mode & 0o077 or mode & 0o600 != 0o600):
         raise StateError(f"KVM volume permissions must be owner-only and writable: {path}")
     if metadata.st_nlink != 1:
         raise StateError(f"KVM volume must not be hard-linked: {path}")
@@ -275,6 +284,8 @@ def _verify_kvm_path(path: Path, size_bytes: int, expected_label: str, runner: C
         raise StateError(f"KVM raw volume unexpectedly has a backing file: {path.name}")
     if not _has_ext4_superblock(path, expected_label=expected_label):
         raise StateError(f"KVM volume is not ext4 with expected label {expected_label!r}: {path.name}")
+    if access_validator is not None:
+        access_validator()
 
 
 def verify_kvm_volume(
@@ -514,6 +525,7 @@ def _delete_ext4_raw_file_locked(
     runner: CommandRunner,
     quarantine_validator: Callable[[Path, Path], None] | None = None,
     quarantine_path: Path | None = None,
+    access_validator: Callable[[Path], None] | None = None,
 ) -> bool:
     """Verify and quarantine-delete one locked raw ext4 artifact."""
     quarantine = quarantine_path
@@ -523,13 +535,21 @@ def _delete_ext4_raw_file_locked(
         if quarantine.exists() or quarantine.is_symlink():
             if path.exists() or path.is_symlink():
                 raise StateError(f"KVM volume and quarantine both exist: {path}")
+            if access_validator is not None:
+                access_validator(quarantine)
             _verify_kvm_path(quarantine, size_bytes, label, runner)
+            if access_validator is not None:
+                access_validator(quarantine)
             quarantine.unlink()
             state.fsync_directory(path.parent)
             return True
     if not path.exists() and not path.is_symlink():
         return False
+    if access_validator is not None:
+        access_validator(path)
     _verify_kvm_path(path, size_bytes, label, runner)
+    if access_validator is not None:
+        access_validator(path)
     quarantine = quarantine or path.with_name(f".{logical_name}-delete-{uuid.uuid4().hex}.raw")
     try:
         os.replace(path, quarantine)
@@ -539,6 +559,8 @@ def _delete_ext4_raw_file_locked(
         if path.exists() or path.is_symlink():
             raise StateError(f"KVM volume path was recreated during deletion: {path}")
         _verify_kvm_path(quarantine, size_bytes, label, runner)
+        if access_validator is not None:
+            access_validator(quarantine)
         quarantine.unlink()
         state.fsync_directory(path.parent)
         return True

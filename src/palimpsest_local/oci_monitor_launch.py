@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v5"
+_SCHEMA = "palimpsest.monitor-launch-authority.v6"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -210,6 +210,7 @@ class MonitorLaunchAuthority:
                 "terminal_timeout_seconds",
                 "runtime_access",
                 "shared_traversal",
+                "root_access",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -223,6 +224,12 @@ class MonitorLaunchAuthority:
                 raise _invalid()
             roots = StatePaths(_path(entries["config"]["path"]), _path(entries["state"]["path"]))
             paths = _paths(roots, binding.record.name)
+            if value["root_access"] is not None:
+                from .oci_root_access import RootAccessReceipt
+                from .oci_root_volume import _paths as volume_paths
+
+                member = RootAccessReceipt.from_dict(value["root_access"])
+                paths["root_disk"] = volume_paths(roots, member.volume.volume_id)[0]
             if set(entries) != {*paths, "kernel", "initramfs"}:
                 raise _invalid()
             descriptors: set[int] = set()
@@ -289,6 +296,28 @@ class MonitorLaunchAuthority:
             ):
                 raise _invalid()
             access = self._frame["runtime_access"]
+            root_access = self._frame["root_access"]
+            from .oci_root_access import verify_root_launch_member
+
+            verify_root_launch_member(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                root_access,
+                self._frame["entries"]["run"]["fd"],
+                binding=selected,
+            )
+            if root_access is not None:
+                from .oci_root_access import verify_root_launch_access
+
+                verify_root_launch_access(
+                    StatePaths(
+                        _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                    ),
+                    root_access,
+                    self._frame["entries"]["root_disk"]["fd"],
+                    binding=selected,
+                )
             from .oci_shared_traversal import verify_shared_traversal
 
             verify_shared_traversal(
@@ -320,7 +349,7 @@ class MonitorLaunchAuthority:
                     runs_directory_fd=self._frame["entries"]["runs"]["fd"],
                 )
             for key, entry in self._frame["entries"].items():
-                is_directory = key not in {"kernel", "initramfs", "runtime_console"}
+                is_directory = key not in {"kernel", "initramfs", "runtime_console", "root_disk"}
                 opened = os.fstat(entry["fd"])
                 flags = fcntl.fcntl(entry["fd"], fcntl.F_GETFL)
                 if flags & os.O_ACCMODE != os.O_RDONLY or flags & getattr(os, "O_PATH", 0):
@@ -330,7 +359,9 @@ class MonitorLaunchAuthority:
                     visible = os.fstat(visible_fd)
                 finally:
                     os.close(visible_fd)
-                if access is not None and key in {"runtime_io", "runtime_console"}:
+                if (access is not None and key in {"runtime_io", "runtime_console"}) or (
+                    root_access is not None and key == "root_disk"
+                ):
                     # Full ACL+target policy above is mandatory, not a generic writable-mode exception.
                     for info in (opened, visible):
                         if (info.st_dev, info.st_ino) != (entry["device"], entry["inode"]):
@@ -346,6 +377,17 @@ class MonitorLaunchAuthority:
                 expected = self._frame["entries"]["monitor"]
                 if (actual.st_dev, actual.st_ino) != (expected["device"], expected["inode"]):
                     raise _invalid()
+            from .oci_root_access import verify_root_launch_tail
+
+            verify_root_launch_tail(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                root_access,
+                self._frame["entries"]["run"]["fd"],
+                self._frame["entries"].get("root_disk", {}).get("fd"),
+                binding=selected,
+            )
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
 
@@ -455,9 +497,16 @@ def prepare_monitor_launch_authority(
             with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
                 runtime_access = mutation.mutable_state().get("oci_runtime_access")
                 shared_traversal = mutation.mutable_state().get("oci_shared_traversal")
+                root_access = mutation.mutable_state().get("oci_root_access")
+                if root_access is not None:
+                    from .oci_root_access import RootAccessReceipt
+                    from .oci_root_volume import _paths as volume_paths
+
+                    member = RootAccessReceipt.from_dict(root_access)
+                    paths["root_disk"] = volume_paths(roots, member.volume.volume_id)[0]
                 for name, path in paths.items():
                     path = _path(str(path))
-                    fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console"})
+                    fd = _open(path, directory=name not in {"kernel", "initramfs", "runtime_console", "root_disk"})
                     opened.append(fd)
                     entries[name] = _entry(path, fd)
                 runtime_io.verify(require_socket_absent=True)
@@ -475,6 +524,7 @@ def prepare_monitor_launch_authority(
             "terminal_timeout_seconds": _timeout(terminal_timeout_seconds),
             "runtime_access": runtime_access,
             "shared_traversal": shared_traversal,
+            "root_access": root_access,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

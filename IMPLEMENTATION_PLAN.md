@@ -1576,6 +1576,46 @@ claim a simultaneous two-VM native lifetime.
 Shared store/CAS paths, external ancestors, BOOT and root-disk access, relabeling,
 public dispatch, endpoint deletion and Gate 2 remain outside this slice.
 
+### PR 4 slice 30S: bind root-file access to exclusive volume ownership
+
+The next private access segment is the exact writable root raw file. Its
+immutable run receipt binds the monitor attempt, attached volume generation,
+run owner, lower graph, filesystem UUID, file identity and canonical QEMU DAC
+principal. A separate durable volume fence records permission transitions;
+an enrollment marker prevents loss of that fence from silently selecting the
+legacy ungranted path. The existing run-then-volume lock order is preserved.
+Even an ungranted lifecycle transition requires an owner-only raw file, so
+losing both access-evidence files cannot release a still-granted disk. There is
+no external history anchor against same-UID removal of all enrollment evidence
+combined with restoration of the owner-only baseline.
+
+Grant records intent before replacing the full baseline ACL with exactly one
+named-QEMU `rw-` grant. Readback and fsync precede completion. Revocation requires
+completed 30L cleanup, the original terminal STALE writer, exclusive journal
+authority and both domain identifiers absent. It restores the exact baseline
+before allowing retention, deletion or a successor claim. Interrupted operations
+resume only from their recorded ACL states, and completed replay is read-only.
+An interrupted deletion may finish from the exact quarantined inode or an
+already-absent raw file with the recorded deleting generation. The permanent
+access evidence remains after deletion; that volume UUID is not recreated.
+
+Managed loading and fresh-exec launch validate the receipt, fence and current
+attachment explicitly. Launch pins the root file descriptor, while permitting
+guest writes to change file contents and timestamps. A retained root's next
+attachment generation cannot inherit the old VM's launch authority. Legacy
+ungranted preparation remains available; no general group-writable exception
+is added to unrelated volume verification.
+Private launch authority v6 includes the root receipt and matches it against
+the current run ledger even when the frame carries no root receipt. Earlier
+v5 frames are rejected; no public state migration is involved.
+
+Native qualification promotes the stale-cleanup child's exact root file to the
+sixth product-owned ACL target in both parent and child. It checks the real ACL,
+LIVE-writer refusal, baseline restoration without changing root bytes, and the
+existing retained-root successor boot. The successor still uses the fixture
+access adapter. Root-volume ancestors, BOOT/shared exports and libvirt relabeling
+remain qualification-only. This does not enable public dispatch or Gate 2.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1594,8 +1634,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable access boundary to VM-root-disk access under its
-   volume generation lock, then BOOT/shared-artifact exports with an
+1. Extend the durable access boundary to root-volume ancestors and
+   BOOT/shared-artifact exports with an
    explicit relabel policy,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
