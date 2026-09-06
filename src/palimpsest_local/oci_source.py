@@ -1158,10 +1158,14 @@ class RegistrySource(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class LocalLayoutSource:
-    """One digest-pinned standard OCI image-layout source."""
+    """A pinned root, or a unique root pinned during the same secure snapshot.
+
+    Automatic selection never guesses between entries (even identical ones).
+    Platform selection inside a single index remains the image resolver's job.
+    """
 
     layout: Path = field(repr=False)
-    root_digest: str
+    root_digest: str | None = None
     _checkpoint: Checkpoint = field(default=_noop_checkpoint, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1169,7 +1173,8 @@ class LocalLayoutSource:
             raise ArtifactValidationError("local OCI layout path must be absolute")
         if any(component in {"", ".", ".."} for component in self.layout.parts[1:]):
             raise ArtifactValidationError("local OCI layout path must not contain relative components")
-        Descriptor(media_type="application/octet-stream", digest=self.root_digest, size=0)
+        if self.root_digest is not None:
+            Descriptor(media_type="application/octet-stream", digest=self.root_digest, size=0)
         if not callable(self._checkpoint):
             raise ArtifactValidationError("local OCI layout checkpoint must be callable")
 
@@ -1187,8 +1192,8 @@ class LocalLayoutSource:
             raise ArtifactValidationError("local OCI source URI path must be absolute")
         return cls(layout=path, root_digest=digest, _checkpoint=checkpoint)
 
-    def snapshot(self, reference: OCIImageRef, cas: SourceCAS) -> SnapshottedOCIImage:
-        if not isinstance(reference, OCIImageRef) or not isinstance(cas, SourceCAS):
+    def snapshot(self, reference: OCIImageRef | None, cas: SourceCAS) -> SnapshottedOCIImage:
+        if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
         with _open_absolute_directory(self.layout, self._checkpoint) as layout_fd:
             marker = strict_json_object(
@@ -1221,11 +1226,15 @@ class LocalLayoutSource:
                     )
                 except KeyError as exc:
                     raise ArtifactValidationError(f"OCI layout index.json manifests[{index}] is malformed") from exc
-                if parsed_descriptor.digest == self.root_digest:
+                if self.root_digest is None or parsed_descriptor.digest == self.root_digest:
                     if "data" in raw_descriptor:
                         raise ArtifactValidationError("pinned OCI layout root uses unsupported embedded data")
                     roots.append(parsed_descriptor)
             if len(roots) != 1:
+                if self.root_digest is None:
+                    raise ArtifactValidationError(
+                        "automatic OCI root selection requires exactly one descriptor; specify --manifest"
+                    )
                 raise ArtifactValidationError("OCI layout must declare the pinned root descriptor exactly once")
             root_descriptor = roots[0]
             if root_descriptor.media_type not in (
@@ -1234,6 +1243,12 @@ class LocalLayoutSource:
                 raise ArtifactValidationError("pinned OCI layout root has an unsupported media type")
             if root_descriptor.size > MAX_IMAGE_JSON_BYTES:
                 raise ArtifactValidationError("pinned OCI layout root exceeds the JSON size limit")
+            if reference is None:
+                reference = OCIImageRef(
+                    registry="local.palimpsest.invalid",
+                    repository="imported/image",
+                    requested_reference=f"local.palimpsest.invalid/imported/image@{root_descriptor.digest}",
+                )
 
             blobs_fd = _open_child_directory(layout_fd, "blobs", self._checkpoint)
             sha256_fd: int | None = None
@@ -1324,10 +1339,10 @@ def _write_archive_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tar
 
 @dataclass(frozen=True, slots=True)
 class LocalArchiveSource:
-    """One digest-pinned, uncompressed standard OCI image archive."""
+    """An uncompressed OCI archive, pinned explicitly or within its snapshot."""
 
     archive: Path = field(repr=False)
-    root_digest: str
+    root_digest: str | None = None
     _checkpoint: Checkpoint = field(default=_noop_checkpoint, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1335,7 +1350,8 @@ class LocalArchiveSource:
             raise ArtifactValidationError("local OCI archive path must be absolute")
         if any(component in {"", ".", ".."} for component in self.archive.parts[1:]):
             raise ArtifactValidationError("local OCI archive path must not contain relative components")
-        Descriptor(media_type="application/octet-stream", digest=self.root_digest, size=0)
+        if self.root_digest is not None:
+            Descriptor(media_type="application/octet-stream", digest=self.root_digest, size=0)
         if not callable(self._checkpoint):
             raise ArtifactValidationError("local OCI archive checkpoint must be callable")
 
@@ -1353,8 +1369,8 @@ class LocalArchiveSource:
             raise ArtifactValidationError("local OCI source URI path must be absolute")
         return cls(archive=path, root_digest=digest, _checkpoint=checkpoint)
 
-    def snapshot(self, reference: OCIImageRef, cas: SourceCAS) -> SnapshottedOCIImage:
-        if not isinstance(reference, OCIImageRef) or not isinstance(cas, SourceCAS):
+    def snapshot(self, reference: OCIImageRef | None, cas: SourceCAS) -> SnapshottedOCIImage:
+        if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
         with _open_absolute_regular_file(self.archive) as (archive_fd, archive_metadata):
             with tempfile.TemporaryDirectory(prefix="palimpsest-oci-archive-") as temporary:

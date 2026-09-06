@@ -627,7 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
     oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
     oci_materialize = oci_commands.add_parser("materialize")
     oci_materialize.add_argument("source", type=Path)
-    oci_materialize.add_argument("--manifest", required=True)
+    oci_materialize.add_argument("--manifest", help="pin a root descriptor; required when the local index is ambiguous")
     oci_materialize.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
     oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
     oci_materialize.add_argument("--timeout", type=float, default=300.0)
@@ -1399,7 +1399,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             config=roots.config.resolve(strict=True),
             state=roots.state.resolve(strict=True),
         )
-        manifest_digest = require_digest(args.manifest)
+        manifest_digest = require_digest(args.manifest) if args.manifest is not None else None
         try:
             source_path = args.source.expanduser().resolve(strict=True)
         except OSError:
@@ -1415,10 +1415,14 @@ def dispatch_args(args: argparse.Namespace) -> int:
             if source_path.is_dir()
             else LocalArchiveSource(archive=source_path, root_digest=manifest_digest)
         )
-        reference = OCIImageRef(
-            registry="local.palimpsest.invalid",
-            repository="imported/image",
-            requested_reference=f"local.palimpsest.invalid/imported/image@{manifest_digest}",
+        reference = (
+            OCIImageRef(
+                registry="local.palimpsest.invalid",
+                repository="imported/image",
+                requested_reference=f"local.palimpsest.invalid/imported/image@{manifest_digest}",
+            )
+            if manifest_digest is not None
+            else None
         )
         source_cas = SourceCAS(oci_roots.oci_source_cas)
         snapshot = source.snapshot(reference, source_cas)

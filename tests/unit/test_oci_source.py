@@ -256,6 +256,77 @@ def test_direct_layout_snapshots_complete_graph_without_paths(tmp_path: Path) ->
     cas.verify_image(result)
 
 
+@pytest.mark.parametrize("archive_input", [False, True])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_local_auto_selection_pins_the_unique_root_in_verified_snapshot(tmp_path, archive_input, indexed):
+    if indexed:
+        layout, root, manifest, _config, _layer = _index_layout(tmp_path / "layout")
+    else:
+        layout, root, _config, _layers = _direct_layout(tmp_path / "layout")
+        manifest = root
+    if archive_input:
+        archive = tmp_path / "image.tar"
+        _write_oci_archive(layout.root, archive)
+        before = archive.read_bytes()
+        source = LocalArchiveSource(archive)
+    else:
+        source = LocalLayoutSource(layout.root)
+    cas = _cas(tmp_path)
+    result = source.snapshot(None, cas)
+    explicit = (
+        LocalArchiveSource(archive, root.digest) if archive_input else LocalLayoutSource(layout.root, root.digest)
+    ).snapshot(None, cas)
+    assert result.root.descriptor == root
+    assert result.manifest.descriptor == manifest
+    assert result.image.reference.requested_reference.endswith("@" + root.digest)
+    assert result.binding_digest == explicit.binding_digest
+    assert source.root_digest is None  # discovery is a snapshot, not mutable request state
+    cas.verify_image(result)
+    if archive_input:
+        assert archive.read_bytes() == before
+
+
+@pytest.mark.parametrize("archive_input", [False, True])
+@pytest.mark.parametrize("entries", ["empty", "duplicate", "different", "unsupported", "embedded"])
+def test_local_auto_selection_rejects_ambiguous_or_unsupported_roots_before_import(tmp_path, archive_input, entries):
+    layout, root, _config, _layers = _direct_layout(tmp_path / "layout")
+    other = {**root.to_dict(), "digest": "sha256:" + "f" * 64}
+    manifests = {
+        "empty": [],
+        "duplicate": [root.to_dict(), root.to_dict()],
+        "different": [root.to_dict(), other],
+        "unsupported": [{**root.to_dict(), "mediaType": "application/octet-stream"}],
+        "embedded": [{**root.to_dict(), "data": "not-a-blob"}],
+    }[entries]
+    (layout.root / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": manifests}))
+    if archive_input:
+        archive = tmp_path / "image.tar"
+        _write_oci_archive(layout.root, archive)
+        source = LocalArchiveSource(archive)
+    else:
+        source = LocalLayoutSource(layout.root)
+    cas = _cas(tmp_path)
+    with pytest.raises(ArtifactValidationError):
+        source.snapshot(None, cas)
+    assert list((tmp_path / "source-cas" / "blobs" / "sha256").iterdir()) == []
+
+
+def test_explicit_pin_still_selects_one_root_from_ambiguous_layout(tmp_path):
+    layout, root, _config, _layers = _direct_layout(tmp_path / "layout")
+    other = {**root.to_dict(), "digest": "sha256:" + "f" * 64}
+    (layout.root / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [other, root.to_dict()]}))
+    result = LocalLayoutSource(layout.root, root.digest).snapshot(None, _cas(tmp_path))
+    assert result.root.descriptor == root
+
+
+def test_auto_selected_root_is_content_verified_not_just_index_metadata(tmp_path):
+    layout, root, _config, _layers = _direct_layout(tmp_path / "layout")
+    blob = layout.blobs / root.digest.removeprefix("sha256:")
+    blob.write_bytes(b"x" * root.size)
+    with pytest.raises(ArtifactValidationError):
+        LocalLayoutSource(layout.root).snapshot(None, _cas(tmp_path))
+
+
 def test_index_snapshots_only_selected_platform_graph(tmp_path: Path) -> None:
     layout, index, manifest, config, layer = _index_layout(tmp_path / "layout")
 

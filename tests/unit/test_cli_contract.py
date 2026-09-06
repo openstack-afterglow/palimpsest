@@ -392,8 +392,9 @@ def test_parser_accepts_additive_buildkit_dockerfile_surface():
     assert parsed.runtime_block_size == 262144
 
 
+@pytest.mark.parametrize("automatic", [False, True])
 def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], automatic: bool
 ) -> None:
     real_state_home = tmp_path / "real-state-home"
     real_state_home.mkdir()
@@ -443,8 +444,7 @@ def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
             "oci",
             "materialize",
             str(source_alias / archive.name),
-            "--manifest",
-            manifest,
+            *([] if automatic else ["--manifest", manifest]),
             "--packer",
             str(packer),
             "--timeout",
@@ -454,7 +454,9 @@ def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
 
     assert result == 0
     assert calls["archive"] == archive.resolve()
-    assert calls["root_digest"] == manifest
+    assert calls["root_digest"] == (None if automatic else manifest)
+    if automatic:
+        assert calls["reference"] is None
     assert calls["snapshot"] is snapshot
     materialize = calls["materialize"]
     assert isinstance(materialize, dict)
