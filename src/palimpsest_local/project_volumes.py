@@ -389,8 +389,11 @@ def _ensure_ext4_raw_file_locked(
     runner: CommandRunner,
     creation_temp_path: Path | None = None,
     filesystem_uuid: str | None = None,
+    parent_validator: Callable[[], None] | None = None,
 ) -> bool:
     """Create or verify one locked raw ext4 artifact at an owner-bound path."""
+    if parent_validator is not None:
+        parent_validator()
     if creation_temp_path is not None:
         if creation_temp_path.parent != path.parent or creation_temp_path == path:
             raise StateError("KVM volume creation temporary path is invalid")
@@ -410,6 +413,8 @@ def _ensure_ext4_raw_file_locked(
             _verify_kvm_path(path, size_bytes, label, runner)
             if filesystem_uuid is not None:
                 _verify_new_oci_root_ext4(path, size_bytes, filesystem_uuid)
+            if parent_validator is not None:
+                parent_validator()
             return True
         if temporary_exists:
             temporary_entry = creation_temp_path.stat(follow_symlinks=False)
@@ -425,11 +430,16 @@ def _ensure_ext4_raw_file_locked(
         _verify_kvm_path(path, size_bytes, label, runner)
         if filesystem_uuid is not None:
             _verify_new_oci_root_ext4(path, size_bytes, filesystem_uuid)
+        if parent_validator is not None:
+            parent_validator()
         return False
 
     _preflight_kvm_tools(runner)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    if parent_validator is None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+    else:
+        parent_validator()
     if creation_temp_path is None:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{logical_name}-",
@@ -492,6 +502,8 @@ def _ensure_ext4_raw_file_locked(
         _verify_kvm_path(temporary, size_bytes, label, runner)
         if filesystem_uuid is not None:
             _verify_new_oci_root_ext4(temporary, size_bytes, filesystem_uuid)
+        if parent_validator is not None:
+            parent_validator()
 
         try:
             os.link(temporary, path, follow_symlinks=False)
@@ -514,6 +526,8 @@ def _ensure_ext4_raw_file_locked(
                 pass
         temporary.unlink(missing_ok=True)
         raise
+    if parent_validator is not None:
+        parent_validator()
     return True
 
 

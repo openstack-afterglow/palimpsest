@@ -913,8 +913,16 @@ def _qualification_runtime_io_adapter(original, get_broker):
 
 
 def _without_product_access_grants(specifications, roots: StatePaths, run_root: Path, root_disk: Path):
-    """Keep fixture access separate from the six production ACL targets."""
-    selected = {roots.state, roots.runs, run_root, run_root / "io", run_root / "io" / "console.log", root_disk}
+    """Keep fixture access separate from the seven production ACL targets."""
+    selected = {
+        roots.state,
+        roots.runs,
+        roots.oci_root_volumes,
+        run_root,
+        run_root / "io",
+        run_root / "io" / "console.log",
+        root_disk,
+    }
     assert {path for path, _, _ in specifications if path in selected} == selected
     return tuple(item for item in specifications if item[0] not in selected)
 
@@ -952,11 +960,33 @@ def _assert_product_root_acl(root_disk: Path, uid: int, *, granted: bool):
             assert (info.st_dev, info.st_ino, info.st_size) == (before.st_dev, before.st_ino, before.st_size)
     finally:
         os.close(descriptor)
+    # Search permission on the parent must not expose its trusted volume record.
+    record = root_disk.with_suffix(".json")
+    descriptor = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(descriptor)
+        assert stat.S_ISREG(opened.st_mode)
+        assert stat.S_IMODE(opened.st_mode) == 0o600
+        assert opened.st_uid == os.geteuid() and opened.st_nlink == 1
+        assert LinuxFdACLBackend().read_acl(descriptor) == baseline_acl(directory=False)
+        visible = record.lstat()
+        assert (visible.st_dev, visible.st_ino) == (opened.st_dev, opened.st_ino)
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize(
     "failure",
-    ["console-grant", "io-grant", "run-grant", "shared-runs-grant", "shared-state-grant", "root-grant", "replay"],
+    [
+        "console-grant",
+        "io-grant",
+        "run-grant",
+        "shared-root-volumes-grant",
+        "shared-runs-grant",
+        "shared-state-grant",
+        "root-grant",
+        "replay",
+    ],
 )
 def test_product_access_failure_before_spawn_retains_pending_authority(failure):
     state = _QualificationProductIOState()
@@ -968,6 +998,7 @@ def test_product_access_failure_before_spawn_retains_pending_authority(failure):
             "console-grant",
             "io-grant",
             "run-grant",
+            "shared-root-volumes-grant",
             "shared-runs-grant",
             "shared-state-grant",
             "root-grant",
@@ -984,6 +1015,7 @@ def test_product_access_failure_before_spawn_retains_pending_authority(failure):
         "console-grant",
         "io-grant",
         "run-grant",
+        "shared-root-volumes-grant",
         "shared-runs-grant",
         "shared-state-grant",
         "root-grant",
@@ -1025,7 +1057,7 @@ def _assert_product_shared_acl(roots: StatePaths, uid: int, *, granted: bool) ->
 
     backend = LinuxFdACLBackend()
     assert uid not in {0, os.geteuid()}
-    for path in (roots.state, roots.runs):
+    for path in (roots.state, roots.runs, roots.oci_root_volumes):
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             opened = os.fstat(descriptor)
@@ -1080,14 +1112,16 @@ class _QualificationProductACLBackend:
     """Observe real product writes without changing ACL or metadata decisions."""
 
     def __init__(
-        self, run_root: Path, *, shared_roots: tuple[Path, Path] = (), root_disk: Path | None = None, backend=None
+        self, run_root: Path, *, shared_roots: tuple[Path, Path, Path] = (), root_disk: Path | None = None, backend=None
     ):
         from palimpsest_local.oci_acl import LinuxFdACLBackend
 
         self.backend = backend or LinuxFdACLBackend()
         self.targets = {}
         self.writes = []
-        shared_targets = (("state", shared_roots[0]), ("runs", shared_roots[1])) if shared_roots else ()
+        shared_targets = (
+            tuple(zip(("state", "runs", "root_volumes"), shared_roots, strict=True)) if shared_roots else ()
+        )
         targets = (
             shared_targets
             + ((("root_disk", root_disk),) if root_disk is not None else ())
@@ -1165,7 +1199,7 @@ def test_product_acl_observer_does_not_normalize_or_write_unrecorded_target(tmp_
         os.close(unrelated)
 
 
-def test_product_access_filter_removes_only_exact_six_owned_targets(tmp_path):
+def test_product_access_filter_removes_only_exact_seven_owned_targets(tmp_path):
     roots = StatePaths(tmp_path / "config", tmp_path / "state")
     run = tmp_path / "run"
     root_disk = tmp_path / "root.raw"
@@ -1176,15 +1210,16 @@ def test_product_access_filter_removes_only_exact_six_owned_targets(tmp_path):
         (run / "io", "directory", "-wx"),
         (run / "io" / "console.log", "regular", "rw-"),
         (root_disk, "regular", "rw-"),
+        (roots.oci_root_volumes, "directory", "--x"),
         (tmp_path / "other" / "io", "directory", "-wx"),
         (tmp_path / "boot", "regular", "r--"),
     )
     assert _without_product_access_grants(specifications, roots, run, root_disk) == (
-        specifications[6],
         specifications[7],
+        specifications[8],
     )
     with pytest.raises(AssertionError):
-        _without_product_access_grants(specifications[:5], roots, run, root_disk)
+        _without_product_access_grants(specifications[:6], roots, run, root_disk)
 
 
 def _assert_qualification_io_boundary(broker, run_root: Path, *, product_io: bool = False) -> None:
@@ -3399,7 +3434,9 @@ def _launch_in_exec_monitor(
                 if product_io:
                     assert root_disk is not None
                     assert all(target.path != root_disk for target in broker.targets)
+                    assert all(target.path != roots.oci_root_volumes for target in broker.targets)
                     _assert_product_root_acl(root_disk, broker.uid, granted=True)
+                    _assert_product_shared_acl(roots, broker.uid, granted=True)
                 # The clean launcher has already exited. Its child owns a real
                 # VM and must still answer IPC while its worker waits in create.
                 assert monitor_ipc.discover_monitor_exec(directory_fd, binding) == endpoint
@@ -4157,7 +4194,9 @@ def test_live_oci_root(
             from palimpsest_local.oci_runtime_access import grant_oci_runtime_access
             from palimpsest_local.oci_shared_traversal import join_oci_shared_traversal
 
-            product_backend = _QualificationProductACLBackend(roots.runs / name, shared_roots=(roots.state, roots.runs))
+            product_backend = _QualificationProductACLBackend(
+                roots.runs / name, shared_roots=(roots.state, roots.runs, roots.oci_root_volumes)
+            )
             access = product_access.grant(
                 lambda: grant_oci_runtime_access(roots, monitor_binding, conn=conn, acl_backend=product_backend)
             )
@@ -4171,6 +4210,7 @@ def test_live_oci_root(
                 "console",
                 "directory",
                 "run",
+                "root_volumes",
                 "runs",
                 "state",
             ]
@@ -4190,6 +4230,7 @@ def test_live_oci_root(
                 "console",
                 "directory",
                 "run",
+                "root_volumes",
                 "runs",
                 "state",
             ]
@@ -4368,7 +4409,7 @@ def test_live_oci_root(
                 assert root_revoked == root_access
                 assert [role for role, _acl in root_backend.writes] == ["root_disk"]
                 product_backend = _QualificationProductACLBackend(
-                    roots.runs / name, shared_roots=(roots.state, roots.runs)
+                    roots.runs / name, shared_roots=(roots.state, roots.runs, roots.oci_root_volumes)
                 )
                 revoked = revoke_oci_runtime_access(
                     roots, monitor_binding, conn=counted_conn, acl_backend=product_backend
@@ -4385,6 +4426,7 @@ def test_live_oci_root(
                     "console",
                     "state",
                     "runs",
+                    "root_volumes",
                 ]
                 revoked_state = read_run_ledger_snapshot(roots, name).state
                 revoke_ignored = {"oci_runtime_access", "oci_shared_traversal", "lifecycle_revision"}
@@ -4405,6 +4447,7 @@ def test_live_oci_root(
                     "console",
                     "state",
                     "runs",
+                    "root_volumes",
                 ]
                 assert read_run_ledger_snapshot(roots, name).state == revoked_state
                 assert (
@@ -4414,6 +4457,7 @@ def test_live_oci_root(
                 assert [role for role, _acl in root_backend.writes] == ["root_disk"]
                 assert stat.S_IMODE(roots.state.stat().st_mode) == 0o700
                 assert stat.S_IMODE(roots.runs.stat().st_mode) == 0o700
+                assert stat.S_IMODE(roots.oci_root_volumes.stat().st_mode) == 0o700
                 assert stat.S_IMODE((roots.runs / name).stat().st_mode) == 0o700
                 assert stat.S_IMODE((roots.runs / name / "io").stat().st_mode) == 0o700
                 assert stat.S_IMODE(console_path.stat().st_mode) == 0o600

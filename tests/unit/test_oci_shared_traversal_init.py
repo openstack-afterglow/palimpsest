@@ -121,7 +121,7 @@ def _empty_managed_epoch(case, member):
     try:
         registry = dict(ns.registry)
         registry["members"] = {shared._key(member): replace(member, phase="left").to_dict()}
-        for role in ("state", "runs"):
+        for role in ("state", "runs", "root_volumes"):
             case.backend.write_acl(ns.fds[role], baseline_acl(directory=True))
         ns.write(registry)
     finally:

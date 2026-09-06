@@ -30,7 +30,11 @@ def case(tmp_path, monkeypatch):
     original = backend.write_acl
     namespace_ids = {
         (path.stat().st_dev, path.stat().st_ino): role
-        for role, path in (("state", value.roots.state), ("runs", value.roots.runs))
+        for role, path in (
+            ("state", value.roots.state),
+            ("runs", value.roots.runs),
+            ("root_volumes", value.roots.oci_root_volumes),
+        )
     }
 
     def write(fd, acl):
@@ -137,7 +141,7 @@ def test_first_join_and_final_leave_preserve_evidence_and_order(case, monkeypatc
     before = json.loads(case.state.read_bytes())
     member = _join(case)
     assert member.phase == "active"
-    assert [role for role, _ in case.backend.writes] == ["runs", "state"]
+    assert [role for role, _ in case.backend.writes] == ["root_volumes", "runs", "state"]
     assert _verify(case, member) == member
     after = json.loads(case.state.read_bytes())
     for key, value in before.items():
@@ -146,7 +150,7 @@ def test_first_join_and_final_leave_preserve_evidence_and_order(case, monkeypatc
     _finish(case, monkeypatch, request)
     member = _leave(case)
     assert member.phase == "left"
-    assert [role for role, _ in case.backend.writes] == ["state", "runs"]
+    assert [role for role, _ in case.backend.writes] == ["state", "runs", "root_volumes"]
     registry = json.loads((case.roots.locks / shared._REGISTRY).read_bytes())
     assert registry["pending"] is None and not shared._active(registry)
     assert registry["members"] == {}
@@ -176,7 +180,7 @@ def test_two_runs_nonfinal_leave_never_changes_ancestor_acl_or_fsync(case, monke
     assert _verify(second, second_member) == second_member
     _finish(second, monkeypatch, request)
     assert _leave(second).phase == "left"
-    assert [role for role, _ in case.backend.writes] == ["state", "runs"]
+    assert [role for role, _ in case.backend.writes] == ["state", "runs", "root_volumes"]
 
 
 @pytest.mark.parametrize("operation", ["join", "leave"])
@@ -306,7 +310,19 @@ def test_durable_registry_ahead_of_run_ledger_is_resumable(case, monkeypatch, re
 
 
 @pytest.mark.parametrize("operation", ["join", "leave"])
-@pytest.mark.parametrize("bits", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "bits",
+    [
+        (False, False, False),
+        (False, False, True),
+        (False, True, True),
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
 def test_partial_registry_accepts_only_exact_acl_prefixes(case, monkeypatch, request, operation, bits):
     _join(case)
     if operation == "leave":
@@ -322,13 +338,13 @@ def test_partial_registry_accepts_only_exact_acl_prefixes(case, monkeypatch, req
             registry["members"] = {}
         registry["pending"] = pending.to_dict()
         ns.write(registry)
-        for role, granted in zip(("state", "runs"), bits, strict=True):
+        for role, granted in zip(("state", "runs", "root_volumes"), bits, strict=True):
             target = getattr(member, role)
             case.backend.write_acl(ns.fds[role], target.granted if granted else target.baseline)
     finally:
         ns.close()
     case.backend.writes.clear()
-    if bits == (True, False):
+    if bits not in {(False, False, False), (False, False, True), (False, True, True), (True, True, True)}:
         with pytest.raises(StateError):
             (_join if operation == "join" else _leave)(case)
         assert case.backend.writes == []
@@ -336,7 +352,7 @@ def test_partial_registry_accepts_only_exact_acl_prefixes(case, monkeypatch, req
         assert (_join if operation == "join" else _leave)(case).phase == ("active" if operation == "join" else "left")
 
 
-def test_concurrent_duplicate_first_join_is_one_membership_and_two_acl_writes(case):
+def test_concurrent_duplicate_first_join_is_one_membership_and_three_acl_writes(case):
     start = threading.Barrier(2)
 
     def join():
@@ -346,7 +362,7 @@ def test_concurrent_duplicate_first_join_is_one_membership_and_two_acl_writes(ca
     with ThreadPoolExecutor(max_workers=2) as executor:
         first, second = list(executor.map(lambda _: join(), range(2)))
     assert first == second
-    assert [role for role, _ in case.backend.writes] == ["runs", "state"]
+    assert [role for role, _ in case.backend.writes] == ["root_volumes", "runs", "state"]
     registry = json.loads((case.roots.locks / shared._REGISTRY).read_bytes())
     assert len(registry["members"]) == 1
 
@@ -379,7 +395,14 @@ def test_final_leave_and_new_join_serialize_and_advance_empty_epoch(case, monkey
         member = future.result(timeout=5)
     assert member.epoch == first.epoch + 1
     assert _verify(second, member) == member
-    assert [role for role, _ in case.backend.writes] == ["state", "runs", "runs", "state"]
+    assert [role for role, _ in case.backend.writes] == [
+        "state",
+        "runs",
+        "root_volumes",
+        "root_volumes",
+        "runs",
+        "state",
+    ]
 
 
 def test_initial_enable_refuses_another_unregistered_active_ledger(case):
@@ -564,6 +587,7 @@ def test_join_reserves_completed_registry_capacity_before_pending_intent(case, m
         second.binding,
         access.RuntimeAccessTarget.from_dict(raw["state"]),
         access.RuntimeAccessTarget.from_dict(raw["runs"]),
+        access.RuntimeAccessTarget.from_dict(raw["root_volumes"]),
         receipt.qemu_uid,
         receipt.qemu_gid,
         "joining",

@@ -494,6 +494,34 @@ successor still uses fixture access. Root-volume parent traversal, BOOT and
 shared immutable exports, relabeling and public `run`/`run -d` remain subsequent
 work; this slice does not activate Gate 2 or a two-VM native shared lifetime.
 
+Slice 30T extends that same shared namespace to `state/oci-root-volumes`.
+All three parents share the existing member set and lock, with first grant
+ordered `root_volumes -> runs -> state` and final restore in reverse. The root
+parent receives exactly search-only `--x`; its raw files still require their
+own generation-bound grants, and volume records remain private. Initialization
+preserves managed ACLs and refuses missing/replaced managed directory authority.
+Non-final leave keeps the remaining member's traversal unchanged.
+Creating another root file uses a scoped parent validator instead of chmod700,
+so a second VM's preparation preserves the first member's access.
+
+Registry/member v2 and launch v7 bind the third parent and inherited FD.
+Previous private contracts are refused, not silently upgraded. Read-only launch
+checks its own membership while permitting another member's legal join/leave.
+For a run with managed root access, raw-file revoke must complete before shared
+leave; the normal sequence is root revoke, runtime I/O revoke, shared leave,
+then retain/reclaim. A leftover root grant cannot be hidden by closing the
+parent and later re-exposed by another join.
+Completed leave replay is read-only historical evidence after later retention,
+successor attachment or deletion; it does not inspect or alter the new root owner.
+
+The stale-cleanup native child now uses seven product ACL targets. Both fixture
+brokers exclude the exact root-volume parent and retain only unrelated fixture
+paths. Native checks include the active parent ACL, initialization preservation
+and final baseline restoration. The retained successor remains fixture-adapted;
+two-member lifetime and survivor authority are portable evidence. BOOT/shared
+exports, external host ancestors, relabeling, public dispatch and Gate 2 remain
+outside this slice.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

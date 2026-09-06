@@ -38,7 +38,7 @@ def test_completed_grant_survives_prepared_and_serialized_authority(granted):
     before_writes = list(granted.backend.writes)
     with _prepare(granted) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v6"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v7"
         assert frame["shared_traversal"] == granted.member.to_dict()
         assert frame["runtime_access"] == granted.receipt.to_dict()
         assert frame["runtime_access"]["schema"] == "palimpsest.oci-runtime-access.v2"
@@ -338,6 +338,6 @@ def test_legacy_registry_absent_qualification_still_has_explicit_null_member(tmp
     assert not (legacy.roots.locks / shared._REGISTRY).exists()
     with _prepare(legacy) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v6"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v7"
         assert frame["shared_traversal"] is None
         authority.validate()

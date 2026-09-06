@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v6"
+_SCHEMA = "palimpsest.monitor-launch-authority.v7"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -119,7 +119,10 @@ def _validate_entry_metadata(
         if is_directory:
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner_uid or info.st_mode & 0o022:
                 raise _invalid()
-            if key not in {"config", "state", "runs", "run", "runtime_packs"} and stat.S_IMODE(info.st_mode) != 0o700:
+            if (
+                key not in {"config", "state", "runs", "run", "runtime_packs", "root_volumes"}
+                and stat.S_IMODE(info.st_mode) != 0o700
+            ):
                 raise _invalid()
         elif key == "runtime_console":
             if (
@@ -224,6 +227,8 @@ class MonitorLaunchAuthority:
                 raise _invalid()
             roots = StatePaths(_path(entries["config"]["path"]), _path(entries["state"]["path"]))
             paths = _paths(roots, binding.record.name)
+            if value["shared_traversal"] is not None:
+                paths["root_volumes"] = roots.oci_root_volumes
             if value["root_access"] is not None:
                 from .oci_root_access import RootAccessReceipt
                 from .oci_root_volume import _paths as volume_paths
@@ -329,6 +334,7 @@ class MonitorLaunchAuthority:
                 access=access,
                 state_fd=self._frame["entries"]["state"]["fd"],
                 runs_fd=self._frame["entries"]["runs"]["fd"],
+                root_volumes_fd=self._frame["entries"].get("root_volumes", {}).get("fd"),
             )
             if access is not None:
                 from .oci_runtime_access import RuntimeAccessReceipt, verify_runtime_access
@@ -387,6 +393,20 @@ class MonitorLaunchAuthority:
                 self._frame["entries"]["run"]["fd"],
                 self._frame["entries"].get("root_disk", {}).get("fd"),
                 binding=selected,
+            )
+            from .oci_shared_traversal import verify_shared_traversal_tail
+
+            verify_shared_traversal_tail(
+                StatePaths(
+                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                ),
+                self._frame["shared_traversal"],
+                binding=selected,
+                access=access,
+                state_fd=self._frame["entries"]["state"]["fd"],
+                runs_fd=self._frame["entries"]["runs"]["fd"],
+                root_volumes_fd=self._frame["entries"].get("root_volumes", {}).get("fd"),
+                run_fd=self._frame["entries"]["run"]["fd"],
             )
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
@@ -497,6 +517,8 @@ def prepare_monitor_launch_authority(
             with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
                 runtime_access = mutation.mutable_state().get("oci_runtime_access")
                 shared_traversal = mutation.mutable_state().get("oci_shared_traversal")
+                if shared_traversal is not None:
+                    paths["root_volumes"] = roots.oci_root_volumes
                 root_access = mutation.mutable_state().get("oci_root_access")
                 if root_access is not None:
                     from .oci_root_access import RootAccessReceipt

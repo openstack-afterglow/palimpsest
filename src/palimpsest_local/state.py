@@ -471,7 +471,10 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
     from .oci_shared_traversal import shared_traversal_initialization
 
     with shared_traversal_initialization(roots):
-        protected = {_identity(path.stat(follow_symlinks=False)) for path in (roots.state, roots.runs, roots.locks)}
+        protected = {
+            _identity(path.stat(follow_symlinks=False))
+            for path in (roots.state, roots.runs, roots.locks, roots.oci_root_volumes)
+        }
         for directory in (
             roots.config,
             roots.store,
@@ -484,7 +487,6 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
             roots.oci_source_cas,
             roots.projects,
             roots.volumes,
-            roots.oci_root_volumes,
         ):
             _initialize_private_root(directory, protected)
     # This cleanup acquires run locks; never nest it under the shared lock.

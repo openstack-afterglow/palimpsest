@@ -473,6 +473,12 @@ def claim_oci_root_volume(
     path, record_path, lock_path = _paths(roots, volume_id)
     label = oci_root_volume_label(volume_id)
     with file_lock(lock_path), _root_authority(roots) as directory_fd:
+        from .oci_shared_traversal import verify_shared_root_parent
+
+        def verify_parent():
+            verify_shared_root_parent(roots, directory_fd)
+
+        verify_parent()
         file_exists = path.exists() or path.is_symlink()
         record_exists = record_path.exists() or record_path.is_symlink()
         if file_exists and not record_exists:
@@ -516,6 +522,7 @@ def claim_oci_root_volume(
                     runner,
                     creation_temp_path=_creation_temporary(roots, volume_id),
                     filesystem_uuid=volume_id,
+                    parent_validator=verify_parent,
                 )
                 attached = OCIRootVolumeRecord(
                     volume_id,
@@ -527,10 +534,13 @@ def claim_oci_root_volume(
                     owner.run_name,
                     record.generation + 1,
                 )
+                verify_parent()
                 _write_record(directory_fd, record_path, attached)
+                verify_parent()
                 return ClaimedOCIRootVolume(attached, path, True, False)
             if file_exists:
                 _verify_kvm_path(path, size_bytes, label, runner)
+                verify_parent()
             if record.status == "deleting":
                 raise StateError("OCI-root volume deletion must be reconciled before reuse")
             if record.status == "attached":
@@ -540,6 +550,7 @@ def claim_oci_root_volume(
                     or record.retention_policy != retention_policy
                 ):
                     raise StateError("OCI-root volume is attached to another run")
+                verify_parent()
                 return ClaimedOCIRootVolume(record, path, False, False)
             claimed = OCIRootVolumeRecord(
                 volume_id,
@@ -551,7 +562,9 @@ def claim_oci_root_volume(
                 owner.run_name,
                 record.generation + 1,
             )
+            verify_parent()
             _write_record(directory_fd, record_path, claimed)
+            verify_parent()
             return ClaimedOCIRootVolume(claimed, path, False, True)
 
         from .oci_root_access import _evidence
@@ -568,7 +581,9 @@ def claim_oci_root_volume(
             owner.run_name,
             1,
         )
+        verify_parent()
         _write_record(directory_fd, record_path, creating)
+        verify_parent()
         try:
             created = _ensure_ext4_raw_file_locked(
                 path,
@@ -578,6 +593,7 @@ def claim_oci_root_volume(
                 runner,
                 creation_temp_path=_creation_temporary(roots, volume_id),
                 filesystem_uuid=volume_id,
+                parent_validator=verify_parent,
             )
             if not created:
                 raise StateError("OCI-root volume appeared without an owner record")
@@ -591,7 +607,9 @@ def claim_oci_root_volume(
                 owner.run_name,
                 2,
             )
+            verify_parent()
             _write_record(directory_fd, record_path, record)
+            verify_parent()
         except BaseException:
             try:
                 _delete_ext4_raw_file_locked(

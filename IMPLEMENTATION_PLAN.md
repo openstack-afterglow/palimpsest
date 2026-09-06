@@ -1616,6 +1616,46 @@ existing retained-root successor boot. The successor still uses the fixture
 access adapter. Root-volume ancestors, BOOT/shared exports and libvirt relabeling
 remain qualification-only. This does not enable public dispatch or Gate 2.
 
+### PR 4 slice 30T: share root-volume parent traversal
+
+The existing shared traversal namespace now covers three exact directories:
+`state`, `runs` and `state/oci-root-volumes`. The new `root_volumes` target uses
+only named-QEMU search permission (`--x`, mode0710); it grants no listing or
+entry creation/deletion rights. Per-file raw access remains governed by the
+30S generation fence, and volume metadata files remain owner-only.
+
+All three directories share one membership set, epoch and namespace lock.
+First join grants `root_volumes -> runs -> state`; final leave restores
+`state -> runs -> root_volumes`. Non-final departures preserve the survivor's
+access without ACL writes or target fsync. Ordered partial states, permanent
+enrollment, bounded registry admission and immutable member identities retain
+the existing recovery rules. Managed initialization validates and preserves
+the third directory rather than applying legacy chmod repair.
+Root-file creation also validates and preserves the managed parent, so preparing
+a second VM cannot reset its mode to0700 and cut off the first VM. This scoped
+OCI policy leaves ordinary project-volume initialization unchanged.
+
+The private registry/member schema becomes v2 and launch authority becomes v7.
+Launch carries the root-volume directory FD and verifies all three exact
+targets with its own active membership. A different VM's join/leave does not
+invalidate a survivor's authority. Earlier v1 namespace/member and v6 launch
+contracts fail closed; no public state migration is involved.
+
+The explicit completion order is root-file revoke, per-run I/O revoke, shared
+leave, then retention/reclaim. Shared leave refuses an outstanding managed
+root-file grant before changing membership or ancestor ACLs. This prevents
+a later namespace join from exposing a departed run's leftover raw grant.
+Completed left replay remains historical and read-only after a later root
+retention, successor claim or deletion.
+
+Native qualification removes the root-volume directory from both fixture
+brokers as the seventh product target. It checks exact ACLs during the existing
+stale-cleanup child, initialization preservation and final restore, then keeps
+the retained-root successor proof. The successor still uses fixture access;
+simultaneous two-member lifetime is covered by portable tests. External host
+ancestors, BOOT/shared immutable exports, relabel policy, public dispatch and
+Gate 2 remain subsequent work.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1634,8 +1674,7 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable access boundary to root-volume ancestors and
-   BOOT/shared-artifact exports with an
+1. Extend the durable access boundary to BOOT/shared-artifact exports with an
    explicit relabel policy,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain

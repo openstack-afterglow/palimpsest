@@ -1,4 +1,4 @@
-"""Private set-based traversal of the exact state/runs namespace.
+"""Private set-based traversal of state, runs and the root-volume parent.
 
 The namespace lock precedes every run lock. Read-only launch validation never
 takes that lock: atomic registry snapshots contain immutable member identities,
@@ -44,14 +44,16 @@ from .oci_runtime_access import (
     _verify_pinned,
     _verify_pinned_metadata,
 )
-from .state import locked_existing_run
+from .state import _read_pinned_json_object, locked_existing_run
 
 SHARED_TRAVERSAL_STATE_KEY = "oci_shared_traversal"
 _REGISTRY = "oci-shared-traversal.json"
 _MARKER = "oci-shared-traversal.enrolled.json"
 _LOCK = "oci-shared-traversal.lock"
-_SCHEMA = "palimpsest.oci-shared-traversal.v1"
-_MEMBER_SCHEMA = "palimpsest.oci-shared-traversal-member.v1"
+_SCHEMA = "palimpsest.oci-shared-traversal.v2"
+_MEMBER_SCHEMA = "palimpsest.oci-shared-traversal-member.v2"
+_ROLES = ("state", "runs", "root_volumes")
+_CHILD_NAMES = {"runs": "runs", "locks": "locks", "root_volumes": "oci-root-volumes"}
 _MAX_REGISTRY_BYTES = 1024 * 1024
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FORK_LOCK = threading.Lock()
@@ -77,6 +79,7 @@ class SharedTraversalMembership:
     binding: MonitorPreActivationBinding
     state: RuntimeAccessTarget
     runs: RuntimeAccessTarget
+    root_volumes: RuntimeAccessTarget
     qemu_uid: int
     qemu_gid: int
     phase: str
@@ -95,7 +98,7 @@ class SharedTraversalMembership:
         ):
             raise _invalid()
         MonitorPreActivationBinding.__post_init__(self.binding)
-        for target in (self.state, self.runs):
+        for target in (self.state, self.runs, self.root_volumes):
             if type(target) is not RuntimeAccessTarget:
                 raise _invalid()
             RuntimeAccessTarget.__post_init__(target)
@@ -106,14 +109,14 @@ class SharedTraversalMembership:
                 or target.granted != traversal_acl(target.baseline, self.qemu_uid)
             ):
                 raise _invalid()
-        if (self.state.device, self.state.inode) == (self.runs.device, self.runs.inode):
+        if len({(target.device, target.inode) for target in (self.state, self.runs, self.root_volumes)}) != 3:
             raise _invalid()
 
     def to_dict(self):
         return {
             "schema": _MEMBER_SCHEMA,
             **{
-                key: value.to_dict() if key in {"binding", "state", "runs"} else value
+                key: value.to_dict() if key in {"binding", *_ROLES} else value
                 for key, value in ((key, getattr(self, key)) for key in self.__dataclass_fields__)
             },
         }
@@ -129,7 +132,7 @@ class SharedTraversalMembership:
                 raise _invalid()
             fields = {k: v for k, v in value.items() if k != "schema"}
             fields["binding"] = MonitorPreActivationBinding.from_dict(dict(fields["binding"]))
-            for key in ("state", "runs"):
+            for key in _ROLES:
                 fields[key] = RuntimeAccessTarget.from_dict(fields[key])
             return cls(**fields)
         except (TypeError, ValueError, KeyError):
@@ -147,8 +150,7 @@ def _same_member(a, b):
 def _validate_registry(value):
     if (
         type(value) is not dict
-        or set(value)
-        != {"schema", "namespace_id", "epoch", "qemu_uid", "qemu_gid", "state", "runs", "members", "pending"}
+        or set(value) != {"schema", "namespace_id", "epoch", "qemu_uid", "qemu_gid", *_ROLES, "members", "pending"}
         or value["schema"] != _SCHEMA
         or not _uuid(value["namespace_id"])
         or type(value["epoch"]) is not int
@@ -156,7 +158,9 @@ def _validate_registry(value):
         or type(value["members"]) is not dict
     ):
         raise _invalid()
-    targets = {key: RuntimeAccessTarget.from_dict(value[key]) for key in ("state", "runs")}
+    targets = {key: RuntimeAccessTarget.from_dict(value[key]) for key in _ROLES}
+    if len({(target.device, target.inode) for target in targets.values()}) != 3:
+        raise _invalid()
     for target in targets.values():
         if (
             not target.directory
@@ -197,6 +201,7 @@ def _validate_registry(value):
             or (member.qemu_uid, member.qemu_gid) != (value["qemu_uid"], value["qemu_gid"])
             or member.state != targets["state"]
             or member.runs != targets["runs"]
+            or member.root_volumes != targets["root_volumes"]
         ):
             raise _invalid()
     active = [item for item in members if item.phase == "active"]
@@ -253,14 +258,26 @@ class _Namespace:
             self._hold("state", lambda: _open_absolute(roots.state))
             self.verify_metadata()
             create_children = create
-            for role in ("runs", "locks"):
-                if create_children:
+            for role, basename in _CHILD_NAMES.items():
+                enrolled = False
+                if role == "root_volumes":
+                    for name in (_MARKER, _REGISTRY):
+                        try:
+                            os.stat(name, dir_fd=self.fds["locks"], follow_symlinks=False)
+                            enrolled = True
+                        except FileNotFoundError:
+                            pass
+                if create_children and not enrolled:
                     try:
-                        os.mkdir(role, 0o700, dir_fd=self.fds["state"])
+                        os.mkdir(basename, 0o700, dir_fd=self.fds["state"])
                         os.fsync(self.fds["state"])
                     except FileExistsError:
                         pass
-                self._hold(role, lambda role=role: os.open(role, _DIR_FLAGS, dir_fd=self.fds["state"]))
+                try:
+                    self._hold(role, lambda basename=basename: os.open(basename, _DIR_FLAGS, dir_fd=self.fds["state"]))
+                except FileNotFoundError:
+                    if create or role != "root_volumes":
+                        raise
             self.verify_metadata()
             if locked:
                 flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -318,7 +335,7 @@ class _Namespace:
         )
         for role, fd in self.fds.items():
             visible = os.stat(
-                self.roots.state if role == "state" else (_LOCK if role == "lock" else role),
+                self.roots.state if role == "state" else (_LOCK if role == "lock" else _CHILD_NAMES[role]),
                 dir_fd=None if role == "state" else self.fds["locks" if role == "lock" else "state"],
                 follow_symlinks=False,
             )
@@ -330,7 +347,7 @@ class _Namespace:
                     or (role == "lock" and (info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600))
                     or (role == "locks" and not unmanaged_initialization and stat.S_IMODE(info.st_mode) != 0o700)
                     or (
-                        role in {"state", "runs"}
+                        role in _ROLES
                         and (info.st_nlink < 2 or (not unmanaged_initialization and info.st_mode & 0o067))
                     )
                 ):
@@ -378,13 +395,15 @@ class _Namespace:
         else:
             self.registry = None
         if self.registry is not None:
+            if not set(_ROLES) <= self.fds.keys():
+                raise _invalid()
             if self.marker is None or any(
                 self.registry[key]
-                != (getattr(self.marker, key).to_dict() if key in {"state", "runs"} else getattr(self.marker, key))
-                for key in ("namespace_id", "state", "runs", "qemu_uid", "qemu_gid")
+                != (getattr(self.marker, key).to_dict() if key in _ROLES else getattr(self.marker, key))
+                for key in ("namespace_id", *_ROLES, "qemu_uid", "qemu_gid")
             ):
                 raise _invalid()
-        elif self.marker is not None and not self._recover_marker:
+        elif self.marker is not None and (not self._recover_marker or not set(_ROLES) <= self.fds.keys()):
             raise _invalid()
         self.verify_metadata()
 
@@ -488,7 +507,7 @@ if hasattr(os, "register_at_fork"):
 def _acl_states(ns, backend):
     ns.verify_metadata()
     states = {}
-    for role in ("state", "runs"):
+    for role in _ROLES:
         target = RuntimeAccessTarget.from_dict(ns.registry[role])
         acl = backend.read_acl(ns.fds[role])
         _validate_target(os.fstat(ns.fds[role]), target, acl, run_directory=True)
@@ -505,20 +524,25 @@ def _verify_acls(ns, backend, expected):
 
 
 def _allowed(ns):
-    state, runs = (RuntimeAccessTarget.from_dict(ns.registry[role]) for role in ("state", "runs"))
-    baseline = {"state": state.baseline, "runs": runs.baseline}
-    granted = {"state": state.granted, "runs": runs.granted}
+    targets = {role: RuntimeAccessTarget.from_dict(ns.registry[role]) for role in _ROLES}
+    baseline = {role: target.baseline for role, target in targets.items()}
+    granted = {role: target.granted for role, target in targets.items()}
     pending = ns.registry["pending"]
     active = _active(ns.registry)
     if pending is not None and (
         (pending["phase"] == "joining" and not active) or (pending["phase"] == "leaving" and len(active) == 1)
     ):
-        return [baseline, {"state": state.baseline, "runs": runs.granted}, granted]
+        return [
+            baseline,
+            {**baseline, "root_volumes": targets["root_volumes"].granted},
+            {**granted, "state": targets["state"].baseline},
+            granted,
+        ]
     return [granted if active else baseline]
 
 
 def _baseline(ns, backend):
-    for role in ("state", "runs"):
+    for role in _ROLES:
         info = os.fstat(ns.fds[role])
         if stat.S_IMODE(info.st_mode) != 0o700:
             raise _invalid()
@@ -529,7 +553,7 @@ def _baseline(ns, backend):
 
 @contextmanager
 def shared_traversal_initialization(roots, *, acl_backend=None):
-    """Hold global authority while legacy initialization skips state/runs chmod."""
+    """Hold global authority while initialization preserves all shared parents."""
     ns = None
     try:
         ns = _Namespace(roots, create=True, locked=True)
@@ -538,7 +562,7 @@ def shared_traversal_initialization(roots, *, acl_backend=None):
             # Legacy ContentStore/storage-set callers may supply an owner-held
             # 0755 root. Repair only an explicitly unmanaged namespace, under
             # its global lock and through exact pinned, non-symlink FDs.
-            for role in ("locks", "runs", "state"):
+            for role in ("locks", "root_volumes", "runs", "state"):
                 ns.verify()
                 fd = ns.fds[role]
                 if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
@@ -609,6 +633,34 @@ def _scan_unmanaged(ns, current):
     ns.verify()
 
 
+def _require_root_released(mutation, binding):
+    from .oci_root_access import OCI_ROOT_ACCESS_STATE_KEY, RootAccessReceipt, _evidence, require_root_access_revoked
+    from .oci_root_kvm import OCIRootDomainPlan
+    from .oci_root_volume import _paths, _read_record, _RetentionVolumeLock, _root_authority
+
+    value = mutation.snapshot.state.get("oci_root_domain")
+    plan = OCIRootDomainPlan.from_dict(value["plan"])
+    if plan.digest != binding.plan_digest:
+        raise _invalid()
+    marker, fence = _evidence(mutation._roots, plan.root_volume["volume_id"])
+    has_member = OCI_ROOT_ACCESS_STATE_KEY in mutation.snapshot.state
+    if marker is None and not has_member:
+        return
+    member = RootAccessReceipt.from_dict(mutation.mutable_state().get(OCI_ROOT_ACCESS_STATE_KEY))
+    if member.binding != binding or marker is None or fence is None or fence["receipt"] != member.to_dict():
+        raise _invalid()
+    _, record_path, lock_path = _paths(mutation._roots, member.volume.volume_id)
+    with _RetentionVolumeLock(mutation._roots, lock_path) as lock, _root_authority(mutation._roots) as directory:
+        if _read_record(directory, record_path) != member.volume:
+            raise _invalid()
+        require_root_access_revoked(mutation._roots, member.volume)
+        lock.verify()
+        if _read_record(directory, record_path) != member.volume or _evidence(
+            mutation._roots, member.volume.volume_id
+        ) != (marker, fence):
+            raise _invalid()
+
+
 def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
     """Join after exact per-run access grant, before monitor preparation."""
     ns = None
@@ -625,7 +677,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                 _baseline(ns, backend)
                 _scan_unmanaged(ns, binding.record.name)
                 targets = {}
-                for role in ("state", "runs"):
+                for role in _ROLES:
                     info = os.fstat(ns.fds[role])
                     base = baseline_acl(directory=True)
                     targets[role] = RuntimeAccessTarget(
@@ -646,6 +698,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                         binding,
                         RuntimeAccessTarget.from_dict(targets["state"]),
                         RuntimeAccessTarget.from_dict(targets["runs"]),
+                        RuntimeAccessTarget.from_dict(targets["root_volumes"]),
                         *principal,
                         "joining",
                     )
@@ -658,7 +711,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                         or (marker.qemu_uid, marker.qemu_gid) != principal
                     ):
                         raise _invalid()
-                    for role in ("state", "runs"):
+                    for role in _ROLES:
                         target = getattr(marker, role)
                         _validate_target(os.fstat(ns.fds[role]), target, target.baseline, run_directory=True)
                         targets[role] = target.to_dict()
@@ -689,6 +742,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                     binding,
                     RuntimeAccessTarget.from_dict(ns.registry["state"]),
                     RuntimeAccessTarget.from_dict(ns.registry["runs"]),
+                    RuntimeAccessTarget.from_dict(ns.registry["root_volumes"]),
                     *principal,
                     "joining",
                 )
@@ -713,7 +767,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                     _verify_acls(ns, backend, expected_acl)
                     _grant_authority(mutation, binding, conn, principal)
                     _require_member(mutation, expected_member)
-                ns.verify_metadata()
+                ns.verify()
 
             verify()
             recorded = ns.registry["members"].get(_key(member))
@@ -753,7 +807,7 @@ def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):
                 _write_member(mutation, member)
                 expected_member = member
             if not _active(ns.registry):
-                for role in ("runs", "state"):
+                for role in ("root_volumes", "runs", "state"):
                     target = getattr(member, role)
                     verify()
                     if expected_acl[role] != target.granted:
@@ -839,6 +893,9 @@ def leave_oci_shared_traversal(roots, binding, *, conn, acl_backend=None, livene
                     != cleanup
                 ):
                     raise _invalid()
+                if expected_member.phase != "left":
+                    _require_root_released(mutation, binding)
+                ns.verify()
                 authority.validate()
                 _validate_ledger(mutation, binding, journal)
                 _stale(journal, liveness_probe)
@@ -850,8 +907,12 @@ def leave_oci_shared_traversal(roots, binding, *, conn, acl_backend=None, livene
                     _stale(journal, liveness_probe)
                     if _inspect_domain(conn, binding) is not None or conn.getURI() != binding.libvirt_uri:
                         raise _invalid()
+                    if expected_member.phase != "left":
+                        _require_root_released(mutation, binding)
                     _require_member(mutation, expected_member)
-                ns.verify_metadata()
+                    authority.validate()
+                    _validate_ledger(mutation, binding, journal)
+                ns.verify()
 
             verify()
             recorded = ns.registry["members"].get(_key(member))
@@ -862,6 +923,7 @@ def leave_oci_shared_traversal(roots, binding, *, conn, acl_backend=None, livene
                     member.namespace_id != ns.registry["namespace_id"]
                     or member.state.to_dict() != ns.registry["state"]
                     or member.runs.to_dict() != ns.registry["runs"]
+                    or member.root_volumes.to_dict() != ns.registry["root_volumes"]
                     or member.epoch > ns.registry["epoch"]
                 ):
                     raise _invalid()
@@ -891,7 +953,7 @@ def leave_oci_shared_traversal(roots, binding, *, conn, acl_backend=None, livene
                 _write_member(mutation, pending)
                 expected_member = member = pending
             if len(_active(ns.registry)) == 1:
-                for role in ("state", "runs"):
+                for role in _ROLES:
                     target = getattr(member, role)
                     verify()
                     if expected_acl[role] != target.baseline:
@@ -925,7 +987,9 @@ def leave_oci_shared_traversal(roots, binding, *, conn, acl_backend=None, livene
             ns.close()
 
 
-def verify_shared_traversal(roots, member, *, binding=None, access=None, state_fd=None, runs_fd=None, acl_backend=None):
+def verify_shared_traversal(
+    roots, member, *, binding=None, access=None, state_fd=None, runs_fd=None, root_volumes_fd=None, acl_backend=None
+):
     """Pure current-membership check without a namespace or run flock."""
     ns = None
     try:
@@ -948,16 +1012,25 @@ def verify_shared_traversal(roots, member, *, binding=None, access=None, state_f
             access = RuntimeAccessReceipt.from_dict(access) if type(access) is not RuntimeAccessReceipt else access
             if access.phase != "granted" or access.access_id != member.access_id or access.binding != member.binding:
                 raise _invalid()
-        for role, supplied in (("state", state_fd), ("runs", runs_fd)):
+        for role, supplied in (("state", state_fd), ("runs", runs_fd), ("root_volumes", root_volumes_fd)):
             if supplied is not None and _identity(os.fstat(supplied)) != ns.identities[role]:
                 raise _invalid()
         backend = acl_backend or LinuxFdACLBackend()
-        expected = {role: getattr(member, role).granted for role in ("state", "runs")}
+        expected = {role: getattr(member, role).granted for role in _ROLES}
         # Atomic registry replacement by another member is legal. The coherent
         # snapshot's own member must remain active, and target identity/ACL exact.
         if _acl_states(ns, backend) != expected:
             raise _invalid()
         ns.verify_metadata()
+        verify_shared_traversal_tail(
+            roots,
+            member,
+            binding=binding,
+            access=access,
+            state_fd=state_fd,
+            runs_fd=runs_fd,
+            root_volumes_fd=root_volumes_fd,
+        )
         return member
     except StateError:
         raise
@@ -966,3 +1039,65 @@ def verify_shared_traversal(roots, member, *, binding=None, access=None, state_f
     finally:
         if ns is not None:
             ns.close()
+
+
+def verify_shared_traversal_tail(
+    roots, member, *, binding=None, access=None, state_fd=None, runs_fd=None, root_volumes_fd=None, run_fd=None
+):
+    """Current immutable membership/FD checks after external ACL callbacks."""
+    ns = None
+    try:
+        if run_fd is not None:
+            state = _read_pinned_json_object(run_fd, "state.json")
+            if SHARED_TRAVERSAL_STATE_KEY in state and state[SHARED_TRAVERSAL_STATE_KEY] is None:
+                raise _invalid()
+            actual = state.get(SHARED_TRAVERSAL_STATE_KEY)
+            expected = member.to_dict() if type(member) is SharedTraversalMembership else member
+            if actual != expected:
+                raise _invalid()
+        ns = _Namespace(roots)
+        if ns.registry is None:
+            if member is not None:
+                raise _invalid()
+            return
+        member = member if type(member) is SharedTraversalMembership else SharedTraversalMembership.from_dict(member)
+        if (
+            member.phase != "active"
+            or ns.registry["members"].get(_key(member)) != member.to_dict()
+            or binding is not None
+            and member.binding != binding
+        ):
+            raise _invalid()
+        if access is not None:
+            access = access if type(access) is RuntimeAccessReceipt else RuntimeAccessReceipt.from_dict(access)
+            if access.phase != "granted" or access.access_id != member.access_id or access.binding != member.binding:
+                raise _invalid()
+        for role, supplied in (("state", state_fd), ("runs", runs_fd), ("root_volumes", root_volumes_fd)):
+            target = getattr(member, role)
+            _validate_target(os.fstat(ns.fds[role]), target, target.granted, run_directory=True)
+            if supplied is not None:
+                _validate_target(os.fstat(supplied), target, target.granted, run_directory=True)
+        ns.verify()
+    except StateError:
+        raise
+    except Exception:
+        raise _invalid() from None
+    finally:
+        if ns is not None:
+            ns.close()
+
+
+def verify_shared_root_parent(roots, directory_fd):
+    """Exact parent policy for root creation without chmod of an active namespace."""
+    ns = _Namespace(roots)
+    try:
+        if _identity(os.fstat(directory_fd)) != ns.identities.get("root_volumes"):
+            raise _invalid()
+        if ns.registry is None:
+            if stat.S_IMODE(os.fstat(directory_fd).st_mode) != 0o700:
+                raise _invalid()
+        elif _acl_states(ns, LinuxFdACLBackend()) not in _allowed(ns):
+            raise _invalid()
+        ns.verify()
+    finally:
+        ns.close()
