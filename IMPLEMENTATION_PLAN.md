@@ -1724,6 +1724,10 @@ Libvirt forbids per-source label overrides when domain-level relabeling is
 disabled: this exact global policy therefore omits disk and console DAC
 overrides. Legacy domains without the global policy retain their mandatory
 per-source `relabel=no` labels. The two XML forms are validated separately.
+Post-define comparison also recognizes the exact generated file-serial mirror
+for both forms: the global-policy console lacks the legacy per-source label
+tuple. Only the initial generated serial count is normalized; the strict
+mirror parser and subsequent stored projection still reject device drift.
 
 After inactive-domain cleanup and proof that the original terminal writer is
 stale, revoke BOOT access before stage-1, root, runtime I/O and shared traversal

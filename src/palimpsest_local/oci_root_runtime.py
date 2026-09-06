@@ -903,9 +903,11 @@ def _validated_post_define_projection(
         if generated_device not in authored_device_counts and actual_device_counts.get(generated_device) == 1:
             authored_device_counts[generated_device] = 1
     authored_console = authored.get("console")
+    # The projection parser already proved the exact mirror and DAC policy;
+    # domain-wide no-relabel omits the legacy fourth, per-source label item.
     if (
         isinstance(authored_console, tuple)
-        and len(authored_console) == 4
+        and (len(authored_console) == 4 or len(authored_console) == 3 and "dac_label" in authored)
         and authored_console[0] == (("type", "file"),)
         and "serial" not in authored_device_counts
         and actual_device_counts.get("serial") == 1

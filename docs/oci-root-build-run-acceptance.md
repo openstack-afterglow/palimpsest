@@ -659,7 +659,11 @@ also contains one generated `<serial type="file">` peer. It is accepted only
 when its source path, `append=on`, DAC no-relabel child, ISA-serial target, and
 ISA-serial model exactly mirror the sole file console. Initial post-define
 comparison normalizes the generated `serial=1` count only for that authored
-file-console form. The stored projection retains the count and console
+file-console form. For the later 30V exact global static DAC policy, both
+console and mirror omit per-source overrides; initial comparison recognizes
+that separately validated three-item console projection as well as the legacy
+four-item form. It does not admit an unlabeled legacy file console or a
+different serial source, target, model, or policy. The stored projection retains the count and console
 fingerprint, so later removal, duplication, source rebinding, or structural
 change fails closed. A file serial remains forbidden for the default PTY.
 

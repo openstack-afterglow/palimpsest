@@ -167,6 +167,81 @@ def test_oci_root_file_console_serial_and_all_disks_use_exact_selected_dac_scope
     assert len(projection["console"]) == (3 if managed else 4)
 
 
+@pytest.mark.parametrize("managed", [False, True])
+def test_oci_root_post_define_accepts_only_exact_generated_file_serial_under_selected_dac(managed):
+    from palimpsest_local.oci_root_runtime import (
+        _domain_projection,
+        _projection_digest,
+        _validated_post_define_projection,
+    )
+
+    root = _oci_root_source_policy_xml(managed)
+    actual_xml = ET.tostring(root, encoding="unicode")
+    root.find("./devices").remove(root.find("./devices/serial"))
+    authored_xml = ET.tostring(root, encoding="unicode")
+    resolved = SimpleNamespace(xml=authored_xml, profile=_X86_PROFILE)
+    assert "serial" not in dict(_domain_projection(authored_xml)["device_counts"])
+    assert dict(_domain_projection(actual_xml)["device_counts"])["serial"] == 1
+    assert _validated_post_define_projection(None, resolved, actual_xml) == _projection_digest(
+        _domain_projection(actual_xml)
+    )
+
+
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("damage", ["source-path", "append", "source-policy", "target", "model", "duplicate"])
+def test_oci_root_post_define_does_not_normalize_malformed_file_serial_mirrors(managed, damage):
+    from palimpsest_local.oci_root_runtime import _validated_post_define_projection
+
+    root = _oci_root_source_policy_xml(managed)
+    devices = root.find("./devices")
+    serial = root.find("./devices/serial")
+    devices.remove(serial)
+    authored_xml = ET.tostring(root, encoding="unicode")
+    devices.append(serial)
+    source = serial.find("./source")
+    if damage == "source-path":
+        source.set("path", "/tmp/wrong-console.log")
+    elif damage == "append":
+        source.set("append", "off")
+    elif damage == "source-policy":
+        if managed:
+            ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
+        else:
+            source.remove(source.find("./seclabel"))
+    elif damage == "target":
+        serial.find("./target").set("port", "1")
+    elif damage == "model":
+        serial.find("./target/model").set("name", "other")
+    else:
+        devices.append(ET.fromstring(ET.tostring(serial)))
+    with pytest.raises(StateError):
+        _validated_post_define_projection(
+            None, SimpleNamespace(xml=authored_xml, profile=_X86_PROFILE), ET.tostring(root, encoding="unicode")
+        )
+
+
+@pytest.mark.parametrize("damage", ["missing", "dynamic", "relabel"])
+def test_oci_root_post_define_three_item_console_needs_exact_global_dac(damage):
+    from palimpsest_local.oci_root_runtime import _validated_post_define_projection
+
+    root = _oci_root_source_policy_xml(True)
+    serial = root.find("./devices/serial")
+    root.find("./devices").remove(serial)
+    authored_xml = ET.tostring(root, encoding="unicode")
+    root.find("./devices").append(serial)
+    label = root.find("./seclabel")
+    if damage == "missing":
+        root.remove(label)
+    elif damage == "dynamic":
+        label.set("type", "dynamic")
+    else:
+        label.set("relabel", "yes")
+    with pytest.raises(StateError):
+        _validated_post_define_projection(
+            None, SimpleNamespace(xml=authored_xml, profile=_X86_PROFILE), ET.tostring(root, encoding="unicode")
+        )
+
+
 @pytest.mark.parametrize("kind", ["root", "stage1", "lower", "console", "serial"])
 @pytest.mark.parametrize("managed", [False, True])
 def test_oci_root_source_label_cannot_be_omitted_in_legacy_or_override_global_policy(kind, managed):
