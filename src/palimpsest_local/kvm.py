@@ -118,6 +118,7 @@ class OCIRootDomainSpec:
     lifecycle_socket: Path | None = None
     lifecycle_channel_name: str = OCI_CONTROL_CHANNEL_NAME
     lifecycle_protocol: str = OCI_CONTROL_PROTOCOL_V2
+    dac_label: str | None = None
 
 
 def _valid_name(name: str) -> bool:
@@ -362,6 +363,16 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root stage-1 transport identity is invalid")
 
     domain = ET.Element("domain", {"type": "kvm"})
+    if spec.dac_label is not None:
+        if (
+            not isinstance(spec.dac_label, str)
+            or re.fullmatch(r"\+[1-9][0-9]{0,9}:\+[1-9][0-9]{0,9}", spec.dac_label) is None
+        ):
+            raise KvmError("OCI-root fixed DAC principal is invalid")
+        if any(int(value) >= 2**32 - 1 for value in spec.dac_label.split(":")):
+            raise KvmError("OCI-root fixed DAC principal is invalid")
+        label = ET.SubElement(domain, "seclabel", {"type": "static", "model": "dac", "relabel": "no"})
+        ET.SubElement(label, "label").text = spec.dac_label
     ET.SubElement(domain, "name").text = spec.name
     ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(spec.memory_mib)
     ET.SubElement(domain, "vcpu").text = str(spec.vcpus)

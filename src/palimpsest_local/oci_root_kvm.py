@@ -748,6 +748,11 @@ def build_oci_root_domain_plan(
     transaction = prepared.transaction
     if transaction.phase != "resources-ready" or profile.backend != "kvm" or profile.arch != "x86_64":
         raise StateError("OCI-root domain planning requires ready x86_64 KVM resources")
+    from .oci_boot_exports import select_boot_exports
+
+    boot_artifacts, dac_label = select_boot_exports(
+        roots, read_run_ledger_snapshot(roots, transaction.owner.run_name), boot_artifacts
+    )
     revalidated_boot = verify_host_boot_artifacts(
         boot_artifacts.kernel.path,
         boot_artifacts.initramfs.path,
@@ -869,6 +874,7 @@ def build_oci_root_domain_plan(
     )
     transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
     spec = OCIRootDomainSpec(
+        dac_label=dac_label,
         name=plan.run_name,
         memory_mib=memory_mib,
         vcpus=vcpus,
@@ -990,6 +996,9 @@ def commit_oci_root_domain_plan(
         expected_kernel_digest=str(plan.boot_artifacts["kernel"]["digest"]),
         expected_initramfs_digest=str(plan.boot_artifacts["initramfs"]["digest"]),
     )
+    from .oci_boot_exports import select_boot_exports
+
+    boot, dac_label = select_boot_exports(roots, snapshot, boot)
     if boot.to_dict() != _plain_json(plan.boot_artifacts):
         raise StateError("OCI-root domain plan boot artifact binding is invalid")
     try:
@@ -1012,6 +1021,7 @@ def commit_oci_root_domain_plan(
         raise StateError("OCI-root stage-1 transport projection is invalid")
     transport_path = run_paths(roots, plan.run_name).root / OCI_STAGE1_TRANSPORT_FILENAME
     expected_spec = OCIRootDomainSpec(
+        dac_label=dac_label,
         name=plan.run_name,
         memory_mib=plan.memory_mib,
         vcpus=plan.vcpus,
@@ -1197,6 +1207,9 @@ def resolve_committed_oci_root_domain_plan(
     ):
         raise StateError("OCI-root domain plan root volume binding is invalid")
 
+    from .oci_boot_exports import select_boot_exports
+
+    boot_artifacts, dac_label = select_boot_exports(roots, snapshot, boot_artifacts)
     boot = verify_host_boot_artifacts(
         boot_artifacts.kernel.path,
         boot_artifacts.initramfs.path,
@@ -1235,6 +1248,7 @@ def resolve_committed_oci_root_domain_plan(
         raise StateError("OCI-root lifecycle socket path is already reserved")
 
     spec = OCIRootDomainSpec(
+        dac_label=dac_label,
         name=plan.run_name,
         memory_mib=plan.memory_mib,
         vcpus=plan.vcpus,

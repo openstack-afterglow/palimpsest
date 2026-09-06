@@ -380,6 +380,23 @@ def _grant_authority(mutation, binding, conn, principal):
     _no_monitor_journal(mutation)
     if parse_qemu_dac_baselabel(conn.getCapabilities()) != principal or _inspect_domain(conn, binding) is None:
         raise _invalid()
+    if "oci_boot_exports" in mutation.snapshot.state:
+        import xml.etree.ElementTree as ET
+
+        from . import kvm
+        from .oci_boot_exports import _receipt
+        from .oci_root_runtime import _dac_projection
+
+        exports = _receipt(mutation.mutable_state(), mutation.record)
+        domain = _inspect_domain(conn, binding)
+        if (
+            exports.phase != "ready"
+            or (exports.qemu_uid, exports.qemu_gid) != principal
+            or domain is None
+            or _dac_projection(ET.fromstring(domain.XMLDesc(kvm._libvirt().VIR_DOMAIN_XML_INACTIVE)))
+            != exports.dac_label
+        ):
+            raise _invalid()
     _verify_parent(mutation)
     _no_monitor_journal(mutation)
     if conn.getURI() != binding.libvirt_uri:

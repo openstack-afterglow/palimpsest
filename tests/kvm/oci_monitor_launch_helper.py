@@ -144,7 +144,17 @@ def _qualification_metadata_adapter(original_metadata, context, acl_structure, a
         # The control socket and ownership journal are never QEMU resources.
         if key == "monitor" or (
             context.get("product_io", False)
-            and key in {"run", "runtime_io", "runtime_console", "root_disk", "root_volumes", "stage1_transport"}
+            and key
+            in {
+                "run",
+                "runtime_io",
+                "runtime_console",
+                "root_disk",
+                "root_volumes",
+                "stage1_transport",
+                "kernel",
+                "initramfs",
+            }
         ):
             return original_metadata(key, entry, opened, visible, owner_uid)
         broker = context.get("broker")
@@ -390,7 +400,11 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
             root_source = ET.fromstring(resolved.xml).find("./devices/disk/target[@dev='vda']/../source")
             assert root_source is not None
             specifications = fixture["_without_product_access_grants"](
-                specifications, roots, roots.runs / binding.record.name, Path(root_source.attrib["file"])
+                specifications,
+                roots,
+                roots.runs / binding.record.name,
+                Path(root_source.attrib["file"]),
+                boot_paths=(boot.kernel.path, boot.initramfs.path),
             )
         broker = fixture["_QualificationDACBroker"](root, uid, specifications)
         context["broker"] = broker
@@ -405,6 +419,7 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
             for target in broker.targets:
                 if target.path not in {boot.kernel.path, boot.initramfs.path}:
                     continue
+                assert not product_io, "managed BOOT access must not use the fixture broker"
                 broker._verify_held(target)
                 broker._command(["setfacl", "-m", f"u:{os.geteuid()}:r--", "--", target.fd_path], target)
                 original = target.original_acl
@@ -448,13 +463,14 @@ def _install_qualification(root: Path, *, product_io: bool = False) -> None:
             )
             return active
 
-        context["boot_relabel"] = {
-            "uid": uid,
-            "gid": gid,
-            "reader_uid": os.geteuid(),
-            "prove_activity": prove_activity,
-            "digests": {"kernel": boot.kernel.digest, "initramfs": boot.initramfs.digest},
-        }
+        if not product_io:
+            context["boot_relabel"] = {
+                "uid": uid,
+                "gid": gid,
+                "reader_uid": os.geteuid(),
+                "prove_activity": prove_activity,
+                "digests": {"kernel": boot.kernel.digest, "initramfs": boot.initramfs.digest},
+            }
 
         def create():
             result = original_create()

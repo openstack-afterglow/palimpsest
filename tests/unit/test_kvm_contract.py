@@ -110,6 +110,63 @@ def _oci_root_spec() -> OCIRootDomainSpec:
     )
 
 
+def test_oci_root_optional_dac_policy_is_exact_static_and_preserves_legacy_projection():
+    from dataclasses import replace
+
+    from palimpsest_local.oci_root_runtime import _domain_projection
+
+    spec = _oci_root_spec()
+    legacy = build_oci_root_domain_xml(spec, _X86_PROFILE)
+    managed = build_oci_root_domain_xml(replace(spec, dac_label="+12345:+12346"), _X86_PROFILE)
+    xml = ET.fromstring(managed)
+    labels = xml.findall("./seclabel")
+    assert len(labels) == 1
+    assert labels[0].attrib == {"type": "static", "model": "dac", "relabel": "no"}
+    assert labels[0].findtext("./label") == "+12345:+12346"
+    assert "dac_label" not in _domain_projection(legacy)
+    managed_projection = _domain_projection(managed)
+    assert managed_projection.pop("dac_label") == "+12345:+12346"
+    assert managed_projection == _domain_projection(legacy)
+
+
+@pytest.mark.parametrize("value", ["12345:12346", "+0:+12346", "+01:+2", "+4294967295:+2", "+1:+" + "1" * 5000])
+def test_oci_root_dac_renderer_and_projection_reject_noncanonical_principals(value):
+    from dataclasses import replace
+
+    from palimpsest_local.oci_root_runtime import _dac_projection
+
+    with pytest.raises(KvmError):
+        build_oci_root_domain_xml(replace(_oci_root_spec(), dac_label=value), _X86_PROFILE)
+    xml = ET.fromstring('<domain><seclabel model="dac" type="static" relabel="no"><label /></seclabel></domain>')
+    xml.find("./seclabel/label").text = value
+    with pytest.raises(StateError):
+        _dac_projection(xml)
+
+
+@pytest.mark.parametrize("damage", ["none", "dynamic", "relabel", "apparmor", "duplicate", "extra", "attribute"])
+def test_oci_root_dac_projection_never_accepts_security_disable_or_other_lsm_override(damage):
+    from palimpsest_local.oci_root_runtime import _dac_projection
+
+    xml = ET.fromstring(
+        '<domain><seclabel model="dac" type="static" relabel="no"><label>+12345:+12346</label></seclabel></domain>'
+    )
+    node = xml.find("./seclabel")
+    if damage in {"none", "dynamic"}:
+        node.set("type", damage)
+    elif damage == "relabel":
+        node.set("relabel", "yes")
+    elif damage == "apparmor":
+        node.set("model", "apparmor")
+    elif damage == "duplicate":
+        xml.append(ET.fromstring(ET.tostring(node)))
+    elif damage == "extra":
+        ET.SubElement(node, "imagelabel").text = "+12345:+12346"
+    else:
+        node.set("override", "yes")
+    with pytest.raises(StateError):
+        _dac_projection(xml)
+
+
 def test_oci_root_domain_xml_is_direct_kernel_raw_root_without_cloud_seed():
     xml = ET.fromstring(build_oci_root_domain_xml(_oci_root_spec(), _X86_PROFILE))
 

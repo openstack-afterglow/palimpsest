@@ -54,7 +54,7 @@ def test_two_distinct_root_vms_share_parent_until_last_leave(case, monkeypatch, 
     (second.paths.root.parent / "monitor-private").mkdir(mode=0o700)
     with launch_tests._prepare(second) as authority:
         frame = authority.to_dict()
-        assert frame["schema"] == "palimpsest.monitor-launch-authority.v8"
+        assert frame["schema"] == "palimpsest.monitor-launch-authority.v9"
         assert frame["entries"]["root_volumes"]["inode"] == first.root_volumes.inode
         shared_tests._finish(case, monkeypatch, request)
         parent_info = case.roots.oci_root_volumes.stat()

@@ -514,13 +514,46 @@ def _validate_devices_surface(
     return tuple(sorted(counts.items()))
 
 
+def _dac_projection(root: ET.Element) -> str | None:
+    labels = root.findall("./seclabel")
+    if not labels:
+        return None
+    if len(labels) != 1:
+        raise StateError("defined OCI-root DAC policy is invalid")
+    node = labels[0]
+    children = list(node)
+    if (
+        node.attrib != {"type": "static", "model": "dac", "relabel": "no"}
+        or len(children) != 1
+        or children[0].tag != "label"
+        or children[0].attrib
+        or list(children[0])
+        or (node.text or "").strip()
+        or (children[0].tail or "").strip()
+    ):
+        raise StateError("defined OCI-root DAC policy is invalid")
+    value = children[0].text
+    import re
+
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"\+[1-9][0-9]{0,9}:\+[1-9][0-9]{0,9}", value) is None
+        or any(int(item) >= 2**32 - 1 for item in value.split(":"))
+    ):
+        raise StateError("defined OCI-root DAC principal is invalid")
+    return value
+
+
 def _validate_top_level_surface(root: ET.Element) -> None:
     authored = {"cpu", "devices", "features", "memory", "metadata", "name", "os", "vcpu"}
     safe_defaults = {"clock", "currentMemory", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
     counts: dict[str, int] = {}
+    _dac_projection(root)
     for child in list(root):
         if not isinstance(child.tag, str) or "}" in child.tag:
             raise StateError("defined OCI-root top-level extension is forbidden")
+        if child.tag == "seclabel":
+            continue
         if child.tag in authored:
             counts[child.tag] = counts.get(child.tag, 0) + 1
             continue
@@ -758,6 +791,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         console_projection += (tuple(sorted(console_source_label.attrib.items())),)
     return {
         "channels": tuple(channel_projection),
+        **({"dac_label": _dac_projection(root)} if root.find("./seclabel") is not None else {}),
         "controllers": tuple(controllers),
         "disks": _disk_projection(root),
         "device_counts": _validate_devices_surface(
@@ -1047,6 +1081,12 @@ def define_committed_oci_root_domain(
             profile,
             runner=runner,
         )
+        if resolved.spec.dac_label is not None:
+            from .oci_acl import parse_qemu_dac_baselabel
+
+            uid, gid = parse_qemu_dac_baselabel(conn.getCapabilities())
+            if resolved.spec.dac_label != f"+{uid}:+{gid}":
+                raise StateError("OCI-root export DAC principal changed before definition")
         runtime_io = io_guards.enter_context(
             runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
         )

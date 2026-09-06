@@ -545,6 +545,42 @@ DAC `relabel=no`; kernel/initramfs relabeling, shared lower exports and their
 membership/GC policy are not implemented by this slice. Canonical CAS remains
 owner-private, and public dispatch and Gate 2 remain disabled.
 
+Slice 30V introduces two independent run-owned BOOT exports, `boot-kernel` and
+`boot-initramfs`, published before domain planning. A durable receipt selects
+the exact pair and binds its run, resource plan, content and DAC principal.
+Sources are not chmod/chown targets or hardlink backings. Completed exports
+must remain resolvable after source paths disappear; source-removal coverage
+is portable, while the native case checks source identity and contents remain
+unchanged. Unknown reserved files, missing/null publication authority, and
+missing/null grant evidence for exposed files fail closed. A published pair
+with no grant yet remains owner-only and may be used for pre-activation planning.
+
+The pair has a read-only access receipt and fresh-exec v9 authority. Publication,
+grant, launch and revocation must agree on the selected files and principal.
+Final validation includes complete content hashes and immutable metadata
+continuity across external callbacks. Shared departure refuses an outstanding
+BOOT grant, and revocation requires completed inactive-domain cleanup plus the
+original terminal writer being stale.
+
+The domain explicitly selects static DAC with `relabel=no` and the canonical
+numeric QEMU label. This controls DAC ownership changes only; it does not turn
+off other host security drivers. The [libvirt security-label documentation](https://libvirt.org/formatdomain.html#security-label)
+defines that distinction. The qualified server uses AppArmor as well as DAC.
+When AppArmor is advertised, the active native child must report its exact
+UUID-based profile in live XML and an enforcing match from libvirt's runtime
+security-label API. Capability advertisement alone is not sufficient evidence.
+Other hosts still require qualification and must fail closed on unmodeled
+security-label or immutable-metadata changes.
+
+The stale-cleanup native child excludes ten exact product ACL targets from
+both fixture brokers. Kernel/initramfs must use neither the fixture's extra
+reader grant nor its BOOT ownership-normalization adapter. Checks cover active
+read-only ACLs, unchanged ownership/ctime through boot and terminal observation,
+LIVE-writer revocation refusal, final0400 restoration and unchanged content.
+The retained-root successor remains fixture-adapted. Shared lower exports and
+their multi-VM lease/membership/GC contract remain next; canonical CAS, public
+dispatch and Gate 2 remain unchanged.
+
 The native `qemu:///system` qualification has a test-only filesystem access
 broker for libvirt's DAC QEMU identity. It is not a production authority. Its input is the
 unique canonical `dac` security-model `baselabel type="kvm"` (`+uid:+gid`) from

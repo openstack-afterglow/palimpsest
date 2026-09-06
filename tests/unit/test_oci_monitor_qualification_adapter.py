@@ -108,9 +108,12 @@ def test_only_exact_recorded_named_qemu_grant_is_accepted(directory):
     adapter(key, entry, granted, granted, os.geteuid())
 
 
-@pytest.mark.parametrize("key", ["run", "runtime_io", "runtime_console"])
+@pytest.mark.parametrize(
+    "key",
+    ["run", "runtime_io", "runtime_console", "root_disk", "root_volumes", "stage1_transport", "kernel", "initramfs"],
+)
 def test_product_targets_are_never_normalized_by_fixture_metadata_adapter(key):
-    directory = key != "runtime_console"
+    directory = key in {"run", "runtime_io", "root_volumes"}
     _adapter, broker, entry, _original, granted = _setup(directory)
     seen = []
 

@@ -634,8 +634,10 @@ def _scan_unmanaged(ns, current):
 
 
 def _require_root_released(mutation, binding):
+    from .oci_boot_access import require_boot_access_revoked
     from .oci_stage1_access import require_stage1_access_revoked
 
+    boot_stamp = require_boot_access_revoked(mutation, binding)
     stage1_stamp = require_stage1_access_revoked(mutation, binding)
     from .oci_root_access import OCI_ROOT_ACCESS_STATE_KEY, RootAccessReceipt, _evidence, require_root_access_revoked
     from .oci_root_kvm import OCIRootDomainPlan
@@ -648,6 +650,8 @@ def _require_root_released(mutation, binding):
     marker, fence = _evidence(mutation._roots, plan.root_volume["volume_id"])
     has_member = OCI_ROOT_ACCESS_STATE_KEY in mutation.snapshot.state
     if marker is None and not has_member:
+        require_stage1_access_revoked(mutation, binding, metadata_only=True, expected_stamp=stage1_stamp)
+        require_boot_access_revoked(mutation, binding, metadata_only=True, expected_stamp=boot_stamp)
         return
     member = RootAccessReceipt.from_dict(mutation.mutable_state().get(OCI_ROOT_ACCESS_STATE_KEY))
     if member.binding != binding or marker is None or fence is None or fence["receipt"] != member.to_dict():
@@ -663,6 +667,7 @@ def _require_root_released(mutation, binding):
         ) != (marker, fence):
             raise _invalid()
         require_stage1_access_revoked(mutation, binding, metadata_only=True, expected_stamp=stage1_stamp)
+        require_boot_access_revoked(mutation, binding, metadata_only=True, expected_stamp=boot_stamp)
 
 
 def join_oci_shared_traversal(roots, binding, *, conn, acl_backend=None):

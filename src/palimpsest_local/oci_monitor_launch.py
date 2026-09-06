@@ -24,7 +24,7 @@ from .oci_store import OCIStore
 from .platforms import DomainProfile
 from .state import StatePaths, locked_existing_run
 
-_SCHEMA = "palimpsest.monitor-launch-authority.v8"
+_SCHEMA = "palimpsest.monitor-launch-authority.v9"
 _PROFILE_FIELDS = {
     "backend",
     "domain_type",
@@ -215,6 +215,8 @@ class MonitorLaunchAuthority:
                 "shared_traversal",
                 "root_access",
                 "stage1_access",
+                "boot_exports",
+                "boot_access",
             }
             or value["schema"] != _SCHEMA
         ):
@@ -228,6 +230,12 @@ class MonitorLaunchAuthority:
                 raise _invalid()
             roots = StatePaths(_path(entries["config"]["path"]), _path(entries["state"]["path"]))
             paths = _paths(roots, binding.record.name)
+            if value["boot_exports"] is not None:
+                from .oci_boot_exports import BOOT_EXPORT_FILENAMES
+
+                paths.update(
+                    {role: roots.runs / binding.record.name / name for role, name in BOOT_EXPORT_FILENAMES.items()}
+                )
             if value["shared_traversal"] is not None:
                 paths["root_volumes"] = roots.oci_root_volumes
             if value["stage1_access"] is not None:
@@ -308,6 +316,18 @@ class MonitorLaunchAuthority:
             access = self._frame["runtime_access"]
             root_access = self._frame["root_access"]
             stage1_access = self._frame["stage1_access"]
+            from .oci_boot_access import verify_boot_launch
+
+            boot_roots = StatePaths(
+                _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+            )
+            boot_stamp = verify_boot_launch(
+                boot_roots,
+                self._frame["boot_exports"],
+                self._frame["boot_access"],
+                self._frame["entries"],
+                binding=selected,
+            )
             from .oci_stage1_access import verify_stage1_launch
 
             stage1_stamp = verify_stage1_launch(
@@ -436,6 +456,15 @@ class MonitorLaunchAuthority:
                 metadata_only=True,
                 expected_stamp=stage1_stamp,
             )
+            verify_boot_launch(
+                boot_roots,
+                self._frame["boot_exports"],
+                self._frame["boot_access"],
+                self._frame["entries"],
+                binding=selected,
+                metadata_only=True,
+                expected_stamp=boot_stamp,
+            )
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
 
@@ -543,6 +572,12 @@ def prepare_monitor_launch_authority(
         entries = {}
         with locked_existing_run(roots, binding.record.name) as mutation:
             with runtime_io_guard(mutation, plan_digest=binding.plan_digest, require_socket_absent=True) as runtime_io:
+                from .oci_boot_exports import select_boot_exports
+
+                boot_artifacts, _ = select_boot_exports(roots, mutation.snapshot, boot_artifacts)
+                paths.update(kernel=boot_artifacts.kernel.path, initramfs=boot_artifacts.initramfs.path)
+                boot_exports = mutation.mutable_state().get("oci_boot_exports")
+                boot_access = mutation.mutable_state().get("oci_boot_access")
                 runtime_access = mutation.mutable_state().get("oci_runtime_access")
                 shared_traversal = mutation.mutable_state().get("oci_shared_traversal")
                 if shared_traversal is not None:
@@ -585,6 +620,8 @@ def prepare_monitor_launch_authority(
             "shared_traversal": shared_traversal,
             "root_access": root_access,
             "stage1_access": stage1_access,
+            "boot_exports": boot_exports,
+            "boot_access": boot_access,
         }
         result = MonitorLaunchAuthority.from_dict(frame)
         for name in ("kernel", "initramfs"):

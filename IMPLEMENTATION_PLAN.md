@@ -1697,6 +1697,40 @@ selected before committing the domain projection. The existing stage-1 disk
 continues to use explicit source DAC `relabel=no`; this does not resolve BOOT
 relabel policy or enable public dispatch or Gate 2.
 
+### PR 4 slice 30V: run-owned kernel and initramfs exports
+
+Before domain planning, publish independent `boot-kernel` and `boot-initramfs`
+files in the owning run directory. A durable pair receipt binds the run UUID,
+resource plan, digests, sizes, exact file identities and selected canonical
+QEMU DAC principal. Publication never changes the source files or creates
+hardlinks into them. Completed publication selects these files for subsequent
+planning and resolution, without depending on the original source paths.
+Partial publication resumes only the recorded pair; missing authority or
+unexpected reserved-path files must not fall back to caller-owned artifacts.
+
+The run-owned pair has a separate read-only ACL lifetime, with durable
+intent/granted/revoking/revoked phases and owner0400/QEMU0440 policies.
+Fresh-exec authority v9 binds publication and access receipts to the existing
+kernel/initramfs descriptors. Full hashes and immutable metadata, including
+ctime across callbacks, remain part of validation. Old private v8 frames fail
+closed; this is not a public state migration.
+
+The selected DAC principal is fixed before the domain projection through an
+exact top-level static DAC label and `relabel=no`. This is DAC-specific, not a
+request to disable AppArmor or SELinux. The deployed host must qualify the
+resulting inactive XML and actual boot without changing export ownership or
+the immutable metadata. See the official [libvirt security-label contract](https://libvirt.org/formatdomain.html#security-label).
+
+After inactive-domain cleanup and proof that the original terminal writer is
+stale, revoke BOOT access before stage-1, root, runtime I/O and shared traversal
+retirement. Native qualification excludes the pair from both fixture brokers,
+bringing the stale-cleanup child to ten product ACL targets. The retained-root
+successor still uses its separate legacy fixture boot inputs.
+
+Shared lower-image exports remain a distinct next slice: their membership,
+lower leases and GC must cover multiple VM lifetimes. Canonical CAS objects,
+external host ancestors, public OCI-root dispatch and Gate 2 stay unchanged.
+
 Gate 1 is active now. `tests/integration/test_buildkit_named_oci_context.py` runs the Palimpsest CLI with a unique digest-pinned local OCI named context under strict offline/network-none BuildKit policy and `--no-cache`, verifies every output OCI descriptor/blob plus the layer sentinel, checks the independently exported rootfs, and binds stdout to the durable manifest/archive receipt. PR and release workflows create a network-none builder and run this gate.
 
 Gate 2 is present but opt-in and intentionally skipped until the OCI-root KVM path exists. Its build and runtime halves are split so the KVM proof runs on a Docker-daemonless host. `tests/e2e/prepare_local_oci_build.py` creates a Palimpsest-built OCI archive plus a receipt bound to its SHA-256, manifest, platform, and random marker; CI transfers that directory to the runtime-only `tests/e2e/test_local_oci_build_run.py` gate:
@@ -1715,8 +1749,8 @@ Gate 2 activation requires all of the following, not merely successful layer con
 
 ### Next implementation order
 
-1. Extend the durable access boundary to kernel/initramfs and shared lower-artifact exports with an
-   explicit relabel policy,
+1. Extend the durable access boundary to shared lower-artifact exports with
+   explicit membership, lease and reclamation contracts,
    then connect explicit
    deletion/socket and old-run reclamation to the proven inactive-domain
    cleanup and completed lower-lease handoff boundaries. Preserve lower pins
