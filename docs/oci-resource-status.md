@@ -160,3 +160,79 @@ process cleanup. Do not introduce retries, per-process telemetry, raw exception
 cause traversal or result takeover. Verify protocol rejection, legacy behavior,
 sanitization and actual boundary error paths in focused files, then independent
 review, push and exact-SHA Linux tests plus a separate fresh cold public proof.
+
+## Failure-attribution implementation — 2026-09-07
+
+Implementation `18973540b47fbe1a6bdb9b28c3205759eab79761` was independently
+approved and pushed. Sol authored the code and tests; Astra managed the
+contract, independent review, verification and records. The v3 response emits
+only allowlisted stage/errno facts and the exact canonical v2 reader remains
+compatible. MemoryError carries no invented OS errno. PID 1 protection,
+resource limits, process cleanup and lifecycle behavior are unchanged.
+
+Review corrected over-specific spawn labels around subprocess communication,
+restored conservative consumer mappings, and required canonical acceptance
+and real descriptor fault tests. An unsupported descriptor-cleanup change was
+removed; no preexisting cleanup defect is claimed fixed.
+
+Final local selected worker/converter/lane/public-consumer files passed 352
+with eight Linux-only skips (10.54 s). The store lane passed 961 with ten skips
+(42.32 s), including the Unix-socket case denied in the author's sandboxed run.
+Ruff, format and diff checks passed. These overlapping runs are not additive
+and do not constitute a full-suite or native qualification claim.
+
+The initial exact-SHA Linux selection passed 359 and failed one newly added
+test: it assumed the normalized tar began with the file name, but the valid
+stream begins with a PAX header. Cold execution was not started after that
+failure. Test-only follow-up `721a753e3674277905dd897a67034eb7d37e0674`
+checks the bounded tar snapshot's actual member and payload without advancing
+or closing the production descriptor. Independent review approved it; local
+converter checks passed 86 with eight Linux skips (2.53 s). The original failed
+server log remains preserved; no product behavior was changed to satisfy it.
+
+That first correction still omitted the synthesized `.` root member; the
+second Linux selection again passed 359 and failed that same test (27.19 s),
+before cold execution. Test-only correction
+`2b6340ed331babbd922c7b06857ef2033883bf26` now checks exact root-directory and
+file members through a shared helper, with a portable regression exercising
+the production normalized-tar emitter. Local converter verification passed
+87 with eight Linux skips (2.99 s); independent review approved the remaining
+descriptor and fault-injection assertions. Both failed selections remain
+recorded rather than being reported as passes.
+
+### Exact-SHA Linux and fresh cold proof: passed
+
+At `2b6340ed331babbd922c7b06857ef2033883bf26`, the server passed all 361
+selected tests (27.43 s), including the eight cases skipped on macOS. A
+separate fresh-runtime public exec proof then passed (20.72 s): detached
+`run -d`, literal argv/separate streams/exit handling, application root marker
+and identity comparison with authenticated PID 1 evidence, direct PID 1 root
+access denial, continued operation after a missing command, and stop/rm.
+The test verified domain/run removal and original archive preservation.
+
+The successful runtime `/tmp/p-execcli-a66762d5` was removed by the test's
+identity-checked success cleanup. The old failed runtime
+`/tmp/p-execcli-0b710ea6` and its launch error remain preserved. The libvirt
+domain list is empty and source archive SHA-256 remains
+`862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+
+Server evidence:
+
+- `/tmp/palimpsest-g37-server-selected-2b6340ed331babbd922c7b06857ef2033883bf26.log`
+- `/tmp/palimpsest-g37-public-exec-2b6340ed331babbd922c7b06857ef2033883bf26.log`
+- `/tmp/palimpsest-g37-resource-status-2b6340ed331babbd922c7b06857ef2033883bf26.json`
+- Failed fixture selections at `1897354` and `721a753` remain in their
+  corresponding `/tmp/palimpsest-g37-server-selected-<full-SHA>.log` files.
+- Local logs and independent reviews: `/tmp/palimpsest-g37.MOzi44`.
+
+The pre-run advisory observation again showed 238 visible matching threads
+and prospective ceiling 256. This is not admission evidence and does not
+explain why the older materialization failed while this new proof succeeded.
+The former native-verification blocker is closed by the new successful proof;
+the historical resource failure's exact cause remains unknown. No natural
+resource failure was reproduced in this run, so stage/errno failure propagation
+is supported by injected boundary tests, not a claimed native fault capture.
+No limits or unrelated services were changed; no unacknowledged app command
+was replayed. The guest binary and builder were unchanged, so the full guest
+boot matrix and image rebuild were not repeated. Historical Gate 2 evidence
+remains separately recorded, not counted as a new full Gate 2 run here.

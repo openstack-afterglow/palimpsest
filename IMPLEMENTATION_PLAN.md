@@ -2043,3 +2043,18 @@ cold proof. Implement fixed stage/errno facts in the versioned worker response,
 retain strict legacy no-details behavior and existing binding, and preserve
 limits/cleanup. Follow the diagnostic contract; do not interpret approval as
 permission to raise limits, stop services or replay unacknowledged app commands.
+
+Completed bounded failure attribution at `1897354`, with independently reviewed
+test-only fixture corrections `721a753` and `2b6340e`. Exact pushed server
+`2b6340e` passed 361 selected tests and a separate fresh cold public exec proof
+(20.72 s), including protected root evidence and stop/rm cleanup. The original
+image and old failed runtime remain preserved. See the diagnostic contract for
+overlapping local results, both failed fixture selections and final evidence.
+The old resource failure's exact cause is still unknown; this successful fresh
+run is not proof that a specific limiting resource was fixed. PID 1 protection,
+worker caps, process cleanup and lifecycle behavior remain unchanged.
+
+Next: control-lost/unacknowledged-result recovery UX, keeping automatic replay
+and result takeover out of scope until separately designed and authorized.
+Public retained-root boot/reuse and shared multi-VM data volumes remain separate
+follow-ups under the existing VM-root ownership contract.
