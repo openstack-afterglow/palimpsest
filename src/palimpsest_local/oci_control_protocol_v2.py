@@ -36,6 +36,7 @@ MAX_OCI_EXEC_CHUNK_BYTES = 1024
 MAX_OCI_EXEC_TIMEOUT_MS = 30000
 _MAX_PAYLOAD_BYTES = MAX_OCI_CONTROL_FRAME_BYTES - 4
 _MAX_COUNTER = (1 << 63) - 1
+_MAX_U64 = (1 << 64) - 1
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 _KINDS = frozenset(
@@ -145,6 +146,23 @@ def _terminal(value: Any) -> dict[str, int | None]:
     if signal is not None and (type(signal) is not int or not 1 <= signal <= 64):
         raise OCIControlProtocolV2Error("terminal signal is invalid")
     return {"exit_code": exit_code, "signal": signal}
+
+
+def validate_root_identity(value: Any) -> dict[str, Any]:
+    """Validate the sole path-free PID-1 root identity admitted in READY."""
+
+    identity = _exact(value, {"schema", "pid", "filesystem", "device", "inode"}, "root identity")
+    if identity["schema"] != "palimpsest.oci-root-identity.v1":
+        raise OCIControlProtocolV2Error("root identity schema is invalid")
+    if type(identity["pid"]) is not int or identity["pid"] != 1:
+        raise OCIControlProtocolV2Error("root identity PID is invalid")
+    if identity["filesystem"] != "overlayfs":
+        raise OCIControlProtocolV2Error("root identity filesystem is invalid")
+    if type(identity["device"]) is not int or not 0 <= identity["device"] <= _MAX_U64:
+        raise OCIControlProtocolV2Error("root identity device is invalid")
+    if type(identity["inode"]) is not int or not 1 <= identity["inode"] <= _MAX_U64:
+        raise OCIControlProtocolV2Error("root identity inode is invalid")
+    return identity
 
 
 def _freeze(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -286,7 +304,9 @@ class OCIControlV2Message:
                 if self.epoch <= 1:
                     raise OCIControlProtocolV2Error("BOUNDARY_ACK fields are invalid")
             elif self.kind == "READY":
-                _exact(payload, set(), "READY payload")
+                if payload:
+                    ready = _exact(payload, {"root_identity"}, "READY payload")
+                    ready["root_identity"] = validate_root_identity(ready["root_identity"])
                 _counter(self.reply_to, "reply-to host wire sequence")
             elif self.kind == "SNAPSHOT":
                 _counter(self.reply_to, "reply-to request ID")
@@ -648,6 +668,15 @@ def transcript_projection(
         "size_bytes": len(encoded),
         "wire_sequence": message.wire_sequence,
     }
+    # Payloads are generally deliberately excluded.  This one closed-world,
+    # path-free value is retained only after authentication and canonical-wire
+    # verification above, so later readers can distinguish evidence from a
+    # merely successful READY state.
+    if message.kind == "READY" and "root_identity" in message.payload:
+        projection["root_identity"] = validate_root_identity(message.payload["root_identity"])
+        projection["run_id"] = message.binding.run_id
+        projection["domain_core_digest"] = message.binding.domain_core_digest
+        projection["stage1_artifact_digest"] = message.binding.stage1_artifact_digest
     projection["projection_digest"] = f"sha256:{hashlib.sha256(canonical_json_bytes(projection)).hexdigest()}"
     return MappingProxyType(projection)
 
@@ -1263,5 +1292,6 @@ __all__ = [
     "lifecycle_state_digest",
     "sign_message",
     "transcript_projection",
+    "validate_root_identity",
     "verify_message_authentication",
 ]

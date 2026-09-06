@@ -2,6 +2,11 @@
 
 ## 결론
 
+후속 결정: 사용자는 PID 1 보호를 유지하고 Gate 2 검증 기준을 변경하는
+방향을 승인했다. [새 root identity 계약](oci-root-proof.md)에 따라 구현과
+검증을 진행한다. 아래의 원래 probe 실패는 변경 전 근거이며, 보호를
+해제하라는 요청으로 해석하지 않는다.
+
 여기서 PID 1은 **호스트 서버가 아니라 VM 내부의 Palimpsest stage1 관리
 프로세스**다. OCI 이미지의 주 명령과 추가 `exec`는 그 자식으로 실행된다.
 보호의 목적은 이미지 안의 프로그램이 VM 관리자의 메모리·인증 키·제어
@@ -85,7 +90,9 @@ PID 1 자신은 `verify_root_identity`(3324)에서 기존 merged root FD와 새 
 인증만으로 모든 root inode/marker가 별도의 완결된 원격 증명으로 전달된다고
 과장하지 않는다. 하드웨어 attestation이나 guest kernel 전체의 무결성 증명도
 아니다.
-현재 READY payload는 비어 있다. 인증 envelope의 stage1 artifact 식별자는
+이 보고서의 기준 구현에서는 READY payload가 비어 있었다. 후속 계약은
+인증된 최소 root identity를 추가하며 빈 legacy READY를 root 증거로 인정하지
+않는다. 인증 envelope의 stage1 artifact 식별자는
 stage1 transport에 대한 것이며 init 실행 파일의 SHA와 동일하다고 취급하면
 안 된다. 선택적 assembly probe도 기본은 빈 목록이다. Boot key의 보호는
 호스트가 관리하는 채널과 신뢰한 guest kernel/stage1을 전제로 한다.
@@ -99,7 +106,8 @@ stage1 transport에 대한 것이며 init 실행 파일의 SHA와 동일하다�
 고갈 방지, guest kernel/hypervisor 취약점 방어, 호스트 관리자에 대한 방어가
 증명되는 것은 아니다.
 
-다음 선택지는 **제안이며 아직 구현·승인되지 않았다.**
+다음 중 **1번 방향은 후속 사용자 승인을 받았다.** 구현·실기 완료 여부는
+새 계약의 검증 기록으로 구분한다. 2번은 아직 승인되지 않은 제안이다.
 
 1. **현재 보호 유지:** 앱 probe는 자신의 실제 `/`를 검사하고, PID 1 root는
    필요한 최소 사실을 관리자가 직접 검사해 인증된 결과로 내보내는 별도
@@ -109,6 +117,6 @@ stage1 transport에 대한 것이며 init 실행 파일의 SHA와 동일하다�
    선택권이 제품 요구라면 별도 실행 정책으로 설계한다. 그 경우 현재 인증
    키와 lifecycle 관리자를 같은 신뢰 경계 안에 둬도 되는지 다시 검토한다.
 
-권고는 우선 1번이다. 루트 파일시스템 경험을 유지하면서 관리 경계를 열지
-않을 수 있다. 이번 요청은 PID 1 보호의 설명이므로, 보호와 원래 root probe는
-그대로 유지한다. Docker가 설치된 호스트 허용은 이 문제와 별개로 반영한다.
+승인된 1번 방향은 루트 파일시스템 경험을 유지하면서 관리 경계를 열지
+않는다. 보호는 유지하고 원래 probe의 검증 기준만 명시적으로 변경한다.
+Docker가 설치된 호스트 허용은 이 문제와 별개다.

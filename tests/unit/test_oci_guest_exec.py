@@ -54,6 +54,27 @@ static __attribute__((used, noreturn)) void harness_main(void) {
         if (n < 0) exit_now(91);
         used += (usize)n;
     }
+    if (mode == 11) {
+        struct stat_local current;
+        i64 root_fd = sc3(SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+        if (root_fd < 0 || sc2(SYS_fstat, root_fd, (i64)&current) != 0 || sc1(SYS_close, root_fd) != 0)
+            exit_now(100);
+        root_identity_evidence.device = current.dev;
+        root_identity_evidence.inode = current.ino;
+        root_identity_evidence.verified = 1;
+        if (!refresh_root_identity_evidence()) exit_now(102);
+        session.fd = 1;
+        session.key_ack_wire_sequence = 2;
+        if (!send_control_message(&session, 0, 0)) exit_now(103);
+        root_identity_evidence.inode = current.ino ^ 1;
+        if (!root_identity_evidence.inode) root_identity_evidence.inode = current.ino + 1;
+        session.state = LIFECYCLE_NEW;
+        if (refresh_root_identity_evidence() || root_identity_evidence.verified ||
+            root_identity_evidence.device || root_identity_evidence.inode ||
+            send_control_message(&session, 0, 0) || session.state != LIFECYCLE_NEW)
+            exit_now(101);
+        exit_now(0);
+    }
     if (mode == 3) session.state = LIFECYCLE_STOPPING;
     if (mode == 8) session.last_exec_request_id = 9;
     if (mode == 9) remote_exec.active = 1;
@@ -210,6 +231,30 @@ def test_real_c_parser_rejects_duplicate_nonready_replayed_or_busy_exec(runner, 
 def test_real_c_parser_rejects_tampered_authenticated_argv(runner):
     encoded = _frame().replace(b"/bin/demo", b"/bin/evil")
     assert runner(encoded).returncode == 2
+
+
+def test_real_c_root_identity_drift_clears_evidence_and_suppresses_ready(runner):
+    if os.environ.get("PALIMPSEST_GUEST_EXEC_DOCKER_TESTS") != "1":
+        pytest.skip("root-identity harness requires the pinned Docker process to run as PID 1")
+    result = runner(_frame(), 11)
+    assert result.returncode == 0, result.stderr
+    frames = _decode_outputs(result.stdout)
+    assert len(frames) == 1
+    ready = frames[0]
+    assert ready.kind == "READY"
+    assert ready.binding == wire.OCIControlV2Binding(
+        _RUN, "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    )
+    assert ready.boot_attempt_id == _ATTEMPT
+    assert ready.boot_generation == _GENERATION
+    assert ready.wire_sequence == 4
+    assert ready.reply_to == 2
+    assert ready.payload["root_identity"]["schema"] == "palimpsest.oci-root-identity.v1"
+    assert ready.payload["root_identity"]["pid"] == 1
+    assert ready.payload["root_identity"]["filesystem"] == "overlayfs"
+    assert type(ready.payload["root_identity"]["device"]) is int
+    assert type(ready.payload["root_identity"]["inode"]) is int
+    assert ready.payload["root_identity"]["inode"] > 0
 
 
 @pytest.mark.parametrize(

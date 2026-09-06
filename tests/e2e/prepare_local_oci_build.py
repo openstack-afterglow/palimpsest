@@ -12,7 +12,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-_SCHEMA = "palimpsest.oci-root-build-run-acceptance.v1"
+_SCHEMA = "palimpsest.oci-root-build-run-acceptance.v2"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,8 +35,11 @@ def main(argv: list[str] | None = None) -> int:
             "#!/bin/sh\n"
             "set -eu\n"
             f'test "$(cat /palimpsest-e2e-root-marker)" = {marker!r}\n'
-            f'test "$(cat /proc/1/root/palimpsest-e2e-root-marker)" = {marker!r}\n'
-            f"printf 'PALIMPSEST_OCI_ROOT_OK:{marker}\\n'\n",
+            f'test "$(cat /proc/self/root/palimpsest-e2e-root-marker)" = {marker!r}\n'
+            "slash_identity=$(stat -c '%d:%i' /)\n"
+            "self_identity=$(stat -Lc '%d:%i' /proc/self/root)\n"
+            "test \"$slash_identity\" = \"$self_identity\"\n"
+            f"printf 'PALIMPSEST_OCI_ROOT_OK:{marker}:%s\\n' \"$slash_identity\"\n",
             encoding="utf-8",
         )
         probe.chmod(0o755)

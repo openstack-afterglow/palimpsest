@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import test_runtime_dispatch as dispatch_tests
 
-from palimpsest_local import cli, oci_host, platforms, runtime_dispatch, state
+from palimpsest_local import cli, oci_host, oci_root_proof, platforms, runtime_dispatch, state
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.runtime_types import (
@@ -159,6 +159,16 @@ def test_init_runtime_does_not_initialize_default_state(tmp_path, monkeypatch, c
     assert calls == [parent.resolve()]
     assert capsys.readouterr().out == f"PALIMPSEST_STATE_HOME='{parent.resolve()}/state'\n"
     assert not parent.exists()
+
+
+def test_root_proof_is_read_only_and_prints_only_the_public_report(monkeypatch, capsys):
+    report = {"schema": "palimpsest.oci-root-proof.v1", "root_identity": {"device": 7, "inode": 9}}
+    seen = []
+    monkeypatch.setattr(oci_root_proof, "root_proof", lambda roots, name: seen.append((roots, name)) or report)
+    monkeypatch.setattr(cli, "init_roots", lambda: pytest.fail("root-proof initialized state"))
+    assert cli.main(["oci", "root-proof", "demo"]) == 0
+    assert seen and seen[0][1] == "demo"
+    assert __import__("json").loads(capsys.readouterr().out) == report
 
 
 def _record(tmp_path):

@@ -1,8 +1,7 @@
-"""Opt-in public CLI exec proof; run only after native engine qualification.
+"""Opt-in public CLI exec and v2 root-proof checks after native qualification.
 
-This is intentionally separate from unchanged Gate 2, whose PID 1 root probe
-has a distinct supervisor-isolation acceptance conflict. The baked-probe denial
-below proves that conflict and the current protection, not Gate 2 acceptance.
+The baked application proves its own root identity; a separate direct PID 1
+root access attempt must remain denied by the unchanged supervisor isolation.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
     assert archive.is_file()
     archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     receipt = json.loads(archive.with_name("acceptance.json").read_text())
-    assert receipt["schema"] == "palimpsest.oci-root-build-run-acceptance.v1"
+    assert receipt["schema"] == "palimpsest.oci-root-build-run-acceptance.v2"
     assert receipt["archive_sha256"] == "sha256:" + archive_digest
     marker = receipt["marker"]
     assert type(marker) is str and re.fullmatch("palimpsest-local-build-[0-9a-f]{32}", marker)
@@ -61,6 +60,9 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         (parent / "launch.stderr").write_bytes(launched.stderr)
         _success(launched)
         assert launched.stdout == (name + "\n").encode()
+        proof_before = _cli(environment, "oci", "root-proof", name)
+        _success(proof_before)
+        before_report = json.loads(proof_before.stdout)
 
         def execute(label, *argv):
             result = _cli(environment, "exec", name, "--", *argv, timeout=60)
@@ -91,15 +93,35 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         )
         _success(result)
         assert result.stdout == f"PUBLIC_EXEC_IMAGE_ROOT_OK:{marker}\n".encode() and result.stderr == b""
-        isolation = execute("pid1-isolation", "/bin/sh", "-c", "LC_ALL=C /usr/local/bin/palimpsest-e2e-probe")
+        probe = execute("root-probe", "/usr/local/bin/palimpsest-e2e-probe")
+        _success(probe)
+        matched = re.fullmatch(
+            rb"PALIMPSEST_OCI_ROOT_OK:" + re.escape(marker.encode()) + rb":(0|[1-9][0-9]*):([1-9][0-9]*)\n",
+            probe.stdout,
+        )
+        assert matched is not None
+        device, inode = (int(value) for value in matched.groups())
+        assert device <= (1 << 64) - 1 and inode <= (1 << 64) - 1
+        isolation = execute(
+            "pid1-isolation", "/bin/sh", "-c",
+            "LC_ALL=C cat /proc/1/root/palimpsest-e2e-root-marker",
+        )
         assert isolation.returncode != 0 and isolation.stdout == b""
         assert b"Permission denied" in isolation.stderr
-        assert b"/proc/1/root/palimpsest-e2e-root-marker" in isolation.stderr
         missing = execute("missing-command", "/palimpsest-no-such-executable")
         assert missing.returncode == 127 and missing.stdout == b""
         result = execute("after-error", "/bin/sh", "-c", "printf 'still-running'")
         _success(result)
         assert result.stdout == b"still-running" and result.stderr == b""
+        proof_after = _cli(environment, "oci", "root-proof", name)
+        _success(proof_after)
+        after_report = json.loads(proof_after.stdout)
+        assert {key: before_report[key] for key in ("run", "boot", "domain")} == {
+            key: after_report[key] for key in ("run", "boot", "domain")
+        }
+        assert before_report["root_identity"] == after_report["root_identity"]
+        assert after_report["root_identity"]["device"] == device
+        assert after_report["root_identity"]["inode"] == inode
 
         virsh = shutil.which("virsh", path=environment.get("PATH"))
         assert virsh is not None

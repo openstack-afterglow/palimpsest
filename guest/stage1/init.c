@@ -411,6 +411,9 @@ struct lifecycle_session {
 
 static struct lifecycle_binding lifecycle_binding;
 
+struct root_identity_evidence { u64 device; u64 inode; int verified; };
+static struct root_identity_evidence root_identity_evidence;
+
 struct cgroup_node {
     int dir_fd;
     int procs_fd;
@@ -2710,7 +2713,14 @@ static int send_control_message(struct lifecycle_session *session, int kind,
     CONTROL_TEXT("\",\"domain_core_digest\":\""); CONTROL_TEXT(lifecycle_binding.core);
     CONTROL_TEXT("\",\"epoch\":"); if (!append_control_u64(control_body, sizeof(control_body), &used, session->epoch)) return 0;
     CONTROL_TEXT(",\"host_nonce\":\""); CONTROL_TEXT(session->host_nonce);
-    if (kind == 0) CONTROL_TEXT("\",\"kind\":\"READY\",\"payload\":{}");
+    if (kind == 0) {
+        if (!root_identity_evidence.verified) return 0;
+        CONTROL_TEXT("\",\"kind\":\"READY\",\"payload\":{\"root_identity\":{\"device\":");
+        if (!append_control_u64(control_body, sizeof(control_body), &used, root_identity_evidence.device)) return 0;
+        CONTROL_TEXT(",\"filesystem\":\"overlayfs\",\"inode\":");
+        if (!append_control_u64(control_body, sizeof(control_body), &used, root_identity_evidence.inode)) return 0;
+        CONTROL_TEXT(",\"pid\":1,\"schema\":\"palimpsest.oci-root-identity.v1\"}}");
+    }
     else if (kind == 1) CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"ready\",\"stop_request_id\":null,\"terminal\":null}");
     else if (kind == 2) {
         CONTROL_TEXT("\",\"kind\":\"SNAPSHOT\",\"payload\":{\"state\":\"stopping\",\"stop_request_id\":");
@@ -3341,6 +3351,27 @@ static int verify_root_identity(int merged_fd, const struct stat_local *merged_i
     return valid;
 }
 
+static int refresh_root_identity_evidence(void) {
+    struct stat_local slash, proc_root;
+    struct statfs_local slash_fs, proc_root_fs;
+    i64 slash_fd = sc3(SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    i64 proc_root_fd = sc3(SYS_open, (i64)"/proc/self/root", O_RDONLY | O_CLOEXEC | O_DIRECTORY, 0);
+    int valid = root_identity_evidence.verified && sc0(SYS_getpid) == 1 && slash_fd >= 0 && proc_root_fd >= 0 &&
+        sc2(SYS_fstat, slash_fd, (i64)&slash) == 0 &&
+        sc2(SYS_fstat, proc_root_fd, (i64)&proc_root) == 0 &&
+        sc2(SYS_fstatfs, slash_fd, (i64)&slash_fs) == 0 && slash_fs.type == OVERLAYFS_MAGIC &&
+        sc2(SYS_fstatfs, proc_root_fd, (i64)&proc_root_fs) == 0 && proc_root_fs.type == OVERLAYFS_MAGIC &&
+        (slash.mode & S_IFMT) == S_IFDIR && slash.dev == proc_root.dev && slash.ino == proc_root.ino &&
+        slash.dev == root_identity_evidence.device && slash.ino == root_identity_evidence.inode;
+    if (proc_root_fd >= 0 && sc1(SYS_close, proc_root_fd) != 0) valid = 0;
+    if (slash_fd >= 0 && sc1(SYS_close, slash_fd) != 0) valid = 0;
+    if (!valid || slash.ino == 0) {
+        secure_zero(&root_identity_evidence, sizeof(root_identity_evidence));
+        return 0;
+    }
+    return 1;
+}
+
 /* Terminal authority is not published until the writable OverlayFS backing
  * has crossed an explicit sync boundary. Reopen slash without following a
  * terminal path component, bind it to /proc/self/root and OverlayFS, then
@@ -3408,6 +3439,12 @@ static int transition_root(struct expected_device_set *expected, struct opened_r
         if (!recheck_open_role(&roles[i + 1])) valid = 0;
     for (i = 0; valid && i < expected->probe_count; i++)
         if (!verify_probe_at(expected, i, "")) valid = 0;
+    if (valid) {
+        root_identity_evidence.device = merged_identity.dev;
+        root_identity_evidence.inode = merged_identity.ino;
+        root_identity_evidence.verified = merged_identity.ino != 0;
+        valid = root_identity_evidence.verified;
+    } else secure_zero(&root_identity_evidence, sizeof(root_identity_evidence));
     sc1(SYS_close, dev.fd);
     sc1(SYS_close, sys.fd);
     sc1(SYS_close, proc.fd);
@@ -4742,6 +4779,14 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         return n ? 0 : -1;
     }
     write_all(1, WORKLOAD_STARTED_MARKER);
+    if (!refresh_root_identity_evidence()) {
+        set_workload_failure(failure, 41, EIO);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0);
+        close_workload_agent(&agent, &session);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return n != 0 ? 0 : -1;
+    }
     lifecycle->state = LIFECYCLE_READY;
     (void)send_control_message(lifecycle, 0, result);
     write_all(1, LIFECYCLE_READY_COMMITTED_MARKER);

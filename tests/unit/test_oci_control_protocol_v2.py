@@ -41,6 +41,13 @@ NONCE3 = "3" * 64
 KEY = bytes(range(32))
 READY_STATE = {"state": "ready", "stop_request_id": None, "terminal": None}
 STATE_DIGEST = lifecycle_state_digest("ready", stop_request_id=None, terminal=None)
+ROOT_IDENTITY = {
+    "schema": "palimpsest.oci-root-identity.v1",
+    "pid": 1,
+    "filesystem": "overlayfs",
+    "device": 42,
+    "inode": 99,
+}
 
 
 def binding(**changes: str) -> OCIControlV2Binding:
@@ -927,6 +934,39 @@ def test_receipt_projection_and_repr_never_expose_boot_key_or_tag() -> None:
         "size_bytes",
         "wire_sequence",
     }
+
+
+def test_ready_root_identity_is_closed_world_and_retained_only_after_authentication() -> None:
+    ready = signed("READY", payload={"root_identity": ROOT_IDENTITY})
+    projection = transcript_projection(ready, encode_frame(ready), carrier=OCI_CONTROL_CHANNEL_CARRIER, key=KEY)
+    assert projection["root_identity"] == ROOT_IDENTITY
+    assert projection["run_id"] == RUN
+    assert projection["domain_core_digest"] == binding().domain_core_digest
+    assert projection["stage1_artifact_digest"] == binding().stage1_artifact_digest
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {**ROOT_IDENTITY, "pid": True},
+        {**ROOT_IDENTITY, "device": True},
+        {**ROOT_IDENTITY, "device": -1},
+        {**ROOT_IDENTITY, "device": 1 << 64},
+        {**ROOT_IDENTITY, "inode": 0},
+        {**ROOT_IDENTITY, "inode": 1 << 64},
+        {**ROOT_IDENTITY, "filesystem": "ext4"},
+        {**ROOT_IDENTITY, "extra": 1},
+    ],
+)
+def test_ready_root_identity_rejects_types_ranges_and_unknown_fields(identity: dict[str, object]) -> None:
+    with pytest.raises(OCIControlProtocolV2Error, match="root identity"):
+        body("READY", payload={"root_identity": identity})
+
+
+def test_ready_legacy_empty_payload_remains_protocol_compatible() -> None:
+    assert body("READY").payload == {}
+    with pytest.raises(OCIControlProtocolV2Error, match="READY payload"):
+        body("READY", payload={"unexpected": ROOT_IDENTITY})
 
 
 def test_carrier_kind_matrix_and_projection_evidence_are_fail_closed() -> None:

@@ -28,7 +28,7 @@ def case(tmp_path, monkeypatch):
                 "manifest_digest": "sha256:" + "b" * 64,
                 "marker": marker,
                 "platform": "linux/amd64",
-                "schema": "palimpsest.oci-root-build-run-acceptance.v1",
+                "schema": "palimpsest.oci-root-build-run-acceptance.v2",
             }
         )
     )
@@ -49,6 +49,9 @@ def case(tmp_path, monkeypatch):
         domain_error=False,
         domain_present=False,
         run_name=None,
+        proof_reads=0,
+        proof_identity_change=False,
+        pid1_access_allowed=False,
     )
     monkeypatch.setenv("PALIMPSEST_OCI_ROOT_E2E_ARTIFACT_DIR", str(artifact))
     monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(root))
@@ -61,13 +64,26 @@ def case(tmp_path, monkeypatch):
         if arguments[0] == "run":
             value.run_name = arguments[arguments.index("--name") + 1]
             (root / "runs" / value.run_name).mkdir(parents=True)
-        elif arguments[0] == "exec":
-            assert arguments == ["exec", value.run_name, "--", "/usr/local/bin/palimpsest-e2e-probe"]
+        elif arguments[:2] == ["oci", "root-proof"]:
+            value.proof_reads += 1
+            device = 8 if value.proof_identity_change and value.proof_reads == 2 else 7
+            proof = {
+                "schema": "palimpsest.oci-root-proof.v1",
+                "run": {"name": value.run_name, "run_id": "run"},
+                "boot": {"attempt_id": "attempt", "generation": "generation"},
+                "domain": {"id": 7, "uuid": "domain"},
+                "root_identity": {"schema": "palimpsest.oci-root-identity.v1", "pid": 1,
+                                  "filesystem": "overlayfs", "device": device, "inode": 11},
+            }
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(proof), "")
+        elif arguments[0] == "exec" and arguments[-1] == "/usr/local/bin/palimpsest-e2e-probe":
             if isinstance(value.probe_error, BaseException):
                 raise value.probe_error
             if value.probe_error:
                 return subprocess.CompletedProcess(arguments, 1, "", value.probe_error)
-            return subprocess.CompletedProcess(arguments, 0, f"PALIMPSEST_OCI_ROOT_OK:{marker}\n", "")
+            return subprocess.CompletedProcess(arguments, 0, f"PALIMPSEST_OCI_ROOT_OK:{marker}:7:11\n", "")
+        elif arguments[0] == "exec":
+            return subprocess.CompletedProcess(arguments, 95 if value.pid1_access_allowed else 0, "", "")
         elif arguments[0] == "stop" and value.stop_error:
             raise value.stop_error
         elif arguments[0] == "rm":
@@ -103,7 +119,7 @@ def test_docker_present_host_reaches_original_probe_and_records_guard_scope(case
     exists = Path.exists
     monkeypatch.setattr(Path, "exists", lambda path: True if str(path) == "/run/docker.sock" else exists(path))
     case.execute()
-    assert case.calls == ["run", "dominfo", "exec", "stop", "rm", "list"]
+    assert case.calls == ["run", "dominfo", "oci", "exec", "exec", "oci", "stop", "rm", "list"]
     assert set(case.checks().values()) == {"passed"}
     evidence = json.loads((case.work / "command-evidence" / "runtime.json").read_text())
     assert evidence["state_root"] == str(case.root)
@@ -119,6 +135,18 @@ def test_probe_failure_preserves_primary_error_and_reports_all_cleanup_checks(ca
     assert set(case.checks().values()) == {"passed"}
     assert "archive-preserved: passed" in raised.value.__notes__[0]
     assert json.loads((case.work / "command-evidence" / "exec.json").read_text())["returncode"] == 1
+
+
+def test_gate_rejects_root_identity_change_across_bracketed_proofs(case):
+    case.proof_identity_change = True
+    with pytest.raises(AssertionError):
+        case.execute()
+
+
+def test_gate_rejects_unexpected_pid1_root_access(case):
+    case.pid1_access_allowed = True
+    with pytest.raises(AssertionError):
+        case.execute()
 
 
 def test_stop_timeout_does_not_hide_probe_failure_or_skip_rm_and_other_checks(case):

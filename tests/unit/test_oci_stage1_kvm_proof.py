@@ -302,6 +302,19 @@ def _lifecycle() -> dict[str, object]:
             "size_bytes": 1336 if kind == "BOUNDARY_ACK" else 800,
             "wire_sequence": wire,
         }
+        if kind == "READY":
+            value.update(
+                domain_core_digest=plan.domain_core_digest,
+                root_identity={
+                    "device": 7,
+                    "filesystem": "overlayfs",
+                    "inode": 11,
+                    "pid": 1,
+                    "schema": "palimpsest.oci-root-identity.v1",
+                },
+                run_id=plan.run_id,
+                stage1_artifact_digest=transport.receipt.artifact_digest,
+            )
         value["projection_digest"] = (
             "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         )
@@ -449,6 +462,17 @@ def _receipt() -> OCIStage1KVMProofReceipt:
     uid0_plan = build_uid0_isolation_proof_plan()
     uid0_transport = build_stage1_transport(uid0_plan)
     uid0_frames = copy.deepcopy(_lifecycle()["boots"][0]["frames"])
+    uid0_ready = next(frame for frame in uid0_frames if frame["kind"] == "READY")
+    uid0_ready["run_id"] = uid0_plan.run_id
+    uid0_ready["domain_core_digest"] = uid0_plan.domain_core_digest
+    uid0_ready["stage1_artifact_digest"] = uid0_transport.receipt.artifact_digest
+    uid0_ready["projection_digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in uid0_ready.items() if key != "projection_digest"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     return OCIStage1KVMProofReceipt(
         "sha256:" + "1" * 64,
         4096,
@@ -1048,7 +1072,9 @@ connection.sendall(encode_frame(bootstrap))
 key_ack = receive(connection); verify_message_authentication(key_ack, key)
 ready = sign_message(OCIControlV2Message(kind='READY', binding=hello.body.binding,
     boot_attempt_id=hello.body.boot_attempt_id, host_nonce=hello.body.host_nonce, epoch=1,
-    wire_sequence=2, payload={{}}, boot_generation=generation, reply_to=key_ack.body.wire_sequence), key)
+    wire_sequence=2, payload={{'root_identity': {{'device': 7, 'filesystem': 'overlayfs', 'inode': 11,
+        'pid': 1, 'schema': 'palimpsest.oci-root-identity.v1'}}}}, boot_generation=generation,
+    reply_to=key_ack.body.wire_sequence), key)
 frame = encode_frame(ready)
 for part in (frame[:1], frame[1:3], frame[3:]): connection.sendall(part)
 for marker in ({WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r}):
@@ -1474,7 +1500,7 @@ def test_proof_receipt_round_trips_all_executed_artifact_bindings() -> None:
         == receipt
     )
     assert decoded["qemu"]["artifact_digest"] == "sha256:" + "3" * 64
-    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v19"
+    assert decoded["schema"] == "palimpsest.oci-stage1-kvm-proof.v20"
     assert decoded["executed_boots"] == 43
     assert decoded["qemu_invocations"] == 44
     assert LIFECYCLE_CHANNEL_DISCOVERY_NEGATIVE_CONTROL_NAMES == (
@@ -2077,6 +2103,23 @@ def test_receipt_rejects_valid_looking_lifecycle_root_seed_tamper() -> None:
     name = LIFECYCLE_NEGATIVE_CONTROL_NAMES[0]
     lifecycle["channel_discovery_negative_controls"][name]["root_seed_digest"] = "sha256:" + "f" * 64
 
+    with pytest.raises(ArtifactValidationError, match="receipt value"):
+        replace(receipt, lifecycle=lifecycle)
+
+
+@pytest.mark.parametrize("field", ["run_id", "domain_core_digest", "stage1_artifact_digest"])
+def test_v20_receipt_rejects_ready_binding_tamper_with_recomputed_projection(field: str) -> None:
+    receipt = _receipt()
+    lifecycle = copy.deepcopy(receipt.lifecycle)
+    ready = next(frame for frame in lifecycle["boots"][0]["frames"] if frame["kind"] == "READY")
+    ready[field] = "not-a-uuid" if field == "run_id" else "sha256:" + "f" * 64
+    ready["projection_digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in ready.items() if key != "projection_digest"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, lifecycle=lifecycle)
 

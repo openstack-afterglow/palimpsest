@@ -1973,3 +1973,17 @@ proof (20.13 s). Local focused checks passed 239 with seven Linux-only skips;
 server checks covered those seven. Gate 2's known protection/probe conflict
 remains unresolved. The user-approved prior Docker/PID 1 summary was recorded
 and read back in Notion section 17.85, without operational paths or process IDs.
+
+### Approved next milestone: protected PID 1 root evidence for Gate 2
+
+The user explicitly approved retaining PID 1 protection while replacing direct
+application access to `/proc/1/root` with application-root verification plus
+minimal authenticated PID 1 root identity. This supersedes the pending
+root-proof decision above. See [the contract](docs/oci-root-proof.md).
+
+Astra owns planning, orchestration, review coordination and verification;
+GPT 5.6 Sol owns development, as requested. Implement guest READY root facts,
+strict authenticated host projection and current-run proof readout, then the
+versioned Palimpsest-built application probe and Gate 2 comparison. Preserve
+the direct-PID-1-root denial as a negative check. Independent approval precedes
+commit/push; exact-SHA server tests and full revised Gate 2 precede completion.

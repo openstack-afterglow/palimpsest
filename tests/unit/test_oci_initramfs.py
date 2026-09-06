@@ -143,7 +143,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v17"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v18"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -393,6 +393,16 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
     assert source.count("lifecycle_rejected(21, EIO);") >= 2
     assert "else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);" in source
+
+
+def test_ready_root_identity_revalidates_the_transition_baseline() -> None:
+    source = (Path(__file__).resolve().parents[2] / "guest" / "stage1" / "init.c").read_text()
+    assert "root_identity_evidence.device = merged_identity.dev" in source
+    assert "root_identity_evidence.inode = merged_identity.ino" in source
+    assert "slash.dev == root_identity_evidence.device && slash.ino == root_identity_evidence.inode" in source
+    assert source.index("if (!refresh_root_identity_evidence())") < source.index(
+        "lifecycle->state = LIFECYCLE_READY"
+    )
 
 
 def test_terminal_root_quiesce_failure_cannot_publish_terminal_state_or_frame() -> None:

@@ -49,6 +49,7 @@ from .oci_control_protocol_v2 import (
     OCIControlV2Message,
     decode_boundary_line,
     sign_message,
+    validate_root_identity,
 )
 from .oci_control_protocol_v2 import (
     OCI_CONTROL_PROTOCOL_V2 as OCI_CONTROL_PROTOCOL,
@@ -77,7 +78,7 @@ from .oci_provenance import canonical_json_bytes
 from .oci_stage1 import OCIStage1Plan, oci_stage1_device_serial
 from .oci_stage1_transport import BuiltOCIStage1Transport, OCIStage1TransportReceipt, build_stage1_transport
 
-OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v19"
+OCI_STAGE1_KVM_PROOF_SCHEMA = "palimpsest.oci-stage1-kvm-proof.v20"
 KVM_GET_API_VERSION = 0xAE00
 REQUIRED_KVM_API_VERSION = 12
 MAX_KERNEL_BYTES = 128 * 1024 * 1024
@@ -2155,7 +2156,9 @@ def _build_control_qemu_command(
     return command
 
 
-def _valid_lifecycle_boots_v2(boots: Any) -> bool:
+def _valid_lifecycle_boots_v2(
+    boots: Any, plan: OCIStage1Plan, transport: BuiltOCIStage1Transport
+) -> bool:
     normal = (
         (1, "host-to-guest", "HELLO"),
         (1, "guest-to-host", "BOOTSTRAP"),
@@ -2247,6 +2250,8 @@ def _valid_lifecycle_boots_v2(boots: Any) -> bool:
                 "size_bytes",
                 "wire_sequence",
             }
+            if kind == "READY":
+                fields |= {"domain_core_digest", "root_identity", "run_id", "stage1_artifact_digest"}
             if not isinstance(frame, Mapping) or set(frame) != fields:
                 return False
             nonce = frame.get("host_nonce")
@@ -2275,6 +2280,18 @@ def _valid_lifecycle_boots_v2(boots: Any) -> bool:
                 or not 5 <= frame["size_bytes"] <= 64 * 1024
             ):
                 return False
+            if kind == "READY":
+                try:
+                    identity = validate_root_identity(frame["root_identity"])
+                except OCIControlProtocolV2Error:
+                    return False
+                if (
+                    identity != frame["root_identity"]
+                    or frame["run_id"] != plan.run_id
+                    or frame["domain_core_digest"] != plan.domain_core_digest
+                    or frame["stage1_artifact_digest"] != transport.receipt.artifact_digest
+                ):
+                    return False
             last_wire[direction] = wire
             connection_nonces.setdefault(connection, nonce)
             if connection_nonces[connection] != nonce:
@@ -2510,7 +2527,7 @@ def _valid_lifecycle_receipt(value: Any, plan: OCIStage1Plan, transport: BuiltOC
         or qemu_duplicate.get("stage1_marker_count") != 0
     ):
         return False
-    return _valid_lifecycle_boots_v2(boots)
+    return _valid_lifecycle_boots_v2(boots, plan, transport)
 
 
 def _lifecycle_receipt(
@@ -2696,9 +2713,12 @@ def _valid_uid0_lifecycle_evidence(value: Any, plan: OCIStage1Plan, transport: B
     ):
         return False
     for frame, (direction, kind) in zip(frames, expected_v2, strict=True):
+        fields = projection_fields | (
+            {"domain_core_digest", "root_identity", "run_id", "stage1_artifact_digest"} if kind == "READY" else set()
+        )
         if (
             not isinstance(frame, Mapping)
-            or set(frame) != projection_fields
+            or set(frame) != fields
             or frame.get("connection") != 1
             or frame.get("direction") != direction
             or frame.get("kind") != kind
@@ -2719,6 +2739,18 @@ def _valid_uid0_lifecycle_evidence(value: Any, plan: OCIStage1Plan, transport: B
                 return False
         elif frame.get("boot_generation") != generation or not isinstance(frame.get("key_id"), str):
             return False
+        if kind == "READY":
+            try:
+                identity = validate_root_identity(frame["root_identity"])
+            except OCIControlProtocolV2Error:
+                return False
+            if (
+                identity != frame["root_identity"]
+                or frame["run_id"] != plan.run_id
+                or frame["domain_core_digest"] != plan.domain_core_digest
+                or frame["stage1_artifact_digest"] != transport.receipt.artifact_digest
+            ):
+                return False
     return (
         [frame["request_id"] for frame in frames] == [1, None, None, None, 2, None]
         and [frame["reply_to"] for frame in frames] == [None, 1, 1, 2, None, 2]

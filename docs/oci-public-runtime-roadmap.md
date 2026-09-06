@@ -24,9 +24,10 @@ or Gate 2 success.
 
 Subsequent user decision: Docker may coexist on the KVM host. Gate 2 no longer
 rejects a host merely for having Docker sockets; its CLI fallback audit remains.
-The original PID 1 root probe and supervisor protection have not been changed.
-See [the PID 1 protection report](oci-pid1-protection.ko.md) before deciding how
-to reconcile that criterion with the managed-workload security boundary.
+The user subsequently approved replacing the original PID 1 root probe's
+direct-access criterion while retaining supervisor protection. See
+[the protected root identity contract](oci-root-proof.md). Historical failures
+below are preserved and are not revised-gate success.
 
 Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
 `PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
@@ -191,18 +192,19 @@ and STOP during exec. Public CLI proof is separately opt-in. See
 result and qualification details. This does not itself pass Gate 2.
 
 Docker sockets on the current test host are now permitted by user decision.
-The baked `/proc/1/root` probe still conflicts with the existing non-dumpable
-PID 1 supervisor boundary. Do not stop unrelated Docker services, hide sockets
-or weaken PID 1 protection to pass the gate. Resolve the remaining root-proof
-criterion explicitly; the user requested a protection report, not its removal.
+The old baked `/proc/1/root` probe conflicts with the existing non-dumpable
+PID 1 supervisor boundary. The approved v2 criterion compares the application's
+actual root with minimal authenticated PID 1 root identity and retains direct
+PID 1 access denial as a negative check. Do not stop unrelated Docker services,
+hide sockets or weaken PID 1 protection to pass the gate.
 
-Then require `tests/e2e/test_local_oci_build_run.py` with its original root probe:
+Then require `tests/e2e/test_local_oci_build_run.py` with the versioned v2 probe:
 
 ```text
 Palimpsest build → immutable OCI archive + receipt
 → transfer to qualified KVM host (Docker may coexist)
-→ public run -d → separate public exec of the image probe
-→ verify image marker and actual / / PID 1 root
+→ public run -d → root-proof → separate public exec of the image probe → root-proof
+→ verify image marker, app/PID 1 root identity match and protected PID 1 access
 → stop → rm → no domain/run state, source archive preserved
 ```
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -91,7 +92,7 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
     assert archive.is_file() and receipt_path.is_file()
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert set(receipt) == {"archive_sha256", "manifest_digest", "marker", "platform", "schema"}
-    assert receipt["schema"] == "palimpsest.oci-root-build-run-acceptance.v1"
+    assert receipt["schema"] == "palimpsest.oci-root-build-run-acceptance.v2"
     assert receipt["archive_sha256"] == f"sha256:{hashlib.sha256(archive.read_bytes()).hexdigest()}"
     assert isinstance(receipt["manifest_digest"], str) and receipt["manifest_digest"].startswith("sha256:")
     marker = receipt["marker"]
@@ -172,13 +173,46 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
         domain = domain_command("domain-running", ["dominfo", run_name])
         assert domain.returncode == 0, domain.stderr
         assert "running" in domain.stdout.lower()
+        proof_before_result = command("root-proof-before", ["oci", "root-proof", run_name])
+        assert proof_before_result.returncode == 0, proof_before_result.stderr
+        proof_before = json.loads(proof_before_result.stdout)
         executed = command(
             "exec",
             ["exec", run_name, "--", "/usr/local/bin/palimpsest-e2e-probe"],
             timeout=60,
         )
         assert executed.returncode == 0, executed.stderr
-        assert executed.stdout.strip() == f"{_SUCCESS}:{marker}"
+        match = re.fullmatch(rf"{re.escape(_SUCCESS)}:{re.escape(marker)}:(0|[1-9][0-9]*):([1-9][0-9]*)\n", executed.stdout)
+        assert match is not None
+        device_text, inode_text = match.groups()
+        device, inode = int(device_text), int(inode_text)
+        assert device <= (1 << 64) - 1 and inode <= (1 << 64) - 1
+        denied = command(
+            "pid1-root-denied",
+            [
+                "exec", run_name, "--", "/bin/sh", "-c",
+                "message=$(cat /proc/1/root/palimpsest-e2e-root-marker 2>&1); status=$?; "
+                "if test \"$status\" -eq 0; then exit 95; fi; "
+                "case \"$message\" in *'Permission denied'*) exit 0;; *) exit 96;; esac",
+            ],
+        )
+        assert denied.returncode == 0, denied.stderr
+        proof_result = command("root-proof-after", ["oci", "root-proof", run_name])
+        assert proof_result.returncode == 0, proof_result.stderr
+        proof = json.loads(proof_result.stdout)
+        assert proof["schema"] == "palimpsest.oci-root-proof.v1"
+        assert proof["run"]["name"] == run_name
+        assert {key: proof[key] for key in ("run", "boot", "domain")} == {
+            key: proof_before[key] for key in ("run", "boot", "domain")
+        }
+        assert proof_before["root_identity"] == proof["root_identity"]
+        assert proof["root_identity"] == {
+            "schema": "palimpsest.oci-root-identity.v1",
+            "pid": 1,
+            "filesystem": "overlayfs",
+            "device": device,
+            "inode": inode,
+        }
     except BaseException as exc:
         primary = exc
 

@@ -636,6 +636,8 @@ def build_parser() -> argparse.ArgumentParser:
     oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
     oci_materialize.add_argument("--timeout", type=float, default=300.0)
     oci_materialize.add_argument("--output", type=Path)
+    oci_root_proof = oci_commands.add_parser("root-proof")
+    oci_root_proof.add_argument("name")
 
     build = commands.add_parser("build")
     build.add_argument("context", nargs="?", type=Path)
@@ -1409,9 +1411,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print("PALIMPSEST_STATE_HOME=" + shlex.quote(str(runtime_parent / "state")))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
-    roots = resolve_roots() if op in read_only_root_operations else init_roots()
+    roots = resolve_roots() if op in read_only_root_operations or (
+        op == "oci" and args.oci_operation == "root-proof"
+    ) else init_roots()
 
     if op == "oci":
+        if args.oci_operation == "root-proof":
+            from .oci_root_proof import root_proof
+
+            print(json.dumps(root_proof(roots, args.name), indent=2, sort_keys=True))
+            return 0
         oci_roots = StatePaths(
             config=roots.config.resolve(strict=True),
             state=roots.state.resolve(strict=True),

@@ -354,6 +354,7 @@ def test_exact_nested_command_tree_and_defaults():
     assert oci_args.platform == "linux/amd64"
     assert oci_args.packer == Path("/usr/bin/mksquashfs")
     assert oci_args.timeout == 300.0
+    assert parser.parse_args(["oci", "root-proof", "demo"]).name == "demo"
 
 
 def test_parser_accepts_additive_buildkit_dockerfile_surface():

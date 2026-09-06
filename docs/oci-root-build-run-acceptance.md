@@ -40,14 +40,16 @@ Gate 2 remains opt-in. The public OCI-root KVM run/exec adapter now exists.
 The build artifact may be transferred between hosts; Docker may also be
 installed and running on the KVM host. The user explicitly accepted that
 configuration. Docker is not a new required dependency of this KVM runtime.
-The original PID 1 root probe remains unchanged pending the separate protection
-decision explained in [the PID 1 report](oci-pid1-protection.ko.md).
+The user has approved the [protected PID 1 root identity contract](oci-root-proof.md).
+The revised v2 probe checks the application's root and compares its identity
+with authenticated-at-receipt PID 1 facts; direct PID 1 root access must remain
+denied. This supersedes the previous direct-access criterion, not the protection.
 
 1. On the isolated BuildKit host, `tests/e2e/prepare_local_oci_build.py` builds from a digest-pinned local OCI layout through `palimpsest build`.
 2. The build job retains the OCI archive, independent rootfs proof, and a receipt binding the archive SHA-256, manifest digest, platform, and random marker.
 3. Transfer that immutable artifact directory to the qualified KVM host, which may have Docker installed.
 4. `tests/e2e/test_local_oci_build_run.py` verifies the transferred receipt and starts the archive through `palimpsest run ... --backend kvm -d`.
-5. `palimpsest exec` runs the image-baked probe, which proves the random marker is visible both at `/` and through `/proc/1/root/`.
+5. Bracket `palimpsest exec` of the v2 image-baked probe with `palimpsest oci root-proof NAME`. Require the same run/boot/domain, matching actual root device/inode, and the random marker at `/` and `/proc/self/root`. Separately require direct PID 1 root access to be denied.
 6. The test requires a running libvirt domain, stops and removes the VM, and proves the domain and run-owned state are gone while the immutable archive remains.
 
 The gate must not pass merely because layer materialization succeeds. It still
@@ -58,7 +60,7 @@ checks against Docker CLI fallback, not proof that arbitrary absolute executable
 or direct socket connections are impossible. Socket presence is recorded, not
 rejected; no host daemon is stopped or socket hidden.
 
-Cleanup checks must run even when the original guest probe fails, preserve that
+Cleanup checks must run even when the guest probe or root report fails, preserve that
 primary failure, and report cleanup failures too. Verify the selected product
 state root, including `PALIMPSEST_STATE_HOME`, rather than an assumed XDG path.
 
@@ -83,8 +85,10 @@ uv run pytest -q tests/e2e/test_local_oci_build_run.py
 ```
 
 The default suite still skips this opt-in test. Public run and exec have their
-own successful native proofs; that does not imply Gate 2 passed. Its remaining
-root-probe criterion is separately tracked, and PID 1 protection is not relaxed.
+own successful native proofs; that does not imply the revised Gate 2 passed.
+Legacy v1 artifacts do not satisfy this revised gate. The new contract requires
+a fresh Palimpsest-built v2 artifact and actual server verification; PID 1
+protection is not relaxed.
 
 ### Docker-coexistent host verification (2026-09-07)
 
@@ -108,7 +112,8 @@ Detailed server evidence is preserved at
 `/tmp/pytest-of-pieroot/pytest-157/test_local_build_runs_detached0/command-evidence`.
 The selected state root was `/tmp/p-g33a/state`; the immutable source SHA-256
 was `3987bfb8f337ba5333b041b719abf3f377f5cfd623b0894a05a5dfc858d6d4ec`.
-Gate 2 remains unresolved pending the separate root-proof/protection decision.
+This historical attempt predates approval of the new root-proof contract.
+It remains a failed v1 result, not evidence for completion of the revised gate.
 
 ## Lifecycle channel contract checkpoint
 
