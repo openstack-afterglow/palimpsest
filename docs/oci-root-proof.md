@@ -83,3 +83,27 @@ Focused protocol, projection, stale-binding, guest and acceptance tests precede
 push. The server fetches that exact commit before native and Gate 2 tests.
 Earlier successful run/exec proofs and a weaker substituted probe are not
 evidence that this contract passed.
+
+## Verified checkpoint — 2026-09-07
+
+The complete patch and active-run ACL correction received independent Astra
+approval; GPT 5.6 Sol authored the implementation. The revised Gate 2 and
+separate public exec native proof passed on exact pushed host code `36cf897`
+(17.72 s and 20.29 s). See [acceptance evidence](oci-root-build-run-acceptance.md).
+
+At `ef3ffc9`, the same unchanged guest C/ELF passed the dedicated v20 KVM
+qualification: 43 executed boots, 44 QEMU invocations, live PID 1 and actual
+root-as-slash (122.16 s). The later host-only ACL fix did not modify the guest,
+protocol, probe or native receipt validator. Native evidence is retained at
+`/tmp/palimpsest-g35-kvm.etITs8/receipt.json`; log:
+`/tmp/palimpsest-35-kvm-ef3ffc9.log`.
+
+Focused checks, not a full-project suite: local 641 passed, followed by the
+final Docker C harness's 19 passed; actual packaged-ELF integration 34 passed,
+including two byte-identical pinned rebuilds. The initial server selection
+passed 640 with one Docker-PID-1-only skip (covered locally). The ACL follow-up
+passed 135 locally and on its exact server SHA; its final target-fixture
+correction passed all 23 root-proof tests. Overlapping runs are not summed.
+Lane inventory, Ruff and diff checks passed. The root-proof unit file belongs
+to the `oci-monitor` lane; Gate 2, public native and guest-KVM remain separately
+opted-in files/lanes.

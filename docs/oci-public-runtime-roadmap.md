@@ -4,12 +4,22 @@ The user prioritized public foreground `run`, Docker-like `run -d`, and the
 local build-to-run Gate 2 over further isolated infrastructure slices. This
 document records the execution order and the deliberately limited public surface.
 
+**2026-09-07 checkpoint:** the user-approved protected-root v2 Gate 2 is now
+complete at `36cf897`, including actual public detached run, root-proof/exec,
+PID 1 access denial and normal cleanup. Separate public exec also passed on
+that SHA. The unchanged guest ELF passed 43-boot v20 KVM qualification at
+`ef3ffc9`. [Evidence and prior failed attempts](oci-root-build-run-acceptance.md)
+remain distinguished; historical pending statements below are superseded by
+this checkpoint. Full-root privileges, shared data volumes and public retained
+root/recovery UX are not implied by this result.
+
 ## First public local OCI lifecycle (five-stage integration)
 
 The CLI now connects explicit host admission, typed local intake, completed-run
 removal, the native launch adapter and foreground/detached dispatch. Linux
 x86_64 KVM with `qemu:///system` is the only initial target. Public OCI operations
-are `run`, `run -d`, `ps`, `stop`, `rm` and bounded noninteractive guest `exec`;
+are `run`, `run -d`, `ps`, `stop`, `rm`, bounded noninteractive guest `exec`,
+and read-only `oci root-proof` for the exact current running boot;
 `start`, `logs`, TTY/stdin and network attachment remain unsupported. Gate 2
 remains a separate acceptance contract; see the additional-exec
 qualification and remaining host/probe constraints below.

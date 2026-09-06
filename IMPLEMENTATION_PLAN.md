@@ -1987,3 +1987,24 @@ strict authenticated host projection and current-run proof readout, then the
 versioned Palimpsest-built application probe and Gate 2 comparison. Preserve
 the direct-PID-1-root denial as a negative check. Independent approval precedes
 commit/push; exact-SHA server tests and full revised Gate 2 precede completion.
+
+Completed: implementation `ef3ffc9` and exact active-run ACL correction
+`36cf897` were independently approved and pushed. Local focused checks passed
+641, packaged ELF integration 34, and final Docker C harness 19 (overlapping
+selections, not summed). The server passed 640 selected tests with one locally
+covered Docker-PID-1-only skip, then 135 ACL-related tests at the corrected SHA.
+The unchanged guest at `ef3ffc9` passed real v20 KVM qualification: 43 boots,
+44 QEMU invocations, 122.16 s. Corrected host `36cf897` passed revised Gate 2
+(17.72 s) and a separate fresh-runtime public exec proof (20.29 s).
+See [the verified contract](docs/oci-root-proof.md) and
+[preserved acceptance evidence](docs/oci-root-build-run-acceptance.md).
+
+Next: improve control-lost/unacknowledged-result recovery UX and scoped worker
+resource diagnostics without automatic replay or weakening isolation. Public
+retained-root boot/reuse and multi-VM data volumes remain distinct follow-ups;
+normal VM-specific root deletion and source image preservation remain intact.
+
+Notion section 17.86 now records the approved criterion, implementation roles,
+separate verification results and remaining limits. The sanitized update was
+independently reviewed, written and read back; operational paths and process
+identifiers were not included.

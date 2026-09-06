@@ -115,6 +115,41 @@ was `3987bfb8f337ba5333b041b719abf3f377f5cfd623b0894a05a5dfc858d6d4ec`.
 This historical attempt predates approval of the new root-proof contract.
 It remains a failed v1 result, not evidence for completion of the revised gate.
 
+### Protected-root v2 Gate 2 completion (2026-09-07)
+
+The revised, user-approved Gate 2 passed on `pieroot-server` at exact pushed
+code SHA `36cf897847cc3ff161d8e6c2a2fa4d6fb3a24d6b` (17.72 s).
+Palimpsest built a fresh Linux/amd64 v2 image locally with the pinned existing
+BuildKit builder, offline inputs and network disabled. Its archive SHA-256 is
+`862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`;
+manifest digest is
+`sha256:cf27843f03723bf25b59ed6740d87c0d1277050a8f6e54add07cd9dc3af259fd`.
+
+The new detached VM's two public root-proof reports had identical run, boot,
+domain and root facts. The image-baked probe checked its random marker at `/`
+and `/proc/self/root`; its device 21/inode 2 matched the authenticated-at-receipt
+PID 1 OverlayFS identity. Those numbers are observations, not constants in the
+test. A separate failed read confirmed `Permission denied` for direct PID 1
+root access. All six stop/rm, domain/run absence, source preservation and
+guarded Docker CLI checks passed. The source archive was rehashed unchanged.
+
+Evidence: `/tmp/palimpsest-35-gate2-36cf897.log` and
+`/tmp/pytest-of-pieroot/pytest-162/test_local_build_runs_detached0/command-evidence`.
+The retry used the existing materialization cache in `/tmp/p-g35a/state`, but
+created a fresh VM and boot; it did not reuse an earlier running VM or receipt.
+The separate public exec native proof at the same SHA used a fresh runtime and
+passed in 20.29 s: `/tmp/palimpsest-35-public-exec-36cf897.log`.
+
+Preserved intermediate evidence: the first v2 run at `ef3ffc9` reached READY
+but root-proof rejected the active run directory's legitimate mode 0710.
+All six cleanup checks passed (16.56 s; `/tmp/palimpsest-35-gate2-ef3ffc9.log`,
+pytest-160 command evidence). The independently reviewed follow-up admits
+0710 only with an exact typed granted runtime-access receipt and matching ACL;
+it retains pinned device/inode, ownership and permission drift checks. A fresh
+diagnostic materialization separately hit the existing worker resource limit;
+no limits or unrelated services were changed. Cached diagnostic execution
+succeeded and its VM was removed. These failures remain failures, not passes.
+
 ## Lifecycle channel contract checkpoint
 
 OCI-root domain plans now reserve exactly one fixed virtio-serial lifecycle
