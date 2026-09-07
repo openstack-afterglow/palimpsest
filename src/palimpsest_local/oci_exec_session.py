@@ -24,6 +24,19 @@ from .runtime_types import (
 from .state import locked_existing_run
 
 
+def validate_exec_status(value):
+    if (
+        type(value) is not dict
+        or set(value) != {"state", "next_sequence", "occupied"}
+        or type(value["state"]) is not str
+        or value["state"] not in {"not-ready", "ready", "stopping", "terminal", "control-lost"}
+        or type(value["next_sequence"]) is not int
+        or not 1 <= value["next_sequence"] <= MAX_EXEC_SEQUENCE
+        or type(value["occupied"]) is not bool
+    ):
+        raise StateError("OCI exec mailbox status is invalid")
+
+
 def exec_session(name, request, *, roots, _expected_record):
     if type(request) is not ExecRequest:
         raise StateError("OCI exec requires literal guest argv")
@@ -74,16 +87,7 @@ class OCIExecProcessSession:
 
     @staticmethod
     def _validate_status(value):
-        if (
-            type(value) is not dict
-            or set(value) != {"state", "next_sequence", "occupied"}
-            or type(value["state"]) is not str
-            or value["state"] not in {"not-ready", "ready", "stopping", "terminal", "control-lost"}
-            or type(value["next_sequence"]) is not int
-            or not 1 <= value["next_sequence"] <= MAX_EXEC_SEQUENCE
-            or type(value["occupied"]) is not bool
-        ):
-            raise StateError("OCI exec mailbox status is invalid")
+        validate_exec_status(value)
 
     @staticmethod
     def _require_ready(status):

@@ -60,6 +60,14 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         (parent / "launch.stderr").write_bytes(launched.stderr)
         _success(launched)
         assert launched.stdout == (name + "\n").encode()
+        status_before = _cli(environment, "oci", "exec-status", name)
+        _success(status_before)
+        assert json.loads(status_before.stdout) == {
+            "schema": "palimpsest.oci-exec-status.v1",
+            "state": "ready",
+            "occupied": False,
+            "guidance": "Ready and unoccupied is a point-in-time observation, not a guarantee the next exec will succeed.",
+        }
         proof_before = _cli(environment, "oci", "root-proof", name)
         _success(proof_before)
         before_report = json.loads(proof_before.stdout)
@@ -103,7 +111,9 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         device, inode = (int(value) for value in matched.groups())
         assert device <= (1 << 64) - 1 and inode <= (1 << 64) - 1
         isolation = execute(
-            "pid1-isolation", "/bin/sh", "-c",
+            "pid1-isolation",
+            "/bin/sh",
+            "-c",
             "LC_ALL=C cat /proc/1/root/palimpsest-e2e-root-marker",
         )
         assert isolation.returncode != 0 and isolation.stdout == b""
@@ -113,6 +123,14 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         result = execute("after-error", "/bin/sh", "-c", "printf 'still-running'")
         _success(result)
         assert result.stdout == b"still-running" and result.stderr == b""
+        status_after = _cli(environment, "oci", "exec-status", name)
+        _success(status_after)
+        assert json.loads(status_after.stdout) == {
+            "schema": "palimpsest.oci-exec-status.v1",
+            "state": "ready",
+            "occupied": False,
+            "guidance": "Ready and unoccupied is a point-in-time observation, not a guarantee the next exec will succeed.",
+        }
         proof_after = _cli(environment, "oci", "root-proof", name)
         _success(proof_after)
         after_report = json.loads(proof_after.stdout)

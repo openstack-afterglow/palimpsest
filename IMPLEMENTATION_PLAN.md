@@ -2058,3 +2058,12 @@ Next: control-lost/unacknowledged-result recovery UX, keeping automatic replay
 and result takeover out of scope until separately designed and authorized.
 Public retained-root boot/reuse and shared multi-VM data volumes remain separate
 follow-ups under the existing VM-root ownership contract.
+
+The next approved continuation is a bounded `oci exec-status NAME` observation
+and fixed recovery guidance, not result recovery execution. Reuse the original
+monitor's exact binding and status operation; never submit, poll, acknowledge,
+take over or replay another client's command. Missing/stale/unavailable
+authority fails closed. See [the contract](docs/oci-additional-exec.md).
+Astra manages scope, independent review and exact-SHA server verification;
+Sol authors implementation and focused tests. Public retained-root and volume
+sharing remain outside this slice.

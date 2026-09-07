@@ -77,13 +77,49 @@ result-list, takeover, discard or recovery command. A disconnected client does
 not authorize a fresh client to acknowledge its result. Diagnostics do not
 change the one-command mailbox, authentication, result retention or STOP policy.
 
+## Planned recovery observation: `oci exec-status NAME`
+
+Provide a separate bounded status query without attempting a guest command.
+The proposed `palimpsest.oci-exec-status.v1` JSON contains only `schema`,
+`state`, `occupied` and fixed `guidance`. Validate the existing monitor status
+shape, including its internal sequence, but do not expose the sequence, token,
+argv, output, process identifiers or a fabricated command result.
+
+Use the existing exact run/journal binding and pinned MonitorClient, release
+run locks before IPC, and close the client after observation. The only mailbox
+operation is `status`; existing bounded identical status retries may occur on
+timeout. No submit, poll, acknowledgement, takeover, cancellation, STOP or
+removal is performed. Existing-root resolution must not initialize a missing
+runtime. This is mailbox/lifecycle non-mutation, not a promise that normal
+locking or IPC has no transient operating-system effects.
+
+Ready and unoccupied is a point-in-time observation, not an admission guarantee.
+Occupied cannot distinguish an active command from an unacknowledged result
+and does not prove abandonment. Let an available original client finish and
+preserve its output; do not rerun a command merely because its outcome is
+unknown. Not-ready/stopping/terminal/control-lost retain their existing meanings.
+
+The original monitor authority must remain usable to obtain a live status.
+An unavailable monitor, invalid response, replaced identity or a durable
+control-lost journal rejected by the existing client must fail closed, not
+produce a guessed successful JSON report. This slice does not add active-exec
+reconnect or offline result recovery, nor widen accepted journal phases.
+
+Verification: focused real journal/ledger/mailbox fixtures and strict CLI
+projection tests, unchanged durable bytes and retained job result across
+repeated status queries, plus an exact pushed-SHA Linux selection. Extend the
+separate cold public exec proof to observe ready/unoccupied before and after
+normal exec. Fault-state coverage uses controlled production fixtures, not
+unrelated process kills or timing-dependent concurrent guest tests.
+
 ## Host resource diagnostics
 
 Worker/packer process creation failures with `EAGAIN` or `ENOMEM` have an
 explicit resource diagnostic instead of an undifferentiated spawn error.
 Missing executables and permission failures are not mislabeled as resource
-exhaustion. The isolated worker still exports only a fixed error category,
-not raw exception text, source paths or command contents.
+exhaustion. The isolated worker exports a fixed error category and, in response
+v3, allowlisted stage/errno facts, not raw exception text, source paths or command
+contents. See [bounded failure attribution](oci-resource-status.md).
 
 The diagnostic suggests checking applicable process/thread and memory limits;
 it does not claim which limit was reached or count available process slots.

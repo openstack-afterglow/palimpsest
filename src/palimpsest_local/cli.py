@@ -638,6 +638,8 @@ def build_parser() -> argparse.ArgumentParser:
     oci_materialize.add_argument("--output", type=Path)
     oci_root_proof = oci_commands.add_parser("root-proof")
     oci_root_proof.add_argument("name")
+    oci_exec_status = oci_commands.add_parser("exec-status")
+    oci_exec_status.add_argument("name")
     oci_commands.add_parser("resource-status")
 
     build = commands.add_parser("build")
@@ -1417,9 +1419,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(json.dumps(resource_status(), indent=2, sort_keys=True))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
+    read_only_oci_operations = {"root-proof", "exec-status"}
     roots = (
         resolve_roots()
-        if op in read_only_root_operations or (op == "oci" and args.oci_operation == "root-proof")
+        if op in read_only_root_operations or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
     )
 
@@ -1428,6 +1431,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             from .oci_root_proof import root_proof
 
             print(json.dumps(root_proof(roots, args.name), indent=2, sort_keys=True))
+            return 0
+        if args.oci_operation == "exec-status":
+            from .oci_exec_status import exec_status
+
+            print(json.dumps(exec_status(roots, args.name), indent=2, sort_keys=True))
             return 0
         oci_roots = StatePaths(
             config=roots.config.resolve(strict=True),
