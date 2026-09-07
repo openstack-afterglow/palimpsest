@@ -52,17 +52,17 @@ def test_non_ascii_unallowlisted_status_field_is_ignored(tmp_path):
 @pytest.mark.parametrize(
     ("limits", "soft", "hard"),
     [
-        ((300, 400), 256, 256),
+        ((300, 400), 300, 400),
         ((100, 200), 100, 200),
-        ((resource.RLIM_INFINITY, resource.RLIM_INFINITY), 256, 256),
+        ((resource.RLIM_INFINITY, resource.RLIM_INFINITY), 1024, 1024),
         ((resource.RLIM_INFINITY, 80), 80, 80),
-        ((40, resource.RLIM_INFINITY), 40, 256),
+        ((40, resource.RLIM_INFINITY), 40, 1024),
     ],
 )
 def test_prospective_limits_match_worker_limit_semantics(tmp_path, limits, soft, hard):
     report = _report(tmp_path, limits=limits)
     assert report["worker"] == {
-        "configured_ceiling": 256,
+        "configured_ceiling": 1024,
         "prospective_soft": soft,
         "prospective_hard": hard,
         "prospective_effective_ceiling": soft,

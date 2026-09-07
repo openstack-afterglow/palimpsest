@@ -33,6 +33,7 @@ from .oci_process import OCIProcessSpec
 from .oci_provenance import Descriptor, canonical_json_bytes
 from .oci_source import SnapshottedOCIImage
 from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
+from .oci_worker_limits import OCI_WORKER_NPROC_LIMIT
 from .oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
     OCIWorkerProtocolError,
@@ -91,7 +92,7 @@ def _reported_worker_resource_detail(response: OCIWorkerResponse) -> str:
     if stage is None and failure_errno is None:
         return (
             "materializer worker reported a resource failure; check process/thread, memory, and "
-            "service/cgroup limits; worker RLIMIT_NPROC remains capped at 256; "
+            f"service/cgroup limits; worker RLIMIT_NPROC remains capped at {OCI_WORKER_NPROC_LIMIT}; "
             "the exact limiting resource is not identified"
         )
     if not isinstance(stage, str) or stage not in _WORKER_RESOURCE_STAGE_DETAILS:
@@ -108,7 +109,8 @@ def _reported_worker_resource_detail(response: OCIWorkerResponse) -> str:
     return (
         f"materializer worker reported a resource failure during {_WORKER_RESOURCE_STAGE_DETAILS[stage]}"
         f"{errno_detail}; check process/thread, memory, and service/cgroup limits; "
-        "worker RLIMIT_NPROC remains capped at 256; no automatic retry or limit change was attempted"
+        f"worker RLIMIT_NPROC remains capped at {OCI_WORKER_NPROC_LIMIT}; "
+        "no automatic retry or limit change was attempted"
     )
 
 

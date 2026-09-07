@@ -1051,6 +1051,7 @@ def test_parent_resource_detail_uses_only_fixed_stage_and_errno_text(stage, numb
 
     assert fragment in detail
     assert (errno.errorcode[number] in detail) if number is not None else "no operating-system errno" in detail
+    assert "RLIMIT_NPROC remains capped at 1024" in detail
     assert "no automatic retry or limit change" in detail
 
 
@@ -1061,6 +1062,7 @@ def test_parent_resource_detail_preserves_generic_no_details_rendering() -> None
     detail = materializer._reported_worker_resource_detail(response)
 
     assert "exact limiting resource is not identified" in detail
+    assert "RLIMIT_NPROC remains capped at 1024" in detail
     assert "during" not in detail
 
 
@@ -1127,9 +1129,29 @@ def test_worker_process_cap_and_other_limits_are_not_relaxed(monkeypatch):
     assert (worker.resource.RLIMIT_NOFILE, (256, 256)) in calls
     assert (worker.resource.RLIMIT_FSIZE, (40 * 1024**3,) * 2) in calls
     if hasattr(worker.resource, "RLIMIT_NPROC"):
-        assert (worker.resource.RLIMIT_NPROC, (256, 256)) in calls
+        assert (worker.resource.RLIMIT_NPROC, (1024, 1024)) in calls
     if hasattr(worker.resource, "RLIMIT_AS"):
         assert (worker.resource.RLIMIT_AS, (40 * 1024**3,) * 2) in calls
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        ((2048, 4096), (1024, 1024)),
+        ((100, 200), None),
+        ((worker.resource.RLIM_INFINITY, worker.resource.RLIM_INFINITY), (1024, 1024)),
+        ((worker.resource.RLIM_INFINITY, 80), (80, 80)),
+        ((40, worker.resource.RLIM_INFINITY), (40, 1024)),
+    ],
+)
+def test_worker_process_limit_preserves_lower_inherited_bounds(monkeypatch, inherited, expected):
+    calls = []
+    monkeypatch.setattr(worker.resource, "getrlimit", lambda _limit: inherited)
+    monkeypatch.setattr(worker.resource, "setrlimit", lambda limit, bounds: calls.append((limit, bounds)))
+
+    worker._limit(worker.resource.RLIMIT_NPROC, worker._MAX_WORKER_PROCESSES)
+
+    assert calls == ([] if expected is None else [(worker.resource.RLIMIT_NPROC, expected)])
 
 
 def test_parent_worker_boundary_caps_response_bytes(tmp_path: Path) -> None:

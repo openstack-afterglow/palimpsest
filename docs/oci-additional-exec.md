@@ -172,9 +172,10 @@ cgroup and system limits, and memory or PID-namespace conditions. See
 [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html) and
 [pthread_create(3)](https://man7.org/linux/man-pages/man3/pthread_create.3.html).
 
-No resource limit is raised, no unrelated process is stopped and no automatic
-retry is introduced. The worker's configured process ceiling remains 256
-(or a lower inherited limit); this is not a dedicated process-tree quota.
+No resource limit is raised automatically, no unrelated process is stopped and
+no automatic retry is introduced. The worker's explicitly approved configured
+process ceiling is 1024 (or a lower inherited limit); this is not a dedicated
+process-tree quota and the product does not increase it automatically.
 Packer failures that only report a generic nonzero exit are not promoted to a
 specific resource diagnosis by guessing from stderr.
 

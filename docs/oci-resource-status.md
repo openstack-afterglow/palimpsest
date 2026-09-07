@@ -47,7 +47,7 @@ No initialized runtime or BOOT variables are required. On Linux the command
 returns JSON with schema `palimpsest.oci-resource-status.v1`:
 
 - `inherited`: current NPROC soft/hard limits; `null` means infinity here.
-- `worker`: configured ceiling (256) and prospective soft/hard limits, computed
+- `worker`: configured ceiling (1024) and prospective soft/hard limits, computed
   with the existing worker's minimum-of-inherited-and-configured rule. The
   prospective effective ceiling is the projected soft limit, not measured
   remaining capacity or a claim that the limit is enforced for this caller.
