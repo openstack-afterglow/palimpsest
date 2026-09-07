@@ -22,6 +22,12 @@ from pathlib import Path
 import pytest
 
 from .test_oci_public_cli_live import _cli, _success
+from .virsh_output import (
+    virsh_inventory_lines,
+    virsh_single_inventory_value,
+    virsh_single_uuid,
+    virsh_uuid_inventory,
+)
 
 _ENABLE = "PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE"
 _IMAGE = "PALIMPSEST_OCI_EXEC_LIVE_IMAGE"
@@ -35,9 +41,6 @@ _BOOT_KEYS = (
 _GUIDANCE = (
     "Local historical metadata only; it grants no run or monitor authority and is not proof that replay is safe."
 )
-_MAX_VIRSH_INVENTORY_BYTES = 1024 * 1024
-_MAX_VIRSH_INVENTORY_RECORDS = 65536
-
 pytestmark = [
     pytest.mark.kvm,
     pytest.mark.skipif(
@@ -68,31 +71,6 @@ def _inspect(environment: dict[str, str], path: Path) -> tuple[subprocess.Comple
     _success(result)
     assert result.stderr == b""
     return result, json.loads(result.stdout)
-
-
-def _virsh_inventory_lines(output: bytes, *, encoding: str) -> list[str]:
-    assert len(output) <= _MAX_VIRSH_INVENTORY_BYTES
-    if output in (b"", b"\n"):
-        return []
-    assert output.endswith(b"\n")
-    text = output.decode(encoding)
-    records = text[:-1]
-    if records.endswith("\n"):
-        records = records[:-1]
-        assert records
-    lines = records.split("\n")
-    assert len(lines) <= _MAX_VIRSH_INVENTORY_RECORDS
-    assert all(line and all(character.isprintable() for character in line) for line in lines)
-    return lines
-
-
-def _virsh_uuid_inventory(output: bytes) -> list[str]:
-    identifiers = _virsh_inventory_lines(output, encoding="ascii")
-    for identifier in identifiers:
-        parsed = uuid.UUID(identifier)
-        assert str(parsed) == identifier
-    assert len(set(identifiers)) == len(identifiers)
-    return identifiers
 
 
 def test_public_recorded_exec_survives_vm_removal_without_runtime_or_boot_configuration():
@@ -220,14 +198,16 @@ def test_public_recorded_exec_survives_vm_removal_without_runtime_or_boot_config
 
         domain_uuid_result = virsh_query("domuuid", name)
         _success(domain_uuid_result)
-        domain_uuid_text = domain_uuid_result.stdout.decode("ascii")
-        assert domain_uuid_text.endswith("\n") and domain_uuid_text.count("\n") == 1
-        domain_uuid = domain_uuid_text.removesuffix("\n")
-        parsed_domain_uuid = uuid.UUID(domain_uuid)
-        assert str(parsed_domain_uuid) == domain_uuid
+        assert domain_uuid_result.stderr == b""
+        expected_domain_uuid = before_report["domain"]["uuid"]
+        domain_uuid = virsh_single_uuid(
+            domain_uuid_result.stdout,
+            expected=expected_domain_uuid,
+        )
         domain_name_result = virsh_query("domname", domain_uuid)
         _success(domain_name_result)
-        assert domain_name_result.stdout == (name + "\n").encode()
+        assert domain_name_result.stderr == b""
+        virsh_single_inventory_value(domain_name_result.stdout, encoding="utf-8", expected=name)
         assert domain_uuid == before_report["domain"]["uuid"] == after_report["domain"]["uuid"]
 
         _success(_cli(environment, "stop", name, timeout=60))
@@ -235,13 +215,13 @@ def test_public_recorded_exec_survives_vm_removal_without_runtime_or_boot_config
         remaining_names = virsh_query("list", "--all", "--name")
         _success(remaining_names)
         assert remaining_names.stderr == b""
-        remaining_name_values = _virsh_inventory_lines(remaining_names.stdout, encoding="utf-8")
+        remaining_name_values = virsh_inventory_lines(remaining_names.stdout, encoding="utf-8")
         assert len(set(remaining_name_values)) == len(remaining_name_values)
         assert name not in remaining_name_values
         remaining_uuids = virsh_query("list", "--all", "--uuid")
         _success(remaining_uuids)
         assert remaining_uuids.stderr == b""
-        assert domain_uuid not in _virsh_uuid_inventory(remaining_uuids.stdout)
+        assert domain_uuid not in virsh_uuid_inventory(remaining_uuids.stdout)
         assert not (runtime_parent / "state" / "runs" / name).exists()
         assert _record_files(record_path) == recorded_contents
 

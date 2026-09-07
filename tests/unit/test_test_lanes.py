@@ -31,9 +31,12 @@ def test_current_manifest_is_complete_disjoint_and_has_no_special_in_portable():
 
 def test_exec_record_integration_and_native_proof_have_exact_separate_owners():
     integration = "tests/unit/test_oci_exec_record_integration.py"
+    helpers = "tests/unit/test_oci_exec_record_live_helpers.py"
     live = "tests/kvm/test_oci_exec_record_cli_live.py"
     assert integration in lanes.selectors("oci-monitor")
     assert all(integration not in lanes.selectors(lane) for lane in lanes.LANES if lane != "oci-monitor")
+    assert helpers in lanes.selectors("oci-monitor")
+    assert all(helpers not in lanes.selectors(lane) for lane in lanes.LANES if lane != "oci-monitor")
     assert live in lanes.selectors("native-live")
     assert all(live not in lanes.selectors(lane) for lane in lanes.LANES if lane != "native-live")
 
@@ -135,6 +138,12 @@ def test_resource_status_sources_select_only_exact_consumers(module, expected, s
 def test_oci_exec_record_source_selects_exact_consumers_and_new_native_proof():
     result = lanes.select_changed(("src/palimpsest_local/oci_exec_record.py",))
     assert result.lanes == ("core-cli", "oci-monitor")
+    assert result.suggested == ("native-live",)
+
+
+def test_exec_record_virsh_helper_selects_portable_regressions_and_native_consumer():
+    result = lanes.select_changed(("tests/kvm/virsh_output.py",))
+    assert result.lanes == ("oci-monitor",)
     assert result.suggested == ("native-live",)
 
 

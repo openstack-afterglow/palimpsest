@@ -54,7 +54,7 @@ PORTABLE_FILES = {
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
         oci_monitor_ipc oci_monitor_ipc_journal oci_monitor_launch oci_monitor_coordinator
-        oci_monitor_client oci_process_session oci_exec_control oci_exec_protocol oci_exec_ipc oci_exec_session oci_exec_status oci_exec_client oci_exec_public_routing oci_exec_record
+        oci_monitor_client oci_process_session oci_exec_control oci_exec_protocol oci_exec_ipc oci_exec_session oci_exec_status oci_exec_client oci_exec_public_routing oci_exec_record oci_exec_record_live_helpers
         oci_exec_record_integration
         oci_monitor_recovery oci_monitor_retention oci_supervisor oci_run_cleanup
         oci_root_proof
@@ -357,6 +357,10 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
             reasons.append(
                 f"{path}: runner/workflow contracts; all-portable CI collection and shard validation also recommended"
             )
+        elif path == "tests/kvm/virsh_output.py":
+            selected.add("oci-monitor")
+            suggested.add("native-live")
+            reasons.append(f"{path}: portable parser regressions plus explicit native consumer proof")
         elif path.startswith("docs/") or Path(path).suffix.lower() in {".md", ".rst"}:
             reasons.append(f"{path}: documentation only")
         elif path.startswith("hub/"):
