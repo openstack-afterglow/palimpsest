@@ -2222,8 +2222,37 @@ reuse/deletion verdict. Namespace and record reads gain bounds and observed
 replacement/nonregular-file checks. See
 `docs/oci-retained-root-inventory.md` for the full boundary and deletion gate.
 
-Sol owns code/tests and Astra owns planning, independent review and delivery.
-Verification will select only the new inventory/CLI tests and affected root
-record/access/removal contracts, then inspect the existing retained disk on the
-exact pushed server SHA without restarting a VM or rewriting the disk. The old
-failed-VM archive and intentionally retained root are not deletion fixtures.
+Sol authored code/tests and Astra managed planning, independent review and
+delivery. Initial independent review required fixed path-free configuration
+errors and inclusion of the host-runtime CLI tests in changed-source selection.
+Both were corrected, including deeply nested TOML and cancellation coverage;
+FIFO replacement checks run in an owned subprocess with a two-second timeout.
+The final independent review approved all ten files before commit/push.
+
+Code SHA `f4305f3af656e1a404e3d75535f77ce6f274cd5e` passed the same 215
+selected inventory/CLI/root record/access/removal checks locally in 17.34 s and
+on pieroot-server in 96.28 s, with no skips. Lint, changed-file formatting,
+lane manifest and diff checks passed. These are overlapping focused selections,
+not a full-suite result. The eight slowest reported server durations were
+cleanup-test setup phases (1.78–1.81 s each); they identify a candidate for
+separate fixture-cost investigation, not a measured optimization.
+
+On that exact server SHA, both public inventory commands observed the previous
+real retained root as retained/unattached, generation 5 and 4 GiB logical.
+List and exact lookup matched, success stderr was empty, unknown/invalid UUIDs
+and missing state failed without partial stdout or state creation. Repeated
+queries returned the same metadata. Runtime path/type/mode/owner/group/size/
+mtime/ctime snapshots and the record checksum matched before/after; access
+times are deliberately excluded. Raw contents were not opened or requalified.
+The original image and private failed-VM archive checksums still match, and
+earlier pre-VM failure logs and standalone completion records remain present.
+
+Server evidence: `/tmp/palimpsest-g45-inventory.z3s6vr` and
+`/tmp/palimpsest-g45-selected-f4305f3af656e1a404e3d75535f77ce6f274cd5e.log`.
+Local review/test evidence: `/tmp/palimpsest-g45.TGVx1r`.
+No VM restart, disk rewrite/deletion, new image build, full Gate 2 or fresh
+PID 1/boot qualification was performed. Guest protection and resource limits
+are unchanged. The old failed-VM archive and intentionally retained root are
+not deletion fixtures. Next: implement the independently reviewed standalone
+deletion contract above with its own disposable retained-root proof, then
+separately address multi-VM data-volume sharing.

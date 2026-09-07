@@ -85,3 +85,30 @@ conditions. This is an implementation gate, not a claim that deletion exists:
 
 Shared multi-VM data volumes remain a separate design. They must not weaken
 the exclusive root disk contract.
+
+## Verification and focused reruns
+
+Implementation SHA `f4305f3af656e1a404e3d75535f77ce6f274cd5e` passed independent
+review, lint/format/manifest checks and the same 215 selected tests locally
+(17.34 s) and on the server (96.28 s), without skips. This is not the full suite.
+The actual preserved retained root was listed and inspected on that SHA with
+matching allowlisted metadata and empty success stderr. Unknown/invalid IDs
+and missing state were refused without partial output or initialization.
+Runtime metadata snapshots and the record checksum were unchanged; filesystem
+access times are excluded. The source image and old recovery archive checksums
+still match. No VM boot, raw-content/ext4 revalidation, disk deletion, image
+build or new full Gate 2 was performed.
+
+For inventory-only iteration, run the focused files first:
+
+```sh
+python -m pytest -q --durations=8 tests/unit/test_oci_root_volume_inventory.py tests/unit/test_oci_public_cli.py
+```
+
+Changes to the shared reader also require the relevant root-volume,
+root-access/lifecycle, run-cleanup and retained-claim/recovery regressions.
+The new module maps to `core-cli`, `host-runtime` and `oci-store`; selecting
+lanes is a dependency hint, not proof qualification or a full-suite claim.
+Initial review found and resolved configuration-path leakage and a missing
+CLI lane dependency. Malformed/deep configuration, cancellation, bounded FIFO
+replacement and descriptor cleanup are covered by the final focused checks.
