@@ -2077,3 +2077,11 @@ for logs, retained uncertainty, platform checks and non-additive counts.
 The next recovery step requires a separate contract for retaining or recovering
 an original client's result; this observation feature does not authorize result
 takeover, acknowledgement by another client, discard or automatic replay.
+
+The current continuation concretizes a first result-preservation slice:
+process-local immutable completion facts in the original OCI exec session,
+separate from confirmed/unconfirmed ACK delivery. No disk persistence or new
+recovery authority is introduced. See [the contract](docs/oci-exec-result-observation.md).
+Astra owns scope/review/verification; Sol implements the original-session API
+and focused fault tests. Preserve normal ProcessStatusEvent/wait/CLI failure
+semantics, existing ACK retries, PID 1 protection and resource limits.
