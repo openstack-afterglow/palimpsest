@@ -2098,3 +2098,14 @@ internal offline reader, with independent review and focused exact-SHA Linux
 filesystem verification. Public options, OCI-only session barriers and the
 offline CLI remain the next integration slice. Output-content recovery,
 cross-client result authority and automatic replay remain outside this contract.
+
+Completed the isolated storage foundation at `1bf84f1`, with deterministic
+Linux replacement-test correction `b65d1b18296e14261a41a01f3211a1a4f019556f`.
+Independent reviews approved; final local focused selection passed 144 with
+61 Linux-only skips, and the same selection at the exact pushed server SHA
+passed 205 with zero skips (6.24 s, ext4). Lane/lint/changed-format/diff checks
+passed. See the durable-record contract for non-additive results, preserved
+initial server failure, the separate unresolved macOS PTY check and the
+same-user inode-reuse/provenance limitation. This delivers internal APIs only;
+no live exec disk records or new public options exist yet. Next is opt-in
+OCI session integration plus offline CLI and its own focused/native evidence.

@@ -260,3 +260,48 @@ the inode and its timestamp values on ext4. The deterministic replacement test
 keeps the original directory alive to establish a distinct inode, and must not
 be described as proof against arbitrary same-user replacement. Private-parent
 ownership and permissions are the boundary against other principals.
+
+## Storage foundation delivery and qualification
+
+Implementation `1bf84f15bb8a9f4d2e37cb5bd0af7f2cd2248bac` adds the internal
+`OCIExecRecordWriter.reserve(..., managed_state=...)`, observed/confirmed
+publication and `read_exec_record(...)` APIs. The caller supplies local
+completion observations; no live session calls this module yet. Each file has
+the exact versioned `palimpsest.oci-exec-record` schema and the reader labels its
+snapshot as local historical metadata. Test-only correction
+`b65d1b18296e14261a41a01f3211a1a4f019556f` leaves product source unchanged.
+
+Independent source/test review and the correction review approved this isolated
+slice. Final local selection of `test_oci_exec_record.py`,
+`test_oci_exec_session.py`, `test_oci_exec_client.py` and `test_test_lanes.py`
+passed **144 with 61 Linux-only skips** in 1.70 s. After GitHub push,
+pieroot-server fetched exact SHA `b65d1b18296e14261a41a01f3211a1a4f019556f`;
+the same selection passed **205, zero skips** in 6.24 s on ext4, including all
+61 Linux cases and real ACL checks. These overlapping counts are not additive.
+Changed-file lint/format, lane manifest and diff checks passed; server checkout
+was clean after verification. No whole-suite, public recorded-exec, power-loss,
+new image build or new full Gate 2 qualification is claimed.
+
+Evidence is retained in `/tmp/palimpsest-g41.GtlvjG/` locally, including
+`local-server-fix.log`, the three initial review results and
+`review-server-fix-result.txt`. Server selected-test and lane logs are
+`/tmp/palimpsest-g41-server-selected-b65d1b18296e14261a41a01f3211a1a4f019556f.log`
+and `/tmp/palimpsest-g41-server-lanes-b65d1b18296e14261a41a01f3211a1a4f019556f.log`.
+
+The first server selection at `1bf84f1` failed the inode-recycling-dependent
+injection (204 passed, one failed, 6.51 s); its separate log remains retained.
+The correction establishes a deterministic distinct-inode test, not a product
+race fix. Earlier review failures led to publication cleanup/cancellation and
+ACL/fault-test corrections before approval; they are not erased by the final
+pass. An extra, unchanged macOS ProcessSession PTY check also failed outside the
+selected scope (expected marker printed, exit status 1). Its cause was not
+established or fixed; independent review deemed it nonblocking for this
+unintegrated module. Failed delegated-runtime initialization and an unwritable
+default test cache were environmental setup failures, with evidence preserved;
+successful runs used the supported execution environment and a writable cache.
+
+Next is OCI-only opt-in routing/session publication barriers and the offline
+CLI, followed by a separate public recorded-exec/native proof. The internal
+foundation alone neither preserves actual exec results on disk nor changes ACK
+behavior. PID 1 protection, worker limits, output handling and VM-root/volume
+ownership remain unchanged.
