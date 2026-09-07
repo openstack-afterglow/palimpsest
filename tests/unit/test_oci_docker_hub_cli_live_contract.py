@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +78,34 @@ def test_native_proof_uses_public_local_cli_and_never_docker_for_workloads():
     assert '"--manifest",\n                selection.manifest_digest' in source
     assert "LocalArchiveSource(selection.archive, selection.manifest_digest)" in source
     assert "docker pull" not in source and "docker run" not in source and "docker save" not in source
+
+
+def test_authentication_uses_separate_proof_cas_when_fresh_runtime_has_no_runtime_packs(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o711)
+    archive = tmp_path / "image.oci.tar"
+    archive.write_bytes(b"archive")
+    selection = proof.DockerHubImageSelection(archive, proof._file_sha256(archive), "sha256:" + "a" * 64)
+    seen = []
+    process = SimpleNamespace(require_bootable=lambda: None)
+    image = SimpleNamespace(
+        manifest_descriptor=SimpleNamespace(digest=selection.manifest_digest), config=SimpleNamespace(process=process)
+    )
+
+    class FakeArchive:
+        def __init__(self, selected_archive, selected_manifest):
+            assert (selected_archive, selected_manifest) == (archive, selection.manifest_digest)
+
+        def snapshot(self, reference, cas):
+            assert reference is None
+            seen.append(cas)
+            return SimpleNamespace(image=image)
+
+    monkeypatch.setattr(proof, "LocalArchiveSource", FakeArchive)
+    monkeypatch.setattr(proof, "SourceCAS", lambda path: path)
+    assert proof._authenticate(selection, runtime) is process
+    assert seen == [runtime / "proof-source-cas"]
+    assert not (runtime / "state").exists()
 
 
 def test_bounded_command_timeout_preserves_partial_stdout_stderr_and_metadata(tmp_path):

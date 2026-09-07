@@ -242,7 +242,7 @@ def _setup(environment: dict[str, str], label: str):
 
 def _authenticate(selection: DockerHubImageSelection, parent: Path):
     snapshot = LocalArchiveSource(selection.archive, selection.manifest_digest).snapshot(
-        None, SourceCAS((parent / "state" / "runtime-packs" / "oci-source-v1").resolve())
+        None, SourceCAS(parent / "proof-source-cas")
     )
     assert snapshot.image.manifest_descriptor.digest == selection.manifest_digest
     snapshot.image.config.process.require_bootable()
