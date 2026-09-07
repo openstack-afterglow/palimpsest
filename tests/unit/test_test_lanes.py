@@ -29,6 +29,22 @@ def test_current_manifest_is_complete_disjoint_and_has_no_special_in_portable():
     assert "hub" not in lanes.expand_lanes(["full"])
 
 
+def test_exec_record_integration_and_native_proof_have_exact_separate_owners():
+    integration = "tests/unit/test_oci_exec_record_integration.py"
+    live = "tests/kvm/test_oci_exec_record_cli_live.py"
+    assert integration in lanes.selectors("oci-monitor")
+    assert all(integration not in lanes.selectors(lane) for lane in lanes.LANES if lane != "oci-monitor")
+    assert live in lanes.selectors("native-live")
+    assert all(live not in lanes.selectors(lane) for lane in lanes.LANES if lane != "native-live")
+
+    integration_change = lanes.select_changed((integration,))
+    assert integration_change.lanes == ("oci-monitor",) and integration_change.suggested == ()
+    live_change = lanes.select_changed((live,))
+    assert live_change.lanes == () and live_change.suggested == ("native-live",)
+    assert "PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1" in lanes.SPECIAL_NOTES["native-live"]
+    assert live not in lanes.commands(("full",))[0]
+
+
 @pytest.fixture
 def tiny_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(lanes, "PORTABLE_FILES", {"small": ("tests/test_small.py",)})
@@ -116,10 +132,30 @@ def test_resource_status_sources_select_only_exact_consumers(module, expected, s
     assert result.suggested == suggested
 
 
-def test_oci_exec_record_source_selects_only_storage_slice_consumers_without_external_proofs():
+def test_oci_exec_record_source_selects_exact_consumers_and_new_native_proof():
     result = lanes.select_changed(("src/palimpsest_local/oci_exec_record.py",))
     assert result.lanes == ("core-cli", "oci-monitor")
-    assert result.suggested == ()
+    assert result.suggested == ("native-live",)
+
+
+def test_exec_record_session_consumer_selects_affected_lanes_and_external_proofs():
+    result = lanes.select_changed(("src/palimpsest_local/oci_exec_session.py",))
+    assert set(result.lanes) == {
+        "core-cli",
+        "host-runtime",
+        "oci-guest",
+        "oci-monitor",
+        "oci-access",
+        "qualification",
+    }
+    assert result.suggested == ("native-live", "gate2")
+
+
+@pytest.mark.parametrize("module", ["cli", "runtime_dispatch"])
+def test_shared_cli_and_dispatch_modules_keep_conservative_fallback(module):
+    result = lanes.select_changed((f"src/palimpsest_local/{module}.py",))
+    assert result.lanes == lanes.PORTABLE
+    assert result.suggested == tuple(lane for lane in lanes.SPECIAL_FILES if lane != "hub")
 
 
 @pytest.mark.parametrize(

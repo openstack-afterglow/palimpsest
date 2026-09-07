@@ -940,11 +940,51 @@ def exec(
     *,
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
+    completion_record: str | None = None,
 ) -> ProcessSession:
     request = ExecRequest.from_argv(argv)
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
+    if completion_record is not None:
+        from .oci_exec_control import validate_exec_request
+        from .oci_exec_record import OCIExecRecordWriter
+        from .oci_exec_session import OCIExecRecordingError
+
+        validate_exec_request(request.argv, 30000)
+        if record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT:
+            raise StateError("OCI exec completion records require the OCI-root runtime")
+        adapter = _preflight_existing_adapter(record, RuntimeOperation.EXEC, resolved_roots)
+        writer = None
+        recording_error = None
+        try:
+            writer = OCIExecRecordWriter.reserve(completion_record, managed_state=resolved_roots.state)
+        except Exception:
+            recording_error = OCIExecRecordingError("pre-ack", None)
+        if recording_error is not None:
+            raise recording_error
+        session = None
+        try:
+            _revalidate_bound_record(record, resolved_roots)
+            session = adapter.exec_session(
+                name,
+                request,
+                roots=resolved_roots,
+                _expected_record=record,
+                _record_writer=writer,
+            )
+            return _require_process_session(session)
+        except BaseException:
+            if session is not None:
+                try:
+                    session.close()
+                except BaseException:
+                    pass
+            try:
+                writer.close()
+            except BaseException:
+                pass
+            raise
     adapter = _preflight_existing_adapter(record, RuntimeOperation.EXEC, resolved_roots)
     return _require_process_session(
         adapter.exec_session(

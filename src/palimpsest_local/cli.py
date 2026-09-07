@@ -640,6 +640,8 @@ def build_parser() -> argparse.ArgumentParser:
     oci_root_proof.add_argument("name")
     oci_exec_status = oci_commands.add_parser("exec-status")
     oci_exec_status.add_argument("name")
+    oci_exec_record = oci_commands.add_parser("exec-record")
+    oci_exec_record.add_argument("path")
     oci_commands.add_parser("resource-status")
 
     build = commands.add_parser("build")
@@ -812,6 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
     shell = commands.add_parser("shell")
     shell.add_argument("name")
     execute = commands.add_parser("exec")
+    execute.add_argument("--completion-record")
     execute.add_argument("name")
     execute.add_argument("command", nargs=argparse.REMAINDER)
     start = commands.add_parser("start")
@@ -1417,6 +1420,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
         from .oci_resource_status import resource_status
 
         print(json.dumps(resource_status(), indent=2, sort_keys=True))
+        return 0
+    if op == "oci" and args.oci_operation == "exec-record":
+        from .oci_exec_record import read_exec_record
+
+        print(json.dumps(read_exec_record(args.path).to_dict(), indent=2, sort_keys=True))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
     read_only_oci_operations = {"root-proof", "exec-status"}
@@ -2171,6 +2179,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return _run_process_session(runtime_dispatch.shell(args.name, roots=roots), interactive=True)
 
     elif op == "exec":
+        if args.completion_record is not None:
+            return _run_process_session(
+                runtime_dispatch.exec(
+                    args.name,
+                    args.command,
+                    roots=roots,
+                    completion_record=args.completion_record,
+                ),
+                interactive=False,
+            )
         return _run_process_session(
             runtime_dispatch.exec(args.name, args.command, roots=roots),
             interactive=False,

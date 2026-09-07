@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 
 from .errors import StateError
 from .oci_exec_control import MAX_EXEC_CHUNK, MAX_EXEC_OUTPUT, MAX_EXEC_SEQUENCE, validate_exec_request
+from .oci_exec_record import OCIExecRecordWriter
 from .oci_monitor_client import MonitorClient, _Deadline
 from .oci_run_cleanup import _read_run_journal, load_oci_run_binding
 from .runtime_types import (
@@ -95,6 +96,33 @@ class OCIExecAcknowledgementError(StateError):
         return self._observation
 
 
+class OCIExecRecordingError(StateError):
+    """A fixed local-recording failure with the last trustworthy live facts."""
+
+    _MESSAGES = {
+        "pre-ack": "OCI exec completion recording failed before acknowledgement",
+        "post-ack": "OCI exec completion recording failed after validated acknowledgement",
+    }
+
+    def __init__(self, stage: str, observation: OCIExecCompletionObservation | None) -> None:
+        message = self._MESSAGES.get(stage)
+        if message is None:
+            raise ValueError("invalid OCI exec recording error stage")
+        if observation is not None and type(observation) is not OCIExecCompletionObservation:
+            raise TypeError("OCI exec recording error requires an immutable observation")
+        if stage == "post-ack" and (observation is None or observation.acknowledgement != "confirmed"):
+            raise ValueError("post-ACK recording failure requires a confirmed observation")
+        if stage == "pre-ack" and observation is not None and observation.acknowledgement != "unconfirmed":
+            raise ValueError("pre-ACK recording failure requires an unconfirmed observation")
+        self.stage = stage
+        self._observation = observation
+        super().__init__(message)
+
+    @property
+    def observation(self) -> OCIExecCompletionObservation | None:
+        return self._observation
+
+
 def validate_exec_status(value):
     if (
         type(value) is not dict
@@ -108,33 +136,41 @@ def validate_exec_status(value):
         raise StateError("OCI exec mailbox status is invalid")
 
 
-def exec_session(name, request, *, roots, _expected_record):
+def exec_session(name, request, *, roots, _expected_record, _record_writer=None):
     if type(request) is not ExecRequest:
         raise StateError("OCI exec requires literal guest argv")
+    argv = validate_exec_request(request.argv, 30000)
+    if _record_writer is not None and type(_record_writer) is not OCIExecRecordWriter:
+        raise StateError("OCI exec record writer is invalid")
     binding = load_oci_run_binding(roots, name)
     if binding.record != _expected_record:
         raise StateError("OCI exec run identity changed")
     with locked_existing_run(roots, name, expected=binding.record, lock_timeout=5) as mutation:
         endpoint = _read_run_journal(mutation, binding).endpoint
-    return OCIExecProcessSession(roots, binding, endpoint, request.argv)
+    return OCIExecProcessSession(roots, binding, endpoint, argv, _record_writer=_record_writer)
 
 
 class OCIExecProcessSession:
-    def __init__(self, roots, binding, endpoint, argv, *, timeout_ms=30000):
-        argv = validate_exec_request(argv, timeout_ms)
-        self._pid = os.getpid()
-        self._closed = threading.Event()
-        self._consumed = False
-        self._result = None
+    def __init__(self, roots, binding, endpoint, argv, *, timeout_ms=30000, _record_writer=None):
+        if _record_writer is not None:
+            if type(_record_writer) is not OCIExecRecordWriter:
+                raise StateError("OCI exec record writer is invalid")
+        self._recording_enabled = _record_writer is not None
+        self._record_writer = _record_writer
         self._client = None
-        self._stdout = self._stderr = 0
-        self._sizes = (0, 0)
-        self._phase = 0
-        self._terminal = None
-        self._observed_completion = None
-        self._deadline = _Deadline(timeout_ms / 1000 + 10)
-        self._token = str(uuid.uuid4())
         try:
+            self._pid = os.getpid()
+            self._closed = threading.Event()
+            self._consumed = False
+            self._result = None
+            self._stdout = self._stderr = 0
+            self._sizes = (0, 0)
+            self._phase = 0
+            self._terminal = None
+            self._observed_completion = None
+            argv = validate_exec_request(argv, timeout_ms)
+            self._deadline = _Deadline(timeout_ms / 1000 + 10)
+            self._token = str(uuid.uuid4())
             self._client = MonitorClient(roots, binding, endpoint)
             status = self._request("status", {})
             self._validate_status(status)
@@ -274,56 +310,88 @@ class OCIExecProcessSession:
         return self._iterate()
 
     def _iterate(self):
-        while True:
-            value = self._request(
-                "poll", {**self._identity(), "stdout_offset": self._stdout, "stderr_offset": self._stderr}
-            )
-            stdout, stderr = self._decode(value)
-            self._stdout += len(stdout)
-            self._stderr += len(stderr)
-            if stdout:
-                yield ProcessOutputEvent(ProcessStream.STDOUT, stdout)
-            if stderr:
-                yield ProcessOutputEvent(ProcessStream.STDERR, stderr)
-            if value["state"] == "control-lost":
-                raise StateError("OCI exec control was lost; preserve the run evidence")
-            if self._terminal is not None and (self._stdout, self._stderr) == self._sizes:
-                terminal, reason, stdout_bytes, stderr_bytes = self._terminal
-                if terminal is None:
-                    result = None
-                else:
-                    code, number = terminal["exit_code"], terminal["signal"]
-                    category = ProcessExitCategory.EXITED if code is not None else ProcessExitCategory.SIGNALED
-                    result = ProcessExit(code if code is not None else -number, code, number, category)
-                self._observed_completion = OCIExecCompletionObservation(
-                    result,
-                    reason,
-                    stdout_bytes,
-                    stderr_bytes,
-                    "unconfirmed",
+        try:
+            while True:
+                value = self._request(
+                    "poll", {**self._identity(), "stdout_offset": self._stdout, "stderr_offset": self._stderr}
                 )
-                acknowledgement_error = None
-                try:
-                    status = self._request("acknowledge", self._identity())
-                    self._validate_status(status)
-                    if status["next_sequence"] != self._sequence + 1:
-                        raise StateError("OCI exec acknowledgement identity changed")
-                except Exception:
-                    acknowledgement_error = OCIExecAcknowledgementError(self._observed_completion)
-                if acknowledgement_error is not None:
-                    raise acknowledgement_error
-                self._observed_completion = replace(self._observed_completion, acknowledgement="confirmed")
-                # All output and completion evidence are now local. Embedded
-                # CLI callers need not rely on process exit to release the pin.
+                stdout, stderr = self._decode(value)
+                self._stdout += len(stdout)
+                self._stderr += len(stderr)
+                if stdout:
+                    yield ProcessOutputEvent(ProcessStream.STDOUT, stdout)
+                    if self._closed.is_set() or os.getpid() != self._pid:
+                        raise StateError("OCI exec session is closed")
+                if stderr:
+                    yield ProcessOutputEvent(ProcessStream.STDERR, stderr)
+                    if self._closed.is_set() or os.getpid() != self._pid:
+                        raise StateError("OCI exec session is closed")
+                if value["state"] == "control-lost":
+                    raise StateError("OCI exec control was lost; preserve the run evidence")
+                if self._terminal is not None and (self._stdout, self._stderr) == self._sizes:
+                    if self._closed.is_set() or os.getpid() != self._pid:
+                        raise StateError("OCI exec session is closed")
+                    terminal, reason, stdout_bytes, stderr_bytes = self._terminal
+                    if terminal is None:
+                        result = None
+                    else:
+                        code, number = terminal["exit_code"], terminal["signal"]
+                        category = ProcessExitCategory.EXITED if code is not None else ProcessExitCategory.SIGNALED
+                        result = ProcessExit(code if code is not None else -number, code, number, category)
+                    self._observed_completion = OCIExecCompletionObservation(
+                        result,
+                        reason,
+                        stdout_bytes,
+                        stderr_bytes,
+                        "unconfirmed",
+                    )
+                    recording_error = None
+                    if self._record_writer is not None:
+                        try:
+                            self._record_writer.publish_observed(self._observed_completion)
+                        except Exception:
+                            recording_error = OCIExecRecordingError("pre-ack", self._observed_completion)
+                    if recording_error is not None:
+                        self.close()
+                        raise recording_error
+                    acknowledgement_error = None
+                    try:
+                        status = self._request("acknowledge", self._identity())
+                        self._validate_status(status)
+                        if status["next_sequence"] != self._sequence + 1:
+                            raise StateError("OCI exec acknowledgement identity changed")
+                    except Exception:
+                        acknowledgement_error = OCIExecAcknowledgementError(self._observed_completion)
+                    if acknowledgement_error is not None:
+                        raise acknowledgement_error
+                    self._observed_completion = replace(self._observed_completion, acknowledgement="confirmed")
+                    recording_error = None
+                    if self._record_writer is not None:
+                        try:
+                            self._record_writer.publish_confirmed(self._observed_completion)
+                        except Exception:
+                            recording_error = OCIExecRecordingError("post-ack", self._observed_completion)
+                    if recording_error is not None:
+                        self.close()
+                        raise recording_error
+                    # All output and completion evidence are now local. Embedded
+                    # CLI callers need not rely on process exit to release the pin.
+                    self.close()
+                    if reason != "completed":
+                        raise StateError("OCI exec did not complete: " + reason)
+                    assert result is not None
+                    self._result = result
+                    yield ProcessStatusEvent(self._result)
+                    return
+                if not stdout and not stderr:
+                    time.sleep(min(0.01, self._deadline.remaining()))
+        except BaseException:
+            # Recording opts this session into eager cleanup on every error
+            # exit.  Without that option, preserve the original pinned-client
+            # lifetime: failure cleanup remains the caller's responsibility.
+            if self._recording_enabled:
                 self.close()
-                if reason != "completed":
-                    raise StateError("OCI exec did not complete: " + reason)
-                assert result is not None
-                self._result = result
-                yield ProcessStatusEvent(self._result)
-                return
-            if not stdout and not stderr:
-                time.sleep(min(0.01, self._deadline.remaining()))
+            raise
 
     def wait(self):
         if self._result is not None:
@@ -335,10 +403,26 @@ class OCIExecProcessSession:
         return self._result
 
     def close(self):
-        self._closed.set()
+        closed = getattr(self, "_closed", None)
+        if closed is not None:
+            try:
+                closed.set()
+            except BaseException:
+                pass
         if self._client is not None:
-            self._client.close()
+            client = self._client
             self._client = None
+            try:
+                client.close()
+            except BaseException:
+                pass
+        if self._record_writer is not None:
+            writer = self._record_writer
+            self._record_writer = None
+            try:
+                writer.close()
+            except BaseException:
+                pass
 
     def write_stdin(self, data):
         raise ProcessCapabilityError("stdin")

@@ -2109,3 +2109,11 @@ initial server failure, the separate unresolved macOS PTY check and the
 same-user inode-reuse/provenance limitation. This delivers internal APIs only;
 no live exec disk records or new public options exist yet. Next is opt-in
 OCI session integration plus offline CLI and its own focused/native evidence.
+
+Current continuation implements the contracted opt-in public recorded exec and
+offline inspector. Sol owns host integration/focused unit tests and, in a
+separate non-overlapping slice, the native proof/lane registration. Astra owns
+scope, independent review, exact pushed-SHA server verification and reporting.
+The new native proof has its own opt-in; no unchanged guest/build/full Gate 2
+matrix is required. Until its new evidence is recorded, the storage-only 205
+pass must not be presented as this public integration's qualification.

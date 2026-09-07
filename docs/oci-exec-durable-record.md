@@ -1,6 +1,6 @@
 # Opt-in durable exec observations: implementation contract
 
-Status: internal storage foundation; not yet an available CLI/session feature.
+Status: public CLI/session integration candidate; qualification pending below.
 The original process-local baseline was `c2def266774bf2eb7c9edd246a4fb8e99722aa55`, including
 the [process-local observation](oci-exec-result-observation.md). This contract
 adds local historical inspection, **not recovery of monitor/client authority**.
@@ -8,7 +8,7 @@ adds local historical inspection, **not recovery of monitor/client authority**.
 ## Product boundary
 
 Keep ordinary `exec` unchanged: no default files, retention database, new
-permission requirements or additional ACK retries. The proposed opt-in is:
+permission requirements or additional ACK retries. The explicit opt-in is:
 
 ```text
 palimpsest exec --completion-record /absolute/private-parent/new-record NAME -- COMMAND ARG...
@@ -20,7 +20,8 @@ The option must precede NAME because the existing command tail is literal
 The first command supports only the existing Linux OCI-root runtime. Reject
 other runtimes and invalid literal argv before record creation or submission;
 do not silently ignore the option. Compose, shell, stdin/TTY and cloud adapters
-are not extended. Both commands above remain proposed until implemented.
+are not extended. The current continuation implements these commands; it is
+not qualified by the historical storage-only results below.
 
 The second command reads a local directory only. It must work after the
 original CLI has exited and after normal VM removal, without BOOT settings,
@@ -221,9 +222,9 @@ of the storage foundation or proposed CLI feature. Monitor authority recovery
 and output-body storage still require a separate design and explicit scope
 decision.
 
-## Storage-only continuation
+## Storage-only continuation (historical foundation)
 
-This implementation slice provides the internal codec, writer and offline reader
+The initial storage slice provided the internal codec, writer and offline reader
 plus their focused tests. It does not connect a live OCI session or expose the
 proposed CLI commands. There is no claim that actual exec results are written
 before ACK until the later routing/session integration is implemented and
@@ -300,8 +301,38 @@ unintegrated module. Failed delegated-runtime initialization and an unwritable
 default test cache were environmental setup failures, with evidence preserved;
 successful runs used the supported execution environment and a writable cache.
 
-Next is OCI-only opt-in routing/session publication barriers and the offline
-CLI, followed by a separate public recorded-exec/native proof. The internal
-foundation alone neither preserves actual exec results on disk nor changes ACK
-behavior. PID 1 protection, worker limits, output handling and VM-root/volume
-ownership remain unchanged.
+At this foundation delivery, the next step was OCI-only opt-in routing/session
+publication barriers and the offline CLI, followed by a separate public
+recorded-exec/native proof. The internal foundation alone neither preserved
+actual exec results on disk nor changed ACK behavior. PID 1 protection, worker
+limits, output handling and VM-root/volume ownership were unchanged.
+
+## Public integration continuation
+
+The opt-in dispatcher validates literal argv, requires the OCI-root runtime and
+performs the existing exact-record preflight before reserving pending. The
+original OCI session repeats its binding checks before submission and owns
+the writer during execution. No-option adapter calls remain unchanged; generic
+ProcessSession/ExecRequest and cloud/Lima interfaces are not extended.
+
+An observed-publication failure raises the fixed pre-ACK recording error with
+the live unconfirmed observation, without sending ACK. An ACK request/response
+failure keeps the existing acknowledgement error. After a validated ACK, live
+facts become confirmed before confirmed publication; failure to persist that
+last phase raises a distinct post-ACK recording error, not an ACK error or a
+successful child result. No output body or monitor authority is recovered.
+
+`oci exec-record` reads only local metadata before root resolution or
+initialization. Its JSON is the exact versioned snapshot with classification
+and fixed no-authority guidance; successful inspection returns zero regardless
+of the recorded child exit. Malformed/unreadable records fail with fixed
+diagnostics. Both path arguments are kept raw until strict storage validation;
+the parser must not erase dot components or symlinks through normalization.
+
+The independent normal native proof is
+`tests/kvm/test_oci_exec_record_cli_live.py`, enabled only by
+`PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1` with the existing accepted exec image and
+host BOOT configuration. It is separate from the engine/public-exec proofs and
+full Gate 2. ACK faults belong to focused controlled tests, not a claimed live
+reply-loss experiment. Final code review, selected exact-SHA Linux checks and
+this separate native proof remain pending for the integration candidate.
