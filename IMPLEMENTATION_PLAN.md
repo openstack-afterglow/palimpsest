@@ -2180,5 +2180,27 @@ The coarse older resource failure still has no proven exact resource cause.
 Local operational evidence: `/tmp/palimpsest-g44.exaZtB/cleanup-evidence.md` and
 `removal-canonical.log` alongside it. Server private backup:
 `/home/pieroot/palimpsest-kvm-evidence/failed-vm-5376e48a.G83wDb`.
-Public retention/reuse implementation and its separate native qualification
-are the next bounded slice; no new full Gate 2 or image build is implied.
+Public retention/reuse then completed at
+`cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2`: explicit `--root-retention retain`
+and `--root-volume UUID` connect to existing exclusive same-graph/size ownership
+checks. Default deletion remains unchanged; verified retain removal prints the
+reusable UUID. Generic OCI inspect remains closed. Sol authored code/tests;
+Astra managed independent approval, push and exact-SHA server verification.
+
+Local core checks passed 542 and separate lane checks 63; native collection
+skipped its explicit opt-in case. The initial socket-restricted regression
+attempt (419 passed, two EPERM failures) and corrected 421-pass result are kept.
+The exact pushed server SHA passed the combined 605 selected checks without
+skips in 94.18 s. Separate native guest-write/stop/rm/retained-reuse verification
+passed in 32.76 s, with distinct boot/run/domain identities and PID 1 protection.
+Both VMs/runs were normally removed; one detached retained root deliberately
+remains. Results are overlapping selections, not a full-suite claim.
+
+Server native log: `/tmp/palimpsest-g44-native-cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2.log`.
+Reusable test runtime: `/tmp/p-retained-root-05be9dcc`, volume
+`d703835c-ab76-47f2-8f3f-8573cfaa512c`, retained/unattached, generation 5,
+4 GiB logical raw, mode 0600, about 71 MiB allocated for the whole runtime.
+Original image hash and private failed-VM archive checksums still match; the
+libvirt inventory is empty. No new full Gate 2, image build or power-loss proof
+is implied. Next: root inventory/deletion UX, then separately scoped shared
+data-volume design; do not weaken exclusive VM root ownership.

@@ -13,6 +13,10 @@ remain distinguished; historical pending statements below are superseded by
 this checkpoint. Full-root privileges, shared data volumes and public retained
 root/recovery UX are not implied by this result.
 
+**2026-09-08 continuation:** explicit public retained-root reuse is separately
+qualified at `cb48781`; root inventory/deletion and shared data volumes remain
+follow-ups. This does not replace the historical Gate 2 evidence.
+
 ## First public local OCI lifecycle (five-stage integration)
 
 The CLI now connects explicit host admission, typed local intake, completed-run
@@ -73,8 +77,8 @@ only after verified cleanup completes. A later run may request that exclusive
 OverlayFS upper root with the same lower image graph and size using `--root-retention retain
 --root-volume UUID`; private checks reject conflicting, attached or mismatched
 roots. This is not a shared writable data volume. Generic OCI `inspect` remains
-closed, and native public reuse qualification is still required before claiming
-this surface as host-proven.
+closed. The separate native public reuse proof passed at
+`cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2`; see the bounded qualification below.
 
 Set the five host variables before `run`. Existing parent paths are not adopted
 or chmodded. Local layouts require `--runtime-kind oci-root`; `.oci.tar`/`.oci`
@@ -243,7 +247,7 @@ qualification on an appropriately configured runner.
 ## Deferred optimization, not abandoned requirements
 
 Shared lower-export membership/refcounts/GC, multiple VM data-volume sharing,
-retained-root public UX, TTY and parallel exec, remote Docker Hub intake,
+retained-root inventory/deletion UX, TTY and parallel exec, remote Docker Hub intake,
 Compose and non-x86_64 backends need not block the first two milestones.
 The user's eventual multi-VM volume requirement remains. VM root disks stay
 exclusive and explicitly reusable after retention; a future shared data volume
@@ -252,3 +256,32 @@ is a different lifecycle from the VM root.
 Every development change uses the [test lanes](testing.md) and its relevant
 native/product proof. Complete portable shards and broad release regression
 remain integration checks, not a reason to rerun all 4,000+ tests per small edit.
+
+## Public retained-root qualification
+
+At `cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2`, local focused core checks passed
+542 and separate lane checks passed 63; native collection skipped its one
+explicit opt-in proof. The same pushed SHA passed the combined 605 selected
+checks on the server in 94.18 s, without skips. The initial local regression
+attempt had 419 passes and two sandbox socket-bind failures; the same selection
+passed all 421 with normal permissions. These overlapping runs are not a full
+suite total. Independent code/test review, lint, formatting and lane checks
+passed before push.
+
+The separate `tests/kvm/test_oci_retained_root_cli_live.py` proof then passed
+in 32.76 s on that exact SHA. It reuses the previously accepted Palimpsest-built
+archive: public exec writes a unique file in the first guest's `/`, normal
+stop/rm retains the root, and a second public run explicitly reuses the returned
+UUID with the same source graph and size. The new run/boot/domain identities,
+persisted file, authenticated root proof and direct PID 1 access denial are
+checked. Both test VMs/run trees are removed; one detached retained 4 GiB root
+and its test runtime (about 71 MiB allocated) intentionally remain reusable.
+The original image, previous failed-run evidence and private cleanup archive
+remain unchanged. No host-side root write substitutes for guest persistence.
+
+Enable only `PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1`, provide the existing
+`PALIMPSEST_OCI_EXEC_LIVE_IMAGE` acceptance archive and five host BOOT variables,
+then select this test file through pytest. This is normal shutdown and
+reuse qualification, not a fresh image build, full Gate 2, crash/power-loss
+recovery, standalone root export or concurrent multi-VM root sharing. Root
+inventory/deletion UX and shared data-volume semantics remain follow-ups.
