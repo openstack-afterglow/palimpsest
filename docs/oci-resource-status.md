@@ -18,6 +18,13 @@ See [getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html) and
 
 ## Safety and interpretation
 
+On 2026-09-08 the user explicitly approved increasing the configured worker
+NPROC ceiling from 256 to 1024. The diagnostic uses that same shared constant;
+it does not raise limits itself. Lower inherited bounds and all other worker
+limits are preserved. Historical 256 observations below remain historical.
+The adjusted worker and fresh recorded-exec proof passed focused verification;
+see [the qualification evidence](oci-exec-durable-record.md#authorized-nproc-adjustment-and-fresh-native-qualification--2026-09-08).
+
 - The command does not initialize product state, create locks, launch a worker,
   contact libvirt or Docker, change resource limits, stop services or retry work.
 - Procfs reads and enumeration are bounded. Unavailable, malformed, truncated,

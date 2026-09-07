@@ -1,7 +1,8 @@
 # Opt-in durable exec observations: implementation contract
 
-Status: public CLI/session implemented and focused checks passed; new native
-qualification is blocked by host worker resources, as recorded below.
+Status: public CLI/session implemented; focused checks and a fresh native proof
+passed after the explicitly approved worker NPROC increase to 1024. Initial
+resource and test-parser failures remain recorded below.
 The original process-local baseline was `c2def266774bf2eb7c9edd246a4fb8e99722aa55`, including
 the [process-local observation](oci-exec-result-observation.md). This contract
 adds local historical inspection, **not recovery of monitor/client authority**.
@@ -336,9 +337,10 @@ The independent normal native proof is
 host BOOT configuration. It is separate from the engine/public-exec proofs and
 full Gate 2. ACK faults belong to focused controlled tests, not a claimed live
 reply-loss experiment. Code review and selected exact-SHA Linux checks have
-passed; the separate native proof remains required and incomplete.
+passed; the separate native proof was initially incomplete and subsequently
+passed in the authorized continuation below.
 
-## Public integration evidence and native blocker
+## Public integration evidence and initial native blocker
 
 Implementation `7a6a59bc26739ac3988cf3c5c4169c9250caff1e` was independently
 approved and pushed. Final local selection of the eight integration/storage/
@@ -355,9 +357,9 @@ The separate cold native test was actually attempted at the same SHA and
 `toolchain version check`, errno `EAGAIN`, in the existing worker-resource
 category. Neither public recorded exec nor its post-removal inspector ran;
 no new completion-record directory or run was created. Successful read-only
-domain enumeration and exact path checks confirmed absence. Do not describe
-the new public recorded-exec/native acceptance as passed, or substitute an
-earlier successful VM proof for it.
+domain enumeration and exact path checks confirmed absence. That failed attempt
+did not qualify public recorded exec; no earlier successful VM proof was used
+as its replacement.
 
 Read-only resource observations before/after the attempt saw 443/474 visible
 same-real-UID leader thread totals; the worker ceiling stayed 256. These are
@@ -388,10 +390,75 @@ inventory parsing against actual server LF formatting. Intermediate failed
 logs and the previous turn's separate unresolved macOS PTY failure are kept;
 that PTY test was neither rerun nor fixed here.
 
-Resume the required native proof after host resource availability changes, or
-after the user authorizes a precisely scoped host-resource intervention. Do not
-stop other workloads or weaken worker limits implicitly. This qualification
-blocker remains open. A successful future run must verify recorded exit status
+At that delivery the required native proof was blocked pending changed resource
+availability or an explicitly authorized intervention. Do not stop unrelated
+workloads or weaken limits implicitly. The subsequent authorized continuation
+below resolves this qualification blocker by verifying recorded exit status
 and streams, offline inspection, normal stop/rm, retained record bytes and
 unchanged source. Public retained-root reuse and shared multi-VM volumes remain
 separate follow-ups; no output replay or monitor-authority recovery was added.
+
+## Authorized NPROC adjustment and fresh native qualification — 2026-09-08
+
+The user explicitly approved raising the configured worker NPROC ceiling from
+256 to 1024. Sol implemented the shared constant, fixed diagnostics and focused
+boundary tests; Astra managed scope and independent approval. Commit
+`23b8dd76dc469cdcee7ca98b83a9c8f4184a5519` preserves lower inherited soft/hard
+bounds, NOFILE 256, AS/FSIZE/CPU/core limits, PID 1 protections and bounded retry
+behavior. No unrelated workload was stopped or host-wide limit changed.
+The cap is still real-UID-wide accounting, not a private worker-tree quota.
+
+- Local worker/resource/converter/CLI selection: 348 passed, eight Linux skips
+  (3.06 s). Exact pushed-SHA server selection: 356 passed, zero skips (16.90 s).
+  The initial server run had 15 failures and 341 passes (17.51 s): the main
+  orchestration script omitted the established umask 022, so SSH's umask 002
+  created mode-664 fixtures rejected by existing safety checks. Only the test
+  shell was corrected; product code and initial failure logs were preserved.
+- First new native attempt reached boot, root proof/PID 1 denial, recorded exec
+  exit 17, split output and confirmed offline inspection, then failed (14.05 s)
+  because the test expected one LF from virsh domuuid. Actual domuuid and
+  domname both returned the canonical value followed by two LFs, with no stderr.
+  The exact failed VM was normally stopped; its definition, root/run, record
+  and logs remain preserved, not counted as a successful full proof.
+- Test-only correction `8c2b3daba714b1fee4c4b96618125b2b5107fbac` accepts one
+  optional final blank LF but keeps canonical UUID/boot identity, exact name,
+  bounded parsing and cleanup gates. New portable parser/lane checks passed
+  81 locally (1.30 s) and 81 on that exact server SHA (2.48 s). An initial
+  portable-test import error was fixed before final independent approval by
+  separating a test-only parser module. Helper changes select only oci-monitor
+  plus an explicit native-live suggestion. Production code is unchanged from
+  the 356-pass worker-limit commit; counts overlap and are not additive.
+- The fresh exact-node native proof at `8c2b3da` passed in 17.96 s. It verified
+  run -d, actual root markers/PID 1 access denial, exit 17, 36 stdout bytes and
+  22 stderr bytes, confirmed metadata, unchanged boot/root identity, normal
+  stop/rm, and identical offline inspection after removal without BOOT or
+  runtime initialization. Successful VM/run/runtime cleanup completed; the
+  owner-private completion record remains. A separate post-check confirmed
+  that only the earlier stopped failed-test domain remained.
+
+Original image SHA256 remains
+`862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+Final advisory observations reported configured/projected NPROC 1024 and 485
+visible same-UID threads (partial/racy, not admission or capacity guarantees).
+Independent source/test reviews, changed-file lint/format, lane and diff checks
+passed. The earlier unrelated macOS PTY failure remains outside this slice;
+no new image build, full guest matrix, full Gate 2 or physical power-loss test
+is claimed. ACK faults retain their separate controlled-test evidence.
+
+Evidence:
+
+- Local logs and approvals: `/tmp/palimpsest-g43.hCpkMP/`.
+- Server initial selection: `/tmp/palimpsest-g43-selected-23b8dd76dc469cdcee7ca98b83a9c8f4184a5519.log`.
+- Server corrected selection: `/tmp/palimpsest-g43-selected-umask022-23b8dd76dc469cdcee7ca98b83a9c8f4184a5519.log`.
+- Parser/lane checks: `/tmp/palimpsest-g43-helpers-8c2b3daba714b1fee4c4b96618125b2b5107fbac.log`.
+- Failed/successful native logs: `/tmp/palimpsest-g43-native-23b8dd76dc469cdcee7ca98b83a9c8f4184a5519.log`
+  and `/tmp/palimpsest-g43-native-8c2b3daba714b1fee4c4b96618125b2b5107fbac.log`.
+- Preserved failed runtime `/tmp/p-execrecord-runtime-5376e48a`, record parent
+  `/tmp/p-execrecord-retained-5376e48a`, and shut-off domain
+  `exec-record-cli-5376e48a` (UUID `49bd618f-1a3e-4cd8-b436-58c194efd791`).
+- Successful retained record: `/tmp/p-execrecord-retained-d8f18b41/new-record`.
+  Successful runtime `/tmp/p-execrecord-runtime-d8f18b41` was removed.
+
+The public recorded-exec native blocker is resolved by this new proof. The
+raised shared-UID cap is an explicit short-term tradeoff; dedicated worker
+accounting via UID/cgroup remains a separate design, not an implemented feature.

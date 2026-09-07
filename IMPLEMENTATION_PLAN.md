@@ -2128,8 +2128,31 @@ unqualified. New failed evidence, empty record parent, original image and old
 failure evidence remain retained. Worker ceiling 256 and all unrelated
 workloads are unchanged. No unchanged retry or native-success claim.
 
-Next required action is resume that native proof after host resource conditions
-change or a precise user-authorized intervention; do not silently raise limits
-or stop services. See the durable-record contract for exact logs, non-additive
-counts, corrected intermediate failures and bounded diagnostic observations.
-Keep this verification blocker open rather than advancing its completion state.
+At that delivery the next required action was a new native proof after changed
+host resources or an explicit user-authorized intervention. The authorized
+continuation below resolves that verification blocker; the initial failure
+evidence remains preserved in the durable-record contract.
+
+Completed the explicitly approved worker NPROC adjustment (256 to 1024) at
+`23b8dd76dc469cdcee7ca98b83a9c8f4184a5519`, preserving inherited lower limits,
+all other resource limits and PID 1 protections. Sol authored code/tests; Astra
+managed independent approval, push and exact-SHA server verification. Local
+focused checks passed 348 with eight Linux skips; server checks passed 356
+(16.90 s) after correcting the test shell's omitted umask 022. The initial
+15-failure/341-pass result is retained, not erased or presented as a product fix.
+
+Fresh native execution then reached confirmed recorded exec but exposed a
+test-only virsh double-LF parsing assumption (14.05 s). Test/lane correction
+`8c2b3daba714b1fee4c4b96618125b2b5107fbac` was independently approved; 81
+portable parser/lane checks passed locally and on the exact server SHA.
+Production remained identical to the 356-pass commit. A new exact-node native
+proof passed in 17.96 s, including root/PID 1 protection, recorded exit/output,
+normal stop/rm and offline metadata after removal. The successful VM/runtime
+was removed and its record retained. The failed-test VM was normally stopped
+and its definition, root/run and evidence preserved; unrelated workloads were
+not stopped. See the durable-record contract for logs and limitations.
+
+The public recorded-exec native qualification blocker is resolved. No new full
+Gate 2, image-build matrix, output replay or cross-client authority recovery is
+claimed. Dedicated worker accounting, public retained-root reuse and shared
+multi-VM data volumes remain separate follow-ups, not implemented by this step.
