@@ -1,6 +1,7 @@
 # Opt-in durable exec observations: implementation contract
 
-Status: public CLI/session integration candidate; qualification pending below.
+Status: public CLI/session implemented and focused checks passed; new native
+qualification is blocked by host worker resources, as recorded below.
 The original process-local baseline was `c2def266774bf2eb7c9edd246a4fb8e99722aa55`, including
 the [process-local observation](oci-exec-result-observation.md). This contract
 adds local historical inspection, **not recovery of monitor/client authority**.
@@ -334,5 +335,63 @@ The independent normal native proof is
 `PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1` with the existing accepted exec image and
 host BOOT configuration. It is separate from the engine/public-exec proofs and
 full Gate 2. ACK faults belong to focused controlled tests, not a claimed live
-reply-loss experiment. Final code review, selected exact-SHA Linux checks and
-this separate native proof remain pending for the integration candidate.
+reply-loss experiment. Code review and selected exact-SHA Linux checks have
+passed; the separate native proof remains required and incomplete.
+
+## Public integration evidence and native blocker
+
+Implementation `7a6a59bc26739ac3988cf3c5c4169c9250caff1e` was independently
+approved and pushed. Final local selection of the eight integration/storage/
+session/client/public-routing/dispatcher/CLI-contract/lane files passed
+**581 with 67 Linux-only skips** in 3.93 s. On pieroot-server, a clean checkout
+of that exact pushed SHA passed the same selection: **648, zero skips**,
+23.92 s. All 61 storage cases and six new real-writer/pinned-client Linux cases
+executed. Counts overlap and are not additive. Changed-file lint/format, lane
+manifest and diff checks passed; the original storage module and existing
+no-option pinned-client regression test remained unchanged.
+
+The separate cold native test was actually attempted at the same SHA and
+**failed in 1.05 s before VM creation**. The materializer reported fixed stage
+`toolchain version check`, errno `EAGAIN`, in the existing worker-resource
+category. Neither public recorded exec nor its post-removal inspector ran;
+no new completion-record directory or run was created. Successful read-only
+domain enumeration and exact path checks confirmed absence. Do not describe
+the new public recorded-exec/native acceptance as passed, or substitute an
+earlier successful VM proof for it.
+
+Read-only resource observations before/after the attempt saw 443/474 visible
+same-real-UID leader thread totals; the worker ceiling stayed 256. These are
+non-atomic, visibility-dependent observations, not an admission verdict or a
+proof of which process/thread, cgroup or memory limit caused EAGAIN. Separate
+process-name/thread-count inspection showed other workloads sharing the user;
+no unrelated process/service was stopped, no limit was raised, and no unchanged
+native retry was attempted. The source archive's SHA256 remained
+`862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+
+Evidence is retained locally in `/tmp/palimpsest-g42.CCBDNM/`, including
+`local-selected.log`, `review-integration-result.txt` and
+`review-proof-final-result.txt`. Server evidence:
+
+- `/tmp/palimpsest-g42-server-selected-7a6a59bc26739ac3988cf3c5c4169c9250caff1e.log`
+- `/tmp/palimpsest-g42-native-7a6a59bc26739ac3988cf3c5c4169c9250caff1e.log`
+- Failed runtime `/tmp/p-execrecord-runtime-81dbc815` and separate empty record
+  parent `/tmp/p-execrecord-retained-81dbc815` (both preserved).
+
+Initial tests exposed a default-client early-close regression, new-fixture
+setup mistakes and transient lane drift before the parallel test file existed.
+All were corrected before approval; default failure lifetime is caller-owned,
+while recorded failures eagerly close their writer and monitor descriptors.
+Two existing Unix-socket tests hit sandbox EPERM; the related four passed in
+the socket-capable environment, followed by the full selected local pass.
+Native-test review also corrected unsafe absence/retention cleanup gates and
+inventory parsing against actual server LF formatting. Intermediate failed
+logs and the previous turn's separate unresolved macOS PTY failure are kept;
+that PTY test was neither rerun nor fixed here.
+
+Resume the required native proof after host resource availability changes, or
+after the user authorizes a precisely scoped host-resource intervention. Do not
+stop other workloads or weaken worker limits implicitly. This qualification
+blocker remains open. A successful future run must verify recorded exit status
+and streams, offline inspection, normal stop/rm, retained record bytes and
+unchanged source. Public retained-root reuse and shared multi-VM volumes remain
+separate follow-ups; no output replay or monitor-authority recovery was added.

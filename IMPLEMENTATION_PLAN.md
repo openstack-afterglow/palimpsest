@@ -2117,3 +2117,19 @@ scope, independent review, exact pushed-SHA server verification and reporting.
 The new native proof has its own opt-in; no unchanged guest/build/full Gate 2
 matrix is required. Until its new evidence is recorded, the storage-only 205
 pass must not be presented as this public integration's qualification.
+
+Public integration implemented and independently approved at
+`7a6a59bc26739ac3988cf3c5c4169c9250caff1e`. Local focused selection passed
+581 with 67 Linux skips; identical pushed-SHA server selection passed 648 with
+zero skips (23.92 s). The separate fresh recorded-exec native proof **failed
+before VM creation** at the materializer toolchain-version stage with EAGAIN
+(1.05 s); public recorded execution and post-removal inspection remain
+unqualified. New failed evidence, empty record parent, original image and old
+failure evidence remain retained. Worker ceiling 256 and all unrelated
+workloads are unchanged. No unchanged retry or native-success claim.
+
+Next required action is resume that native proof after host resource conditions
+change or a precise user-authorized intervention; do not silently raise limits
+or stop services. See the durable-record contract for exact logs, non-additive
+counts, corrected intermediate failures and bounded diagnostic observations.
+Keep this verification blocker open rather than advancing its completion state.
