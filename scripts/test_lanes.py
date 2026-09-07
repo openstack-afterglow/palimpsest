@@ -38,7 +38,7 @@ PORTABLE_FILES = {
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
         platforms process_session project project_adapter project_runtime project_volumes oci_host
-        oci_run_request oci_run_adapter oci_public_cli oci_resource_status
+        oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
     "oci-store": _units("""
@@ -76,6 +76,7 @@ SPECIAL_FILES = {
         "tests/kvm/test_oci_exec_cli_live.py",
         "tests/kvm/test_oci_exec_record_cli_live.py",
         "tests/kvm/test_oci_retained_root_cli_live.py",
+        "tests/kvm/test_oci_docker_hub_cli_live.py",
     ),
     "guest-kvm": ("tests/kvm/test_oci_guest_stage1_live.py",),
     "guest-binary": ("tests/integration/test_oci_guest_stage1_binary.py",),
@@ -85,7 +86,7 @@ SPECIAL_FILES = {
     "hub": tuple(f"hub/tests/test_{name}.py" for name in ("auth", "hub_api", "image_exports", "migrate")),
 }
 SPECIAL_NOTES = {
-    "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec engine/public CLI proofs require PALIMPSEST_OCI_EXEC_LIVE=1 / PALIMPSEST_OCI_EXEC_CLI_LIVE=1 respectively and their image. The separate durable-record and retained-root CLI proofs require PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1 / PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1 and the existing exec image. Runtime proofs require explicit host BOOT config; offline record inspection does not. Missing opt-ins skip their proof, not qualify it.",
+    "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec engine/public CLI proofs require PALIMPSEST_OCI_EXEC_LIVE=1 / PALIMPSEST_OCI_EXEC_CLI_LIVE=1 respectively and their image. The separate durable-record and retained-root CLI proofs require PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1 / PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1 and the existing exec image. Docker Hub proofs independently require PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,NGINX}_LIVE=1 plus exact local archive and selected manifest pins. Runtime proofs require explicit host BOOT config; offline record inspection does not. Missing opt-ins skip their proof, not qualify it.",
     "guest-kvm": "Explicit KVM guest proof; requires PALIMPSEST_REQUIRE_STAGE1_KVM=1 and proof fixtures.",
     "guest-binary": "Runs guest ELF under Docker when its existing prerequisites permit it.",
     "filesystem": "Privileged Linux filesystem proof; PALIMPSEST_REQUIRE_OCI_FS=1 makes prerequisites mandatory.",

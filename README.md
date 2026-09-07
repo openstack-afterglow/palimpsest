@@ -132,8 +132,13 @@ palimpsest oci materialize ./image-layout --manifest 'sha256:<root-digest>'
 
 This requires the qualified SquashFS packer (`/usr/bin/mksquashfs` by default)
 and currently supports `linux/amd64`. It produces verified layer artifacts,
-not a running VM. Public OCI-root `run/-d` and Gate 2 remain under development;
-see the [public-runtime roadmap](docs/oci-public-runtime-roadmap.md).
+not a running VM by itself. Public local OCI-root `run/-d` and the protected-root
+Gate 2 have separate qualified proofs on Linux/x86_64 KVM; see the
+[public-runtime roadmap](docs/oci-public-runtime-roadmap.md). Docker Hub
+references are not yet accepted directly by OCI-root `run`, and the Docker
+`pull` wrapper does not bridge into that runtime. See
+[Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
+digest-preserving local-archive workflow and its real-image verification scope.
 
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 

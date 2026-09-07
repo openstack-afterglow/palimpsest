@@ -2256,3 +2256,30 @@ are unchanged. The old failed-VM archive and intentionally retained root are
 not deletion fixtures. Next: implement the independently reviewed standalone
 deletion contract above with its own disposable retained-root proof, then
 separately address multi-VM data-volume sharing.
+
+### Docker Hub image compatibility continuation
+
+The user prioritizes checking actual Docker Hub image-to-VM execution before
+the next root-deletion slice. Repository inspection found that direct registry
+references are not connected to public OCI-root run; the existing Docker pull
+wrapper does not produce the accepted local OCI-layout source automatically.
+The current bounded deliverable is unchanged, platform-digest-pinned image
+acquisition plus separately selectable public CLI compatibility proofs.
+
+Astra manages acquisition, plans, independent review and exact-SHA host
+verification; Sol authors native proof tests and their portable contracts/lane
+registration. No product guest or workload privilege changes are included.
+The matrix is foreground hello-world, default Redis Alpine and non-root NGINX
+Alpine detached. Preserve failures as compatibility findings rather than
+overriding image configuration or weakening PID 1 protection to pass.
+
+Use an externally distributed, digest-pinned Skopeo helper to copy descriptors
+and actual layers into OCI archives with preserve-digests. The helper runs with
+its own bounded resources, no capabilities, no host Docker socket and only a
+dedicated acquisition output mount; target workloads never run in Docker.
+The first copy stopped before any archive/VM creation because the read-only
+helper root did not provide writable `/var/tmp`. A separately reviewed
+bounded tmpfs correction retained isolation and original failure logs. Both
+hello-world and Redis acquisitions then succeeded; native qualification and
+the non-root image check remain pending. See
+`docs/oci-docker-hub-compatibility.md` for scope and public-intake follow-up.

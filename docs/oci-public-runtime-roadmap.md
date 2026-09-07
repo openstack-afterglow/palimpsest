@@ -14,14 +14,20 @@ this checkpoint. Full-root privileges, shared data volumes and public retained
 root/recovery UX are not implied by this result.
 
 **2026-09-08 continuation:** explicit public retained-root reuse is separately
-qualified at `cb48781`; root inventory/deletion and shared data volumes remain
-follow-ups. This does not replace the historical Gate 2 evidence.
+qualified at `cb48781`; saved-root inventory is qualified at `f4305f3`.
+Standalone root deletion and shared data volumes remain follow-ups. These
+do not replace the historical Gate 2 evidence.
 
-The next bounded surface is read-only saved-root discovery via
+Read-only saved-root discovery is qualified at `f4305f3` via
 `oci root-volumes` and `oci root-volume UUID`. These are metadata observations,
 not disk-integrity checks or reuse/deletion authorization. The
 [inventory and deletion boundary](oci-retained-root-inventory.md) keeps
 standalone deletion behind a separate durable-intent/recovery implementation.
+
+The current user-requested check is [real Docker Hub image compatibility](oci-docker-hub-compatibility.md):
+digest-preserving acquisition into local OCI archives followed by public VM
+execution of unchanged image defaults. Direct registry-reference `run` is not
+yet implemented; external acquisition is not a Docker workload fallback.
 
 ## First public local OCI lifecycle (five-stage integration)
 
