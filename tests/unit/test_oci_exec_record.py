@@ -418,26 +418,40 @@ def test_linux_injected_no_clobber_collision_preserves_winner(monkeypatch, linux
     assert not list(path.glob(".observed.*.tmp"))
 
 
-def test_linux_reserve_does_not_adopt_a_replaced_creation(monkeypatch, linux_private):
+def test_linux_reserve_rejects_distinct_inode_replacement_before_open(monkeypatch, linux_private):
     before = open_fd_count()
     parent, managed = linux_private
     path = parent / "creation-race"
+    original = parent / "creation-race-original"
     real_open = records.os.open
     replaced = False
+    original_identity = replacement_identity = None
 
     def replace_before_open(name, flags, *args, **kwargs):
-        nonlocal replaced
+        nonlocal original_identity, replaced, replacement_identity
         if name == path.name and flags & os.O_DIRECTORY and not replaced:
             replaced = True
-            os.rmdir(name, dir_fd=kwargs["dir_fd"])
+            directory_fd = kwargs["dir_fd"]
+            # Unlink/recreate can recycle an inode and its timestamps; retaining the
+            # original under a sibling name makes this a distinct-identity injection.
+            original_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            original_identity = (original_metadata.st_dev, original_metadata.st_ino)
+            os.rename(name, original.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
             os.mkdir(name, 0o700, dir_fd=kwargs["dir_fd"])
+            replacement_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            replacement_identity = (replacement_metadata.st_dev, replacement_metadata.st_ino)
         return real_open(name, flags, *args, **kwargs)
 
     monkeypatch.setattr(records.os, "open", replace_before_open)
     with pytest.raises(records.OCIExecRecordError) as raised:
         records.OCIExecRecordWriter.reserve(path, managed_state=managed)
     assert raised.value.stage == "reserve"
+    assert replaced and original_identity is not None and replacement_identity is not None
+    assert original_identity != replacement_identity
+    assert (original.stat().st_dev, original.stat().st_ino) == original_identity
+    assert original.is_dir() and list(original.iterdir()) == []
     assert path.is_dir() and list(path.iterdir()) == []
+    assert not (path / "pending.json").exists()
     assert open_fd_count() == before
 
 

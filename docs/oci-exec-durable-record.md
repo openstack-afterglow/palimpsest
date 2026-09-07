@@ -252,3 +252,11 @@ Since no runtime imports or calls the new module yet, a new VM boot, public
 recorded-exec proof and full Gate 2 are not this slice's qualification. Those
 remain required for the later public integration; earlier VM results cannot
 be substituted for them.
+
+Creation-race checks compare directory inode bindings; they do not authenticate
+an inode incarnation against the same user or administrator. In particular,
+unlinking an unopened directory and immediately recreating it can reuse both
+the inode and its timestamp values on ext4. The deterministic replacement test
+keeps the original directory alive to establish a distinct inode, and must not
+be described as proof against arbitrary same-user replacement. Private-parent
+ownership and permissions are the boundary against other principals.
