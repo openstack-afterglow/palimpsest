@@ -28,6 +28,10 @@ The current user-requested check is [real Docker Hub image compatibility](oci-do
 digest-preserving acquisition into local OCI archives followed by public VM
 execution of unchanged image defaults. Direct registry-reference `run` is not
 yet implemented; external acquisition is not a Docker workload fallback.
+At `f606e32`, unchanged hello-world passed its foreground VM lifecycle;
+Redis failed in pre-VM packing and non-root NGINX failed process validation
+(`ArgsEscaped`). The separate tests expose real compatibility gaps rather
+than qualifying arbitrary Docker Hub images or detached service execution.
 
 ## First public local OCI lifecycle (five-stage integration)
 

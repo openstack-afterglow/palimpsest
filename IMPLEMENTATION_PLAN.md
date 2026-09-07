@@ -2280,6 +2280,46 @@ dedicated acquisition output mount; target workloads never run in Docker.
 The first copy stopped before any archive/VM creation because the read-only
 helper root did not provide writable `/var/tmp`. A separately reviewed
 bounded tmpfs correction retained isolation and original failure logs. Both
-hello-world and Redis acquisitions then succeeded; native qualification and
-the non-root image check remain pending. See
+hello-world and Redis acquisitions then succeeded, followed by NGINX. See
 `docs/oci-docker-hub-compatibility.md` for scope and public-intake follow-up.
+
+The independently reviewed proof code was pushed at `9096f7b`. Its first
+hello attempt failed before VM creation: the proof assumed lazy product
+cache directories existed after init-runtime. Sol isolated the proof CAS
+under the existing private runtime parent and added a fresh-runtime
+regression; independent review approved the correction at `f606e32`.
+Local focused checks passed 118 (2.67 s), with three opt-in native skips;
+the exact pushed server SHA passed the same 118 portable checks (4.14 s).
+
+All three pinned-image native nodes then ran independently at `f606e32`:
+hello-world foreground passed (13.56 s), Redis failed pre-VM packing (3.93 s),
+and unprivileged NGINX failed pre-VM ArgsEscaped validation (1.03 s). Redis
+has completed immutable receipts for ordinals 0-3; the next layer is only
+data/ (uid 999, gid 1000, mode 0755). Its generic pack failure does not prove
+resource exhaustion or entrypoint capability trouble. The NGINX config has
+User 101 and ArgsEscaped true; no workload privileges were exercised.
+Failures remain retained and explicitly failed, not skipped. Hello's
+successful domain and run state were normally removed; final observed
+libvirt inventory was empty. Original archives and prior retained-root and
+failed-VM recovery evidence were not modified. Service runtime/root-proof
+qualification remains incomplete; existing local-build Gate 2 is separate.
+
+Next bounded work: diagnose the exact directory-only packer failure with
+unchanged source and product worker limits (disclosing a separate diagnostic
+CPU/deadline budget), then independently review the Linux
+ArgsEscaped interpretation before changing the parser. A direct registry
+run intake still requires the explicit pinned acquisition contract in the
+compatibility document; no registry client or security relaxation has been
+implemented in this proof-only slice.
+
+The optional standalone Redis diagnostic did not receive independent approval
+and was not copied to or executed on the server. Review found unresolved
+interruption/descendant-cleanup boundaries and a diagnostic read that could
+replace the original verifier error. Preserve those reviews and the private
+draft; do not treat the draft as an approved operational script. A fresh
+private diagnostic parent was prepared but has no test workload. Exact Redis
+packer cause and corrective implementation remain open; zero-fragment
+superblock handling is only a code-inspection hypothesis. The delivered
+scope is the actual three-image compatibility check, independently selected
+tests, the qualified proof setup correction, and documented follow-up—not a
+successful three-service qualification or completed registry intake.
