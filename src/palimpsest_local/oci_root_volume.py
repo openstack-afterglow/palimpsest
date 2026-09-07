@@ -40,7 +40,10 @@ OCI_ROOT_VOLUME_SCHEMA = "palimpsest.oci-root-volume.v1"
 OCI_ROOT_VOLUME_RETENTION_POLICIES = frozenset({"delete", "retain"})
 MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS = 4096
 MAX_OCI_ROOT_VOLUME_GENERATION = 10**MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS - 1
+# Read-only inventory bounds: fail closed without returning a partial namespace.
 _RECORD_BYTES = 64 * 1024
+_MAX_NAMESPACE_ENTRIES = 4096  # Includes ignored dot-prefixed lifecycle entries.
+_MAX_VOLUME_RECORDS = 1024
 _HEX_RE = re.compile(r"^[0-9a-f]{32}$")
 _RETENTION_FORK_LOCK = threading.Lock()
 _RETENTION_LOCKS: weakref.WeakSet[_RetentionVolumeLock] = weakref.WeakSet()
@@ -332,11 +335,16 @@ def _strict_json_load(directory_fd: int, name: str) -> dict[str, Any]:
     file_fd: int | None = None
     try:
         entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+        if not stat.S_ISREG(entry.st_mode):
+            raise StateError("OCI-root volume record is unsafe")
+        file_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
         opened = os.fstat(file_fd)
         if (
-            not stat.S_ISREG(entry.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
+            not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != os.geteuid()
             or opened.st_nlink != 1
             or stat.S_IMODE(opened.st_mode) != 0o600
@@ -352,10 +360,25 @@ def _strict_json_load(directory_fd: int, name: str) -> dict[str, Any]:
                 break
             payload += chunk
         after = os.fstat(file_fd)
-        if len(payload) != opened.st_size or (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
-            opened.st_size,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+        def identity(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_uid,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            len(payload) != opened.st_size
+            or identity(entry) != identity(opened)
+            or identity(after) != identity(opened)
+            or identity(current) != identity(opened)
         ):
             raise StateError("OCI-root volume record changed during read")
     except FileNotFoundError:
@@ -951,10 +974,24 @@ def list_oci_root_volume_records(roots: StatePaths) -> tuple[OCIRootVolumeRecord
     raw_names: set[str] = set()
     record_stems: set[str] = set()
     with _root_authority(roots) as directory_fd:
+        namespace_before = os.fstat(directory_fd)
+        visible_before = os.stat(roots.oci_root_volumes, follow_symlinks=False)
+        names: list[str] = []
+        seen_names: set[str] = set()
         try:
-            names = sorted(os.listdir(directory_fd))
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    if len(names) >= _MAX_NAMESPACE_ENTRIES:
+                        raise StateError("OCI-root volume namespace exceeds its entry limit")
+                    if entry.name in seen_names:
+                        raise StateError("OCI-root volume namespace contains a duplicate entry")
+                    seen_names.add(entry.name)
+                    names.append(entry.name)
+        except StateError:
+            raise
         except OSError:
             raise StateError("OCI-root volumes cannot be enumerated") from None
+        names.sort()
         for name in names:
             if name.startswith("."):
                 continue
@@ -969,6 +1006,8 @@ def list_oci_root_volume_records(roots: StatePaths) -> tuple[OCIRootVolumeRecord
                 raise StateError("OCI-root volume record filename is invalid")
             record_stems.add(stem)
             found.append(record)
+            if len(found) > _MAX_VOLUME_RECORDS:
+                raise StateError("OCI-root volume namespace exceeds its record limit")
         expected_raws = {
             record.volume_id.replace("-", "")
             for record in found
@@ -976,6 +1015,25 @@ def list_oci_root_volume_records(roots: StatePaths) -> tuple[OCIRootVolumeRecord
         }
         if raw_names != expected_raws or not expected_raws.issubset(record_stems):
             raise StateError("OCI-root volume artifact and owner records are inconsistent")
+        namespace_after = os.fstat(directory_fd)
+        visible_after = os.stat(roots.oci_root_volumes, follow_symlinks=False)
+
+        def namespace_identity(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_uid,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        expected_namespace = namespace_identity(namespace_before)
+        if any(
+            namespace_identity(observed) != expected_namespace
+            for observed in (visible_before, namespace_after, visible_after)
+        ):
+            raise StateError("OCI-root volume namespace changed during enumeration")
     return tuple(found)
 
 

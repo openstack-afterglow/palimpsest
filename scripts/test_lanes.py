@@ -42,7 +42,7 @@ PORTABLE_FILES = {
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
     "oci-store": _units("""
-        oci_changeset oci_convert_security oci_converter_first_pass oci_image
+        oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
         oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff
         oci_worker_protocol
     """),
@@ -205,6 +205,7 @@ LANES = (*PORTABLE, *SPECIAL_FILES)
 # an import graph or a guarantee. Shared infrastructure/unknown changes fall
 # back to every portable lane. Suggested external proofs still need opt-in.
 DEPENDENCIES = (
+    ("oci_root_volume_inventory", ("core-cli", "host-runtime", "oci-store"), ()),
     ("oci_resource_status", ("host-runtime", "core-cli"), ()),
     ("oci_worker_limits", ("host-runtime", "oci-store"), ("native-live",)),
     (

@@ -144,6 +144,12 @@ def test_resource_status_sources_select_only_exact_consumers(module, expected, s
     assert result.suggested == suggested
 
 
+def test_root_volume_inventory_source_selects_cli_and_store_contracts_only():
+    result = lanes.select_changed(("src/palimpsest_local/oci_root_volume_inventory.py",))
+    assert set(result.lanes) == {"core-cli", "host-runtime", "oci-store"}
+    assert result.suggested == ()
+
+
 def test_oci_exec_record_source_selects_exact_consumers_and_new_native_proof():
     result = lanes.select_changed(("src/palimpsest_local/oci_exec_record.py",))
     assert result.lanes == ("core-cli", "oci-monitor")

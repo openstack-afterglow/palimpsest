@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import pytest
 import test_runtime_dispatch as dispatch_tests
 
-from palimpsest_local import cli, oci_host, oci_root_proof, platforms, runtime_dispatch, state
+from palimpsest_local import (
+    cli,
+    oci_host,
+    oci_root_proof,
+    oci_root_volume_inventory,
+    platforms,
+    runtime_dispatch,
+    state,
+)
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.runtime_types import (
@@ -220,6 +228,108 @@ def test_root_proof_is_read_only_and_prints_only_the_public_report(monkeypatch, 
     assert cli.main(["oci", "root-proof", "demo"]) == 0
     assert seen and seen[0][1] == "demo"
     assert __import__("json").loads(capsys.readouterr().out) == report
+
+
+@pytest.mark.parametrize("operation", ["root-volumes", "root-volume"])
+def test_root_volume_inventory_is_early_read_only_json_without_host_or_state_effects(
+    tmp_path, monkeypatch, capsys, operation
+):
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
+    monkeypatch.setattr(cli, "init_roots", lambda: pytest.fail("state initialized"))
+    monkeypatch.setattr(oci_host, "preflight_oci_host", lambda *_a, **_k: pytest.fail("host probed"))
+    expected = {"schema": "fixed"}
+    monkeypatch.setattr(
+        oci_root_volume_inventory, "root_volumes", lambda selected: expected if selected == roots else None
+    )
+    monkeypatch.setattr(
+        oci_root_volume_inventory,
+        "root_volume",
+        lambda selected, volume_id: (
+            expected if selected == roots and volume_id == "49bd618f-1a3e-4cd8-b436-58c194efd791" else None
+        ),
+    )
+    args = ["oci", operation]
+    if operation == "root-volume":
+        args.append("49bd618f-1a3e-4cd8-b436-58c194efd791")
+    assert cli.main(args) == 0
+    assert __import__("json").loads(capsys.readouterr().out) == expected
+    assert not roots.state.exists() and not roots.config.exists()
+
+
+def test_root_volume_inventory_real_projection_and_failures_have_no_partial_stdout(tmp_path, monkeypatch, capsys):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
+    monkeypatch.setattr(cli, "init_roots", lambda: pytest.fail("state initialized"))
+    monkeypatch.setattr(oci_host, "preflight_oci_host", lambda *_a, **_k: pytest.fail("host probed"))
+
+    assert cli.main(["oci", "root-volumes"]) == 0
+    assert __import__("json").loads(capsys.readouterr().out)["volumes"] == []
+
+    unknown = "49bd618f-1a3e-4cd8-b436-58c194efd791"
+    assert cli.main(["oci", "root-volume", unknown]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "unknown" in captured.err
+
+    (roots.oci_root_volumes / "unexpected").touch()
+    assert cli.main(["oci", "root-volumes"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "OCI root-volume metadata is unavailable or inconsistent"
+
+
+def test_root_volume_inventory_missing_runtime_is_fixed_and_boot_independent(tmp_path, monkeypatch, capsys):
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
+    monkeypatch.setattr(cli, "init_roots", lambda: pytest.fail("state initialized"))
+    monkeypatch.setattr(oci_host, "preflight_oci_host", lambda *_a, **_k: pytest.fail("host probed"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: pytest.fail("subprocess entered"))
+
+    assert cli.main(["oci", "root-volumes"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "OCI root-volume metadata is unavailable or inconsistent"
+    assert str(tmp_path) not in captured.err
+    assert not roots.state.exists() and not roots.config.exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["oci", "root-volumes"],
+        ["oci", "root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"],
+    ],
+)
+@pytest.mark.parametrize("malformed", ["[storage\n", "x=" + "[" * 2000 + "0" + "]" * 2000])
+def test_root_volume_inventory_malformed_config_is_fixed_and_path_free(tmp_path, monkeypatch, capsys, args, malformed):
+    config_home = tmp_path / "private-config"
+    config = config_home / "palimpsest"
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text(malformed)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("PALIMPSEST_STATE_HOME", raising=False)
+    monkeypatch.setattr(cli, "init_roots", lambda: pytest.fail("state initialized"))
+    monkeypatch.setattr(oci_host, "preflight_oci_host", lambda *_a, **_k: pytest.fail("host probed"))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_a, **_k: pytest.fail("subprocess entered"))
+
+    assert cli.main(args) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "OCI root-volume metadata is unavailable or inconsistent"
+    assert str(tmp_path) not in captured.err
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_root_volume_inventory_root_resolution_preserves_cancellation(monkeypatch, interruption):
+    def interrupt():
+        raise interruption(7) if interruption is SystemExit else interruption()
+
+    monkeypatch.setattr(cli, "resolve_roots", interrupt)
+    if interruption is SystemExit:
+        assert cli.main(["oci", "root-volumes"]) == 7
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(["oci", "root-volumes"])
 
 
 def _record(tmp_path):

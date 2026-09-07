@@ -644,6 +644,9 @@ def build_parser() -> argparse.ArgumentParser:
     oci_exec_record = oci_commands.add_parser("exec-record")
     oci_exec_record.add_argument("path")
     oci_commands.add_parser("resource-status")
+    oci_commands.add_parser("root-volumes")
+    oci_root_volume = oci_commands.add_parser("root-volume")
+    oci_root_volume.add_argument("volume_id")
 
     build = commands.add_parser("build")
     build.add_argument("context", nargs="?", type=Path)
@@ -1433,6 +1436,20 @@ def dispatch_args(args: argparse.Namespace) -> int:
         from .oci_exec_record import read_exec_record
 
         print(json.dumps(read_exec_record(args.path).to_dict(), indent=2, sort_keys=True))
+        return 0
+    if op == "oci" and args.oci_operation in {"root-volumes", "root-volume"}:
+        from .oci_root_volume_inventory import root_volume, root_volumes
+
+        try:
+            inventory_roots = resolve_roots()
+        except (PalimpsestError, OSError, ValueError, TypeError, OverflowError, RecursionError):
+            raise PalimpsestError("OCI root-volume metadata is unavailable or inconsistent") from None
+        payload = (
+            root_volumes(inventory_roots)
+            if args.oci_operation == "root-volumes"
+            else root_volume(inventory_roots, args.volume_id)
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
     read_only_oci_operations = {"root-proof", "exec-status"}

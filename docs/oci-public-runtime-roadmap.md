@@ -17,6 +17,12 @@ root/recovery UX are not implied by this result.
 qualified at `cb48781`; root inventory/deletion and shared data volumes remain
 follow-ups. This does not replace the historical Gate 2 evidence.
 
+The next bounded surface is read-only saved-root discovery via
+`oci root-volumes` and `oci root-volume UUID`. These are metadata observations,
+not disk-integrity checks or reuse/deletion authorization. The
+[inventory and deletion boundary](oci-retained-root-inventory.md) keeps
+standalone deletion behind a separate durable-intent/recovery implementation.
+
 ## First public local OCI lifecycle (five-stage integration)
 
 The CLI now connects explicit host admission, typed local intake, completed-run
@@ -247,7 +253,7 @@ qualification on an appropriately configured runner.
 ## Deferred optimization, not abandoned requirements
 
 Shared lower-export membership/refcounts/GC, multiple VM data-volume sharing,
-retained-root inventory/deletion UX, TTY and parallel exec, remote Docker Hub intake,
+retained-root deletion UX, TTY and parallel exec, remote Docker Hub intake,
 Compose and non-x86_64 backends need not block the first two milestones.
 The user's eventual multi-VM volume requirement remains. VM root disks stay
 exclusive and explicitly reusable after retention; a future shared data volume
@@ -284,4 +290,5 @@ Enable only `PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1`, provide the existing
 then select this test file through pytest. This is normal shutdown and
 reuse qualification, not a fresh image build, full Gate 2, crash/power-loss
 recovery, standalone root export or concurrent multi-VM root sharing. Root
-inventory/deletion UX and shared data-volume semantics remain follow-ups.
+deletion UX and shared data-volume semantics remain follow-ups; the subsequent
+metadata-only inventory is described separately above.

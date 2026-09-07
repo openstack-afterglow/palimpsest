@@ -2204,3 +2204,26 @@ Original image hash and private failed-VM archive checksums still match; the
 libvirt inventory is empty. No new full Gate 2, image build or power-loss proof
 is implied. Next: root inventory/deletion UX, then separately scoped shared
 data-volume design; do not weaken exclusive VM root ownership.
+
+### Saved-root inventory continuation
+
+Inspection showed that standalone retained-root deletion is not a thin wrapper
+around `release_oci_root_volume`: that API requires the prior attached owner,
+whereas retained records have no attachment. Do not fabricate an owner or boot
+a disposable VM to delete the retained disk. The next deletion implementation
+needs an explicit durable destructive intent, access/reference checks and
+interruption recovery without lock-order inversion.
+
+The bounded implementation for this continuation is instead `oci root-volumes`
+and `oci root-volume UUID`: allowlisted stored metadata, no raw disk reads,
+BOOT/tool/backend calls, state initialization or lifecycle lock creation.
+Missing/inconsistent state fails closed; stored retained status is not a
+reuse/deletion verdict. Namespace and record reads gain bounds and observed
+replacement/nonregular-file checks. See
+`docs/oci-retained-root-inventory.md` for the full boundary and deletion gate.
+
+Sol owns code/tests and Astra owns planning, independent review and delivery.
+Verification will select only the new inventory/CLI tests and affected root
+record/access/removal contracts, then inspect the existing retained disk on the
+exact pushed server SHA without restarting a VM or rewriting the disk. The old
+failed-VM archive and intentionally retained root are not deletion fixtures.
