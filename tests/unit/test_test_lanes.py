@@ -116,6 +116,12 @@ def test_resource_status_sources_select_only_exact_consumers(module, expected, s
     assert result.suggested == suggested
 
 
+def test_oci_exec_record_source_selects_only_storage_slice_consumers_without_external_proofs():
+    result = lanes.select_changed(("src/palimpsest_local/oci_exec_record.py",))
+    assert result.lanes == ("core-cli", "oci-monitor")
+    assert result.suggested == ()
+
+
 @pytest.mark.parametrize(
     "module",
     ["oci_materializer", "oci_materializer_worker", "oci_packer", "oci_worker_protocol"],

@@ -2092,8 +2092,9 @@ not a live dropped-reply test. See the contract for evidence and limitations.
 The next-step [durable record contract](docs/oci-exec-durable-record.md) now
 specifies explicit opt-in metadata storage, before/after-ACK publication,
 conservative crash states and offline inspection without monitor authority.
-This continuation is design only: no disk persistence or new CLI is implemented.
-Next implementation: strict local record storage, OCI-only session barriers and
-offline inspector, followed by independent review and focused exact-SHA server
-verification. Output-content recovery, cross-client result authority and
-automatic replay remain outside this contract.
+That contract step (`c44361f`) was design only and exposed no new CLI.
+The current continuation implements only strict local record storage and the
+internal offline reader, with independent review and focused exact-SHA Linux
+filesystem verification. Public options, OCI-only session barriers and the
+offline CLI remain the next integration slice. Output-content recovery,
+cross-client result authority and automatic replay remain outside this contract.

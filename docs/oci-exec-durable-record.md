@@ -1,7 +1,7 @@
 # Opt-in durable exec observations: implementation contract
 
-Status: design for the next implementation, not an available CLI feature.
-The shipped baseline is `c2def266774bf2eb7c9edd246a4fb8e99722aa55`, including
+Status: internal storage foundation; not yet an available CLI/session feature.
+The original process-local baseline was `c2def266774bf2eb7c9edd246a4fb8e99722aa55`, including
 the [process-local observation](oci-exec-result-observation.md). This contract
 adds local historical inspection, **not recovery of monitor/client authority**.
 
@@ -212,11 +212,43 @@ replace focused evidence with overlapping totals or call a documentation review
 a code/native qualification. VM-root retention/reuse and multi-VM data-volume
 sharing remain separate user requirements, not consequences of local records.
 
-## This task's delivery
+## Contract delivery (historical)
 
-This task delivers the contract and implementation sequencing only. No product
-code, CLI parser, disk writer, reader, guest, protocol, tests or limits have been
-changed. The preceding implementation's 398-test selections and native pass
-remain historical evidence, not validation of this proposed feature. Source
-development follows this contract; monitor authority recovery and output-body
-storage still require a separate design and explicit scope decision.
+Commit `c44361f4eecefe5a914cee716fd5bb1ddb3d676f` delivered only the contract
+and implementation sequencing. It changed no product code or tests. The earlier
+398-test selections and native pass remain historical evidence, not validation
+of the storage foundation or proposed CLI feature. Monitor authority recovery
+and output-body storage still require a separate design and explicit scope
+decision.
+
+## Storage-only continuation
+
+This implementation slice provides the internal codec, writer and offline reader
+plus their focused tests. It does not connect a live OCI session or expose the
+proposed CLI commands. There is no claim that actual exec results are written
+before ACK until the later routing/session integration is implemented and
+qualified. Standalone tests supply observations as local inputs, not guest
+attestations, and storage state transitions do not perform monitor operations.
+
+The writer takes an explicit managed-state exclusion root from its future
+caller; it must not resolve or initialize runtime state itself. Offline reading
+does not require that exclusion root or the original run to exist. The future
+dispatcher remains responsible for full OCI argv validation, exact runtime
+preflight and same-record entry checks before reserving a record. The no-option
+exec route and generic ProcessSession/cloud adapter interfaces remain unchanged.
+
+Linux no-clobber publication follows
+[renameat2/RENAME_NOREPLACE](https://man7.org/linux/man-pages/man2/rename.2.html).
+Missing support must fail rather than fall back to an overwriting rename.
+The synchronization sequence follows [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html):
+file synchronization alone does not establish directory-entry persistence.
+Descriptor-based attribute checks use the Linux behavior described by
+[Python's os.listxattr](https://docs.python.org/3/library/os.html#os.listxattr).
+
+Qualification for this isolated foundation uses the new storage test file,
+existing observation/session/client regressions, and lane validation. Real
+Linux filesystem checks run against the exact pushed SHA on pieroot-server.
+Since no runtime imports or calls the new module yet, a new VM boot, public
+recorded-exec proof and full Gate 2 are not this slice's qualification. Those
+remain required for the later public integration; earlier VM results cannot
+be substituted for them.
