@@ -11,6 +11,7 @@ import math
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +37,8 @@ class LocalOCIRunRequest:
     memory_mib: int = 512
     vcpus: int = 1
     root_size_bytes: int = 4 * 1024**3
+    root_retention: str = "delete"
+    root_volume_id: str | None = None
     network: None = None
     platform: str = "linux/amd64"
     backend: str = "kvm"
@@ -63,6 +66,17 @@ class LocalOCIRunRequest:
         if type(self.vcpus) is not int or not 1 <= self.vcpus <= 256:
             raise ArtifactValidationError("OCI run vcpus must be between 1 and 256")
         _validate_size(self.root_size_bytes)
+        if type(self.root_retention) is not str or self.root_retention not in {"delete", "retain"}:
+            raise ArtifactValidationError("OCI run root retention policy is invalid")
+        if self.root_volume_id is not None:
+            try:
+                parsed_root_volume_id = uuid.UUID(self.root_volume_id)
+            except (AttributeError, TypeError, ValueError):
+                raise ArtifactValidationError("OCI run root volume ID must be a canonical UUID") from None
+            if str(parsed_root_volume_id) != self.root_volume_id:
+                raise ArtifactValidationError("OCI run root volume ID must be a canonical UUID")
+            if self.root_retention != "retain":
+                raise ArtifactValidationError("OCI run retained root reuse requires --root-retention retain")
         if self.network is not None:
             raise ArtifactValidationError("local OCI run networking is not available yet")
         if self.platform != "linux/amd64" or self.backend != "kvm":
@@ -102,6 +116,8 @@ def resolve_local_oci_run_request(
     memory_mib: int = 512,
     vcpus: int = 1,
     root_size_bytes: int = 4 * 1024**3,
+    root_retention: str = "delete",
+    root_volume_id: str | None = None,
     network: None = None,
     platform: str = "linux/amd64",
     backend: str = "kvm",
@@ -123,6 +139,8 @@ def resolve_local_oci_run_request(
         memory_mib=memory_mib,
         vcpus=vcpus,
         root_size_bytes=root_size_bytes,
+        root_retention=root_retention,
+        root_volume_id=root_volume_id,
         network=network,
         platform=platform,
         backend=backend,

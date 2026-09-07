@@ -57,6 +57,7 @@ def test_request_defaults_are_foreground_local_linux_kvm_without_cloud_spec(tmp_
     assert not request.detached
     assert request.network is None
     assert request.root_size_bytes == 4 * 1024**3
+    assert request.root_retention == "delete" and request.root_volume_id is None
     assert (request.memory_mib, request.vcpus) == (512, 1)
     assert not hasattr(request, "spec")
     assert str(tmp_path) not in repr(request)
@@ -91,6 +92,12 @@ def test_request_defaults_are_foreground_local_linux_kvm_without_cloud_spec(tmp_
         {"root_size_bytes": True},
         {"root_size_bytes": 1024},
         {"root_size_bytes": 64 * 1024**2 + 1},
+        {"root_retention": "archive"},
+        {"root_retention": 1},
+        {"root_retention": []},
+        {"root_volume_id": "not-a-uuid", "root_retention": "retain"},
+        {"root_volume_id": "49BD618F-1A3E-4CD8-B436-58C194EFD791", "root_retention": "retain"},
+        {"root_volume_id": "49bd618f-1a3e-4cd8-b436-58c194efd791"},
     ],
 )
 def test_request_rejects_unsupported_or_mutable_policy(tmp_path, changes):
@@ -108,6 +115,16 @@ def test_resolver_canonicalizes_existing_symlink_without_selecting_image(tmp_pat
     assert request.source == source.resolve()
     assert request.detached
     assert request.manifest_digest is None
+
+
+def test_resolver_preserves_explicit_retained_root_reuse_policy(tmp_path):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    volume_id = "49bd618f-1a3e-4cd8-b436-58c194efd791"
+    request = intake.resolve_local_oci_run_request(
+        source, name="demo", root_retention="retain", root_volume_id=volume_id
+    )
+    assert request.root_retention == "retain" and request.root_volume_id == volume_id
 
 
 def test_resolver_refuses_missing_or_non_path_source(tmp_path):

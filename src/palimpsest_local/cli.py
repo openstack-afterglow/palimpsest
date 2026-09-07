@@ -35,6 +35,7 @@ from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
 from .oci_materializer import materialize_image_hard
 from .oci_packer import discover_squashfs_toolchain
+from .oci_run_cleanup import OCIRunRemovalResult
 from .oci_run_request import resolve_local_oci_run_request
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
 from .oci_store import OCIStore
@@ -771,6 +772,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runtime-kind", choices=("cloud-image", "oci-root"))
     run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
     run.add_argument("--manifest", help="pin the root descriptor of a local OCI image")
+    run.add_argument(
+        "--root-retention",
+        choices=("delete", "retain"),
+        default=None,
+        help="OCI writable-root removal policy (default: delete)",
+    )
+    run.add_argument("--root-volume", help="reuse an explicitly retained OCI writable-root UUID")
 
     compose = commands.add_parser("compose")
     compose.add_argument("-f", "--file", dest="project_file", type=Path)
@@ -2092,6 +2100,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 detached=args.detach,
                 memory_mib=args.memory,
                 vcpus=args.vcpus,
+                root_retention=args.root_retention or "delete",
+                root_volume_id=args.root_volume,
             )
             result = runtime_dispatch.run_local_oci(request, roots=roots)
             if args.detach:
@@ -2102,8 +2112,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
             if result.session is None:
                 raise PalimpsestError("OCI-root foreground launch is missing its process session")
             return _run_process_session(result.session, interactive=False)
-        if getattr(args, "detach", False) or getattr(args, "manifest", None) is not None:
-            raise PalimpsestError("--detach and --manifest are supported only for local OCI-root runs")
+        if (
+            getattr(args, "detach", False)
+            or getattr(args, "manifest", None) is not None
+            or getattr(args, "root_retention", None) is not None
+            or getattr(args, "root_volume", None) is not None
+        ):
+            raise PalimpsestError(
+                "--detach, --manifest, --root-retention and --root-volume are supported only for local OCI-root runs"
+            )
         network = args.network if args.network is not None else "default"
         stack = _resolve_runtime_stack(
             store,
@@ -2202,8 +2219,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(f"stopped {args.name}")
 
     elif op == "rm":
-        runtime_dispatch.rm(args.name, roots=roots, volumes=args.volumes)
+        removal = runtime_dispatch.rm(args.name, roots=roots, volumes=args.volumes)
         print(f"removed {args.name}")
+        if isinstance(removal, OCIRunRemovalResult) and removal.retention_policy == "retain":
+            print(f"retained root\t{removal.root_volume_id}")
 
     elif op == "commit":
         result = runtime_dispatch.commit(args.name, args.tag, roots=roots)

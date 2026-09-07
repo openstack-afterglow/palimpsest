@@ -73,6 +73,7 @@ def test_public_local_run_foreground_or_detached(tmp_path, monkeypatch, capsys, 
     request = seen[0]
     assert isinstance(request, LocalOCIRunRequest)
     assert request.detached is detached and request.network is None
+    assert request.root_retention == "delete" and request.root_volume_id is None
     assert request.source == source.resolve()
     assert capsys.readouterr().out == ("demo\n" if detached else "literal console output\n")
 
@@ -90,6 +91,48 @@ def test_root_manifest_pin_is_canonicalized_for_local_intake(tmp_path, monkeypat
     )
     assert cli.main(["run", str(source), "--name", "demo", "--manifest", "A" * 64, "-d"]) == 0
     assert seen[0].manifest_digest == "sha256:" + "a" * 64
+
+
+def test_public_run_threads_explicit_retained_root_policy(tmp_path, monkeypatch):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    volume_id = "49bd618f-1a3e-4cd8-b436-58c194efd791"
+    seen = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **_kwargs: (
+            seen.append(request) or SimpleNamespace(record=SimpleNamespace(name="demo"), terminal=None, session=None)
+        ),
+    )
+    assert (
+        cli.main(["run", str(source), "--name", "demo", "--root-retention", "retain", "--root-volume", volume_id, "-d"])
+        == 0
+    )
+    assert seen[0].root_retention == "retain" and seen[0].root_volume_id == volume_id
+
+
+def test_public_run_rejects_root_volume_without_retain_before_adapter(tmp_path, monkeypatch):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    monkeypatch.setattr(runtime_dispatch, "run_local_oci", lambda *_a, **_k: pytest.fail("adapter entered"))
+    assert (
+        cli.main(["run", str(source), "--name", "demo", "--root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"]) == 1
+    )
+
+
+def test_successful_retained_rm_discloses_only_exact_root_uuid(monkeypatch, capsys):
+    from palimpsest_local.oci_run_cleanup import OCIRunRemovalResult
+
+    result = OCIRunRemovalResult(
+        "demo",
+        "00000000-0000-4000-8000-000000000000",
+        "49bd618f-1a3e-4cd8-b436-58c194efd791",
+        "retain",
+    )
+    monkeypatch.setattr(runtime_dispatch, "rm", lambda *_a, **_k: result)
+    assert cli.main(["rm", "demo"]) == 0
+    assert capsys.readouterr().out == "removed demo\nretained root\t49bd618f-1a3e-4cd8-b436-58c194efd791\n"
 
 
 @pytest.mark.parametrize(
@@ -120,7 +163,15 @@ def test_detached_early_exit_is_not_reported_as_running(tmp_path, monkeypatch, c
     assert "exited before detached" in captured.err
 
 
-@pytest.mark.parametrize("flags", [["-d"], ["--manifest", "a" * 64]])
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["-d"],
+        ["--manifest", "a" * 64],
+        ["--root-retention", "retain"],
+        ["--root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"],
+    ],
+)
 def test_cloud_run_does_not_adopt_new_oci_flags(monkeypatch, flags):
     monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *a, **k: pytest.fail("cloud resolution entered"))
     assert cli.main(["run", "cloud:latest", "--name", "demo", *flags]) == 1

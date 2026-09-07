@@ -2156,3 +2156,29 @@ The public recorded-exec native qualification blocker is resolved. No new full
 Gate 2, image-build matrix, output replay or cross-client authority recovery is
 claimed. Dedicated worker accounting, public retained-root reuse and shared
 multi-VM data volumes remain separate follow-ups, not implemented by this step.
+
+### Failed-run remediation and public root retention continuation
+
+On the user's next remediation request, the only remaining libvirt domain was
+the shut-off VM from the virsh parsing assertion above, not a failed guest boot.
+At exact server SHA `7222b1b529f933a2ea1b7b5d978de6139e317842`, its sparse
+4 GiB root, runtime/record files and domain XML were privately archived before
+normal removal. The archive occupies about 85 MiB; archived root/record hashes
+matched the original, and archive/XML checksums were rechecked after removal.
+Socket files are excluded: this preserves recovery material, not a qualified
+automatic boot or authenticated monitor restore. Never publish the archive.
+
+Independent review required an exact imported-checkout check. Its first attempt
+stopped before mutation because the server checkout is a symlink; comparing
+both canonical paths resolved that precheck and received separate approval.
+The supported public `rm` then removed the exact domain, run tree and saved
+delete-policy root. Full name/UUID inventories were empty. No forced cleanup,
+fabricated lifecycle or unrelated workload stop was used. Old pre-VM failure
+logs, standalone completion records and the original image remain unchanged.
+The coarse older resource failure still has no proven exact resource cause.
+
+Local operational evidence: `/tmp/palimpsest-g44.exaZtB/cleanup-evidence.md` and
+`removal-canonical.log` alongside it. Server private backup:
+`/home/pieroot/palimpsest-kvm-evidence/failed-vm-5376e48a.G83wDb`.
+Public retention/reuse implementation and its separate native qualification
+are the next bounded slice; no new full Gate 2 or image build is implied.

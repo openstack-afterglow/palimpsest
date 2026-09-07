@@ -12,6 +12,7 @@ import pytest
 import test_oci_store as fixtures
 
 from palimpsest_local import oci_run_adapter as adapter
+from palimpsest_local import oci_run_cleanup as cleanup
 from palimpsest_local import state
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_host import OCIHostConfig
@@ -108,7 +109,11 @@ def case(tmp_path, monkeypatch):
 
     def prepare(reservation, receipt, store, **kwargs):
         value.calls.append("prepare")
-        assert kwargs == {"root_volume_size_bytes": request.root_size_bytes, "retention_policy": "delete"}
+        assert kwargs == {
+            "root_volume_size_bytes": request.root_size_bytes,
+            "retained_volume_id": request.root_volume_id,
+            "retention_policy": request.root_retention,
+        }
         value.prepared = fixtures.prepare_oci_root_run(
             reservation, receipt, store, runner=fixtures._RootVolumeTools(), **kwargs
         )
@@ -251,6 +256,27 @@ def test_readonly_admission_failure_does_not_initialize_or_reserve(case, monkeyp
     assert "connect" not in case.calls and "init" not in case.calls
 
 
+def test_launch_threads_explicit_retained_root_claim_to_existing_preparer(case, monkeypatch):
+    volume_id = "49bd618f-1a3e-4cd8-b436-58c194efd791"
+    case.request = replace(case.request, root_retention="retain", root_volume_id=volume_id)
+    captured = []
+
+    def prepare(reservation, receipt, store, **kwargs):
+        captured.append(kwargs)
+        raise StateError("captured retained root policy")
+
+    monkeypatch.setattr(adapter, "prepare_oci_root_run", prepare)
+    with pytest.raises(StateError, match="captured retained root policy"):
+        launch(case)
+    assert captured == [
+        {
+            "root_volume_size_bytes": case.request.root_size_bytes,
+            "retained_volume_id": volume_id,
+            "retention_policy": "retain",
+        }
+    ]
+
+
 def test_non_system_libvirt_profile_is_rejected_before_state_mutation(case):
     case.profile.uri = "qemu:///session"
     with pytest.raises(StateError, match="qualified system"):
@@ -325,15 +351,45 @@ def test_rm_uses_existing_binding_and_always_closes_its_connection(case, monkeyp
         case.calls.append("remove")
         if fail:
             raise StateError("removal refused")
-        return "removed"
+        return cleanup.OCIRunRemovalResult(
+            case.request.name,
+            case.binding.record.run_id,
+            case.prepared.transaction.volume_id,
+            case.prepared.transaction.retention_policy,
+        )
 
     monkeypatch.setattr(adapter, "remove_oci_run", remove)
     if fail:
         with pytest.raises(StateError, match="refused"):
             adapter.rm_oci_run(case.roots, case.request.name, expected_record=case.record)
     else:
-        assert adapter.rm_oci_run(case.roots, case.request.name, expected_record=case.record) == "removed"
+        result = adapter.rm_oci_run(case.roots, case.request.name, expected_record=case.record)
+        assert result.name == case.request.name and result.run_id == case.binding.record.run_id
     assert case.calls == ["connect", "remove", "close"]
+
+
+@pytest.mark.parametrize("mutation", ["type", "name", "run-id", "volume-id", "policy"])
+def test_rm_rejects_unbound_or_malformed_completion_receipt(case, monkeypatch, mutation):
+    launch(case)
+    monkeypatch.setattr(adapter, "load_oci_run_binding", lambda *_: case.binding)
+    values = {
+        "name": case.request.name,
+        "run_id": case.binding.record.run_id,
+        "root_volume_id": case.prepared.transaction.volume_id,
+        "retention_policy": "retain",
+    }
+    if mutation == "type":
+        result = "removed"
+    else:
+        field = {"run-id": "run_id", "volume-id": "root_volume_id", "policy": "retention_policy"}.get(
+            mutation, mutation
+        )
+        values[field] = "other" if mutation == "name" else "not-valid"
+        result = cleanup.OCIRunRemovalResult(**values)
+    monkeypatch.setattr(adapter, "remove_oci_run", lambda *_a, **_k: result)
+    with pytest.raises(StateError, match="invalid completion receipt"):
+        adapter.rm_oci_run(case.roots, case.request.name, expected_record=case.record)
+    assert case.calls[-1] == "close"
 
 
 @pytest.mark.parametrize("first", [signal.SIGINT, signal.SIGTERM])

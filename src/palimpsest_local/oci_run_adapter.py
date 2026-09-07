@@ -35,7 +35,7 @@ from .oci_root_runtime import (
     define_committed_oci_root_domain,
     prepare_oci_root_monitor_binding,
 )
-from .oci_run_cleanup import load_oci_run_binding, remove_oci_run
+from .oci_run_cleanup import OCIRunRemovalResult, load_oci_run_binding, remove_oci_run
 from .oci_run_request import LocalOCIRunRequest, materialize_local_oci_run
 from .oci_runtime_access import grant_oci_runtime_access
 from .oci_shared_traversal import join_oci_shared_traversal
@@ -109,7 +109,8 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                     selected.receipt,
                     store,
                     root_volume_size_bytes=request.root_size_bytes,
-                    retention_policy="delete",
+                    retained_volume_id=request.root_volume_id,
+                    retention_policy=request.root_retention,
                 )
             publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
             boot = load_oci_boot_exports(roots, request.name)
@@ -207,6 +208,20 @@ def rm_oci_run(roots, name, *, expected_record=None):
     binding = _existing(roots, name, expected_record)
     conn = connect_oci_root_libvirt(binding.libvirt_uri)
     try:
-        return remove_oci_run(roots, binding, OCIStore(roots), conn=conn, timeout=10)
+        result = remove_oci_run(roots, binding, OCIStore(roots), conn=conn, timeout=10)
+        if (
+            type(result) is not OCIRunRemovalResult
+            or result.name != binding.record.name
+            or result.run_id != binding.record.run_id
+            or result.retention_policy not in {"delete", "retain"}
+        ):
+            raise StateError("OCI removal returned an invalid completion receipt")
+        try:
+            parsed_volume_id = uuid.UUID(result.root_volume_id)
+        except (AttributeError, TypeError, ValueError):
+            raise StateError("OCI removal returned an invalid completion receipt") from None
+        if str(parsed_volume_id) != result.root_volume_id:
+            raise StateError("OCI removal returned an invalid completion receipt")
+        return result
     finally:
         conn.close()

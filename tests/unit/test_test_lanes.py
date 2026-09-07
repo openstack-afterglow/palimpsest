@@ -48,6 +48,15 @@ def test_exec_record_integration_and_native_proof_have_exact_separate_owners():
     assert live not in lanes.commands(("full",))[0]
 
 
+def test_retained_root_public_proof_is_native_only_and_explicitly_opted_in():
+    live = "tests/kvm/test_oci_retained_root_cli_live.py"
+    assert live in lanes.selectors("native-live")
+    assert all(live not in lanes.selectors(lane) for lane in lanes.LANES if lane != "native-live")
+    selection = lanes.select_changed((live,))
+    assert selection.lanes == () and selection.suggested == ("native-live",)
+    assert "PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1" in lanes.SPECIAL_NOTES["native-live"]
+
+
 @pytest.fixture
 def tiny_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(lanes, "PORTABLE_FILES", {"small": ("tests/test_small.py",)})

@@ -59,6 +59,23 @@ palimpsest stop app
 palimpsest rm app
 ```
 
+To retain and later reuse one VM-exclusive writable upper root:
+
+```sh
+palimpsest run app.oci.tar --name first -d --root-retention retain
+palimpsest stop first
+palimpsest rm first  # capture: retained root<TAB><canonical UUID>
+palimpsest run app.oci.tar --name second -d --root-retention retain --root-volume UUID
+```
+
+An explicitly retained removal reports `retained root<TAB><canonical UUID>`
+only after verified cleanup completes. A later run may request that exclusive
+OverlayFS upper root with the same lower image graph and size using `--root-retention retain
+--root-volume UUID`; private checks reject conflicting, attached or mismatched
+roots. This is not a shared writable data volume. Generic OCI `inspect` remains
+closed, and native public reuse qualification is still required before claiming
+this surface as host-proven.
+
 Set the five host variables before `run`. Existing parent paths are not adopted
 or chmodded. Local layouts require `--runtime-kind oci-root`; `.oci.tar`/`.oci`
 files select OCI automatically. `--manifest sha256:…` selects an explicit root
@@ -76,8 +93,8 @@ not reported as a live detached service. Closing a reader alone only detaches.
 
 Normal `rm` verifies terminal completion, inactive exact domain and stale
 monitor ownership before revoking access and releasing leases/root resources.
-The default root is VM-exclusive and deleted with normal removal. The existing
-retained-root API remains; public retention/reboot UX is deferred. Failed
+The default root is VM-exclusive and deleted with normal removal. Explicit
+retention and reuse preserve that exclusivity; shared-root UX remains deferred. Failed
 pre-activation grants or ambiguous/stale terminal socket state are preserved
 and may require recovery beyond normal `rm`; never manufacture terminal proof
 or delete a guessed VM to make a failure appear clean.
