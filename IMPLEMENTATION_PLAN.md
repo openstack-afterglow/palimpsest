@@ -2059,7 +2059,7 @@ and result takeover out of scope until separately designed and authorized.
 Public retained-root boot/reuse and shared multi-VM data volumes remain separate
 follow-ups under the existing VM-root ownership contract.
 
-The next approved continuation is a bounded `oci exec-status NAME` observation
+The approved continuation, now completed below, was a bounded `oci exec-status NAME` observation
 and fixed recovery guidance, not result recovery execution. Reuse the original
 monitor's exact binding and status operation; never submit, poll, acknowledge,
 take over or replay another client's command. Missing/stale/unavailable
@@ -2067,3 +2067,13 @@ authority fails closed. See [the contract](docs/oci-additional-exec.md).
 Astra manages scope, independent review and exact-SHA server verification;
 Sol authors implementation and focused tests. Public retained-root and volume
 sharing remain outside this slice.
+
+Completed at `c393a8452e8e0c74473c902843f0ada2d95533d7`: independently reviewed
+`oci exec-status NAME`, strict advisory JSON and fixed guidance, exact authority
+and bounded initial lock acquisition. Local selected tests passed 386; the
+same server selection passed 386, followed by a separate fresh cold public
+exec-status/run/exec/stop/rm proof (21.39 s). See the additional-exec contract
+for logs, retained uncertainty, platform checks and non-additive counts.
+The next recovery step requires a separate contract for retaining or recovering
+an original client's result; this observation feature does not authorize result
+takeover, acknowledgement by another client, discard or automatic replay.

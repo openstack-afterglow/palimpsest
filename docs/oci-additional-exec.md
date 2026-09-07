@@ -77,10 +77,10 @@ result-list, takeover, discard or recovery command. A disconnected client does
 not authorize a fresh client to acknowledge its result. Diagnostics do not
 change the one-command mailbox, authentication, result retention or STOP policy.
 
-## Planned recovery observation: `oci exec-status NAME`
+## Recovery observation: `oci exec-status NAME`
 
-Provide a separate bounded status query without attempting a guest command.
-The proposed `palimpsest.oci-exec-status.v1` JSON contains only `schema`,
+The command provides a separate bounded status query without attempting a guest command.
+The `palimpsest.oci-exec-status.v1` JSON contains only `schema`,
 `state`, `occupied` and fixed `guidance`. Validate the existing monitor status
 shape, including its internal sequence, but do not expose the sequence, token,
 argv, output, process identifiers or a fabricated command result.
@@ -105,12 +105,56 @@ control-lost journal rejected by the existing client must fail closed, not
 produce a guessed successful JSON report. This slice does not add active-exec
 reconnect or offline result recovery, nor widen accepted journal phases.
 
-Verification: focused real journal/ledger/mailbox fixtures and strict CLI
+Verification used focused real journal/ledger/mailbox fixtures and strict CLI
 projection tests, unchanged durable bytes and retained job result across
-repeated status queries, plus an exact pushed-SHA Linux selection. Extend the
-separate cold public exec proof to observe ready/unoccupied before and after
-normal exec. Fault-state coverage uses controlled production fixtures, not
-unrelated process kills or timing-dependent concurrent guest tests.
+repeated status queries, plus an exact pushed-SHA Linux selection. The separate
+cold public exec proof was extended to observe ready/unoccupied before and
+after normal exec and passed. Fault-state coverage uses controlled production
+fixtures, not unrelated process kills or timing-dependent concurrent guest tests.
+
+### Implementation and verification — 2026-09-07
+
+Implementation `c393a8452e8e0c74473c902843f0ada2d95533d7` was independently
+approved, pushed and tested at the exact SHA on `pieroot-server`. Astra owned
+planning, review and verification; GPT 5.6 Sol authored the code and tests.
+
+Independent review found an unbounded initial run-lock wait in the reused
+binding loader. The observer now reads the canonical journal's binding and
+endpoint within one explicit five-second run-lock scope, then releases it
+before constructing the pinned client. Existing helper defaults and exec
+semantics remain unchanged. A real spawned process holding the run lock
+verifies bounded refusal, no IPC, closed descriptors and unchanged evidence.
+
+- Final local selection: 386 passed (8.79 s), with Ruff, format and lane checks
+  passing. This includes 43 observer tests, real mailbox queued/running/
+  completed-unacknowledged retention, canonical authority failures and strict
+  CLI projection. Earlier overlapping selections are not additional coverage.
+  A temporary guidance-text expectation failure was corrected before approval.
+- Actual macOS CLI: typed unsupported-host error, no success JSON and no missing
+  state/config directories created. Local native collection skipped one test
+  because the required Linux/KVM opt-in and image were unavailable; that skip
+  did not qualify the native path.
+- Exact-SHA Linux selection: the same nine files, 386 passed (76.71 s), including
+  the real process lock-contention regression.
+- Separate fresh cold public CLI proof: 1 passed (21.39 s). `exec-status` returned
+  exact ready/unoccupied advisory JSON before and after additional commands.
+  `run -d`, literal argv, split streams, exit/missing-command behavior, current
+  root evidence, direct PID 1 root denial and stop/rm all passed. Domain/run
+  removal and unchanged source archive SHA-256 were verified.
+
+The successful runtime `/tmp/p-execcli-593b6ebd` was removed by identity-checked
+test cleanup. The old failed runtime `/tmp/p-execcli-0b710ea6` and original
+archive were preserved. Source SHA-256 remains
+`862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+Server logs are `/tmp/palimpsest-g38-server-selected-c393a8452e8e0c74473c902843f0ada2d95533d7.log`
+and `/tmp/palimpsest-g38-public-exec-c393a8452e8e0c74473c902843f0ada2d95533d7.log`.
+Local logs and independent reviews are in `/tmp/palimpsest-g38.4zZBRg`.
+
+Occupied/control-lost and unavailable-authority behavior is covered by
+controlled production fixtures, not a claim of live monitor failure/reconnect.
+No result takeover/replay, offline result recovery, guest or resource-limit
+change was added. The guest and builder were unchanged; no image rebuild,
+full guest boot matrix or new full Gate 2 run is claimed by this slice.
 
 ## Host resource diagnostics
 
