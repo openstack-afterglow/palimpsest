@@ -2078,10 +2078,16 @@ The next recovery step requires a separate contract for retaining or recovering
 an original client's result; this observation feature does not authorize result
 takeover, acknowledgement by another client, discard or automatic replay.
 
-The current continuation concretizes a first result-preservation slice:
+Completed the first result-preservation slice at `36173fa4d9c9f00c5e1cb9faab0d91c9ac6537fa`:
 process-local immutable completion facts in the original OCI exec session,
 separate from confirmed/unconfirmed ACK delivery. No disk persistence or new
 recovery authority is introduced. See [the contract](docs/oci-exec-result-observation.md).
-Astra owns scope/review/verification; Sol implements the original-session API
-and focused fault tests. Preserve normal ProcessStatusEvent/wait/CLI failure
-semantics, existing ACK retries, PID 1 protection and resource limits.
+Astra managed scope/review/verification; Sol implemented the original-session API
+and focused fault tests. Normal ProcessStatusEvent/wait/CLI failure semantics,
+existing ACK retries, PID 1 protection and resource limits remain unchanged.
+Independent review approved; local and exact-SHA server selections each passed
+398 tests. A separate fresh cold public run-d/exec-status/exec/root-proof/stop/rm
+proof passed in 21.43 s. ACK uncertainty was verified with controlled injection,
+not a live dropped-reply test. See the contract for evidence and limitations.
+Next: a separate original-client durable retention/recovery contract; no disk
+persistence, cross-client result authority or automatic replay is implemented.

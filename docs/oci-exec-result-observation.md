@@ -55,13 +55,47 @@ are unchanged.
 
 ## Verification and later decisions
 
-Focused tests must distinguish failures before/after actual mailbox ACK,
+Focused tests distinguish failures before/after actual mailbox ACK,
 malformed ACK responses, paused/chunked output, invalid terminal evidence,
 non-success reasons, immutable metadata, same-process close versus fork,
 interrupt propagation, real pinned-client binding/descriptor cleanup and
 nonzero CLI error presentation. A fresh exact-SHA server public cold exec proof
-checks unchanged normal run/exec/stop/rm behavior. Injected ACK uncertainty is
+checked unchanged normal run/exec/stop/rm behavior. Injected ACK uncertainty is
 not a claim of a live dropped-reply or reconnect proof.
+
+### Completed qualification — 2026-09-07
+
+Implementation: `36173fa4d9c9f00c5e1cb9faab0d91c9ac6537fa`. Sol authored
+source/tests; Astra managed the contract and verification, with a separate
+read-only Astra approval before commit and push.
+
+- Local final nine-file selection: 398 passed in 7.87 s. Exact pushed-SHA
+  Linux selection: 398 passed in 75.21 s. Author 126 and reviewer 107 focused
+  passes overlap with these selections and are not additive suite coverage.
+- Repository Ruff lint, changed-file formatting, lane classification and diff
+  checks passed. A repository-wide format check reported nine unrelated,
+  unchanged files needing formatting; those files were not modified.
+- Fresh public cold exec proof: 1 passed in 21.43 s, including detached launch,
+  exec-status before/after, literal argv, separate stdout/stderr, exit 17,
+  missing-command exit 127, app root and same-boot authenticated root evidence,
+  PID 1 direct-access denial, stop/rm and source-image preservation.
+- The source archive SHA-256 remained
+  `862d4b9365f30e35a12ca48263223e4dfa11d00abb3ca68a428848e99e348458`.
+  Successful test cleanup removed its VM/run; the domain list was empty.
+  The old failed runtime evidence remains preserved. Its original resource
+  failure's exact cause is still unknown.
+
+Local evidence: `/tmp/palimpsest-g39.QUsDEE/local-selected.log`,
+`lane-check.log`, `sol-result.txt` and `review-result.txt` in the same directory.
+Server evidence:
+`/tmp/palimpsest-g39-server-selected-36173fa4d9c9f00c5e1cb9faab0d91c9ac6537fa.log`
+and `/tmp/palimpsest-g39-public-exec-36173fa4d9c9f00c5e1cb9faab0d91c9ac6537fa.log`.
+The successful cold runtime was `/tmp/p-execcli-b8f0b60b`; preserved historical
+failure evidence includes `/tmp/p-execcli-0b710ea6/launch.stderr`.
+
+Guest and builder were unchanged, so no new image build, complete guest boot
+matrix or full Gate 2 was run. The native proof covers normal ACK behavior;
+lost-ACK, interrupt and binding failures were controlled test injections.
 
 Disk retention, output-content storage and post-restart recovery require a
 separate contract covering ownership, secret exposure, retention/deletion,
