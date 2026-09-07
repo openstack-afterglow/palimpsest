@@ -102,3 +102,8 @@ separate contract covering ownership, secret exposure, retention/deletion,
 atomic persistence relative to ACK, and continuity of original-client authority.
 They are not implied by this in-memory observation slice. Result takeover by a
 different client, result discard and automatic replay remain out of scope.
+
+The follow-up [durable record contract](oci-exec-durable-record.md) now defines
+an opt-in metadata-only design and implementation/test slices. It does not yet
+add disk persistence to this shipped process-local API or recover authority
+after process death; the future reader would inspect local historical claims.

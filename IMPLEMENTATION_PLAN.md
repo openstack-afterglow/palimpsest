@@ -2089,5 +2089,11 @@ Independent review approved; local and exact-SHA server selections each passed
 398 tests. A separate fresh cold public run-d/exec-status/exec/root-proof/stop/rm
 proof passed in 21.43 s. ACK uncertainty was verified with controlled injection,
 not a live dropped-reply test. See the contract for evidence and limitations.
-Next: a separate original-client durable retention/recovery contract; no disk
-persistence, cross-client result authority or automatic replay is implemented.
+The next-step [durable record contract](docs/oci-exec-durable-record.md) now
+specifies explicit opt-in metadata storage, before/after-ACK publication,
+conservative crash states and offline inspection without monitor authority.
+This continuation is design only: no disk persistence or new CLI is implemented.
+Next implementation: strict local record storage, OCI-only session barriers and
+offline inspector, followed by independent review and focused exact-SHA server
+verification. Output-content recovery, cross-client result authority and
+automatic replay remain outside this contract.
