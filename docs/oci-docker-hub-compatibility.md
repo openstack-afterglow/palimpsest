@@ -279,6 +279,70 @@ The earlier empty-all-domain failure remains recorded rather than reclassified.
 Original Hub and existing build archive hashes remain unchanged.
 No new application image was built; hello-world and NGINX were not rerun.
 
+### 2026-09-08 preserved Redis privilege-boundary checkpoint (`d9b3593`)
+
+This documentation-only checkpoint uses analysis baseline
+`e5cacb2891d6b5454c91274dfebdaf4ebfe0d676`; the product under observation
+remains unchanged at
+[`d9b3593`](https://github.com/openstack-afterglow/palimpsest/commit/d9b3593774b11e62283a075e7df55838c6f0412a).
+No source, test, setting or image was changed. No test, VM, image build or
+application execution was performed, and this is not a new Gate 2 result.
+
+Main's read-only SSH inspection used `unsquashfs -cat` against the preserved
+current Redis lower layers only; it did not extract or mount them. Layer
+`d37f81ae91d2bb1de4ed0ad644f29339954ce4814d4ea24c327866dcd51185f4`
+contains the original `usr/local/bin/docker-entrypoint.sh`. In the relevant
+default path, when the first argument is `redis-server` and UID is zero, that
+script finds current-directory entries not owned by `redis`, changes their
+ownership, and then uses `/usr/bin/setpriv` to re-exec the original script and
+original arguments as the `redis` UID/GID with supplementary groups cleared.
+This describes the inspected preserved image; the current upstream Redis
+master script uses `gosu` and is not evidence for these image bytes.
+
+The preserved APK records in layers
+`76eb1c41678f89618a08aa5c261ad876aa2827cb4f02bb38920a05b80a0046bf`
+and `bd1c68e5be9fb53e974c3527804a35c69453e5956e9549b5eeef2f732907978f`
+identify `setpriv` as util-linux `2.40.4-r1`. In official util-linux v2.40.4,
+[`setpriv.c`](https://github.com/util-linux/util-linux/blob/v2.40.4/sys-utils/setpriv.c)
+requests `PR_SET_KEEPCAPS(1)` before changing UID, GID and groups and emits the
+same error text observed in the preserved console if that request fails.
+Official Linux v6.6
+[`commoncap.c`](https://github.com/torvalds/linux/blob/v6.6/security/commoncap.c)
+rejects that request when `KEEP_CAPS_LOCKED` is set. Its
+[`securebits.h`](https://github.com/torvalds/linux/blob/v6.6/include/uapi/linux/securebits.h)
+definitions decode the locally verified securebits value 239 (`0xef`) as
+`KEEP_CAPS` off and locked, together with locked `NOROOT`, locked
+`NO_SETUID_FIXUP`, and locked `NO_CAP_AMBIENT_RAISE` settings.
+
+This is a source inference that matches the observed application error, not a
+traced-syscall proof. The package version matches the cited util-linux upstream
+version, but the Alpine patch set and installed binary have not been audited
+for equivalence. The citations use Linux v6.6 semantics; they do not claim
+that the unavailable exact v6.6.71 source was verified.
+
+Local source inspection independently confirms empty capability sets, locked
+`NOROOT`, and `no_new_privs`; its seccomp filter does not directly deny
+`prctl`. Unlocking `KEEP_CAPS` alone would neither supply `CAP_SETUID` or
+`CAP_SETGID` nor authorize an arbitrary supplementary-group transition, so
+that policy relaxation is not a compatibility fix and would weaken the
+deliberate boundary. The existing public OCI `run` contract has no `--user`
+override.
+
+The preferred next decision is whether to separately approve an explicit,
+bound effective-user override. Such a contract could let trusted stage-1
+demote before exec while retaining the existing capability protections and
+unchanged source-image bytes. It would still change process identity and its
+binding, and Redis data paths could require compatible ownership or
+permissions. It is not implemented, approved or validated, does not guarantee
+service readiness, and can never convert the original-default Redis result
+into a compatibility pass. Granting workload capabilities is not recommended.
+
+The original default remains **FAILED**: Redis readiness, subsequent service
+exec/root/PID 1 comparisons and Gate 2 qualification did not pass. The system
+libvirt inventory shows the preserved Redis definition shut off; the empty
+read-only session-libvirt inventory is not system inventory. The failed
+definition, lower layers and earlier historical evidence remain preserved.
+
 ## Next public intake contract
 
 The approved proc-only mode correction is implemented and passed the original
