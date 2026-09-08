@@ -71,6 +71,18 @@ palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
 
 ## 1. Artifact Management (`image`, `layer`, `bundle`)
 
+For a qualified Linux KVM host and an existing local OCI archive, an explicit
+launch user is available without changing the image:
+
+```sh
+palimpsest run ./redis.oci.tar --name redis-demo --user redis -d
+```
+
+`--user USER[:GROUP]` applies only to OCI-root runs. Omit it to keep the image
+user. It grants no capabilities, does not repair file ownership and does not
+enable direct registry-reference intake. Read the
+[identity contract and compatibility limits](oci-run-user.md) before use.
+
 ### Managing Boot Images (`image`)
 
 Boot images are bootable `qcow2` or `raw` cloud images used as immutable base disks (`vda`).

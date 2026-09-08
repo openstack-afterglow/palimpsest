@@ -10,9 +10,15 @@ from typing import Any
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
-from .oci_boot_plan import OCIBootPlanIntent, PreparedOCIBootPlan, prepare_oci_boot_plan
+from .oci_boot_plan import (
+    OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
+    OCI_ROOT_BOOT_PLAN_SCHEMA,
+    OCIBootPlanIntent,
+    PreparedOCIBootPlan,
+    prepare_oci_boot_plan,
+)
 from .oci_materializer import OCIImageMaterializationReceipt
-from .oci_process import OCIProcessSpec
+from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_volume import (
     ClaimedOCIRootVolume,
@@ -72,6 +78,7 @@ _BOOT_PLAN_FIELDS = frozenset(
         "writable_root_policy",
     }
 )
+_OVERRIDE_BOOT_PLAN_FIELDS = _BOOT_PLAN_FIELDS | {"process_provenance"}
 _LOWER_GRAPH_FIELDS = frozenset(
     {
         "config_descriptor",
@@ -131,7 +138,16 @@ class OCIRootPreparationTransaction:
         if not isinstance(plan, dict):
             raise StateError("OCI-root preparation boot plan is invalid")
         plan_digest = _canonical_digest(self.boot_plan_digest, "OCI-root preparation plan digest is invalid")
-        if set(plan) != _BOOT_PLAN_FIELDS:
+        schema = plan.get("schema")
+        if not isinstance(schema, str) or schema not in {
+            OCI_ROOT_BOOT_PLAN_SCHEMA,
+            OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
+        }:
+            raise StateError("OCI-root preparation boot plan schema is invalid")
+        expected_fields = (
+            _OVERRIDE_BOOT_PLAN_FIELDS if schema == OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA else _BOOT_PLAN_FIELDS
+        )
+        if set(plan) != expected_fields:
             raise StateError("OCI-root preparation boot plan fields are invalid")
         actual = _json_digest(plan, "OCI-root preparation boot plan is invalid")
         if actual != plan_digest:
@@ -144,12 +160,24 @@ class OCIRootPreparationTransaction:
         actual_graph = _json_digest(graph, "OCI-root preparation lower graph is invalid")
         if actual_graph != lower_graph or plan.get("lower_graph_digest") != lower_graph:
             raise StateError("OCI-root preparation lower graph binding is invalid")
-        if plan.get("schema") != "palimpsest.oci-root-boot-plan.v2":
-            raise StateError("OCI-root preparation boot plan schema is invalid")
         try:
-            OCIProcessSpec.from_dict(plan.get("process")).require_bootable()
+            process = OCIProcessSpec.from_dict(plan.get("process"))
+            process.require_bootable()
         except (ArtifactValidationError, TypeError, ValueError):
             raise StateError("OCI-root preparation process contract is invalid") from None
+        if schema == OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA:
+            provenance = plan.get("process_provenance")
+            if not isinstance(provenance, Mapping) or set(provenance) != {"image_process", "user_override"}:
+                raise StateError("OCI-root preparation process provenance is invalid")
+            try:
+                image_process = OCIProcessSpec.from_dict(provenance.get("image_process"))
+                image_process.require_bootable()
+                user_override = OCIUserSpec.from_dict(provenance.get("user_override"))
+                effective_process = image_process.with_user(user_override)
+            except (ArtifactValidationError, TypeError, ValueError):
+                raise StateError("OCI-root preparation process provenance is invalid") from None
+            if process != effective_process:
+                raise StateError("OCI-root preparation effective process binding is invalid")
         if (
             plan.get("phase") != "lower-reserved"
             or plan.get("retention") != "durable-lease-set"
@@ -358,6 +386,7 @@ def prepare_oci_root_run(
     root_volume_size_bytes: int,
     retained_volume_id: str | None = None,
     retention_policy: str = "delete",
+    user_override: OCIUserSpec | None = None,
     runner: CommandRunner = _default_runner,
 ) -> PreparedOCIRootRun:
     """Durably prepare immutable lowers and one exclusive writable root."""
@@ -365,7 +394,7 @@ def prepare_oci_root_run(
     if not isinstance(store, OCIStore):
         raise StateError("OCI-root preparation store is invalid")
     size_bytes = _validate_size(root_volume_size_bytes)
-    intent = OCIBootPlanIntent(owner.run_id, owner.run_name, materialization)
+    intent = OCIBootPlanIntent(owner.run_id, owner.run_name, materialization, user_override)
     store.validate_receipt_occurrences(intent.receipts, intent.occurrences)
     lease_set_id = store.lease_set_id(intent.receipts, owner, plan_digest=intent.digest)
     rollback_action = "retain" if retained_volume_id is not None else "delete"
@@ -401,6 +430,7 @@ def prepare_oci_root_run(
             run_id=owner.run_id,
             run_name=owner.run_name,
             store=store,
+            user_override=user_override,
         )
         claimed = claim_oci_root_volume(
             reservation.roots,

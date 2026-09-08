@@ -65,7 +65,10 @@ def test_docker_hub_proof_has_portable_contract_and_native_only_execution():
     assert all(live not in lanes.selectors(lane) for lane in lanes.LANES if lane != "native-live")
     selection = lanes.select_changed((live,))
     assert selection.lanes == () and selection.suggested == ("native-live",)
-    assert "PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,NGINX}_LIVE=1" in lanes.SPECIAL_NOTES["native-live"]
+    native_note = lanes.SPECIAL_NOTES["native-live"]
+    assert "PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,REDIS_USER,NGINX}_LIVE=1" in native_note
+    assert "REDIS_USER is the separate explicit --user redis proof" in native_note
+    assert "REDIS remains the unchanged default-process compatibility proof" in native_note
 
 
 def test_real_packer_component_tests_are_native_only():

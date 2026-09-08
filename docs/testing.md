@@ -110,6 +110,37 @@ partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification
 
+### Explicit OCI run user
+
+The optional `run --user USER[:GROUP]` has a focused host-contract loop:
+
+```sh
+uv run pytest -q tests/unit/test_oci_process.py tests/unit/test_oci_run_request.py \
+  tests/unit/test_oci_public_cli.py tests/unit/test_oci_run_adapter.py \
+  tests/unit/test_oci_docker_hub_cli_live_contract.py
+uv run pytest -q tests/unit/test_oci_store.py \
+  -k 'boot_plan or oci_root_prepare or user_override or override_preparation or oci_root_domain'
+```
+
+The separately selected real-image node is
+`tests/kvm/test_oci_docker_hub_cli_live.py::test_docker_hub_redis_detached_explicit_user_and_public_exec`.
+It requires `PALIMPSEST_OCI_DOCKER_HUB_REDIS_USER_LIVE=1`, plus
+`PALIMPSEST_OCI_DOCKER_HUB_REDIS_USER_IMAGE` (absolute local archive),
+`PALIMPSEST_OCI_DOCKER_HUB_REDIS_USER_ARCHIVE_SHA256` and
+`PALIMPSEST_OCI_DOCKER_HUB_REDIS_USER_MANIFEST_SHA256` (canonical `sha256:` pins),
+and the existing five host BOOT/packer settings. It is independent of the
+original `REDIS` opt-in and explicitly uses `--user redis` with the original
+entrypoint/arguments. Neither test substitutes for the other.
+
+Use one fresh 512 MiB / one-vCPU, network-none VM. Preserve all failed runtimes
+and previously retained domains/disks. A separate unchanged-image cold public
+exec proof checks the default launch contract at the same pushed SHA; its
+existing defaults are 4 GiB / two vCPUs. Execute sequentially with reviewed
+inventory checks. Guest C/ELF are unchanged by the host-only user override;
+this does not itself require the whole guest boot matrix or qualify Gate 2.
+
+### Other focused paths
+
 The read-only NPROC diagnostic has a small independent feedback loop:
 
 ```sh

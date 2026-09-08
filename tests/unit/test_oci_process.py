@@ -35,6 +35,50 @@ def test_process_config_preserves_literal_argv_environment_and_identity() -> Non
     assert OCIProcessSpec.from_dict(process.to_dict()) == process
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("redis", OCIUserSpec("redis", None)),
+        ("redis:staff", OCIUserSpec("redis", "staff")),
+        ("1000", OCIUserSpec("1000", None)),
+        ("1000:1001", OCIUserSpec("1000", "1001")),
+        ("1000:staff", OCIUserSpec("1000", "staff")),
+    ],
+)
+def test_explicit_user_override_accepts_canonical_names_and_numbers(value: str, expected: OCIUserSpec) -> None:
+    assert OCIUserSpec.from_override_value(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", ":staff", "redis:", "redis:staff:extra", "01", "1000:01", "-1", "bad user", 1000],
+)
+def test_explicit_user_override_rejects_empty_ambiguous_or_noncanonical_values(value: object) -> None:
+    with pytest.raises(ArtifactValidationError):
+        OCIUserSpec.from_override_value(value)
+
+
+@pytest.mark.parametrize("value", ["9" * 5000, f"redis:{'9' * 5000}"])
+def test_explicit_user_override_rejects_oversized_user_or_group_cleanly(value: str) -> None:
+    with pytest.raises(ArtifactValidationError, match="override is invalid"):
+        OCIUserSpec.from_override_value(value)
+
+
+def test_user_override_changes_only_process_identity() -> None:
+    image = OCIProcessSpec(("/init", "--serve"), (("MODE", "prod"),), "/srv", OCIUserSpec("0", "0"), 12)
+
+    effective = image.with_user(OCIUserSpec("redis", "staff"))
+
+    assert effective.user == OCIUserSpec("redis", "staff")
+    assert (effective.argv, effective.environment, effective.cwd, effective.stop_signal) == (
+        image.argv,
+        image.environment,
+        image.cwd,
+        image.stop_signal,
+    )
+    assert image.user == OCIUserSpec("0", "0")
+
+
 def test_empty_process_is_source_valid_but_not_bootable() -> None:
     process = OCIProcessSpec.from_config(None)
 

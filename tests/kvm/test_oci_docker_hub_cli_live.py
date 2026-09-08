@@ -18,7 +18,10 @@ from pathlib import Path
 
 import pytest
 
+from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
+from palimpsest_local.oci_root_prepare import OCIRootPreparationTransaction
 from palimpsest_local.oci_source import LocalArchiveSource, SourceCAS
+from palimpsest_local.state import read_run_ledger_snapshot, resolve_roots
 
 _PREFIX = "PALIMPSEST_OCI_DOCKER_HUB_"
 _BOOT_KEYS = ("KERNEL", "KERNEL_DIGEST", "KERNEL_CONFIG", "KERNEL_CONFIG_DIGEST", "PACKER")
@@ -316,6 +319,82 @@ def _record_source_hashes(parent: Path, before: str, archive: Path) -> str | Non
         return None
 
 
+def _detached_run_arguments(
+    selection: DockerHubImageSelection,
+    name: str,
+    *,
+    user_override: str | None = None,
+) -> tuple[object, ...]:
+    arguments: tuple[object, ...] = (
+        "run",
+        selection.archive,
+        "--manifest",
+        selection.manifest_digest,
+        "--name",
+        name,
+        "--memory",
+        "512",
+        "--vcpus",
+        "1",
+        "-d",
+    )
+    if user_override is not None:
+        arguments += ("--user", user_override)
+    return arguments
+
+
+def _effective_ledger_process(
+    environment: dict[str, str],
+    name: str,
+    *,
+    image_process: OCIProcessSpec,
+    user_override: str | None,
+) -> OCIProcessSpec:
+    snapshot = read_run_ledger_snapshot(resolve_roots(environment), name)
+    transaction = OCIRootPreparationTransaction.from_dict(snapshot.state.get("oci_root"))
+    assert transaction.owner.run_id == snapshot.record.run_id
+    assert transaction.owner.run_name == snapshot.record.name == name
+    effective_process = OCIProcessSpec.from_dict(transaction.boot_plan["process"])
+    if user_override is None:
+        assert effective_process == image_process
+    else:
+        provenance = transaction.boot_plan["process_provenance"]
+        recorded_image_process = OCIProcessSpec.from_dict(provenance["image_process"])
+        recorded_override = OCIUserSpec.from_dict(provenance["user_override"])
+        assert recorded_image_process == image_process
+        assert recorded_override == OCIUserSpec.from_override_value(user_override)
+        assert effective_process == image_process.with_user(recorded_override)
+    return effective_process
+
+
+def _assert_explicit_user_status(payload: bytes, expected_name: str) -> None:
+    fields: dict[str, str] = {}
+    for line in payload.decode("ascii").splitlines():
+        key, separator, value = line.partition("=")
+        assert separator and key not in fields and key and value
+        fields[key] = value
+    capability_fields = {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"}
+    assert set(fields) == {
+        "user",
+        "uid",
+        "gid",
+        "account_uid",
+        "account_gid",
+        *capability_fields,
+        "NoNewPrivs",
+        "Seccomp",
+    }
+    assert fields["user"] == expected_name
+    uid = int(fields["uid"])
+    gid = int(fields["gid"])
+    assert uid == int(fields["account_uid"]) > 0
+    assert gid == int(fields["account_gid"]) > 0
+    for key in capability_fields:
+        assert re.fullmatch(r"[0-9a-fA-F]{16}", fields[key]) and int(fields[key], 16) == 0
+    assert fields["NoNewPrivs"] == "1"
+    assert fields["Seccomp"] == "2"
+
+
 def test_docker_hub_hello_world_foreground_default_process():
     selection = _selection("HELLO", os.environ)
     parent, environment = _setup(_environment(), "hello")
@@ -362,10 +441,16 @@ def _detached_default_service(
     version_binary: str,
     version_flag: str,
     version_marker: bytes,
+    *,
+    runtime_label: str | None = None,
+    user_override: str | None = None,
+    expected_identity_name: str | None = None,
 ):
+    assert (user_override is None) == (expected_identity_name is None)
     selection = _selection(kind, os.environ)
-    parent, environment = _setup(_environment(), kind.lower())
-    name = "hub-" + kind.lower() + "-" + uuid.uuid4().hex[:8]
+    label = runtime_label or kind.lower()
+    parent, environment = _setup(_environment(), label)
+    name = "hub-" + label + "-" + uuid.uuid4().hex[:8]
     before_hash = _file_sha256(selection.archive)
     try:
         process = _authenticate(selection, parent)
@@ -376,22 +461,22 @@ def _detached_default_service(
             "run",
             _cli(
                 environment,
-                "run",
-                selection.archive,
-                "--manifest",
-                selection.manifest_digest,
-                "--name",
-                name,
-                "--memory",
-                "512",
-                "--vcpus",
-                "1",
-                "-d",
+                *_detached_run_arguments(selection, name, user_override=user_override),
                 timeout=180,
             ),
         )
         _success(launched)
         assert launched.stdout == (name + "\n").encode()
+        if user_override is not None:
+            effective_process = _effective_ledger_process(
+                environment,
+                name,
+                image_process=process,
+                user_override=user_override,
+            )
+            (parent / "effective-process.json").write_text(
+                json.dumps(effective_process.to_dict(), sort_keys=True) + "\n"
+            )
         _wait_console(parent / "state" / "runs" / name / "io" / "console.log", readiness, timeout=45)
         running = _save(parent, "domain", _domain_info(environment, name))
         _success(running)
@@ -405,8 +490,29 @@ def _detached_default_service(
         assert version_marker in version.stdout + version.stderr
         identity = _save(parent, "user", _cli(environment, "exec", name, "--", "/bin/sh", "-c", "id -u", timeout=60))
         _success(identity)
-        if process.user.user.isdecimal():
+        if user_override is None and process.user.user.isdecimal():
             assert identity.stdout == (process.user.user + "\n").encode()
+        if expected_identity_name is not None:
+            explicit_identity = _save(
+                parent,
+                "explicit-user-status",
+                _cli(
+                    environment,
+                    "exec",
+                    name,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "printf 'user=%s\\nuid=%s\\ngid=%s\\naccount_uid=%s\\naccount_gid=%s\\n' "
+                    '"$(id -un)" "$(id -u)" "$(id -g)" "$(id -u redis)" "$(id -g redis)"; '
+                    'while read -r key value; do case "$key" in '
+                    "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:) "
+                    'printf \'%s=%s\\n\' "${key%:}" "$value";; esac; done < /proc/self/status',
+                    timeout=60,
+                ),
+            )
+            _success(explicit_identity)
+            _assert_explicit_user_status(explicit_identity.stdout, expected_identity_name)
         root = _save(
             parent,
             "root",
@@ -463,6 +569,20 @@ def test_docker_hub_redis_detached_default_process_and_public_exec():
     # Redis may expose a real capability-policy incompatibility; do not override its config to pass.
     _detached_default_service(
         "REDIS", b"Ready to accept connections", ("redis-server",), "redis-server", "--version", b"Redis server v="
+    )
+
+
+def test_docker_hub_redis_detached_explicit_user_and_public_exec():
+    _detached_default_service(
+        "REDIS_USER",
+        b"Ready to accept connections",
+        ("redis-server",),
+        "redis-server",
+        "--version",
+        b"Redis server v=",
+        runtime_label="redis-user",
+        user_override="redis",
+        expected_identity_name="redis",
     )
 
 

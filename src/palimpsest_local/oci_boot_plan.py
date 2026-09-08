@@ -8,6 +8,7 @@ from typing import Any
 
 from .errors import ArtifactValidationError
 from .oci_materializer import OCIImageMaterializationReceipt
+from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_store import (
     ArtifactLeaseOwner,
@@ -19,6 +20,7 @@ from .oci_store import (
 )
 
 OCI_ROOT_BOOT_PLAN_SCHEMA = "palimpsest.oci-root-boot-plan.v2"
+OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA = "palimpsest.oci-root-boot-plan.v3"
 OCI_ROOT_LOWER_ROLE = "root-lower"
 
 
@@ -29,6 +31,7 @@ class OCIBootPlanIntent:
     run_id: str
     run_name: str
     materialization: OCIImageMaterializationReceipt
+    user_override: OCIUserSpec | None = None
 
     def __post_init__(self) -> None:
         ArtifactLeaseOwner(self.run_id, self.run_name, OCI_ROOT_LOWER_ROLE)
@@ -38,6 +41,8 @@ class OCIBootPlanIntent:
             self.materialization.process.require_bootable()
         except ArtifactValidationError:
             raise OCIStoreError("oci-boot-plan", "OCI image process is not bootable") from None
+        if self.user_override is not None and not isinstance(self.user_override, OCIUserSpec):
+            raise OCIStoreError("oci-boot-plan", "OCI process user override is invalid")
 
     @property
     def owner(self) -> ArtifactLeaseOwner:
@@ -100,13 +105,18 @@ class OCIBootPlanIntent:
     def lower_graph_digest(self) -> str:
         return f"sha256:{hashlib.sha256(canonical_json_bytes(self.lower_graph_dict())).hexdigest()}"
 
+    @property
+    def process(self) -> OCIProcessSpec:
+        image_process = self.materialization.process
+        return image_process if self.user_override is None else image_process.with_user(self.user_override)
+
     def to_dict(self) -> dict[str, Any]:
         lower_graph = self.lower_graph_dict()
-        return {
+        plan = {
             **lower_graph,
             "lower_graph_digest": self.lower_graph_digest,
             "phase": "lower-reserved",
-            "process": self.materialization.process.to_dict(),
+            "process": self.process.to_dict(),
             "retention": "durable-lease-set",
             "run": {
                 "backend": "kvm",
@@ -117,6 +127,13 @@ class OCIBootPlanIntent:
             "schema": OCI_ROOT_BOOT_PLAN_SCHEMA,
             "writable_root_policy": "vm-specific",
         }
+        if self.user_override is not None:
+            plan["schema"] = OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA
+            plan["process_provenance"] = {
+                "image_process": self.materialization.process.to_dict(),
+                "user_override": self.user_override.to_dict(),
+            }
+        return plan
 
     @property
     def digest(self) -> str:
@@ -164,11 +181,12 @@ def prepare_oci_boot_plan(
     run_id: str,
     run_name: str,
     store: OCIStore,
+    user_override: OCIUserSpec | None = None,
 ) -> PreparedOCIBootPlan:
     """Create or crash-recover the deterministic lower reservation for a run."""
     if not isinstance(store, OCIStore):
         raise OCIStoreError("oci-boot-plan", "boot-plan store is invalid")
-    intent = OCIBootPlanIntent(run_id, run_name, materialization)
+    intent = OCIBootPlanIntent(run_id, run_name, materialization, user_override)
     store.validate_receipt_occurrences(intent.receipts, intent.occurrences)
     lower_leases = store.acquire_lease_set(
         intent.receipts,
@@ -197,6 +215,7 @@ def release_oci_boot_plan(prepared: PreparedOCIBootPlan, store: OCIStore) -> Non
 
 __all__ = [
     "OCI_ROOT_BOOT_PLAN_SCHEMA",
+    "OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA",
     "OCI_ROOT_LOWER_ROLE",
     "OCIBootPlanIntent",
     "PreparedOCIBootPlan",

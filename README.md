@@ -141,6 +141,14 @@ references are not yet accepted directly by OCI-root `run`, and the Docker
 [Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
 digest-preserving local-archive workflow and its real-image verification scope.
 
+OCI-root runs accept an explicit `--user USER[:GROUP]` (name or canonical
+numeric ID), for example `palimpsest run ./redis.oci.tar --name redis-demo
+--user redis -d`. This changes only the launch identity, not the source image,
+entrypoint or arguments. Without the option, the image's configured user is
+unchanged. PID 1 protections and the capabilityless workload policy remain
+enabled; this is not privileged mode or general Docker compatibility. See
+[explicit OCI run users](docs/oci-run-user.md) for the contract and limits.
+
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 
 ```sh

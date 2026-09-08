@@ -30,7 +30,7 @@ def _environment(path: Path, kind: str) -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize("kind", ["HELLO", "REDIS", "NGINX"])
+@pytest.mark.parametrize("kind", ["HELLO", "REDIS", "REDIS_USER", "NGINX"])
 def test_selection_requires_independent_opt_in_and_all_pins(tmp_path, kind):
     with pytest.raises(pytest.skip.Exception):
         proof._selection(kind, {})
@@ -44,7 +44,7 @@ def test_selection_requires_independent_opt_in_and_all_pins(tmp_path, kind):
             proof._selection(kind, incomplete)
 
 
-@pytest.mark.parametrize("kind", ["HELLO", "REDIS", "NGINX"])
+@pytest.mark.parametrize("kind", ["HELLO", "REDIS", "REDIS_USER", "NGINX"])
 def test_selection_accepts_only_absolute_hash_bound_local_archive(tmp_path, kind):
     archive = tmp_path / "image.oci.tar"
     archive.write_bytes(b"unchanged external archive")
@@ -78,6 +78,72 @@ def test_native_proof_uses_public_local_cli_and_never_docker_for_workloads():
     assert '"--manifest",\n                selection.manifest_digest' in source
     assert "LocalArchiveSource(selection.archive, selection.manifest_digest)" in source
     assert "docker pull" not in source and "docker run" not in source and "docker save" not in source
+
+
+def test_redis_user_selection_is_separate_and_default_cannot_acquire_override(tmp_path):
+    archive = tmp_path / "redis.oci.tar"
+    archive.write_bytes(b"unchanged redis archive")
+    environment = _environment(archive, "REDIS")
+    with pytest.raises(pytest.skip.Exception):
+        proof._selection("REDIS_USER", environment)
+    environment.update(_environment(archive, "REDIS_USER"))
+    default = proof._selection("REDIS", environment)
+    explicit = proof._selection("REDIS_USER", environment)
+    assert default == explicit
+
+    default_arguments = proof._detached_run_arguments(default, "hub-redis-proof")
+    explicit_arguments = proof._detached_run_arguments(explicit, "hub-redis-user-proof", user_override="redis")
+    assert default_arguments == (
+        "run",
+        archive.resolve(),
+        "--manifest",
+        "sha256:" + "a" * 64,
+        "--name",
+        "hub-redis-proof",
+        "--memory",
+        "512",
+        "--vcpus",
+        "1",
+        "-d",
+    )
+    assert explicit_arguments == (
+        "run",
+        archive.resolve(),
+        "--manifest",
+        "sha256:" + "a" * 64,
+        "--name",
+        "hub-redis-user-proof",
+        "--memory",
+        "512",
+        "--vcpus",
+        "1",
+        "-d",
+        "--user",
+        "redis",
+    )
+
+
+def _explicit_user_status(*, user: str = "redis", uid: int = 999, gid: int = 998) -> bytes:
+    return (
+        f"user={user}\nuid={uid}\ngid={gid}\naccount_uid={uid}\naccount_gid={gid}\n"
+        "CapInh=0000000000000000\nCapPrm=0000000000000000\n"
+        "CapEff=0000000000000000\nCapBnd=0000000000000000\n"
+        "CapAmb=0000000000000000\nNoNewPrivs=1\nSeccomp=2\n"
+    ).encode()
+
+
+def test_explicit_user_status_requires_named_nonroot_identity_and_capabilityless_policy():
+    proof._assert_explicit_user_status(_explicit_user_status(), "redis")
+    for payload in (
+        _explicit_user_status(user="root"),
+        _explicit_user_status(uid=0),
+        _explicit_user_status().replace(b"account_gid=998", b"account_gid=997"),
+        _explicit_user_status().replace(b"CapEff=0000000000000000", b"CapEff=0000000000000001"),
+        _explicit_user_status().replace(b"NoNewPrivs=1", b"NoNewPrivs=0"),
+        _explicit_user_status().replace(b"Seccomp=2", b"Seccomp=0"),
+    ):
+        with pytest.raises(AssertionError):
+            proof._assert_explicit_user_status(payload, "redis")
 
 
 def test_authentication_uses_separate_proof_cas_when_fresh_runtime_has_no_runtime_packs(tmp_path, monkeypatch):

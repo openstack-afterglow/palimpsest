@@ -35,6 +35,8 @@ import palimpsest_local.state as state_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_boot_plan import (
+    OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
+    OCI_ROOT_BOOT_PLAN_SCHEMA,
     OCIBootPlanIntent,
     PreparedOCIBootPlan,
     load_prepared_oci_boot_plan,
@@ -1527,12 +1529,116 @@ def test_boot_plan_is_path_free_ordered_and_recoverable(tmp_path: Path) -> None:
     assert tuple(member.ordinal for member in prepared.lower_leases.members) == (0, 1, 2)
     assert prepared.intent.to_dict()["phase"] == "lower-reserved"
     assert prepared.intent.to_dict()["writable_root_policy"] == "vm-specific"
+    assert prepared.intent.to_dict()["schema"] == OCI_ROOT_BOOT_PLAN_SCHEMA
+    assert prepared.intent.to_dict()["process"] == materialization.process.to_dict()
+    assert "process_provenance" not in prepared.intent.to_dict()
     assert str(tmp_path) not in encoded
     assert "/blobs/" not in encoded and "/lease-sets/" not in encoded
 
     release_oci_boot_plan(prepared, store)
     assert list((roots.oci_derived_store / "leases").iterdir()) == []
     assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+def test_explicit_user_boot_plan_binds_original_override_and_effective_process(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    original_process = materialization.process
+    override = OCIUserSpec("redis", "staff")
+
+    prepared = prepare_oci_boot_plan(
+        materialization,
+        run_id=str(uuid.uuid4()),
+        run_name="redis",
+        store=store,
+        user_override=override,
+    )
+    plan = prepared.intent.to_dict()
+
+    assert plan["schema"] == OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA
+    assert plan["process_provenance"] == {
+        "image_process": original_process.to_dict(),
+        "user_override": override.to_dict(),
+    }
+    assert OCIProcessSpec.from_dict(plan["process"]) == original_process.with_user(override)
+    assert materialization.process == original_process
+    assert materialization.to_dict()["process"] == original_process.to_dict()
+    release_oci_boot_plan(prepared, store)
+
+
+@pytest.mark.parametrize("invalid_schema", [[], {}])
+def test_preparation_rejects_unhashable_boot_plan_schema_as_state_error(tmp_path: Path, invalid_schema: object) -> None:
+    _roots, store = _store(tmp_path)
+    intent = OCIBootPlanIntent(str(uuid.uuid4()), "demo", _image_materialization(store))
+    plan = deepcopy(intent.to_dict())
+    plan["schema"] = invalid_schema
+    plan_digest = (
+        f"sha256:{hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+    )
+
+    with pytest.raises(StateError, match="boot plan schema is invalid"):
+        OCIRootPreparationTransaction(
+            "resources-planned",
+            plan,
+            plan_digest,
+            _digest("9"),
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "delete",
+            "delete",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("effective-user", "effective process binding"),
+        ("effective-argv", "effective process binding"),
+        ("override", "effective process binding"),
+        ("image-process", "effective process binding"),
+        ("provenance-field", "process provenance"),
+        ("plan-field", "boot plan fields"),
+    ],
+)
+def test_override_preparation_rejects_tampered_process_provenance(tmp_path: Path, mutation: str, match: str) -> None:
+    _roots, store = _store(tmp_path)
+    intent = OCIBootPlanIntent(
+        str(uuid.uuid4()),
+        "redis",
+        _image_materialization(store),
+        OCIUserSpec("redis", None),
+    )
+    plan = deepcopy(intent.to_dict())
+    provenance = plan["process_provenance"]
+    if mutation == "effective-user":
+        plan["process"]["user"] = OCIUserSpec("other", None).to_dict()
+    elif mutation == "effective-argv":
+        plan["process"]["argv"].append("--tampered")
+    elif mutation == "override":
+        provenance["user_override"] = OCIUserSpec("other", None).to_dict()
+    elif mutation == "image-process":
+        provenance["image_process"]["cwd"] = "/tampered"
+    elif mutation == "provenance-field":
+        provenance["source"] = "attacker"
+    else:
+        plan["host_path"] = "/tmp/attacker"
+    plan_digest = (
+        f"sha256:{hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}"
+    )
+
+    with pytest.raises(StateError, match=match):
+        OCIRootPreparationTransaction(
+            "resources-planned",
+            plan,
+            plan_digest,
+            _digest("9"),
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            intent.lower_graph_digest,
+            "delete",
+            "delete",
+        )
 
 
 def test_boot_plan_digest_and_lease_set_are_deterministic(tmp_path: Path) -> None:
@@ -1880,7 +1986,7 @@ def _evented_connection(
     return oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
 
 
-def _committed_oci_domain(tmp_path: Path, name: str):
+def _committed_oci_domain(tmp_path: Path, name: str, *, user_override: OCIUserSpec | None = None):
     roots, store = _short_oci_store()
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
@@ -1897,11 +2003,30 @@ def _committed_oci_domain(tmp_path: Path, name: str):
             _image_materialization(store),
             store,
             root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+            user_override=user_override,
             runner=tools,
         )
     preview = build_oci_root_domain_plan(roots, prepared, store, boot, profile, runner=tools)
     plan = commit_oci_root_domain_plan(roots, preview, store, runner=tools)
     return roots, store, tools, boot, profile, prepared, plan
+
+
+def test_user_override_is_bound_through_preparation_domain_and_stage1(tmp_path: Path) -> None:
+    override = OCIUserSpec("redis", "staff")
+    roots, _store_value, _tools, _boot, _profile, prepared, plan = _committed_oci_domain(
+        tmp_path,
+        "redis-user",
+        user_override=override,
+    )
+    transaction_plan = prepared.transaction.boot_plan
+    image_process = OCIProcessSpec.from_dict(transaction_plan["process_provenance"]["image_process"])
+
+    assert transaction_plan["schema"] == OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA
+    assert image_process.user == OCIUserSpec("0", "0")
+    assert plan.process == image_process.with_user(override)
+    assert OCIStage1Plan.from_domain_plan(plan).process == plan.process
+    ledger = read_run_ledger_snapshot(roots, "redis-user").state["oci_root"]
+    assert OCIRootPreparationTransaction.from_dict(ledger) == prepared.transaction
 
 
 def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: Path) -> None:

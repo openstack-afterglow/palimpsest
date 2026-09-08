@@ -16,6 +16,7 @@ from palimpsest_local import (
     state,
 )
 from palimpsest_local.errors import StateError
+from palimpsest_local.oci_process import OCIUserSpec
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.runtime_types import (
     CapabilityCheck,
@@ -82,6 +83,7 @@ def test_public_local_run_foreground_or_detached(tmp_path, monkeypatch, capsys, 
     assert isinstance(request, LocalOCIRunRequest)
     assert request.detached is detached and request.network is None
     assert request.root_retention == "delete" and request.root_volume_id is None
+    assert request.user_override is None
     assert request.source == source.resolve()
     assert capsys.readouterr().out == ("demo\n" if detached else "literal console output\n")
 
@@ -99,6 +101,61 @@ def test_root_manifest_pin_is_canonicalized_for_local_intake(tmp_path, monkeypat
     )
     assert cli.main(["run", str(source), "--name", "demo", "--manifest", "A" * 64, "-d"]) == 0
     assert seen[0].manifest_digest == "sha256:" + "a" * 64
+
+
+def test_public_local_run_accepts_redis_user_as_separate_compatibility_mode(tmp_path, monkeypatch):
+    source = tmp_path / "redis.oci.tar"
+    source.touch()
+    seen = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **_kwargs: (
+            seen.append(request) or SimpleNamespace(record=SimpleNamespace(name="redis"), terminal=None, session=None)
+        ),
+    )
+
+    assert cli.main(["run", str(source), "--name", "redis", "--user", "redis", "-d"]) == 0
+    assert seen[0].user_override == OCIUserSpec("redis", None)
+
+
+@pytest.mark.parametrize("value", ["1000", "1000:1001", "redis:staff"])
+def test_public_local_run_accepts_canonical_user_and_group_forms(tmp_path, monkeypatch, value):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    seen = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **_kwargs: (
+            seen.append(request) or SimpleNamespace(record=SimpleNamespace(name="demo"), terminal=None, session=None)
+        ),
+    )
+
+    assert cli.main(["run", str(source), "--name", "demo", "--user", value, "-d"]) == 0
+    assert seen[0].user_override == OCIUserSpec.from_override_value(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        ":staff",
+        "redis:",
+        "redis:staff:extra",
+        "01",
+        "1000:01",
+        "bad user",
+        "9" * 5000,
+        f"redis:{'9' * 5000}",
+    ],
+)
+def test_public_local_run_rejects_invalid_user_before_adapter(tmp_path, monkeypatch, value):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    monkeypatch.setattr(runtime_dispatch, "run_local_oci", lambda *_a, **_k: pytest.fail("adapter entered"))
+
+    assert cli.main(["run", str(source), "--name", "demo", "--user", value, "-d"]) == 1
 
 
 def test_public_run_threads_explicit_retained_root_policy(tmp_path, monkeypatch):
@@ -178,11 +235,20 @@ def test_detached_early_exit_is_not_reported_as_running(tmp_path, monkeypatch, c
         ["--manifest", "a" * 64],
         ["--root-retention", "retain"],
         ["--root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"],
+        ["--user", "redis"],
     ],
 )
 def test_cloud_run_does_not_adopt_new_oci_flags(monkeypatch, flags):
     monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *a, **k: pytest.fail("cloud resolution entered"))
     assert cli.main(["run", "cloud:latest", "--name", "demo", *flags]) == 1
+
+
+def test_cloud_user_rejection_precedes_store_resolution_and_state_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "ContentStore", lambda *_a, **_k: pytest.fail("content store entered"))
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *_a, **_k: pytest.fail("cloud resolution entered"))
+
+    assert cli.main(["run", "cloud:latest", "--name", "demo", "--user", "redis"]) == 1
+    assert not (tmp_path / "state").exists() and not (tmp_path / "config").exists()
 
 
 @pytest.mark.parametrize("kind", ["layout", "explicit-cloud", "reference"])

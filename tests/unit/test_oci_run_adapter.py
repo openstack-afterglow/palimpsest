@@ -17,6 +17,7 @@ from palimpsest_local import state
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_host import OCIHostConfig
 from palimpsest_local.oci_monitor_ipc import MonitorPreActivationBinding
+from palimpsest_local.oci_process import OCIUserSpec
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.oci_store import OCIStore
 from palimpsest_local.runtime_types import ProcessExit, ProcessExitCategory
@@ -113,6 +114,7 @@ def case(tmp_path, monkeypatch):
             "root_volume_size_bytes": request.root_size_bytes,
             "retained_volume_id": request.root_volume_id,
             "retention_policy": request.root_retention,
+            "user_override": request.user_override,
         }
         value.prepared = fixtures.prepare_oci_root_run(
             reservation, receipt, store, runner=fixtures._RootVolumeTools(), **kwargs
@@ -273,6 +275,28 @@ def test_launch_threads_explicit_retained_root_claim_to_existing_preparer(case, 
             "root_volume_size_bytes": case.request.root_size_bytes,
             "retained_volume_id": volume_id,
             "retention_policy": "retain",
+            "user_override": None,
+        }
+    ]
+
+
+def test_launch_threads_typed_user_override_to_preparation(case, monkeypatch):
+    case.request = replace(case.request, user_override=OCIUserSpec("redis", "staff"))
+    captured = []
+
+    def prepare(_reservation, _receipt, _store, **kwargs):
+        captured.append(kwargs)
+        raise StateError("captured user override")
+
+    monkeypatch.setattr(adapter, "prepare_oci_root_run", prepare)
+    with pytest.raises(StateError, match="captured user override"):
+        launch(case)
+    assert captured == [
+        {
+            "root_volume_size_bytes": case.request.root_size_bytes,
+            "retained_volume_id": None,
+            "retention_policy": "delete",
+            "user_override": OCIUserSpec("redis", "staff"),
         }
     ]
 

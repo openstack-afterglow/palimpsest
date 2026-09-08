@@ -1,8 +1,9 @@
 """Typed local OCI create input, independent of cloud image stacks.
 
-The first public local-image contract uses the authenticated image process as-is:
-no host environment inheritance, shell expansion, or process override rewrites.
-Materialization produces immutable cache receipts, not a running VM or leases.
+The local-image contract uses the authenticated image process as-is except for an
+explicit user-only override: there is no host environment inheritance, shell
+expansion, or other process rewriting. Materialization receipts remain immutable
+and describe the original image process, not a running VM or leases.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_materializer import OCIImageMaterializationReceipt, materialize_image_hard
 from .oci_packer import VerifiedSquashFSToolchain
+from .oci_process import OCIUserSpec
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
 from .oci_store import OCIStore
 from .project_volumes import _validate_size
@@ -42,6 +44,7 @@ class LocalOCIRunRequest:
     network: None = None
     platform: str = "linux/amd64"
     backend: str = "kvm"
+    user_override: OCIUserSpec | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name) is None:
@@ -59,6 +62,8 @@ class LocalOCIRunRequest:
                 or normalize_digest(self.manifest_digest) != self.manifest_digest
             ):
                 raise ArtifactValidationError("local OCI run manifest digest must be canonical")
+        if self.user_override is not None and not isinstance(self.user_override, OCIUserSpec):
+            raise ArtifactValidationError("local OCI run user override must be typed")
         if type(self.detached) is not bool:
             raise ArtifactValidationError("OCI run detached policy must be a boolean")
         if type(self.memory_mib) is not int or not 256 <= self.memory_mib <= 1_048_576:
@@ -112,6 +117,7 @@ def resolve_local_oci_run_request(
     *,
     name: str,
     manifest_digest: str | None = None,
+    user_override: OCIUserSpec | None = None,
     detached: bool = False,
     memory_mib: int = 512,
     vcpus: int = 1,
@@ -135,6 +141,7 @@ def resolve_local_oci_run_request(
         name=name,
         source=selected,
         manifest_digest=manifest_digest,
+        user_override=user_override,
         detached=detached,
         memory_mib=memory_mib,
         vcpus=vcpus,

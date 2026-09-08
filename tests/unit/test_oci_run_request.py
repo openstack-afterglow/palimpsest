@@ -10,7 +10,7 @@ import test_oci_source as source_tests
 from palimpsest_local import oci_materializer
 from palimpsest_local import oci_run_request as intake
 from palimpsest_local.errors import ArtifactValidationError, PalimpsestError, UnsupportedPlatformError
-from palimpsest_local.oci_process import OCIProcessSpec
+from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE
 from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
 from palimpsest_local.state import StatePaths, init_resolved_roots
@@ -58,11 +58,35 @@ def test_request_defaults_are_foreground_local_linux_kvm_without_cloud_spec(tmp_
     assert request.network is None
     assert request.root_size_bytes == 4 * 1024**3
     assert request.root_retention == "delete" and request.root_volume_id is None
+    assert request.user_override is None
     assert (request.memory_mib, request.vcpus) == (512, 1)
     assert not hasattr(request, "spec")
     assert str(tmp_path) not in repr(request)
     with pytest.raises(FrozenInstanceError):
         request.detached = True
+
+
+def test_request_preserves_legacy_positional_field_order(tmp_path):
+    source = tmp_path / "source"
+    request = intake.LocalOCIRunRequest(
+        "demo",
+        source,
+        None,
+        True,
+        768,
+        2,
+        8 * 1024**3,
+        "retain",
+        None,
+        None,
+        "linux/amd64",
+        "kvm",
+    )
+
+    assert request.detached is True
+    assert (request.memory_mib, request.vcpus, request.root_size_bytes) == (768, 2, 8 * 1024**3)
+    assert request.root_retention == "retain"
+    assert request.user_override is None
 
 
 @pytest.mark.parametrize(
@@ -77,6 +101,7 @@ def test_request_defaults_are_foreground_local_linux_kvm_without_cloud_spec(tmp_
         {"manifest_digest": "a" * 64},
         {"manifest_digest": "sha256:" + "A" * 64},
         {"manifest_digest": 4},
+        {"user_override": "redis"},
         {"detached": 1},
         {"memory_mib": True},
         {"memory_mib": 255},
@@ -127,6 +152,16 @@ def test_resolver_preserves_explicit_retained_root_reuse_policy(tmp_path):
     assert request.root_retention == "retain" and request.root_volume_id == volume_id
 
 
+def test_resolver_preserves_typed_user_override_without_rewriting_image_input(tmp_path):
+    source = tmp_path / "image.oci.tar"
+    source.touch()
+    override = OCIUserSpec("redis", "staff")
+
+    request = intake.resolve_local_oci_run_request(source, name="demo", user_override=override)
+
+    assert request.user_override is override
+
+
 def test_resolver_refuses_missing_or_non_path_source(tmp_path):
     for source in (tmp_path / "missing", "ubuntu:latest"):
         with pytest.raises(ArtifactValidationError):
@@ -169,11 +204,35 @@ def test_intake_snapshots_local_input_and_preserves_process_and_layer_occurrence
     assert process.environment == (("PATH", "/bin"), ("MESSAGE", "$HOME;literal"))
     assert process.cwd == "/work"
     assert (process.user.user, process.user.group, process.stop_signal) == ("1000", "1001", 15)
+    assert prepared.request.user_override is None
     assert list(roots.runs.iterdir()) == []
     with pytest.raises(ArtifactValidationError, match="root pin"):
         intake.PreparedLocalOCIRun(replace(request, manifest_digest="sha256:" + "a" * 64), prepared.receipt)
     with pytest.raises(ArtifactValidationError, match="no Entrypoint"):
         intake.PreparedLocalOCIRun(request, replace(prepared.receipt, process=OCIProcessSpec.empty()))
+
+
+def test_materialization_receipt_keeps_image_process_when_request_has_override(tmp_path, monkeypatch):
+    layout, _manifest = _layout(tmp_path / "layout")
+    override = OCIUserSpec("redis", None)
+    request = intake.resolve_local_oci_run_request(layout.root, name="redis", user_override=override)
+    roots = _roots(tmp_path)
+    monkeypatch.setattr(intake, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        oci_materializer,
+        "materialize_layer_hard",
+        lambda image, ordinal, **_kwargs: source_tests._derived_result(image, ordinal),
+    )
+
+    prepared = intake.materialize_local_oci_run(
+        request,
+        roots=roots,
+        packer_path=Path("/usr/bin/mksquashfs"),
+        toolchain=object(),
+    )
+
+    assert prepared.request.user_override == override
+    assert prepared.receipt.process.user == OCIUserSpec("1000", "1001")
 
 
 @pytest.mark.parametrize("failure", ["ambiguous", "unbootable", "mismatch"])

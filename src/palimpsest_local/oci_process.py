@@ -14,6 +14,7 @@ MAX_PROCESS_ARGUMENTS = 4096
 MAX_PROCESS_ENVIRONMENT = 4096
 MAX_PROCESS_BYTES = 256 * 1024
 MAX_ACCOUNT_DATABASE_BYTES = 64 * 1024
+MAX_USER_OVERRIDE_LENGTH = 65
 OCI_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
@@ -103,6 +104,13 @@ class OCIUserSpec:
         return cls(user, group if separator else None)
 
     @classmethod
+    def from_override_value(cls, value: Any) -> OCIUserSpec:
+        """Parse an explicit CLI user override without image-config defaults."""
+        if not isinstance(value, str) or not value or len(value) > MAX_USER_OVERRIDE_LENGTH:
+            raise ArtifactValidationError("OCI run user override is invalid")
+        return cls.from_value(value)
+
+    @classmethod
     def from_dict(cls, value: Any) -> OCIUserSpec:
         if not isinstance(value, Mapping) or set(value) != {"group", "user"}:
             raise ArtifactValidationError("image process user fields are invalid")
@@ -163,6 +171,12 @@ class OCIProcessSpec:
     def require_bootable(self) -> None:
         if not self.bootable:
             raise ArtifactValidationError("OCI image has no Entrypoint or Cmd to execute")
+
+    def with_user(self, user: OCIUserSpec) -> OCIProcessSpec:
+        """Return an effective process differing only in its user identity."""
+        if not isinstance(user, OCIUserSpec):
+            raise ArtifactValidationError("OCI process user override is invalid")
+        return OCIProcessSpec(self.argv, self.environment, self.cwd, user, self.stop_signal)
 
     def to_dict(self) -> dict[str, Any]:
         return {

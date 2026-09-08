@@ -35,6 +35,7 @@ from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
 from .oci_materializer import materialize_image_hard
 from .oci_packer import discover_squashfs_toolchain
+from .oci_process import OCIUserSpec
 from .oci_run_cleanup import OCIRunRemovalResult
 from .oci_run_request import resolve_local_oci_run_request
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
@@ -775,6 +776,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--runtime-kind", choices=("cloud-image", "oci-root"))
     run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
     run.add_argument("--manifest", help="pin the root descriptor of a local OCI image")
+    run.add_argument("--user", help="run a local OCI image as USER[:GROUP]")
     run.add_argument(
         "--root-retention",
         choices=("delete", "retain"),
@@ -1459,6 +1461,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
         else init_roots()
     )
 
+    if op == "run" and args.user is not None:
+        source = Path(args.image_or_bundle).expanduser()
+        explicit_kind = getattr(args, "runtime_kind", None)
+        local_oci = explicit_kind == "oci-root" or (
+            explicit_kind is None
+            and source.is_file()
+            and (source.name.endswith(".oci.tar") or source.name.endswith(".oci"))
+        )
+        if not local_oci:
+            raise PalimpsestError("--user is supported only for local OCI-root runs")
+
     if op == "oci":
         if args.oci_operation == "root-proof":
             from .oci_root_proof import root_proof
@@ -2114,6 +2127,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 source,
                 name=args.name,
                 manifest_digest=require_digest(args.manifest) if args.manifest is not None else None,
+                user_override=OCIUserSpec.from_override_value(args.user) if args.user is not None else None,
                 detached=args.detach,
                 memory_mib=args.memory,
                 vcpus=args.vcpus,
@@ -2134,9 +2148,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
             or getattr(args, "manifest", None) is not None
             or getattr(args, "root_retention", None) is not None
             or getattr(args, "root_volume", None) is not None
+            or getattr(args, "user", None) is not None
         ):
             raise PalimpsestError(
-                "--detach, --manifest, --root-retention and --root-volume are supported only for local OCI-root runs"
+                "--detach, --manifest, --root-retention, --root-volume and --user are supported only for local OCI-root runs"
             )
         network = args.network if args.network is not None else "default"
         stack = _resolve_runtime_stack(

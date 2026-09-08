@@ -111,6 +111,7 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                     root_volume_size_bytes=request.root_size_bytes,
                     retained_volume_id=request.root_volume_id,
                     retention_policy=request.root_retention,
+                    user_override=request.user_override,
                 )
             publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
             boot = load_oci_boot_exports(roots, request.name)
