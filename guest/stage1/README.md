@@ -94,8 +94,17 @@ are emitted. The original exit-71 rejection and indeterminate-state wait
 remain unchanged; later readiness/move/chroot failures remain generic.
 The marker is diagnostic console output, not authenticated READY/root proof,
 and does not imply rollback or authorize workload execution. Success emits
-no new marker. In particular, this diagnostic change does not admit an
-existing root-owned empty `0555` target: exact `0755` is still required.
+no new marker. Following the user's narrow compatibility approval, only the
+root-owned empty `proc` target accepts either exact `0755` or `0555`. `dev`,
+`sys` and generic directory checks remain exact `0755`. No permissions are
+normalized and no source image is changed. The ordered nofollow/type/owner/
+mode/emptiness checks retain the initial device/inode/mode/UID/GID snapshot;
+immediately before each mount move, both retained and reopened target FDs
+must still match that snapshot. Even a `0755` to `0555` change (or the reverse)
+between preparation and readiness is rejected. Production readiness requires
+OverlayFS; a restricted tmpfs C harness exercises the shared checker without
+claiming to qualify real mount operations. PID 1 protection, workload
+credentials/capabilities and authenticated root evidence remain unchanged.
 
 The root-volume generation is bounded consistently in Python and C to 4096
 canonical decimal digits.
@@ -223,5 +232,6 @@ graceful guest-shutdown nor a crash-recovery claim. Three additional boots
 isolate missing, wrong-sized, and wrong-digest post-overlay probe rejection.
 Three v3-fixture-backed transition controls independently replace the highest
 lower with a real zstd SquashFS containing a regular `dev`, `sys`, or `proc`.
-Each reaches valid assembly and then proves that the named target must be an
-exact root-owned 0755 empty directory before any mount move.
+Each reaches valid assembly and rejects the regular-file target before any
+mount move. Those controls retain their original fixtures; they do not alone
+qualify the newly admitted root-owned empty `proc` mode `0555`.

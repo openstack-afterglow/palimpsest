@@ -3000,8 +3000,10 @@ enum safe_dir_reason {
     SAFE_DIR_REASON_FILESYSTEM_IDENTITY,
 };
 
-static int safe_dir_checked(const char *path, int create, int require_empty, int expected_mode,
-                            int *kept_fd, enum safe_dir_reason *reason) {
+static int safe_dir_policy_checked(const char *path, int create, int require_empty,
+                                   int expected_mode, int alternate_mode, int *kept_fd,
+                                   struct stat_local *initial_identity,
+                                   enum safe_dir_reason *reason) {
     struct stat_local st;
     i64 fd, r;
     if (reason) *reason = SAFE_DIR_REASON_UNKNOWN;
@@ -3027,7 +3029,8 @@ static int safe_dir_checked(const char *path, int create, int require_empty, int
         sc1(SYS_close, fd);
         return 0;
     }
-    if (expected_mode && (st.mode & 07777) != (u32)expected_mode) {
+    if (expected_mode && (st.mode & 07777) != (u32)expected_mode &&
+        (!alternate_mode || (st.mode & 07777) != (u32)alternate_mode)) {
         if (reason) *reason = SAFE_DIR_REASON_MODE;
         if (fd >= 0) sc1(SYS_close, fd);
         return 0;
@@ -3066,8 +3069,14 @@ static int safe_dir_checked(const char *path, int create, int require_empty, int
             }
         }
     }
+    if (initial_identity) *initial_identity = st;
     *kept_fd = (int)fd;
     return 1;
+}
+
+static int safe_dir_checked(const char *path, int create, int require_empty, int expected_mode,
+                            int *kept_fd, enum safe_dir_reason *reason) {
+    return safe_dir_policy_checked(path, create, require_empty, expected_mode, 0, kept_fd, 0, reason);
 }
 
 static int safe_dir(const char *path, int create, int require_empty, int expected_mode, int *kept_fd) {
@@ -3323,11 +3332,29 @@ static int assemble_staging_root(const struct expected_device_set *expected, str
     return 1;
 }
 
-static int transition_target_dir_checked(const char *path, int *kept_fd,
+enum transition_target {
+    TRANSITION_TARGET_PROC = 0,
+    TRANSITION_TARGET_SYS,
+    TRANSITION_TARGET_DEV,
+};
+
+static int transition_target_policy_checked(const char *path, enum transition_target target,
+                                            int create, int *kept_fd,
+                                            struct stat_local *initial_identity,
+                                            enum safe_dir_reason *reason) {
+    return safe_dir_policy_checked(path, create, 1, 0755,
+                                   target == TRANSITION_TARGET_PROC ? 0555 : 0,
+                                   kept_fd, initial_identity, reason);
+}
+
+static int transition_target_dir_checked(const char *path, enum transition_target target,
+                                         int *kept_fd, struct stat_local *initial_identity,
                                          enum safe_dir_reason *reason) {
-    if (!safe_dir_checked(path, 1, 1, 0755, kept_fd, reason)) return 0;
+    if (!transition_target_policy_checked(path, target, 1, kept_fd, initial_identity, reason)) return 0;
     if (stable_dir(path, *kept_fd, OVERLAYFS_MAGIC)) return 1;
     if (reason) *reason = SAFE_DIR_REASON_FILESYSTEM_IDENTITY;
+    sc1(SYS_close, *kept_fd);
+    *kept_fd = -1;
     return 0;
 }
 
@@ -3346,12 +3373,6 @@ static const char *safe_dir_reason_text(enum safe_dir_reason reason) {
     }
 }
 
-enum transition_target {
-    TRANSITION_TARGET_PROC = 0,
-    TRANSITION_TARGET_SYS,
-    TRANSITION_TARGET_DEV,
-};
-
 static void transition_target_rejected(enum transition_target target, enum safe_dir_reason reason) {
     write_all(2, "palimpsest guest stage1: root transition target rejected; target=");
     if (target == TRANSITION_TARGET_PROC) write_all(2, "proc");
@@ -3363,18 +3384,33 @@ static void transition_target_rejected(enum transition_target target, enum safe_
     write_all(2, "\n");
 }
 
-static int transition_target_ready(const char *path, int retained_fd) {
+static int transition_target_ready_checked(const char *path, enum transition_target target,
+                                           int retained_fd,
+                                           const struct stat_local *initial_identity,
+                                           i64 filesystem_magic) {
     struct stat_local retained, current;
     struct statfs_local fs;
     int current_fd = -1;
-    int valid = safe_dir(path, 0, 1, 0755, &current_fd) &&
+    int valid = initial_identity &&
+        transition_target_policy_checked(path, target, 0, &current_fd, 0, 0) &&
         sc2(SYS_fstat, retained_fd, (i64)&retained) == 0 &&
         sc2(SYS_fstat, current_fd, (i64)&current) == 0 &&
-        retained.dev == current.dev && retained.ino == current.ino &&
-        retained.mode == current.mode && retained.uid == current.uid && retained.gid == current.gid &&
-        sc2(SYS_fstatfs, current_fd, (i64)&fs) == 0 && fs.type == OVERLAYFS_MAGIC;
+        retained.dev == initial_identity->dev && retained.ino == initial_identity->ino &&
+        retained.mode == initial_identity->mode && retained.uid == initial_identity->uid &&
+        retained.gid == initial_identity->gid &&
+        current.dev == initial_identity->dev && current.ino == initial_identity->ino &&
+        current.mode == initial_identity->mode && current.uid == initial_identity->uid &&
+        current.gid == initial_identity->gid &&
+        sc2(SYS_fstatfs, current_fd, (i64)&fs) == 0 && fs.type == filesystem_magic;
     if (current_fd >= 0) sc1(SYS_close, current_fd);
     return valid;
+}
+
+static int transition_target_ready(const char *path, enum transition_target target,
+                                   int retained_fd,
+                                   const struct stat_local *initial_identity) {
+    return transition_target_ready_checked(path, target, retained_fd, initial_identity,
+                                           OVERLAYFS_MAGIC);
 }
 
 struct held_filesystem {
@@ -3486,6 +3522,7 @@ static int transition_root(struct expected_device_set *expected, struct opened_r
                            struct opened_role *transport, int merged_fd) {
     struct held_filesystem dev = {.fd = -1}, sys = {.fd = -1}, proc = {.fd = -1};
     struct stat_local merged_identity;
+    struct stat_local dev_target_identity, sys_target_identity, proc_target_identity;
     int dev_target = -1, sys_target = -1, proc_target = -1;
     enum safe_dir_reason target_reason = SAFE_DIR_REASON_UNKNOWN;
     u32 i;
@@ -3495,25 +3532,31 @@ static int transition_root(struct expected_device_set *expected, struct opened_r
         !hold_filesystem("/dev", 0x01021994, &dev) ||
         !hold_filesystem("/sys", 0x62656572, &sys) ||
         !hold_filesystem("/proc", 0x9fa0, &proc)) goto rejected;
-    if (!transition_target_dir_checked("/run/palimpsest/merged/proc", &proc_target, &target_reason)) {
+    if (!transition_target_dir_checked("/run/palimpsest/merged/proc", TRANSITION_TARGET_PROC,
+                                       &proc_target, &proc_target_identity, &target_reason)) {
         transition_target_rejected(TRANSITION_TARGET_PROC, target_reason);
         goto rejected;
     }
-    if (!transition_target_dir_checked("/run/palimpsest/merged/sys", &sys_target, &target_reason)) {
+    if (!transition_target_dir_checked("/run/palimpsest/merged/sys", TRANSITION_TARGET_SYS,
+                                       &sys_target, &sys_target_identity, &target_reason)) {
         transition_target_rejected(TRANSITION_TARGET_SYS, target_reason);
         goto rejected;
     }
-    if (!transition_target_dir_checked("/run/palimpsest/merged/dev", &dev_target, &target_reason)) {
+    if (!transition_target_dir_checked("/run/palimpsest/merged/dev", TRANSITION_TARGET_DEV,
+                                       &dev_target, &dev_target_identity, &target_reason)) {
         transition_target_rejected(TRANSITION_TARGET_DEV, target_reason);
         goto rejected;
     }
-    if (!transition_target_ready("/run/palimpsest/merged/dev", dev_target)) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/dev", TRANSITION_TARGET_DEV,
+                                 dev_target, &dev_target_identity)) goto rejected;
     sc1(SYS_close, dev_target); dev_target = -1;
     if (sc5(SYS_mount, (i64)"/dev", (i64)"/run/palimpsest/merged/dev", 0, MS_MOVE, 0) != 0) goto rejected;
-    if (!transition_target_ready("/run/palimpsest/merged/sys", sys_target)) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/sys", TRANSITION_TARGET_SYS,
+                                 sys_target, &sys_target_identity)) goto rejected;
     sc1(SYS_close, sys_target); sys_target = -1;
     if (sc5(SYS_mount, (i64)"/sys", (i64)"/run/palimpsest/merged/sys", 0, MS_MOVE, 0) != 0) goto rejected;
-    if (!transition_target_ready("/run/palimpsest/merged/proc", proc_target)) goto rejected;
+    if (!transition_target_ready("/run/palimpsest/merged/proc", TRANSITION_TARGET_PROC,
+                                 proc_target, &proc_target_identity)) goto rejected;
     sc1(SYS_close, proc_target); proc_target = -1;
     if (sc5(SYS_mount, (i64)"/proc", (i64)"/run/palimpsest/merged/proc", 0, MS_MOVE, 0) != 0 ||
         sc1(SYS_chdir, (i64)"/run/palimpsest/merged") != 0 ||

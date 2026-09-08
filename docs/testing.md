@@ -198,6 +198,17 @@ root identity; retain separate native positives/negatives and original-image
 verification. In particular, a diagnostic native Redis failure remains a
 compatibility failure, even when it successfully identifies the rejecting check.
 
+The approved proc-only `0555` exception uses the same production policy in
+the real C fixture module. It separately checks acceptance, pre-move readiness,
+unchanged metadata and initial-identity retention across `0755`/`0555` changes.
+Generic directory checks and `dev`/`sys` still reject `0555`; wrong owner,
+nonempty/nofollow/type, special bits, replaced inode and filesystem identity
+remain negative controls. The internal readiness checker uses tmpfs magic in
+the restricted fixture only; the runtime wrapper fixes OverlayFS magic.
+Retain the existing native guest matrix and an unchanged original Redis run
+as separate real mount/workload evidence. A later Redis entrypoint failure
+must not be hidden by changing its user, command, image or privileges.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire

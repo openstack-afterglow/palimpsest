@@ -10,7 +10,9 @@ _TOOLCHAIN = "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d
 _MARKER = "palimpsest guest stage1: root transition target rejected; target=proc; check={}\n"
 _HARNESS = r"""
 #define SYS_lstat 6
+#define SYS_chmod 90
 #define SYS_symlink 88
+#define SYS_rename 82
 #define O_CREAT 0100
 #define O_EXCL 0200
 #define _start guest_boot_start
@@ -23,7 +25,7 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
     enum transition_target label = TRANSITION_TARGET_PROC;
     const char *target = "@FIXTURE@";
     enum safe_dir_reason reason = SAFE_DIR_REASON_UNKNOWN;
-    struct stat_local before, after;
+    struct stat_local before, after, initial_identity;
     int fd = -1;
     i64 child;
     if (stack[0] != 3) exit_now(89);
@@ -34,13 +36,43 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
         if (sc2(SYS_mkdir, (i64)"@FIXTURE@/real", 0755) != 0 ||
             sc2(SYS_symlink, (i64)"real", (i64)"@FIXTURE@/target") != 0) exit_now(90);
         target = "@FIXTURE@/target";
-    } else if (text_equal(kind, "nonempty")) {
+    } else if (text_equal(kind, "regular")) {
+        child = sc3(SYS_open, (i64)"@FIXTURE@/target", O_WRONLY | O_CREAT | O_EXCL, 0755);
+        if (child < 0 || sc1(SYS_close, child) != 0) exit_now(91);
+        target = "@FIXTURE@/target";
+    } else if (text_equal(kind, "nonempty") || text_equal(kind, "owner-nonempty")) {
         child = sc3(SYS_open, (i64)"@FIXTURE@/child", O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (child < 0 || sc1(SYS_close, child) != 0) exit_now(91);
+    } else if (text_equal(kind, "ready-replaced")) {
+        if (sc2(SYS_mkdir, (i64)"@FIXTURE@/target", 0555) != 0) exit_now(90);
+        target = "@FIXTURE@/target";
     }
     if (sc2(SYS_lstat, (i64)target, (i64)&before) != 0) exit_now(92);
-    if (safe_dir_checked(target, 1, 1, 0755, &fd, &reason)) {
-        if (fd < 0 || sc1(SYS_close, fd) != 0 || !text_equal(kind, "accepted")) exit_now(93);
+    if (text_equal(kind, "generic-mode")) {
+        if (safe_dir_checked(target, 1, 1, 0755, &fd, &reason)) exit_now(99);
+        if (reason != SAFE_DIR_REASON_MODE) exit_now(95);
+        exit_now(0);
+    }
+    if (transition_target_policy_checked(target, label, 1, &fd, &initial_identity, &reason)) {
+        if (text_equal(kind, "ready")) {
+            if (!transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(96);
+        } else if (text_equal(kind, "ready-to-0555")) {
+            if (sc2(SYS_chmod, (i64)target, 0555) != 0 ||
+                transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(97);
+        } else if (text_equal(kind, "ready-to-0755")) {
+            if (sc2(SYS_chmod, (i64)target, 0755) != 0 ||
+                transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(98);
+        } else if (text_equal(kind, "ready-wrong-fs")) {
+            if (transition_target_ready_checked(target, label, fd, &initial_identity, 0x794c7630)) exit_now(96);
+        } else if (text_equal(kind, "ready-replaced")) {
+            if (sc2(SYS_rename, (i64)target, (i64)"@FIXTURE@/old") != 0 ||
+                sc2(SYS_mkdir, (i64)target, initial_identity.mode & 07777) != 0 ||
+                transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(96);
+        } else if (!text_equal(kind, "accepted")) exit_now(93);
+        if (fd < 0 || sc1(SYS_close, fd) != 0) exit_now(93);
+        if ((text_equal(kind, "accepted") || text_equal(kind, "ready")) &&
+            (sc2(SYS_lstat, (i64)target, (i64)&after) != 0 ||
+             before.mode != after.mode || before.uid != after.uid || before.gid != after.gid)) exit_now(94);
         exit_now(0);
     }
     transition_target_rejected(label, reason);
@@ -50,6 +82,8 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
     if (text_equal(kind, "nonempty") && reason == SAFE_DIR_REASON_NONEMPTY) exit_now(0);
     if (text_equal(kind, "symlink") && reason == SAFE_DIR_REASON_OPEN) exit_now(0);
     if (text_equal(kind, "owner") && reason == SAFE_DIR_REASON_OWNER) exit_now(0);
+    if (text_equal(kind, "owner-nonempty") && reason == SAFE_DIR_REASON_OWNER) exit_now(0);
+    if (text_equal(kind, "regular") && reason == SAFE_DIR_REASON_OPEN) exit_now(0);
     exit_now(95);
 }
 
@@ -155,12 +189,13 @@ def transition_harness(tmp_path_factory):
 @pytest.mark.parametrize(
     ("kind", "target", "mode", "uid", "reason"),
     [
-        pytest.param("mode", "proc", "0555", 0, "mode", id="root-empty-0555-proc"),
         pytest.param("mode", "sys", "0555", 0, "mode", id="root-empty-0555-sys"),
         pytest.param("mode", "dev", "0555", 0, "mode", id="root-empty-0555-dev"),
         pytest.param("nonempty", "proc", "0755", 0, "nonempty", id="root-nonempty"),
         pytest.param("symlink", "proc", "0755", 0, "open", id="nofollow-symlink"),
         pytest.param("owner", "proc", "0755", 12345, "owner", id="wrong-owner"),
+        pytest.param("owner-nonempty", "proc", "0777", 12345, "owner", id="owner-before-emptiness"),
+        pytest.param("regular", "proc", "0755", 0, "open", id="special-regular-file"),
     ],
 )
 def test_real_c_transition_target_rejections_are_exact_and_do_not_normalize(
@@ -172,8 +207,51 @@ def test_real_c_transition_target_rejections_are_exact_and_do_not_normalize(
     assert result.stderr.decode() == _MARKER.replace("target=proc", f"target={target}").format(reason)
 
 
-def test_real_c_transition_target_accepts_root_owned_empty_0755(transition_harness):
-    result = transition_harness("accepted")
+@pytest.mark.parametrize(
+    ("target", "mode"),
+    [
+        pytest.param("proc", "0755", id="proc-0755"),
+        pytest.param("proc", "0555", id="proc-0555"),
+        pytest.param("sys", "0755", id="sys-0755"),
+        pytest.param("dev", "0755", id="dev-0755"),
+    ],
+)
+def test_real_c_transition_target_accepts_only_approved_modes(transition_harness, target, mode):
+    result = transition_harness("accepted", target=target, fixture_mode=mode)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize("mode", ["0555", "0755"])
+def test_real_c_transition_target_readiness_accepts_unchanged_proc_mode(transition_harness, mode):
+    result = transition_harness("ready", target="proc", fixture_mode=mode)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize(
+    ("initial_mode", "kind"),
+    [("0755", "ready-to-0555"), ("0555", "ready-to-0755")],
+)
+def test_real_c_transition_target_readiness_rejects_mode_identity_change(
+    transition_harness, initial_mode, kind
+):
+    result = transition_harness(kind, target="proc", fixture_mode=initial_mode)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+def test_real_c_generic_safe_dir_still_rejects_0555(transition_harness):
+    result = transition_harness("generic-mode", target="proc", fixture_mode="0555")
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+@pytest.mark.parametrize("kind", ["ready-wrong-fs", "ready-replaced"])
+def test_real_c_transition_target_readiness_rejects_identity_controls(transition_harness, kind):
+    result = transition_harness(kind, target="proc", fixture_mode="0755")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
     assert result.stderr == b""
