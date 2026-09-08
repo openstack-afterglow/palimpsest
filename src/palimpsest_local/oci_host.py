@@ -23,6 +23,57 @@ from .oci_initramfs import build_bootstrap_initramfs
 from .oci_root_kvm import _verify_host_boot_artifact, verify_first_party_bootstrap_initramfs, verify_host_boot_artifacts
 
 _HOST_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+_RUNTIME_ANCESTOR_STAMP_FIELDS = (
+    ("dev", "st_dev"),
+    ("ino", "st_ino"),
+    ("mode", "st_mode"),
+    ("uid", "st_uid"),
+    ("gid", "st_gid"),
+    ("ctime", "st_ctime_ns"),
+)
+_RUNTIME_ANCESTOR_POST_ACL_FIELDS = tuple(field for field in _RUNTIME_ANCESTOR_STAMP_FIELDS if field[0] != "gid")
+_RUNTIME_ANCESTOR_IDENTITY_FIELDS = _RUNTIME_ANCESTOR_STAMP_FIELDS[:2]
+_RUNTIME_ANCESTOR_CHANGE_FIELDS_BY_PHASE = {
+    "post-acl": tuple(name for name, _ in _RUNTIME_ANCESTOR_POST_ACL_FIELDS),
+    "final-identity": tuple(name for name, _ in _RUNTIME_ANCESTOR_IDENTITY_FIELDS),
+    "final-stamp": tuple(name for name, _ in _RUNTIME_ANCESTOR_STAMP_FIELDS),
+}
+_RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_DEPTH = 9999
+_RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_BYTES = 160
+
+
+def _stat_values(info, fields: tuple[tuple[str, str], ...]) -> tuple[int, ...]:
+    return tuple(getattr(info, attribute) for _, attribute in fields)
+
+
+def _changed_stat_field_names(
+    before: tuple[int, ...], after: tuple[int, ...], fields: tuple[tuple[str, str], ...]
+) -> tuple[str, ...]:
+    return tuple(name for (name, _), old, new in zip(fields, before, after, strict=True) if old != new)
+
+
+def _runtime_ancestor_changed(*, phase: str, depth: int, changed: tuple[str, ...]) -> StateError:
+    allowed_fields = _RUNTIME_ANCESTOR_CHANGE_FIELDS_BY_PHASE.get(phase)
+    if (
+        allowed_fields is None
+        or type(depth) is not int
+        or depth < 0
+        or type(changed) is not tuple
+        or not changed
+        or len(changed) > len(allowed_fields)
+        or changed != tuple(name for name in allowed_fields if name in changed)
+    ):
+        return StateError("OCI runtime ancestor changed during verification")
+    depth_label = str(min(depth, _RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_DEPTH))
+    if depth > _RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_DEPTH:
+        depth_label += "+"
+    message = (
+        "OCI runtime ancestor changed during verification: "
+        f"phase={phase} depth={depth_label} changed={','.join(changed)}"
+    )
+    if len(message.encode("ascii")) > _RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_BYTES:
+        return StateError("OCI runtime ancestor changed during verification")
+    return StateError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,11 +115,10 @@ def verify_runtime_parent(path: Path, *, pin: bool = False) -> int | None:
         raise StateError("OCI runtime parent must be an absolute canonical path")
     descriptors = []
     stamps = []
-    fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_ctime_ns")
     try:
         descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         descriptors.append(descriptor)
-        for component in (None, *path.parts[1:]):
+        for depth, component in enumerate((None, *path.parts[1:])):
             if component is not None:
                 descriptor = os.open(
                     component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor
@@ -106,24 +156,40 @@ def verify_runtime_parent(path: Path, *, pin: bool = False) -> int | None:
                     "OCI runtime ancestors require simple search-enabled ACLs; named/default ACLs are unsupported"
                 )
             after = os.fstat(descriptor)
-            if (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_ctime_ns) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_uid,
-                after.st_ctime_ns,
-            ):
-                raise StateError("OCI runtime ancestor changed during verification")
-            stamps.append(tuple(getattr(before, key) for key in fields))
+            before_post_acl = _stat_values(before, _RUNTIME_ANCESTOR_POST_ACL_FIELDS)
+            after_post_acl = _stat_values(after, _RUNTIME_ANCESTOR_POST_ACL_FIELDS)
+            if before_post_acl != after_post_acl:
+                raise _runtime_ancestor_changed(
+                    phase="post-acl",
+                    depth=depth,
+                    changed=_changed_stat_field_names(
+                        before_post_acl, after_post_acl, _RUNTIME_ANCESTOR_POST_ACL_FIELDS
+                    ),
+                )
+            stamps.append(_stat_values(before, _RUNTIME_ANCESTOR_STAMP_FIELDS))
         # Verify the visible chain again so renaming an already-open ancestor
         # never makes a detached directory qualify a different runtime path.
         visible = path
-        for descriptor, stamp in zip(reversed(descriptors), reversed(stamps), strict=True):
+        for depth in range(len(descriptors) - 1, -1, -1):
+            descriptor, stamp = descriptors[depth], stamps[depth]
             held, current = os.fstat(descriptor), visible.lstat()
-            if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino) or tuple(
-                getattr(held, key) for key in fields
-            ) != stamp:
-                raise StateError("OCI runtime ancestor changed during verification")
+            held_identity = _stat_values(held, _RUNTIME_ANCESTOR_IDENTITY_FIELDS)
+            current_identity = _stat_values(current, _RUNTIME_ANCESTOR_IDENTITY_FIELDS)
+            if held_identity != current_identity:
+                raise _runtime_ancestor_changed(
+                    phase="final-identity",
+                    depth=depth,
+                    changed=_changed_stat_field_names(
+                        held_identity, current_identity, _RUNTIME_ANCESTOR_IDENTITY_FIELDS
+                    ),
+                )
+            held_stamp = _stat_values(held, _RUNTIME_ANCESTOR_STAMP_FIELDS)
+            if held_stamp != stamp:
+                raise _runtime_ancestor_changed(
+                    phase="final-stamp",
+                    depth=depth,
+                    changed=_changed_stat_field_names(stamp, held_stamp, _RUNTIME_ANCESTOR_STAMP_FIELDS),
+                )
             visible = visible.parent
         return os.dup(descriptors[-1]) if pin else None
     except (OSError, UnicodeError, subprocess.SubprocessError):

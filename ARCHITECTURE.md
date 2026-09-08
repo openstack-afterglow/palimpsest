@@ -43,6 +43,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 `4cbc863`의 명시적 `run --user` 후속 checkpoint: 관련 13개 모듈의 로컬·서버 검사 각1,057건이 통과했다. 원본 Redis 아카이브의 별도 `--user redis` 실기는 통과(28.05초)했고 UID999/GID1000·capability0·NNP1/seccomp2·실제 root 비교·PID1 거부·stop/rm을 확인했다. 같은 SHA의 기존 빌드 이미지 기본 cold exec도 통과(20.68초)했다. 원본 기본 Redis 실패와 기존 inactive 등록·자료는 보존하며, 새 build·전체 Gate2·직접 registry intake 성공으로 확대하지 않는다. 상세 근거는 [compatibility checkpoint](docs/oci-docker-hub-compatibility.md)에 있다.
 
+2026-09-09 후속 진단은 `oci_host.verify_runtime_parent`의 기존 거부 조건과 syscall 순서를 유지하며 `post-acl` / `final-identity` / `final-stamp`, root 기준 depth, 변경된 필드 이름만 제한된 오류에 덧붙인다. 경로·metadata 값은 출력하지 않으며 ACL/ctime 검사 완화·재시도·게스트 변경은 없다. 이 관측성 변경은 이전 cold 실패의 원인 확정이나 재통과가 아니다. [표준 I/O 경로 검토](docs/oci-linux-process.md)는 별칭과 FD 재열기 권한을 구분하며 아직 게스트 allowlist를 변경하지 않는다. 검증 범위는 [focused host diagnostic loop](docs/testing.md)에 분리한다.
+
 Palimpsest 안에는 서로 다른 실행/저장 경계가 있다. conventional runtime과 OCI-root runtime은 같은 `run` 명령 계층을 공유할 수 있지만, cloud-image base와 OCI source graph를 같은 artifact로 취급하지 않는다.
 
 ```mermaid
@@ -269,9 +271,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "84cfb57643931f150f1c8d133643d2cf4d1e94102f2b08575fda82144bcc415b",
-  "reviewed_at": "2026-09-08T12:26:18Z",
-  "summary": "Reviewed Linux-only ArgsEscaped boolean/null acceptance with literal argv and invalid-type refusal. Existing platform validation, raw config/CAS/snapshot bindings, process schemas, guest C/ELF and PID1/capability protections remain unchanged; new focused identity/platform regressions and unchanged native NGINX/cold proof boundaries documented."
+  "source_sha256": "e0cc8ed270aa43e7af3fa37c9ab9c8eb3795d0a1322c644e9a135b21cf639268",
+  "reviewed_at": "2026-09-08T16:25:31Z",
+  "summary": "Reviewed runtime-parent bounded phase/depth/field diagnostics and deterministic verifier tests; explicit comparison fields preserve existing predicates, syscall order, FD cleanup and launch consumer. Standard-I/O proposal distinguishes unqualified reopen permissions; guest source/ELF, security policy and schemas unchanged. Focused host testing boundary documented."
 }
 ```
 <!-- architecture-review:end -->

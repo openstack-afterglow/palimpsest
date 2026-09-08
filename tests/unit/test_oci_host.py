@@ -59,6 +59,12 @@ def simple_ancestors(monkeypatch, target, *, mode=0o711, acl=b"user::rwx\ngroup:
     monkeypatch.setattr(host.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=acl))
 
 
+def changed_stat(info, **changes):
+    values = {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_ctime_ns")}
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
 def test_search_chain_does_not_change_any_permissions(tmp_path, monkeypatch):
     before = tmp_path.stat()
     simple_ancestors(monkeypatch, tmp_path)
@@ -119,6 +125,286 @@ def test_later_acl_callback_cannot_change_previously_verified_ancestor(tmp_path,
     monkeypatch.setattr(host.subprocess, "run", callback)
     with pytest.raises(StateError, match="changed"):
         host.verify_runtime_parent(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "name"),
+    [
+        ("st_dev", "dev"),
+        ("st_ino", "ino"),
+        ("st_mode", "mode"),
+        ("st_uid", "uid"),
+        ("st_ctime_ns", "ctime"),
+    ],
+)
+def test_post_acl_change_identifies_depth_and_allowlisted_field(tmp_path, monkeypatch, attribute, name):
+    simple_ancestors(monkeypatch, tmp_path)
+    verified_fstat = host.os.fstat
+    target_inode = tmp_path.stat().st_ino
+    calls = 0
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        if info.st_ino == target_inode:
+            calls += 1
+            if calls == 2:
+                return changed_stat(info, **{attribute: getattr(info, attribute) + 1})
+        return info
+
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    depth = len(tmp_path.parts) - 1
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(tmp_path)
+    assert str(raised.value) == (
+        f"OCI runtime ancestor changed during verification: phase=post-acl depth={depth} changed={name}"
+    )
+
+
+def test_post_acl_comparison_intentionally_excludes_gid(tmp_path, monkeypatch):
+    simple_ancestors(monkeypatch, tmp_path)
+    verified_fstat = host.os.fstat
+    target_inode = tmp_path.stat().st_ino
+    calls = 0
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        if info.st_ino == target_inode:
+            calls += 1
+            if calls == 2:
+                return changed_stat(info, st_gid=info.st_gid + 1)
+        return info
+
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    host.verify_runtime_parent(tmp_path)
+
+
+def test_ancestor_depth_starts_at_zero_for_root(monkeypatch):
+    root = Path("/")
+    simple_ancestors(monkeypatch, root)
+    verified_fstat = host.os.fstat
+    calls = 0
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        calls += 1
+        if calls == 2:
+            return changed_stat(info, st_ctime_ns=info.st_ctime_ns + 1)
+        return info
+
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(root)
+    assert str(raised.value) == (
+        "OCI runtime ancestor changed during verification: phase=post-acl depth=0 changed=ctime"
+    )
+
+
+def test_final_visible_identity_change_is_distinct_and_path_free(tmp_path, monkeypatch):
+    target = tmp_path / "private-runtime-name"
+    target.mkdir()
+    simple_ancestors(monkeypatch, target)
+    original_lstat = Path.lstat
+    visible = target.stat()
+
+    def lstat(path):
+        info = original_lstat(path)
+        if path == target:
+            return changed_stat(info, st_dev=visible.st_dev + 11, st_ino=visible.st_ino + 13)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    depth = len(target.parts) - 1
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(target)
+    assert str(raised.value) == (
+        f"OCI runtime ancestor changed during verification: phase=final-identity depth={depth} changed=dev,ino"
+    )
+    assert str(target) not in str(raised.value)
+    assert target.name not in str(raised.value)
+
+
+def test_final_held_stamp_change_includes_gid_and_orders_fields(tmp_path, monkeypatch):
+    simple_ancestors(monkeypatch, tmp_path)
+    verified_fstat = host.os.fstat
+    target_inode = tmp_path.stat().st_ino
+    calls = 0
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        if info.st_ino == target_inode:
+            calls += 1
+            if calls == 3:
+                return changed_stat(info, st_mode=info.st_mode + 1, st_gid=info.st_gid + 1)
+        return info
+
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    depth = len(tmp_path.parts) - 1
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(tmp_path)
+    assert str(raised.value) == (
+        f"OCI runtime ancestor changed during verification: phase=final-stamp depth={depth} changed=mode,gid"
+    )
+
+
+def test_change_diagnostic_is_bounded_and_never_contains_metadata_values_or_unknown_labels(tmp_path, monkeypatch):
+    target = tmp_path / "secret-component"
+    target.mkdir()
+    simple_ancestors(monkeypatch, target)
+    verified_fstat = host.os.fstat
+    target_inode = target.stat().st_ino
+    private_value = 10**200
+    calls = 0
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        if info.st_ino == target_inode:
+            calls += 1
+            if calls == 2:
+                return changed_stat(info, st_ctime_ns=private_value)
+        return info
+
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(target)
+    message = str(raised.value)
+    assert len(message.encode("ascii")) <= host._RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_BYTES
+    assert str(target) not in message
+    assert target.name not in message
+    assert str(private_value) not in message
+    assert "changed=ctime" in message
+
+    bounded = str(
+        host._runtime_ancestor_changed(
+            phase="final-stamp",
+            depth=private_value,
+            changed=("dev", "ino", "mode", "uid", "gid", "ctime"),
+        )
+    )
+    assert "depth=9999+" in bounded
+    assert str(private_value) not in bounded
+    assert len(bounded.encode("ascii")) <= host._RUNTIME_ANCESTOR_MAX_DIAGNOSTIC_BYTES
+
+    fallback = str(host._runtime_ancestor_changed(phase="private-phase", depth=private_value, changed=("secret",)))
+    assert fallback == "OCI runtime ancestor changed during verification"
+
+
+def test_verification_failure_closes_every_opened_descriptor(tmp_path, monkeypatch):
+    simple_ancestors(monkeypatch, tmp_path)
+    verified_fstat = host.os.fstat
+    original_open = host.os.open
+    original_close = host.os.close
+    target_inode = tmp_path.stat().st_ino
+    opened = []
+    closed = []
+    calls = 0
+
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    def metadata(fd):
+        nonlocal calls
+        info = verified_fstat(fd)
+        if info.st_ino == target_inode:
+            calls += 1
+            if calls == 2:
+                return changed_stat(info, st_ctime_ns=info.st_ctime_ns + 1)
+        return info
+
+    monkeypatch.setattr(host.os, "open", tracked_open)
+    monkeypatch.setattr(host.os, "close", tracked_close)
+    monkeypatch.setattr(host.os, "fstat", metadata)
+    with pytest.raises(StateError, match="phase=post-acl"):
+        host.verify_runtime_parent(tmp_path)
+    assert opened
+    assert closed == list(reversed(opened))
+
+
+def test_successful_pin_duplicates_only_final_descriptor_and_keeps_it_open(tmp_path, monkeypatch):
+    simple_ancestors(monkeypatch, tmp_path)
+    original_dup = host.os.dup
+    duplicated = []
+
+    def tracked_dup(descriptor):
+        pinned = original_dup(descriptor)
+        duplicated.append((descriptor, pinned))
+        return pinned
+
+    monkeypatch.setattr(host.os, "dup", tracked_dup)
+    pinned = host.verify_runtime_parent(tmp_path, pin=True)
+    try:
+        assert isinstance(pinned, int)
+        assert len(duplicated) == 1
+        assert pinned == duplicated[0][1]
+        assert host.os.fstat(pinned).st_ino == tmp_path.stat().st_ino
+    finally:
+        os.close(pinned)
+
+
+def test_successful_verification_keeps_existing_stat_acl_and_visible_check_sequence(tmp_path, monkeypatch):
+    simple_ancestors(monkeypatch, tmp_path)
+    verified_fstat = host.os.fstat
+    original_open = host.os.open
+    original_lstat = Path.lstat
+    original_dup = host.os.dup
+    opened = []
+    fstat_calls = []
+    acl_calls = []
+    lstat_calls = []
+    dup_calls = []
+
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_fstat(descriptor):
+        fstat_calls.append(descriptor)
+        return verified_fstat(descriptor)
+
+    def tracked_acl(*args, **kwargs):
+        acl_calls.append(kwargs["pass_fds"][0])
+        return SimpleNamespace(returncode=0, stdout=b"user::rwx\ngroup::--x\nother::--x\n")
+
+    def tracked_lstat(path):
+        lstat_calls.append(path)
+        return original_lstat(path)
+
+    def tracked_dup(descriptor):
+        dup_calls.append(descriptor)
+        return original_dup(descriptor)
+
+    monkeypatch.setattr(host.os, "open", tracked_open)
+    monkeypatch.setattr(host.os, "fstat", tracked_fstat)
+    monkeypatch.setattr(host.subprocess, "run", tracked_acl)
+    monkeypatch.setattr(Path, "lstat", tracked_lstat)
+    monkeypatch.setattr(host.os, "dup", tracked_dup)
+    pinned = host.verify_runtime_parent(tmp_path, pin=True)
+    try:
+        assert len(opened) == len(tmp_path.parts)
+        assert acl_calls == opened
+        assert fstat_calls == [descriptor for descriptor in opened for _ in range(2)] + list(reversed(opened))
+        expected_visible = []
+        visible = tmp_path
+        while True:
+            expected_visible.append(visible)
+            if visible == visible.parent:
+                break
+            visible = visible.parent
+        assert lstat_calls == expected_visible
+        assert dup_calls == [opened[-1]]
+    finally:
+        os.close(pinned)
 
 
 def test_create_only_new_parent_preserves_existing(tmp_path, monkeypatch):

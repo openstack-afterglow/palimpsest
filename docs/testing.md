@@ -162,6 +162,18 @@ this does not itself require the whole guest boot matrix or qualify Gate 2.
 
 ### Other focused paths
 
+Runtime-parent diagnostic-only edits use
+`tests/unit/test_oci_host.py tests/unit/test_oci_run_adapter.py`
+and `tests/unit/test_architecture_guard.py`. Inspect the lane planner as usual;
+this explicit selection covers the verifier and direct launch consumer, not
+the full host-runtime lane. Run the same selection on the pushed server SHA.
+Injected metadata changes test rejection diagnostics, not the cause of a
+previous intermittent native launch failure. Do not relax ACL/identity/ctime
+checks or retry to manufacture a pass. No guest rebuild is needed when guest
+source and packaged bytes are unchanged. Another cold VM attempt requires a
+reviewed fresh-name strategy preserving the retained `exec-cli` definition;
+unit passes do not qualify that unrun native attempt.
+
 The read-only NPROC diagnostic has a small independent feedback loop:
 
 ```sh

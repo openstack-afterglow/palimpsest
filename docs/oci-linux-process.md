@@ -111,3 +111,43 @@ path contract with positive/negative C and native tests before changing the
 device allowlist or packaged ELF. Direct registry-reference intake remains a
 separate unimplemented task. Neither the parser change nor this failed service
 test constitutes a new application build or full Gate 2 qualification.
+
+## Standard-I/O pathname review (2026-09-09, not implemented)
+
+Inherited descriptors and path-based reopening are separate contracts. The
+current workload can write its inherited stdout/stderr, but the private `/dev`
+does not publish `/dev/stdin`, `/dev/stdout`, `/dev/stderr` or `/dev/fd`.
+The [Linux proc FD documentation](https://www.man7.org/linux/man-pages/man5/proc_pid_fd.5.html)
+also distinguishes permission to use an existing descriptor from permission
+to reopen its underlying inode. Therefore merely adding links is not a proven
+fix for the original NGINX failure, particularly after dropping credentials.
+
+A candidate narrow contract is three fixed links to `/proc/self/fd/0`, `/1`
+and `/2`, with an explicit decision on whether the more general `/dev/fd`
+alias is needed. This is a proposal, not an expanded allowlist. The existing
+six device nodes must remain exact, and extra entries, altered targets,
+wrong types/owners and cross-PID targets must be rejected. Creation and
+verification must fit the private tmpfs inode budget, including temporary
+cgroup staging. PID 1's FD masks and capability/securebits/NNP/seccomp boundary
+must remain unchanged.
+
+Before implementation, qualify reopening separately for the main workload's
+inherited console and additional exec's stdout/stderr pipes, for numeric root
+and non-root identities. `exec_child` duplicates separate pipe endpoints onto
+FDs 1/2; this is not evidence that their inode ownership permits reopening
+after credential drop. Do not chmod the shared console or add capabilities
+to bypass this distinction. Any stream transport change needs its own review.
+
+Required evidence remains: real-C positive/negative allowlist tests, packaged
+ELF reproducibility if C changes, original unchanged NGINX default-process
+native proof, and a separate cold public lifecycle proof. Preserve the three
+failed definitions and use a reviewed unique-name strategy for cold testing;
+the existing fixed `exec-cli` test name now collides with retained evidence.
+No new native test or application build is claimed by this review.
+
+A small unprivileged Linux probe on `pieroot-server` confirmed the distinction:
+writing through a newly created anonymous pipe's existing descriptor succeeded,
+while reopening that same endpoint via `/proc/self/fd` after setting its inode
+mode to zero returned EACCES. The probe closed both endpoints and touched no
+VM or filesystem file. This demonstrates the general permission boundary, not
+the actual guest console/pipe modes or the cause of NGINX's failed open.
