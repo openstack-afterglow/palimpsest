@@ -177,6 +177,23 @@ palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
 - `palimpsest run --backend <Tab><Tab>` → lists valid choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
 
 ---
+## Standalone Hub bootstrap and migration
+
+The Hub package is an independent service under `hub/`. Bootstrap creates tables in an empty destination; data migration copies supported rows from a different source database and does not copy filesystem blobs. Keep these operations separate:
+
+```bash
+cd hub
+uv sync --frozen --extra dev
+uv run palimpsest-hub-bootstrap
+uv run palimpsest-hub-migrate-data \
+  --source-url "$SOURCE_DATABASE_URL" \
+  --destination-url "$DESTINATION_DATABASE_URL"
+```
+
+Run `uv run palimpsest-hub` for the API on port `8020` and `uv run palimpsest-hub-worker` for asynchronous Glance exports. Configure the Hub's database, local blob path, Redis URL, and OpenStack settings through the deployment environment; do not commit those values. The API authenticates project-scoped Keystone tokens in `X-Auth-Token`.
+
+See [Living architecture](../ARCHITECTURE.md) for the local/Hub boundary and the exact maintenance check.
+
 
 ## Package vs. KVM-Extra Boundary
 
@@ -195,8 +212,8 @@ Afterglow API containers depend on `palimpsest-local==0.1.0` without the `[kvm]`
 
 | Variable | Description | Default / Fallback |
 |---|---|---|
-| `PALIMPSEST_URL` | Base URL of Afterglow Hub API (e.g. `https://hub.afterglow.dev`) | `--url` CLI argument |
-| `PALIMPSEST_TOKEN` | Bearer token for Hub authentication | **Required for Hub requests** (No CLI flag exists, preventing token leaks in `ps` output) |
+| `PALIMPSEST_URL` | Base URL of the native Palimpsest Hub `/v1` API | `--url` CLI argument |
+| `PALIMPSEST_TOKEN` | Project-scoped Keystone token sent in `X-Auth-Token` | **Required for Hub requests**; supply through a secret manager or process environment, never in docs/state |
 | `PALIMPSEST_REGISTRY` | Registry profile used for unqualified image references | `default` in `registries.toml` |
 | `DOCKER_CONFIG` | Existing Docker configuration and credential-helper directory | `~/.docker` |
 | `XDG_CONFIG_HOME` | Configuration root directory | `~/.config` |

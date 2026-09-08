@@ -31,7 +31,7 @@ def _units(names: str) -> tuple[str, ...]:
 # globs: a new test file must be classified intentionally in code review.
 PORTABLE_FILES = {
     "core-cli": _units("""
-        afterglow_tracking cli_contract cli_project cli_registry completion
+        afterglow_tracking architecture_guard cli_contract cli_project cli_registry completion
         inventory log_stream metrics refs runtime_dispatch runtime_facade
         sandbox_policy state test_lanes ui
     """),

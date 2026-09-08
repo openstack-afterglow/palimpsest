@@ -44,15 +44,16 @@ Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, b
 
 - **API Worker:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`)
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`)
-- **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` or `python -m palimpsest_hub.migrate`
+- **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
+- **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies non-empty source tables into an empty initialized destination; it is not bootstrap.
 
 ### Client Hub Configuration
 
-Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and Keystone token (`PALIMPSEST_TOKEN` or environment) to call native `/v1` Hub endpoints over `X-Auth-Token`.
+Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and a Keystone token from `PALIMPSEST_TOKEN` to call native `/v1` Hub endpoints over `X-Auth-Token`. Keep the token in a secret manager or process environment; do not paste a token into documentation, shell history, or state files.
 
 ```sh
 export PALIMPSEST_URL="http://hub.example:8020"
-export PALIMPSEST_TOKEN="gAAAAAB..."
+# Set PALIMPSEST_TOKEN from your secret-management mechanism.
 
 palimpsest image ls --arch aarch64
 palimpsest --url http://another-hub.example:8020 image ls
@@ -399,6 +400,8 @@ opt-in lanes, not substitutes for portable tests. See the
 [test workflow](docs/testing.md) for selection rules and release checks.
 
 ## Project references
+
+- [Living architecture](ARCHITECTURE.md) — current source map, runtime boundaries, and update procedure
 
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
 - [Installation details](docs/install.md)

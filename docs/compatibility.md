@@ -1,6 +1,6 @@
 # Palimpsest Local Compatibility & Integration Contract
 
-`palimpsest-local` provides an independently versioned Python library and CLI (`palimpsest`) that integrates with Afterglow Hub while enforcing strict artifact verification and local KVM runtime invariants.
+`palimpsest-local` provides an independently versioned Python library and CLI (`palimpsest`) that integrates with Afterglow Hub while enforcing strict artifact verification and local KVM runtime invariants. The current architecture map is [the root `ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 Palimpsest Hub's native `/v1` artifact API and external Docker/OCI `/v2` registries are distinct protocols and storage domains. The client does not reinterpret one as the other.
 
@@ -12,8 +12,8 @@ Palimpsest Hub's native `/v1` artifact API and external Docker/OCI `/v2` registr
 
 - **API Base Prefix:** `/v1`
 - **Authentication Headers:**
-  - `X-Auth-Token: <token>` (Required Keystone auth token)
-  - `X-Project-Id: <project_id>` (Optional project ID scope header)
+  - `X-Auth-Token` (required project-scoped Keystone authentication token)
+  - `X-Project-Id: <project_id>` (optional project ID scope header)
 - **OpenAPI Security Scheme:** `KeystoneToken` (`apiKey` in header `X-Auth-Token`)
 - **Content Media Types:**
   - `application/vnd.afterglow.palimpsest.layer.squashfs.v1` (SquashFS layer)
@@ -131,7 +131,7 @@ Profile mirrors, CA files, plain-HTTP, and TLS-skip settings are inputs to `pali
 | Host Platform: Linux aarch64 | Supported (libvirt/KVM) | KVM acceleration, `virt` machine + EFI firmware, `/dev/kvm`, `qemu:///system`, libvirt default network. |
 | Host Platform: macOS arm64 (Default) | Supported (Lima/VZ) | Apple Silicon default runtime. Uses Lima/VZ backend with persistent `limactl disk` volumes and static TCP port forwarding. |
 | Host Platform: macOS arm64 (Experimental) | Supported (`libvirt-hvf`) | Experimental `libvirt-hvf` backend (`--backend libvirt-hvf`). Hypervisor.framework acceleration (`qemu:///session`, `virt` machine + `hdiutil` seed ISO, SLIRP user-mode `hostfwd` networking, no libvirt network driver). |
-| Root Overlay / Pivot | **Unsupported** | No rootfs pivot or `overlayroot` modification of `/` or `/usr`. |
+| Root Overlay / Pivot (conventional cloud-image path) | **Unsupported** | The conventional runtime keeps the merged tree at `/opt/layers/merged` and does not modify `/` or `/usr`. The separate Linux-amd64 OCI-root path has its own root-transition contract; see [the public runtime roadmap](oci-public-runtime-roadmap.md) and [root proof](oci-root-proof.md). |
 | Remote KVM (`qemu+ssh://`) | **Unsupported** | Local `qemu:///system` daemon connection only. |
 | Multi-Host Scheduling | **Unsupported** | Single-host local KVM execution only. |
 | `palimpsest.yml` projects | **Supported strict subset** | Multi-VM services, dependency-started ordering, environment, typed cloud-init, one network, persistent named block volumes, and lifecycle commands. Unknown Compose fields fail closed. |
@@ -155,11 +155,11 @@ The Dockerfile/BuildKit interface is experimental and does not replace the v1 `P
 - Online builds consult the Hub cache index before executing a miss. Returned content is SHA-256 verified before BuildKit import; Hub errors fail closed rather than falling back to an implicit rebuild. Repeated command/profile `cache-from` and `cache-to` backends are additive and cannot replace mandatory Hub participation.
 - `build --push` publishes the OCI output through Buildx. `build --runtime-push` uploads the verified SquashFS runtime block through Hub `/v1`; the flags are not aliases.
 - Strict `--offline` builds accept only local contexts, digest-pinned local OCI images, a local runtime base, and local cache. They require an already-bootstrapped local `docker-container` builder whose container network mode is `none`, enforce `--network none` for build steps, do not load Palimpsest registry profiles or invoke registry authentication, and create no Hub or remote-registry client. Docker may still read its selected `DOCKER_CONFIG` to locate that local context and builder. `--registry`, `--pull`, both push flags, and external cache backends are rejected.
-- Dockerfile/OCI layers are compacted into one deterministic SquashFS runtime block so VM disk and mount counts do not grow with Dockerfile instruction count.
+- Dockerfile/OCI layers are compacted into one deterministic SquashFS runtime block for the conventional Dockerfile/BuildKit runtime path, so VM disk and mount counts do not grow with Dockerfile instruction count. This single-block statement does not describe the separate OCI-root layer-occurrence materializer.
 - Linux KVM already attaches SquashFS artifacts as read-only raw `virtio-blk` disks. There is no active NFS layer-attachment implementation in this repository.
 - Lima/VZ copies layer files into the guest and mounts them with `loop,ro`. It is a functional Apple Silicon path, not evidence for Linux KVM block transport or production startup performance.
 - Runtime artifact metadata records the BuildKit platform and normalized cloud-image architecture, not a host-specific bus. The per-run state records the actual KVM `virtio-blk` or Lima SCP/loop attachment path.
-- The initial runtime block remains mounted below `/opt/layers/merged`; root pivot and complete OCI rootfs semantics remain unsupported.
+- The conventional runtime block remains mounted below `/opt/layers/merged`; root pivot and complete OCI rootfs semantics remain unsupported there. OCI-root's distinct actual-`/` implementation and constraints are documented in [the public runtime roadmap](oci-public-runtime-roadmap.md).
 
 The complete interface, performance matrix, receipt fields, and acceptance gates are specified in [BuildKit Cache and Block Runtime Workflow](buildkit-block-workflow.md).
 
@@ -167,4 +167,4 @@ The complete interface, performance matrix, receipt fields, and acceptance gates
 
 ## KVM Release Gate Notice
 
-> **Mandatory Release Gate:** Package release `v0.1.0` on PyPI and Afterglow dependency cutover are **blocked** until full integration testing succeeds on a physical Linux x86_64 KVM host (`pytest -m kvm`). Pure unit contracts pass on all development hosts, but hardware-assisted virtualization proof remains a non-negotiable release prerequisite.
+> **Mandatory Release Gate:** Package release `v0.1.0` and Afterglow dependency cutover remain blocked until the required physical Linux x86_64 KVM integration contract is successfully and independently executed (`pytest -m kvm`). This document defines the boundary; it does not claim that a test or live proof was run during this documentation change.

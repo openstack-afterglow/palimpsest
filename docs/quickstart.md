@@ -6,12 +6,26 @@ This guide covers common workflows using the `palimpsest` CLI tool for working w
 
 ## Prerequisites & Environment Setup
 
-Set your Hub URL and Bearer token via environment variables:
+Set the Hub URL and a project-scoped Keystone token through your secret-management mechanism. The token is sent in `X-Auth-Token`; never copy a real token into this guide, shell history, or local state.
 
 ```bash
-export PALIMPSEST_URL="https://hub.afterglow.dev"
-export PALIMPSEST_TOKEN="ag_token_example_12345"
+export PALIMPSEST_URL="https://hub.example.invalid"
+# Set PALIMPSEST_TOKEN from your secret-management mechanism.
 ```
+
+### Standalone Hub bootstrap and data migration
+
+Bootstrap and data migration are separate operations. From the Hub package directory, initialize an empty destination schema first, then (when moving existing rows) copy the three supported tables from a different source database:
+
+```bash
+cd hub
+uv run palimpsest-hub-bootstrap
+uv run palimpsest-hub-migrate-data \
+  --source-url "$SOURCE_DATABASE_URL" \
+  --destination-url "$DESTINATION_DATABASE_URL"
+```
+
+The migration refuses an identical source/destination URL and a non-empty destination table. Run it only after reviewing the source and destination; it does not replace the bootstrap step or move blob files. Start the API and export worker separately with `uv run palimpsest-hub` and `uv run palimpsest-hub-worker`.
 
 These variables authenticate Palimpsest Hub's native `/v1` artifact and cache API. Hub is separate from any Docker/OCI `/v2` registry configured below.
 
