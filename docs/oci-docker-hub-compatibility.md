@@ -132,11 +132,53 @@ literal argv, separate streams, exit status and VM lifecycle. This is neither
 a new image build nor full Gate 2. Guest verifier parity and a fresh original
 Redis rerun remain separate follow-up work at this checkpoint.
 
+### 2026-09-08 guest parity checkpoint (`a991912`)
+
+The portable guest and real C stage-1 now apply the same v3 fragment rule.
+A host/portable differential regression first failed only the zero-fragment
+finite-offset case (one failed, six passed). After correction, focused local
+Python/C/packaged-ELF checks passed 108 (19.26 s). The source and packaged ELF
+provenance pins were updated after two identical offline pinned-toolchain
+builds. No filesystem bounds, whole-lower digest check, protocol ABI, PID 1
+protection or workload/resource policy was changed.
+
+At exact pushed
+[`a991912`](https://github.com/openstack-afterglow/palimpsest/commit/a9919123a02fbd79ca0ad43cb0f6911acc168c70),
+server focused checks passed 106 with two skips (13.51 s). After acquiring the
+missing pinned GCC toolchain image and enabling the Docker PID 1 harness,
+the two skipped nodes alone passed (6.65 s), including two rebuilt ELFs
+matching the packaged bytes. The initial skips were not counted as passes.
+
+The unchanged Redis native proof still **FAILED** (75.60 s), now at
+`root transition rejected; root state is indeterminate; workload disabled`.
+The console confirms ext4 mounted. The C control flow reaches this rejection
+only after lower structural/digest verification and staging-root assembly;
+which internal root-transition check failed is not yet established. No
+entrypoint, Redis readiness, service exec/root-proof or PID 1 denial proof
+passed. Do not call this a capability failure or hide it with image edits,
+privilege changes, or a success/xfail reclassification. The failed run remains
+preserved, its domain was absent in post-failure inventory, and the original
+Redis archive SHA256 still matched the immutable identity above.
+
+The separate existing Palimpsest-built cold public exec proof **PASSED** at
+the same SHA (20.47 s), including run/exec/root reports/stop/rm. Its original
+archive hash remained unchanged. Redis requests 512 MiB / one vCPU; the
+unchanged cold proof uses CLI defaults of 4096 MiB / two vCPUs. An earlier
+operational-plan description incorrectly assigned the smaller budget to both;
+source inspection and independent review corrected the description, not the
+defaults or proof code. Both run with network `none`, one VM at a time.
+
+This is a narrow guest compatibility correction and existing-build regression,
+not a new application-image build, full native negative-control matrix, or
+new Gate 2 qualification. The earlier `hello-world` success and NGINX failure
+remain historical results from their recorded SHA, not reruns of this guest.
+
 ## Next public intake contract
 
-First align host, portable guest and C stage-1 structural validation for valid
-zero-fragment SquashFS, preserving all other checks and PID 1/workload policy,
-then rerun the unchanged original Redis proof. Do not execute the previously
+First isolate the exact Redis root-transition rejection using bounded,
+secret-free diagnostics and targeted regression tests, preserving the original
+image and all PID 1/workload policy. Fragment-rule parity is implemented, but
+does not by itself qualify Redis. Do not execute the previously
 rejected standalone diagnostic. Separately review Linux handling of the
 legacy `ArgsEscaped` field against the OCI/Moby contract before changing the
 existing fail-closed parser. Neither change is justified by silently editing

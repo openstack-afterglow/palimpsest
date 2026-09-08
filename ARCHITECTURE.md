@@ -170,7 +170,9 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
-현재 테스트는 portable unit/contract, separate Hub environment, privileged filesystem, guest-binary, native KVM, BuildKit Gate 1, OCI-root Gate 2로 나뉜다. 2026-09-08 `list --check`와 `core-cli` 1025건, architecture guard focused 13건은 통과했지만 다른 lane의 파일 존재는 여전히 `test-defined`일 뿐 `test-passed`가 아니다.
+현재 테스트는 portable unit/contract, separate Hub environment, privileged filesystem, guest-binary, native KVM, BuildKit Gate 1, OCI-root Gate 2로 나뉜다. 2026-09-08 `list --check`와 `core-cli` 1025건, architecture guard focused 13건이 통과했다. 이후 실제 실행한 선별 검사는 아래 checkpoint에 따로 기록한다. 실행하지 않은 다른 lane의 파일 존재는 여전히 `test-defined`일 뿐 `test-passed`가 아니다.
+
+후속 `a991912`에서 guest fragment 규칙과 배포 ELF를 동기화했다. 로컬 Python/C/ELF 108건(19.26초), 서버 106건·2skip(13.51초) 후 빠진 고정 toolchain과 Docker PID 1 opt-in을 준비한 두 노드가 별도로 통과했다(6.65초). 같은 SHA의 기존 빌드 이미지 cold public exec는 통과(20.47초), 원본 Redis는 filesystem 검증·staging assembly를 지나 root transition에서 실패했다(75.60초). 내부 거부 지점은 아직 미확정이며 workload를 실행하지 않았다. 전체 native 부정 제어 matrix·새 Gate 2·새 애플리케이션 이미지 빌드 통과로 확대하지 않는다. 실패 자료와 원본 archive는 보존하고 다음 검사는 root-transition의 정확한 거부 조건을 좁힌다.
 
 실제 `mksquashfs`를 호출하는 최소 레이어·재현성 검사는 `tests/oci_fs/test_layer_filesystem.py`의 정확한 `native-live` 노드로 분리했다. `PALIMPSEST_OCI_PACK_LIVE=1`과 절대 도구 경로·SHA256 고정값이 있어야 실행하며 portable 선택에서는 제외한다. 입력/tar 64KiB, 검증 출력 1MiB, packer 호출 30초로 제한한 알려진 작은 fixture의 독립 component 검사다. mount·VM·외부 materializer worker의 자원 격리 검증이 아니며, 출력 크기는 생성 뒤 확인하고 최종 reap의 hard deadline이나 부모 강제 종료 뒤 정리를 보장하지 않는다. 실제 실패를 skip/xfail로 바꾸지 않는다. 수정 전 `d255fd2`의 서버에서 디렉터리 전용·빈 레이어가 각각 fragment accounting 오류로 실패했다(0.57초·0.37초). v3 수정의 실제 도구 및 VM 결과는 별도 검증하며 이 실패 재현을 성공 증거로 대신하지 않는다. 정확한 선택 방법은 [테스트 안내](docs/testing.md)에 기록한다.
 
@@ -246,8 +248,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 {
   "schema_version": 1,
   "source_sha256": "ba21461767a8dbd09a3dd155b02fb72f5d610e639b89343027f4005152c09d3e",
-  "reviewed_at": "2026-09-08T08:20:50Z",
-  "summary": "Reviewed guest SquashFS parity after c95d948 Redis failed pre-mount: portable and C predicates now match host v3 without relaxing other checks or PID1/workload/resource policy. Regenerated sealed ELF twice with pinned offline toolchain and updated source/binary provenance; exact acceptance/rejection harness and portable differential regressions added. Local focused Python/C/packaged ELF checks108passed; exact pushed server and original Redis rerun pending. No protocol ABI change or full Gate2 requalification."
+  "reviewed_at": "2026-09-08T08:33:34Z",
+  "summary": "Recorded exact a991912 guest parity verification: local108pass, server106pass2skip then bothmissingnodespass afterpinnedtoolchain and DockerPID1optin; coldpublicexec1pass20.47s. OriginalRedis still fails at roottransition after filesystemverification and stagingassembly75.60s; internalcauseunknown, noentrypoint/capabilityclaim. Existingimages andfailed/retainedevidence preserved. Documentationonly; sourcehash unchanged. Fullnative/Gate2/newimagebuild notrerun."
 }
 ```
 <!-- architecture-review:end -->
