@@ -50,6 +50,7 @@ PORTABLE_FILES = {
         oci_control_protocol oci_control_protocol_v2 oci_fs_fixtures
         oci_guest_filesystems oci_guest_stage1 oci_initramfs oci_process
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
+        oci_guest_transition
     """),
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff

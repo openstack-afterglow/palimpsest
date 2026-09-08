@@ -83,6 +83,20 @@ rejection, `69` filesystem rejection, live-only `70` mount/assembly rejection,
 and live-only `71` root-transition rejection. A partial transition is reported
 as indeterminate rather than rolled back. Live PID 1 never exits: both success
 and failure wait fail-closed.
+
+Before moving any pseudo-filesystem, a rejected initial `proc`, `sys`, or
+`dev` target preparation emits an additional fixed diagnostic:
+`root transition target rejected; target=proc; check=mode` (for example).
+Target names are compile-time literals; checks are a closed set covering
+mkdir, open, stat/type, owner, exact mode, directory read/encoding/emptiness,
+and filesystem identity. No image values, paths, errno, run IDs or secrets
+are emitted. The original exit-71 rejection and indeterminate-state wait
+remain unchanged; later readiness/move/chroot failures remain generic.
+The marker is diagnostic console output, not authenticated READY/root proof,
+and does not imply rollback or authorize workload execution. Success emits
+no new marker. In particular, this diagnostic change does not admit an
+existing root-owned empty `0555` target: exact `0755` is still required.
+
 The root-volume generation is bounded consistently in Python and C to 4096
 canonical decimal digits.
 

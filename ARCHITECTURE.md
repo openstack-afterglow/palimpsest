@@ -154,6 +154,8 @@ uv run palimpsest-hub-worker
 
 API는 401 Keystone validation, 403 system-admin, 404 visibility/ownership, 409 offset/descriptor conflict, 413 size limit, 422 digest/schema 오류를 구분한다. local runtime은 foreign domain, stale/ambiguous ledger, failed ACL/release를 성공으로 제조하지 않는다. 실패한 OCI materializer가 즉시 reap되지 않으면 scratch authority를 background reaper가 보존하므로 임의 삭제하지 않는다. stage-1의 partial root transition은 rollback 성공으로 표시하지 않으며, exact evidence가 없으면 fail-closed한다.
 
+stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 고정 target/check 진단을 남긴다. `safe_dir_checked`는 기존 `safe_dir`와 같은 syscall·검증 순서를 유지하면서 실제 거부 조건을 닫힌 enum으로 반환하고, 다른 호출자는 기존 wrapper를 사용한다. 원본 경로·이미지 데이터·errno·식별자·비밀은 출력하지 않는다. 기존 exit71·indeterminate wait와 이후 generic root-transition 검사는 유지하며 진단 console은 authenticated READY/root 증거가 아니다. root 소유·정확한0755·빈 디렉터리·nofollow·filesystem identity 정책은 그대로다. Redis의 보존 lower에서 관찰한 `/proc`0555와의 충돌은 instrumented native 실행으로 확인해야 하며,0555 허용은 별도 결정이다.
+
 ## Security boundaries
 
 | 주체/경계 | 권한과 인증 | 저장/전송 원칙 |
@@ -247,9 +249,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ba21461767a8dbd09a3dd155b02fb72f5d610e639b89343027f4005152c09d3e",
-  "reviewed_at": "2026-09-08T08:33:34Z",
-  "summary": "Recorded exact a991912 guest parity verification: local108pass, server106pass2skip then bothmissingnodespass afterpinnedtoolchain and DockerPID1optin; coldpublicexec1pass20.47s. OriginalRedis still fails at roottransition after filesystemverification and stagingassembly75.60s; internalcauseunknown, noentrypoint/capabilityclaim. Existingimages andfailed/retainedevidence preserved. Documentationonly; sourcehash unchanged. Fullnative/Gate2/newimagebuild notrerun."
+  "source_sha256": "3cfe2897322dd923abff0abbdabcd33195ac816a04e9f4df8da48ad9e8cd5df4",
+  "reviewed_at": "2026-09-08T09:59:56Z",
+  "summary": "Reviewed fail-only fixed root-transition target/reason diagnostics, unchanged exact-0755 and PID 1 policy, actual C fixture coverage, lane placement and reproducible packaged ELF provenance."
 }
 ```
 <!-- architecture-review:end -->

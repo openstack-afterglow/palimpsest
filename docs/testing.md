@@ -185,6 +185,19 @@ pinned rebuilds matching the packaged bytes. C source checks alone do not
 prove that the shipped binary changed. These tests do not mount an OCI root
 or replace the separately selected original-image native proof.
 
+Transition-target diagnostics have a separate real-C module,
+`tests/unit/test_oci_guest_transition.py`, selected by
+`PALIMPSEST_GUEST_TRANSITION_DOCKER_TESTS=1`. It uses the pinned offline GCC
+image; compilation runs as the invoking UID, and ownership-sensitive checks
+run as container UID 0 with all capabilities dropped, no-new-privileges,
+network disabled, a read-only root/binary and small fresh tmpfs fixtures.
+No host-root fixture mutation is needed. Without the explicit opt-in these
+tests skip; skips are not evidence that C compiled or executed. Fixture
+checks and fixed marker formatting do not qualify OverlayFS mount/move or
+root identity; retain separate native positives/negatives and original-image
+verification. In particular, a diagnostic native Redis failure remains a
+compatibility failure, even when it successfully identifies the rejecting check.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire

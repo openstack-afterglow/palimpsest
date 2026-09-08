@@ -2987,16 +2987,48 @@ static __attribute__((noreturn)) void service_terminal_lifecycle(
     }
 }
 
-static int safe_dir(const char *path, int create, int require_empty, int expected_mode, int *kept_fd) {
+enum safe_dir_reason {
+    SAFE_DIR_REASON_UNKNOWN = 0,
+    SAFE_DIR_REASON_MKDIR,
+    SAFE_DIR_REASON_OPEN,
+    SAFE_DIR_REASON_STAT_TYPE,
+    SAFE_DIR_REASON_OWNER,
+    SAFE_DIR_REASON_MODE,
+    SAFE_DIR_REASON_DIRECTORY_READ,
+    SAFE_DIR_REASON_INVALID,
+    SAFE_DIR_REASON_NONEMPTY,
+    SAFE_DIR_REASON_FILESYSTEM_IDENTITY,
+};
+
+static int safe_dir_checked(const char *path, int create, int require_empty, int expected_mode,
+                            int *kept_fd, enum safe_dir_reason *reason) {
     struct stat_local st;
     i64 fd, r;
+    if (reason) *reason = SAFE_DIR_REASON_UNKNOWN;
     if (create) {
         r = sc2(SYS_mkdir, (i64)path, expected_mode ? expected_mode : 0755);
-        if (r != 0 && r != -EEXIST) return 0;
+        if (r != 0 && r != -EEXIST) {
+            if (reason) *reason = SAFE_DIR_REASON_MKDIR;
+            return 0;
+        }
     }
     fd = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
-    if (fd < 0 || sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFDIR ||
-        (expected_mode && (st.uid != 0 || st.gid != 0 || (st.mode & 07777) != (u32)expected_mode))) {
+    if (fd < 0) {
+        if (reason) *reason = SAFE_DIR_REASON_OPEN;
+        return 0;
+    }
+    if (sc2(SYS_fstat, fd, (i64)&st) < 0 || (st.mode & S_IFMT) != S_IFDIR) {
+        if (reason) *reason = SAFE_DIR_REASON_STAT_TYPE;
+        sc1(SYS_close, fd);
+        return 0;
+    }
+    if (expected_mode && (st.uid != 0 || st.gid != 0)) {
+        if (reason) *reason = SAFE_DIR_REASON_OWNER;
+        sc1(SYS_close, fd);
+        return 0;
+    }
+    if (expected_mode && (st.mode & 07777) != (u32)expected_mode) {
+        if (reason) *reason = SAFE_DIR_REASON_MODE;
         if (fd >= 0) sc1(SYS_close, fd);
         return 0;
     }
@@ -3005,19 +3037,29 @@ static int safe_dir(const char *path, int create, int require_empty, int expecte
         for (;;) {
             i64 n = sc3(SYS_getdents64, fd, (i64)entries, sizeof(entries));
             usize offset = 0;
-            if (n < 0) { sc1(SYS_close, fd); return 0; }
+            if (n < 0) {
+                if (reason) *reason = SAFE_DIR_REASON_DIRECTORY_READ;
+                sc1(SYS_close, fd); return 0;
+            }
             if (!n) break;
             while (offset < (usize)n) {
                 const u8 *entry = entries + offset;
                 usize name_bytes, i;
                 u32 reclen;
-                if ((usize)n - offset < 20) { sc1(SYS_close, fd); return 0; }
+                if ((usize)n - offset < 20) {
+                    if (reason) *reason = SAFE_DIR_REASON_INVALID;
+                    sc1(SYS_close, fd); return 0;
+                }
                 reclen = (u32)entry[16] | ((u32)entry[17] << 8);
-                if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, fd); return 0; }
+                if (reclen < 20 || reclen > (usize)n - offset) {
+                    if (reason) *reason = SAFE_DIR_REASON_INVALID;
+                    sc1(SYS_close, fd); return 0;
+                }
                 name_bytes = reclen - 19;
                 for (i = 0; i < name_bytes && entry[19 + i]; i++) {}
                 if (i == name_bytes || !((i == 1 && entry[19] == '.') ||
                     (i == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                    if (reason) *reason = i == name_bytes ? SAFE_DIR_REASON_INVALID : SAFE_DIR_REASON_NONEMPTY;
                     sc1(SYS_close, fd); return 0;
                 }
                 offset += reclen;
@@ -3026,6 +3068,10 @@ static int safe_dir(const char *path, int create, int require_empty, int expecte
     }
     *kept_fd = (int)fd;
     return 1;
+}
+
+static int safe_dir(const char *path, int create, int require_empty, int expected_mode, int *kept_fd) {
+    return safe_dir_checked(path, create, require_empty, expected_mode, kept_fd, 0);
 }
 
 static int stable_dir(const char *path, int fd, i64 magic) {
@@ -3277,9 +3323,44 @@ static int assemble_staging_root(const struct expected_device_set *expected, str
     return 1;
 }
 
-static int transition_target_dir(const char *path, int *kept_fd) {
-    return safe_dir(path, 1, 1, 0755, kept_fd) &&
-           stable_dir(path, *kept_fd, OVERLAYFS_MAGIC);
+static int transition_target_dir_checked(const char *path, int *kept_fd,
+                                         enum safe_dir_reason *reason) {
+    if (!safe_dir_checked(path, 1, 1, 0755, kept_fd, reason)) return 0;
+    if (stable_dir(path, *kept_fd, OVERLAYFS_MAGIC)) return 1;
+    if (reason) *reason = SAFE_DIR_REASON_FILESYSTEM_IDENTITY;
+    return 0;
+}
+
+static const char *safe_dir_reason_text(enum safe_dir_reason reason) {
+    switch (reason) {
+        case SAFE_DIR_REASON_MKDIR: return "mkdir";
+        case SAFE_DIR_REASON_OPEN: return "open";
+        case SAFE_DIR_REASON_STAT_TYPE: return "stat/type";
+        case SAFE_DIR_REASON_OWNER: return "owner";
+        case SAFE_DIR_REASON_MODE: return "mode";
+        case SAFE_DIR_REASON_DIRECTORY_READ: return "directory-read";
+        case SAFE_DIR_REASON_INVALID: return "invalid";
+        case SAFE_DIR_REASON_NONEMPTY: return "nonempty";
+        case SAFE_DIR_REASON_FILESYSTEM_IDENTITY: return "filesystem identity";
+        default: return "unknown";
+    }
+}
+
+enum transition_target {
+    TRANSITION_TARGET_PROC = 0,
+    TRANSITION_TARGET_SYS,
+    TRANSITION_TARGET_DEV,
+};
+
+static void transition_target_rejected(enum transition_target target, enum safe_dir_reason reason) {
+    write_all(2, "palimpsest guest stage1: root transition target rejected; target=");
+    if (target == TRANSITION_TARGET_PROC) write_all(2, "proc");
+    else if (target == TRANSITION_TARGET_SYS) write_all(2, "sys");
+    else if (target == TRANSITION_TARGET_DEV) write_all(2, "dev");
+    else write_all(2, "unknown");
+    write_all(2, "; check=");
+    write_all(2, safe_dir_reason_text(reason));
+    write_all(2, "\n");
 }
 
 static int transition_target_ready(const char *path, int retained_fd) {
@@ -3406,16 +3487,26 @@ static int transition_root(struct expected_device_set *expected, struct opened_r
     struct held_filesystem dev = {.fd = -1}, sys = {.fd = -1}, proc = {.fd = -1};
     struct stat_local merged_identity;
     int dev_target = -1, sys_target = -1, proc_target = -1;
+    enum safe_dir_reason target_reason = SAFE_DIR_REASON_UNKNOWN;
     u32 i;
     int valid;
     if (merged_fd < 0 || sc2(SYS_fstat, merged_fd, (i64)&merged_identity) < 0 ||
         (merged_identity.mode & S_IFMT) != S_IFDIR ||
         !hold_filesystem("/dev", 0x01021994, &dev) ||
         !hold_filesystem("/sys", 0x62656572, &sys) ||
-        !hold_filesystem("/proc", 0x9fa0, &proc) ||
-        !transition_target_dir("/run/palimpsest/merged/proc", &proc_target) ||
-        !transition_target_dir("/run/palimpsest/merged/sys", &sys_target) ||
-        !transition_target_dir("/run/palimpsest/merged/dev", &dev_target)) goto rejected;
+        !hold_filesystem("/proc", 0x9fa0, &proc)) goto rejected;
+    if (!transition_target_dir_checked("/run/palimpsest/merged/proc", &proc_target, &target_reason)) {
+        transition_target_rejected(TRANSITION_TARGET_PROC, target_reason);
+        goto rejected;
+    }
+    if (!transition_target_dir_checked("/run/palimpsest/merged/sys", &sys_target, &target_reason)) {
+        transition_target_rejected(TRANSITION_TARGET_SYS, target_reason);
+        goto rejected;
+    }
+    if (!transition_target_dir_checked("/run/palimpsest/merged/dev", &dev_target, &target_reason)) {
+        transition_target_rejected(TRANSITION_TARGET_DEV, target_reason);
+        goto rejected;
+    }
     if (!transition_target_ready("/run/palimpsest/merged/dev", dev_target)) goto rejected;
     sc1(SYS_close, dev_target); dev_target = -1;
     if (sc5(SYS_mount, (i64)"/dev", (i64)"/run/palimpsest/merged/dev", 0, MS_MOVE, 0) != 0) goto rejected;
