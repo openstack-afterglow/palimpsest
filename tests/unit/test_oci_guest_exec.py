@@ -75,6 +75,17 @@ static __attribute__((used, noreturn)) void harness_main(void) {
             exit_now(101);
         exit_now(0);
     }
+    if (mode == 12) {
+        struct expected_device expected;
+        i64 fd;
+        memset(&expected, 0, sizeof(expected));
+        expected.size = 512;
+        fd = sc3(SYS_open, (i64)"@SQUASHFS_FIXTURE@", O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+        if (fd < 0) exit_now(104);
+        i = verify_squashfs_structure_fd((int)fd, &expected) ? 0 : 2;
+        if (sc1(SYS_close, fd) != 0) exit_now(105);
+        exit_now((int)i);
+    }
     if (mode == 3) session.state = LIFECYCLE_STOPPING;
     if (mode == 8) session.last_exec_request_id = 9;
     if (mode == 9) remote_exec.active = 1;
@@ -136,8 +147,11 @@ def runner(tmp_path_factory):
     directory = tmp_path_factory.mktemp("guest-exec-c")
     repository = Path(__file__).resolve().parents[2]
     source = "/repo/guest/stage1/init.c" if docker else str(repository / "guest/stage1/init.c")
+    squashfs_fixture = "/out/lower.raw" if docker else str(directory / "lower.raw")
     (directory / "harness.c").write_text(
-        _HARNESS.replace("@SOURCE@", source).replace("@KEY_ID@", wire.key_identifier(_KEY))
+        _HARNESS.replace("@SOURCE@", source)
+        .replace("@KEY_ID@", wire.key_identifier(_KEY))
+        .replace("@SQUASHFS_FIXTURE@", squashfs_fixture)
     )
     flags = [
         "-std=c11",
@@ -195,7 +209,68 @@ def runner(tmp_path_factory):
     def execute(frame, mode=0):
         return subprocess.run(command, input=bytes([mode]) + frame[4:], capture_output=True, timeout=15, check=False)
 
+    execute.squashfs_fixture = directory / "lower.raw"
+
     return execute
+
+
+def _structural_squashfs(*, fragments, fragment_table_start, id_table_start=144, padding=None):
+    maximum = 2**64 - 1
+    bytes_used = 160
+    payload = struct.pack(
+        "<5I6H8Q",
+        0x73717368,
+        1,
+        0,
+        131072,
+        fragments,
+        1,
+        17,
+        0,
+        1,
+        4,
+        0,
+        0,
+        bytes_used,
+        id_table_start,
+        maximum,
+        96,
+        112,
+        fragment_table_start,
+        maximum,
+    )
+    payload += b"\0" * (bytes_used - len(payload))
+    return payload + (padding if padding is not None else b"\0" * (512 - bytes_used))
+
+
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    [
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=128), True, id="zero-finite"),
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=2**64 - 1), True, id="zero-sentinel"),
+        pytest.param(_structural_squashfs(fragments=1, fragment_table_start=128), True, id="nonzero-finite"),
+        pytest.param(_structural_squashfs(fragments=1, fragment_table_start=2**64 - 1), False, id="nonzero-sentinel"),
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=160), False, id="out-of-range"),
+        pytest.param(
+            _structural_squashfs(fragments=0, fragment_table_start=128, id_table_start=2**64 - 1),
+            False,
+            id="required-table",
+        ),
+        pytest.param(
+            _structural_squashfs(
+                fragments=0,
+                fragment_table_start=128,
+                padding=b"\0" * (512 - 161) + b"x",
+            ),
+            False,
+            id="nonzero-padding",
+        ),
+    ],
+)
+def test_real_c_squashfs_structural_acceptance_matches_v3(runner, payload, accepted):
+    runner.squashfs_fixture.write_bytes(payload)
+    result = runner(b"\0\0\0\0", mode=12)
+    assert result.returncode == (0 if accepted else 2), result.stderr
 
 
 def _frame(argv=("/bin/demo",), timeout=1000):
@@ -242,9 +317,7 @@ def test_real_c_root_identity_drift_clears_evidence_and_suppresses_ready(runner)
     assert len(frames) == 1
     ready = frames[0]
     assert ready.kind == "READY"
-    assert ready.binding == wire.OCIControlV2Binding(
-        _RUN, "sha256:" + "a" * 64, "sha256:" + "b" * 64
-    )
+    assert ready.binding == wire.OCIControlV2Binding(_RUN, "sha256:" + "a" * 64, "sha256:" + "b" * 64)
     assert ready.boot_attempt_id == _ATTEMPT
     assert ready.boot_generation == _GENERATION
     assert ready.wire_sequence == 4

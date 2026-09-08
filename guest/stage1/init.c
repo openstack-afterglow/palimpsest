@@ -1545,7 +1545,7 @@ static int verify_squashfs_structure_fd(int fd, const struct expected_device *ex
     if (required[1] >= required[2] || (root_inode >> 16) >= bytes_used - required[1]) return 0;
     root_offset = required[1] + (root_inode >> 16);
     if (root_offset >= bytes_used) return 0;
-    if ((fragments == 0) != (offsets[4] == ~(u64)0)) return 0;
+    if (fragments > 0 && offsets[4] == ~(u64)0) return 0;
     if (!!(flags & 0x80) != (offsets[5] != ~(u64)0)) return 0;
     padding = expected->size - bytes_used;
     if (padding >= block_size) return 0;

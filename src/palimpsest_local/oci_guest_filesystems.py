@@ -24,7 +24,7 @@ EXT4_FEATURE_INCOMPAT_64BIT = 0x80
 EXT4_FEATURE_RO_COMPAT_METADATA_CSUM = 0x400
 
 SQUASHFS_SUPERBLOCK_BYTES = 96
-SQUASHFS_STRUCTURAL_POLICY = "palimpsest.squashfs-superblock.v2"
+SQUASHFS_STRUCTURAL_POLICY = "palimpsest.squashfs-superblock.v3"
 MAX_STAGE1_FILESYSTEM_VERIFY_BYTES = 32 * 1024**3
 _UINT64_MAX = (1 << 64) - 1
 _SQUASHFS = struct.Struct("<5I6H8Q")
@@ -204,7 +204,7 @@ def verify_squashfs_superblock(payload: bytes, *, device_size: int, padding: byt
         raise ArtifactValidationError("SquashFS required tables are unavailable")
     if inode_start >= directory_start or root_inode >> 16 >= bytes_used - inode_start:
         raise ArtifactValidationError("SquashFS root inode location is invalid")
-    if (fragments == 0) != (fragment_start == _UINT64_MAX):
+    if fragments > 0 and fragment_start == _UINT64_MAX:
         raise ArtifactValidationError("SquashFS fragment accounting is invalid")
     if bool(flags & 0x80) != (export_start != _UINT64_MAX):
         raise ArtifactValidationError("SquashFS export accounting is invalid")

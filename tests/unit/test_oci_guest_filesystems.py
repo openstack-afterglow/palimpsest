@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import struct
+import tempfile
 
 import pytest
 
+from palimpsest_local import oci_packer
 from palimpsest_local._oci_stage1_kvm_proof import (
     _filesystem_negative_context,
     _mutated_filesystem_payload,
@@ -16,11 +19,102 @@ from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_guest_filesystems import (
     EXT4_SUPERBLOCK_BYTES,
     EXT4_SUPERBLOCK_OFFSET,
+    SQUASHFS_STRUCTURAL_POLICY,
     ext4_primary_superblock_checksum,
     verify_ext4_superblock,
     verify_lower_device,
     verify_squashfs_superblock,
 )
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+def _structural_squashfs(
+    *,
+    fragments: int,
+    fragment_table_start: int,
+    id_table_start: int = 144,
+    padding: bytes | None = None,
+) -> bytes:
+    bytes_used = 160
+    image = struct.pack(
+        "<5I6H8Q",
+        0x73717368,
+        1,
+        0,
+        131072,
+        fragments,
+        1,
+        17,
+        0,
+        1,
+        4,
+        0,
+        0,
+        bytes_used,
+        id_table_start,
+        _UINT64_MAX,
+        96,
+        112,
+        fragment_table_start,
+        _UINT64_MAX,
+    )
+    image += b"\0" * (bytes_used - len(image))
+    return image + (padding if padding is not None else b"\0" * (512 - bytes_used))
+
+
+def _host_accepts(payload: bytes) -> bool:
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        try:
+            oci_packer.verify_squashfs_fd(image.fileno(), len(payload), len(payload))
+        except oci_packer.SquashFSPackError:
+            return False
+    return True
+
+
+def _portable_guest_accepts(payload: bytes) -> bool:
+    bytes_used = int.from_bytes(payload[40:48], "little")
+    try:
+        verify_squashfs_superblock(payload[:96], device_size=len(payload), padding=payload[bytes_used:])
+    except ArtifactValidationError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    [
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=128), True, id="zero-finite"),
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=_UINT64_MAX), True, id="zero-sentinel"),
+        pytest.param(_structural_squashfs(fragments=1, fragment_table_start=128), True, id="nonzero-finite"),
+        pytest.param(_structural_squashfs(fragments=1, fragment_table_start=_UINT64_MAX), False, id="nonzero-sentinel"),
+        pytest.param(_structural_squashfs(fragments=0, fragment_table_start=160), False, id="out-of-range"),
+        pytest.param(
+            _structural_squashfs(fragments=0, fragment_table_start=128, id_table_start=_UINT64_MAX),
+            False,
+            id="required-table",
+        ),
+        pytest.param(
+            _structural_squashfs(
+                fragments=0,
+                fragment_table_start=128,
+                padding=b"\0" * (512 - 161) + b"x",
+            ),
+            False,
+            id="nonzero-padding",
+        ),
+    ],
+)
+def test_host_and_portable_guest_squashfs_structural_acceptance_are_identical(payload: bytes, accepted: bool) -> None:
+    assert _host_accepts(payload) is accepted
+    assert _portable_guest_accepts(payload) is accepted
+
+
+def test_host_and_portable_guest_share_squashfs_structural_policy_identity() -> None:
+    assert SQUASHFS_STRUCTURAL_POLICY == oci_packer.SQUASHFS_STRUCTURAL_VERIFIER_ID
+    assert SQUASHFS_STRUCTURAL_POLICY == "palimpsest.squashfs-superblock.v3"
 
 
 def _root_superblock() -> tuple[bytearray, int, str, str]:

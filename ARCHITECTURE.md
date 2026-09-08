@@ -13,7 +13,7 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
-구현 상태와 검증 수준은 분리한다. 2026-09-08 portable lane manifest 검사와 `core-cli` 1025건, architecture guard focused 13건이 통과했다. privileged filesystem·guest binary·native KVM·BuildKit·Hub 계층은 실행하지 않았다.
+구현 상태와 검증 수준은 분리한다. 2026-09-08 아키텍처 정리 시 portable lane manifest 검사와 합쳐진 작업트리의 `core-cli` 1025건, architecture guard focused 13건이 통과했다. 이후 `c95d948`의 서버 관련 검사 567건·real packer 3건과 기존 빌드 이미지의 cold public exec 1건이 통과했다. 같은 SHA의 원본 Redis는 변환 뒤 stage-1 filesystem 검증에서 실패했다. 아래 현재 checkpoint와 역사적 qualification을 구분하며 전체 suite·Gate 2 재통과를 뜻하지 않는다.
 
 | 기능 | Implementation | Verification evidence | Current limit | Source |
 | --- | --- | --- | --- | --- |
@@ -121,6 +121,7 @@ flowchart LR
 - `.sqsh`의 SHA-256은 derived runtime bytes의 identity다. archive tar SHA-256은 transport identity이고 manifest digest와 다르다.
 - `DerivedSquashFSKey.digest`는 compressed digest, size, DiffID, normalization/tar/pack policy, packer version/executable/dependency digest와 structural verifier를 포함한 recipe/cache identity다.
 - [`oci_packer.py:verify_squashfs_fd`](src/palimpsest_local/oci_packer.py)의 구조 검증은 `palimpsest.squashfs-superblock.v3`다. fragment가 0개이면 기존 범위 검사를 통과한 유한 table offset 또는 미사용 sentinel을 허용하고, 1개 이상이면 table이 있어야 한다. 필수 table·범위·root 위치·padding 검사는 유지한다. v3는 기존 recipe/receipt에 반영돼 v2와 다른 cache key를 만들며 이전 기록을 삭제하거나 자동 변환하지 않는다.
+- 같은 fragment 규칙을 [`oci_guest_filesystems.py`](src/palimpsest_local/oci_guest_filesystems.py)의 portable pre-mount 검증과 [`guest/stage1/init.c`](guest/stage1/init.c)의 실제 FD 검증에도 적용한다. host/portable 차등 검사와 실제 C 하네스가 zero/nonzero·필수 table·범위·padding 수락/거부를 따로 확인한다. 배포 ELF는 고정 offline toolchain으로 재생성하고 source/binary provenance digest를 갱신한다. 전체 lower digest·plan/장치 identity·PID 1 보호·capability/seccomp/no-new-privs·자원 정책은 변경하지 않는다. 이 동기화 전 `c95d948`의 Redis는 stage-1 filesystem 거부로 실패했으며 native 재통과는 별도 증거가 필요하다.
 - `OCIImageMaterializationReceipt`는 source snapshot binding, source image/manifest/config, ordered layer descriptors/DiffIDs와 결과 receipt를 결합한다. receipt digest는 `.sqsh` bytes digest와 별개다.
 - `run_id`/run name, `OCIRootVolumeRecord.volume_id`와 generation, `ArtifactLeaseOwner`/lease-set ID, libvirt domain UUID, monitor authority는 lifecycle identity다. retained root 재사용은 같은 lower graph/size와 exclusive attachment 조건을 다시 확인한다.
 - Hub layer `kind`는 `cloud-image`, `squashfs`, `buildkit-cache`를 구분한다. cloud image는 `disk_format`과 `arch`가 필요하고 parent/chain이 없으며, BuildKit cache는 runtime architecture/parent chain이 없다.
@@ -212,7 +213,7 @@ uv run python scripts/test_lanes.py run gate1
 uv run python scripts/test_lanes.py run gate2
 ```
 
-`guest-binary`, `filesystem`, `native-live`, `gate1`, `gate2`는 각각 문서화된 environment variable, Linux tools, `/dev/kvm`, Docker Buildx 또는 qualified host가 없으면 통과 증거가 아니다. 이 문서 작업에서는 `list --check`, `core-cli`와 guard만 실행했고 live provider/Glance/KVM 실행을 관찰하지 않았다.
+`guest-binary`, `filesystem`, `native-live`, `gate1`, `gate2`는 각각 문서화된 environment variable, Linux tools, `/dev/kvm`, Docker Buildx 또는 qualified host가 없으면 통과 증거가 아니다. 아키텍처 정리 자체의 검사는 `list --check`, `core-cli`와 guard에 한정했다. 후속 `c95d948`의 선별 KVM 결과는 [이미지별 호환성 기록](docs/oci-docker-hub-compatibility.md)에 별도로 기록하며 live provider/Glance·전체 native matrix 통과로 확대하지 않는다.
 
 ## Change guide
 
@@ -244,9 +245,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "db41b85c87fc60baf118875d105ed5420cf4adbc4404fce6e8be06d376e3f809",
-  "reviewed_at": "2026-09-08T07:57:17Z",
-  "summary": "Reviewed confirmed zero-fragment rejection from real mksquashfs4.6.1 at d255fd2. Narrow verifier correction keeps all other bounds and increments structural identity to v3; regression tests cover zero/nonzero tables, padding and actual recipe key separation. No guest, PID1 or resource policy changes. Corrected native and original VM checks still pending."
+  "source_sha256": "ba21461767a8dbd09a3dd155b02fb72f5d610e639b89343027f4005152c09d3e",
+  "reviewed_at": "2026-09-08T08:20:50Z",
+  "summary": "Reviewed guest SquashFS parity after c95d948 Redis failed pre-mount: portable and C predicates now match host v3 without relaxing other checks or PID1/workload/resource policy. Regenerated sealed ELF twice with pinned offline toolchain and updated source/binary provenance; exact acceptance/rejection harness and portable differential regressions added. Local focused Python/C/packaged ELF checks108passed; exact pushed server and original Redis rerun pending. No protocol ABI change or full Gate2 requalification."
 }
 ```
 <!-- architecture-review:end -->

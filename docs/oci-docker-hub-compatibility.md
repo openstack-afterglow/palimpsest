@@ -47,7 +47,7 @@ domain, default workload readiness, additional public exec, app root identity
 matching authenticated PID 1 root evidence, direct PID 1 access refusal and
 normal cleanup. They must preserve source archives and failure evidence.
 
-### 2026-09-08 native results
+### 2026-09-08 initial native results (`f606e32`)
 
 All three independently selected checks ran on pushed commit
 [`f606e32`](https://github.com/openstack-afterglow/palimpsest/commit/f606e32f497d835ffa04cf03655e920a22fa7917)
@@ -69,7 +69,7 @@ A proposed standalone Redis diagnostic was **not executed**: independent
 review still rejected its interruption/descendant-cleanup guarantees and an
 observation path that could replace the production error. Its rejected review
 evidence is preserved separately from the native results. The precise packer
-error remains unresolved; zero-fragment superblock handling is only a
+error remained unresolved at this checkpoint; zero-fragment superblock handling was only a
 code-inspection hypothesis, not an observed diagnostic result or a fix.
 
 These are new real-image compatibility checks, not a new image build or full
@@ -101,14 +101,43 @@ privileged operations such as switching user or changing ownership. Such a
 failure must be reported, not hidden by weakening PID 1 protection or granting
 privileges.
 
+### 2026-09-08 zero-fragment follow-up
+
+The in-repository, individually selected real-packer regressions at pushed
+`d255fd2` reproduced the fragment-accounting rejection for directory-only and
+empty layers (0.57 s and 0.37 s). The previously rejected standalone diagnostic
+was not executed. These small production-packer component tests are not
+worker-isolation or VM qualification; their limits are in [testing](testing.md).
+
+At pushed `c95d948`, the host structural verifier v3 accepts an already-bounded
+finite fragment-table offset for zero fragments, without changing the other
+structural checks. Local focused checks passed 560 with seven Linux skips;
+the same server selection passed 567 (169.94 s). Three real-packer cases,
+including deterministic output, passed (0.71 s). These overlapping results
+are not a full-suite aggregate.
+
+The unchanged original Redis proof then passed layer conversion but failed
+after VM boot (75.98 s). Its console reported stage-1 filesystem contract
+rejection before mounting, not workload readiness. Read-only examination of
+the seven generated lowers found the portable guest verifier rejected exactly
+the two zero-fragment images, with finite offsets 188 and 136; the other five
+passed. Both the portable guest verifier and C stage-1 verifier still contained
+the old predicate. No Redis entrypoint/capability failure is established by
+this attempt. The failed runtime and source archive remain preserved; no
+domain remained in the read-only post-failure inventory.
+
+Separately, the existing immutable Palimpsest-built image passed the cold
+public run/exec/stop/rm proof at the same SHA (one test, 21.92 s), including
+literal argv, separate streams, exit status and VM lifecycle. This is neither
+a new image build nor full Gate 2. Guest verifier parity and a fresh original
+Redis rerun remain separate follow-up work at this checkpoint.
+
 ## Next public intake contract
 
-First diagnose Redis's directory-only layer pack failure without changing
-source bytes or product sandbox limits; separately disclose any standalone
-diagnostic CPU/deadline budget. The next reproducer needs a reviewed owned
-process boundary covering preparation, launch and interruption cleanup,
-plus observations that cannot replace the original verifier error. Do not
-execute the currently rejected diagnostic. Separately review Linux handling of the
+First align host, portable guest and C stage-1 structural validation for valid
+zero-fragment SquashFS, preserving all other checks and PID 1/workload policy,
+then rerun the unchanged original Redis proof. Do not execute the previously
+rejected standalone diagnostic. Separately review Linux handling of the
 legacy `ArgsEscaped` field against the OCI/Moby contract before changing the
 existing fail-closed parser. Neither change is justified by silently editing
 the downloaded image or bypassing its validator.

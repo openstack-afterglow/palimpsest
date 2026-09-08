@@ -168,6 +168,23 @@ and [Linux reader](https://github.com/torvalds/linux/blob/v6.6/fs/squashfs/super
 Run the unchanged real-packer nodes again after the fix; a portable structural
 fixture is not proof of native format compatibility.
 
+At `c95d948`, all three real-packer cases passed on the server (0.71 s), but
+the original Redis VM then exposed the same obsolete predicate in portable
+guest and C stage-1 validation. Host parser success alone therefore does not
+qualify guest filesystem compatibility. Keep portable/C differential cases
+separate from native VM proofs, and retain nonzero missing-table, bounds,
+required-table, padding and whole-device digest negative controls.
+
+For guest parity edits, the focused portable selection is
+`tests/unit/test_oci_guest_filesystems.py tests/unit/test_oci_initramfs.py`.
+The actual C source harness is `tests/unit/test_oci_guest_exec.py`; Linux uses
+host `cc`, while macOS requires explicit `PALIMPSEST_GUEST_EXEC_DOCKER_TESTS=1`
+with the existing pinned offline GCC image. The packaged ELF is separately
+checked by `tests/integration/test_oci_guest_stage1_binary.py`, including two
+pinned rebuilds matching the packaged bytes. C source checks alone do not
+prove that the shipped binary changed. These tests do not mount an OCI root
+or replace the separately selected original-image native proof.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire
