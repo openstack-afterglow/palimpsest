@@ -221,13 +221,73 @@ proposed next change only. User approval is pending; the current implementation
 still rejects it. Do not chmod the image, broaden other target modes, relax
 PID 1 protection or count the diagnostic failure as a compatibility pass.
 
+### 2026-09-08 approved proc-mode checkpoint (`d9b3593`)
+
+Following explicit user approval, exact pushed
+[`d9b3593`](https://github.com/openstack-afterglow/palimpsest/commit/d9b3593774b11e62283a075e7df55838c6f0412a)
+admits root-owned empty `proc` targets with either exact `0755` or `0555`.
+Generic directory checks and `dev`/`sys` remain unchanged. Nofollow, type,
+owner, mode and emptiness validation retain their original order. An immutable
+initial device/inode/mode/UID/GID snapshot is compared against both retained
+and reopened descriptors before each mount move; changes between the two
+admitted modes still reject. Runtime readiness fixes OverlayFS magic. No
+chmod, original-image edit, PID 1 protection or workload privilege change was
+made. This approval supersedes the pending decision in the previous checkpoint.
+
+A real C baseline test first failed with the original proc/mode diagnostic
+(2.43 s). An intermediate candidate then failed both mode-change tests;
+the initial snapshot correction addressed those failures rather than removing
+the tests. A later inode-replacement fixture setup failure was corrected to
+replace a child inside tmpfs, without increasing Docker privileges. Final
+actual-C tests passed 22 (5.70 s). The final pinned offline ELF builds were
+identical and matched the packaged binary/provenance pins. Local focused
+checks passed 209 (32.93 s); the same selection passed 209 without skips on
+the exact server SHA (43.16 s), including two packaged-ELF rebuilds. These
+overlapping counts are not a full-suite aggregate.
+
+The dedicated packaged-stage-1 native proof **PASSED** again (123.43 s):
+43 boots / 44 QEMU invocations, including existing real root-transition and
+PID 1/workload-isolation controls. This is not the entire native suite or a
+new Gate 2 qualification.
+
+The unchanged Redis service proof still **FAILED** (61.67 s), now waiting for
+the application's `Ready to accept connections` message. Public `run -d`
+returned successfully. Its console records completed root transition with
+root as `/`, committed workload isolation, workload startup and lifecycle
+READY. The previous proc/mode rejection is resolved on this real original
+image. The entrypoint then reports
+`setpriv: keep process capabilities failed: Operation not permitted`, and
+PID 1 records main status 1 after terminal root synchronization and cgroup
+cleanup. This is the observed next boundary, not a Redis readiness success.
+Service exec, authenticated root-report comparison and direct PID 1 refusal
+checks were not reached. Do not claim those service proofs passed or grant
+additional privileges to conceal the entrypoint failure.
+
+The failed runtime, root disk and console are preserved. An all-domain name
+listing initially blocked the cold public exec preflight. A subsequent exact
+domain query showed `shut off`: only its persistent definition remained, not
+an active 512 MiB / one vCPU guest. The earlier description of a running VM
+and request to stop it were corrected; no manual stop or deletion occurred.
+An independently approved replacement plan preserved that exact inactive
+definition, verifying its UUID, shut-off state, disabled autostart, zero active
+domains and immutable archive hashes before and after the separate fresh-runtime
+test. The existing Palimpsest-built cold public run/exec/root-report/PID 1
+refusal/stop/rm proof then **PASSED** at the same product SHA (21.07 s), using
+its normal 4 GiB / two vCPU defaults and network `none`. Neither the inactive
+Redis definition nor its failure material was removed to satisfy a preflight.
+The earlier empty-all-domain failure remains recorded rather than reclassified.
+Original Hub and existing build archive hashes remain unchanged.
+No new application image was built; hello-world and NGINX were not rerun.
+
 ## Next public intake contract
 
-The exact Redis root-transition mode rejection is now established. Await the
-requested user decision on accepting only root-owned empty `/proc` mode
-`0555` alongside `0755`; after approval, separately review and test that narrow
-change while preserving nofollow, identity and PID 1/workload policy. Neither
-fragment-rule parity nor the diagnostic qualifies Redis. Do not execute the previously
+The approved proc-only mode correction is implemented and passed the original
+Redis root transition, and the separate cold public exec regression passed
+under the reviewed inactive-domain preservation plan. Next assess the
+original entrypoint's `setpriv` capability-retention requirement against the
+unchanged workload policy; the proc approval does not authorize broader
+privileges, user/command overrides or image changes. Redis service compatibility
+remains unqualified. Do not execute the previously
 rejected standalone diagnostic. Separately review Linux handling of the
 legacy `ArgsEscaped` field against the OCI/Moby contract before changing the
 existing fail-closed parser. Neither change is justified by silently editing
