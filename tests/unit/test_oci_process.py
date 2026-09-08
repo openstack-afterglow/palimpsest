@@ -35,6 +35,39 @@ def test_process_config_preserves_literal_argv_environment_and_identity() -> Non
     assert OCIProcessSpec.from_dict(process.to_dict()) == process
 
 
+@pytest.mark.parametrize("args_escaped", [None, False, True])
+def test_linux_args_escaped_accepts_null_or_strict_boolean_without_changing_argv(
+    args_escaped: bool | None,
+) -> None:
+    process = OCIProcessSpec.from_config(
+        {
+            "ArgsEscaped": args_escaped,
+            "Entrypoint": ["/usr/bin/demo", "'already quoted'"],
+            "Cmd": ["two words", "line\\nwith-newline", ""],
+        }
+    )
+
+    assert process.argv == ("/usr/bin/demo", "'already quoted'", "two words", "line\\nwith-newline", "")
+
+
+def test_linux_args_escaped_missing_true_and_false_have_identical_process_identity() -> None:
+    base = {
+        "Entrypoint": ["/bin/echo", '"pre-escaped"'],
+        "Cmd": ["$HOME; literal", ""],
+        "Env": ["MODE=literal"],
+        "WorkingDir": "/work",
+        "User": "101:202",
+        "StopSignal": "SIGUSR1",
+    }
+
+    missing = OCIProcessSpec.from_config(base)
+    false = OCIProcessSpec.from_config({**base, "ArgsEscaped": False})
+    true = OCIProcessSpec.from_config({**base, "ArgsEscaped": True})
+
+    assert missing == false == true
+    assert true.argv == ("/bin/echo", '"pre-escaped"', "$HOME; literal", "")
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -167,14 +200,18 @@ def test_image_root_identity_resolution_rejects_missing_ambiguous_or_malformed_d
         ({"User": "01"}, "canonical"),
         ({"User": "root:"}, "user is invalid"),
         ({"StopSignal": "SIGPWR"}, "unsupported"),
-        ({"ArgsEscaped": True}, "unsupported"),
-        ({"ArgsEscaped": []}, "unsupported"),
         ({"WorkingDir": False}, "WorkingDir is invalid"),
     ],
 )
 def test_process_config_rejects_ambiguous_or_unsupported_values(config: dict[str, object], match: str) -> None:
     with pytest.raises(ArtifactValidationError, match=match):
         OCIProcessSpec.from_config(config)
+
+
+@pytest.mark.parametrize("args_escaped", [0, 1, 0.0, 1.0, "true", [], {}, ()])
+def test_linux_args_escaped_rejects_every_non_boolean_non_null_type(args_escaped: object) -> None:
+    with pytest.raises(ArtifactValidationError, match="ArgsEscaped must be a boolean or null"):
+        OCIProcessSpec.from_config({"ArgsEscaped": args_escaped})
 
 
 def test_process_wire_contract_rejects_noncanonical_or_unknown_fields() -> None:

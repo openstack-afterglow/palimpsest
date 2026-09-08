@@ -198,8 +198,8 @@ class OCIProcessSpec:
         if not isinstance(value, Mapping):
             raise ArtifactValidationError("image config.config must be an object or null")
         args_escaped = value.get("ArgsEscaped")
-        if args_escaped is not None and args_escaped is not False:
-            raise ArtifactValidationError("image process ArgsEscaped is unsupported on linux")
+        if args_escaped is not None and type(args_escaped) is not bool:
+            raise ArtifactValidationError("image process ArgsEscaped must be a boolean or null")
 
         def string_array(field_name: str) -> tuple[str, ...]:
             raw = value.get(field_name)

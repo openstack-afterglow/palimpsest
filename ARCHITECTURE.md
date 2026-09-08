@@ -92,6 +92,8 @@ OCI `run --user`는 `OCIUserSpec.from_override_value`에서 빈 값 없는 이�
 
 명시적 user 값은 숫자 변환 전에 65문자로 제한해 과대 입력도 일반 검증 오류로 거부한다. `user_override`는 request의 마지막 필드여서 기존 positional 인자 순서를 보존한다. v3 schema는 문자열 및 지원 version을 확인한 뒤 exact-field 검증으로 진행하며 list/dict 값도 `StateError`로 거부한다. 원본 Redis 기본 proof와 새 `REDIS_USER` proof는 독립 opt-in이며 후자는 원본/실행 process 대조, 실제 non-root UID/GID와 capability/NNP/seccomp, root/PID1 비교를 별도 검사한다.
 
+Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 허용하고 boolean 값과 무관하게 원본 Entrypoint+Cmd 벡터를 그대로 전달한다. 숫자·문자열·배열·객체는 거부하며 shell 삽입·인자 분할·unescape는 없다. `oci_image.py`의 기존 Linux amd64 gate와 source config descriptor/CAS bytes/snapshot identity를 보존한다. canonical process가 같더라도 원본 config digest는 다를 수 있다. Windows 지원·process/boot-plan schema·recipe·게스트 C/ELF·PID 1 및 workload 보호 변경은 없다. 자세한 근거와 제한은 [Linux process metadata](docs/oci-linux-process.md), 선별 검사와 독립 NGINX native 경계는 [testing](docs/testing.md)에 있다.
+
 ## Runtime flows
 
 ### Conventional cloud-image flow
@@ -263,9 +265,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e67eba6bd40280ec9cecc12519cf234a202be97f583cf39bb4f274f3f23ba661",
-  "reviewed_at": "2026-09-08T11:39:06Z",
-  "summary": "Reviewed explicit OCI run user-only override, bounded CLI parsing and legacy positional/default v2 compatibility; v3 original/effective process provenance is rebound through preparation, leases, domain and unchanged stage1. Separate Redis-user native proof and focused regressions preserve original-default evidence and PID1/capabilityless policy."
+  "source_sha256": "84cfb57643931f150f1c8d133643d2cf4d1e94102f2b08575fda82144bcc415b",
+  "reviewed_at": "2026-09-08T12:26:18Z",
+  "summary": "Reviewed Linux-only ArgsEscaped boolean/null acceptance with literal argv and invalid-type refusal. Existing platform validation, raw config/CAS/snapshot bindings, process schemas, guest C/ELF and PID1/capability protections remain unchanged; new focused identity/platform regressions and unchanged native NGINX/cold proof boundaries documented."
 }
 ```
 <!-- architecture-review:end -->

@@ -110,6 +110,27 @@ partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
 ## When to broaden verification
 
+### Linux legacy ArgsEscaped
+
+For the Linux-only [process metadata contract](oci-linux-process.md), start
+with `tests/unit/test_oci_process.py tests/unit/test_oci_source.py`. Before push,
+also select `test_oci_image.py`, `test_oci_layout.py`, `test_oci_run_request.py`,
+`test_oci_run_adapter.py`, `test_oci_store.py`,
+`test_oci_docker_hub_cli_live_contract.py` and `test_architecture_guard.py`
+from `tests/unit/`. This is focused consumer coverage, not the full suite.
+
+Select the unchanged native node
+`tests/kvm/test_oci_docker_hub_cli_live.py::test_docker_hub_nginx_unprivileged_detached_default_process_and_public_exec`
+independently with `PALIMPSEST_OCI_DOCKER_HUB_NGINX_LIVE=1` and its `IMAGE`,
+`ARCHIVE_SHA256`, `MANIFEST_SHA256` settings under the same prefix, plus the
+five host BOOT/packer settings. Use the pinned original archive, no user or
+command override, 512 MiB / one vCPU and network none. The proof checks process
+readiness/root/lifecycle, not HTTP serving. Preserve failed runtimes and prior
+inactive domains with reviewed exact inventory/hash checks before and after.
+Then run the separate unchanged built-image cold exec proof below at the same
+pushed SHA, sequentially. A failed or skipped native test is not qualification;
+neither these checks nor the unchanged guest binary imply a new full Gate 2.
+
 ### Explicit OCI run user
 
 The optional `run --user USER[:GROUP]` has a focused host-contract loop:

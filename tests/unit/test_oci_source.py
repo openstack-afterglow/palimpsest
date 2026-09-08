@@ -30,6 +30,7 @@ from palimpsest_local.oci_provenance import (
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OCI_LAYER_GZIP_MEDIA_TYPE,
     Descriptor,
+    canonical_json_bytes,
 )
 from palimpsest_local.oci_source import (
     LocalArchiveSource,
@@ -89,6 +90,7 @@ def _direct_layout(
     layer_payloads: tuple[bytes, ...] = (b"layer",),
     repeated: bool = False,
     docker: bool = False,
+    process_config: dict[str, object] | None = None,
 ) -> tuple[Layout, Descriptor, Descriptor, tuple[Descriptor, ...]]:
     layout = Layout(root)
     layer_media_type = DOCKER_LAYER_GZIP_MEDIA_TYPE if docker else OCI_LAYER_GZIP_MEDIA_TYPE
@@ -98,14 +100,14 @@ def _direct_layout(
     if repeated:
         layers = (layers[0], layers[0])
     diff_ids = [f"sha256:{index + 1:064x}" for index in range(len(layers))]
-    config = layout.add(
-        {
-            "architecture": "amd64",
-            "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": diff_ids},
-        },
-        config_media_type,
-    )
+    config_document: dict[str, object] = {
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": diff_ids},
+    }
+    if process_config is not None:
+        config_document["config"] = process_config
+    config = layout.add(config_document, config_media_type)
     manifest = layout.add(
         {
             "schemaVersion": 2,
@@ -254,6 +256,108 @@ def test_direct_layout_snapshots_complete_graph_without_paths(tmp_path: Path) ->
     assert os.fspath(tmp_path / "source-cas") not in serialized
     assert os.fspath(layout.root) not in repr(result)
     cas.verify_image(result)
+
+
+def test_linux_args_escaped_boolean_preserves_process_and_raw_source_bindings(tmp_path: Path) -> None:
+    base_process: dict[str, object] = {
+        "Entrypoint": ["/usr/bin/demo", '"pre-escaped"'],
+        "Cmd": ["two words", "$HOME; literal", ""],
+        "Env": ["MODE=literal"],
+        "WorkingDir": "/work",
+        "User": "101:202",
+        "StopSignal": "SIGUSR1",
+    }
+    cas_root = tmp_path / "source-cas"
+    cas = SourceCAS(cas_root)
+    snapshots = {}
+
+    for args_escaped in (False, True):
+        layout, manifest, config, _layers = _direct_layout(
+            tmp_path / f"layout-{str(args_escaped).lower()}",
+            docker=True,
+            process_config={**base_process, "ArgsEscaped": args_escaped},
+        )
+        raw_config = (layout.blobs / config.digest.removeprefix("sha256:")).read_bytes()
+
+        snapshot = layout.source(manifest).snapshot(_ref(manifest.digest), cas)
+        snapshots[args_escaped] = snapshot
+
+        assert snapshot.config.descriptor == config
+        assert config.digest == f"sha256:{hashlib.sha256(raw_config).hexdigest()}"
+        assert _target(cas_root, config).read_bytes() == raw_config
+        binding_members = {
+            "cas_id": snapshot.cas_id,
+            "config": config.to_dict(),
+            "domain": "palimpsest.source-snapshot.v1",
+            "image_digest": snapshot.image.digest,
+            "layers": [item.descriptor.to_dict() for item in snapshot.layers],
+            "manifest": snapshot.manifest.descriptor.to_dict(),
+            "root": snapshot.root.descriptor.to_dict(),
+        }
+        expected_binding = f"sha256:{hashlib.sha256(canonical_json_bytes(binding_members)).hexdigest()}"
+        assert snapshot.binding_digest == expected_binding
+        cas.verify_image(snapshot)
+
+    false_snapshot = snapshots[False]
+    true_snapshot = snapshots[True]
+    expected_argv = ("/usr/bin/demo", '"pre-escaped"', "two words", "$HOME; literal", "")
+    assert false_snapshot.image.config.process == true_snapshot.image.config.process
+    assert false_snapshot.image.config.process.argv == expected_argv
+    assert false_snapshot.config.descriptor != true_snapshot.config.descriptor
+    assert false_snapshot.binding_digest != true_snapshot.binding_digest
+
+
+@pytest.mark.parametrize(
+    ("platform_os", "platform_architecture"),
+    [("windows", "amd64"), ("linux", "arm64")],
+)
+def test_index_rejects_unsupported_platform_before_reading_its_process_config(
+    tmp_path: Path,
+    platform_os: str,
+    platform_architecture: str,
+) -> None:
+    layout = Layout(tmp_path / "layout")
+    hostile_config = layout.add(
+        {
+            "architecture": platform_architecture,
+            "os": platform_os,
+            "config": {"ArgsEscaped": {"not": "a boolean"}},
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "1" * 64]},
+        },
+        OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    )
+    layer = layout.add(b"layer", OCI_LAYER_GZIP_MEDIA_TYPE)
+    unsupported_manifest = layout.add(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": hostile_config.to_dict(),
+            "layers": [layer.to_dict()],
+        },
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    )
+    index = layout.add(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [
+                {
+                    **unsupported_manifest.to_dict(),
+                    "platform": {"os": platform_os, "architecture": platform_architecture},
+                }
+            ],
+        },
+        OCI_IMAGE_INDEX_MEDIA_TYPE,
+    )
+    layout.top(index)
+    cas_root = tmp_path / "source-cas"
+
+    with pytest.raises(ArtifactValidationError, match="no exact linux/amd64 manifest"):
+        layout.source(index).snapshot(_ref(index.digest), SourceCAS(cas_root))
+
+    assert not _target(cas_root, unsupported_manifest).exists()
+    assert not _target(cas_root, hostile_config).exists()
+    assert not _target(cas_root, layer).exists()
 
 
 @pytest.mark.parametrize("archive_input", [False, True])
