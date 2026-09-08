@@ -173,12 +173,61 @@ not a new application-image build, full native negative-control matrix, or
 new Gate 2 qualification. The earlier `hello-world` success and NGINX failure
 remain historical results from their recorded SHA, not reruns of this guest.
 
+### 2026-09-08 root-transition diagnostic checkpoint (`162cebe`)
+
+At exact pushed
+[`162cebe`](https://github.com/openstack-afterglow/palimpsest/commit/162cebe0477d4b61262b455c688b623988d98245),
+stage-1 adds one fixed target/reason marker only when initial proc/sys/dev
+target preparation fails before any mount move. It does not change exact
+`0755`, root ownership, emptiness, nofollow, identity checks, PID 1 protection,
+or workload privileges. The original generic exit-71 fail-closed wait remains.
+The console diagnostic is not authenticated READY or root-identity evidence.
+
+The new actual-C fixture checks passed 11 cases, including root-owned empty
+`0555` rejection as `mode`, unchanged metadata, wrong ownership, nonempty and
+symlink targets, special mode bits and the `0755` positive. The final source
+was built twice with the pinned offline compiler; identical final outputs
+match the packaged ELF and provenance pins. Local focused checks passed 185
+(23.50 s), plus architecture guard regressions 13 (7.51 s). Exact-SHA server
+focused checks passed 198 without skips (39.42 s), including the explicit
+Docker fixture opt-in and two packaged-ELF reproduction builds. These overlap
+and must not be added together as a full-suite result.
+
+The separate packaged-stage-1 native proof **PASSED** (123.45 s), executing
+43 boots / 44 QEMU invocations across its existing positive and negative
+controls, including root transition and PID 1/workload isolation. This is the
+dedicated guest proof, not the entire native suite or a new Gate 2 result.
+
+The unchanged Redis service proof still **FAILED** (76.03 s). Its console now
+contains exactly one `target=proc; check=mode` diagnostic followed by the
+existing indeterminate-root/workload-disabled rejection. Read-only listing
+of the previously generated original-image lowers identified root-owned
+`0555` for `/proc`, while `/dev` and `/sys` were `0755`. The instrumented VM
+therefore confirms the exact mode predicate as the current rejection, before
+mount moves and before the Redis entrypoint. No Redis readiness, service exec
+or authenticated root/PID 1 service proof passed. No later compatibility
+outcome is inferred from this diagnosis.
+
+The failed runtime and console remain preserved; the post-failure domain
+inventory was empty. The separate unchanged Palimpsest-built cold public
+run/exec/root-report/stop/rm proof then **PASSED** (21.17 s), with its normal
+4 GiB / two vCPU defaults. Redis used 512 MiB / one vCPU. Both were serial,
+network-none VM runs. Original Hub archive hashes and the existing build
+archive hash remained unchanged. No new application image was built, and
+hello-world and NGINX were not rerun.
+
+Allowing a root-owned empty `/proc` with `0555` in addition to `0755` is a
+proposed next change only. User approval is pending; the current implementation
+still rejects it. Do not chmod the image, broaden other target modes, relax
+PID 1 protection or count the diagnostic failure as a compatibility pass.
+
 ## Next public intake contract
 
-First isolate the exact Redis root-transition rejection using bounded,
-secret-free diagnostics and targeted regression tests, preserving the original
-image and all PID 1/workload policy. Fragment-rule parity is implemented, but
-does not by itself qualify Redis. Do not execute the previously
+The exact Redis root-transition mode rejection is now established. Await the
+requested user decision on accepting only root-owned empty `/proc` mode
+`0555` alongside `0755`; after approval, separately review and test that narrow
+change while preserving nofollow, identity and PID 1/workload policy. Neither
+fragment-rule parity nor the diagnostic qualifies Redis. Do not execute the previously
 rejected standalone diagnostic. Separately review Linux handling of the
 legacy `ArgsEscaped` field against the OCI/Moby contract before changing the
 existing fail-closed parser. Neither change is justified by silently editing

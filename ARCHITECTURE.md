@@ -28,6 +28,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 | Hub Glance export worker | partial | source-reviewed, test-defined | OpenStack/DB/Redis와 qemu-img 전제가 있는 비동기 worker; worker 자체의 live 실행은 별도 운영 검증 | [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py), [`hub/tests/test_image_exports.py`](hub/tests/test_image_exports.py) |
 | direct Docker Hub → `run` intake | not-implemented | source-reviewed, test-defined | Skopeo 등 외부 도구로 digest-preserving OCI archive를 만든 뒤에만 local OCI 경계로 들어감 | [`oci_source.py`](src/palimpsest_local/oci_source.py), [`docs/oci-docker-hub-compatibility.md`](docs/oci-docker-hub-compatibility.md) |
 
+최신 `162cebe` 진단 checkpoint: exact-SHA 서버 집중 검사 198건과 전용 게스트 native 43 boots / 44 QEMU proof가 통과했다. 원본 Redis 실기는 여전히 실패지만, 고정 로그가 `/proc`의 mode 검사 거부를 확인했다. 원본 lower의 root-owned `0555`와 현재 exact `0755` 정책의 충돌이며 entrypoint는 실행되지 않았다. 정책 변경은 사용자 결정 대기 중이고 PID 1 보호는 그대로다. 별도 기존 빌드 이미지의 cold public exec는 통과했다. 전체 Gate 2나 일반 이미지 호환성 완료를 뜻하지 않으며 자세한 결과는 [compatibility checkpoint](docs/oci-docker-hub-compatibility.md)에 기록한다.
+
 `IMPLEMENTATION_PLAN.md`, [`docs/oci-public-runtime-roadmap.md`](docs/oci-public-runtime-roadmap.md), [`docs/oci-docker-hub-compatibility.md`](docs/oci-docker-hub-compatibility.md), 그리고 [`tracking/afterglow-palimpsest.json`](tracking/afterglow-palimpsest.json)은 각각 역사적 계획/qualification 기록 또는 Afterglow baseline 계약이다. 이 문서는 해당 파일의 완료 주장이나 hash를 재작성하지 않으며, 현재 소스와 테스트 정의가 우선한다.
 
 ## System context
@@ -154,7 +156,7 @@ uv run palimpsest-hub-worker
 
 API는 401 Keystone validation, 403 system-admin, 404 visibility/ownership, 409 offset/descriptor conflict, 413 size limit, 422 digest/schema 오류를 구분한다. local runtime은 foreign domain, stale/ambiguous ledger, failed ACL/release를 성공으로 제조하지 않는다. 실패한 OCI materializer가 즉시 reap되지 않으면 scratch authority를 background reaper가 보존하므로 임의 삭제하지 않는다. stage-1의 partial root transition은 rollback 성공으로 표시하지 않으며, exact evidence가 없으면 fail-closed한다.
 
-stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 고정 target/check 진단을 남긴다. `safe_dir_checked`는 기존 `safe_dir`와 같은 syscall·검증 순서를 유지하면서 실제 거부 조건을 닫힌 enum으로 반환하고, 다른 호출자는 기존 wrapper를 사용한다. 원본 경로·이미지 데이터·errno·식별자·비밀은 출력하지 않는다. 기존 exit71·indeterminate wait와 이후 generic root-transition 검사는 유지하며 진단 console은 authenticated READY/root 증거가 아니다. root 소유·정확한0755·빈 디렉터리·nofollow·filesystem identity 정책은 그대로다. Redis의 보존 lower에서 관찰한 `/proc`0555와의 충돌은 instrumented native 실행으로 확인해야 하며,0555 허용은 별도 결정이다.
+stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 고정 target/check 진단을 남긴다. `safe_dir_checked`는 기존 `safe_dir`와 같은 syscall·검증 순서를 유지하면서 실제 거부 조건을 닫힌 enum으로 반환하고, 다른 호출자는 기존 wrapper를 사용한다. 원본 경로·이미지 데이터·errno·식별자·비밀은 출력하지 않는다. 기존 exit71·indeterminate wait와 이후 generic root-transition 검사는 유지하며 진단 console은 authenticated READY/root 증거가 아니다. root 소유·정확한0755·빈 디렉터리·nofollow·filesystem identity 정책은 그대로다. Redis의 보존 lower에서 관찰한 `/proc`0555와의 충돌은 `162cebe`의 instrumented native 실행에서 `target=proc; check=mode`로 확인됐다. 0555 허용은 사용자 결정 대기 중이며 현재 정책에는 적용되지 않았다.
 
 ## Security boundaries
 
