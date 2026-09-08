@@ -6,8 +6,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import tarfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -28,11 +30,12 @@ from palimpsest_local.oci_convert import (
     to_base36,
     translate_oci_tar_to_overlay_tar,
 )
-from palimpsest_local.oci_converter import stage_layer
+from palimpsest_local.oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, stage_layer
 from palimpsest_local.oci_image import OCIImageRef
 from palimpsest_local.oci_materializer import materialize_image_hard, materialize_layer_hard
 from palimpsest_local.oci_packer import (
     PackedSquashFSReceipt,
+    SquashFSPackPolicy,
     discover_squashfs_toolchain,
     pack_staged_squashfs,
 )
@@ -52,6 +55,21 @@ _TRANSLATED_FIXTURE_SHA256 = {
     "base_layer.tar": "4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6",
     "leaf_layer.tar": "85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79",
 }
+
+_MINIMAL_LAYER_LIMITS = replace(
+    DEFAULT_LAYER_CONVERSION_LIMITS,
+    max_compressed_bytes=64 * 1024,
+    max_uncompressed_bytes=64 * 1024,
+    max_members=4,
+    max_physical_headers=4,
+)
+_MINIMAL_PACK_POLICY = SquashFSPackPolicy(
+    max_normalized_tar_bytes=64 * 1024,
+    max_image_bytes=1024 * 1024,
+    max_root_xattr_bytes=4096,
+    packer_timeout_seconds=30.0,
+    terminate_grace_seconds=0.5,
+)
 
 
 def _descriptor(payload: bytes, media_type: str) -> Descriptor:
@@ -85,6 +103,75 @@ def _pack_staged_fixture(
 
 def _snapshot_fixture(root: Path, payload: bytes):
     return _snapshot_fixtures(root, (payload,))
+
+
+def _live_packer() -> tuple[Path, str]:
+    if os.environ.get("PALIMPSEST_OCI_PACK_LIVE") != "1":
+        pytest.skip("set PALIMPSEST_OCI_PACK_LIVE=1 to run the real minimal-layer pack proof")
+    path_value = os.environ.get("PALIMPSEST_OCI_PACK_LIVE_PACKER")
+    digest = os.environ.get("PALIMPSEST_OCI_PACK_LIVE_PACKER_SHA256")
+    assert path_value, "PALIMPSEST_OCI_PACK_LIVE_PACKER must name the real packer"
+    packer = Path(path_value)
+    assert packer.is_absolute(), "PALIMPSEST_OCI_PACK_LIVE_PACKER must be absolute"
+    assert digest and re.fullmatch(r"[0-9a-f]{64}", digest), (
+        "PALIMPSEST_OCI_PACK_LIVE_PACKER_SHA256 must be a lowercase SHA-256"
+    )
+    assert hashlib.sha256(packer.read_bytes()).hexdigest() == digest
+    return packer, digest
+
+
+def _minimal_layer_tar(layer_kind: str) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        if layer_kind == "directory-only":
+            directory = tarfile.TarInfo("data")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.uid = 999
+            directory.gid = 1000
+            archive.addfile(directory)
+        elif layer_kind == "file":
+            member = tarfile.TarInfo("value")
+            member.mode = 0o644
+            member.size = len(b"payload")
+            archive.addfile(member, io.BytesIO(b"payload"))
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("layer_kind", ["directory-only", "empty"])
+def test_real_staged_squashfs_accepts_minimal_layer(tmp_path: Path, layer_kind: str) -> None:
+    """Exercise the standalone production packer subprocess with tiny explicit bounds."""
+    packer, packer_digest = _live_packer()
+    cas, image = _snapshot_fixture(tmp_path, _minimal_layer_tar(layer_kind))
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source, limits=_MINIMAL_LAYER_LIMITS) as staged:
+        with pack_staged_squashfs(
+            staged,
+            packer_path=packer,
+            expected_packer_sha256=packer_digest,
+            policy=_MINIMAL_PACK_POLICY,
+        ) as packed:
+            payload = b"".join(packed.chunks())
+            assert payload
+            assert packed.receipt.source_diff_id == staged.receipt.diff_id
+
+
+def test_real_staged_squashfs_build_is_byte_deterministic(tmp_path: Path) -> None:
+    packer, packer_digest = _live_packer()
+    cas, image = _snapshot_fixture(tmp_path, _minimal_layer_tar("file"))
+    built: list[tuple[bytes, object]] = []
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source, limits=_MINIMAL_LAYER_LIMITS) as staged:
+        for _ in range(2):
+            with pack_staged_squashfs(
+                staged,
+                packer_path=packer,
+                expected_packer_sha256=packer_digest,
+                policy=_MINIMAL_PACK_POLICY,
+            ) as packed:
+                built.append((b"".join(packed.chunks()), packed.receipt))
+
+    assert built[0] == built[1]
 
 
 def _snapshot_fixtures(root: Path, payloads: tuple[bytes, ...]):

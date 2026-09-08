@@ -9,7 +9,6 @@ import io
 import json
 import os
 import pickle
-import shutil
 import struct
 import sys
 import tarfile
@@ -1090,28 +1089,25 @@ def test_staged_squashfs_lease_requires_verified_eof(tmp_path: Path) -> None:
                 next(packed.chunks(1))
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux") or shutil.which("mksquashfs") is None,
-    reason="Linux mksquashfs is not installed",
-)
-def test_real_staged_squashfs_build_is_byte_deterministic(tmp_path: Path) -> None:
-    member, payload = _file("value", b"payload")
-    uncompressed = _tar(member, payloads={member.name: payload})
+def _minimal_layer_tar(layer_kind: str) -> bytes:
+    if layer_kind == "empty":
+        return _tar()
+    directory = tarfile.TarInfo("data")
+    directory.type = tarfile.DIRTYPE
+    directory.mode = 0o755
+    directory.uid = 999
+    directory.gid = 1000
+    return _tar(directory)
+
+
+@pytest.mark.parametrize("layer_kind", ["directory-only", "empty"])
+def test_minimal_layer_fixture_has_expected_staged_members(tmp_path: Path, layer_kind: str) -> None:
+    uncompressed = _minimal_layer_tar(layer_kind)
     cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
-    packer = Path(shutil.which("mksquashfs") or "")
-    packer_digest = hashlib.sha256(packer.read_bytes()).hexdigest()
-    built: list[tuple[bytes, object]] = []
 
     with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
-        for _ in range(2):
-            with pack_staged_squashfs(
-                staged,
-                packer_path=packer,
-                expected_packer_sha256=packer_digest,
-            ) as packed:
-                built.append((b"".join(packed.chunks()), packed.receipt))
-
-    assert built[0] == built[1]
+        expected_members = [("data", "directory", 0)] if layer_kind == "directory-only" else []
+        assert [(item.path, item.kind, item.size) for item in staged.members] == expected_members
 
 
 def test_large_pax_integer_is_range_checked_before_python_int_conversion(tmp_path: Path) -> None:

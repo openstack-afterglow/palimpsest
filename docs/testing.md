@@ -145,8 +145,17 @@ attribution-only edit may use these explicit files without claiming all mapped
 consumers or the full guest matrix were exercised.
 
 The worker file includes real bounded subprocess failure cases; the converter
-file contains Linux-only pinned-packer cases. macOS skips do not verify those
-Linux paths: run the selected files on the exact pushed server SHA too.
+file contains portable intake cases. Real pinned-packer component cases are
+separate `native-live` nodes in `tests/oci_fs/test_layer_filesystem.py`; they do
+not run in portable lanes and do not require mounts or `CAP_SYS_ADMIN`. Select
+the exact nodes with `PALIMPSEST_OCI_PACK_LIVE=1`,
+`PALIMPSEST_OCI_PACK_LIVE_PACKER` set to an absolute path, and
+`PALIMPSEST_OCI_PACK_LIVE_PACKER_SHA256` set to its lowercase SHA-256. These
+tests use the production packer subprocess management with small explicit byte
+and time limits so parser errors remain visible. They are standalone component
+tests, not hard-worker or end-to-end materializer qualification. macOS skips do
+not verify those Linux paths: run the selected nodes on the exact pushed server
+SHA too.
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire

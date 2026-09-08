@@ -68,6 +68,16 @@ def test_docker_hub_proof_has_portable_contract_and_native_only_execution():
     assert "PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,NGINX}_LIVE=1" in lanes.SPECIAL_NOTES["native-live"]
 
 
+def test_real_packer_component_tests_are_native_only():
+    nodes = {
+        f"{lanes.FS_FILE}::test_real_staged_squashfs_accepts_minimal_layer",
+        f"{lanes.FS_FILE}::test_real_staged_squashfs_build_is_byte_deterministic",
+    }
+    assert nodes <= set(lanes.selectors("native-live"))
+    assert all(nodes.isdisjoint(lanes.selectors(lane)) for lane in lanes.LANES if lane != "native-live")
+    assert "PALIMPSEST_OCI_PACK_LIVE=1" in lanes.SPECIAL_NOTES["native-live"]
+
+
 @pytest.fixture
 def tiny_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(lanes, "PORTABLE_FILES", {"small": ("tests/test_small.py",)})

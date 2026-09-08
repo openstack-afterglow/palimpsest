@@ -170,6 +170,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 현재 테스트는 portable unit/contract, separate Hub environment, privileged filesystem, guest-binary, native KVM, BuildKit Gate 1, OCI-root Gate 2로 나뉜다. 2026-09-08 `list --check`와 `core-cli` 1025건, architecture guard focused 13건은 통과했지만 다른 lane의 파일 존재는 여전히 `test-defined`일 뿐 `test-passed`가 아니다.
 
+실제 `mksquashfs`를 호출하는 최소 레이어·재현성 검사는 `tests/oci_fs/test_layer_filesystem.py`의 정확한 `native-live` 노드로 분리했다. `PALIMPSEST_OCI_PACK_LIVE=1`과 절대 도구 경로·SHA256 고정값이 있어야 실행하며 portable 선택에서는 제외한다. 입력/tar 64KiB, 검증 출력 1MiB, packer 호출 30초로 제한한 알려진 작은 fixture의 독립 component 검사다. mount·VM·외부 materializer worker의 자원 격리 검증이 아니며, 출력 크기는 생성 뒤 확인하고 최종 reap의 hard deadline이나 부모 강제 종료 뒤 정리를 보장하지 않는다. 실제 실패를 skip/xfail로 바꾸지 않는다. 제품 검증기는 아직 변경하지 않았고 서버의 실패 재현은 다음 단계다. 정확한 선택 방법은 [테스트 안내](docs/testing.md)에 기록한다.
+
 ### 정확한 명령
 
 로컬 core와 문서 guard:
@@ -241,9 +243,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9eb4391527b108116f607e6dcbff1668cc2cd14cc2d9ee0de5d93786157d88ea",
-  "reviewed_at": "2026-09-08T07:44:40Z",
-  "summary": "Reviewed architecture and freshness guard integration, source lifecycle ordering and successful release gate. This staged change only adds architecture maintenance; Redis reproducer and product behavior changes remain separate. Local combined core-cli 1025 passed and focused guard 13 passed; no native qualification claimed."
+  "source_sha256": "722ad14a37fd4077e034604f7dab0fa9813344fa8086555bbba467f9ea155ad3",
+  "reviewed_at": "2026-09-08T07:48:06Z",
+  "summary": "Reviewed native-only minimal SquashFS component tests and portable lane separation. Known tiny fixture uses explicit component limits, not outer-worker qualification. Product verifier unchanged; real server failure reproduction pending. Prior focused local168 passed7Linux skips and combined core1025 passed are distinct from native proof."
 }
 ```
 <!-- architecture-review:end -->
