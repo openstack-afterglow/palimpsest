@@ -345,6 +345,64 @@ definition, lower layers and earlier historical evidence remain preserved.
 
 ## Next public intake contract
 
+### 2026-09-08 explicit Redis user qualification (`4cbc863`)
+
+The user approved the separately proposed explicit `run --user` option and
+Redis-user test. This supersedes only the preceding pending override decision;
+it does not approve additional workload capabilities or relabel the original
+default-process Redis failure. GPT 5.6 Sol implemented the host contract and
+test slices, with independent Astra code/native-plan approval before push.
+
+At product commit
+[`4cbc863`](https://github.com/openstack-afterglow/palimpsest/commit/4cbc863fc73caab141c9d54001cbfe7edf769934),
+the CLI accepts canonical `USER[:GROUP]`, rejects empty/oversized inputs and
+cloud-image use, and preserves the request's old positional arguments. Default
+runs retain boot-plan v2. Explicit overrides use v3 with original image
+process, user override and recomputed user-only effective process bound into
+the existing preparation/lease/domain/stage-1 chain. Image bytes, immutable
+materialization receipts, lower graph, guest C/ELF and PID 1/capability/NNP/
+securebits/seccomp policy are unchanged. No automatic ownership repair occurs.
+See [the user contract](oci-run-user.md).
+
+The final focused 13-module selection passed **1,057 locally** (26.45 s) and
+**1,057 on the exact server SHA** (198.83 s), without skips. These are the same
+selection on two hosts, not a full-suite aggregate. The independent review
+first blocked oversized numeric inputs and an unstamped architecture marker;
+both were corrected and reapproved. Intermediate consumer checks also caught
+a stale test-lane selection assertion, which was updated without dropping the
+native-only requirement. Two temporary Unix-socket fixtures initially failed
+at sandbox bind, then passed in the scoped elevated rerun and final selection.
+The explicit-user proof's original-UID expectation was corrected before native
+execution. Working/staged architecture, lane inventory, Ruff and diff checks
+passed. No full guest matrix was rerun for this host-only change.
+
+The separately opted-in **original-archive Redis `--user redis` proof PASSED**
+(28.05 s). It used a fresh 512 MiB / one-vCPU, network-none VM and the same
+digest-pinned archive and manifest, without changing entrypoint, arguments or
+environment. Redis reported version 7.4.11 and service readiness. Public exec
+reported `redis`, UID 999/GID 1000 matching the image account, all five
+capability sets zero, `NoNewPrivs=1`, and `Seccomp=2`. The proof compared the
+authenticated original process with v3 provenance/effective process, matched
+the app's actual `/` device/inode with two authenticated PID 1 root reports,
+required direct `/proc/1/root` access to fail with permission denial, and
+completed stop/rm with exact new-domain/run absence. Redis archive hashes
+before/after remained identical. This qualifies only the explicit-user case,
+not the original-default Redis execution or arbitrary Docker Hub images.
+
+After inventory verification, the separate existing Palimpsest-built image's
+cold default public run/exec/root/PID 1 refusal/stop/rm proof **PASSED**
+(20.68 s), using unchanged 4 GiB / two-vCPU defaults and network none. No new
+application image was built; this is not a new full Gate 2 qualification.
+Both tests ran sequentially on `pieroot-server` at the same pushed product
+SHA. The prior inactive Redis definition was preserved with exact UUID,
+shut-off state and disabled autostart before/after; zero active domains and
+unchanged original Hub/build archive hashes were rechecked. Earlier failed
+runtimes, disks and recovery evidence were not removed.
+
+The earlier assessment paragraph below is retained as historical context;
+its user-override decision is now superseded by this checkpoint. Next work is
+the separate Linux `ArgsEscaped` contract and direct registry-reference intake.
+
 The approved proc-only mode correction is implemented and passed the original
 Redis root transition, and the separate cold public exec regression passed
 under the reviewed inactive-domain preservation plan. Next assess the

@@ -57,3 +57,14 @@ against authenticated PID 1 root reports, direct PID 1 access refusal, normal
 stop/removal and unchanged source hashes. See [test selection](testing.md).
 Successful implementation or portable tests alone are not native service
 qualification or a new full Gate 2 result.
+
+## Verified checkpoint — 2026-09-08
+
+At [`4cbc863`](https://github.com/openstack-afterglow/palimpsest/commit/4cbc863fc73caab141c9d54001cbfe7edf769934),
+the separate pinned Redis archive proof passed on `pieroot-server` in 28.05 s:
+Redis 7.4.11 readiness, UID 999/GID 1000, zero capabilities, NNP/seccomp,
+public exec/root comparison/PID 1 refusal and normal cleanup. The unchanged
+default cold exec regression passed separately in 20.68 s. The same focused
+1,057 tests passed locally and on the exact server SHA. This is explicit-user
+qualification, not success of the original Redis default or direct registry
+intake. See [the full checkpoint](oci-docker-hub-compatibility.md).
