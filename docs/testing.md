@@ -315,6 +315,18 @@ Check the exact preserved domain inventory/UUIDs/state/autostart and original
 archive hashes before and after, including after a failed native test. This
 does not require a guest rebuild or qualify the full Gate 2.
 
+At `6c230b5`, the focused five-file selection passed 157 tests locally (9.40 s)
+and the same 157 tests on `pieroot-server` (21.04 s). Portable collection
+found 5,471 tests; collection is not execution. The separately selected cold
+native proof passed with fresh runtime suffix `d569fc7c`, and all 21 wrapper
+postflight observations passed. The proof removed only its successful fresh
+run/domain/runtime; the prior Redis, NGINX and fixed `exec-cli` definitions
+remained inactive with their original UUIDs and autostart disabled. All four
+original archive hashes were unchanged, with no active VM afterward.
+This run did not reproduce the earlier ancestor-change failure, but did not
+identify or fix its cause. It is not a new application build, NGINX test,
+standard-I/O pathname qualification, or full Gate 2 run.
+
 - Per edit: relevant lane(s), regression tests for the change, lint and format.
 - Before push: inspect the changed-file plan and run the affected portable
   lanes; include the required native/build proof for changed runtime surfaces.
