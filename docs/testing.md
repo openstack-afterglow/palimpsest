@@ -298,6 +298,23 @@ own; neither silently enables the other or substitutes for Gate 2. New exec
 protocol/mailbox/IPC/session/routing unit files belong to oci-monitor, while the
 actual guest C harness belongs to oci-guest with its own platform prerequisites.
 
+The cold public-CLI proof uses one fresh eight-hex UUID suffix for both its
+`/tmp/p-execcli-<suffix>` runtime and `exec-cli-<suffix>` run/domain name.
+It never reuses the fixed `exec-cli` name of retained failed evidence. A name
+collision is still a failure, not permission to adopt or delete a domain.
+All public commands and domain checks use the selected name; root identity,
+PID 1 refusal, split streams, exit status and stop/rm assertions are unchanged.
+Only a fully successful proof removes its own identity-checked temporary
+runtime. Failed runtimes remain available for investigation.
+
+For this test-name-only change, select portable cold-proof contract tests plus
+`test_oci_host.py`, `test_oci_run_adapter.py`, `test_test_lanes.py` and
+`test_architecture_guard.py` in `tests/unit/`. Run the same selection on the
+exact pushed server SHA, followed by the separately opted-in cold native file.
+Check the exact preserved domain inventory/UUIDs/state/autostart and original
+archive hashes before and after, including after a failed native test. This
+does not require a guest rebuild or qualify the full Gate 2.
+
 - Per edit: relevant lane(s), regression tests for the change, lint and format.
 - Before push: inspect the changed-file plan and run the affected portable
   lanes; include the required native/build proof for changed runtime surfaces.

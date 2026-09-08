@@ -39,6 +39,7 @@ PORTABLE_FILES = {
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
+        oci_exec_cli_live_contract
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
     "oci-store": _units("""

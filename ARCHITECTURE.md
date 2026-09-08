@@ -194,6 +194,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
+Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않도록 새 runtime과 run/domain에 같은 실행별 UUID suffix를 사용한다. public lifecycle/root/PID1 assertions와 성공 시에만 해당 runtime을 정리하는 경계는 유지한다. 테스트 이름·portable contract/lane 등록만 바꾸며 production runtime, guest C/ELF, 보안 정책·schema에는 영향이 없다. 기존 실패 기록은 삭제하거나 새 성공으로 대체하지 않는다. 정확한 focused/native 선택과 보존 확인은 [testing](docs/testing.md)에 따른다.
+
 현재 테스트는 portable unit/contract, separate Hub environment, privileged filesystem, guest-binary, native KVM, BuildKit Gate 1, OCI-root Gate 2로 나뉜다. 2026-09-08 `list --check`와 `core-cli` 1025건, architecture guard focused 13건이 통과했다. 이후 실제 실행한 선별 검사는 아래 checkpoint에 따로 기록한다. 실행하지 않은 다른 lane의 파일 존재는 여전히 `test-defined`일 뿐 `test-passed`가 아니다.
 
 후속 `a991912`에서 guest fragment 규칙과 배포 ELF를 동기화했다. 로컬 Python/C/ELF 108건(19.26초), 서버 106건·2skip(13.51초) 후 빠진 고정 toolchain과 Docker PID 1 opt-in을 준비한 두 노드가 별도로 통과했다(6.65초). 같은 SHA의 기존 빌드 이미지 cold public exec는 통과(20.47초), 원본 Redis는 filesystem 검증·staging assembly를 지나 root transition에서 실패했다(75.60초). 내부 거부 지점은 아직 미확정이며 workload를 실행하지 않았다. 전체 native 부정 제어 matrix·새 Gate 2·새 애플리케이션 이미지 빌드 통과로 확대하지 않는다. 실패 자료와 원본 archive는 보존하고 다음 검사는 root-transition의 정확한 거부 조건을 좁힌다.
@@ -271,9 +273,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e0cc8ed270aa43e7af3fa37c9ab9c8eb3795d0a1322c644e9a135b21cf639268",
-  "reviewed_at": "2026-09-08T16:25:31Z",
-  "summary": "Reviewed runtime-parent bounded phase/depth/field diagnostics and deterministic verifier tests; explicit comparison fields preserve existing predicates, syscall order, FD cleanup and launch consumer. Standard-I/O proposal distinguishes unqualified reopen permissions; guest source/ELF, security policy and schemas unchanged. Focused host testing boundary documented."
+  "source_sha256": "e968e1ca334cb30e775ece79434e3b01e684fab1821e7b868c85ea74d1567096",
+  "reviewed_at": "2026-09-08T17:59:34Z",
+  "summary": "Reviewed cold public exec proof fresh shared UUID-suffix target and portable routing contracts; existing assertions, command timeouts, failure preservation and success-only identity-checked cleanup retained. Added focused host-runtime manifest entry; production runtime, guest source/ELF, security policy and schemas unchanged."
 }
 ```
 <!-- architecture-review:end -->

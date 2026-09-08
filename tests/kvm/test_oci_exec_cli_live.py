@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,51 @@ pytestmark = [
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecCLIProofTarget:
+    parent: Path
+    name: str
+
+    def launch(self, environment, archive):
+        return _cli(environment, "run", archive, "--name", self.name, "-d", timeout=180)
+
+    def exec_status(self, environment):
+        return _cli(environment, "oci", "exec-status", self.name)
+
+    def root_proof(self, environment):
+        return _cli(environment, "oci", "root-proof", self.name)
+
+    def execute(self, environment, *argv):
+        return _cli(environment, "exec", self.name, "--", *argv, timeout=60)
+
+    def domain_info(self, environment, virsh):
+        return subprocess.run(
+            [virsh, "-c", "qemu:///system", "dominfo", self.name],
+            env=environment,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+
+    def stop(self, environment):
+        return _cli(environment, "stop", self.name, timeout=60)
+
+    def remove(self, environment):
+        return _cli(environment, "rm", self.name, timeout=60)
+
+    @property
+    def run_state(self):
+        return self.parent / "state" / "runs" / self.name
+
+
+def _fresh_exec_cli_target():
+    suffix = uuid.uuid4().hex[:8]
+    return _ExecCLIProofTarget(
+        parent=Path("/tmp") / ("p-execcli-" + suffix),
+        name="exec-cli-" + suffix,
+    )
+
+
 def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle():
     assert sys.platform.startswith("linux") and platform.machine() == "x86_64"
     image_value = os.environ.get("PALIMPSEST_OCI_EXEC_LIVE_IMAGE")
@@ -43,7 +89,8 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
     assert receipt["archive_sha256"] == "sha256:" + archive_digest
     marker = receipt["marker"]
     assert type(marker) is str and re.fullmatch("palimpsest-local-build-[0-9a-f]{32}", marker)
-    parent = Path("/tmp") / ("p-execcli-" + uuid.uuid4().hex[:8])
+    target = _fresh_exec_cli_target()
+    parent = target.parent
     assert not parent.exists()
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     environment["PYTHONNOUSERSITE"] = "1"
@@ -52,15 +99,15 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
     owned = parent.lstat()
     environment["PALIMPSEST_STATE_HOME"] = str(parent / "state")
     environment["XDG_CONFIG_HOME"] = str(parent / "config")
-    name = "exec-cli"
+    name = target.name
     completed = False
     try:
-        launched = _cli(environment, "run", archive, "--name", name, "-d", timeout=180)
+        launched = target.launch(environment, archive)
         (parent / "launch.stdout").write_bytes(launched.stdout)
         (parent / "launch.stderr").write_bytes(launched.stderr)
         _success(launched)
         assert launched.stdout == (name + "\n").encode()
-        status_before = _cli(environment, "oci", "exec-status", name)
+        status_before = target.exec_status(environment)
         _success(status_before)
         assert json.loads(status_before.stdout) == {
             "schema": "palimpsest.oci-exec-status.v1",
@@ -68,12 +115,12 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
             "occupied": False,
             "guidance": "Ready and unoccupied is a point-in-time observation, not a guarantee the next exec will succeed.",
         }
-        proof_before = _cli(environment, "oci", "root-proof", name)
+        proof_before = target.root_proof(environment)
         _success(proof_before)
         before_report = json.loads(proof_before.stdout)
 
         def execute(label, *argv):
-            result = _cli(environment, "exec", name, "--", *argv, timeout=60)
+            result = target.execute(environment, *argv)
             (parent / (label + ".stdout")).write_bytes(result.stdout)
             (parent / (label + ".stderr")).write_bytes(result.stderr)
             return result
@@ -123,7 +170,7 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         result = execute("after-error", "/bin/sh", "-c", "printf 'still-running'")
         _success(result)
         assert result.stdout == b"still-running" and result.stderr == b""
-        status_after = _cli(environment, "oci", "exec-status", name)
+        status_after = target.exec_status(environment)
         _success(status_after)
         assert json.loads(status_after.stdout) == {
             "schema": "palimpsest.oci-exec-status.v1",
@@ -131,7 +178,7 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
             "occupied": False,
             "guidance": "Ready and unoccupied is a point-in-time observation, not a guarantee the next exec will succeed.",
         }
-        proof_after = _cli(environment, "oci", "root-proof", name)
+        proof_after = target.root_proof(environment)
         _success(proof_after)
         after_report = json.loads(proof_after.stdout)
         assert {key: before_report[key] for key in ("run", "boot", "domain")} == {
@@ -145,21 +192,15 @@ def test_public_exec_preserves_literal_argv_split_streams_exit_and_vm_lifecycle(
         assert virsh is not None
 
         def domain_info():
-            return subprocess.run(
-                [virsh, "-c", "qemu:///system", "dominfo", name],
-                env=environment,
-                capture_output=True,
-                check=False,
-                timeout=15,
-            )
+            return target.domain_info(environment, virsh)
 
         running = domain_info()
         _success(running)
         assert b"running" in running.stdout.lower()
-        _success(_cli(environment, "stop", name, timeout=60))
-        _success(_cli(environment, "rm", name, timeout=60))
+        _success(target.stop(environment))
+        _success(target.remove(environment))
         assert domain_info().returncode != 0
-        assert not (parent / "state" / "runs" / name).exists()
+        assert not target.run_state.exists()
         assert archive.is_file() and hashlib.sha256(archive.read_bytes()).hexdigest() == archive_digest
         completed = True
     finally:
