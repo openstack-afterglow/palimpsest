@@ -1025,6 +1025,81 @@ def test_structural_verifier_rejects_missing_required_tables() -> None:
             oci_packer._verify_superblock(image.fileno(), len(impossible), len(impossible))
 
 
+def _structural_squashfs(*, fragments: int, fragment_table_start: int, padding: bytes | None = None) -> bytes:
+    bytes_used = 160
+    image = struct.pack(
+        "<5I6H8Q",
+        0x73717368,
+        1,
+        0,
+        131072,
+        fragments,
+        1,
+        17,
+        0,
+        1,
+        4,
+        0,
+        0,
+        bytes_used,
+        144,
+        2**64 - 1,
+        96,
+        112,
+        fragment_table_start,
+        2**64 - 1,
+    )
+    image += b"\0" * (bytes_used - len(image))
+    return image + (padding if padding is not None else b"\0" * (512 - bytes_used))
+
+
+@pytest.mark.parametrize("fragment_table_start", [128, 2**64 - 1])
+def test_structural_verifier_accepts_zero_fragments_with_finite_or_sentinel_table(
+    fragment_table_start: int,
+) -> None:
+    payload = _structural_squashfs(fragments=0, fragment_table_start=fragment_table_start)
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        oci_packer._verify_superblock(image.fileno(), len(payload), len(payload))
+
+
+def test_structural_verifier_requires_table_for_positive_fragments() -> None:
+    payload = _structural_squashfs(fragments=1, fragment_table_start=2**64 - 1)
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        with pytest.raises(SquashFSPackError, match="fragment table accounting"):
+            oci_packer._verify_superblock(image.fileno(), len(payload), len(payload))
+
+
+def test_structural_verifier_accepts_positive_fragments_with_in_range_table() -> None:
+    payload = _structural_squashfs(fragments=1, fragment_table_start=128)
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        oci_packer._verify_superblock(image.fileno(), len(payload), len(payload))
+
+
+def test_structural_verifier_rejects_out_of_bounds_zero_fragment_table() -> None:
+    payload = _structural_squashfs(fragments=0, fragment_table_start=160)
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        with pytest.raises(SquashFSPackError, match="table offset"):
+            oci_packer._verify_superblock(image.fileno(), len(payload), len(payload))
+
+
+def test_structural_verifier_rejects_nonzero_padding() -> None:
+    padding = b"\0" * (512 - 161) + b"x"
+    payload = _structural_squashfs(fragments=0, fragment_table_start=128, padding=padding)
+    with tempfile.TemporaryFile(mode="w+b") as image:
+        image.write(payload)
+        image.flush()
+        with pytest.raises(SquashFSPackError, match="padding is invalid"):
+            oci_packer._verify_superblock(image.fileno(), len(payload), len(payload))
+
+
 def test_squashfs_toolchain_identity_binds_version_executable_and_dependencies() -> None:
     executable = "sha256:" + "1" * 64
     dependency_a = "sha256:" + "2" * 64

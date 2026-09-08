@@ -185,6 +185,15 @@ def _key(occurrence: DerivedLayerOccurrence) -> DerivedSquashFSKey:
     )
 
 
+def test_derived_recipe_v3_differs_from_v2_without_invalidating_old_key_records() -> None:
+    current = _key(_occurrence())
+    old = replace(current, structural_verifier="palimpsest.squashfs-superblock.v2")
+
+    assert SQUASHFS_STRUCTURAL_VERIFIER_ID == "palimpsest.squashfs-superblock.v3"
+    assert current.digest != old.digest
+    assert DerivedSquashFSKey.from_dict(old.to_dict()) == old
+
+
 def _receipts(occurrence: DerivedLayerOccurrence, image: bytes) -> tuple[LayerIntakeReceipt, PackedSquashFSReceipt]:
     intake = LayerIntakeReceipt(
         policy_id=LAYER_INTAKE_POLICY_ID,

@@ -35,7 +35,7 @@ SQUASHFS_BLOCK_DEVICE_ALIGNMENT = 512
 
 SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
 SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v2"
-SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v2"
+SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v3"
 SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
 
 _PACKER_RESOURCE_FAILURE_STAGES = frozenset(
@@ -732,7 +732,7 @@ def verify_squashfs_fd(fd: int, image_size: int, maximum: int) -> None:
         raise SquashFSPackError("oci-pack-superblock", "SquashFS required tables are unavailable")
     if inode_table_start >= directory_table_start or inode_table_start + (root_inode >> 16) >= bytes_used:
         raise SquashFSPackError("oci-pack-superblock", "SquashFS root inode location is invalid")
-    if (fragments == 0) != (fragment_table_start == _UINT64_MAX):
+    if fragments > 0 and fragment_table_start == _UINT64_MAX:
         raise SquashFSPackError("oci-pack-superblock", "SquashFS fragment table accounting is invalid")
     if bool(flags & 0x80) != (export_table_start != _UINT64_MAX):
         raise SquashFSPackError("oci-pack-superblock", "SquashFS export table accounting is invalid")

@@ -156,6 +156,18 @@ and time limits so parser errors remain visible. They are standalone component
 tests, not hard-worker or end-to-end materializer qualification. macOS skips do
 not verify those Linux paths: run the selected nodes on the exact pushed server
 SHA too.
+
+The zero-fragment regression first failed on real `mksquashfs` 4.6.1 at
+`d255fd2`, separately for directory-only and empty layers. Structural verifier
+v3 permits an already-in-bounds fragment-table offset when no fragments exist;
+nonzero fragments still require a table. Required tables, bounds, root location
+and padding checks remain intact. The verifier version participates in the
+existing derived recipe/receipt identity; v2 records are not migrated or deleted.
+This matches the [upstream writer](https://github.com/plougher/squashfs-tools/blob/4.6.1/squashfs-tools/mksquashfs.c)
+and [Linux reader](https://github.com/torvalds/linux/blob/v6.6/fs/squashfs/super.c).
+Run the unchanged real-packer nodes again after the fix; a portable structural
+fixture is not proof of native format compatibility.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire
