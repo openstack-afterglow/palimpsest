@@ -15,9 +15,13 @@ precedence:
 Root resolution itself does not create or change `/var/lib`, migrate an existing
 XDG or configured root, or delete old state. Normal state initialization creates
 the selected root only when operating-system permissions allow it; this change
-does not install or preprovision system directories. A single-operator Linux
-installation must preprovision `/var/lib/palimpsest` as an owner-only directory
-for the account that runs Palimpsest. Existing explicit roots remain valid and
+does not install or preprovision system directories. The separate root-only
+`python -I -m palimpsest_local.linux_install` installation step creates the
+no-login `palimpsest` system account and primary group, with its home at
+`/var/lib/palimpsest`, and both standard directories owned by
+`palimpsest:palimpsest` with mode `0700`. Use the administrator-owned Python
+installation described in [installation](install.md). Package installation alone
+does not invoke sudo or modify host accounts. Existing explicit roots remain valid and
 are the supported way to continue managing existing runs, failed VMs, volumes,
 layers, and other assets without moving them.
 
@@ -41,17 +45,55 @@ ledgers remains under the managed state root. OCI-root execution continues to
 support network `none` only, and a Palimpsest-managed shared-network asset
 feature is not implemented by this storage change.
 
-## Planned chronological host journal
+The installer accepts a preexisting account and directories only when they
+match the required identity, ownership, and modes. It refuses partial or
+conflicting identities and never recursively chowns, deletes, or migrates
+existing data. A failed account creation can leave partial setup requiring
+administrator inspection. Management commands run as the dedicated UID;
+group ownership alone does not grant other UIDs direct write access. No sudoers,
+Docker/libvirt/KVM group membership, or runtime daemon is installed.
 
-The complete Linux layout will add an independently secured
-`/var/log/palimpsest` root, also preprovisioned for the single operator. The
-planned journal will record host-observed lifecycle events in UTC order with an
-explicit sequence so equal timestamps and clock adjustments cannot reorder
-events. Records must remain owner-only, bounded, free of credentials and secret
-environment values, and protected against symlink and inode replacement.
+## Chronological host command journal
 
-That journal is not implemented in this slice. In particular, current raw VM
-console files remain pinned below each run's managed state. OCI startup,
+The CLI records command start/end observations in
+`/var/log/palimpsest/commands.jsonl`. `PALIMPSEST_LOG_HOME` can explicitly select
+another preprovisioned absolute owner-private directory; outside Linux the
+journal is disabled unless this override is present. Invalid overrides warn,
+rather than silently disabling recording.
+
+Records contain only a fixed schema, allowlisted command family (or `unknown`),
+start/end phase, command success/error, random invocation ID, UTC observation
+time, monotonic time, and an increasing sequence within the journal file.
+Sequence and append order remain authoritative when wall time goes backwards;
+timestamps describe host observation, not exact guest event time. Command
+arguments, paths, environment values, names, credentials, guest output, and
+exception text are not serialized. A successful `run -d` command is not evidence
+that its workload later completed successfully.
+
+The directory is `0700`; the single-link regular journal file is `0600` and owned
+by the effective UID. Component-by-component no-follow opening, file/root
+identity rechecks, and a nonblocking exclusive lock protect publication. Initial
+file creation is exclusive; only an already-existing-file result permits a
+second open without creation flags. Other open errors are not retried.
+Lock acquisition uses a 50 ms wait budget, each record is at most 512 bytes, and the
+file is capped at 64 MiB. These bounds do not impose a hard deadline on kernel
+filesystem I/O. A partial tail, invalid sequence, unsafe path, full file, or
+write/sync failure leaves existing bytes intact and produces a warning. A failed
+partial append can leave an incomplete tail; it is not silently truncated.
+There is no automatic rotation, deletion, or damaged-file repair. Administrators
+must preserve and inspect records before arranging maintenance with writers
+stopped; replacing the file starts a new sequence scope.
+
+Logging failures do not replace a command's result or prevent dispatch. A fixed
+warning goes to stderr, at most once per invocation, and is repeated on every
+subsequent affected invocation until recording recovers. JSON stdout is not
+changed. If stderr itself is unavailable, warning delivery is best-effort and
+still does not abort the command. This is not a periodic background alert or a
+web-UI health banner. Argument parsing/help and internal shell-completion exits
+before dispatch are not journaled. Direct library calls and detached monitor
+events are outside this CLI command journal.
+
+Current raw VM console files remain pinned below each run's managed state. OCI startup,
 monitoring, retained-console streaming, and QEMU access bind those files to
 exact run-directory and inode identities. Moving or mirroring them before a
 versioned log-routing contract would risk weakening lifecycle evidence or
@@ -64,6 +106,33 @@ lifecycle behavior. It must not relocate or delete existing failed-run data
 automatically.
 
 ## Verification checkpoint — 2026-09-09
+
+### Dedicated installation and fail-open journal (working-tree verification)
+
+The new installation and command-journal implementation passed independent
+review. Final local `core-cli` verification passed 1,061 tests (27.07 seconds),
+and the focused OCI host/adapter tests passed 77 (2.02 seconds). A disposable
+network-disabled Linux container verified real account/group creation, two
+idempotent provisioning calls, unchanged UID/GID and directory inodes, no-login
+home, exact directory ownership/modes, and state initialization and paired
+journal writes as the dedicated UID. The test container was removed normally;
+the host's accounts and standard directories were not changed.
+
+Earlier local checks are retained as failures: restricted socket access caused
+two failures and 28 setup errors; after permitting test sockets, a concurrent
+journal test failed. A typed reproduction later identified `ENOENT` during
+concurrent initial file opens, before the journal lock. Exclusive creation with
+an `EEXIST`-only existing-file open fixed this path; it is not a lock-timeout fix
+or a generalized retry. The production 50 ms budget remains unchanged, while
+successful concurrency and timeout/fail-open behavior have separate tests.
+
+GitHub publication was blocked by the automatic safety reviewer pending explicit
+approval for this payload and destination. These changes are not yet pushed or
+tested at an exact pushed SHA on the server. Actual host provisioning also
+requires administrator authentication and an administrator-owned package
+installation; service-UID KVM/libvirt/Docker permissions are separate.
+
+### Earlier storage-default and console diagnostic checkpoint
 
 Implementation commit `1b9c5c6` passed 412 focused local tests plus 13
 architecture-guard tests. The exact pushed commit passed the same 425 tests on

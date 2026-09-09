@@ -37,8 +37,18 @@ uv run pytest -q tests/unit/test_state.py -k 'state_root or unconfigured or expl
 ```
 
 These tests exercise resolution only for `/var/lib/palimpsest`; they do not
-provision `/var/lib`, migrate existing data, or verify the planned
-`/var/log/palimpsest` journal.
+provision `/var/lib`, migrate existing data, or verify the separate implemented
+`/var/log/palimpsest` host command journal.
+
+The Linux service-account installer has a root-free unit contract:
+
+```sh
+uv run pytest -q tests/unit/test_linux_install.py
+```
+
+This test does not modify host accounts or system directories. Any root smoke
+test must run in a disposable, network-disabled container and must never mount
+host account databases or writable host system paths.
 
 Tests remain in their existing modules; the runner changes selection, not
 assertions, fixtures or production safety checks. A documentation-only edit

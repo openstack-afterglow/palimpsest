@@ -32,7 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_registry completion
-        inventory log_stream metrics refs runtime_dispatch runtime_facade
+        host_journal inventory linux_install log_stream metrics refs runtime_dispatch runtime_facade
         sandbox_policy state test_lanes ui
     """),
     "host-runtime": _units("""
@@ -279,7 +279,7 @@ DEPENDENCIES = (
         ("oci-guest", "oci-monitor", "oci-access", "oci-store", "qualification", "host-runtime"),
         ("guest-binary", "guest-kvm", "native-live", "gate2"),
     ),
-    ("completion inventory log_stream metrics ui", ("core-cli", "host-runtime", "build-registry"), ()),
+    ("completion host_journal inventory linux_install log_stream metrics ui", ("core-cli", "host-runtime", "build-registry"), ()),
 )
 
 

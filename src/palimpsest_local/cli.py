@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completion, inventory, runtime_dispatch, ui
+from . import __version__, completion, host_journal, inventory, runtime_dispatch, ui
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
@@ -2330,7 +2330,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             args = parser.parse_args(raw_args)
         _validate_args(args, parser)
-        return dispatch_args(args)
+        journal = host_journal.begin(args.operation)
+        try:
+            result = dispatch_args(args)
+        except BaseException:
+            journal.finish("error")
+            raise
+        journal.finish("success" if result == 0 else "error")
+        return result
     except SystemExit as exc:
         return int(exc.code)
     except PalimpsestError as exc:

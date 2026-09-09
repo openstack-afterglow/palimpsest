@@ -138,6 +138,43 @@ For running the test suite and linters:
 uv sync --extra dev --extra kvm
 ```
 
+### Dedicated Linux management account
+
+For a single-operator system installation, provision the fixed management
+identity and storage roots with:
+
+```bash
+sudo /opt/palimpsest/bin/python -I -m palimpsest_local.linux_install
+```
+
+Replace `/opt/palimpsest/bin/python` with the administrator-owned interpreter
+where the package is installed. Do not run this root command from an editable
+user checkout or an untrusted current directory.
+
+The command creates the no-login `palimpsest` system user and primary group,
+then creates `/var/lib/palimpsest` and `/var/log/palimpsest` with owner and group
+`palimpsest:palimpsest` and mode `0700`. It is idempotent only when existing
+accounts and directories match that exact contract. It rejects symlinks,
+conflicting ownership or modes, and unsafe writable ancestors; it does not
+recursively change ownership, migrate existing data, or install sudo rules.
+
+Run Palimpsest management operations as the dedicated `palimpsest` service UID
+so the existing owner-only state and inode checks remain effective. Group
+ownership identifies the managed service boundary; mode `0700` means it is not
+direct multi-user write access. The installer does not add the account to
+Docker, libvirt, KVM, or any other privileged group. Those runtime permissions
+must be reviewed and granted separately for the intended deployment.
+
+For example, with the package installed in the trusted path above, run a normal
+management command under the dedicated identity with a clean home and without
+inherited state-root overrides:
+
+```bash
+sudo -H -u palimpsest env -u PALIMPSEST_STATE_HOME -u PALIMPSEST_LOG_HOME \
+  -u XDG_STATE_HOME -u XDG_CONFIG_HOME \
+  /opt/palimpsest/bin/python -I -m palimpsest_local.cli store show
+```
+
 ### Shell Completion Setup
 Palimpsest includes dynamic shell completion scripts for `zsh`, `bash`, and `fish`. Completion candidates follow the live CLI `argparse` tree dynamically and suppress unrelated filesystem suggestions.
 
@@ -215,6 +252,7 @@ Afterglow API containers depend on `palimpsest-local==0.1.0` without the `[kvm]`
 | `PALIMPSEST_URL` | Base URL of the native Palimpsest Hub `/v1` API | `--url` CLI argument |
 | `PALIMPSEST_TOKEN` | Project-scoped Keystone token sent in `X-Auth-Token` | **Required for Hub requests**; supply through a secret manager or process environment, never in docs/state |
 | `PALIMPSEST_REGISTRY` | Registry profile used for unqualified image references | `default` in `registries.toml` |
+| `PALIMPSEST_LOG_HOME` | Explicit owner-private host command journal root | Linux: `/var/log/palimpsest`; other platforms: journaling disabled when unset |
 | `DOCKER_CONFIG` | Existing Docker configuration and credential-helper directory | `~/.docker` |
 | `XDG_CONFIG_HOME` | Configuration root directory | `~/.config` |
 | `XDG_STATE_HOME` | Explicit per-user state and store parent | Linux: `/var/lib/palimpsest` when unset; other platforms: `~/.local/state/palimpsest` |
@@ -269,7 +307,9 @@ these defaults. Palimpsest does not create the `/var/lib` parent, migrate an
 existing state root, or delete legacy data as part of default resolution. A
 single-operator Linux installation must preprovision `/var/lib/palimpsest` for
 the Palimpsest account. See [Linux storage and logging rollout](linux-storage-logging.md)
-for the asset boundary and the not-yet-implemented `/var/log/palimpsest` plan.
+for the asset boundary and the implemented fail-open `/var/log/palimpsest`
+host command journal. Raw VM consoles remain pinned below their run state and
+are not moved into this journal.
 If `~/.local/state/palimpsest` already exists, resolution fails closed instead
 of hiding it; set `XDG_STATE_HOME=$HOME/.local/state` to keep selecting it.
 

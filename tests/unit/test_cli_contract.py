@@ -40,6 +40,9 @@ from palimpsest_local.runtime_types import (
 @pytest.fixture(autouse=True)
 def _isolated_xdg_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep CLI state/config writes out of the developer's real XDG roots."""
+    journal_root = tmp_path / "host-journal"
+    journal_root.mkdir(mode=0o700)
+    monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(journal_root))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     monkeypatch.setattr(
