@@ -105,6 +105,14 @@ static __attribute__((used,noreturn)) void probe(u64 *stack) {
     N(" stdout_alias=",alias1);N(" stderr_alias=",alias2);N(" rootdev=",root.dev);N(" rootino=",root.ino);N(" pid1root=",pid1);A("\n");
 #undef A
 #undef N
-    if(!write_all(1,output,used)||!write_all(2,output,used))finish(103);if(same(argv[1],"exec"))finish(0);for(;;)sc0(34);
+    if (!write_all(1, output, used) || !write_all(2, output, used)) {
+        finish(103);
+    }
+    if (same(argv[1], "exec")) {
+        finish(0);
+    }
+    for (;;) {
+        sc0(34);
+    }
 }
 __asm__(".global _start\n_start:\nmov %rsp,%rdi\nand $-16,%rsp\ncall probe\n");

@@ -277,9 +277,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "858763f080e6b69983d79b07579428cf03e25a17b24041d5b61443639e7ed32b",
-  "reviewed_at": "2026-09-09T07:48:34Z",
-  "summary": "Reviewed test-only stdio C ABI/probe, strict completed-exec envelopes with separate partial-console handling, native public run/exec UID0/101 diagnostics, retained public root reports and lane registration. Production guest source/ELF, stream transport, device allowlist and security policy unchanged. Native outcomes remain separate from original NGINX compatibility, application builds and Gate2."
+  "source_sha256": "ec6397e3621e62c63ba7aa3f2ca4091f90357cc2636035b3d5879381757340eb",
+  "reviewed_at": "2026-09-09T07:55:42Z",
+  "summary": "Reviewed the test-only stdio probe pinned-GCC compile fix: split adjacent write, exec-exit and pause control flow into explicit braced statements to satisfy -Werror=misleading-indentation without changing syscalls, flags, record schema or runtime behavior. Production guest source/ELF and architecture remain unchanged."
 }
 ```
 <!-- architecture-review:end -->
