@@ -190,3 +190,31 @@ under UID 0 and UID 101 with the existing security policy, independently
 reviewed before any guest change. Do not chmod the shared console or add
 capabilities. This checkpoint is not evidence of a root image build, NGINX
 qualification, native proof or Gate 2 pass.
+
+## Separate native stdio diagnostic
+
+`tests/kvm/test_oci_stdio_cli_live.py` defines two separately selectable
+UID 0/101 diagnostic cases under `PALIMPSEST_OCI_STDIO_CLI_LIVE=1`.
+Each uses a fresh scratch OCI fixture with the test-only static
+`tests/kvm/assets/stdio-fd-probe.c`, the existing public-CLI layout builder,
+and explicit numeric `run --user UID:UID`. The fixture is not the original
+NGINX image or a Palimpsest application-build acceptance artifact.
+
+The main process and a public additional exec report their own FD 1/2
+metadata and `/proc/self/fd/1` / `/proc/self/fd/2` reopening result. Reopening
+uses write-only, append, nonblocking and no-controlling-terminal flags;
+there is no create/truncate, stdio read, device creation or permission change.
+Reports are written through both inherited output descriptors. The main
+device's type/mode are observations rather than assumed compatibility facts;
+the additional-exec pipe contract is checked separately. Missing standard
+stream aliases, empty capabilities/groups, locked securebits, NNP/seccomp,
+and denied direct PID 1 root access remain required observations.
+
+Each case compares the main and exec root identities with the authenticated
+public root report. Only successful cases perform normal stop/removal of
+their own fresh VM; diagnostic artifacts remain, and failures preserve their
+runtime. Execute sequentially with 512 MiB and one vCPU, exact pushed code,
+and independent checks of retained domains and original archive hashes.
+Portable parser/layout checks and a local cross-compilation are not native
+evidence. No guest stage-1 source/ELF, production stream transport, device
+allowlist or security policy changes are part of this diagnostic.

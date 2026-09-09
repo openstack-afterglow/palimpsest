@@ -187,6 +187,18 @@ worker/store coverage and require the separate cold public exec proof below;
 the diagnostic alone does not require rebuilding the unchanged guest or
 rerunning the full guest boot matrix.
 
+The main-console versus additional-exec standard-I/O diagnostic is separately
+opted in with `PALIMPSEST_OCI_STDIO_CLI_LIVE=1`. Run the two explicit pytest
+nodes in `tests/kvm/test_oci_stdio_cli_live.py` sequentially with `-x`: UID 0
+and UID 101 each receive a fresh 512 MiB, one-vCPU, no-network runtime and a
+tiny test-only scratch OCI image. The probe records bounded FD 1/2 metadata and
+path-reopen errno without reading standard I/O, changing permissions, or
+creating aliases. Its portable parser contract is
+`tests/unit/test_oci_stdio_cli_live_contract.py`. This diagnostic does not
+change or qualify the packaged guest, an original application image, Gate 2,
+or general OCI compatibility; retain its receipt and exact failed runtime for
+review rather than normalizing observed console metadata.
+
 For worker/packer resource failures and additional-exec diagnostics, keep the
 two feedback loops separate:
 

@@ -194,6 +194,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
+표준 I/O 진단은 `tests/kvm/test_oci_stdio_cli_live.py`의 별도 opt-in UID0/101 사례로 분리한다. 새 scratch OCI fixture의 테스트 전용 C 프로그램이 main/추가 exec의 FD1/2 메타데이터·경로 재열기와 기존 권한 경계, 인증된 root 보고와의 일치를 관찰한다. 각 VM은512MiB·1vCPU로 순차 실행하며 성공한 새 VM만 정상 stop/rm하고 진단 자료와 실패 runtime은 보존한다. production guest C/ELF·출력 전송·device allowlist·보안 정책은 바꾸지 않는다. 이 테스트 정의는 NGINX 호환성 수정·실제 native 통과·새 application build·Gate2 증거가 아니며 [진단 계약](docs/oci-linux-process.md)과 [선별 실행](docs/testing.md)을 구분한다.
+
 Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않도록 새 runtime과 run/domain에 같은 실행별 UUID suffix를 사용한다. public lifecycle/root/PID1 assertions와 성공 시에만 해당 runtime을 정리하는 경계는 유지한다. 테스트 이름·portable contract/lane 등록만 바꾸며 production runtime, guest C/ELF, 보안 정책·schema에는 영향이 없다. 기존 실패 기록은 삭제하거나 새 성공으로 대체하지 않는다. 정확한 focused/native 선택과 보존 확인은 [testing](docs/testing.md)에 따른다.
 
 `6c230b5`에서 로컬·동일 SHA 서버 집중 검사 각157건과 새 이름의 cold public exec 실기1건(21.68초)이 통과했다. 앱의 실제 root identity와 인증된 보고 비교, PID1 직접 접근 거부, stop/rm·새 runtime 정리를 확인했다. 기존 세 inactive 실패 정의·UUID/autostart 및 원본 archive 네 개의 해시는 보존됐고 사후 확인21건이 통과했다. 이전 ancestor 오류는 이번에 재현되지 않았지만 원인 확정/수정으로 기록하지 않는다. NGINX·표준 I/O pathname·새 application build·전체 Gate2는 이번 검증 범위가 아니다.
@@ -275,9 +277,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "163ebe2403c436a93e25d157b83687061f86c34d595a9f9b26445bbefba447ad",
-  "reviewed_at": "2026-09-09T04:28:48Z",
-  "summary": "Reviewed host ancestor verifier and guest stdio setup. Added test-only real direct-child ctime regression and documented isolated UID101 missing-alias/O_CREAT and root-owned pipe reopen probes. No production, guest C/ELF, ACL/ctime policy, schemas or architecture change. Historical host failure remains unattributed; original NGINX and actual guest stdio qualification remain pending."
+  "source_sha256": "858763f080e6b69983d79b07579428cf03e25a17b24041d5b61443639e7ed32b",
+  "reviewed_at": "2026-09-09T07:48:34Z",
+  "summary": "Reviewed test-only stdio C ABI/probe, strict completed-exec envelopes with separate partial-console handling, native public run/exec UID0/101 diagnostics, retained public root reports and lane registration. Production guest source/ELF, stream transport, device allowlist and security policy unchanged. Native outcomes remain separate from original NGINX compatibility, application builds and Gate2."
 }
 ```
 <!-- architecture-review:end -->
