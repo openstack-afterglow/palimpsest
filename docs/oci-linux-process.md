@@ -334,10 +334,30 @@ original NGINX qualification and full Gate 2 remain separate unfinished work.
 
 ## Main-output pump component (not integrated)
 
+Production PID 1 now prepares, but does not write through, a parent-owned main
+console sink. After the trusted initial procfs mount and before root assembly,
+it reopens the fixed `/proc/self/fd/1` magic link as a distinct nonblocking,
+close-on-exec, write-only open file description. The sole `O_NOFOLLOW`
+exception is limited to this fixed PID 1 self-FD path: the no-follow attempt
+must first fail with `ELOOP`. The original and reopened descriptors must remain
+the same root-owned `0600` character device with device number `5:1`; device,
+inode, rdev, mode, UID and GID and the original descriptor/status flags are
+bound before and after the root transition. No `/dev/console` pathname is
+reopened.
+
+The held sink is explicitly closed in both workload child paths before
+isolation or fixed-FD duplication. PID 1 retires it after workload cleanup but
+before root quiescence and TERMINAL publication; error returns retain a common
+close immediately after the supervisor returns. Ownership is removed from
+state before close so a failed close cannot later target a reused descriptor.
+Acquisition, revalidation or parent close failure remains fail-closed. This
+preparation changes the packaged guest but does not yet redirect main
+stdout/stderr or invoke the pump.
+
 `guest/stage1/main_output_pump.h` defines a freestanding, callback-driven
 two-stream output state machine for later PID 1 integration. Production
-`guest/stage1/init.c` does not include it, so the packaged guest ELF and current
-main console behavior are unchanged. Each stream has a fixed 4096-byte buffer.
+`guest/stage1/init.c` does not include the pump header, so current main console
+output behavior remains unchanged. Each stream has a fixed 4096-byte buffer.
 A tick attempts at most one sink write and at most one read from each stream;
 each successful transfer is at most 1024 bytes. Round-robin starting indices
 prevent a transiently stalled first stream from starving the second. Linux raw

@@ -380,6 +380,19 @@ and real nonblocking pipes without a VM. Production `init.c` does not include
 the header, so this test is not packaged-ELF, PID 1, STOP, teardown, console or
 TERMINAL integration evidence.
 
+The production console-sink helpers and their child/parent call sites have
+separate source-extraction harnesses:
+
+```sh
+uv run python -m pytest -q tests/unit/test_main_console_sink.py tests/unit/test_main_console_sink_callsites.py
+```
+
+These compile the current functions and call-site bodies from
+`guest/stage1/init.c` against deterministic syscall doubles. They cover console
+identity and descriptor validation, cleanup faults, and explicit close ordering
+before child isolation and parent TERMINAL handling. They do not replace the
+packaged-binary, PID 1, or native VM proof.
+
 The cold public-CLI proof uses one fresh eight-hex UUID suffix for both its
 `/tmp/p-execcli-<suffix>` runtime and `exec-cli-<suffix>` run/domain name.
 It never reuses the fixed `exec-cli` name of retained failed evidence. A name

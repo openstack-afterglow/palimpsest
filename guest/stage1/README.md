@@ -41,11 +41,18 @@ scripts/build_oci_guest_init.sh
 
 `main_output_pump.h` is currently an independently tested component for a
 future main-output transport. `init.c` does not include it and the packaged ELF
-does not contain it. It provides only bounded two-stream buffering and drain
-state; PID 1 integration, descriptor ownership, polling, STOP service, teardown
-and terminal authorization remain unimplemented.
+does not contain the pump component. It provides only bounded two-stream
+buffering and drain state; pump integration, main-pipe ownership, polling, STOP
+service, teardown drain and terminal authorization remain unimplemented.
 Its callbacks are trusted nonblocking adapters; the component does not make a
 blocking callback nonblocking and does not own a drain deadline.
+
+PID 1 does prepare an otherwise-unused parent-owned nonblocking console sink
+for that future integration. It reopens only the trusted `/proc/self/fd/1`
+object before root transition, binds its exact root-owned `0600` character
+device identity (`5:1`) and original flags across the transition, and keeps the
+new descriptor out of both workload child paths. Main stdout/stderr are not yet
+redirected to pipes and no workload bytes are forwarded through this sink.
 
 The build runs offline and read-only as the invoking UID/GID with fixed locale,
 timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest

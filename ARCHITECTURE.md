@@ -95,6 +95,7 @@ flowchart LR
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
 | guest boundary | [`guest/stage1/init.c`](guest/stage1/init.c), [`src/palimpsest_local/oci_guest_stage1.py`](src/palimpsest_local/oci_guest_stage1.py), [`src/palimpsest_local/oci_lifecycle_transport.py`](src/palimpsest_local/oci_lifecycle_transport.py) | authenticated root/lower block을 read-only 정책으로 확인하고 OverlayFS를 `/`로 move-mount-chroot한 뒤 PID 1이 workload와 lifecycle protocol을 감독 |
 | main-output preparation component | [`guest/stage1/main_output_pump.h`](guest/stage1/main_output_pump.h), [`tests/c/main_output_pump_harness.c`](tests/c/main_output_pump_harness.c) | 독립 C 출력 버퍼 상태기계와 실행 하네스. 아직 `init.c`에서 사용하지 않으며 배포 게스트의 출력·종료 동작은 변경하지 않음 |
+| parent-owned console sink preparation | [`guest/stage1/init.c`](guest/stage1/init.c)의 `acquire_main_console_sink`, `revalidate_main_console_sink`, `close_main_console_sink` | 루트 전환 전 독립 nonblocking console FD 확보, 전환 후 identity 재검증, 양 자식의 조기 close와 TERMINAL 전 부모 정리. 아직 출력 전달에 사용하지 않음 |
 | Hub API | [`hub/src/palimpsest_hub/main.py`](hub/src/palimpsest_hub/main.py), [`hub/src/palimpsest_hub/auth.py`](hub/src/palimpsest_hub/auth.py), [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py) | `/v1` discovery/health, Keystone token scope, layer/image query, resumable upload, bundle, image-export API |
 | Hub persistence/ops | [`hub/src/palimpsest_hub/models.py`](hub/src/palimpsest_hub/models.py), [`hub/src/palimpsest_hub/services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py) | SQL rows와 filesystem blobs를 source of truth로 유지하고 worker lease/conversion/GC를 수행 |
 
@@ -208,7 +209,13 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 메인 출력의 다음 단계는 독립 `main_output_pump.h` component다. stdout/stderr별 고정 4KiB 버퍼와 1KiB 전송 quantum을 두고, 한 tick의 callback 호출은 sink write 최대1회·source read 각 stream 최대1회로 제한한다. stream 내부 순서와 공정한 교대 처리를 유지하지만 두 stream 사이의 실제 발생 시간순 정렬은 보장하지 않는다. EOF와 buffered output 전송 완료를 함께 확인하며 잘못된 상태·영구 I/O 오류는 실패 상태를 유지한다. caller가 nonblocking callback, polling, deadline, FD 소유권을 보장해야 한다. 이 component의 drained 판정은 인증·cgroup 정리·root sync를 포함한 TERMINAL 발행 승인이 아니다.
 
-[`test_main_output_pump.py`](tests/unit/test_main_output_pump.py)는 실제 header를 컴파일해 callback 오류 주입과 호스트 nonblocking pipe를 검사하는 독립 선별 항목이다. `init.c`와 packaged ELF는 그대로이며 VM/PID1/STOP/teardown 통합·NGINX·새 build·Gate2 증거가 아니다. 다음 통합은 정상 main loop뿐 아니라 `terminate_and_reap`의 조기 반환·기한 후 처리 및 모든 오류 경로의 출력 보존을 함께 검토해야 한다. 상세 계약과 실행 선택은 [process](docs/oci-linux-process.md), [testing](docs/testing.md)에 기록한다.
+[`test_main_output_pump.py`](tests/unit/test_main_output_pump.py)는 실제 header를 컴파일해 callback 오류 주입과 호스트 nonblocking pipe를 검사하는 독립 선별 항목이다. pump header는 여전히 `init.c`에 포함되지 않는다. 이 component 검사는 VM/PID1/STOP/teardown 통합·NGINX·새 build·Gate2 증거가 아니다. 다음 출력 전달 통합은 정상 main loop뿐 아니라 `terminate_and_reap`의 조기 반환·기한 후 처리 및 모든 오류 경로의 출력 보존을 함께 검토해야 한다. 상세 계약과 실행 선택은 [process](docs/oci-linux-process.md), [testing](docs/testing.md)에 기록한다.
+
+후속 production stage-1은 `prepare_live` 직후, OCI 루트 전환 전에 고정 `/proc/self/fd/1`만 재열어 부모 소유 sink를 준비한다. no-follow 시도가 정확히 `ELOOP`인 경우에만 이 trusted self-FD magic link를 따른다. 기존 FD1은 writable·blocking 상태와 flags를 그대로 유지하고, 새 FD는 write-only·nonblocking·close-on-exec이어야 한다. 기존/새 FD의 device·inode·rdev·mode·UID/GID를 비교하며 정확한 root0:0·0600 character device `5:1`만 허용한다. 루트 전환 후에는 pathname을 다시 열지 않고 보유 FD와 기존 FD1을 재검증한다. 이 `5:1` 제한은 새 production 조건이며 변경 ELF의 실제 native positive 검증 전에는 실기 통과로 간주하지 않는다.
+
+sink FD는 main 자식의 isolation 전과 추가 exec 자식의 고정 FD100..102 복제 전에 명시적으로 닫는다. 부모는 정상 TERMINAL 발행 전에 close 성공을 요구하고 실패/반환 경로에서도 정리한다. close 전에 소유 상태를 `-1`로 비워 재사용 FD를 다시 닫지 않으며 오류는 정상 terminal로 승격하지 않는다. 이번 준비는 guest source·packaged ELF를 변경하지만 main stdout/stderr를 pipe로 전환하거나 pump에 bytes를 전달하지 않는다. console 권한·PID1 보호·표준 스트림 별칭·저장 및 journal 정책은 변경하지 않는다.
+
+[`test_main_console_sink.py`](tests/unit/test_main_console_sink.py)는 실제 helper를 추출해38개 오류/정상 시나리오를 실행하고, [`test_main_console_sink_callsites.py`](tests/unit/test_main_console_sink_callsites.py)는 실제 호출 구간8개 실행과 자식 분기·종료 순서의 source 구조 검사를 함께 수행한다. 로컬46개·기존 게스트 C 회귀64개·관련 portable/architecture140개·재현 빌드를 포함한 packaged binary34개가 통과했다. sandbox의 Docker 접근 거부와 test lane 등록 전 중간 실패는 최종 통과와 구분한다. 변경 ELF의 서버 실기는 아직 수행하지 않았다. 예정된 stage-1 부팅 matrix, UID0/101 stdio, 기존 이미지 cold public exec는 별도 필수 검증이며, 기존 stdio probe는 신규 sink FD를 직접 열거하지 않으므로 자식의 조기 close 증거는 호출 구간 검사와 구분한다.
 
 `1b9c5c6` Linux 저장 경로와 console OFD 선행 진단 checkpoint: 로컬 집중412건·architecture13건, 정확한 push SHA의 서버425건(34.30초)이 통과했다. 별도 테스트 PID1의 KVM 진단1건(2.01초)에서 상속 콘솔 flags·identity를 유지한 독립 nonblocking 재열기를 확인했다. 사전·사후 보존 검사 각18건도 통과했다. 표준 저장·로그 디렉터리는 서버에 아직 없고 관리자 준비가 필요하다. `/var/log` 시간순 journal의 기록 실패 정책은 결정 전이며 미구현이다. production guest·main 출력 전송·원본 NGINX·새 build·전체Gate2 검증으로 확대하지 않는다. [저장·로그 적용 상태](docs/linux-storage-logging.md)를 참고한다.
 
@@ -297,9 +304,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5992923e40d11e3f9382f2e942f69d9b36d631537e1ac205825678ba8cba3c4d",
-  "reviewed_at": "2026-09-09T12:08:30Z",
-  "summary": "Reviewed standalone main-output pump header, real C callback/pipe harness, explicit test lane and component-only documentation. Two fixed buffers, per-tick bounds, FIFO/fairness, transient handling, sticky failures and EOF-plus-empty drain reviewed. Header remains unreferenced by init.c; guest ELF, PID1 security, console transport, lifecycle and installation state unchanged. Native integration and teardown drain remain separate gates."
+  "source_sha256": "4bfdd29582c2a3c05191ed5a0125930502faa9d572f82499891f0f7d657de0f3",
+  "reviewed_at": "2026-09-09T12:58:16Z",
+  "summary": "Reviewed production parent-owned console sink acquisition before root transition, held-FD identity/flags revalidation, explicit main/exec child closes and parent close before authenticated TERMINAL. Reviewed source-extracted helper and callsite regressions, split test manifest, fixed-toolchain source/ELF provenance and affected architecture/process/testing docs. Local focused and packaged-binary checks passed; changed-ELF native qualification remains pending. Pump header remains unintegrated; console permissions, PID1 protection, stream aliases and host storage/journal policies unchanged."
 }
 ```
 <!-- architecture-review:end -->

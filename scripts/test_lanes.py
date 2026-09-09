@@ -52,6 +52,7 @@ PORTABLE_FILES = {
         oci_guest_filesystems oci_guest_stage1 oci_initramfs oci_process
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
         oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
+        main_console_sink main_console_sink_callsites
     """),
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff

@@ -111,6 +111,10 @@ struct span { const char *p; usize n; };
 #define O_CLOEXEC 02000000
 #define O_NOFOLLOW 0400000
 #define O_DIRECTORY 0200000
+#define O_ACCMODE 3
+#define F_GETFD 1
+#define F_GETFL 3
+#define FD_CLOEXEC 1
 #define POLLIN 1
 #define POLLOUT 4
 #define POLLERR 8
@@ -153,6 +157,7 @@ struct span { const char *p; usize n; };
 #define EACCES 13
 #define ENOTDIR 20
 #define ENAMETOOLONG 36
+#define ELOOP 40
 #define CLOCK_MONOTONIC 1
 #define GRND_NONBLOCK 1
 #define BLKROGET 0x125e
@@ -231,6 +236,7 @@ struct span { const char *p; usize n; };
 #define WORKLOAD_ISOLATION_MARKER "palimpsest guest stage1: workload isolation committed; agent cgroup and exec session owned by pid1; lifecycle authority retained by pid1\n"
 #define ROOT_TRANSITION_MARKER "palimpsest guest stage1: root transition complete; root is slash; workload pending\n"
 #define WORKLOAD_TERMINAL_PREFIX "palimpsest guest stage1: workload terminal; main_status="
+#define MAIN_CONSOLE_SINK_REJECTED_MARKER "palimpsest guest stage1: main console sink rejected; waiting fail-closed\n"
 #define TERMINAL_ROOT_QUIESCED_MARKER "palimpsest guest stage1: terminal root quiesced; overlay slash identity stable; syncfs committed\n"
 #define WORKLOAD_REJECTED_PREFIX "palimpsest guest stage1: workload launch rejected; stage="
 #define WORKLOAD_CLEANUP_REJECTED_PREFIX "palimpsest guest stage1: workload cleanup rejected; stage="
@@ -301,6 +307,17 @@ struct statfs_local {
     i64 flags;
     i64 spare[4];
 };
+
+struct main_console_sink_local {
+    int fd;
+    int original_status_flags;
+    int original_descriptor_flags;
+    struct stat_local identity;
+};
+
+/* This parent-owned descriptor is prepared for the future main-output pump.
+ * This change does not yet write workload output through it. */
+static struct main_console_sink_local main_console_sink = {.fd = -1};
 
 struct pollfd_local {
     int fd;
@@ -2009,6 +2026,96 @@ static int prepare_live(void) {
            mount_ok("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, 0x9fa0) &&
            mount_ok("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, 0x62656572) &&
            mount_ok("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, 0x01021994);
+}
+
+static int same_console_identity(const struct stat_local *left,
+                                 const struct stat_local *right) {
+    return left->dev == right->dev && left->ino == right->ino &&
+           left->rdev == right->rdev && left->mode == right->mode &&
+           left->uid == right->uid && left->gid == right->gid;
+}
+
+static int valid_kernel_console(const struct stat_local *identity) {
+    return (identity->mode & S_IFMT) == S_IFCHR &&
+           (identity->mode & 07777) == 0600 && identity->uid == 0 &&
+           identity->gid == 0 && dev_major(identity->rdev) == 5 &&
+           dev_minor(identity->rdev) == 1;
+}
+
+static int close_main_console_sink(void) {
+    int fd = main_console_sink.fd;
+    main_console_sink.fd = -1;
+    if (fd < 0) return 1;
+    return sc1(SYS_close, fd) == 0;
+}
+
+static int acquire_main_console_sink(void) {
+    static const char path[] = "/proc/self/fd/1";
+    struct stat_local before, after, reopened;
+    i64 nofollow, fd, status_flags, descriptor_flags;
+    i64 original_status_flags, original_descriptor_flags;
+    int valid;
+    if (sc0(SYS_getpid) != 1 || main_console_sink.fd != -1 ||
+        sc2(SYS_fstat, 1, (i64)&before) != 0 || !valid_kernel_console(&before))
+        return 0;
+    original_status_flags = sc3(SYS_fcntl, 1, F_GETFL, 0);
+    original_descriptor_flags = sc3(SYS_fcntl, 1, F_GETFD, 0);
+    if (original_status_flags < 0 || original_descriptor_flags < 0 ||
+        ((original_status_flags & O_ACCMODE) != O_WRONLY &&
+         (original_status_flags & O_ACCMODE) != O_RDWR) ||
+        (original_status_flags & O_NONBLOCK))
+        return 0;
+    nofollow = sc3(SYS_open, (i64)path,
+                   O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY | O_NOFOLLOW, 0);
+    if (nofollow >= 0) {
+        if (nofollow >= 3) sc1(SYS_close, nofollow);
+        return 0;
+    }
+    if (nofollow != -ELOOP) return 0;
+    fd = sc3(SYS_open, (i64)path, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY, 0);
+    if (fd < 3) {
+        return 0;
+    }
+    status_flags = sc3(SYS_fcntl, fd, F_GETFL, 0);
+    descriptor_flags = sc3(SYS_fcntl, fd, F_GETFD, 0);
+    valid = sc2(SYS_fstat, fd, (i64)&reopened) == 0 &&
+            sc2(SYS_fstat, 1, (i64)&after) == 0 &&
+            same_console_identity(&before, &reopened) &&
+            same_console_identity(&before, &after) &&
+            valid_kernel_console(&reopened) && status_flags >= 0 &&
+            (status_flags & O_ACCMODE) == O_WRONLY &&
+            (status_flags & O_NONBLOCK) && descriptor_flags >= 0 &&
+            (descriptor_flags & FD_CLOEXEC) &&
+            sc3(SYS_fcntl, 1, F_GETFL, 0) == original_status_flags &&
+            sc3(SYS_fcntl, 1, F_GETFD, 0) == original_descriptor_flags;
+    if (!valid) {
+        sc1(SYS_close, fd);
+        return 0;
+    }
+    main_console_sink.fd = (int)fd;
+    main_console_sink.original_status_flags = (int)original_status_flags;
+    main_console_sink.original_descriptor_flags = (int)original_descriptor_flags;
+    main_console_sink.identity = before;
+    return 1;
+}
+
+static int revalidate_main_console_sink(void) {
+    struct stat_local held, original;
+    i64 status_flags, descriptor_flags;
+    if (main_console_sink.fd < 3 ||
+        sc2(SYS_fstat, main_console_sink.fd, (i64)&held) != 0 ||
+        sc2(SYS_fstat, 1, (i64)&original) != 0 ||
+        !same_console_identity(&main_console_sink.identity, &held) ||
+        !same_console_identity(&main_console_sink.identity, &original) ||
+        !valid_kernel_console(&held))
+        return 0;
+    status_flags = sc3(SYS_fcntl, main_console_sink.fd, F_GETFL, 0);
+    descriptor_flags = sc3(SYS_fcntl, main_console_sink.fd, F_GETFD, 0);
+    return status_flags >= 0 && (status_flags & O_ACCMODE) == O_WRONLY &&
+           (status_flags & O_NONBLOCK) && descriptor_flags >= 0 &&
+           (descriptor_flags & FD_CLOEXEC) &&
+           sc3(SYS_fcntl, 1, F_GETFL, 0) == main_console_sink.original_status_flags &&
+           sc3(SYS_fcntl, 1, F_GETFD, 0) == main_console_sink.original_descriptor_flags;
 }
 
 #define MOUNTINFO_MAX (64 * 1024)
@@ -4443,6 +4550,7 @@ static __attribute__((noreturn)) void exec_child(struct lifecycle_session *lifec
     u64 empty_mask = 0;
     u8 token = 1;
     i64 operation;
+    if (!close_main_console_sink()) child_fail(error, 42, EIO);
     if (sc3(SYS_dup3, error, 100, O_CLOEXEC) != 100 ||
         sc3(SYS_dup3, isolation, 101, O_CLOEXEC) != 101 ||
         sc3(SYS_dup3, release, 102, O_CLOEXEC) != 102) exit_now(127);
@@ -4817,6 +4925,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (main_pid == 0) {
         i64 operation;
         u8 isolation_ready = 1, release = 0;
+        if (!close_main_console_sink()) child_fail(error_pipe[1], 42, EIO);
         if (sc1(SYS_close, lifecycle->fd) != 0) child_fail(error_pipe[1], 32, EIO);
         sc1(SYS_close, error_pipe[0]);
         sc1(SYS_close, isolation_pipe[0]);
@@ -5126,6 +5235,15 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
     }
+    /* The prepared sink is not terminal authority.  Retire it successfully
+     * before root quiescence and TERMINAL publication. */
+    if (!close_main_console_sink()) {
+        set_workload_failure(failure, 42, EIO);
+        close_workload_agent(&agent, &session);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return -1;
+    }
     if (!quiesce_terminal_root()) {
         set_workload_failure(failure, 37, EIO);
         close_workload_agent(&agent, &session);
@@ -5231,17 +5349,28 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     }
     if (pid != 1) exit_now(EXIT_USAGE);
     if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
+    if (!acquire_main_console_sink()) wait_closed(MAIN_CONSOLE_SINK_REJECTED_MARKER);
     code = run_consumer(0, 0);
+    if (code) (void)close_main_console_sink();
     if (code == EXIT_FILESYSTEM) wait_closed("palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed\n");
     if (code == EXIT_ASSEMBLY) wait_closed("palimpsest guest stage1: mount or staging assembly rejected; root is not slash; pivot and workload disabled; waiting fail-closed\n");
     if (code == EXIT_ROOT_TRANSITION) wait_closed("palimpsest guest stage1: root transition rejected; root state is indeterminate; workload disabled; waiting fail-closed\n");
     if (code) wait_closed("palimpsest guest stage1: pre-mount contract rejected; waiting fail-closed\n");
+    if (!revalidate_main_console_sink()) {
+        (void)close_main_console_sink();
+        wait_closed(MAIN_CONSOLE_SINK_REJECTED_MARKER);
+    }
     write_all(1, ROOT_TRANSITION_MARKER);
     if (!prepare_lifecycle(&lifecycle)) {
+        (void)close_main_console_sink();
         lifecycle_rejected(20, EIO);
         for (;;) sc0(SYS_pause);
     }
     code = supervise_workload(&workload, &workload_failure, &workload_result, &lifecycle);
+    if (!close_main_console_sink() && code == 1) {
+        set_workload_failure(&workload_failure, 42, EIO);
+        code = -1;
+    }
     if (!code) {
         sc1(SYS_close, lifecycle.fd);
         wipe_lifecycle_secret(&lifecycle);
