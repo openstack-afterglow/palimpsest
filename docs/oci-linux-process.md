@@ -218,3 +218,44 @@ and independent checks of retained domains and original archive hashes.
 Portable parser/layout checks and a local cross-compilation are not native
 evidence. No guest stage-1 source/ELF, production stream transport, device
 allowlist or security policy changes are part of this diagnostic.
+
+### Native diagnostic result — 2026-09-09
+
+On exact pushed `cc1fca7`, the two sequential UID 0/101 cases passed on
+`pieroot-server` in 30.54 seconds. Each fresh VM used 512 MiB, one vCPU and
+no network. The pinned GCC static build succeeded. The preceding `8055f68`
+attempt failed before VM boot on `-Werror=misleading-indentation` (1.64
+seconds); only the final C control-flow statements were split into braced
+blocks, without disabling warnings or changing probe semantics. Its evidence
+at `/tmp/p-stdio-0-728b7dc5` remains preserved.
+
+| Process | FD 1/2 type and owner/mode | UID 0 reopen | UID 101 reopen |
+| --- | --- | --- | --- |
+| Main | character console, 0:0, 0600 | success | EACCES |
+| Additional exec | separate FIFO pipes, 0:0, 0600 | success | EACCES |
+
+Both identities successfully wrote their reports through inherited FD 1/2.
+Both lacked `/dev/stdout` and `/dev/stderr` (ENOENT). In all four reports,
+all five capability sets and supplementary groups were empty, securebits
+were 239, NNP was 1, seccomp was 2, and direct PID 1 root access returned
+EACCES. Main and exec root device/inode matched the authenticated public
+root reports before and after exec, with run/boot/domain identity unchanged.
+Normal stop/removal and absence checks passed for both fresh diagnostic VMs.
+
+Evidence remains at `/tmp/p-stdio-0-0ddf7126/evidence` and
+`/tmp/p-stdio-101-b52f06e6/evidence`: compile output, CLI results, public
+root reports and `diagnostic-receipt.json`. All 17 preflight and all 17
+postflight observations passed, preserving the three old inactive domains
+with their UUID/state/autostart and all four original archive hashes. No
+active VM remained. Focused parser, fixture, lane and architecture checks
+passed locally (113, 9.17 seconds) and on this exact server SHA (113, 7.46
+seconds); these are separate from the two native cases and not a full suite.
+
+This confirms the actual guest's inherited-write versus pathname-reopen
+boundary, not the exact syscall cause of the original NGINX failure. Fixed
+self-FD aliases alone would not resolve the observed UID 101 DAC failure.
+The next design must review private workload-owned output transport and
+strict fixed aliases, without chmod of the shared console or capability
+additions. Production guest C/ELF and PID 1 protection remain unchanged.
+Original NGINX qualification, a new application build and full Gate 2 remain
+uncompleted by this diagnostic.
