@@ -151,3 +151,42 @@ while reopening that same endpoint via `/proc/self/fd` after setting its inode
 mode to zero returned EACCES. The probe closed both endpoints and touched no
 VM or filesystem file. This demonstrates the general permission boundary, not
 the actual guest console/pipe modes or the cause of NGINX's failed open.
+
+## Host churn and standard-I/O probe checkpoint — 2026-09-09
+
+The investigation started from clean baseline `3fca07d`. The original
+read-only NGINX lower still has `error.log -> /dev/stderr` and
+`access.log -> /dev/stdout`. Production `prepare_workload_mount_boundary`
+creates exactly the six documented device nodes and no aliases. Upstream
+NGINX `ngx_log_init` opens the log with `NGX_FILE_APPEND` and
+`NGX_FILE_CREATE_OR_OPEN` in
+[`ngx_log.c`](https://github.com/nginx/nginx/blob/master/src/core/ngx_log.c),
+while
+[`ngx_files.h`](https://github.com/nginx/nginx/blob/master/src/os/unix/ngx_files.h)
+maps those flags to `O_WRONLY | O_APPEND | O_CREAT`. This is source-based
+supporting evidence, not an exact syscall trace of the original binary.
+
+The main investigation ran `/tmp/palimpsest-g56.BHPdp1/stdio-probe.py` in the
+existing Python image `d7c79db7d957` as a disposable read-only, no-network
+Docker container with no host mounts, a private 64 KiB tmpfs, 128 MiB memory,
+0.25 CPU and 16 PIDs. The parent retained only `SETUID`/`SETGID` setup
+capabilities before selecting UID/GID 101 with empty supplementary groups. In
+a root-owned mode-0755 simulated device directory, opening a missing `stderr`
+link without `O_CREAT` returned `ENOENT`, while using `O_CREAT` returned
+`EACCES`. Writing through an inherited root-owned mode-0600 pipe succeeded,
+but reopening the present self-FD alias returned `EACCES`. All four expected
+results passed.
+
+This was not an actual guest-console qualification and did not fix NGINX. The
+read-only check `sudo -n true` required a password; passwordless sudo was not
+available and no host privilege was relaxed. The current three VMs remain shut off and were not
+rebooted or deleted. Ordinary direct-child churn on a checked host ancestor is
+now a plausible mechanism, but the historical failure lacks phase, depth and
+field diagnostics and remains unattributed. The ctime and ACL checks remain
+intact.
+
+The next concrete gate is a main-console and exec-pipe ownership/reopen matrix
+under UID 0 and UID 101 with the existing security policy, independently
+reviewed before any guest change. Do not chmod the shared console or add
+capabilities. This checkpoint is not evidence of a root image build, NGINX
+qualification, native proof or Gate 2 pass.

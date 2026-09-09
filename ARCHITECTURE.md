@@ -275,9 +275,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e968e1ca334cb30e775ece79434e3b01e684fab1821e7b868c85ea74d1567096",
-  "reviewed_at": "2026-09-08T17:59:34Z",
-  "summary": "Reviewed cold public exec proof fresh shared UUID-suffix target and portable routing contracts; existing assertions, command timeouts, failure preservation and success-only identity-checked cleanup retained. Added focused host-runtime manifest entry; production runtime, guest source/ELF, security policy and schemas unchanged."
+  "source_sha256": "163ebe2403c436a93e25d157b83687061f86c34d595a9f9b26445bbefba447ad",
+  "reviewed_at": "2026-09-09T04:28:48Z",
+  "summary": "Reviewed host ancestor verifier and guest stdio setup. Added test-only real direct-child ctime regression and documented isolated UID101 missing-alias/O_CREAT and root-owned pipe reopen probes. No production, guest C/ELF, ACL/ctime policy, schemas or architecture change. Historical host failure remains unattributed; original NGINX and actual guest stdio qualification remain pending."
 }
 ```
 <!-- architecture-review:end -->

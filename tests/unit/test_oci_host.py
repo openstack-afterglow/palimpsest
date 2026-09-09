@@ -1,6 +1,7 @@
 import hashlib
 import os
 import stat
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,7 +53,10 @@ def simple_ancestors(monkeypatch, target, *, mode=0o711, acl=b"user::rwx\ngroup:
     def metadata(fd):
         info = original(fd)
         values = {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_ctime_ns")}
-        values["st_mode"] = stat.S_IFDIR | (mode if info.st_ino == inode else 0o755)
+        if info.st_ino != inode:
+            values["st_mode"] = stat.S_IFDIR | 0o755
+        elif mode is not None:
+            values["st_mode"] = stat.S_IFDIR | mode
         return SimpleNamespace(**values)
 
     monkeypatch.setattr(host.os, "fstat", metadata)
@@ -158,6 +162,55 @@ def test_post_acl_change_identifies_depth_and_allowlisted_field(tmp_path, monkey
         host.verify_runtime_parent(tmp_path)
     assert str(raised.value) == (
         f"OCI runtime ancestor changed during verification: phase=post-acl depth={depth} changed={name}"
+    )
+
+
+def test_real_direct_child_creation_reports_post_acl_ctime_change(tmp_path, monkeypatch):
+    target = tmp_path / "owned-ancestor"
+    target.mkdir()
+    target.chmod(0o711)
+    before = target.stat()
+
+    # Cross a full timestamp second so a real mkdir cannot share the baseline
+    # ctime even on a filesystem with coarse timestamp resolution.
+    deadline = time.monotonic() + 3.0
+    while time.time_ns() <= before.st_ctime_ns + 1_000_000_000:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail("timed out establishing an older directory ctime baseline")
+        time.sleep(min(0.01, remaining))
+
+    simple_ancestors(monkeypatch, target, mode=None)
+    normalized_fstat = host.os.fstat
+    created = target / "concurrent-child"
+    mutations = 0
+
+    def callback(*args, **kwargs):
+        nonlocal mutations
+        info = normalized_fstat(kwargs["pass_fds"][0])
+        if (info.st_dev, info.st_ino) == (before.st_dev, before.st_ino):
+            assert mutations == 0
+            created.mkdir()
+            mutations += 1
+        return SimpleNamespace(returncode=0, stdout=b"user::rwx\ngroup::--x\nother::--x\n")
+
+    monkeypatch.setattr(host.subprocess, "run", callback)
+    depth = len(target.parts) - 1
+    with pytest.raises(StateError) as raised:
+        host.verify_runtime_parent(target)
+    assert str(raised.value) == (
+        f"OCI runtime ancestor changed during verification: phase=post-acl depth={depth} changed=ctime"
+    )
+
+    after = target.stat()
+    assert mutations == 1
+    assert created.is_dir()
+    assert after.st_ctime_ns > before.st_ctime_ns
+    assert (after.st_ino, after.st_mode, after.st_uid, after.st_gid) == (
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
     )
 
 
