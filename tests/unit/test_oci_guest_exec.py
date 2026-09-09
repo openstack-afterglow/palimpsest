@@ -86,6 +86,44 @@ static __attribute__((used, noreturn)) void harness_main(void) {
         if (sc1(SYS_close, fd) != 0) exit_now(105);
         exit_now((int)i);
     }
+    if (mode == 13 || mode == 14 || mode == 15) {
+        int pipes[5][2];
+        struct guest_process process;
+        struct stat_local observed;
+        i64 child, status;
+        memset(pipes, 0, sizeof(pipes));
+        memset(&process, 0, sizeof(process));
+        process.uid = 101; process.gid = 202;
+        for (i = 0; i < 2; i++) if (sc2(SYS_pipe2, (i64)pipes[i], O_CLOEXEC) != 0) exit_now(106);
+        if (mode == 14 && sc3(SYS_fchown, pipes[0][0], 1, 1) != 0) exit_now(107);
+        if (mode == 15 && sc2(91, pipes[1][0], 0400) != 0) exit_now(107);
+        if (own_exec_output_pipes(pipes, &process) != (mode == 13)) exit_now(108);
+        if (mode != 13) {
+            for (i = 0; i < 2; i++) { sc1(SYS_close, pipes[i][0]); sc1(SYS_close, pipes[i][1]); }
+            for (i = 0; i < 2; i++) if (sc2(SYS_fstat, pipes[i][0], (i64)&observed) != -9 ||
+                                           sc2(SYS_fstat, pipes[i][1], (i64)&observed) != -9) exit_now(114);
+            exit_now(0);
+        }
+        for (i = 0; i < 2; i++) {
+            if (sc2(SYS_fstat, pipes[i][0], (i64)&observed) != 0 || observed.uid != 101 ||
+                observed.gid != 202 || (observed.mode & S_IFMT) != S_IFIFO ||
+                (observed.mode & 07777) != 0600) exit_now(109);
+        }
+        child = sc0(SYS_fork);
+        if (child == 0) {
+            if (sc3(SYS_dup3, pipes[0][1], 1, 0) != 1 || sc3(SYS_dup3, pipes[1][1], 2, 0) != 2 ||
+                sc2(SYS_setgroups, 0, 0) != 0 || sc3(SYS_setresgid, 202, 202, 202) != 0 ||
+                sc3(SYS_setresuid, 101, 101, 101) != 0) exit_now(110);
+            if (sc3(SYS_open, (i64)"/proc/self/fd/1", O_WRONLY | O_NONBLOCK | O_NOCTTY, 0) < 0 ||
+                sc3(SYS_open, (i64)"/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_NOCTTY, 0) < 0) exit_now(111);
+            exit_now(0);
+        }
+        if (child < 0) exit_now(112);
+        for (i = 0; i < 2; i++) { sc1(SYS_close, pipes[i][0]); sc1(SYS_close, pipes[i][1]); }
+        do { status = 0; n = sc4(SYS_wait4, child, (i64)&status, 0, 0); } while (n == -EINTR);
+        if (n != child || status != 0) exit_now(113);
+        exit_now(0);
+    }
     if (mode == 3) session.state = LIFECYCLE_STOPPING;
     if (mode == 8) session.last_exec_request_id = 9;
     if (mode == 9) remote_exec.active = 1;
@@ -210,6 +248,43 @@ def runner(tmp_path_factory):
         return subprocess.run(command, input=bytes([mode]) + frame[4:], capture_output=True, timeout=15, check=False)
 
     execute.squashfs_fixture = directory / "lower.raw"
+    if docker:
+        execute.root_command = [
+            "docker",
+            "run",
+            "--rm",
+            "--interactive",
+            "--platform",
+            "linux/amd64",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "0:0",
+            "--pids-limit",
+            "16",
+            "--memory",
+            "128m",
+            "--cpus",
+            "0.25",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=16m",
+            "--mount",
+            f"type=bind,src={directory / 'harness'},dst=/harness,readonly",
+            "--entrypoint",
+            "/harness",
+            _TOOLCHAIN,
+        ]
 
     return execute
 
@@ -271,6 +346,30 @@ def test_real_c_squashfs_structural_acceptance_matches_v3(runner, payload, accep
     runner.squashfs_fixture.write_bytes(payload)
     result = runner(b"\0\0\0\0", mode=12)
     assert result.returncode == (0 if accepted else 2), result.stderr
+
+
+@pytest.mark.parametrize("mode", [13, 14, 15])
+def test_real_c_exec_output_pipe_ownership_and_uid101_self_reopen(runner, mode):
+    if os.environ.get("PALIMPSEST_GUEST_EXEC_DOCKER_TESTS") != "1":
+        pytest.skip("UID 101 pipe ownership proof requires the restricted pinned Docker harness")
+    result = subprocess.run(
+        runner.root_command,
+        input=bytes([mode]),
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_exec_output_ownership_is_before_fork_and_failure_closes_all_pairs() -> None:
+    source = (Path(__file__).resolve().parents[2] / "guest/stage1/init.c").read_text()
+    start = source.index("static int start_remote_exec")
+    body = source[start : source.index("static int cancel_remote_exec", start)]
+    assert body.index("own_exec_output_pipes") < body.index("pid = sc0(SYS_fork)")
+    failed = body[body.index("failed:") :]
+    assert "for (i = 0; i < count; i++)" in failed
+    assert "sc1(SYS_close, pipes[i][0])" in failed and "sc1(SYS_close, pipes[i][1])" in failed
 
 
 def _frame(argv=("/bin/demo",), timeout=1000):

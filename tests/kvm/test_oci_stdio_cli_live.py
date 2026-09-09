@@ -242,6 +242,10 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     assert len(main_records) == 2 and main_records[0] == main_records[1]
     main = main_records[0]
     _assert_security(main, uid)
+    assert all(main[f"fd{fd}type"] == 0o020000 for fd in (1, 2))
+    assert all(main[f"fd{fd}uid"] == main[f"fd{fd}gid"] == 0 for fd in (1, 2))
+    assert all(main[f"fd{fd}mode"] == 0o600 for fd in (1, 2))
+    assert all(main[f"fd{fd}reopen"] == (0 if uid == 0 else 13) for fd in (1, 2))
     proof_before = _root_proof(environment, name)
     (evidence / "root-before.json").write_text(json.dumps(proof_before, indent=2, sort_keys=True) + "\n")
     assert (main["rootdev"], main["rootino"]) == (
@@ -257,9 +261,9 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     _assert_security(additional, uid)
     assert (additional["rootdev"], additional["rootino"]) == (main["rootdev"], main["rootino"])
     assert all(additional[f"fd{fd}type"] == 0o010000 for fd in (1, 2))
-    assert all(additional[f"fd{fd}uid"] == additional[f"fd{fd}gid"] == 0 for fd in (1, 2))
+    assert all(additional[f"fd{fd}uid"] == additional[f"fd{fd}gid"] == uid for fd in (1, 2))
     assert all(additional[f"fd{fd}mode"] == 0o600 for fd in (1, 2))
-    assert all(additional[f"fd{fd}reopen"] == (0 if uid == 0 else 13) for fd in (1, 2))
+    assert all(additional[f"fd{fd}reopen"] == 0 for fd in (1, 2))
     assert any(
         main[f"fd{fd}type"] != additional[f"fd{fd}type"] or main[f"fd{fd}ino"] != additional[f"fd{fd}ino"]
         for fd in (1, 2)

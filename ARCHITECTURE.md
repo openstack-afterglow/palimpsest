@@ -180,6 +180,8 @@ stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 
 
 ## Security boundaries
 
+추가 exec 출력은 `guest/stage1/init.c:own_exec_output_pipes`가 `start_remote_exec`의 fork 전에 준비한다. 두 출력 파이프는 각각 양 끝이 같은 FIFO inode이고 stdout/stderr는 서로 달라야 한다. 네 FD 전체의 초기 root0:0·0600과 identity를 먼저 확인한 뒤에만 이미 해석된 workload UID/GID로 소유권을 바꾸고 identity·type·mode·owner를 다시 검증한다. 실패하면 기존 pre-fork cleanup 경로로 거부한다. isolation/error/release 파이프·main console·기존 bounded exec 전송과 종료 정책은 바꾸지 않는다. 게스트 ELF와 source digest는 함께 갱신하며, 표준 스트림 별칭이나 새 권한을 추가하지 않는다. [상세 경계](docs/oci-linux-process.md)와 [실제 C/실기 검사](docs/testing.md)를 구분한다.
+
 | 주체/경계 | 권한과 인증 | 저장/전송 원칙 |
 | --- | --- | --- |
 | 로컬 사용자와 CLI | owner-only XDG state; Hub 요청은 `PALIMPSEST_TOKEN` 환경 입력 | token을 state/ledger/log에 저장하지 않고, registry credential은 Docker credential helper가 소유 |
@@ -190,13 +192,13 @@ stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 
 | guest stage-1/PID 1 | authenticated control channel, signed/bound plan, block identity, private cgroup, no-new-privs/seccomp | workload argv/env/cwd는 authenticated image contract에서만 오며 host credential/secret forwarding 없음 |
 | OCI-root workload | network 없음, capabilityless child subset | PID namespace/완전한 hostile-root availability sandbox를 주장하지 않으며 direct PID 1 authority는 거부 |
 
-명시적 `--user`는 stage-1의 기존 image-root 계정 해석과 exec 전 UID/GID 선택만 바꾼다. capability 전체 제거·securebits 잠금·no-new-privs·seccomp·PID 1 보호를 유지하며 UID 0에도 capability가 없다. 자동 chown/chmod나 supplementary-group 추가는 하지 않는다. 원본 기본 실행과 override 호환성 proof를 별도 취급한다.
+명시적 `--user`는 stage-1의 기존 image-root 계정 해석과 exec 전 UID/GID 선택만 바꾼다. capability 전체 제거·securebits 잠금·no-new-privs·seccomp·PID 1 보호를 유지하며 UID 0에도 capability가 없다. 이미지 파일의 자동 chown/chmod나 supplementary-group 추가는 하지 않는다. PID 1이 새로 만든 추가-exec 출력 파이프의 소유권 설정은 위의 별도 경계다. 원본 기본 실행과 override 호환성 proof를 별도 취급한다.
 
 Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 다르다. Hub는 OCI `/v2` registry를 흉내 내지 않으며, Docker wrapper가 Hub token을 Docker credential로 변환하지 않는다.
 
 ## Development and verification
 
-표준 I/O 진단은 `tests/kvm/test_oci_stdio_cli_live.py`의 별도 opt-in UID0/101 사례로 분리한다. 새 scratch OCI fixture의 테스트 전용 C 프로그램이 main/추가 exec의 FD1/2 메타데이터·경로 재열기와 기존 권한 경계, 인증된 root 보고와의 일치를 관찰한다. 각 VM은512MiB·1vCPU로 순차 실행하며 성공한 새 VM만 정상 stop/rm하고 진단 자료와 실패 runtime은 보존한다. production guest C/ELF·출력 전송·device allowlist·보안 정책은 바꾸지 않는다. 이 테스트 정의는 NGINX 호환성 수정·실제 native 통과·새 application build·Gate2 증거가 아니며 [진단 계약](docs/oci-linux-process.md)과 [선별 실행](docs/testing.md)을 구분한다.
+표준 I/O 진단은 `tests/kvm/test_oci_stdio_cli_live.py`의 별도 opt-in UID0/101 사례로 분리한다. 새 scratch OCI fixture의 테스트 전용 C 프로그램이 main/추가 exec의 FD1/2 메타데이터·경로 재열기와 기존 권한 경계, 인증된 root 보고와의 일치를 검사한다. 현재 계약은 main root-owned0600 character console과 추가 exec의 workload-owned0600 FIFO를 구분한다. 각 VM은512MiB·1vCPU로 순차 실행하며 성공한 새 VM만 정상 stop/rm하고 진단 자료와 실패 runtime은 보존한다. 테스트 정의만으로 새 게스트 ELF·NGINX 호환성·실제 native 통과·새 application build·Gate2를 주장하지 않는다. 변경된 게스트는 별도 재현 빌드와 부팅 matrix도 필요하다. [진단 계약](docs/oci-linux-process.md)과 [선별 실행](docs/testing.md)을 구분한다.
 
 Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않도록 새 runtime과 run/domain에 같은 실행별 UUID suffix를 사용한다. public lifecycle/root/PID1 assertions와 성공 시에만 해당 runtime을 정리하는 경계는 유지한다. 테스트 이름·portable contract/lane 등록만 바꾸며 production runtime, guest C/ELF, 보안 정책·schema에는 영향이 없다. 기존 실패 기록은 삭제하거나 새 성공으로 대체하지 않는다. 정확한 focused/native 선택과 보존 확인은 [testing](docs/testing.md)에 따른다.
 
@@ -279,9 +281,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ec6397e3621e62c63ba7aa3f2ca4091f90357cc2636035b3d5879381757340eb",
-  "reviewed_at": "2026-09-09T07:55:42Z",
-  "summary": "Reviewed the test-only stdio probe pinned-GCC compile fix: split adjacent write, exec-exit and pause control flow into explicit braced statements to satisfy -Werror=misleading-indentation without changing syscalls, flags, record schema or runtime behavior. Production guest source/ELF and architecture remain unchanged."
+  "source_sha256": "5829e081d322d0ed53de85efc0bfff0796492c00dced16a523deb9845ec0f033",
+  "reviewed_at": "2026-09-09T08:24:10Z",
+  "summary": "Reviewed exec-only workload-owned stdout/stderr FIFO preparation before fork, initial/post identity and ownership checks, unchanged control pipes/main console/security/pump contracts, exact production-callsite fault tests and real UID101:GID202 reopening. Packaged sealed ELF/source digests updated; current architecture and detailed contracts distinguish unimplemented main transport/aliases and pending native qualification."
 }
 ```
 <!-- architecture-review:end -->

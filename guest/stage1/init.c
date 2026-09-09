@@ -40,6 +40,7 @@ struct span { const char *p; usize n; };
 #define SYS_mkdir 83
 #define SYS_readlink 89
 #define SYS_chmod 90
+#define SYS_fchown 93
 #define SYS_setpgid 109
 #define SYS_getgroups 115
 #define SYS_setgroups 116
@@ -128,6 +129,7 @@ struct span { const char *p; usize n; };
 #define S_IFREG 0100000
 #define S_IFBLK 0060000
 #define S_IFCHR 0020000
+#define S_IFIFO 0010000
 #define S_IFDIR 0040000
 #define MS_RDONLY 1
 #define MS_NOSUID 2
@@ -4465,6 +4467,46 @@ static __attribute__((noreturn)) void exec_child(struct lifecycle_session *lifec
     child_fail(100, 7, operation);
 }
 
+static int own_exec_output_pipes(int pipes[5][2], const struct guest_process *process) {
+    struct stat_local before[2][2], after[2][2];
+    u32 stream, endpoint;
+    if (!process) return 0;
+    for (stream = 0; stream < 2; stream++) {
+        for (endpoint = 0; endpoint < 2; endpoint++) {
+            if (sc2(SYS_fstat, pipes[stream][endpoint], (i64)&before[stream][endpoint]) != 0 ||
+                (before[stream][endpoint].mode & S_IFMT) != S_IFIFO ||
+                (before[stream][endpoint].mode & 07777) != 0600 ||
+                before[stream][endpoint].uid != 0 || before[stream][endpoint].gid != 0 ||
+                !before[stream][endpoint].dev || !before[stream][endpoint].ino)
+                return 0;
+        }
+        if (before[stream][0].dev != before[stream][1].dev ||
+            before[stream][0].ino != before[stream][1].ino)
+            return 0;
+    }
+    if (before[0][0].dev == before[1][0].dev && before[0][0].ino == before[1][0].ino)
+        return 0;
+    for (stream = 0; stream < 2; stream++)
+        for (endpoint = 0; endpoint < 2; endpoint++)
+            if (sc3(SYS_fchown, pipes[stream][endpoint], process->uid, process->gid) != 0)
+                return 0;
+    for (stream = 0; stream < 2; stream++) {
+        for (endpoint = 0; endpoint < 2; endpoint++) {
+            if (sc2(SYS_fstat, pipes[stream][endpoint], (i64)&after[stream][endpoint]) != 0 ||
+                (after[stream][endpoint].mode & S_IFMT) != S_IFIFO ||
+                (after[stream][endpoint].mode & 07777) != 0600 ||
+                after[stream][endpoint].uid != process->uid || after[stream][endpoint].gid != process->gid ||
+                after[stream][endpoint].dev != before[stream][endpoint].dev ||
+                after[stream][endpoint].ino != before[stream][endpoint].ino)
+                return 0;
+        }
+        if (after[stream][0].dev != after[stream][1].dev ||
+            after[stream][0].ino != after[stream][1].ino)
+            return 0;
+    }
+    return !(after[0][0].dev == after[1][0].dev && after[0][0].ino == after[1][0].ino);
+}
+
 static int start_remote_exec(struct workload_agent *agent, struct lifecycle_session *lifecycle) {
     int pipes[5][2]; u32 i, count = 0; i64 pid;
     remote_exec.pending = 0; remote_exec.active = 1; remote_exec.phase = 1;
@@ -4480,6 +4522,7 @@ static int start_remote_exec(struct workload_agent *agent, struct lifecycle_sess
     }
     /* The child's release read is intentionally blocking, under a parent deadline. */
     if (sc3(SYS_fcntl, pipes[4][0], 4, 0) != 0) goto failed;
+    if (!own_exec_output_pipes(pipes, &remote_exec.process)) goto failed;
     pid = sc0(SYS_fork);
     if (pid == 0) exec_child(lifecycle, pipes[3][1], pipes[2][1], pipes[4][0], pipes[0][1], pipes[1][1]);
     if (pid < 0) goto failed;

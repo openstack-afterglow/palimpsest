@@ -259,3 +259,24 @@ strict fixed aliases, without chmod of the shared console or capability
 additions. Production guest C/ELF and PID 1 protection remain unchanged.
 Original NGINX qualification, a new application build and full Gate 2 remain
 uncompleted by this diagnostic.
+
+## Additional-exec output ownership boundary
+
+The next implementation slice is intentionally smaller than the combined
+transport-and-alias proposal. Additional exec alone now requires both endpoints
+of its stdout and stderr pipes to begin as distinct root-owned FIFO inodes with
+mode `0600`, changes only those output inodes to the already resolved process
+UID/GID before fork, and verifies that inode identity, type and mode remain
+unchanged. The isolation, child-error and release pipes stay root-owned and any
+failure refuses the exec before a child is created.
+
+This slice does not change the main character console, `/dev`, standard-stream
+aliases, output limits, lifecycle protocol, security policy or terminal drain
+semantics. The earlier native observations therefore remain historical
+evidence for the unchanged implementation at that checkpoint, not a claim
+about this new packaged guest. A later main-output design must use a separately
+opened nonblocking console description, fixed bounded fair buffers, continued
+lifecycle/STOP service, and require output EOF plus successful flush before
+terminal publication. A deadline or permanent sink failure must report
+incomplete delivery rather than silently discard output. That design remains
+unimplemented and requires its own review.

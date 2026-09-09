@@ -274,6 +274,14 @@ root identity; retain separate native positives/negatives and original-image
 verification. In particular, a diagnostic native Redis failure remains a
 compatibility failure, even when it successfully identifies the rejecting check.
 
+For additional-exec output ownership changes, run both
+`tests/unit/test_oci_guest_exec.py` and
+`tests/unit/test_oci_exec_pipe_ownership.py`. The first uses real anonymous
+pipes to check distinct UID/GID ownership and UID 101 self-FD reopening; the
+second injects failures through the production start callsite and requires
+pre-fork refusal, complete endpoint cleanup and unchanged root-owned control
+pipes. These tests do not qualify the packaged ELF or native lifecycle.
+
 The approved proc-only `0555` exception uses the same production policy in
 the real C fixture module. It separately checks acceptance, pre-move readiness,
 unchanged metadata and initial-identity retention across `0755`/`0555` changes.

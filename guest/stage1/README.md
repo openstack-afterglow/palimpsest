@@ -195,6 +195,16 @@ The cgroup provides workload containment and deterministic cleanup; it is not
 a complete hostile-root availability sandbox. Every admitted resolved identity,
 including UID 0, executes without capabilities behind the same boundary.
 
+Additional exec stdout and stderr remain separate anonymous pipes and retain
+their existing bounded lifecycle transport. Before an exec child is forked,
+PID 1 verifies two distinct root-owned FIFO inodes with mode `0600`, each
+shared by its pipe's two endpoints, changes only those two inodes to the already
+resolved workload UID/GID, and verifies their identity, type and mode again.
+Isolation, child-error and release pipes remain root-owned. Failure at any
+ownership or identity check closes all newly created endpoints and refuses the
+exec before fork; the main workload console and its termination policy are not
+changed by this boundary.
+
 The native proof opens the uniquely named lifecycle virtio port and runs the
 bounded v2 HELLO/BOOTSTRAP/KEY_ACK/READY/STOP/TERMINAL exchange for both the
 base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
