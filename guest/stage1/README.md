@@ -39,6 +39,14 @@ The reproducible build is:
 scripts/build_oci_guest_init.sh
 ```
 
+`main_output_pump.h` is currently an independently tested component for a
+future main-output transport. `init.c` does not include it and the packaged ELF
+does not contain it. It provides only bounded two-stream buffering and drain
+state; PID 1 integration, descriptor ownership, polling, STOP service, teardown
+and terminal authorization remain unimplemented.
+Its callbacks are trusted nonblocking adapters; the component does not make a
+blocking callback nonblocking and does not own a drain deadline.
+
 The build runs offline and read-only as the invoking UID/GID with fixed locale,
 timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest
 of GCC 14.3.0 Bookworm, pinned as:

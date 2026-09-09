@@ -94,6 +94,7 @@ flowchart LR
 | OCI root preparation | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py)의 `prepare_oci_root_run`, `release_oci_root_transaction`; [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py) | lower lease와 VM-exclusive ext4 root volume을 durable transaction으로 claim/release; retained root는 별도 identity로 재사용 |
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
 | guest boundary | [`guest/stage1/init.c`](guest/stage1/init.c), [`src/palimpsest_local/oci_guest_stage1.py`](src/palimpsest_local/oci_guest_stage1.py), [`src/palimpsest_local/oci_lifecycle_transport.py`](src/palimpsest_local/oci_lifecycle_transport.py) | authenticated root/lower block을 read-only 정책으로 확인하고 OverlayFS를 `/`로 move-mount-chroot한 뒤 PID 1이 workload와 lifecycle protocol을 감독 |
+| main-output preparation component | [`guest/stage1/main_output_pump.h`](guest/stage1/main_output_pump.h), [`tests/c/main_output_pump_harness.c`](tests/c/main_output_pump_harness.c) | 독립 C 출력 버퍼 상태기계와 실행 하네스. 아직 `init.c`에서 사용하지 않으며 배포 게스트의 출력·종료 동작은 변경하지 않음 |
 | Hub API | [`hub/src/palimpsest_hub/main.py`](hub/src/palimpsest_hub/main.py), [`hub/src/palimpsest_hub/auth.py`](hub/src/palimpsest_hub/auth.py), [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py) | `/v1` discovery/health, Keystone token scope, layer/image query, resumable upload, bundle, image-export API |
 | Hub persistence/ops | [`hub/src/palimpsest_hub/models.py`](hub/src/palimpsest_hub/models.py), [`hub/src/palimpsest_hub/services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py) | SQL rows와 filesystem blobs를 source of truth로 유지하고 worker lease/conversion/GC를 수행 |
 
@@ -205,6 +206,10 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
+메인 출력의 다음 단계는 독립 `main_output_pump.h` component다. stdout/stderr별 고정 4KiB 버퍼와 1KiB 전송 quantum을 두고, 한 tick의 callback 호출은 sink write 최대1회·source read 각 stream 최대1회로 제한한다. stream 내부 순서와 공정한 교대 처리를 유지하지만 두 stream 사이의 실제 발생 시간순 정렬은 보장하지 않는다. EOF와 buffered output 전송 완료를 함께 확인하며 잘못된 상태·영구 I/O 오류는 실패 상태를 유지한다. caller가 nonblocking callback, polling, deadline, FD 소유권을 보장해야 한다. 이 component의 drained 판정은 인증·cgroup 정리·root sync를 포함한 TERMINAL 발행 승인이 아니다.
+
+[`test_main_output_pump.py`](tests/unit/test_main_output_pump.py)는 실제 header를 컴파일해 callback 오류 주입과 호스트 nonblocking pipe를 검사하는 독립 선별 항목이다. `init.c`와 packaged ELF는 그대로이며 VM/PID1/STOP/teardown 통합·NGINX·새 build·Gate2 증거가 아니다. 다음 통합은 정상 main loop뿐 아니라 `terminate_and_reap`의 조기 반환·기한 후 처리 및 모든 오류 경로의 출력 보존을 함께 검토해야 한다. 상세 계약과 실행 선택은 [process](docs/oci-linux-process.md), [testing](docs/testing.md)에 기록한다.
+
 `1b9c5c6` Linux 저장 경로와 console OFD 선행 진단 checkpoint: 로컬 집중412건·architecture13건, 정확한 push SHA의 서버425건(34.30초)이 통과했다. 별도 테스트 PID1의 KVM 진단1건(2.01초)에서 상속 콘솔 flags·identity를 유지한 독립 nonblocking 재열기를 확인했다. 사전·사후 보존 검사 각18건도 통과했다. 표준 저장·로그 디렉터리는 서버에 아직 없고 관리자 준비가 필요하다. `/var/log` 시간순 journal의 기록 실패 정책은 결정 전이며 미구현이다. production guest·main 출력 전송·원본 NGINX·새 build·전체Gate2 검증으로 확대하지 않는다. [저장·로그 적용 상태](docs/linux-storage-logging.md)를 참고한다.
 
 메인 출력 전송의 선행 진단은 `tests/kvm/test_oci_console_ofd_live.py`의 독립 opt-in이다. 테스트 전용 PID 1이 root 전환 전 proc/sys/dev 준비 뒤 정확한 self-FD 재열기와 inode·소유권·모드 보존, 새 nonblocking open-file description이 기존 콘솔 flags를 바꾸지 않는지 검사한다. 고정 컴파일러로 만든 별도 initramfs와 128MiB·1vCPU·network none의 제한된 직접 QEMU 부팅만 사용한다. 기존 guest C/ELF·workload·PID1 보호 정책은 바꾸지 않으며 OCI root 전환, 메인 출력 펌프, NGINX 또는 Gate 2를 검증한 것으로 확대하지 않는다. 실제 실행 결과는 별도로 기록하며 진단 실패도 보존한다.
@@ -292,9 +297,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ff578d892e5700d9e90ae77a1319f10950fcaf8f8a1744f1e0e9e2f2b47c0005",
-  "reviewed_at": "2026-09-09T10:33:07Z",
-  "summary": "Reviewed root-only Linux service identity/fixed private-directory provisioning and fail-open CLI command journal. Concurrent initial open ENOENT reproduced independently; exclusive create with EEXIST-only non-creating fallback and exact flag regressions address creation race without retries or production budget changes. Safe record fields, identities, bounds and CLI fixture isolation reviewed; documentation updated; guest/raw-console/runtime authority unchanged."
+  "source_sha256": "5992923e40d11e3f9382f2e942f69d9b36d631537e1ac205825678ba8cba3c4d",
+  "reviewed_at": "2026-09-09T12:08:30Z",
+  "summary": "Reviewed standalone main-output pump header, real C callback/pipe harness, explicit test lane and component-only documentation. Two fixed buffers, per-tick bounds, FIFO/fairness, transient handling, sticky failures and EOF-plus-empty drain reviewed. Header remains unreferenced by init.c; guest ELF, PID1 security, console transport, lifecycle and installation state unchanged. Native integration and teardown drain remain separate gates."
 }
 ```
 <!-- architecture-review:end -->

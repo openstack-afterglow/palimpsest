@@ -331,3 +331,33 @@ observations, including the three historical inactive domains' UUID/state/
 autostart, four archive hashes, no active VM and no remaining QEMU process.
 The earlier failures remain preserved. Main-output transport, fixed aliases,
 original NGINX qualification and full Gate 2 remain separate unfinished work.
+
+## Main-output pump component (not integrated)
+
+`guest/stage1/main_output_pump.h` defines a freestanding, callback-driven
+two-stream output state machine for later PID 1 integration. Production
+`guest/stage1/init.c` does not include it, so the packaged guest ELF and current
+main console behavior are unchanged. Each stream has a fixed 4096-byte buffer.
+A tick attempts at most one sink write and at most one read from each stream;
+each successful transfer is at most 1024 bytes. Round-robin starting indices
+prevent a transiently stalled first stream from starving the second. Linux raw
+negative errno values `-4` and `-11` mean interrupted/try-again; adapters on
+other systems translate their native errno to this component ABI.
+
+Callbacks are trusted, nonblocking and non-reentrant adapters. They must honor
+the supplied buffer size, return either a bounded nonnegative byte count or the
+documented negative error ABI, and must not mutate pump state. The component
+cannot bound a callback that blocks. `main_output_pump_init` requires a valid
+pump pointer; a missing callback supplied to a valid pump is a sticky failure.
+A successful tick return means only that no permanent failure occurred, not
+that bytes moved; the future poll loop must not treat it as progress or spin on
+it.
+
+Invalid state or callback counts, zero/permanent sink writes, and permanent
+source failures make failure sticky. Output is drained only when both sources
+have reported EOF and both buffers are empty. This is not permission to publish
+TERMINAL: lifecycle authentication, cgroup cleanup, root quiescence and sync
+remain separate supervisor conditions. The component owns no descriptors,
+polling, deadlines, signals, STOP handling, reaping, console permissions,
+capabilities or `/dev` aliases. Later integration must update both the normal
+main loop and every `terminate_and_reap` path before terminal publication.

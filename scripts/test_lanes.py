@@ -51,7 +51,7 @@ PORTABLE_FILES = {
         oci_control_protocol oci_control_protocol_v2 oci_fs_fixtures
         oci_guest_filesystems oci_guest_stage1 oci_initramfs oci_process
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
-        oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract
+        oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
     """),
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
@@ -279,7 +279,11 @@ DEPENDENCIES = (
         ("oci-guest", "oci-monitor", "oci-access", "oci-store", "qualification", "host-runtime"),
         ("guest-binary", "guest-kvm", "native-live", "gate2"),
     ),
-    ("completion host_journal inventory linux_install log_stream metrics ui", ("core-cli", "host-runtime", "build-registry"), ()),
+    (
+        "completion host_journal inventory linux_install log_stream metrics ui",
+        ("core-cli", "host-runtime", "build-registry"),
+        (),
+    ),
 )
 
 

@@ -368,6 +368,18 @@ own; neither silently enables the other or substitutes for Gate 2. New exec
 protocol/mailbox/IPC/session/routing unit files belong to oci-monitor, while the
 actual guest C harness belongs to oci-guest with its own platform prerequisites.
 
+The component-only main-output pump has a dependency-free local C harness:
+
+```sh
+uv run python -m pytest -q tests/unit/test_main_output_pump.py
+```
+
+It compiles `tests/c/main_output_pump_harness.c` with the local C compiler and
+directly includes `guest/stage1/main_output_pump.h`. It exercises callback I/O
+and real nonblocking pipes without a VM. Production `init.c` does not include
+the header, so this test is not packaged-ELF, PID 1, STOP, teardown, console or
+TERMINAL integration evidence.
+
 The cold public-CLI proof uses one fresh eight-hex UUID suffix for both its
 `/tmp/p-execcli-<suffix>` runtime and `exec-cli-<suffix>` run/domain name.
 It never reuses the fixed `exec-cli` name of retained failed evidence. A name
