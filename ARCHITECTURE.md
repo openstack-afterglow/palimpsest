@@ -86,7 +86,7 @@ flowchart LR
 | 영역 | 주요 경로와 심볼 | 책임과 의존 방향 |
 | --- | --- | --- |
 | CLI와 routing | [`cli.py`](src/palimpsest_local/cli.py)의 `main`, `resolve_local_oci_run_request`; [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py) | argparse surface와 typed `RuntimeKind`/`RuntimeBackend`를 결정하고 cloud-image, Lima, OCI adapter로 분기 |
-| local state | [`state.py`](src/palimpsest_local/state.py)의 `StatePaths`, `reserve_new_run`, `locked_existing_run`, `atomic_write_json` | owner-only XDG roots, run/project ledgers, lock과 atomic publication. runtime adapter가 이 경계를 소비 |
+| local state | [`state.py`](src/palimpsest_local/state.py)의 `StatePaths`, `reserve_new_run`, `locked_existing_run`, `atomic_write_json` | owner-only selected state root, run/project ledgers, lock과 atomic publication. runtime adapter가 이 경계를 소비 |
 | conventional runtime | [`cloud_runtime.py`](src/palimpsest_local/cloud_runtime.py)의 `create_run`, lifecycle operations; [`lima.py`](src/palimpsest_local/lima.py); [`project_runtime.py`](src/palimpsest_local/project_runtime.py)의 `up_project`/`down_project` | verified cloud image와 layers를 KVM/libvirt 또는 Lima/VZ에 연결하고 compose-shaped project를 reconcile |
 | OCI source | [`oci_source.py`](src/palimpsest_local/oci_source.py)의 `LocalLayoutSource`, `LocalArchiveSource`, `SourceCAS`, `SnapshottedOCIImage` | no-follow snapshot, descriptor/digest 검증, source bytes를 private CAS에 고정 |
 | OCI conversion/store | [`oci_materializer.py`](src/palimpsest_local/oci_materializer.py)의 `materialize_image_hard`; [`oci_store.py`](src/palimpsest_local/oci_store.py)의 `DerivedSquashFSKey`, `DerivedLayerReceipt`, lease APIs; [`artifact_store.py`](src/palimpsest_local/artifact_store.py)의 `ArtifactStore` | worker deadline/resource boundary 안에서 normalized tar → SquashFS를 만들고 derived recipe, record, artifact, occurrence를 관리 |
@@ -130,7 +130,7 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 
 | 데이터 | authoritative storage | cache/파생물 | 불변식 |
 | --- | --- | --- | --- |
-| local config와 run/project state | `${XDG_CONFIG_HOME}/palimpsest`, `${XDG_STATE_HOME}/palimpsest/{runs,projects,volumes,locks}` | 없음 | owner-only mode, no-follow read, atomic ledger와 lock |
+| local config와 run/project state | `${XDG_CONFIG_HOME}/palimpsest`; Linux의 미설정 기본은 `/var/lib/palimpsest/{runs,projects,volumes,locks}`, 명시적 env/config/XDG root와 다른 플랫폼은 기존 경로 유지 | 없음 | owner-only mode, no-follow read, atomic ledger와 lock; 기존 자료 자동 이전 없음 |
 | local generic artifact bytes | `store/blobs/sha256/<hex>`와 metadata | tags, transfer records | byte digest 검증 후 publish; base는 read-only |
 | OCI source bytes | run/operation에 지정된 private `SourceCAS` | snapshot binding | descriptor size/digest와 CAS identity를 함께 검증 |
 | OCI derived runtime block | `OCIStore`의 derived record와 `ArtifactStore` `.sqsh` bytes | `DerivedSquashFSKey`, warm hit | packer/policy/toolchain까지 recipe identity에 포함; receipt는 source graph와 store에 binding |
@@ -158,7 +158,7 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 - base package는 `palimpsest-local` Python 3.12+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
 - conventional macOS Apple Silicon은 Lima 2.1+ VZ(`lima-vz`)를 기본으로 사용하고, Linux KVM은 `/dev/kvm`, QEMU, `qemu:///system`, `default` network와 `cloud-localds`, `mksquashfs`, OpenSSH가 필요하다.
 - OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. OCI network는 `none`만 현재 public intake에서 허용한다.
-- local state에는 `store/`, `runs/`, `projects/`, `volumes/`, `builds/`, `build-cache/`, `runtime-packs/`, `tags/`, `transfers/`, `oci-root-volumes/`가 있다. `ps`/`inspect`/`logs`는 각각 durable ledger 또는 retained console만 읽는 제한된 관찰 명령이다.
+- local state에는 `store/`, `runs/`, `projects/`, `volumes/`, `builds/`, `build-cache/`, `runtime-packs/`, `tags/`, `transfers/`, `oci-root-volumes/`가 있다. Linux에서 env/config/XDG override가 모두 없을 때만 기본 root는 `/var/lib/palimpsest`이며 설치자가 단일 운영자 소유로 미리 준비해야 한다. 기존 `~/.local/state/palimpsest` 항목이 있으면 새 기본값으로 조용히 전환하지 않고 명시적 XDG 선택을 요구하며, 기존 명시 root와 자료는 자동 이동하지 않는다. `ps`/`inspect`/`logs`는 각각 durable ledger 또는 retained console만 읽는 제한된 관찰 명령이다. `/var/log/palimpsest`의 UTC host journal은 계획 상태이고, 현재 raw console의 pinned identity와 경로는 바뀌지 않았다. 세부 경계는 [`docs/linux-storage-logging.md`](docs/linux-storage-logging.md)에 있다.
 
 ### Hub 배포 단위
 
@@ -186,7 +186,7 @@ stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 
 
 | 주체/경계 | 권한과 인증 | 저장/전송 원칙 |
 | --- | --- | --- |
-| 로컬 사용자와 CLI | owner-only XDG state; Hub 요청은 `PALIMPSEST_TOKEN` 환경 입력 | token을 state/ledger/log에 저장하지 않고, registry credential은 Docker credential helper가 소유 |
+| 로컬 사용자와 CLI | owner-only selected state root; Hub 요청은 `PALIMPSEST_TOKEN` 환경 입력 | token을 state/ledger/log에 저장하지 않고, registry credential은 Docker credential helper가 소유 |
 | Hub API 사용자 | project-scoped Keystone token in `X-Auth-Token`; 선택적 `X-Project-Id`; system-admin은 별도 Keystone role assignment 확인 | layer visibility와 upload/export를 project로 제한; 문서에 실제 token/password를 기록하지 않음 |
 | Hub service identity | 설정된 OpenStack password는 `SecretStr`로 읽어 Glance 연결에만 사용 | source code와 문서에 credential을 넣지 않으며, export blob은 configured local path에 저장 |
 | local artifact/CAS | no-follow descriptor, owner UID/mode, digest lock과 SHA-256 | CAS bytes를 hardlink/chmod로 runtime authority에 노출하지 않고 sealed copy/lease를 사용 |
@@ -199,6 +199,8 @@ stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 
 Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 다르다. Hub는 OCI `/v2` registry를 흉내 내지 않으며, Docker wrapper가 Hub token을 Docker credential로 변환하지 않는다.
 
 ## Development and verification
+
+메인 출력 전송의 선행 진단은 `tests/kvm/test_oci_console_ofd_live.py`의 독립 opt-in이다. 테스트 전용 PID 1이 root 전환 전 proc/sys/dev 준비 뒤 정확한 self-FD 재열기와 inode·소유권·모드 보존, 새 nonblocking open-file description이 기존 콘솔 flags를 바꾸지 않는지 검사한다. 고정 컴파일러로 만든 별도 initramfs와 128MiB·1vCPU·network none의 제한된 직접 QEMU 부팅만 사용한다. 기존 guest C/ELF·workload·PID1 보호 정책은 바꾸지 않으며 OCI root 전환, 메인 출력 펌프, NGINX 또는 Gate 2를 검증한 것으로 확대하지 않는다. 실제 실행 결과는 별도로 기록하며 진단 실패도 보존한다.
 
 표준 I/O 진단은 `tests/kvm/test_oci_stdio_cli_live.py`의 별도 opt-in UID0/101 사례로 분리한다. 새 scratch OCI fixture의 테스트 전용 C 프로그램이 main/추가 exec의 FD1/2 메타데이터·경로 재열기와 기존 권한 경계, 인증된 root 보고와의 일치를 검사한다. 현재 계약은 main root-owned0600 character console과 추가 exec의 workload-owned0600 FIFO를 구분한다. 각 VM은512MiB·1vCPU로 순차 실행하며 성공한 새 VM만 정상 stop/rm하고 진단 자료와 실패 runtime은 보존한다. 테스트 정의만으로 새 게스트 ELF·NGINX 호환성·실제 native 통과·새 application build·Gate2를 주장하지 않는다. 변경된 게스트는 별도 재현 빌드와 부팅 matrix도 필요하다. [진단 계약](docs/oci-linux-process.md)과 [선별 실행](docs/testing.md)을 구분한다.
 
@@ -283,9 +285,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5829e081d322d0ed53de85efc0bfff0796492c00dced16a523deb9845ec0f033",
-  "reviewed_at": "2026-09-09T08:39:13Z",
-  "summary": "Reviewed exec-only output FIFO ownership helper, pre/post identity checks, unchanged control pipes/main console/security/transport, real C and actual callsite fault coverage, and matching sealed ELF provenance. Recorded exact-SHA focused/binary/native results separately, including checkout-mode failure and scoped repair; main transport, aliases, NGINX and full Gate2 remain outside this completed slice."
+  "source_sha256": "857a341d37707bc19b978dea3f8d19e9b9e1463154173b22e6656c359799982a",
+  "reviewed_at": "2026-09-09T09:33:35Z",
+  "summary": "Reviewed Linux default state resolution, explicit-root precedence and conservative legacy refusal; storage layout documentation updated without migration or provisioning. Reviewed test-only PID 1 console OFD probe, bounded native cleanup, isolated test imports and split-lane registration. Production guest and pinned console authorities unchanged; chronological host journal and main output transport remain unimplemented."
 }
 ```
 <!-- architecture-review:end -->

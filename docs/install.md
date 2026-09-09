@@ -217,7 +217,7 @@ Afterglow API containers depend on `palimpsest-local==0.1.0` without the `[kvm]`
 | `PALIMPSEST_REGISTRY` | Registry profile used for unqualified image references | `default` in `registries.toml` |
 | `DOCKER_CONFIG` | Existing Docker configuration and credential-helper directory | `~/.docker` |
 | `XDG_CONFIG_HOME` | Configuration root directory | `~/.config` |
-| `XDG_STATE_HOME` | Local state and store root directory | `~/.local/state` |
+| `XDG_STATE_HOME` | Explicit per-user state and store parent | Linux: `/var/lib/palimpsest` when unset; other platforms: `~/.local/state/palimpsest` |
 
 ---
 
@@ -258,10 +258,23 @@ Registry selection for unqualified image references is: an explicit registry in 
 See [Docker/OCI Registry Profiles](registries.md) for the full command and BuildKit configuration contract.
 
 ### State & Store Layout
-Root directory: `${XDG_STATE_HOME:-~/.local/state}/palimpsest/` (Permissions: `0700`).
+Root directory (permissions `0700`):
+
+- Linux, when no environment or config override is present: `/var/lib/palimpsest/`.
+- With an explicit `XDG_STATE_HOME`: `${XDG_STATE_HOME}/palimpsest/`.
+- Other platforms without an override: `~/.local/state/palimpsest/`.
+
+`PALIMPSEST_STATE_HOME` and configured `storage.state_root` take precedence over
+these defaults. Palimpsest does not create the `/var/lib` parent, migrate an
+existing state root, or delete legacy data as part of default resolution. A
+single-operator Linux installation must preprovision `/var/lib/palimpsest` for
+the Palimpsest account. See [Linux storage and logging rollout](linux-storage-logging.md)
+for the asset boundary and the not-yet-implemented `/var/log/palimpsest` plan.
+If `~/.local/state/palimpsest` already exists, resolution fails closed instead
+of hiding it; set `XDG_STATE_HOME=$HOME/.local/state` to keep selecting it.
 
 ```text
-~/.local/state/palimpsest/
+<selected-state-root>/
 ├── store/                          # Content-addressed artifact store (dir: 0700)
 │   └── blobs/sha256/<hex>          # Verified immutable blob files (file: 0444)
 ├── runs/                           # Local VM run ledgers (dir: 0700)

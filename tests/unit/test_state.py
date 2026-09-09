@@ -1144,6 +1144,105 @@ def test_state_root_precedence_and_source_reporting(tmp_path: Path) -> None:
     assert roots_env.state == env_st
 
 
+def test_linux_unconfigured_state_root_resolves_to_var_lib_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_home = tmp_path / "cfg"
+    user_home = tmp_path / "home"
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+
+    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(config_home)})
+
+    assert roots.config == config_home / "palimpsest"
+    assert roots.state == Path("/var/lib/palimpsest")
+    assert not config_home.exists()
+
+
+@pytest.mark.parametrize("legacy_kind", ["directory", "dangling-symlink"])
+def test_linux_unconfigured_root_refuses_to_hide_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_kind: str
+) -> None:
+    user_home = tmp_path / "home"
+    legacy = user_home / ".local" / "state" / "palimpsest"
+    legacy.parent.mkdir(parents=True)
+    if legacy_kind == "directory":
+        legacy.mkdir()
+    else:
+        legacy.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+
+    with pytest.raises(StateError, match="legacy Linux state root exists.*XDG_STATE_HOME"):
+        state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg")})
+
+
+def test_linux_explicit_xdg_state_home_bypasses_legacy_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    user_home = tmp_path / "home"
+    legacy = user_home / ".local" / "state" / "palimpsest"
+    legacy.mkdir(parents=True)
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+
+    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(legacy.parent)})
+
+    assert roots.state == legacy
+
+
+def test_linux_unconfigured_root_fails_closed_when_legacy_probe_is_inaccessible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(state.os, "lstat", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    with pytest.raises(StateError, match="cannot determine whether the legacy Linux state root exists"):
+        state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg")})
+
+
+@pytest.mark.parametrize("source", ["env", "config"])
+def test_linux_explicit_primary_override_bypasses_legacy_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    legacy = tmp_path / "home" / ".local" / "state" / "palimpsest"
+    legacy.mkdir(parents=True)
+    config_home = tmp_path / "cfg"
+    selected = tmp_path / "selected"
+    environment = {"XDG_CONFIG_HOME": str(config_home)}
+    if source == "env":
+        environment["PALIMPSEST_STATE_HOME"] = str(selected)
+    else:
+        config_root = config_home / "palimpsest"
+        config_root.mkdir(parents=True)
+        (config_root / "config.toml").write_text(f'[storage]\nstate_root = "{selected}"\n', encoding="utf-8")
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    assert state.resolve_roots(environment).state == selected
+
+
+def test_non_linux_unconfigured_state_root_keeps_user_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_home = tmp_path / "cfg"
+    user_home = tmp_path / "home"
+    monkeypatch.setattr(state.sys, "platform", "darwin")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+
+    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(config_home)})
+
+    assert roots.state == user_home / ".local" / "state" / "palimpsest"
+    assert not config_home.exists()
+
+
+def test_linux_explicit_xdg_state_home_precedes_system_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    xdg_state = tmp_path / "state"
+
+    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(xdg_state)})
+
+    assert roots.state == xdg_state / "palimpsest"
+    assert not xdg_state.exists()
+
+
 def test_invalid_relative_palimpsest_state_home(tmp_path: Path) -> None:
     env = {
         "XDG_CONFIG_HOME": str(tmp_path / "cfg"),

@@ -9,6 +9,7 @@ import math
 import os
 import re
 import stat as stat_module
+import sys
 import tempfile
 import time
 import tomllib
@@ -453,8 +454,23 @@ def resolve_roots(environment: dict[str, str] | None = None) -> StatePaths:
                     raise StateError(f"invalid storage.state_root in {config_file}")
         if cfg_state_root is not None:
             state = cfg_state_root
+        elif "XDG_STATE_HOME" in env and env["XDG_STATE_HOME"]:
+            state = Path(env["XDG_STATE_HOME"]) / "palimpsest"
+        elif sys.platform.startswith("linux"):
+            legacy_state = Path.home() / ".local" / "state" / "palimpsest"
+            try:
+                os.lstat(legacy_state)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise StateError("cannot determine whether the legacy Linux state root exists") from exc
+            else:
+                raise StateError(
+                    "legacy Linux state root exists; set XDG_STATE_HOME to its parent to select it explicitly"
+                )
+            state = Path("/var/lib/palimpsest")
         else:
-            state = Path(env.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "palimpsest"
+            state = Path.home() / ".local" / "state" / "palimpsest"
 
     return StatePaths(config, state)
 

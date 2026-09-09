@@ -189,7 +189,9 @@ palimpsest store rm sha256:<digest>
 
 ## State locations
 
-Default root is `${XDG_STATE_HOME:-~/.local/state}/palimpsest/`:
+The unconfigured Linux default root is `/var/lib/palimpsest/`; an explicit
+`XDG_STATE_HOME` selects `${XDG_STATE_HOME}/palimpsest/`, and other platforms
+default to `~/.local/state/palimpsest/`:
 
 ```text
 store/          content-addressed base images and layers

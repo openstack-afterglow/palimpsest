@@ -29,6 +29,17 @@ uv run python scripts/test_lanes.py run oci-access
 uv run python scripts/test_lanes.py run qualification
 ```
 
+Linux state-root default and override changes can first be checked without
+creating system directories:
+
+```sh
+uv run pytest -q tests/unit/test_state.py -k 'state_root or unconfigured or explicit_xdg'
+```
+
+These tests exercise resolution only for `/var/lib/palimpsest`; they do not
+provision `/var/lib`, migrate existing data, or verify the planned
+`/var/log/palimpsest` journal.
+
 Tests remain in their existing modules; the runner changes selection, not
 assertions, fixtures or production safety checks. A documentation-only edit
 can produce an empty test recommendation; that is not a successful test run.
@@ -206,6 +217,27 @@ creating aliases. Its portable parser contract is
 change or qualify the packaged guest, an original application image, Gate 2,
 or general OCI compatibility; retain its receipt and exact failed runtime for
 review rather than normalizing observed console metadata.
+
+The pre-transition PID 1 console-open-description diagnostic is a distinct
+native opt-in:
+
+```sh
+PALIMPSEST_OCI_CONSOLE_OFD_LIVE=1 uv run python -m pytest -q \
+  tests/kvm/test_oci_console_ofd_live.py::test_pid1_console_procfd_reopen_has_independent_nonblocking_ofd
+```
+
+It boots a test-only static PID 1 with the same qualified kernel/config and KVM
+selection, 128 MiB memory, one vCPU and no network. The bounded probe mounts its
+own procfs before any root transition, requires `O_NOFOLLOW` to reject the exact
+`/proc/self/fd/1` magic link, then narrowly reopens that fixed self descriptor.
+It checks stable character-device identity and proves the reopened descriptor is
+nonblocking without changing the inherited console flags. Both fixed writes and
+the final marker must occur exactly once. QEMU output is capped at 1 MiB and the
+20-second boot is terminated through only its newly owned process group; evidence
+is retained on failure. This diagnostic does not use or modify production
+`guest/stage1/init.c`, the packaged ELF, an OCI image, or the main-output path.
+Do not run it before independent code review, and do not treat compilation,
+collection, a skip, or a host userspace probe as native evidence.
 
 For worker/packer resource failures and additional-exec diagnostics, keep the
 two feedback loops separate:

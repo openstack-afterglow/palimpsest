@@ -2,7 +2,7 @@
 
 `palimpsest-local` is a Python 3.12+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
 
-It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
+It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under a managed state root. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
 
 ## Status
 
@@ -106,7 +106,10 @@ palimpsest bundle pull sha256:<leaf-layer-digest> --include-base --output ./bund
 palimpsest bundle verify ./bundle
 ```
 
-Local artifacts live below `${XDG_STATE_HOME:-~/.local/state}/palimpsest/`:
+Local artifacts live below the selected state root. The unconfigured Linux
+default is `/var/lib/palimpsest`; an explicit `XDG_STATE_HOME` selects
+`${XDG_STATE_HOME}/palimpsest`, and other platforms default to
+`~/.local/state/palimpsest`:
 
 ```text
 store/       content-addressed blobs and metadata
