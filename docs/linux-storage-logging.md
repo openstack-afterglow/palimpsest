@@ -62,3 +62,30 @@ runs, retain legacy lookup for existing runs, distinguish the chronological
 host journal from raw guest console bytes, and verify both KVM and OCI monitor
 lifecycle behavior. It must not relocate or delete existing failed-run data
 automatically.
+
+## Verification checkpoint — 2026-09-09
+
+Implementation commit `1b9c5c6` passed 412 focused local tests plus 13
+architecture-guard tests. The exact pushed commit passed the same 425 tests on
+the Linux qualification host (34.30 seconds). Independent review, Ruff, lane
+inventory, and working/staged architecture checks passed. This is focused
+verification, not a full portable-suite or system-directory installation proof.
+
+Read-only host inspection found both standard directories absent, and the
+operator could not obtain noninteractive administrative access. No system
+directory, ownership, global configuration, or existing asset was changed.
+Actual provisioning remains pending, as does the operating-account choice.
+Before integrating the chronological journal, its failure policy must be
+settled: continue the VM operation with a warning, or refuse operations when
+records cannot be written. The latter changes VM availability; neither policy
+is implemented by this checkpoint.
+
+An independent test-only console diagnostic also passed on the exact commit
+(one KVM boot, 2.01 seconds, 128 MiB, one vCPU, no network). It verifies a
+separate nonblocking console open description before root transition without
+changing inherited console flags or ownership. All 18 preservation checks
+passed both before and after the run: the three earlier inactive VM definitions
+and four original archive hashes were preserved, and no active VM/QEMU remained.
+Evidence is retained privately. This is a prerequisite for future main-output
+transport, not its implementation, a new application build, NGINX qualification,
+or a complete Gate 2 run. Production guest C/ELF and PID 1 protection are unchanged.
