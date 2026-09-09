@@ -107,7 +107,7 @@ automatically.
 
 ## Verification checkpoint — 2026-09-09
 
-### Dedicated installation and fail-open journal (working-tree verification)
+### Dedicated installation and fail-open journal (`0456822`)
 
 The new installation and command-journal implementation passed independent
 review. Final local `core-cli` verification passed 1,061 tests (27.07 seconds),
@@ -126,11 +126,20 @@ an `EEXIST`-only existing-file open fixed this path; it is not a lock-timeout fi
 or a generalized retry. The production 50 ms budget remains unchanged, while
 successful concurrency and timeout/fail-open behavior have separate tests.
 
-GitHub publication was blocked by the automatic safety reviewer pending explicit
-approval for this payload and destination. These changes are not yet pushed or
-tested at an exact pushed SHA on the server. Actual host provisioning also
-requires administrator authentication and an administrator-owned package
-installation; service-UID KVM/libvirt/Docker permissions are separate.
+GitHub publication was initially blocked by the automatic safety reviewer.
+After explicit user approval of this payload and destination, implementation
+commit `0456822baf8e5d963185148f57969e31479d7b64` was pushed to the existing
+branch. The exact commit passed `core-cli` on the Linux server: 1,061 tests
+(49.66 seconds), followed by 77 OCI host/adapter tests (15.72 seconds). The
+architecture source guard also passed. No native VM rerun was required for this
+host-only change; this is not a new Gate 2 or guest qualification.
+
+Read-only inspection still found no dedicated account/group or either standard
+directory, and noninteractive sudo required a password. Actual host provisioning
+therefore remains unperformed. It requires administrator authentication and an
+administrator-owned package installation; service-UID KVM/libvirt/Docker
+permissions are separate. No host account, permission policy, or old VM data was
+changed during these tests.
 
 ### Earlier storage-default and console diagnostic checkpoint
 
