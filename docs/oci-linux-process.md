@@ -280,3 +280,54 @@ lifecycle/STOP service, and require output EOF plus successful flush before
 terminal publication. A deadline or permanent sink failure must report
 incomplete delivery rather than silently discard output. That design remains
 unimplemented and requires its own review.
+
+### Exec-only qualification checkpoint — 2026-09-09
+
+Exact pushed `bb04a5b` passed the final local focused selection (297 tests,
+17.36 seconds) and packaged ELF checks (34 tests, 10.11 seconds, including two
+pinned rebuilds). The same server SHA passed 297 focused tests in 24.92 seconds
+and 34 binary tests in 16.69 seconds. The new callsite harness executes the
+actual production helper and start function with syscall/cgroup doubles:
+eleven faults require no fork, all ten endpoints closed and session cleanup;
+its successful case checks exact control ownership, FD mapping and flags.
+A separate real-pipe test verifies UID 101/GID 202 reopening after credential
+drop. Neither kind of C harness substitutes for guest execution.
+
+The first server focused run had 296 passes and one failure (25.09 seconds):
+all provenance hashes matched, but checkout had created the packaged ELF as
+`0664`, not the required `0644`. Read-only inspection found shell umask `002`
+and no extended/default ACL. Fresh scratch checkouts reproduced `0664` under
+`002` and `0644` under `022`, with identical content. After independent review,
+only that exact no-follow, single-link, identity/hash-verified package file was
+changed to `0644`; content and ownership remained unchanged. The strict test
+was retained, the failed log and scratch experiment were preserved, and no VM
+had been started. Future checkout commands set process umask before Git,
+without changing global settings or normalizing VM/image permissions.
+
+The subsequent required stage-1 proof passed all 43 boots / 44 QEMU invocations
+in 122.20 seconds, with the private evidence retained. The two sequential
+public stdio cases passed in 30.52 seconds, with these observed FD 1/2 results:
+
+| Identity / process | Type, owner and mode | Self-FD pathname reopen |
+| --- | --- | --- |
+| UID 0 main | character console, 0:0, 0600 | success |
+| UID 101 main | character console, 0:0, 0600 | EACCES |
+| UID 0 additional exec | separate FIFO pipes, 0:0, 0600 | success |
+| UID 101 additional exec | separate FIFO pipes, 101:101, 0600 | success |
+
+All four reports retained capability sets/groups zero, securebits 239, NNP 1,
+seccomp 2 and denied direct PID 1 root access. Main/exec root identities matched
+the authenticated public root reports before and after exec. Standard stream
+aliases remained absent. Both diagnostic VMs passed normal stop/removal, and
+their private receipts remain retained.
+
+The separate unchanged Palimpsest-built archive cold public lifecycle proof
+passed in 21.43 seconds using a fresh runtime: literal argv, split streams,
+exit status, root/PID 1 checks and normal stop/removal. Its successful
+temporary runtime was removed by the existing proof. This reused an existing
+immutable application artifact; it was not a new application build.
+Each of the three native runs passed all 18 preflight and 18 postflight
+observations, including the three historical inactive domains' UUID/state/
+autostart, four archive hashes, no active VM and no remaining QEMU process.
+The earlier failures remain preserved. Main-output transport, fixed aliases,
+original NGINX qualification and full Gate 2 remain separate unfinished work.

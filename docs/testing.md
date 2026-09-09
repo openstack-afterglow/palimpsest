@@ -95,6 +95,14 @@ against an existing user VM or delete retained failure evidence to speed up a
 test. A native change still requires its actual native proof; a focused unit
 pass is not a replacement.
 
+Set the process `umask 022` **before Git checkout/merge**, not merely before
+pytest. Git's non-executable file entry does not encode the full required
+`0644` mode: a checkout under the server's `002` mask can create the packaged
+guest ELF as `0664` while its content hash and Git status still match. Retain
+the strict package mode/provenance check. Do not broadly chmod a checkout or
+relax the assertion; any existing mismatch needs exact-file identity/hash
+inspection and a separately reviewed, narrowly scoped metadata repair.
+
 The coordinated native case additionally requires the invoking Python to import
 both the installed project and libvirt normally: clean product children do not
 inherit `PYTHONPATH`. Use a qualified system-Python venv with
