@@ -451,3 +451,27 @@ The rebuilt ELF SHA-256 is
 source-bundle SHA-256 is
 `9538af57001c1c968d1d9a7728ad7839cd289d3c387deca5015be9c665fbd331`.
 These are local checks, not a replacement for the failed native proof.
+
+On exact `d32328a`, the native host passed the same 686 selected checks.
+The next stage-1 run reached final receipt construction but failed the retained
+console ordering predicate (121.37 seconds). A separate line-number-only
+diagnostic reproduced that rejection (122.19 seconds); all preceding marker
+count checks had passed. A shorter two-boot observer then emitted only fixed
+marker ordinals and deliberately stopped without qualification (21.51 seconds).
+It confirmed that the first authenticated boundary preceded the workload's
+signal-armed marker; the remaining expected order was intact. Each run passed
+all 21 preflight and 21 postflight preservation checks, with no active VM/QEMU.
+
+The proof host had closed composite connection one as soon as READY_COMMITTED
+arrived, without waiting for the already-counted workload signal-armed marker.
+The new pipe path permits that child marker to arrive later. The correction
+waits for both markers before that one intentional disconnect. It does not
+change guest source/ELF, authentication, negative reconnect controls or the
+receipt's exact marker counts/order. The portable six-connection fixture now
+also exercises delayed signal readiness; the original ordering case remains.
+UID stdio and cold native qualification remain unrun until this gate passes.
+The five-file synchronization follow-up passed 423 selected local protocol/
+proof/manifest/architecture checks and independent review. The delayed variant
+requires the connection to remain open before emitting signal readiness, then
+completes the original six authenticated connections. No guest rebuild is
+needed because this change only corrects host proof synchronization.

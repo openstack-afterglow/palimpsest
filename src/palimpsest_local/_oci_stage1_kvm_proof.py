@@ -4552,7 +4552,12 @@ def _read_console_until(
             if lifecycle_scenario == "negative" and negative_reconnect_pending and ready_committed == 1:
                 close_channel(require_peer_boundary=True)
                 negative_reconnect_pending = False
-            if lifecycle_scenario == "composite" and connection_ordinal == 1 and ready_committed == 1:
+            if (
+                lifecycle_scenario == "composite"
+                and connection_ordinal == 1
+                and ready_committed == 1
+                and armed_count == 1
+            ):
                 if channel_pending:
                     raise KVMProofFailure("initial lifecycle HELLO was not fully written")
                 close_channel(require_peer_boundary=True)

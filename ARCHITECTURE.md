@@ -210,6 +210,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
 
+Stage-1의 composite 재접속 proof는 첫 연결을 의도적으로 끊기 전에 READY_COMMITTED와 workload의 신호 준비 marker를 모두 기다린다. 메인 파이프의 비동기 전달에서 receipt가 요구하는 marker 순서를 검사 호스트가 먼저 동기화하며, receipt의 정확한 개수·순서·인증 조건이나 별도 negative reconnect 경로는 바꾸지 않는다.
+
 메인 출력은 `init.c`에서 `main_output_pump.h`를 소비한다. stdout/stderr별 고정 4KiB 버퍼와 공통 16KiB console 큐, 1KiB 전송 quantum을 사용한다. 한 서비스 tick은 실제 sink write 최대1회와 source read 각 stream 최대1회를 시도한다. stream 내부 순서와 큐에 수용된 순서는 유지하지만 독립 stream의 실제 발생 시간순 정렬이나 진단 문장 전체의 atomicity는 보장하지 않는다. workload enqueue의 용량 부족은 무변경 재시도이며 진단 enqueue의 용량 초과·잘못된 상태·영구 I/O 오류는 실패를 유지한다. sink가 영구적으로 실패하면 무손실 전달은 보장할 수 없다.
 
 [`test_main_output_pump.py`](tests/unit/test_main_output_pump.py)는 실제 header의 callback 오류와 호스트 nonblocking pipe를 검사한다. [`test_main_output_pipes.py`](tests/unit/test_main_output_pipes.py)는 production 파이프 helper와 호출 경계를, [`test_main_output_terminate.py`](tests/unit/test_main_output_terminate.py)는 종료 루프를 분리해 검사한다. 이러한 정의는 변경 ELF의 native 검증이나 NGINX·새 build·Gate2 통과 증거가 아니다. 상세 계약과 실행 선택은 [process](docs/oci-linux-process.md), [testing](docs/testing.md)에 기록한다.
@@ -309,9 +311,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c612bc3a37044c25947faa6e5b5fd630f3145fd433466237c51a7567f5578be7",
-  "reviewed_at": "2026-09-10T06:46:13Z",
-  "summary": "Investigated exact-e585ce1 native STOP stage21 failure: expired cleanup caller slice was incorrectly treated as control protocol error even with empty parser. Reviewed minimal reader helper distinguishing slice yield from true full five-second frame expiry/clock failure, unchanged parser preservation and 64-frame fairness, actual red-baseline/green regressions, rebuilt source-bundle/ELF pins and evidence/docs. No security or5+1 output-drain contract relaxation. Independent review passed; disjoint local245+343+64+34=686 checks passed. Prior native failure and21pre/post preservation remain recorded; corrected exact-SHA native pending."
+  "source_sha256": "272314901b17f5a6d580487aeef4e73c16ff49d94cb102e257f4d6bd9c1ae31c",
+  "reviewed_at": "2026-09-10T07:08:38Z",
+  "summary": "Investigated exact-d32328a retained-console receipt ordering failure. Bounded line-only and2boot marker-ordinal diagnostics proved first authenticated boundary arrived before signal-armed while allmarker counts passed; all21pre/post preservation checks passed. Reviewed proof-host-only synchronization: first composite disconnect waitsREADY_COMMITTED plus signal-armed; original sixconnection fixture retained and delayed-output variant added. Guest source/ELF, receipt counts/order/authentication and negative-control path unchanged. Independent review and423 local related checks passed. Architecture/process/testing docs preserve failures; exact-SHA native pending."
 }
 ```
 <!-- architecture-review:end -->

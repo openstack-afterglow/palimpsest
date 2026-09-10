@@ -1225,7 +1225,8 @@ time.sleep(2)
     temporary.cleanup()
 
 
-def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path: Path) -> None:
+@pytest.mark.parametrize("delayed_armed", [False, True])
+def test_console_reader_drives_exact_six_connection_reconnect_composite(tmp_path: Path, delayed_armed: bool) -> None:
     plan = build_proof_plan()
     transport = build_stage1_transport(plan)
     binding = OCIControlBinding(plan.run_id, plan.domain_core_digest, transport.receipt.artifact_digest)
@@ -1305,9 +1306,19 @@ bootstrap = OCIControlV2Message('BOOTSTRAP', binding, attempt, nonce, epoch, gue
 c.sendall(encode_frame(sign_message(bootstrap, key)))
 key_ack = receive(c); verify_message_authentication(key_ack, key); last_host_wire = key_ack.body.wire_sequence
 send_message(c, 'READY', {{}}, last_host_wire)
-for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r},
-               {LIFECYCLE_READY_COMMITTED_MARKER!r}):
-    sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
+if {delayed_armed!r}:
+    for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {LIFECYCLE_READY_COMMITTED_MARKER!r}):
+        sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
+    c.settimeout(0.2)
+    try: premature = c.recv(1)
+    except socket.timeout: premature = None
+    assert premature is None
+    c.settimeout(None)
+    sys.stdout.buffer.write({WORKLOAD_SIGNAL_ARMED_MARKER!r} + b'\\n'); sys.stdout.flush()
+else:
+    for marker in ({ROOT_TRANSITION_MARKER!r}, {WORKLOAD_STARTED_MARKER!r}, {WORKLOAD_SIGNAL_ARMED_MARKER!r},
+                   {LIFECYCLE_READY_COMMITTED_MARKER!r}):
+        sys.stdout.buffer.write(marker + b'\\n'); sys.stdout.flush()
 drain(c)
 send_boundary(public_state('ready'), last_host_wire)
 c, _ = listener.accept(); reconnect = receive(c); verify_message_authentication(reconnect, key)

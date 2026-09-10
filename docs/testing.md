@@ -436,6 +436,13 @@ PID1 access restrictions remain unchanged. Set a healthy private
 host journal failure-warning tests; never strip a warning to pass the proof.
 These selections do not qualify NGINX, a new application build or full Gate 2.
 
+The stage-1 composite reconnect proof waits for both READY_COMMITTED and the
+workload's signal-armed marker before its first intentional disconnect. Pipe
+delivery makes readiness and child-output observation asynchronous; the test
+must establish the ordering it later verifies. The six-connection portable
+fixture covers both immediately available and delayed signal readiness.
+Receipt marker counts/order and authenticated boundary checks are unchanged.
+
 The cold public-CLI proof uses one fresh eight-hex UUID suffix for both its
 `/tmp/p-execcli-<suffix>` runtime and `exec-cli-<suffix>` run/domain name.
 It never reuses the fixed `exec-cli` name of retained failed evidence. A name
