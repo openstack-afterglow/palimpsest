@@ -77,6 +77,11 @@ the installed package verifies the bundled stage-1 ELF digest and format.
 The helper also exercises the README's `uv tool install --no-index` path in
 temporary tool directories and runs that installed executable. `--no-deps`
 belongs to the separate `uv pip install` probe, not `uv tool install`.
+The generated reference normalizes argparse usage whitespace and optional
+positional requiredness: Python 3.12 and 3.13 otherwise render different
+wrapping and internal `required` values for `*` and remainder arguments.
+Check the same generated file under both supported versions; accepting a stale
+file or changing production parsing is not the fix.
 These checks do not boot a VM, qualify Gate 2, publish a release, or authorize
 changes to `/var/lib/palimpsest` or `/var/log/palimpsest`.
 

@@ -315,9 +315,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b79aeb46ec4772a116c42b4b5fb142a33f4619705186c1f9835a8abf32f911bf",
-  "reviewed_at": "2026-09-10T07:41:58Z",
-  "summary": "Reviewed CLI parser/dispatch, installer and package assets against new reference and packaging source.74 command paths/216 argument definitions have checked syntax and authored usage. Package helper builds wheel from sdist, validates ELF, and tests separate isolated uv-pip plus uv-tool installations; corrected unsupported uv-tool --no-deps found by actual smoke. CI/core-cli mappings updated. No production runtime, guest, schema, privilege, data ownership or release gate change. Prior focused256 and core/qualification1347 tests passed; final artifact/server checks remain separate evidence, not native or Gate2 qualification."
+  "source_sha256": "a2692318bbfcc9cb735ef6f6e0882db7d28ddf75d3e9b5838f2a6e5aad223398",
+  "reviewed_at": "2026-09-10T07:47:44Z",
+  "summary": "Reviewed canonical CLI reference rendering and restored optional-positional parser metadata after Python3.12/3.13 drift observed on7df6a32 server. Both versions now pass generation checks, all command/option coverage and required-option/+ regression controls remain. Production parser/runtime/guest and packaging unchanged. Initial core/qualification1347 checks and both local/server package install smokes passed at7df6a32; final focused/new-SHA results recorded separately. This is not release or native/Gate2 qualification."
 }
 ```
 <!-- architecture-review:end -->

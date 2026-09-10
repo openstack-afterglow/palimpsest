@@ -133,7 +133,7 @@ PATH_DESCRIPTIONS = {
 
 
 def _display_default(action: argparse.Action) -> str:
-    if action.required:
+    if _is_semantically_required(action):
         return "required"
     if action.default is argparse.SUPPRESS:
         return "—"
@@ -142,6 +142,13 @@ def _display_default(action: argparse.Action) -> str:
     if isinstance(action.default, Path):
         return _code(action.default)
     return _code(repr(action.default))
+
+
+def _is_semantically_required(action: argparse.Action) -> bool:
+    """Normalize argparse's version-dependent positional ``required`` field."""
+    if action.option_strings:
+        return action.required
+    return action.nargs not in ("?", "*", argparse.REMAINDER)
 
 
 def _value(action: argparse.Action) -> str:
@@ -193,13 +200,20 @@ def _commands(parser: argparse.ArgumentParser, path: tuple[str, ...] = ()):
 
 
 def _format_usage(parser: argparse.ArgumentParser) -> str:
-    """Render independently of the caller's terminal width/COLUMNS."""
+    """Render canonical syntax independent of Python and terminal wrapping."""
     original = parser.formatter_class
-    parser.formatter_class = lambda prog: argparse.HelpFormatter(prog, width=78, max_help_position=24)
+    normalized: list[tuple[argparse.Action, bool]] = []
+    for action in parser._actions:
+        if not action.option_strings and action.nargs in ("?", "*", argparse.REMAINDER):
+            normalized.append((action, action.required))
+            action.required = False
+    parser.formatter_class = lambda prog: argparse.HelpFormatter(prog, width=1_000_000, max_help_position=24)
     try:
-        return parser.format_usage().strip()
+        return " ".join(parser.format_usage().split())
     finally:
         parser.formatter_class = original
+        for action, required in normalized:
+            action.required = required
 
 
 GUIDE_ANCHORS = {

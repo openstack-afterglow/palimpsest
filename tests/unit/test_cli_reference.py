@@ -83,7 +83,7 @@ def test_render_covers_every_parser_path_argument_and_alias_without_dispatch(
     )
     for path, command in commands.items():
         section = _command_section(rendered, path)
-        assert command.format_usage().strip() in section
+        assert reference._format_usage(command) in section
         for action in command._actions:
             if action.dest == "help" or isinstance(action, argparse._SubParsersAction):
                 continue
@@ -135,6 +135,53 @@ def test_render_is_independent_of_terminal_width_and_explains_automatic_help(
     assert narrow == wide
     assert "`-h`/`--help`" in narrow
     assert "every command" in narrow
+
+
+def test_optional_positional_required_metadata_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    parser = argparse.ArgumentParser(prog="palimpsest")
+    parser.add_argument("--must", required=True)
+    optional = parser.add_argument("optional", nargs="?")
+    many = parser.add_argument("many", nargs="*")
+    remainder = parser.add_argument("remainder", nargs=argparse.REMAINDER)
+    parser.add_argument("one_or_more", nargs="+")
+    parser.add_argument("required")
+    monkeypatch.setattr(reference, "build_parser", lambda: parser)
+    monkeypatch.setattr(
+        reference,
+        "DESCRIPTIONS",
+        {
+            **reference.DESCRIPTIONS,
+            "must": "Required option.",
+            "optional": "Optional value.",
+            "many": "Optional values.",
+            "remainder": "Remaining values.",
+            "one_or_more": "One or more required values.",
+            "required": "Required value.",
+        },
+    )
+
+    optional.required = True
+    many.required = True
+    remainder.required = True
+    legacy = reference.render()
+    assert optional.required is True
+    assert many.required is True
+    assert remainder.required is True
+    optional.required = False
+    many.required = False
+    remainder.required = False
+    current = reference.render()
+
+    assert legacy == current
+    assert "| `optional` | string (optional) | `None` |" in current
+    assert "| `many` | string (zero or more) | `None` |" in current
+    assert "| `remainder` | string (remainder) | `None` |" in current
+    assert "| `--must` | string | required |" in current
+    assert "| `one_or_more` | string (one or more) | required |" in current
+    assert "| `required` | string | required |" in current
+    assert (
+        "usage: palimpsest [-h] --must MUST [optional] [many ...] ... one_or_more [one_or_more ...] required" in current
+    )
 
 
 @pytest.mark.parametrize(("contents", "diagnostic"), [(None, "missing"), ("stale\n", "stale")])

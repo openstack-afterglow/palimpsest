@@ -12,8 +12,7 @@ Coverage: **74 command paths**, **216 positional/option definitions** (excluding
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version]
-                  {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,inspect,logs,shell,exec,start,stop,rm,commit,ui,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,inspect,logs,shell,exec,start,stop,rm,commit,ui,store,completion} ...
 ```
 
 Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `ui`, `store`, `completion`.
@@ -30,8 +29,7 @@ Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `l
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image [-h]
-                        {ls,pull,verify,import,push,inspect,history,rm,save,load} ...
+usage: palimpsest image [-h] {ls,pull,verify,import,push,inspect,history,rm,save,load} ...
 ```
 
 Subcommands: `ls`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm`, `save`, `load`.
@@ -43,9 +41,7 @@ Subcommands: `ls`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image ls [-h] [--ubuntu-base UBUNTU_BASE] [--arch ARCH]
-                           [--os-variant OS_VARIANT]
-                           [--disk-format {qcow2,raw}] [--limit LIMIT]
+usage: palimpsest image ls [-h] [--ubuntu-base UBUNTU_BASE] [--arch ARCH] [--os-variant OS_VARIANT] [--disk-format {qcow2,raw}] [--limit LIMIT]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -93,10 +89,7 @@ usage: palimpsest image verify [-h] --digest DIGEST path
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image import [-h] --disk-format {qcow2,raw}
-                               --arch {x86_64,aarch64}
-                               [--os-variant OS_VARIANT]
-                               path
+usage: palimpsest image import [-h] --disk-format {qcow2,raw} --arch {x86_64,aarch64} [--os-variant OS_VARIANT] path
 ```
 
 | Argument | Value | Parser default | Description |
@@ -113,11 +106,7 @@ usage: palimpsest image import [-h] --disk-format {qcow2,raw}
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image push [-h] --name NAME [--disk-format {qcow2,raw}]
-                             [--arch {x86_64,aarch64}]
-                             [--os-variant OS_VARIANT]
-                             [--ubuntu-base UBUNTU_BASE] [--publish]
-                             path
+usage: palimpsest image push [-h] --name NAME [--disk-format {qcow2,raw}] [--arch {x86_64,aarch64}] [--os-variant OS_VARIANT] [--ubuntu-base UBUNTU_BASE] [--publish] path
 ```
 
 | Argument | Value | Parser default | Description |
@@ -137,9 +126,7 @@ usage: palimpsest image push [-h] --name NAME [--disk-format {qcow2,raw}]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image inspect [-h] [-f FORMAT] [--platform PLATFORM]
-                                [--registry REGISTRY]
-                                references [references ...]
+usage: palimpsest image inspect [-h] [-f FORMAT] [--platform PLATFORM] [--registry REGISTRY] references [references ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -156,9 +143,7 @@ usage: palimpsest image inspect [-h] [-f FORMAT] [--platform PLATFORM]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image history [-h] [--format FORMAT] [--no-trunc]
-                                [--platform PLATFORM] [-q]
-                                reference
+usage: palimpsest image history [-h] [--format FORMAT] [--no-trunc] [--platform PLATFORM] [-q] reference
 ```
 
 | Argument | Value | Parser default | Description |
@@ -176,8 +161,7 @@ usage: palimpsest image history [-h] [--format FORMAT] [--no-trunc]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image rm [-h] [-f] [--no-prune] [--platform PLATFORM]
-                           references [references ...]
+usage: palimpsest image rm [-h] [-f] [--no-prune] [--platform PLATFORM] references [references ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -194,8 +178,7 @@ usage: palimpsest image rm [-h] [-f] [--no-prune] [--platform PLATFORM]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image save [-h] [-o OUTPUT] [--platform PLATFORM]
-                             references [references ...]
+usage: palimpsest image save [-h] [-o OUTPUT] [--platform PLATFORM] references [references ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -239,8 +222,7 @@ Subcommands: `ls`, `pull`, `pack`, `push`.
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT]
-                           [--limit LIMIT]
+usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT] [--limit LIMIT]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -287,10 +269,7 @@ usage: palimpsest layer pack [-h] --tag TAG directory
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT]
-                             [--base-image BASE_IMAGE]
-                             [--ubuntu-base UBUNTU_BASE] [--publish]
-                             value
+usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT] [--base-image BASE_IMAGE] [--ubuntu-base UBUNTU_BASE] [--publish] value
 ```
 
 | Argument | Value | Parser default | Description |
@@ -321,8 +300,7 @@ Subcommands: `pull`, `verify`.
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest bundle pull [-h] --output OUTPUT [--include-base]
-                              leaf_digest
+usage: palimpsest bundle pull [-h] --output OUTPUT [--include-base] leaf_digest
 ```
 
 | Argument | Value | Parser default | Description |
@@ -352,8 +330,7 @@ usage: palimpsest bundle verify [-h] directory
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci [-h]
-                      {init-runtime,materialize,root-proof,exec-status,exec-record,resource-status,root-volumes,root-volume} ...
+usage: palimpsest oci [-h] {init-runtime,materialize,root-proof,exec-status,exec-record,resource-status,root-volumes,root-volume} ...
 ```
 
 Subcommands: `init-runtime`, `materialize`, `root-proof`, `exec-status`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
@@ -379,10 +356,7 @@ usage: palimpsest oci init-runtime [-h] path
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci materialize [-h] [--manifest MANIFEST]
-                                  [--platform {linux/amd64}] [--packer PACKER]
-                                  [--timeout TIMEOUT] [--output OUTPUT]
-                                  source
+usage: palimpsest oci materialize [-h] [--manifest MANIFEST] [--platform {linux/amd64}] [--packer PACKER] [--timeout TIMEOUT] [--output OUTPUT] source
 ```
 
 | Argument | Value | Parser default | Description |
@@ -477,21 +451,7 @@ usage: palimpsest oci root-volume [-h] volume_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}]
-                        [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER]
-                        [--network {none,default}] [--offline]
-                        [--platform PLATFORM] [--target TARGET]
-                        [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE]
-                        [--cache-scope CACHE_SCOPE] [--registry REGISTRY]
-                        [--cache-from CACHE_FROM] [--cache-to CACHE_TO]
-                        [--no-cache] [--pull] [--load]
-                        [--progress {auto,none,plain,quiet,rawjson,tty}]
-                        [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT]
-                        [--runtime-tag RUNTIME_TAG]
-                        [--runtime-base RUNTIME_BASE]
-                        [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push]
-                        [--runtime-push]
-                        [context]
+usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--registry REGISTRY] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -557,11 +517,7 @@ usage: palimpsest registry ls [-h] [--format {table,json}]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest registry add [-h] [--namespace NAMESPACE] [--mirror MIRROR]
-                               [--ca CA] [--plain-http] [--tls-skip-verify]
-                               [--cache-from CACHE_FROM] [--cache-to CACHE_TO]
-                               [--default] [--force]
-                               name endpoint
+usage: palimpsest registry add [-h] [--namespace NAMESPACE] [--mirror MIRROR] [--ca CA] [--plain-http] [--tls-skip-verify] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--default] [--force] name endpoint
 ```
 
 | Argument | Value | Parser default | Description |
@@ -642,9 +598,7 @@ usage: palimpsest registry buildkit-config [-h] --output OUTPUT [--force]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest login [-h] [-u USERNAME] [--password-stdin]
-                        [--registry REGISTRY]
-                        [server]
+usage: palimpsest login [-h] [-u USERNAME] [--password-stdin] [--registry REGISTRY] [server]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -676,9 +630,7 @@ usage: palimpsest logout [-h] [--registry REGISTRY] [server]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q]
-                       [--registry REGISTRY]
-                       reference
+usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] reference
 ```
 
 | Argument | Value | Parser default | Description |
@@ -696,9 +648,7 @@ usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest push [-h] [-a] [--platform PLATFORM] [-q]
-                       [--registry REGISTRY]
-                       reference
+usage: palimpsest push [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] reference
 ```
 
 | Argument | Value | Parser default | Description |
@@ -732,9 +682,7 @@ usage: palimpsest tag [-h] [--registry REGISTRY] source target
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest images [-h] [-a] [--digests] [-f FILTER] [--format FORMAT]
-                         [--no-trunc] [--tree] [-q]
-                         [repository]
+usage: palimpsest images [-h] [-a] [--digests] [-f FILTER] [--format FORMAT] [--no-trunc] [--tree] [-q] [repository]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -755,9 +703,7 @@ usage: palimpsest images [-h] [-a] [--digests] [-f FILTER] [--format FORMAT]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest history [-h] [--format FORMAT] [--no-trunc]
-                          [--platform PLATFORM] [-q]
-                          reference
+usage: palimpsest history [-h] [--format FORMAT] [--no-trunc] [--platform PLATFORM] [-q] reference
 ```
 
 | Argument | Value | Parser default | Description |
@@ -775,8 +721,7 @@ usage: palimpsest history [-h] [--format FORMAT] [--no-trunc]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest rmi [-h] [-f] [--no-prune] [--platform PLATFORM]
-                      references [references ...]
+usage: palimpsest rmi [-h] [-f] [--no-prune] [--platform PLATFORM] references [references ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -793,8 +738,7 @@ usage: palimpsest rmi [-h] [-f] [--no-prune] [--platform PLATFORM]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest save [-h] [-o OUTPUT] [--platform PLATFORM]
-                       references [references ...]
+usage: palimpsest save [-h] [-o OUTPUT] [--platform PLATFORM] references [references ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -840,14 +784,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY]
-                      [--vcpus VCPUS] [--network NETWORK]
-                      [--backend {auto,kvm,lima-vz,libvirt-hvf}]
-                      [--runtime-kind {cloud-image,oci-root}] [-d]
-                      [--manifest MANIFEST] [--user USER]
-                      [--root-retention {delete,retain}]
-                      [--root-volume ROOT_VOLUME]
-                      image_or_bundle
+usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle
 ```
 
 | Argument | Value | Parser default | Description |
@@ -873,10 +810,7 @@ usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest compose [-h] [-f PROJECT_FILE] [-p PROJECT_NAME]
-                          [--project-directory PROJECT_DIRECTORY]
-                          [--env-file ENV_FILE]
-                          {config,up,down,ps,logs,exec,stop,port} ...
+usage: palimpsest compose [-h] [-f PROJECT_FILE] [-p PROJECT_NAME] [--project-directory PROJECT_DIRECTORY] [--env-file ENV_FILE] {config,up,down,ps,logs,exec,stop,port} ...
 ```
 
 Subcommands: `config`, `up`, `down`, `ps`, `logs`, `exec`, `stop`, `port`.
@@ -911,8 +845,7 @@ usage: palimpsest compose config [-h] [--quiet] [--format {json}] [--services]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest compose up [-h] [-d] [--no-recreate] [--force-recreate]
-                             [services ...]
+usage: palimpsest compose up [-h] [-d] [--no-recreate] [--force-recreate] [services ...]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -1002,8 +935,7 @@ usage: palimpsest compose stop [-h] [services ...]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest compose port [-h] [--protocol {tcp,udp}]
-                               service private_port
+usage: palimpsest compose port [-h] [--protocol {tcp,udp}] service private_port
 ```
 
 | Argument | Value | Parser default | Description |
@@ -1187,8 +1119,7 @@ usage: palimpsest store show [-h] [--format {table,json}]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest store ls [-h] [--kind {image,layer,all}]
-                           [--format {table,json}]
+usage: palimpsest store ls [-h] [--kind {image,layer,all}] [--format {table,json}]
 ```
 
 | Argument | Value | Parser default | Description |
