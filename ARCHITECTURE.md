@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+메인 출력 통합의 현재 실기 checkpoint는 `9736132`다. `d32328a`의 동일 guest에 로컬·서버 선별686건이 통과했고, proof 동기화 후속은 로컬·정확한 서버 SHA의423건이 통과했다(중복 합산하지 않음). 같은 `9736132`의43 boots/44 QEMU와 영수증 검증, UID0/101 stdio2건, 기존 빌드 이미지 cold 공개 lifecycle1건이 통과했다. 메인·추가 exec의 workload-owned0600 FIFO 재열기, 인증된 실제 root와 PID1 거부를 확인했다. 각 실행의21개 사전·사후 보존 검사와 stdio/cold의 전용 journal 각28기록도 통과했다. 중간 STOP/receipt 순서 실패는 [process evidence](docs/oci-linux-process.md)에 보존하며 표준 별칭·원본NGINX·새 application build·전체Gate2 또는 운영 계정 설치 완료로 확대하지 않는다.
+
 구현 상태와 검증 수준은 분리한다. 2026-09-08 아키텍처 정리 시 portable lane manifest 검사와 합쳐진 작업트리의 `core-cli` 1025건, architecture guard focused 13건이 통과했다. 이후 `c95d948`의 서버 관련 검사 567건·real packer 3건과 기존 빌드 이미지의 cold public exec 1건이 통과했다. 같은 SHA의 원본 Redis는 변환 뒤 stage-1 filesystem 검증에서 실패했다. 아래 현재 checkpoint와 역사적 qualification을 구분하며 전체 suite·Gate 2 재통과를 뜻하지 않는다.
 
 | 기능 | Implementation | Verification evidence | Current limit | Source |
@@ -311,9 +313,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "272314901b17f5a6d580487aeef4e73c16ff49d94cb102e257f4d6bd9c1ae31c",
-  "reviewed_at": "2026-09-10T07:08:38Z",
-  "summary": "Investigated exact-d32328a retained-console receipt ordering failure. Bounded line-only and2boot marker-ordinal diagnostics proved first authenticated boundary arrived before signal-armed while allmarker counts passed; all21pre/post preservation checks passed. Reviewed proof-host-only synchronization: first composite disconnect waitsREADY_COMMITTED plus signal-armed; original sixconnection fixture retained and delayed-output variant added. Guest source/ELF, receipt counts/order/authentication and negative-control path unchanged. Independent review and423 local related checks passed. Architecture/process/testing docs preserve failures; exact-SHA native pending."
+  "source_sha256": "f5bd1368b5b151791f58be9e2d8a971d22b07001b3e487e1849e61834520b81e",
+  "reviewed_at": "2026-09-10T07:17:50Z",
+  "summary": "Reviewed documentation-only final main-output checkpoint and guest README against exact9736132 native evidence. Production C/ELF and host code unchanged. Guest integration passed686 local/server selected checks atd32328a; proof synchronization passed423 local/server checks without duplicate-total claims. Native43boots/44QEMU+receipt, UID0/101stdio2 and existing-image coldpubliclifecycle1 passed; each21pre/post preservation checks and both28-record(14pair) privatejournals passed. Current architecture/process/guest docs distinguish native evidence from historical pending/failures and preserve remainingaliases/NGINX/newbuild/fullGate2/adminsetup limits."
 }
 ```
 <!-- architecture-review:end -->

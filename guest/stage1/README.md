@@ -74,9 +74,11 @@ userspace deadlines do not claim a hard kernel deadline for tasks stuck in an
 uninterruptible kernel state.
 
 The stage-1 source identity uses the versioned source-bundle framing over
-the named `init.c` and `main_output_pump.h` inputs. This implementation has not
-yet received the separate native VM/stdout-stderr qualification; component and
-portable checks are not that evidence.
+the named `init.c` and `main_output_pump.h` inputs. The separate native stage-1,
+UID 0/101 stdout-stderr and existing-image public lifecycle proofs passed at
+`9736132`; see the [native checkpoint](../../docs/oci-linux-process.md#main-output-native-checkpoint-9736132-2026-09-10).
+Component/portable checks are distinct evidence, and this does not qualify
+standard stream aliases, original NGINX, a new application build or full Gate 2.
 
 The build runs offline and read-only as the invoking UID/GID with fixed locale,
 timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest

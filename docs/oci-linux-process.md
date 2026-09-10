@@ -385,10 +385,10 @@ Thus drain is output completeness evidence, not lifecycle authority by itself.
 
 The build provenance uses versioned source-bundle framing over the named `init.c` and
 `main_output_pump.h` inputs rather than treating `init.c` alone as the compiled
-source. The implementation and portable/component tests are current source
-evidence only. The separate native VM, UID stdio and public lifecycle matrix is
-still pending and no earlier compatibility checkpoint is rewritten as proof
-for this output path.
+source. Portable/component evidence is distinct from the separate native VM,
+UID stdio and public lifecycle proofs, which passed at the `9736132` checkpoint
+below. No earlier compatibility checkpoint is rewritten as proof for this
+output path.
 
 Local integration verification (2026-09-10): the frozen source and rebuilt ELF
 passed 239 focused output/initramfs/filesystem/stage-1/manifest/architecture
@@ -475,3 +475,38 @@ proof/manifest/architecture checks and independent review. The delayed variant
 requires the connection to remain open before emitting signal readiness, then
 completes the original six authenticated connections. No guest rebuild is
 needed because this change only corrects host proof synchronization.
+
+## Main-output native checkpoint: 9736132 (2026-09-10)
+
+The synchronization follow-up was pushed as
+`973613231ff0e57f0c11f5ed5c57fd673b924e71`; its exact server checkout passed
+423 focused protocol/proof/manifest/architecture checks (44.59 seconds).
+This follows the unchanged guest's 686 local and exact-server checks at
+`d32328a`; these overlapping selections are not added into a full-suite count.
+
+The ordinary, uninstrumented stage-1 matrix then passed all 43 boots / 44 QEMU
+invocations and receipt validation (121.87 seconds). The two sequential public
+UID 0/101 stdio probes passed (31.59 seconds). Main and additional-exec FD 1/2
+were workload-owned `0600` FIFOs with successful self-FD reopening for both
+identities. Capability sets and supplementary groups remained zero, securebits
+239, NNP 1, seccomp 2 and PID 1 root access denial remained enforced; actual
+main/exec roots matched authenticated reports. Stream aliases remain absent.
+
+The same SHA's existing Palimpsest-built image passed the cold public
+run/exec/root/PID1/stop/rm proof (21.14 seconds), including literal argv,
+split stdout/stderr and exit status. This reused an immutable existing image,
+not a new application build. Each native run passed all 21 preflight and
+21 postflight checks: four preserved inactive domain identities/states/
+autostart settings, four archive digests, clean exact-SHA checkout and no
+active VM/QEMU. Successful proof VMs were removed only by their own existing
+normal cleanup; prior failed domains/runtime evidence were preserved.
+
+The stdio and cold runs each used a fresh private healthy journal directory;
+their `commands.jsonl` files passed owner/0600/single-link/schema/sequence
+checks with 28 records (14 start/end pairs) each. This does not install the
+operational `/var/log/palimpsest` or `/var/lib/palimpsest` directories or the
+service account. Those still require administrator setup. The main-output
+path is now live-verified within these explicit proofs; original NGINX,
+standard stream aliases, a new application build and full Gate 2 remain
+separate unfinished work. Earlier failed runs and bounded diagnostics above
+are retained as failures/diagnostics, not rewritten as passing qualifications.
