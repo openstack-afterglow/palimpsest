@@ -26,8 +26,8 @@
     "lower1": {
       "base64_file": "lower1.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "1eadb04f6ebd217a7611fe721edb40f7fa51ecc117701286e2770e0fca28e2b1",
-      "raw_size_bytes": 4096,
+      "raw_sha256": "abc49ff703fa1ab15354a1f8ce260e1ed0dc0edcb1ff3f14eae66147abe74c42",
+      "raw_size_bytes": 8192,
       "source_entries": [
         {
           "mode": 420,
@@ -46,8 +46,8 @@
         {
           "mode": 493,
           "path": ".__palimpsest_workload_proof_v1",
-          "sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-          "size_bytes": 9932,
+          "sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+          "size_bytes": 10028,
           "type": "file"
         },
         {
@@ -108,8 +108,8 @@
     "transition_dev": {
       "base64_file": "transition-dev.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "d5c030a52e030ef0f968e52280532e63e28c6b6048739e30cce9725245dd0a06",
-      "raw_size_bytes": 4096,
+      "raw_sha256": "3aea3a49124a5ecb900c1368d963efd5cdd85916591559d0e824a5997f3e6dd5",
+      "raw_size_bytes": 8192,
       "source_entries": [
         {
           "mode": 420,
@@ -128,8 +128,8 @@
         {
           "mode": 493,
           "path": ".__palimpsest_workload_proof_v1",
-          "sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-          "size_bytes": 9932,
+          "sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+          "size_bytes": 10028,
           "type": "file"
         },
         {
@@ -188,8 +188,8 @@
     "transition_proc": {
       "base64_file": "transition-proc.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "13aaf5f0f48430e59c7225e635155f7b2a81c9bf10135ef680d66bd484f49476",
-      "raw_size_bytes": 4096,
+      "raw_sha256": "bfd3fd3da0e4771a1b704cfdb542cde85ed6d96ef7f56f8279fd50d7398d4516",
+      "raw_size_bytes": 8192,
       "source_entries": [
         {
           "mode": 420,
@@ -208,8 +208,8 @@
         {
           "mode": 493,
           "path": ".__palimpsest_workload_proof_v1",
-          "sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-          "size_bytes": 9932,
+          "sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+          "size_bytes": 10028,
           "type": "file"
         },
         {
@@ -268,8 +268,8 @@
     "transition_sys": {
       "base64_file": "transition-sys.squashfs.b64",
       "compression_id": 6,
-      "raw_sha256": "9df9f1eb93e1c063950c50142d7b3c3ee46d155252cac8016054ea91dd5ef1e2",
-      "raw_size_bytes": 4096,
+      "raw_sha256": "de7623e19a502c419a1449b6145277d040e6af27410f9babbce59bf32500544d",
+      "raw_size_bytes": 8192,
       "source_entries": [
         {
           "mode": 420,
@@ -288,8 +288,8 @@
         {
           "mode": 493,
           "path": ".__palimpsest_workload_proof_v1",
-          "sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-          "size_bytes": 9932,
+          "sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+          "size_bytes": 10028,
           "type": "file"
         },
         {
@@ -370,10 +370,10 @@
       "build_script": "scripts/build_oci_guest_workload_proof.sh",
       "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
       "elf_mode": 493,
-      "elf_sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-      "elf_size_bytes": 9932,
+      "elf_sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+      "elf_size_bytes": 10028,
       "source": "guest/workload-proof/proof.c",
-      "source_sha256": "f8c07a962b98a52e50f8e08feaebf07d65dbc9cd84c51b4b1c2622c4d9f3affa",
+      "source_sha256": "519e458dec5cbe61de6bc0208c63d32c311e8596f99f3beb6a303d510c1d4b1e",
       "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
     }
   },

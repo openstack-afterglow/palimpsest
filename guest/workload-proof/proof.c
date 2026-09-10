@@ -37,6 +37,7 @@ typedef unsigned long usize;
 #define SYS_mknod 133
 #define SYS_unshare 272
 #define SYS_newfstatat 262
+#define SYS_readlinkat 267
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -55,6 +56,7 @@ typedef unsigned long usize;
 #define ENOSPC 28
 #define S_IFMT 0170000
 #define S_IFCHR 0020000
+#define S_IFLNK 0120000
 #define CLONE_NEWNS 0x00020000
 #define AT_FDCWD -100
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -222,7 +224,7 @@ static int verify_capabilityless_boundary(void) {
 }
 
 static int allowed_dev_name(const u8 *name, usize size) {
-    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty"};
+    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr"};
     usize i;
     for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
         if (size == slen(allowed[i])) {
@@ -263,7 +265,7 @@ static int verify_private_devices(void) {
             offset += reclen;
         }
     }
-    if (sc1(SYS_close, directory) != 0 || seen != 0x3f) return 0;
+    if (sc1(SYS_close, directory) != 0 || seen != 0xff) return 0;
     {
         static const char *paths[] = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"};
         usize i;
@@ -271,6 +273,25 @@ static int verify_private_devices(void) {
             struct stat_local st;
             if (sc4(SYS_newfstatat, AT_FDCWD, (i64)paths[i], (i64)&st, AT_SYMLINK_NOFOLLOW) != 0 ||
                 (st.mode & S_IFMT) != S_IFCHR) return 0;
+        }
+    }
+    {
+        static const char *paths[] = {"/dev/stdout", "/dev/stderr"};
+        static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2"};
+        usize i;
+        for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+            char target[32];
+            usize expected_size = slen(targets[i]), at;
+            struct stat_local st;
+            i64 size;
+            u8 difference = 0;
+            if (sc4(SYS_newfstatat, AT_FDCWD, (i64)paths[i], (i64)&st, AT_SYMLINK_NOFOLLOW) != 0 ||
+                (st.mode & S_IFMT) != S_IFLNK || (st.mode & 07777) != 0777 ||
+                st.uid != 0 || st.gid != 0 || st.nlink != 1) return 0;
+            size = sc4(SYS_readlinkat, AT_FDCWD, (i64)paths[i], (i64)target, sizeof(target));
+            if (size < 0 || (usize)size != expected_size) return 0;
+            for (at = 0; at < expected_size; at++) difference |= (u8)target[at] ^ (u8)targets[i][at];
+            if (difference != 0) return 0;
         }
     }
     {

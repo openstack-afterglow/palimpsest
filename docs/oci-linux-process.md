@@ -145,6 +145,35 @@ failed definitions and use a reviewed unique-name strategy for cold testing;
 the existing fixed `exec-cli` test name now collides with retained evidence.
 No new native test or application build is claimed by this review.
 
+## Bounded stdout/stderr alias implementation (2026-09-11, test-defined)
+
+The implemented guest source keeps the existing six private character devices
+and adds only `stdout -> /proc/self/fd/1` and
+`stderr -> /proc/self/fd/2` inside the workload child's private `/dev` mount.
+It intentionally does not add `/dev/stdin`, `/dev/fd`, cross-PID aliases, new
+devices, capabilities, groups, or a parent-side pathname open. Link creation
+does not overwrite a pre-existing object. Each link must remain a root-owned,
+single-link mode-0777 symlink with its exact bounded target under no-follow
+metadata inspection. A bounded buffer larger than the exact target makes both
+suffixes and truncation reject rather than compare as a prefix.
+
+The directory allowlist now requires exactly the original six device names and
+these two link names. The device entries are rechecked as root-owned,
+single-link mode-0666 character devices with their exact major/minor pairs.
+The whole policy runs immediately after construction and again after the
+temporary cgroup staging entry is removed. These guarantees end at workload
+release: a capabilityless numeric-UID-0 workload can still mutate its private
+mode-0755 `/dev`, so the source does not claim immutable aliases after launch.
+
+`tests/unit/test_workload_dev_aliases.py` compiles the production C helpers and
+exercises the exact positive set plus pre-existing entry, wrong target, wrong
+type, hard-link/extra-entry, missing-entry, and generic `/dev/fd` controls in a
+bounded private tmpfs. Its portable callsite assertions keep creation after the
+private tmpfs mount and before credential drop, and preserve the later cgroup
+lifecycle revalidation. This is focused component evidence only. Until the
+packaged ELF is reproducibly rebuilt and native probes pass, it is not an
+original-NGINX compatibility success or a new Gate 2 qualification.
+
 A small unprivileged Linux probe on `pieroot-server` confirmed the distinction:
 writing through a newly created anonymous pipe's existing descriptor succeeded,
 while reopening that same endpoint via `/proc/self/fd` after setting its inode

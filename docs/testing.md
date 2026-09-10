@@ -271,12 +271,19 @@ opted in with `PALIMPSEST_OCI_STDIO_CLI_LIVE=1`. Run the two explicit pytest
 nodes in `tests/kvm/test_oci_stdio_cli_live.py` sequentially with `-x`: UID 0
 and UID 101 each receive a fresh 512 MiB, one-vCPU, no-network runtime and a
 tiny test-only scratch OCI image. The probe records bounded FD 1/2 metadata and
-path-reopen errno without reading standard I/O, changing permissions, or
-creating aliases. Its portable parser contract is
-`tests/unit/test_oci_stdio_cli_live_contract.py`. This diagnostic does not
-change or qualify the packaged guest, an original application image, Gate 2,
-or general OCI compatibility; retain its receipt and exact failed runtime for
-review rather than normalizing observed console metadata.
+requires exactly two pre-existing root-owned mode-0777 single-link aliases:
+`/dev/stdout -> /proc/self/fd/1` and `/dev/stderr -> /proc/self/fd/2`;
+`/dev/stdin` and `/dev/fd` remain absent. Only after exact no-follow metadata
+and bounded target validation does it open each alias with the NGINX-relevant
+write/create/append flags plus diagnostic `O_NONBLOCK`, require full reopened
+FD identity, and emit one stream-specific marker through the pathname. It
+never truncates, reads standard I/O, changes permissions, or creates an alias.
+Its portable parser/source contract is
+`tests/unit/test_oci_stdio_cli_live_contract.py`. Until independent review, a
+new guest ELF and exact-SHA native UID 0/101 passes, this remains `test-defined`
+and does not qualify the changed packaged guest, an original application
+image, Gate 2, or general OCI compatibility. Retain its receipt and exact
+failed runtime rather than normalizing observed metadata.
 
 The pre-transition PID 1 console-open-description diagnostic is a distinct
 native opt-in:
@@ -480,8 +487,9 @@ exact pushed SHA on the native host. Select the stage-1 matrix, UID0/101 stdio
 probe and cold public exec as distinct finite runs with inventory/archive
 preservation checks before and after every run, including failures. The
 updated stdio probe expects main and additional-exec output to be separate
-workload-owned FIFO0600 endpoints with successful self-FD reopen; aliases and
-PID1 access restrictions remain unchanged. Set a healthy private
+workload-owned FIFO0600 endpoints with successful self-FD reopen, exact fixed
+stdout/stderr aliases, identity-preserving pathname reopen and one observed
+write on each stream. PID1 access restrictions remain unchanged. Set a healthy private
 `PALIMPSEST_LOG_HOME` for stdio and cold guest-only stderr comparisons. Keep the separate
 host journal failure-warning tests; never strip a warning to pass the proof.
 These selections do not qualify NGINX, a new application build or full Gate 2.

@@ -466,13 +466,16 @@ def _receipt() -> OCIStage1KVMProofReceipt:
     uid0_ready["run_id"] = uid0_plan.run_id
     uid0_ready["domain_core_digest"] = uid0_plan.domain_core_digest
     uid0_ready["stage1_artifact_digest"] = uid0_transport.receipt.artifact_digest
-    uid0_ready["projection_digest"] = "sha256:" + hashlib.sha256(
-        json.dumps(
-            {key: value for key, value in uid0_ready.items() if key != "projection_digest"},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    uid0_ready["projection_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in uid0_ready.items() if key != "projection_digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
     return OCIStage1KVMProofReceipt(
         "sha256:" + "1" * 64,
         4096,
@@ -650,7 +653,7 @@ def test_qemu_command_is_explicit_native_kvm_readonly_and_networkless(tmp_path: 
 def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None:
     topology = pre_mount_topology(build_proof_plan())
     manifest_digest = topology["fixture_manifest_digest"]
-    assert manifest_digest == "sha256:3ad31e3cf2159aee100c639cbfa57eed77d6278251b01dc3fab0351417dd4d02"
+    assert manifest_digest == "sha256:bbcedfb70b81d463f89b9bc99104f78e254fa65ba8f2a548a2be41ae55249027"
     assert topology["fixture_policy"] == "palimpsest.kvm-actual-filesystem-fixtures.v11"
     manifest = json.loads((Path(__file__).parents[1] / "kvm" / "assets" / "filesystem-fixtures.json").read_text())
     assert manifest["provenance"]["lower_builder"]["argv_policy"] == (
@@ -669,14 +672,17 @@ def test_actual_filesystem_fixture_manifest_is_exact_and_receipt_bound() -> None
     assert b'"/sys/fs/cgroup/cgroup.procs"' in helper_source
     assert b'"/sys/fs/cgroup/palimpsest.agent/cgroup.procs"' in helper_source
     assert b'"/sys/fs/cgroup/palimpsest.agent/exec-00000001/cgroup.procs"' in helper_source
+    assert b'{"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr"}' in helper_source
+    assert b'"/proc/self/fd/1", "/proc/self/fd/2"' in helper_source
+    assert b"seen != 0xff" in helper_source
     assert helper == {
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c",
-        "elf_size_bytes": 9932,
+        "elf_sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
+        "elf_size_bytes": 10028,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "f8c07a962b98a52e50f8e08feaebf07d65dbc9cd84c51b4b1c2622c4d9f3affa",
+        "source_sha256": "519e458dec5cbe61de6bc0208c63d32c311e8596f99f3beb6a303d510c1d4b1e",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
 
@@ -2124,13 +2130,16 @@ def test_v20_receipt_rejects_ready_binding_tamper_with_recomputed_projection(fie
     lifecycle = copy.deepcopy(receipt.lifecycle)
     ready = next(frame for frame in lifecycle["boots"][0]["frames"] if frame["kind"] == "READY")
     ready[field] = "not-a-uuid" if field == "run_id" else "sha256:" + "f" * 64
-    ready["projection_digest"] = "sha256:" + hashlib.sha256(
-        json.dumps(
-            {key: value for key, value in ready.items() if key != "projection_digest"},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    ready["projection_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in ready.items() if key != "projection_digest"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
     with pytest.raises(ArtifactValidationError, match="receipt value"):
         replace(receipt, lifecycle=lifecycle)
 

@@ -61,6 +61,8 @@ struct span { const char *p; usize n; };
 #define SYS_openat 257
 #define SYS_mkdirat 258
 #define SYS_unlinkat 263
+#define SYS_symlinkat 266
+#define SYS_readlinkat 267
 #define SYS_clock_gettime 228
 #define SYS_getrandom 318
 #define SYS_mknod 133
@@ -137,6 +139,7 @@ struct span { const char *p; usize n; };
 #define S_IFCHR 0020000
 #define S_IFIFO 0010000
 #define S_IFDIR 0040000
+#define S_IFLNK 0120000
 #define MS_RDONLY 1
 #define MS_NOSUID 2
 #define MS_NODEV 4
@@ -4135,39 +4138,88 @@ static int make_safe_workload_device(const char *path, u32 major, u32 minor) {
            dev_major(st.rdev) == major && dev_minor(st.rdev) == minor;
 }
 
-static int safe_workload_dev_entries(void) {
-    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty"};
+static int safe_workload_stdio_aliases_at(int directory, int create) {
+    static const char *names[] = {"stdout", "stderr"};
+    static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2"};
+    usize i;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        struct stat_local st;
+        char target[17];
+        i64 n;
+        usize expected = slen(targets[i]);
+        if (create && sc3(SYS_symlinkat, (i64)targets[i], directory, (i64)names[i]) != 0)
+            return 0;
+        if (sc4(SYS_newfstatat, directory, (i64)names[i], (i64)&st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            (st.mode & S_IFMT) != S_IFLNK || (st.mode & 07777) != 0777 ||
+            st.uid != 0 || st.gid != 0 || st.nlink != 1)
+            return 0;
+        n = sc4(SYS_readlinkat, directory, (i64)names[i], (i64)target, sizeof(target));
+        if (n != (i64)expected || !bytes_equal(target, targets[i], expected)) return 0;
+    }
+    return 1;
+}
+
+static int make_safe_workload_stdio_aliases(void) {
+    i64 directory = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    int valid;
+    if (directory < 0) return 0;
+    valid = safe_workload_stdio_aliases_at((int)directory, 1);
+    if (sc1(SYS_close, directory) != 0) return 0;
+    return valid;
+}
+
+static int safe_workload_device_at(int directory, const char *name, u32 major, u32 minor) {
+    struct stat_local st;
+    return sc4(SYS_newfstatat, directory, (i64)name, (i64)&st, AT_SYMLINK_NOFOLLOW) == 0 &&
+           (st.mode & S_IFMT) == S_IFCHR && (st.mode & 07777) == 0666 &&
+           st.uid == 0 && st.gid == 0 && st.nlink == 1 &&
+           dev_major(st.rdev) == major && dev_minor(st.rdev) == minor;
+}
+
+static int safe_workload_dev_entries_at(int directory) {
+    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr"};
+    static const u32 majors[] = {1, 1, 1, 1, 1, 5};
+    static const u32 minors[] = {3, 5, 7, 8, 9, 0};
     u8 entries[2048];
     u32 seen = 0;
-    i64 directory = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
-    if (directory < 0) return 0;
     for (;;) {
         i64 n = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
         usize offset = 0;
-        if (n < 0) { sc1(SYS_close, directory); return 0; }
+        if (n < 0) return 0;
         if (!n) break;
         while (offset < (usize)n) {
             const u8 *entry = entries + offset;
             usize length, i;
             u32 reclen;
             int match = -1;
-            if ((usize)n - offset < 20) { sc1(SYS_close, directory); return 0; }
+            if ((usize)n - offset < 20) return 0;
             reclen = (u32)entry[16] | ((u32)entry[17] << 8);
-            if (reclen < 20 || reclen > (usize)n - offset) { sc1(SYS_close, directory); return 0; }
+            if (reclen < 20 || reclen > (usize)n - offset) return 0;
             for (length = 0; length < reclen - 19 && entry[19 + length]; length++) {}
-            if (length == reclen - 19) { sc1(SYS_close, directory); return 0; }
+            if (length == reclen - 19) return 0;
             if (!((length == 1 && entry[19] == '.') ||
                   (length == 2 && entry[19] == '.' && entry[20] == '.'))) {
                 for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
                     if (length == slen(allowed[i]) && bytes_equal(entry + 19, allowed[i], length)) match = (int)i;
-                if (match < 0 || (seen & (1U << match))) { sc1(SYS_close, directory); return 0; }
+                if (match < 0 || (seen & (1U << match))) return 0;
                 seen |= 1U << match;
             }
             offset += reclen;
         }
     }
+    if (seen != (1U << (sizeof(allowed) / sizeof(allowed[0]))) - 1) return 0;
+    for (usize i = 0; i < sizeof(majors) / sizeof(majors[0]); i++)
+        if (!safe_workload_device_at(directory, allowed[i], majors[i], minors[i])) return 0;
+    return safe_workload_stdio_aliases_at(directory, 0);
+}
+
+static int safe_workload_dev_entries(void) {
+    i64 directory = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    int valid;
+    if (directory < 0) return 0;
+    valid = safe_workload_dev_entries_at((int)directory);
     if (sc1(SYS_close, directory) != 0) return 0;
-    return seen == (1U << (sizeof(allowed) / sizeof(allowed[0]))) - 1;
+    return valid;
 }
 
 static i64 install_read_only_cgroup_view(void) {
@@ -4212,6 +4264,7 @@ static int prepare_workload_mount_boundary(struct child_error_local *failure) {
         !make_safe_workload_device("/dev/random", 1, 8) ||
         !make_safe_workload_device("/dev/urandom", 1, 9) ||
         !make_safe_workload_device("/dev/tty", 5, 0) ||
+        !make_safe_workload_stdio_aliases() ||
         !safe_workload_dev_entries()) {
         operation = -EIO;
         goto rejected;

@@ -29,14 +29,17 @@ from .test_oci_public_cli_live import _image_layout
 
 _ENABLE = "PALIMPSEST_OCI_STDIO_CLI_LIVE"
 _TOOLCHAIN = "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
-_PREFIX = b"PALIMPSEST_STDIO_FD_V1 "
+_PREFIX = b"PALIMPSEST_STDIO_FD_V2 "
+_ALIAS_PREFIX = b"PALIMPSEST_STDIO_ALIAS_V2 "
 _MAX_LINE = 2048
 _MAX_CONSOLE = 8 * 1024 * 1024
 _FIELDS = (
     "role uid gid groups capinh capprm capeff capbnd capamb securebits nnp seccomp "
     "fd1type fd1mode fd1uid fd1gid fd1dev fd1ino fd1reopen "
     "fd2type fd2mode fd2uid fd2gid fd2dev fd2ino fd2reopen "
-    "stdout_alias stderr_alias rootdev rootino pid1root"
+    "stdout_alias stdout_meta stdout_target stdout_open stdout_same stdout_write "
+    "stderr_alias stderr_meta stderr_target stderr_open stderr_same stderr_write "
+    "stdin_alias fd_alias rootdev rootino pid1root"
 ).split()
 _DECIMAL = re.compile(r"0|[1-9][0-9]*")
 _HEX16 = re.compile(r"[0-9a-f]{16}")
@@ -89,6 +92,18 @@ def _records(payload: bytes, *, role: str, partial_tail: bool = False) -> list[d
             line = line[:-2] + b"\n"
         records.append(parse_probe_record(line, expected_role=role))
     return records
+
+
+def _alias_marker_count(payload: bytes, *, role: str, stream: str, console: bool = False) -> int:
+    assert role in {"service", "exec"} and stream in {"stdout", "stderr"}
+    expected = _ALIAS_PREFIX + role.encode("ascii") + b" " + stream.encode("ascii") + b"\n"
+    count = 0
+    for line in payload.splitlines(keepends=True):
+        if console and line.endswith(b"\r\n"):
+            line = line[:-2] + b"\n"
+        if line == expected:
+            count += 1
+    return count
 
 
 def _compile(parent: Path, environment: dict[str, str]) -> Path:
@@ -179,7 +194,13 @@ def _assert_security(record: dict[str, int | str], uid: int) -> None:
     assert record["uid"] == record["gid"] == uid and record["groups"] == 0
     assert all(record[key] == 0 for key in ("capinh", "capprm", "capeff", "capbnd", "capamb"))
     assert (record["securebits"], record["nnp"], record["seccomp"]) == (239, 1, 2)
-    assert record["stdout_alias"] == record["stderr_alias"] == 2
+    assert record["stdout_alias"] == record["stderr_alias"] == 0o120000
+    assert all(
+        record[f"{stream}_{field}"] == expected
+        for stream in ("stdout", "stderr")
+        for field, expected in (("meta", 1), ("target", 1), ("open", 0), ("same", 1), ("write", 0))
+    )
+    assert record["stdin_alias"] == record["fd_alias"] == 2
     assert record["pid1root"] == 13
     for fd in (1, 2):
         assert record[f"fd{fd}type"] in {0o010000, 0o020000, 0o100000, 0o140000}
@@ -239,6 +260,8 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     _success(launched)
     console = parent / "state" / "runs" / name / "io" / "console.log"
     _payload, main_records = _wait_main(console)
+    assert _alias_marker_count(_payload, role="service", stream="stdout", console=True) == 1
+    assert _alias_marker_count(_payload, role="service", stream="stderr", console=True) == 1
     assert len(main_records) == 2 and main_records[0] == main_records[1]
     main = main_records[0]
     _assert_security(main, uid)
@@ -257,6 +280,10 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     executed = _save(evidence, "exec", _cli(environment, "exec", name, "--", "/bin/public-proof", "exec", timeout=60))
     _success(executed)
     stdout_records, stderr_records = _records(executed.stdout, role="exec"), _records(executed.stderr, role="exec")
+    assert _alias_marker_count(executed.stdout, role="exec", stream="stdout") == 1
+    assert _alias_marker_count(executed.stdout, role="exec", stream="stderr") == 0
+    assert _alias_marker_count(executed.stderr, role="exec", stream="stderr") == 1
+    assert _alias_marker_count(executed.stderr, role="exec", stream="stdout") == 0
     assert len(stdout_records) == len(stderr_records) == 1 and stdout_records[0] == stderr_records[0]
     additional = stdout_records[0]
     _assert_security(additional, uid)

@@ -49,6 +49,18 @@ diagnostic overflow and permanent I/O errors are sticky failures. Per-stream
 order and observed enqueue order are preserved, but independent stdout and
 stderr have no reconstructed real-time total order.
 
+The child-private mode-0755 `/dev` contains the same six root-owned character
+devices plus exactly two root-owned links: `stdout -> /proc/self/fd/1` and
+`stderr -> /proc/self/fd/2`. There is no `/dev/stdin` or general `/dev/fd`
+alias. The workload child creates the links without replacing an existing
+entry and checks their no-follow type, owner, mode, link count, and exact
+bounded target before dropping credentials. The complete eight-entry directory
+and all device identities are checked again after temporary cgroup staging is
+removed. The privileged parent never follows these aliases; reopening resolves
+the workload child's already-owned FIFO endpoints. These are setup-time checks
+inside the child's private mount namespace, not an immutability guarantee
+against a UID 0 workload after launch.
+
 PID 1 acquires and revalidates a distinct nonblocking console OFD through the
 fixed `/proc/self/fd/1` magic link before root transition. After acquisition,
 diagnostics use only the queue and pinned sink: there is no blocking fallback.
@@ -77,8 +89,10 @@ The stage-1 source identity uses the versioned source-bundle framing over
 the named `init.c` and `main_output_pump.h` inputs. The separate native stage-1,
 UID 0/101 stdout-stderr and existing-image public lifecycle proofs passed at
 `9736132`; see the [native checkpoint](../../docs/oci-linux-process.md#main-output-native-checkpoint-9736132-2026-09-10).
-Component/portable checks are distinct evidence, and this does not qualify
-standard stream aliases, original NGINX, a new application build or full Gate 2.
+Component/portable checks are distinct evidence. Source and focused real-C
+tests define the two standard-output aliases separately from native
+qualification; they do not by themselves qualify original NGINX, a new
+application build or full Gate 2.
 
 The build runs offline and read-only as the invoking UID/GID with fixed locale,
 timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest
