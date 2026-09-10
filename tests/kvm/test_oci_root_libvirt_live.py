@@ -4143,7 +4143,7 @@ def _inject_reuse_only_executable(root_path: Path, *, prove_absent: Callable[[],
     # executing it in the next guest proves the retained upper is its real /.
     load_proof_filesystems()
     executable = Path(__file__).with_name("assets") / "workload-proof.x86_64"
-    assert _sha256_file(executable) == "48c4d521bca61b31feaf69c7779bcc76ed2a91db5af5fe33bf9e87d1d9b3e54c"
+    assert _sha256_file(executable) == "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4"
     assert not any(character.isspace() for character in str(executable))
     assert prove_absent(), "fixture root still has a domain"
     descriptor = os.open(root_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)

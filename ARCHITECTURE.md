@@ -108,6 +108,7 @@ flowchart LR
 | parent-owned console sink | [`guest/stage1/init.c`](guest/stage1/init.c)의 `acquire_main_console_sink`, `revalidate_main_console_sink`, `close_main_console_sink` | 루트 전환 전 독립 nonblocking console FD 확보, 양 자식의 조기 close, 루트 전환·TERMINAL 전 identity 재검증. PID1은 종료 후 인증된 reconnect 제어 메시지를 위해 통로를 유지하며 실패 대기에서 닫음 |
 | workload stdio aliases | [`guest/stage1/init.c`](guest/stage1/init.c)의 `safe_workload_stdio_aliases_at`, `make_safe_workload_stdio_aliases`, `safe_workload_dev_entries_at`; [`tests/unit/test_workload_dev_aliases.py`](tests/unit/test_workload_dev_aliases.py) | child-only private `/dev`의 고정 두 symlink 생성·nofollow 검증. 여섯 device node와 두 별칭의 정확한 entry 집합을 검사하며 부모가 symlink 대상 FD를 열지 않음 |
 | native workload proof fixtures | [`guest/workload-proof/proof.c`](guest/workload-proof/proof.c), [`_oci_stage1_kvm_proof.py`](src/palimpsest_local/_oci_stage1_kvm_proof.py), [`filesystem-fixtures.json`](tests/kvm/assets/filesystem-fixtures.json) | 테스트 전용 workload가 정확한 여덟 `/dev` 항목과 두 별칭을 독립 검증. 재현 빌드한 proof ELF를 SquashFS fixture에 포함하고 source/ELF/fixture pin을 함께 검증하며 production authority로 사용하지 않음 |
+| retained-root test fixture injection | [`test_oci_root_libvirt_live.py`](tests/kvm/test_oci_root_libvirt_live.py)의 `_inject_reuse_only_executable` | 테스트 전용 upper 주입도 shared fixture loader와 독립 ELF pin을 모두 확인. domain 부재·root identity·journal replay 확인 후에만 새 경로를 사용하며 production retain 동작과 분리 |
 | Hub API | [`hub/src/palimpsest_hub/main.py`](hub/src/palimpsest_hub/main.py), [`hub/src/palimpsest_hub/auth.py`](hub/src/palimpsest_hub/auth.py), [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py) | `/v1` discovery/health, Keystone token scope, layer/image query, resumable upload, bundle, image-export API |
 | Hub persistence/ops | [`hub/src/palimpsest_hub/models.py`](hub/src/palimpsest_hub/models.py), [`hub/src/palimpsest_hub/services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py) | SQL rows와 filesystem blobs를 source of truth로 유지하고 worker lease/conversion/GC를 수행 |
 
@@ -329,9 +330,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "20943dbe1df69e8c803bf9d1c9604682253c44609c9cf18797f329654441f130",
-  "reviewed_at": "2026-09-10T16:09:02Z",
-  "summary": "Reviewed child-private stdout/stderr symlinks and exact eight-entry device validation, unchanged PID1/capability/NNP/seccomp and parent console authority; synchronized source-bundle/sealed ELF and independent workload-proof ELF/SquashFS provenance without changing receipt acceptance or historical records. Actual-C17, packaged ELF34, guest/proof consumers346, output helpers101 with12 platform skips, and contract/lane/architecture113 passed locally; independent source review approved. Reproducible ELF builds and fixture check passed. Native stage1/stdio/NGINX/cold validation remains pending exact pushed SHA; no Gate2 claim."
+  "source_sha256": "9c4a2525aa7b35eb555a1300380eeb60d32c11477917a4981dd89a357577db45",
+  "reviewed_at": "2026-09-10T16:14:31Z",
+  "summary": "Reviewed retained-root fixture injection consumer and synchronized its independent ELF pin to reproduced proof0d01eeed without changing domain absence, root identity, journal replay or unique-path safety. Added explicit consumer test guidance/code map. Preserved2084133 GitHub package failure10/1347 due old pin; local corrected core-cli/qualification1350 passed7 platform skips and independent reuse12 passed. Prior2084133 exact-server guest-related589 and ELF34 passed; guest/proof binaries and production source unchanged in this follow-up. Exact follow-up server gates and native proofs pending."
 }
 ```
 <!-- architecture-review:end -->

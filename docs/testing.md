@@ -494,6 +494,20 @@ write on each stream. PID1 access restrictions remain unchanged. Set a healthy p
 host journal failure-warning tests; never strip a warning to pass the proof.
 These selections do not qualify NGINX, a new application build or full Gate 2.
 
+When the test-only `guest/workload-proof/proof.c` changes, also rebuild its
+ELF and SquashFS fixtures, synchronize their canonical manifest/source/ELF
+pins, and run the portable retained-root injection consumers before push:
+
+```sh
+uv run python -m pytest -q tests/kvm/test_oci_root_libvirt_live.py -k reuse_fixture
+```
+
+These are mocked offline-injection contracts, not an opt-in VM run. The
+separate reuse fixture keeps an explicit ELF digest in addition to the shared
+fixture loader; it must match the newly reproduced test binary. Retain its
+domain-absence, identity and journal-replay failure controls. The broader
+`core-cli qualification` selection remains the development-package gate.
+
 The stage-1 composite reconnect proof waits for both READY_COMMITTED and the
 workload's signal-armed marker before its first intentional disconnect. Pipe
 delivery makes readiness and child-output observation asynchronous; the test
