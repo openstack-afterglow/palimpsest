@@ -13,6 +13,32 @@ It provides the `palimpsest` command and keeps local artifacts, tags, run state,
 
 ## Install
 
+### Download an exact-SHA development package
+
+Successful pushes to `main`, `dev`, and `codex/oci-root-phase1` publish a
+GitHub prerelease tagged `package-<full-commit-SHA>`. Download all three assets
+for the exact commit, verify them, and then install the wheel:
+
+```sh
+SHA="FULL_40_CHARACTER_COMMIT_SHA"
+BASE="https://github.com/openstack-afterglow/palimpsest/releases/download/package-${SHA}"
+DOWNLOAD_DIR="$(mktemp -d)"
+cd "$DOWNLOAD_DIR"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0-py3-none-any.whl"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0.tar.gz"
+curl -fLO "${BASE}/SHA256SUMS"
+sha256sum -c SHA256SUMS && \
+  uv tool install --no-index ./palimpsest_local-0.1.0.dev0-py3-none-any.whl
+```
+
+The workflow refuses an existing tag instead of replacing its assets. If
+publication fails after tag creation, the tag is preserved and an automatic
+rerun refuses it; recovery is an explicit maintainer operation. These
+packages are development snapshots, are never marked Latest, and are not
+stable, PyPI-published, or Gate 2-qualified. The URLs exist only after that
+commit's workflow succeeds; see the
+[GitHub releases list](https://github.com/openstack-afterglow/palimpsest/releases).
+
 ### Build and install locally
 
 From a trusted checkout with Python 3.12+ and
@@ -94,6 +120,8 @@ palimpsest image load -i ./api.tar
 Profiles are stored without secrets in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Selection order for an unqualified reference is: a registry written in the reference, `--registry`, `PALIMPSEST_REGISTRY`, then the configured default. Palimpsest reuses the existing Docker credential store from `DOCKER_CONFIG` or `~/.docker`; use `login --password-stdin` for non-interactive authentication. `palimpsest docker ...` provides a generic Docker passthrough for commands without a first-class wrapper while blocking Docker-global `--config` overrides before the subcommand and password-bearing login arguments.
 
 See [Docker/OCI registry profiles](docs/registries.md) for cache settings, private CAs/mirrors, Docker-compatible command coverage, and offline restrictions.
+See also the source-based [Docker Hub intake analysis](docs/docker-hub-intake-analysis.md)
+for the current local-archive boundary and unqualified gaps.
 
 ## Artifact workflow
 

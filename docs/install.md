@@ -3,7 +3,38 @@
 Palimpsest Local is a Python 3.12+ CLI. Its base distribution has no required
 Python dependencies. The checkout version is `0.1.0.dev0`; public `v0.1.0`
 publication remains blocked pending the documented physical Linux KVM release
-gate. Build and install a local artifact rather than assuming PyPI availability.
+gate. Build and install a local artifact, or select an exact-SHA GitHub
+development package, rather than assuming PyPI availability.
+
+## Download an exact-SHA development package
+
+Successful workflow runs for `main`, `dev`, and `codex/oci-root-phase1`
+publish a prerelease tagged `package-<full-commit-SHA>`. Choose the full SHA you
+reviewed instead of resolving a moving branch name or the Latest release:
+
+```sh
+SHA="FULL_40_CHARACTER_COMMIT_SHA"
+BASE="https://github.com/openstack-afterglow/palimpsest/releases/download/package-${SHA}"
+DOWNLOAD_DIR="$(mktemp -d)"
+cd "$DOWNLOAD_DIR"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0-py3-none-any.whl"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0.tar.gz"
+curl -fLO "${BASE}/SHA256SUMS"
+sha256sum -c SHA256SUMS && \
+  uv tool install --no-index ./palimpsest_local-0.1.0.dev0-py3-none-any.whl && \
+  palimpsest --version
+```
+
+The URLs exist only after that commit's workflow succeeds. The publisher
+refuses an existing tag and never overwrites assets. This prerelease is not
+Latest, stable, PyPI-published, signed, or native KVM/Gate 2-qualified. Review
+the [GitHub releases list](https://github.com/openstack-afterglow/palimpsest/releases)
+and commit before use. On macOS, use `shasum -a 256 -c SHA256SUMS` if GNU
+`sha256sum` is unavailable.
+
+If release publication fails after the tag is created, the workflow preserves
+that tag and an automated rerun fails instead of deleting or replacing it.
+Maintainer inspection and explicit recovery are required.
 
 ## Build and verify distributions
 

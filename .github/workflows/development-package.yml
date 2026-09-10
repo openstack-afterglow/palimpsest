@@ -1,0 +1,90 @@
+name: Development package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+      - codex/oci-root-phase1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: development-package-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify development package
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/dev' ||
+      github.ref == 'refs/heads/codex/oci-root-phase1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - name: Check architecture freshness
+        run: python3 scripts/check_architecture.py
+      - name: Check generated CLI reference
+        run: uv run python scripts/generate_cli_reference.py --check
+      - name: Check test-lane manifest
+        run: uv run python scripts/test_lanes.py list --check
+      - name: Lint development-package contracts
+        run: uv run ruff check scripts/test_lanes.py tests/unit/test_development_package_workflow.py tests/unit/test_test_lanes.py
+      - name: Run relevant portable contracts
+        run: uv run python scripts/test_lanes.py run core-cli qualification
+      - name: Build and smoke-test package artifacts
+        run: uv run python scripts/build_package.py --out-dir "$RUNNER_TEMP/palimpsest-dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: development-distributions-${{ github.sha }}
+          path: ${{ runner.temp }}/palimpsest-dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish SHA-specific prerelease
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: development-distributions-${{ github.sha }}
+          path: dist/
+      - name: Verify transferred checksums
+        working-directory: dist
+        run: |
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+          test "$(find . -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test -f SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create the SHA-specific tag without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: package-${{ github.sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            --method POST \
+            --field "ref=refs/tags/${TAG}" \
+            --field "sha=${GITHUB_SHA}" >/dev/null
+      - name: Publish development prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: package-${{ github.sha }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "Development package ${GITHUB_SHA}" \
+            --notes "Unqualified development package built from commit ${GITHUB_SHA}. This is not a stable release or Gate 2 qualification." \
+            --prerelease \
+            --latest=false

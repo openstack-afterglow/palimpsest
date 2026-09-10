@@ -234,7 +234,9 @@ def test_documentation_and_empty_changes_explain_no_tests():
 
 
 def test_tool_and_workflow_changes_select_bounded_contracts():
-    result = lanes.select_changed(("scripts/test_lanes.py", ".github/workflows/test.yml"))
+    result = lanes.select_changed(
+        ("scripts/test_lanes.py", ".github/workflows/test.yml", ".github/workflows/development-package.yml")
+    )
     assert set(result.lanes) == {"core-cli", "qualification"}
     assert any("all-portable CI" in reason for reason in result.reasons)
 

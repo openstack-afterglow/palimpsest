@@ -32,6 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
+        development_package_workflow
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         sandbox_policy state test_lanes ui
     """),
@@ -374,7 +375,11 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
         elif path in {"scripts/generate_cli_reference.py", "scripts/build_package.py"}:
             selected.add("core-cli")
             reasons.append(f"{path}: CLI documentation/package tooling; isolated package smoke also required")
-        elif path in {"scripts/test_lanes.py", ".github/workflows/test.yml"}:
+        elif path in {
+            "scripts/test_lanes.py",
+            ".github/workflows/test.yml",
+            ".github/workflows/development-package.yml",
+        }:
             selected.update(("core-cli", "qualification"))
             reasons.append(
                 f"{path}: runner/workflow contracts; all-portable CI collection and shard validation also recommended"

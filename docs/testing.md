@@ -85,6 +85,20 @@ file or changing production parsing is not the fix.
 These checks do not boot a VM, qualify Gate 2, publish a release, or authorize
 changes to `/var/lib/palimpsest` or `/var/log/palimpsest`.
 
+The separate `development-package.yml` workflow runs the architecture guard,
+CLI reference check, lane-manifest check, focused lint, `core-cli` plus
+`qualification`, and the real package smoke before the publish job receives
+`contents: write`. It accepts pushes only from `main`, `dev`, or
+`codex/oci-root-phase1`, plus manual dispatch of those same refs; pull requests
+cannot publish. A successful run creates the unique
+`package-<full-commit-SHA>` prerelease with the wheel, sdist, and
+`SHA256SUMS`. It verifies the transferred checksums, atomically refuses an
+existing tag, and never clobbers assets. The prerelease is not Latest, a PyPI
+publication, or evidence that native KVM, guest-binary, filesystem, Gate 1, or
+Gate 2 lanes passed.
+If publication fails after tag creation, the tag remains and an automatic
+rerun fails closed; inspection and recovery are separate maintainer actions.
+
 The two tooling scripts select `core-cli` in the changed-file planner. CI also
 runs the real package smoke explicitly; ordinary unit lanes do not need to
 download and rebuild distributions for every test iteration. Run the same
