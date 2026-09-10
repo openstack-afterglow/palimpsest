@@ -307,9 +307,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "52f8a6ebb26a16145656e3485ec3fa83b7c3bd24c32db5a72de301cf2c67aa24",
-  "reviewed_at": "2026-09-10T06:29:32Z",
-  "summary": "Reviewed main stdout/stderr workload-owned FIFO wiring, bounded pump/unified console queue, 5-second grace plus 1-second post-kill drain, nonblocking reap/close failure handling and nested control deadline/fairness. Reviewed retained pinned sink for authenticated terminal reconnect, retired ordinary diagnostics, source-bundle v2/ELF pins, actual C harnesses, updated native stdio expectations and split test manifest. Architecture/process/testing/guest docs reflect current source and limitations. Independent source review and disjoint local selections passed 680 checks including 64 actual C and 34 packaged ELF checks; intermediate fixture/manifest and sandbox socket failures retained. Exact-SHA native qualification remains pending; PID1 isolation, console device permissions, absent stream aliases and host storage/journal policy unchanged."
+  "source_sha256": "3a18f7978347176e147f1d55f8c9fffe7f4531021bf5c774362f35f5c972cd10",
+  "reviewed_at": "2026-09-10T06:35:51Z",
+  "summary": "Reviewed test-only Linux GCC portability fix: explicit stdint.h for uintptr_t and unambiguous embedded C fixture statements. No production architecture, guest source, ELF, security assertion or output contract change. Updated process evidence records exact81e0180 server fixture failures and omitted pytest umask022 without hiding them; corrected environment passed372 protocol/initramfs and98 C/ELF checks. Local28 focused and pinned Linux GCC15 scenarios passed; independent two-file review approved. Follow-up exact-SHA output/native verification pending."
 }
 ```
 <!-- architecture-review:end -->

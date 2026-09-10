@@ -410,3 +410,16 @@ the canonical two-file source bundle SHA-256 is
 `10ec84029efa76f36874ea63d851aaa98a1339b3549fc1be21664904c27d7152`.
 GitHub publication and exact-SHA server/native qualification remain pending
 at this local checkpoint; existing failure records are not replaced.
+
+The integration was subsequently pushed as `81e0180` and fetched by the native
+host at the exact SHA. Before any VM run, its focused checks exposed test-only
+Linux GCC portability defects (missing `stdint.h` and misleading indentation).
+The follow-up adds the explicit include and separates fixture statements;
+production guest source, packaged ELF and all assertions are unchanged. Local
+focused checks passed 28 cases, and the three affected generated fixtures
+compiled under the pinned Linux GCC and passed all 15 runtime scenarios.
+The first SSH pytest invocations also inherited umask `002`; unlike the Git
+fetch, those invocations omitted the required `022`. No verifier was relaxed
+and no existing artifact was chmodded. With process umask corrected, the same
+server SHA passed the 372 protocol/initramfs checks and 98 actual-C/ELF checks.
+Final output checks on the follow-up SHA and all native runs remain pending.

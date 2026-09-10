@@ -112,7 +112,12 @@ def test_prepare_main_output_actual_fault_matrix(tmp_path):
         static struct main_output_local main_output = {{0}, {-1,-1}, {-1,-1}};
         static int scenario, pipes, closes, owners[8], flags[8];
         static void main_output_pump_init(struct main_output_pump *p) { p->value = 1; }
-        static i64 sc1(i64 call, i64 fd) { if (call != SYS_close) return -1; closes++; flags[fd] = -1; return 0; }
+        static i64 sc1(i64 call, i64 fd) {
+          if (call != SYS_close) return -1;
+          closes++;
+          flags[fd] = -1;
+          return 0;
+        }
         static i64 sc2(i64 call, i64 a, i64 b) {
           int fd; (void)b;
           if (call == SYS_pipe2) { int *p=(int *)(uintptr_t)a; if (scenario==1 && pipes==1) return -5;
@@ -120,7 +125,10 @@ def test_prepare_main_output_actual_fault_matrix(tmp_path):
             flags[p[0]]=O_RDONLY; flags[p[1]]=O_WRONLY; pipes++; return 0; }
           if (call == SYS_fstat) { struct stat_local *s=(void *)(uintptr_t)b; fd=(int)a; memset(s,0,sizeof(*s));
             s->dev=7; s->ino=scenario==2 ? (fd<=4 ? 100 : 101) : 100+(fd-3)/2; s->mode=S_IFIFO|0600; s->uid=owners[fd]; s->gid=owners[fd];
-            if (scenario==3) s->mode=S_IFIFO|0644; if (scenario==4 && owners[fd]) s->ino++; return 0; }
+            if (scenario==3) s->mode=S_IFIFO|0644;
+            if (scenario==4 && owners[fd]) s->ino++;
+            return 0;
+          }
           return -1;
         }
         static i64 sc3(i64 call, i64 a, i64 b, i64 c) { int fd=(int)a;
@@ -238,10 +246,17 @@ def test_eof_and_full_cleanup_close_faults_actual(tmp_path):
         struct main_output_local { struct main_output_pump pump; int read_fd[2], write_fd[2]; };
         static struct main_output_local main_output={{0},{10,12},{11,13}};
         static int scenario, close_attempt[32], reads;
-        static i64 sc1(i64 call,i64 fd) { if(call!=SYS_close)return -99; close_attempt[fd]++;
-          if ((scenario==1&&fd==10)||(scenario==2&&fd==12)||(scenario==3&&fd==10)) return -5; return 0; }
+        static i64 sc1(i64 call,i64 fd) {
+          if(call!=SYS_close) return -99;
+          close_attempt[fd]++;
+          if ((scenario==1&&fd==10)||(scenario==2&&fd==12)||(scenario==3&&fd==10)) return -5;
+          return 0;
+        }
         static i64 sc3(i64 call,i64 fd,i64 bytes,i64 size) { (void)fd;(void)bytes;(void)size;
-          if(call!=SYS_read)return -99; reads++; return 0; }
+          if(call!=SYS_read) return -99;
+          reads++;
+          return 0;
+        }
     ''') + "\n" + extracted + textwrap.dedent(r'''
         int main(int argc,char **argv) { unsigned char byte; int result; scenario=argc>1?atoi(argv[1]):0;
           if (scenario<=2) {
