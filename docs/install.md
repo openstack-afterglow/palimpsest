@@ -36,6 +36,28 @@ If release publication fails after the tag is created, the workflow preserves
 that tag and an automated rerun fails instead of deleting or replacing it.
 Maintainer inspection and explicit recovery are required.
 
+### Verified development-package checkpoint
+
+The [development-package Actions run for
+`7c7ac540fb792b06e8bdd4900662f83477e8f566`](https://github.com/openstack-afterglow/palimpsest/actions/runs/34468685079)
+completed successfully and published the public
+[`package-7c7ac540fb792b06e8bdd4900662f83477e8f566`
+prerelease](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-7c7ac540fb792b06e8bdd4900662f83477e8f566).
+Its verified SHA-256 values are:
+
+- wheel: `305c5bd1b2e23516f4b332e1c4a677acee775715430ab02cc3c8405cff1f3f10`
+- sdist: `fca917387230b66a08065387e641ff35a81f3f47b3435968b802161a4824c378`
+
+On the Linux verification server, an isolated download into
+`/tmp/palimpsest-github-install.QkUfxsHw` passed checksum verification,
+`--no-index` wheel installation, CLI version/help, and the sealed stage-1 ELF
+validation. The installed wheel then cold-materialized the same fresh
+`hello-world` archive into a 4,096-byte SquashFS image with SHA-256
+`cbc3b5f5473509f8b760a5b673d5f5c78cb3303e1da8b38ea1a0768dc4d0e59c`.
+This checkpoint verifies public package delivery, isolated installation, and
+cold materialization only; it did not boot a native VM and is not Gate 2
+qualification.
+
 ## Build and verify distributions
 
 From a trusted checkout with [uv](https://docs.astral.sh/uv/) available:

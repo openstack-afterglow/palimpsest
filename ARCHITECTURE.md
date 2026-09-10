@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+2026-09-11 `7c7ac54`의 같은 Docker Hub `hello-world` archive는 기존 공개 foreground 실기 항목에서 1건 통과했다(13.68초). Linux KVM·512MiB·1vCPU·network none에서 원본 `/hello`의 출력·exit0와 새 run/domain 제거를 확인했다. 기존 inactive domain 네 개의 UUID/state/autostart와 archive 여섯 개의 hash를 전후 보존했다. 최초 preflight는 빈 `virsh` 출력의 줄바꿈 처리에서 VM 실행 전에 중단됐으며, 빈 줄 정규화만 수정한 후 본 검사를 실행했다. 이 항목은 독립적인 guest root/PID1 거부 검사·detached/exec·전체 Gate 2가 아니다. [실기 checkpoint](docs/docker-hub-intake-analysis.md)와 [GitHub 패키지 설치 검증](docs/install.md)을 구분한다. Production source·게스트 ELF·보안 정책 변경은 없다.
+
 2026-09-10 `3aafb7a`의 새 Docker Hub `hello-world` 취득은 외부 Skopeo의 digest-preserving OCI archive 생성, 선택된 Linux amd64 manifest pin의 secure CAS snapshot, 실제 hard-worker cold SquashFS 변환까지 통과했다. remote index와 local manifest pin을 혼동한 거부 및 첫 root-owned archive의 chmod 실패는 보존했다. 기존 inactive domain 네 개는 변경하지 않았으며 새 archive의 VM 부팅·Gate 2는 실행하지 않았다. 상세 digest와 재현 경계는 [현재 intake 분석](docs/docker-hub-intake-analysis.md)에 기록하며 direct registry `run` 구현으로 확대하지 않는다.
 
 메인 출력 통합의 현재 실기 checkpoint는 `9736132`다. `d32328a`의 동일 guest에 로컬·서버 선별686건이 통과했고, proof 동기화 후속은 로컬·정확한 서버 SHA의423건이 통과했다(중복 합산하지 않음). 같은 `9736132`의43 boots/44 QEMU와 영수증 검증, UID0/101 stdio2건, 기존 빌드 이미지 cold 공개 lifecycle1건이 통과했다. 메인·추가 exec의 workload-owned0600 FIFO 재열기, 인증된 실제 root와 PID1 거부를 확인했다. 각 실행의21개 사전·사후 보존 검사와 stdio/cold의 전용 journal 각28기록도 통과했다. 중간 STOP/receipt 순서 실패는 [process evidence](docs/oci-linux-process.md)에 보존하며 표준 별칭·원본NGINX·새 application build·전체Gate2 또는 운영 계정 설치 완료로 확대하지 않는다.
@@ -320,8 +322,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 {
   "schema_version": 1,
   "source_sha256": "664ff27a7227a3b672f6bba5ce5cc33a9138ecc05995488a50544ad9e1d3999a",
-  "reviewed_at": "2026-09-10T10:51:58Z",
-  "summary": "Reviewed separate GitHub development-package workflow, package helper, CLI source boundaries, focused safety tests and lane selection. Allowlisted branches publish checked wheel/sdist/checksums as non-latest SHA-specific prereleases with publish-only write authority and no overwrite; formal v-tag KVM/PyPI gates unchanged. Runtime, guest ELF, host privileges and registry intake implementation unchanged. Fresh Docker Hub intake evidence is separate from VM/Gate2 qualification; current Actions and exact-SHA server verification remain to be executed."
+  "reviewed_at": "2026-09-10T15:24:04Z",
+  "summary": "Reviewed unchanged public hello-world native test, request/host launch boundary and fresh exact-7c7ac54 evidence: one foreground native test passed with output/exit0/new run/domain cleanup, six preserved source archives and four inactive domains unchanged, private journal six ordered records. Preserved preflight-only empty-virsh newline failure. Documentation-only follow-up records actual GitHub install checkpoint and native result; production source, guest ELF, security boundaries and test definitions unchanged. No independent root/PID1 probe, detached exec or full Gate2 qualification claimed."
 }
 ```
 <!-- architecture-review:end -->

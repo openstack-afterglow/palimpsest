@@ -126,6 +126,42 @@ also warned that the optional host journal was unavailable; conversion
 continued and the receipt was produced, so this run does not prove host-journal
 installation or recording.
 
+## Native foreground follow-up (2026-09-11)
+
+At exact clean server commit `7c7ac540fb792b06e8bdd4900662f83477e8f566`, the
+unchanged native node
+`test_docker_hub_hello_world_foreground_default_process` passed once in
+13.68 seconds. It used the freshly downloaded owner-controlled archive and
+selected manifest recorded above, the qualified 6.6.71 kernel/config, and
+`mksquashfs` 4.6.1. The authenticated image default remained `argv=["/hello"]`;
+the foreground public command observed `Hello from Docker!`, returned success,
+and the test removed its newly generated run/domain normally.
+
+The healthy private host journal contains exactly six ordered records: start
+and successful end pairs for `oci init-runtime`, `run`, and `rm`. Before and
+after the test, the product checkout remained at the exact clean SHA, no domain
+was active, and the four retained inactive definitions kept their exact UUID,
+shut-off state, and disabled autostart setting. SHA-256 values were unchanged
+for the three original Docker Hub archives, the existing built-image archive,
+the new owner-controlled hello-world archive, and the preserved root-owned
+first-acquisition archive. The primary evidence root is
+`/tmp/palimpsest-hello-native.TE4Op1kn`; test-owned runtime and setup-failure
+evidence are retained at `/tmp/p-hub-hello-378185da` and
+`/tmp/p-hub-evidence-hello-378185da`.
+
+An initial preflight-only attempt is preserved at
+`/tmp/palimpsest-hello-native.jNlBhW4l`. It exited before pytest because an
+empty `virsh list --name` response contained only a newline and the shell
+check treated that formatting byte as an active-domain record. The actual run
+normalized only empty inventory lines; it did not weaken the zero-active-domain
+requirement or change the test.
+
+This qualifies the new archive's short-lived default foreground workload,
+expected output, exit status, source preservation, and owned cleanup. The node
+does not perform the detached service proof's independent authenticated root
+comparison or PID 1 access-refusal probe, and this result is not a full Gate 2
+qualification or direct-registry intake implementation.
+
 ## Compatibility implications and next bounded stage
 
 This fresh result verifies that the external acquisition/local-intake seam is
@@ -133,10 +169,12 @@ usable for a small, unchanged Docker Hub image. It does not broaden the runtime
 contract to arbitrary Docker images. The current runtime still intentionally
 has no network and no facility to add capabilities or rewrite image defaults.
 
-The shortest next proof is a fresh, uniquely named `hello-world` public KVM run
-using this exact archive and manifest pin, followed by source-hash and domain
-inventory checks. It should be a separate explicit opt-in native lifecycle
-proof, not folded into acquisition or conversion.
+At the acquisition checkpoint, the shortest next proof was a fresh, uniquely
+named `hello-world` public KVM run using this exact archive and manifest pin,
+followed by source-hash and domain inventory checks. The 2026-09-11 foreground
+follow-up above completed that bounded proof separately from acquisition and
+conversion. Broader lifecycle evidence still requires the independent root and
+PID 1 assertions that this short-lived node does not contain.
 
 For service compatibility, the next work should remain image-specific and
 fail-closed:
