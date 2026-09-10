@@ -2241,6 +2241,18 @@ static u64 cap_control_deadline(u64 deadline) {
     return deadline;
 }
 
+/* A protocol frame owns its full five-second deadline.  A tighter STOP or
+ * cleanup deadline only bounds this caller's service slice: exhausting it
+ * yields with parser state intact instead of manufacturing a wire error. */
+static int control_read_deadline_status(u64 frame_deadline, u64 now) {
+    u64 slice_deadline;
+    if (!now) return -1;
+    if (frame_deadline && now >= frame_deadline) return -1;
+    slice_deadline = cap_control_deadline(0);
+    if (slice_deadline && now >= slice_deadline) return 0;
+    return 1;
+}
+
 static int wait_control_fd(int fd, short events, u64 deadline) {
     struct pollfd_local item;
     for (;;) {
@@ -2452,11 +2464,9 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
         u8 *target;
         usize needed;
         i64 n;
-        u64 effective_deadline = cap_control_deadline(session->frame_deadline);
-        if (effective_deadline) {
-            u64 now = monotonic_millis();
-            if (!now || now >= effective_deadline) return -1;
-        }
+        int deadline_status = control_read_deadline_status(
+            session->frame_deadline, monotonic_millis());
+        if (deadline_status <= 0) return deadline_status;
         if (session->payload_expected) {
             target = control_payload + session->payload_used;
             needed = session->payload_expected - session->payload_used;
@@ -2470,7 +2480,7 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
             if (!session->frame_deadline) {
                 u64 now = monotonic_millis();
                 if (!now) return -1;
-                session->frame_deadline = cap_control_deadline(now + 5000);
+                session->frame_deadline = now + 5000;
             }
             session->connection = LIFECYCLE_CONNECTED;
             session->reconnect_backoff_ms = 10;

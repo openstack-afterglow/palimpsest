@@ -312,8 +312,8 @@ def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() 
     assert "frame == -2 && session->initial_input_seen" in prepare
     assert "session->initial_input_seen = 1" in reader
     assert "initial_input_seen" not in connection_lost
-    assert "session->frame_deadline = cap_control_deadline(now + 5000)" in reader
-    assert "effective_deadline = cap_control_deadline(session->frame_deadline)" in reader
+    assert "session->frame_deadline = now + 5000" in reader
+    assert "control_read_deadline_status" in reader
     assert "session->frame_deadline && monotonic_millis() >= session->frame_deadline" in reader
     assert live_main.index("if (!prepare_lifecycle(&lifecycle))") < live_main.index("supervise_workload(&workload")
 

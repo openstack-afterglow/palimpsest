@@ -208,6 +208,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
+제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
+
 메인 출력은 `init.c`에서 `main_output_pump.h`를 소비한다. stdout/stderr별 고정 4KiB 버퍼와 공통 16KiB console 큐, 1KiB 전송 quantum을 사용한다. 한 서비스 tick은 실제 sink write 최대1회와 source read 각 stream 최대1회를 시도한다. stream 내부 순서와 큐에 수용된 순서는 유지하지만 독립 stream의 실제 발생 시간순 정렬이나 진단 문장 전체의 atomicity는 보장하지 않는다. workload enqueue의 용량 부족은 무변경 재시도이며 진단 enqueue의 용량 초과·잘못된 상태·영구 I/O 오류는 실패를 유지한다. sink가 영구적으로 실패하면 무손실 전달은 보장할 수 없다.
 
 [`test_main_output_pump.py`](tests/unit/test_main_output_pump.py)는 실제 header의 callback 오류와 호스트 nonblocking pipe를 검사한다. [`test_main_output_pipes.py`](tests/unit/test_main_output_pipes.py)는 production 파이프 helper와 호출 경계를, [`test_main_output_terminate.py`](tests/unit/test_main_output_terminate.py)는 종료 루프를 분리해 검사한다. 이러한 정의는 변경 ELF의 native 검증이나 NGINX·새 build·Gate2 통과 증거가 아니다. 상세 계약과 실행 선택은 [process](docs/oci-linux-process.md), [testing](docs/testing.md)에 기록한다.
@@ -307,9 +309,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "3a18f7978347176e147f1d55f8c9fffe7f4531021bf5c774362f35f5c972cd10",
-  "reviewed_at": "2026-09-10T06:35:51Z",
-  "summary": "Reviewed test-only Linux GCC portability fix: explicit stdint.h for uintptr_t and unambiguous embedded C fixture statements. No production architecture, guest source, ELF, security assertion or output contract change. Updated process evidence records exact81e0180 server fixture failures and omitted pytest umask022 without hiding them; corrected environment passed372 protocol/initramfs and98 C/ELF checks. Local28 focused and pinned Linux GCC15 scenarios passed; independent two-file review approved. Follow-up exact-SHA output/native verification pending."
+  "source_sha256": "c612bc3a37044c25947faa6e5b5fd630f3145fd433466237c51a7567f5578be7",
+  "reviewed_at": "2026-09-10T06:46:13Z",
+  "summary": "Investigated exact-e585ce1 native STOP stage21 failure: expired cleanup caller slice was incorrectly treated as control protocol error even with empty parser. Reviewed minimal reader helper distinguishing slice yield from true full five-second frame expiry/clock failure, unchanged parser preservation and 64-frame fairness, actual red-baseline/green regressions, rebuilt source-bundle/ELF pins and evidence/docs. No security or5+1 output-drain contract relaxation. Independent review passed; disjoint local245+343+64+34=686 checks passed. Prior native failure and21pre/post preservation remain recorded; corrected exact-SHA native pending."
 }
 ```
 <!-- architecture-review:end -->

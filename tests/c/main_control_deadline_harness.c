@@ -32,15 +32,15 @@ struct lifecycle_session {
 };
 
 static u8 control_payload[CONTROL_PAYLOAD_MAX];
-static u64 clock_now = 100, cleanup_deadline;
+static u64 clock_now = 100;
+static int main_console_diagnostics_retired;
+static u64 main_workload_stop_deadline, main_workload_cleanup_deadline;
 static i64 read_results[8];
 static const u8 *read_bytes[8];
 static u32 read_sizes[8], read_at, read_count, pump_reads, writes;
 
 static u64 monotonic_millis(void) { return clock_now; }
-static u64 cap_control_deadline(u64 deadline) {
-  return cleanup_deadline && (!deadline || cleanup_deadline < deadline) ? cleanup_deadline : deadline;
-}
+/* DEADLINE_FUNCTIONS */
 static i64 sc3(i64 call, i64 fd, i64 target, i64 size) {
   i64 result;
   (void)fd;
@@ -80,8 +80,9 @@ static int run_case(const char *name) {
   struct lifecycle_session session;
   usize size = 0;
   memset(&session, 0, sizeof(session));
-  read_at = read_count = pump_reads = writes = 0; clock_now = 100; cleanup_deadline = 0;
-  session.fd = 7;
+  read_at = read_count = pump_reads = writes = 0; clock_now = 100;
+  main_workload_stop_deadline = main_workload_cleanup_deadline = 0;
+  main_console_diagnostics_retired = 0; session.fd = 7;
   if (!strcmp(name, "eintr-empty")) {
     read_results[0] = -EINTR; read_count = 1;
     CHECK(read_control_frame_actual(&session, &size) == 0);
@@ -97,11 +98,39 @@ static int run_case(const char *name) {
     read_results[3] = -EINTR; read_count = 4;
     CHECK(read_control_frame_actual(&session, &size) == 0);
     CHECK(session.payload_expected == 3 && session.payload_used == 1 && session.frame_deadline == 5100);
+  } else if (!strcmp(name, "slice-empty")) {
+    main_workload_stop_deadline = 100;
+    CHECK(read_control_frame_actual(&session, &size) == 0);
+    CHECK(!session.initial_input_seen && !session.header_used && !session.frame_deadline && read_at == 0);
+  } else if (!strcmp(name, "slice-partial")) {
+    session.initial_input_seen = 1; session.payload_expected = 3; session.payload_used = 1;
+    session.frame_deadline = 5100; control_payload[0] = 'a'; main_workload_cleanup_deadline = 100;
+    CHECK(read_control_frame_actual(&session, &size) == 0);
+    CHECK(session.payload_expected == 3 && session.payload_used == 1);
+    CHECK(session.frame_deadline == 5100 && control_payload[0] == 'a' && read_at == 0);
+  } else if (!strcmp(name, "active-first-partial")) {
+    static const u8 header[] = {0, 0, 0, 3}, payload[] = {'a'};
+    main_workload_stop_deadline = 150;
+    read_results[0] = 4; read_bytes[0] = header; read_sizes[0] = 4;
+    read_results[1] = 1; read_bytes[1] = payload; read_sizes[1] = 1;
+    read_results[2] = -EINTR; read_count = 3;
+    CHECK(read_control_frame_actual(&session, &size) == 0);
+    CHECK(session.payload_expected == 3 && session.payload_used == 1);
+    CHECK(session.frame_deadline == 5100 && control_payload[0] == 'a');
+  } else if (!strcmp(name, "protocol-expired")) {
+    session.initial_input_seen = 1; session.payload_expected = 3; session.payload_used = 1;
+    session.frame_deadline = 100; control_payload[0] = 'a'; main_workload_stop_deadline = 100;
+    CHECK(read_control_frame_actual(&session, &size) == -1);
+    CHECK(session.payload_expected == 3 && session.payload_used == 1);
+    CHECK(session.frame_deadline == 100 && control_payload[0] == 'a' && read_at == 0);
   } else if (!strcmp(name, "pump-yields-64")) {
     struct supervisor_result result = {0}; int stop = 0;
     session.connection_has_hello = 1; session.state = LIFECYCLE_READY;
     CHECK(lifecycle_pump(&session, &result, &stop) == 1);
     CHECK(pump_reads == 64 && writes == 64 && stop == 0);
+  } else if (!strcmp(name, "clock-zero")) {
+    clock_now = 0;
+    CHECK(read_control_frame_actual(&session, &size) == -1 && read_at == 0);
   } else return 2;
   return 0;
 }

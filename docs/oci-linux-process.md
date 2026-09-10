@@ -423,3 +423,31 @@ fetch, those invocations omitted the required `022`. No verifier was relaxed
 and no existing artifact was chmodded. With process umask corrected, the same
 server SHA passed the 372 protocol/initramfs checks and 98 actual-C/ELF checks.
 Final output checks on the follow-up SHA and all native runs remain pending.
+
+The exact follow-up `e585ce1` passed all 239 output-focused server checks and
+the architecture guard. Its first native stage-1 positive workload failed
+after STOP dispatch and the workload's stop-observed marker (14.32 seconds),
+with lifecycle rejection stage 21 / errno 5; no remaining matrix, stdio or
+cold native case was run. All 21 preflight and 21 postflight preservation
+checks passed, with no active VM or QEMU and all prior domains/archives intact.
+Source investigation traced the failure to `read_control_frame`: expiration
+of the supervisor's graceful cleanup slice was treated as a protocol error,
+even when no partial frame existed. The correction distinguishes caller
+slice exhaustion (yield with parser state intact) from the actual frame's
+five-second timeout (reject). Neither the 5+1 cleanup budget nor authenticated
+protocol, output completeness or PID 1 protection is relaxed. The failed
+native result remains evidence; the corrected guest requires a fresh rebuild
+and exact-SHA native verification.
+
+The corrected local guest passed 245 focused output/initramfs/filesystem/
+stage-1/manifest/architecture checks, 343 protocol/proof checks, 64 actual C
+checks and 34 ELF/reproducible-build checks (686 total). The actual reader
+regression also reconstructs the previous conflated logic and requires its
+empty-parser expiry case to fail; the corrected reader preserves partial
+bytes on slice exhaustion, retains a full five-second frame deadline and
+rejects actual frame expiry or clock failure. Independent review passed.
+The rebuilt ELF SHA-256 is
+`737d736319710de05d9318b7cbcf380849de47b99631717c96bc25498a2b6cea`;
+source-bundle SHA-256 is
+`9538af57001c1c968d1d9a7728ad7839cd289d3c387deca5015be9c665fbd331`.
+These are local checks, not a replacement for the failed native proof.

@@ -405,6 +405,9 @@ Control I/O and random acquisition use the current cleanup phase deadline;
 an expired STOP deadline cannot erase the separate post-kill drain budget.
 The parser yields on EINTR and lifecycle pumping yields after at most 64
 complete frames so repeated control traffic cannot starve output or teardown.
+The frame's own five-second timeout remains distinct from the caller's STOP
+or cleanup slice: exhausted caller time yields without dropping parser state,
+while an expired partial-frame deadline still rejects the connection.
 
 The production console-sink helpers and their child/parent call sites have
 separate source-extraction harnesses:
