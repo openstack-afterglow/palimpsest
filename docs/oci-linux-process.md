@@ -539,3 +539,85 @@ path is now live-verified within these explicit proofs; original NGINX,
 standard stream aliases, a new application build and full Gate 2 remain
 separate unfinished work. Earlier failed runs and bounded diagnostics above
 are retained as failures/diagnostics, not rewritten as passing qualifications.
+
+## Bounded stdio-alias verification checkpoint: c563867 (2026-09-11)
+
+The bounded stdout/stderr alias implementation and its synchronized native
+proof fixtures were frozen at exact
+`c563867c23c67f352e40774a8068cf11939fe0e7`. Local verification passed 17
+actual-C helper cases, 34 packaged-ELF/reproducible-build cases, 346 guest
+consumer cases, 101 output-focused cases with 12 explicit platform/opt-in
+skips, and 113 alias/native-contract cases. These selections overlap and are
+reported independently; they are not summed into a full-suite total.
+
+The exact server checkout passed the combined core/qualification selection:
+1,357 tests in 51.59 seconds. Its separate guest plus packaged-ELF selection
+passed 623 tests in 70.46 seconds. The production stage-1 ELF SHA-256 is
+`f8fe63805583a4b9bd33a2974f66f58f98c8c2b8589ee6ae748931c1081d67d5`;
+the canonical source-bundle SHA-256 is
+`9ec5562b88200e6290d227beb3b8e41785b348e4fe6e1a079d660362fbed2dab`.
+The independent workload-proof ELF SHA-256 is
+`0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4`,
+and its source SHA-256 is
+`519e458dec5cbe61de6bc0208c63d32c311e8596f99f3beb6a303d510c1d4b1e`.
+
+Two preliminary failures remain part of the record. The first fixture-pin
+update used the raw manifest-file hash where the verifier requires canonical
+JSON digest and retained the previous proof-ELF size; the unchanged strict
+verifier rejected both until the canonical digest and reproduced size were
+synchronized. A separate local protocol selection initially failed because
+the sandbox denied Unix-socket creation with `EPERM`; the same assertions
+passed when rerun with that local socket restriction lifted. Neither failure
+was converted to a skip or addressed by relaxing production validation.
+
+At `2084133286201f738bd300498526968100d29d94`, the package workflow recorded
+10 failures among 1,347 passes because a retained-root consumer still pinned
+the stale workload-proof identity. The consumer pin was synchronized without
+changing retained-root safety checks. The follow-up exact `c563867` package
+workflow run `34500872305` succeeded.
+
+The unchanged stage-1 native matrix then passed its one selected test in
+121.81 seconds: all 43 boots / 44 QEMU invocations and receipt validation
+passed. All 24 preflight and 24 postflight preservation observations passed.
+The retained stage-1 evidence is
+`/tmp/palimpsest-alias-stage1-0c3fdd1a`, with wrapper observations under
+`/tmp/palimpsest-alias-wrapper-rzjlz72q`.
+
+The two sequential UID 0/101 V2 stdio cases passed in 31.26 seconds. Main and
+additional-exec FD 1/2 remained separate workload-owned `0600` FIFOs; each
+process observed the exact root-owned `/dev/stdout -> /proc/self/fd/1` and
+`/dev/stderr -> /proc/self/fd/2` aliases, reopened the intended FD identity,
+and wrote exactly one marker through each pathname. The existing capability,
+group, securebits, NNP, seccomp, authenticated-root and PID 1 denial assertions
+also passed. All 24 preflight and 24 postflight observations passed, and the
+private journal passed with 28 records. Runtime evidence remains at
+`/tmp/p-stdio-0-f26b91dd` and `/tmp/p-stdio-101-ce52426f`; wrapper and journal
+evidence remain at `/tmp/palimpsest-alias-wrapper-eus_sfxm` and
+`/tmp/palimpsest-alias-stdio-journal-uz324nhz`.
+
+The preserved original Docker Hub NGINX archive then passed its unchanged
+default-process native test in 31.65 seconds. The image argv and configured
+user were used without override; readiness, public exec, root identity, PID 1
+refusal, normal stop and removal all passed. All 24 preflight and 24 postflight
+observations passed. The private journal passed with 20 records, including the
+one expected additional-exec error for PID 1 refusal. Runtime, wrapper and
+journal evidence remain at `/tmp/p-hub-nginx-e3777da3`,
+`/tmp/palimpsest-alias-wrapper-vrunrz2t` and
+`/tmp/palimpsest-alias-nginx-journal-1gz7b22l`.
+
+Finally, the unchanged existing `g35` Palimpsest-built image passed its cold
+public lifecycle test in 22.08 seconds. Literal argv, split stdout/stderr,
+exit status 17, image-root identity, PID 1 refusal, missing-command status 127,
+continued exec availability, and normal stop/removal all passed. The successful
+test removed only its fresh `/tmp/p-execcli-9ce6521b` runtime through its normal
+cleanup. All 24 preflight and 24 postflight observations passed. Wrapper and
+journal evidence remain at `/tmp/palimpsest-alias-wrapper-pbdlre_5` and
+`/tmp/palimpsest-alias-cold-journal-87gahkr0`; the journal passed with 28
+records and exactly the three expected additional-exec errors.
+
+These four native selections were finite and sequential; their counts and
+durations are not a full-suite total. The NGINX result is a preserved-archive,
+default-process, network-disabled process/readiness proof, not HTTP serving.
+The cold result reused an existing immutable built image, not a new application
+build. This checkpoint does not claim direct registry `run`, HTTP
+serving/networking, a new application build, or full Gate 2 qualification.
