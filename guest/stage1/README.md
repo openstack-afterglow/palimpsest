@@ -39,20 +39,44 @@ The reproducible build is:
 scripts/build_oci_guest_init.sh
 ```
 
-`main_output_pump.h` is currently an independently tested component for a
-future main-output transport. `init.c` does not include it and the packaged ELF
-does not contain the pump component. It provides only bounded two-stream
-buffering and drain state; pump integration, main-pipe ownership, polling, STOP
-service, teardown drain and terminal authorization remain unimplemented.
-Its callbacks are trusted nonblocking adapters; the component does not make a
-blocking callback nonblocking and does not own a drain deadline.
+`init.c` includes `main_output_pump.h` and routes the main workload's stdout
+and stderr through two distinct workload-UID:GID-owned `0600` FIFOs. Child
+write ends remain blocking; only PID 1's read ends are nonblocking. Each stream
+has a fixed 4 KiB pump buffer. Observed chunks and PID 1 diagnostics enter one
+16 KiB console queue, and an actual console flush performs at most one
+nonblocking 1 KiB write per tick. Queue admission is atomic for workload data;
+diagnostic overflow and permanent I/O errors are sticky failures. Per-stream
+order and observed enqueue order are preserved, but independent stdout and
+stderr have no reconstructed real-time total order.
 
-PID 1 does prepare an otherwise-unused parent-owned nonblocking console sink
-for that future integration. It reopens only the trusted `/proc/self/fd/1`
-object before root transition, binds its exact root-owned `0600` character
-device identity (`5:1`) and original flags across the transition, and keeps the
-new descriptor out of both workload child paths. Main stdout/stderr are not yet
-redirected to pipes and no workload bytes are forwarded through this sink.
+PID 1 acquires and revalidates a distinct nonblocking console OFD through the
+fixed `/proc/self/fd/1` magic link before root transition. After acquisition,
+diagnostics use only the queue and pinned sink: there is no blocking fallback.
+Ordinary diagnostics retire after the last terminal marker; authenticated
+reconnect boundaries are control messages, not discardable diagnostics.
+Pre-acquisition bootstrap
+failures and non-PID fixture mode retain their direct-write exception.
+
+Cleanup uses one shared budget: up to five seconds for graceful supervision,
+then cgroup kill and at most one additional second for output drain. Natural
+exit also gives descendant writers a bounded drain opportunity. Success
+requires pump EOF, empty buffers, an empty healthy queue and completed process
+cleanup. The terminal sequence is root quiescence, terminal diagnostic
+enqueue, bounded drain and held-sink revalidation, then authenticated TERMINAL
+publication. The main pipes are closed, but PID 1 retains the same nonblocking
+console sink for authenticated reconnect `BOUNDARY_ACK` delivery. Terminal
+control service polls pending console output and gives each pending boundary
+a separate five-second delivery budget; it does not extend workload cleanup.
+Control delivery failure wipes lifecycle secrets, closes the sink and waits
+fail-closed without changing the completed workload's terminal cause.
+Deadline expiry or permanent output failure disables normal TERMINAL. These
+userspace deadlines do not claim a hard kernel deadline for tasks stuck in an
+uninterruptible kernel state.
+
+The stage-1 source identity uses the versioned source-bundle framing over
+the named `init.c` and `main_output_pump.h` inputs. This implementation has not
+yet received the separate native VM/stdout-stderr qualification; component and
+portable checks are not that evidence.
 
 The build runs offline and read-only as the invoking UID/GID with fixed locale,
 timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest

@@ -20,12 +20,15 @@ from palimpsest_local.oci_initramfs import (
     OCI_STAGE1_BINARY_DIGEST,
     OCI_STAGE1_BUILD_RECIPE_DIGEST,
     OCI_STAGE1_SEAL_RECIPE_DIGEST,
+    OCI_STAGE1_SOURCE_BUNDLE_DOMAIN,
+    OCI_STAGE1_SOURCE_BUNDLE_NAMES,
     OCI_STAGE1_SOURCE_DIGEST,
     InitramfsEntryReceipt,
     NewcEntry,
     OCIInitramfsManifest,
     build_bootstrap_initramfs,
     build_newc,
+    canonical_stage1_source_bundle,
     parse_newc,
     verify_bootstrap_initramfs,
     verify_static_x86_64_elf,
@@ -222,13 +225,20 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
 def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance() -> None:
     repository = Path(__file__).resolve().parents[2]
     paths = {
-        OCI_STAGE1_SOURCE_DIGEST: repository / "guest/stage1/init.c",
         OCI_STAGE1_BUILD_RECIPE_DIGEST: repository / "scripts/build_oci_guest_init.sh",
         OCI_STAGE1_SEAL_RECIPE_DIGEST: repository / "scripts/seal_static_elf.py",
         OCI_STAGE1_BINARY_DIGEST: repository / "src/palimpsest_local/assets/oci-stage1-init.x86_64",
     }
     for expected, path in paths.items():
         assert f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}" == expected
+    source_bundle = canonical_stage1_source_bundle(
+        (repository / OCI_STAGE1_SOURCE_BUNDLE_NAMES[0]).read_bytes(),
+        (repository / OCI_STAGE1_SOURCE_BUNDLE_NAMES[1]).read_bytes(),
+    )
+    assert f"sha256:{hashlib.sha256(source_bundle).hexdigest()}" == OCI_STAGE1_SOURCE_DIGEST
+    assert OCI_STAGE1_SOURCE_DIGEST != (
+        f"sha256:{hashlib.sha256((repository / OCI_STAGE1_SOURCE_BUNDLE_NAMES[0]).read_bytes()).hexdigest()}"
+    )
     assert stat.S_IMODE(paths[OCI_STAGE1_BINARY_DIGEST].stat().st_mode) == 0o644
     stage1 = paths[OCI_STAGE1_BINARY_DIGEST].read_bytes()
     assert b"workload terminal; main_status=" in stage1
@@ -255,6 +265,36 @@ def test_packaged_stage1_binary_and_reproducible_build_inputs_match_provenance()
         assert marker in stage1
 
 
+def test_stage1_source_bundle_has_independent_named_length_framing() -> None:
+    init_source = b'#include "main_output_pump.h"\n'
+    pump_header = b"#define MAIN_OUTPUT_PUMP_H\n"
+    names = ("guest/stage1/init.c", "guest/stage1/main_output_pump.h")
+
+    assert OCI_STAGE1_SOURCE_BUNDLE_DOMAIN == b"palimpsest.guest-stage1-source-bundle.v1\0"
+    assert OCI_STAGE1_SOURCE_BUNDLE_NAMES == names
+    expected = bytearray(b"palimpsest.guest-stage1-source-bundle.v1\0")
+    expected.extend((2).to_bytes(4, "big"))
+    for name, source in zip(names, (init_source, pump_header), strict=True):
+        encoded_name = name.encode("ascii")
+        expected.extend(len(encoded_name).to_bytes(4, "big"))
+        expected.extend(encoded_name)
+        expected.extend(len(source).to_bytes(8, "big"))
+        expected.extend(source)
+
+    actual = canonical_stage1_source_bundle(init_source, pump_header)
+    assert actual == bytes(expected)
+    assert canonical_stage1_source_bundle(init_source + b" ", pump_header) != actual
+    assert canonical_stage1_source_bundle(init_source, pump_header + b" ") != actual
+
+
+@pytest.mark.parametrize("invalid", [None, "source", bytearray(b"source")])
+def test_stage1_source_bundle_rejects_non_bytes(invalid: object) -> None:
+    with pytest.raises(TypeError, match="source bundle entries must be bytes"):
+        canonical_stage1_source_bundle(invalid, b"header")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="source bundle entries must be bytes"):
+        canonical_stage1_source_bundle(b"init", invalid)  # type: ignore[arg-type]
+
+
 def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() -> None:
     repository = Path(__file__).resolve().parents[2]
     source = (repository / "guest" / "stage1" / "init.c").read_text()
@@ -272,7 +312,8 @@ def test_initial_lifecycle_wait_is_unbounded_only_before_the_first_input_byte() 
     assert "frame == -2 && session->initial_input_seen" in prepare
     assert "session->initial_input_seen = 1" in reader
     assert "initial_input_seen" not in connection_lost
-    assert "session->frame_deadline = now + 5000" in reader
+    assert "session->frame_deadline = cap_control_deadline(now + 5000)" in reader
+    assert "effective_deadline = cap_control_deadline(session->frame_deadline)" in reader
     assert "session->frame_deadline && monotonic_millis() >= session->frame_deadline" in reader
     assert live_main.index("if (!prepare_lifecycle(&lifecycle))") < live_main.index("supervise_workload(&workload")
 
@@ -320,7 +361,7 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     source = (repository / "guest" / "stage1" / "init.c").read_text()
     packaged = (repository / "src" / "palimpsest_local" / "assets" / "oci-stage1-init.x86_64").read_bytes()
 
-    assert source.count("return n ? 0 : -1;") == 4
+    assert source.count("return n ? 0 : -1;") == 5
     assert "sc2(SYS_kill, main_pid, SIGKILL)" not in source
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
@@ -375,13 +416,15 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "value.n != 36" in source
     assert "for (i = 0; i < nonce.n; i++) if (!is_hex" in source
     assert 'memcpy(name_path + 24 + slen(selected), "/name", 6)' in source
-    assert "lifecycle_poll_timeout(lifecycle, remote_exec.active ? 100 : -1)" in source
+    assert "lifecycle_poll_timeout(lifecycle, 100)" in source
+    assert "count += main_output_poll(pollfds + count, 9u - count)" in source
     assert "lifecycle_poll_timeout(session, -1)" in source
     assert "session->outbound_failed" in source
     assert "lifecycle_connection_lost(session);" in source
     assert "n != 0 && n != -ESRCH" in source
     assert "lifecycle->state >= LIFECYCLE_READY && !lifecycle->natural_terminal_frozen" in source
-    assert "terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle)" in source
+    assert "terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0)" in source
+    assert "terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, main_done)" in source
     assert "if (session->state == LIFECYCLE_TERMINAL)" in source
     assert "session->natural_late_stop_allowed = 0;" in source
     assert "lifecycle->natural_late_stop_allowed = lifecycle->connection_has_hello;" in source
@@ -391,7 +434,7 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert signed_host_parser.index('key(j, "reply_to")') < signed_host_parser.index('key(j, "request_id")')
     assert "session->payload_used + 1 == session->payload_expected" in source
     assert "write_all(1, LIFECYCLE_PARTIAL_BUFFERED_MARKER);" in source
-    assert source.count("lifecycle_rejected(21, EIO);") >= 2
+    assert source.count("lifecycle_rejected(21, EIO);") >= 1
     assert "else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);" in source
 
 
@@ -400,16 +443,16 @@ def test_ready_root_identity_revalidates_the_transition_baseline() -> None:
     assert "root_identity_evidence.device = merged_identity.dev" in source
     assert "root_identity_evidence.inode = merged_identity.ino" in source
     assert "slash.dev == root_identity_evidence.device && slash.ino == root_identity_evidence.inode" in source
-    assert source.index("if (!refresh_root_identity_evidence())") < source.index(
-        "lifecycle->state = LIFECYCLE_READY"
-    )
+    assert source.index("if (!refresh_root_identity_evidence())") < source.index("lifecycle->state = LIFECYCLE_READY")
 
 
 def test_terminal_root_quiesce_failure_cannot_publish_terminal_state_or_frame() -> None:
     repository = Path(__file__).resolve().parents[2]
     source = (repository / "guest" / "stage1" / "init.c").read_text()
     quiesce = source.split("static int quiesce_terminal_root(void)", 1)[1].split("static int transition_root", 1)[0]
-    terminal_tail = source.rsplit("if (!lifecycle->stop_request_id)", 1)[1].split("static int run_consumer", 1)[0]
+    terminal_tail = source.rsplit("if (main_done && !lifecycle->stop_request_id)", 1)[1].split(
+        "static int run_consumer", 1
+    )[0]
 
     assert 'SYS_open, (i64)"/", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY' in quiesce
     assert 'SYS_open, (i64)"/proc/self/root", O_RDONLY | O_CLOEXEC | O_DIRECTORY' in quiesce

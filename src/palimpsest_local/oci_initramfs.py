@@ -42,14 +42,19 @@ OCI_STAGE1_LIFECYCLE_BROKER_CONTRACT = "palimpsest.guest-lifecycle-broker.v3"
 OCI_STAGE1_WORKLOAD_ISOLATION_CONTRACT = "palimpsest.workload-lifecycle-authority-isolation.v3"
 OCI_STAGE1_PLAN_TRANSPORT = OCI_GUEST_STAGE1_PLAN_TRANSPORT
 OCI_BOOTSTRAP_CAPABILITY = OCI_GUEST_STAGE1_CAPABILITY
-OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf.v1"
+OCI_STAGE1_BUILD_CONTRACT = "palimpsest.guest-stage1-build-sealed-elf-source-bundle.v2"
+OCI_STAGE1_SOURCE_BUNDLE_DOMAIN = b"palimpsest.guest-stage1-source-bundle.v1\0"
+OCI_STAGE1_SOURCE_BUNDLE_NAMES = (
+    "guest/stage1/init.c",
+    "guest/stage1/main_output_pump.h",
+)
 OCI_STAGE1_TOOLCHAIN_IMAGE = (
     "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
 )
-OCI_STAGE1_SOURCE_DIGEST = "sha256:71ccea0e5eaa2974d74c0d6c16bfc3c1eff4a32f7ba4b6fa39b6cd0b76d2bd4a"
+OCI_STAGE1_SOURCE_DIGEST = "sha256:10ec84029efa76f36874ea63d851aaa98a1339b3549fc1be21664904c27d7152"
 OCI_STAGE1_BUILD_RECIPE_DIGEST = "sha256:c8bcfa444a295ed05a05b04340b221a466df9b383c0fa659160c869a892777b9"
 OCI_STAGE1_SEAL_RECIPE_DIGEST = "sha256:f103ba852593d4c242ddd9f7f62a8ea043b18f6f5c72399eda6811925edfb196"
-OCI_STAGE1_BINARY_DIGEST = "sha256:ee9715ba275d5ebd1734d75705be861a87f4d718d3d96b9b4248f0d7bd69fdc9"
+OCI_STAGE1_BINARY_DIGEST = "sha256:3cad3fd4667d063d3689a9a9a82e93d1fe7406292c6d2a00d291f49d65822137"
 MAX_OCI_INITRAMFS_BYTES = 64 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRY_BYTES = 32 * 1024 * 1024
 MAX_OCI_INITRAMFS_ENTRIES = 64
@@ -78,6 +83,26 @@ _REQUIRED_PATHS = tuple(path for path, _mode in _REQUIRED_LAYOUT)
 
 def _digest(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def canonical_stage1_source_bundle(init_source: bytes, main_output_pump_header: bytes) -> bytes:
+    """Frame the complete stage-1 compilation source under a versioned domain."""
+
+    sources = (init_source, main_output_pump_header)
+    if any(not isinstance(source, bytes) for source in sources):
+        raise TypeError("stage-1 source bundle entries must be bytes")
+    framed = [OCI_STAGE1_SOURCE_BUNDLE_DOMAIN, struct.pack(">I", len(OCI_STAGE1_SOURCE_BUNDLE_NAMES))]
+    for name, source in zip(OCI_STAGE1_SOURCE_BUNDLE_NAMES, sources, strict=True):
+        encoded_name = name.encode("ascii")
+        framed.extend(
+            (
+                struct.pack(">I", len(encoded_name)),
+                encoded_name,
+                struct.pack(">Q", len(source)),
+                source,
+            )
+        )
+    return b"".join(framed)
 
 
 def _canonical_digest(value: Any, field_name: str) -> str:
@@ -779,6 +804,8 @@ __all__ = [
     "OCI_STAGE1_PLAN_TRANSPORT",
     "OCI_STAGE1_ROOT_TRANSITION_CONTRACT",
     "OCI_STAGE1_SEAL_RECIPE_DIGEST",
+    "OCI_STAGE1_SOURCE_BUNDLE_DOMAIN",
+    "OCI_STAGE1_SOURCE_BUNDLE_NAMES",
     "OCI_STAGE1_SOURCE_DIGEST",
     "OCI_STAGE1_SUPERVISOR_CONTRACT",
     "OCI_STAGE1_TERMINAL_ROOT_QUIESCE_CONTRACT",
@@ -786,6 +813,7 @@ __all__ = [
     "OCI_STAGE1_TOOLCHAIN_IMAGE",
     "build_bootstrap_initramfs",
     "build_newc",
+    "canonical_stage1_source_bundle",
     "parse_newc",
     "verify_bootstrap_initramfs",
     "verify_static_x86_64_elf",

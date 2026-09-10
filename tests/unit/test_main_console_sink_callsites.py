@@ -48,34 +48,27 @@ def callsite_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     exec_child = _line(exec_function, "if (!close_main_console_sink()) child_fail(error, 42, EIO);")
     parent_close = _block(
         supervise,
-        "if (!close_main_console_sink()) {\n        set_workload_failure(failure, 42, EIO);",
+        "if (!main_console_queue_empty(&main_console_queue) || !revalidate_main_console_sink()) {",
     )
-    early_close = _line(start, "if (code) (void)close_main_console_sink();")
     assert main_child_block.index("if (!close_main_console_sink()) child_fail") < main_child_block.index(
         "prepare_workload_isolation(process"
     )
     assert exec_function.index("if (!close_main_console_sink()) child_fail") < exec_function.index("SYS_dup3")
-    assert supervise.index(parent_close) < supervise.index("quiesce_terminal_root()")
+    assert supervise.index("quiesce_terminal_root()") < supervise.index(parent_close)
+    assert supervise.index("workload_terminal(result)") < supervise.index(parent_close)
+    assert supervise.index(parent_close) < supervise.index("main_console_diagnostics_retired = 1")
     assert supervise.index(parent_close) < supervise.index("lifecycle->state = LIFECYCLE_TERMINAL")
-    assert start.index("code = run_consumer(0, 0);") < start.index(early_close)
-    assert start.index(early_close) < start.index("if (code == EXIT_FILESYSTEM)")
     revalidation_failure = _block(start, "if (!revalidate_main_console_sink()) {")
     lifecycle_failure = _block(start, "if (!prepare_lifecycle(&lifecycle)) {")
-    returned_close = _block(
-        start,
-        "if (!close_main_console_sink() && code == 1) {",
-    )
     assert "(void)close_main_console_sink();" in revalidation_failure
     assert revalidation_failure.index("close_main_console_sink") < revalidation_failure.index("wait_closed")
-    assert "(void)close_main_console_sink();" in lifecycle_failure
-    assert lifecycle_failure.index("close_main_console_sink") < lifecycle_failure.index("lifecycle_rejected")
-    assert start.index("code = supervise_workload(") < start.index(returned_close)
-    assert start.index(returned_close) < start.index("if (!code) {")
+    assert "(void)close_main_console_sink();" not in lifecycle_failure
+    assert lifecycle_failure.index("lifecycle_rejected") < lifecycle_failure.index("wait_closed")
     generated = (
         template.replace("/* MAIN_CHILD_CLOSE */", main_child)
         .replace("/* EXEC_CHILD_CLOSE */", exec_child)
         .replace("/* PARENT_TERMINAL_CLOSE */", parent_close)
-        .replace("/* EARLY_START_CLOSE */", early_close)
+        .replace("/* EARLY_START_CLOSE */", "(void)code;")
     )
     directory = tmp_path_factory.mktemp("main-console-sink-callsites")
     source = directory / "callsites.c"
@@ -104,7 +97,7 @@ def callsite_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.mark.parametrize(
     "scenario",
-    range(8),
+    range(6),
     ids=(
         "main-child-close-first",
         "main-child-close-failure",
@@ -112,8 +105,6 @@ def callsite_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "exec-child-close-failure",
         "terminal-close-failure",
         "terminal-close-first",
-        "early-error-close",
-        "early-success-no-close",
     ),
 )
 def test_production_sink_callsite(scenario: int, callsite_harness: Path) -> None:

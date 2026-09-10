@@ -332,52 +332,81 @@ autostart, four archive hashes, no active VM and no remaining QEMU process.
 The earlier failures remain preserved. Main-output transport, fixed aliases,
 original NGINX qualification and full Gate 2 remain separate unfinished work.
 
-## Main-output pump component (not integrated)
+## Main-output transport
 
-Production PID 1 now prepares, but does not write through, a parent-owned main
-console sink. After the trusted initial procfs mount and before root assembly,
-it reopens the fixed `/proc/self/fd/1` magic link as a distinct nonblocking,
-close-on-exec, write-only open file description. The sole `O_NOFOLLOW`
-exception is limited to this fixed PID 1 self-FD path: the no-follow attempt
-must first fail with `ELOOP`. The original and reopened descriptors must remain
-the same root-owned `0600` character device with device number `5:1`; device,
-inode, rdev, mode, UID and GID and the original descriptor/status flags are
-bound before and after the root transition. No `/dev/console` pathname is
-reopened.
+Production PID 1 includes `guest/stage1/main_output_pump.h`. Before the main
+fork it creates distinct stdout and stderr FIFOs, verifies their identity and
+root-owned `0600` mode, changes both endpoints to the resolved workload UID and
+GID, and verifies them again. The inherited child write ends are blocking and
+become fd 1 and 2; only the parent read ends are nonblocking. Main-output FDs
+are removed from additional exec children. Creation, ownership, flag, dup and
+close faults fail closed.
 
-The held sink is explicitly closed in both workload child paths before
-isolation or fixed-FD duplication. PID 1 retires it after workload cleanup but
-before root quiescence and TERMINAL publication; error returns retain a common
-close immediately after the supervisor returns. Ownership is removed from
-state before close so a failed close cannot later target a reused descriptor.
-Acquisition, revalidation or parent close failure remains fail-closed. This
-preparation changes the packaged guest but does not yet redirect main
-stdout/stderr or invoke the pump.
+Each stream has a fixed 4 KiB buffer and contributes at most one 1 KiB read per
+pump tick. Chunks enter the same fixed 16 KiB queue as PID 1 diagnostics.
+Workload enqueue is all-or-none backpressure, so a retry cannot duplicate
+bytes; diagnostic overflow and permanent source or sink errors are sticky.
+An actual console flush performs at most one nonblocking 1 KiB write per tick.
+The design preserves each stream's byte order, diagnostic enqueue order and
+the order in which PID 1 observes workload chunks. It does not claim a total
+real-time ordering between independent stdout and stderr pipes.
 
-`guest/stage1/main_output_pump.h` defines a freestanding, callback-driven
-two-stream output state machine for later PID 1 integration. Production
-`guest/stage1/init.c` does not include the pump header, so current main console
-output behavior remains unchanged. Each stream has a fixed 4096-byte buffer.
-A tick attempts at most one sink write and at most one read from each stream;
-each successful transfer is at most 1024 bytes. Round-robin starting indices
-prevent a transiently stalled first stream from starving the second. Linux raw
-negative errno values `-4` and `-11` mean interrupted/try-again; adapters on
-other systems translate their native errno to this component ABI.
+The sink remains a distinct nonblocking, close-on-exec, write-only OFD reopened
+through the fixed `/proc/self/fd/1` magic link and bound to the original
+root-owned `0600` kernel console identity (`5:1`) across root transition. No
+`/dev/console` pathname is reopened. Once this sink is acquired, diagnostics
+are enqueued and never fall back to inherited blocking stdout or stderr.
+Ordinary diagnostics retire after the last terminal diagnostic; authenticated
+console `BOUNDARY_ACK` frames remain a distinct, non-discardable control path.
+Post-close diagnostic attempts are discarded. Direct writes remain only for
+pre-acquisition bootstrap handling and non-PID fixture execution.
 
-Callbacks are trusted, nonblocking and non-reentrant adapters. They must honor
-the supplied buffer size, return either a bounded nonnegative byte count or the
-documented negative error ABI, and must not mutate pump state. The component
-cannot bound a callback that blocks. `main_output_pump_init` requires a valid
-pump pointer; a missing callback supplied to a valid pump is a sticky failure.
-A successful tick return means only that no permanent failure occurred, not
-that bytes moved; the future poll loop must not treat it as progress or spin on
-it.
+Normal supervision, STOP handling and teardown continue pumping output. One
+cleanup budget allows up to five seconds for graceful progress; after forced
+cgroup cleanup, at most one additional second is available for final output
+drain. Natural exit also gives descendant writers a bounded opportunity to
+close their inherited endpoints. An early `ECHILD` observation is not success
+until both sources reached EOF, their buffers are empty, and the shared queue
+is empty and healthy. Deadline expiry, residual bytes or permanent I/O failure
+prevents normal TERMINAL publication. These userspace bounds do not guarantee
+a hard deadline for a task stuck in an uninterruptible kernel state.
 
-Invalid state or callback counts, zero/permanent sink writes, and permanent
-source failures make failure sticky. Output is drained only when both sources
-have reported EOF and both buffers are empty. This is not permission to publish
-TERMINAL: lifecycle authentication, cgroup cleanup, root quiescence and sync
-remain separate supervisor conditions. The component owns no descriptors,
-polling, deadlines, signals, STOP handling, reaping, console permissions,
-capabilities or `/dev` aliases. Later integration must update both the normal
-main loop and every `terminate_and_reap` path before terminal publication.
+On success the order is root quiescence, terminal diagnostic enqueue, bounded
+drain and held-sink revalidation, then authenticated TERMINAL publication.
+Main pipe ownership is retired, while PID 1 retains its one nonblocking
+console descriptor for terminal reconnect. Closing it before TERMINAL would
+disable the existing authenticated boundary protocol; adding another descriptor
+to the same console would not isolate device backpressure. Terminal service
+polls pending console writes and uses a separate five-second pending-boundary
+delivery deadline, without extending the workload's five-plus-one-second
+cleanup budget. A control failure wipes secrets and closes the sink before
+waiting fail-closed; it does not rewrite the completed workload's exit cause.
+Thus drain is output completeness evidence, not lifecycle authority by itself.
+
+The build provenance uses versioned source-bundle framing over the named `init.c` and
+`main_output_pump.h` inputs rather than treating `init.c` alone as the compiled
+source. The implementation and portable/component tests are current source
+evidence only. The separate native VM, UID stdio and public lifecycle matrix is
+still pending and no earlier compatibility checkpoint is rewritten as proof
+for this output path.
+
+Local integration verification (2026-09-10): the frozen source and rebuilt ELF
+passed 239 focused output/initramfs/filesystem/stage-1/manifest/architecture
+checks, 343 lifecycle/control/transport/qualification/proof checks, 64 actual
+C guest-exec/ownership/transition checks and 34 packaged-ELF checks, including
+two reproducible pinned-toolchain rebuilds. These disjoint selections total
+680 passed; no full-suite or native result is implied. Independent review
+also executed the new parser EINTR and 64-frame fairness harness.
+
+Intermediate failures remain distinct: strict C fixture compilation exposed
+unused-helper/indentation issues during concurrent edits, then passed after
+correction; five manifest checks failed before the new control test was
+registered, then the complete focused selection passed. Six local protocol
+tests initially failed because the sandbox refused Unix socket bind; the
+identical 343-test selection passed with that local socket restriction lifted.
+The new ELF SHA-256 is
+`3cad3fd4667d063d3689a9a9a82e93d1fe7406292c6d2a00d291f49d65822137`;
+the canonical two-file source bundle SHA-256 is
+`10ec84029efa76f36874ea63d851aaa98a1339b3549fc1be21664904c27d7152`.
+GitHub publication and exact-SHA server/native qualification remain pending
+at this local checkpoint; existing failure records are not replaced.

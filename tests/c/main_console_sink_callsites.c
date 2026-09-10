@@ -20,6 +20,9 @@ struct exec_session {
     int unused;
 };
 
+struct main_console_queue { int unused; };
+static struct main_console_queue main_console_queue;
+
 static int close_result;
 static int close_calls;
 static int child_failure_stage;
@@ -36,6 +39,15 @@ static int close_main_console_sink(void) {
     close_calls++;
     close_event = ++event_number;
     return close_result;
+}
+
+static int main_console_queue_empty(const struct main_console_queue *queue) {
+    (void)queue;
+    return 1;
+}
+
+static int revalidate_main_console_sink(void) {
+    return close_main_console_sink();
 }
 
 static __attribute__((noreturn)) void child_fail(int fd, u32 stage, i64 error) {

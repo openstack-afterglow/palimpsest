@@ -1,4 +1,5 @@
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,19 @@ def harness(tmp_path_factory):
     generated.write_text(template.replace("/*PRODUCTION_FUNCTIONS*/", functions))
     output = generated.with_suffix("")
     result = subprocess.run(
-        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(generated), "-o", str(output)],
+        [
+            "cc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-I",
+            str(ROOT),
+            str(generated),
+            "-o",
+            str(output),
+        ],
         capture_output=True,
         timeout=20,
     )
@@ -93,3 +106,77 @@ def test_production_console_sink_faults(harness, scenario):
     scenario_number = SCENARIOS.index(scenario)
     result = subprocess.run([str(harness), str(scenario_number)], timeout=10)
     assert result.returncode == 0
+
+
+def test_production_diagnostic_routing_actual(tmp_path):
+    source = (ROOT / "guest/stage1/init.c").read_text()
+    functions = "\n".join(
+        _function(source, name)
+        for name in (
+            "static usize slen",
+            "static void write_all_direct",
+            "static void write_all(int fd",
+        )
+    )
+    harness_source = tmp_path / "diagnostic-routing.c"
+    harness_source.write_text(
+        textwrap.dedent(
+            r"""
+            #include <string.h>
+            #include "guest/stage1/main_output_pump.h"
+            typedef signed long i64; typedef unsigned long usize;
+            #define SYS_write 1
+            struct main_console_sink_local { int fd; };
+            static struct main_console_sink_local main_console_sink = {.fd = -1};
+            static struct main_console_queue main_console_queue;
+            static int main_console_queue_active;
+            static int main_console_diagnostics_retired;
+            static unsigned char direct[64]; static usize direct_used;
+            static i64 sc3(i64 call, i64 fd, i64 bytes, i64 size) {
+              (void)fd; if (call != SYS_write || size < 0 || direct_used + (usize)size > sizeof(direct)) return -5;
+              memcpy(direct + direct_used, (const void *)bytes, (usize)size); direct_used += (usize)size; return size;
+            }
+            """
+        )
+        + functions
+        + textwrap.dedent(
+            r"""
+            int main(void) {
+              write_all(1, "direct");
+              if (direct_used != 6 || memcmp(direct, "direct", 6)) return 1;
+              main_console_queue_init(&main_console_queue); main_console_queue_active = 1; main_console_sink.fd = 7;
+              write_all(2, "queued");
+              if (direct_used != 6 || main_console_queue.used != 6 || memcmp(main_console_queue.bytes, "queued", 6)) return 2;
+              main_console_sink.fd = -1; write_all(1, "discarded");
+              if (direct_used != 6 || main_console_queue.used != 6) return 3;
+              main_console_sink.fd = 7; main_console_diagnostics_retired = 1; write_all(1, "retired");
+              if (direct_used != 6 || main_console_queue.used != 6) return 4;
+              main_console_diagnostics_retired = 0; main_console_queue.used = MAIN_CONSOLE_QUEUE_BYTES;
+              write_all(1, "overflow");
+              if (!main_console_queue.failed || main_console_queue_valid(&main_console_queue)) return 5;
+              return 0;
+            }
+            """
+        )
+    )
+    binary = tmp_path / "diagnostic-routing"
+    built = subprocess.run(
+        [
+            "cc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-I",
+            str(ROOT),
+            str(harness_source),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        timeout=20,
+    )
+    assert built.returncode == 0, built.stderr.decode()
+    ran = subprocess.run([str(binary)], capture_output=True, timeout=5)
+    assert ran.returncode == 0, ran.stderr.decode()

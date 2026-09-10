@@ -14,6 +14,8 @@ typedef unsigned long u64;
 typedef signed long i64;
 typedef unsigned long usize;
 
+#include "main_output_pump.h"
+
 struct span { const char *p; usize n; };
 
 #define SYS_read 0
@@ -315,9 +317,27 @@ struct main_console_sink_local {
     struct stat_local identity;
 };
 
-/* This parent-owned descriptor is prepared for the future main-output pump.
- * This change does not yet write workload output through it. */
 static struct main_console_sink_local main_console_sink = {.fd = -1};
+static struct main_console_queue main_console_queue;
+struct main_output_local {
+    struct main_output_pump pump;
+    int read_fd[2];
+    int write_fd[2];
+};
+static struct main_output_local main_output = {.read_fd = {-1, -1}, .write_fd = {-1, -1}};
+/* Once set, diagnostics never fall back to inherited blocking stdout/stderr,
+ * including after the pinned sink has been detached. */
+static int main_console_queue_active;
+static int main_console_diagnostics_retired;
+static u64 main_console_flush_deadline;
+static u64 main_console_boundary_deadline;
+static u64 main_workload_stop_deadline;
+static u64 main_workload_cleanup_deadline;
+
+static void set_main_console_flush_deadline(u64 absolute) {
+    if (absolute && (!main_console_flush_deadline || absolute < main_console_flush_deadline))
+        main_console_flush_deadline = absolute;
+}
 
 struct pollfd_local {
     int fd;
@@ -406,6 +426,7 @@ struct lifecycle_session {
     u64 next_sequence;
     u64 frame_deadline;
     u64 outbound_deadline;
+    u64 reconnect_not_before;
     u64 last_hello_request_id;
     u64 hello_request_id;
     u64 stop_request_id;
@@ -541,7 +562,7 @@ static int text_equal(const char *a, const char *b) {
     return an == bn && bytes_equal(a, b, an);
 }
 
-static void write_all(int fd, const char *s) {
+static void write_all_direct(int fd, const char *s) {
     usize left = slen(s);
     while (left) {
         i64 n = sc3(SYS_write, fd, (i64)s, (i64)left);
@@ -549,6 +570,16 @@ static void write_all(int fd, const char *s) {
         s += n;
         left -= (usize)n;
     }
+}
+
+static void write_all(int fd, const char *s) {
+    usize size = slen(s);
+    if (!main_console_queue_active) {
+        write_all_direct(fd, s);
+        return;
+    }
+    if (main_console_diagnostics_retired || main_console_sink.fd < 0) return;
+    (void)main_console_enqueue_diagnostic(&main_console_queue, (const unsigned char *)s, size);
 }
 
 static void write_u32(int fd, u32 value) {
@@ -614,9 +645,50 @@ static __attribute__((noreturn)) void exit_now(int code) {
     for (;;) {}
 }
 
-static __attribute__((noreturn)) void wait_closed(const char *message) {
-    write_all(2, message);
-    for (;;) sc0(SYS_pause);
+static u64 monotonic_millis(void);
+
+static main_output_count write_main_console_nonblocking(
+    void *context, const unsigned char *bytes, main_output_size size) {
+    (void)context;
+    if (main_console_sink.fd < 0) return -EIO;
+    return sc3(SYS_write, main_console_sink.fd, (i64)bytes, (i64)size);
+}
+
+static void flush_main_console_bounded(void) {
+    u64 now, deadline;
+    struct pollfd_local item;
+    if (!main_console_queue_active || main_console_sink.fd < 0) return;
+    now = monotonic_millis();
+    if (!now) {
+        main_console_queue.failed = 1;
+        return;
+    }
+    if (!main_console_flush_deadline) main_console_flush_deadline = now + 1000;
+    deadline = main_console_flush_deadline;
+    while (now < deadline) {
+        int timeout;
+        if (!main_console_flush_tick(&main_console_queue, 0, write_main_console_nonblocking) ||
+            main_console_queue_empty(&main_console_queue))
+            return;
+        timeout = (int)(deadline - now > 10 ? 10 : deadline - now);
+        item.fd = main_console_sink.fd;
+        item.events = POLLOUT;
+        item.revents = 0;
+        if (sc3(SYS_poll, (i64)&item, 1, timeout) < 0) {
+            main_console_queue.failed = 1;
+            return;
+        }
+        now = monotonic_millis();
+        if (!now) {
+            main_console_queue.failed = 1;
+            return;
+        }
+    }
+}
+
+static void flush_main_console_tick(void) {
+    if (main_console_queue_active && main_console_sink.fd >= 0)
+        (void)main_console_flush_tick(&main_console_queue, 0, write_main_console_nonblocking);
 }
 
 static u32 rotr32(u32 x, u32 n) { return (x >> n) | (x << (32 - n)); }
@@ -2045,6 +2117,7 @@ static int valid_kernel_console(const struct stat_local *identity) {
 static int close_main_console_sink(void) {
     int fd = main_console_sink.fd;
     main_console_sink.fd = -1;
+    main_console_flush_deadline = 0;
     if (fd < 0) return 1;
     return sc1(SYS_close, fd) == 0;
 }
@@ -2055,7 +2128,7 @@ static int acquire_main_console_sink(void) {
     i64 nofollow, fd, status_flags, descriptor_flags;
     i64 original_status_flags, original_descriptor_flags;
     int valid;
-    if (sc0(SYS_getpid) != 1 || main_console_sink.fd != -1 ||
+    if (sc0(SYS_getpid) != 1 || main_console_sink.fd != -1 || main_console_queue_active ||
         sc2(SYS_fstat, 1, (i64)&before) != 0 || !valid_kernel_console(&before))
         return 0;
     original_status_flags = sc3(SYS_fcntl, 1, F_GETFL, 0);
@@ -2096,6 +2169,8 @@ static int acquire_main_console_sink(void) {
     main_console_sink.original_status_flags = (int)original_status_flags;
     main_console_sink.original_descriptor_flags = (int)original_descriptor_flags;
     main_console_sink.identity = before;
+    main_console_queue_init(&main_console_queue);
+    main_console_queue_active = 1;
     return 1;
 }
 
@@ -2116,6 +2191,13 @@ static int revalidate_main_console_sink(void) {
            (descriptor_flags & FD_CLOEXEC) &&
            sc3(SYS_fcntl, 1, F_GETFL, 0) == main_console_sink.original_status_flags &&
            sc3(SYS_fcntl, 1, F_GETFD, 0) == main_console_sink.original_descriptor_flags;
+}
+
+static __attribute__((noreturn)) void wait_closed(const char *message) {
+    write_all(2, message);
+    flush_main_console_bounded();
+    (void)close_main_console_sink();
+    for (;;) sc0(SYS_pause);
 }
 
 #define MOUNTINFO_MAX (64 * 1024)
@@ -2147,6 +2229,18 @@ static u64 monotonic_millis(void) {
     return (u64)now.sec * 1000 + (u64)now.nsec / 1000000;
 }
 
+static u64 cap_control_deadline(u64 deadline) {
+    if (main_workload_cleanup_deadline) {
+        if (!deadline || main_workload_cleanup_deadline < deadline)
+            return main_workload_cleanup_deadline;
+        return deadline;
+    }
+    if (!main_console_diagnostics_retired && main_workload_stop_deadline &&
+        (!deadline || main_workload_stop_deadline < deadline))
+        return main_workload_stop_deadline;
+    return deadline;
+}
+
 static int wait_control_fd(int fd, short events, u64 deadline) {
     struct pollfd_local item;
     for (;;) {
@@ -2166,9 +2260,11 @@ static int wait_control_fd(int fd, short events, u64 deadline) {
 static int control_io_exact(int fd, u8 *buffer, usize size, int writing) {
     usize used = 0;
     u64 now = monotonic_millis();
-    u64 deadline = now ? now + 5000 : 0;
+    u64 deadline = cap_control_deadline(now ? now + 5000 : 0);
     if (!deadline) return 0;
     while (used < size) {
+        now = monotonic_millis();
+        if (!now || now >= deadline) return 0;
         i64 n = writing ? sc3(SYS_write, fd, (i64)(buffer + used), size - used)
                         : sc3(SYS_read, fd, (i64)(buffer + used), size - used);
         if (n > 0 && (usize)n <= size - used) { used += (usize)n; continue; }
@@ -2255,16 +2351,21 @@ static int generate_boot_generation(char out[37]) {
     u8 bytes[16];
     usize used = 0, i, text = 0;
     u64 now = monotonic_millis();
-    u64 deadline = now ? now + 5000 : 0;
+    u64 deadline = cap_control_deadline(now ? now + 5000 : 0);
     while (used < sizeof(bytes)) {
+        now = monotonic_millis();
+        if (!now || now >= deadline) return 0;
         i64 n = sc3(SYS_getrandom, (i64)(bytes + used), sizeof(bytes) - used, GRND_NONBLOCK);
         if (n > 0 && (usize)n <= sizeof(bytes) - used) { used += (usize)n; continue; }
         if (n == -EINTR) continue;
         if (n == -EAGAIN) {
             struct pollfd_local none;
-            if (!deadline || monotonic_millis() >= deadline) return 0;
+            u64 remaining;
+            now = monotonic_millis();
+            if (!now || now >= deadline) return 0;
+            remaining = deadline - now;
             none.fd = -1; none.events = 0; none.revents = 0;
-            sc3(SYS_poll, (i64)&none, 0, 10);
+            sc3(SYS_poll, (i64)&none, 0, remaining < 10 ? (int)remaining : 10);
             continue;
         }
         return 0;
@@ -2298,6 +2399,10 @@ static void lifecycle_connection_lost(struct lifecycle_session *session) {
     session->frame_deadline = 0;
     session->outbound_failed = 0;
     session->outbound_deadline = 0;
+    {
+        u64 now = monotonic_millis();
+        session->reconnect_not_before = now ? now + session->reconnect_backoff_ms : 0;
+    }
     if (admitted_peer_boundary && session->key_ack_wire_sequence) {
         session->epoch++;
         if (!send_boundary_ack(session, discarded_header, discarded_payload, discarded_expected))
@@ -2310,8 +2415,13 @@ static void lifecycle_connection_lost(struct lifecycle_session *session) {
  * actual rejection; this helper only guarantees that it is called again. */
 static int lifecycle_poll_timeout(const struct lifecycle_session *session, int fallback) {
     u64 now, deadline = session->frame_deadline, remaining;
-    if (session->connection == LIFECYCLE_DISCONNECTED)
-        return (int)session->reconnect_backoff_ms;
+    if (session->connection == LIFECYCLE_DISCONNECTED) {
+        now = monotonic_millis();
+        if (!now || !session->reconnect_not_before || now >= session->reconnect_not_before) return 0;
+        remaining = session->reconnect_not_before - now;
+        if (fallback >= 0 && remaining > (u64)fallback) return fallback;
+        return (int)remaining;
+    }
     if (session->outbound_failed && (!deadline || session->outbound_deadline < deadline))
         deadline = session->outbound_deadline;
     if (!deadline) return fallback;
@@ -2322,6 +2432,18 @@ static int lifecycle_poll_timeout(const struct lifecycle_session *session, int f
     return (int)remaining;
 }
 
+static int lifecycle_reconnect_due(const struct lifecycle_session *session) {
+    u64 now;
+    if (session->connection != LIFECYCLE_DISCONNECTED) return 1;
+    now = monotonic_millis();
+    return now && (!session->reconnect_not_before || now >= session->reconnect_not_before);
+}
+
+static void lifecycle_schedule_reconnect(struct lifecycle_session *session) {
+    u64 now = monotonic_millis();
+    session->reconnect_not_before = now ? now + session->reconnect_backoff_ms : 0;
+}
+
 /* Return 1 for one complete frame, 0 for no data, -2 for a peer boundary,
  * and -1 for a complete invalid length or I/O failure. An incomplete frame is
  * connection-local and discarded only after read(2) reports the peer boundary. */
@@ -2330,6 +2452,11 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
         u8 *target;
         usize needed;
         i64 n;
+        u64 effective_deadline = cap_control_deadline(session->frame_deadline);
+        if (effective_deadline) {
+            u64 now = monotonic_millis();
+            if (!now || now >= effective_deadline) return -1;
+        }
         if (session->payload_expected) {
             target = control_payload + session->payload_used;
             needed = session->payload_expected - session->payload_used;
@@ -2343,10 +2470,11 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
             if (!session->frame_deadline) {
                 u64 now = monotonic_millis();
                 if (!now) return -1;
-                session->frame_deadline = now + 5000;
+                session->frame_deadline = cap_control_deadline(now + 5000);
             }
             session->connection = LIFECYCLE_CONNECTED;
             session->reconnect_backoff_ms = 10;
+            session->reconnect_not_before = 0;
             if (session->payload_expected) {
                 session->payload_used += (u32)n;
                 if (session->payload_used == session->payload_expected) {
@@ -2371,7 +2499,7 @@ static int read_control_frame(struct lifecycle_session *session, usize *payload_
             }
             continue;
         }
-        if (n == -EINTR) continue;
+        if (n == -EINTR) return 0;
         if (n == -EAGAIN) {
             if (session->payload_expected && session->payload_used + 1 == session->payload_expected &&
                 !session->partial_frame_marker_emitted) {
@@ -2732,13 +2860,19 @@ static int write_signed_message(struct lifecycle_session *session, const u8 *bod
         !append_control(control_output, sizeof(control_output), &used, "\"}}")) return 0;
     secure_zero(tag, sizeof(tag)); secure_zero(tag_text, sizeof(tag_text));
     if (console == 1) {
-        i64 n;
+        int queued;
         usize prefix_size = slen(LIFECYCLE_BOUNDARY_PREFIX);
         digest_text(control_output + prefix_size, used - prefix_size, session->boundary_digest);
         if (!append_control(control_output, sizeof(control_output), &used, "\n")) return 0;
-        n = sc3(SYS_write, 1, (i64)control_output, used);
+        queued = main_console_queue_active && main_console_sink.fd >= 0 &&
+                 main_console_enqueue_diagnostic(&main_console_queue, control_output, used);
+        if (queued && main_console_diagnostics_retired && !main_console_boundary_deadline) {
+            u64 now = monotonic_millis();
+            if (!now) queued = 0;
+            else main_console_boundary_deadline = now + 5000;
+        }
         secure_zero(control_output, used);
-        return n == (i64)used;
+        return queued;
     }
     {
         u32 payload = (u32)(used - 4);
@@ -2947,12 +3081,15 @@ static int lifecycle_current_snapshot(struct lifecycle_session *session,
     return 1;
 }
 
-/* Pump every currently available complete frame.  Outbound loss commits the
- * state/sequence attempt but is not an input boundary: only read(2)==0 may
- * discard the current parser, HELLO, and nonce context. */
+/* Pump a bounded batch of currently available complete frames.  Yielding
+ * after 64 frames keeps output draining and absolute cleanup deadlines live
+ * even when a peer continuously supplies duplicate requests.  Outbound loss
+ * commits the state/sequence attempt but is not an input boundary: only
+ * read(2)==0 may discard the current parser, HELLO, and nonce context. */
 static int lifecycle_pump(struct lifecycle_session *session,
                           const struct supervisor_result *result, int *dispatch_stop) {
-    for (;;) {
+    u32 frames;
+    for (frames = 0; frames < 64; frames++) {
         usize size = 0;
         int frame = read_control_frame(session, &size);
         if (frame == -2) return 1;
@@ -2981,6 +3118,7 @@ static int lifecycle_pump(struct lifecycle_session *session,
             else if (stop == 2) write_all(1, LIFECYCLE_STOP_DUPLICATE_MARKER);
         }
     }
+    return 1;
 }
 
 static int prepare_lifecycle(struct lifecycle_session *session) {
@@ -3003,6 +3141,7 @@ static int prepare_lifecycle(struct lifecycle_session *session) {
      * five-second partial-frame deadline and a peer boundary is terminal for
      * this initial, unauthenticated exchange. */
     for (;;) {
+        flush_main_console_tick();
         int frame = read_control_frame(session, &size);
         if (frame == 1) {
             if (parse_hello(session, size)) {
@@ -3035,6 +3174,7 @@ static int authenticate_lifecycle_bootstrap(struct lifecycle_session *session) {
     write_all(1, LIFECYCLE_BOOTSTRAP_SENT_MARKER);
     deadline = monotonic_millis() + 5000;
     while (monotonic_millis() < deadline) {
+        flush_main_console_tick();
         int frame = read_control_frame(session, &size);
         if (frame == 1) {
             u64 request_id = 0, wire = 0;
@@ -3063,37 +3203,73 @@ static void wipe_lifecycle_secret(struct lifecycle_session *session) {
     secure_zero(session->boot_generation, sizeof(session->boot_generation));
 }
 
+static int service_terminal_console_tick(void) {
+    if (!main_console_queue_valid(&main_console_queue)) return 0;
+    if (main_console_queue_empty(&main_console_queue)) {
+        main_console_boundary_deadline = 0;
+        return 1;
+    }
+    if (main_console_sink.fd < 0 || !main_console_boundary_deadline) return 0;
+    {
+        u64 now = monotonic_millis();
+        if (!now || now >= main_console_boundary_deadline) return 0;
+    }
+    flush_main_console_tick();
+    if (!main_console_queue_valid(&main_console_queue)) return 0;
+    if (main_console_queue_empty(&main_console_queue)) main_console_boundary_deadline = 0;
+    return 1;
+}
+
 static __attribute__((noreturn)) void service_terminal_lifecycle(
     struct lifecycle_session *session, const struct supervisor_result *result) {
     for (;;) {
-        struct pollfd_local pollfd;
+        struct pollfd_local pollfds[2];
+        u32 count = 0;
+        int timeout;
+        i64 polled;
         int dispatch_stop = 0;
         int was_disconnected = session->connection == LIFECYCLE_DISCONNECTED;
-        pollfd.fd = session->fd; pollfd.events = POLLIN; pollfd.revents = 0;
-        if (was_disconnected) {
-            struct pollfd_local none;
-            none.fd = -1; none.events = 0; none.revents = 0;
-            sc3(SYS_poll, (i64)&none, 0, (int)session->reconnect_backoff_ms);
-        } else {
-            i64 n = sc3(SYS_poll, (i64)&pollfd, 1,
-                        lifecycle_poll_timeout(session, -1));
-            if (n < 0 && n != -EINTR) {
-                wipe_lifecycle_secret(session);
-                lifecycle_rejected(21, EIO);
-                for (;;) sc0(SYS_pause);
-            }
+        if (!service_terminal_console_tick()) goto failed;
+        timeout = lifecycle_poll_timeout(session, -1);
+        if (main_console_boundary_deadline) {
+            u64 now = monotonic_millis(), remaining;
+            if (!now || now >= main_console_boundary_deadline) goto failed;
+            remaining = main_console_boundary_deadline - now;
+            if (timeout < 0 || remaining < (u64)timeout) timeout = (int)remaining;
         }
-        if (!lifecycle_pump(session, result, &dispatch_stop) || dispatch_stop) {
-            wipe_lifecycle_secret(session);
-            lifecycle_rejected(21, EIO);
-            for (;;) sc0(SYS_pause);
+        if (!was_disconnected) {
+            pollfds[count].fd = session->fd;
+            pollfds[count].events = POLLIN;
+            pollfds[count].revents = 0;
+            count++;
         }
-        if (was_disconnected && session->connection == LIFECYCLE_DISCONNECTED &&
+        if (!main_console_queue_empty(&main_console_queue)) {
+            pollfds[count].fd = main_console_sink.fd;
+            pollfds[count].events = POLLOUT;
+            pollfds[count].revents = 0;
+            count++;
+        }
+        polled = sc3(SYS_poll, (i64)pollfds, count, timeout);
+        if (polled < 0 && polled != -EINTR) goto failed;
+        {
+            int reconnect_due = lifecycle_reconnect_due(session);
+        if ((reconnect_due &&
+             !lifecycle_pump(session, result, &dispatch_stop)) || dispatch_stop) {
+            goto failed;
+        }
+        if (was_disconnected && reconnect_due && session->connection == LIFECYCLE_DISCONNECTED &&
             session->reconnect_backoff_ms < 100) {
             session->reconnect_backoff_ms *= 2;
             if (session->reconnect_backoff_ms > 100) session->reconnect_backoff_ms = 100;
+            lifecycle_schedule_reconnect(session);
+        }
         }
     }
+failed:
+    wipe_lifecycle_secret(session);
+    (void)close_main_console_sink();
+    lifecycle_rejected(21, EIO);
+    for (;;) sc0(SYS_pause);
 }
 
 enum safe_dir_reason {
@@ -4445,7 +4621,13 @@ static int remove_empty_exec_session_and_agent(struct workload_agent *agent,
 static void record_reaped_child(struct supervisor_result *result, i64 reaped, i64 main_pid, int status) {
     u32 normalized = workload_status(status);
     result->reaped++;
-    if (reaped != main_pid) {
+    if (reaped == main_pid) {
+        result->main_status = normalized;
+        result->main_exit_code = 0;
+        result->main_signal = 0;
+        if ((status & 0x7f) == 0) result->main_exit_code = (u32)((status >> 8) & 0xff);
+        else result->main_signal = (u32)(status & 0x7f);
+    } else {
         if (normalized == 128 + SIGKILL) result->forced_status = normalized;
         else result->cooperative_status = normalized;
     }
@@ -4531,6 +4713,170 @@ static void close_exec_fd(int *fd) {
     *fd = -1;
 }
 
+static int close_main_output_fd(int *fd) {
+    int owned = *fd;
+    *fd = -1;
+    return owned < 0 || sc1(SYS_close, owned) == 0;
+}
+
+static int close_main_output(void) {
+    int close_ok = 1;
+    u32 stream;
+    for (stream = 0; stream < 2; stream++) {
+        if (!close_main_output_fd(&main_output.read_fd[stream])) close_ok = 0;
+        if (!close_main_output_fd(&main_output.write_fd[stream])) close_ok = 0;
+    }
+    return close_ok;
+}
+
+static int prepare_main_output(const struct guest_process *process) {
+    int pipes[2][2];
+    struct stat_local before[2][2], after[2][2];
+    u32 stream, endpoint, created = 0;
+    i64 flags;
+    if (!process || main_output.read_fd[0] >= 0 || main_output.read_fd[1] >= 0 ||
+        main_output.write_fd[0] >= 0 || main_output.write_fd[1] >= 0) return 0;
+    for (stream = 0; stream < 2; stream++) {
+        if (sc2(SYS_pipe2, (i64)pipes[stream], O_CLOEXEC) != 0) goto failed;
+        created++;
+    }
+    for (stream = 0; stream < 2; stream++) {
+        for (endpoint = 0; endpoint < 2; endpoint++) {
+            if (pipes[stream][endpoint] < 3 ||
+                sc2(SYS_fstat, pipes[stream][endpoint], (i64)&before[stream][endpoint]) != 0 ||
+                (before[stream][endpoint].mode & S_IFMT) != S_IFIFO ||
+                (before[stream][endpoint].mode & 07777) != 0600 ||
+                before[stream][endpoint].uid != 0 || before[stream][endpoint].gid != 0 ||
+                !before[stream][endpoint].dev || !before[stream][endpoint].ino) goto failed;
+        }
+        if (before[stream][0].dev != before[stream][1].dev ||
+            before[stream][0].ino != before[stream][1].ino) goto failed;
+    }
+    if (before[0][0].dev == before[1][0].dev && before[0][0].ino == before[1][0].ino) goto failed;
+    for (stream = 0; stream < 2; stream++)
+        for (endpoint = 0; endpoint < 2; endpoint++)
+            if (sc3(SYS_fchown, pipes[stream][endpoint], process->uid, process->gid) != 0) goto failed;
+    for (stream = 0; stream < 2; stream++) {
+        for (endpoint = 0; endpoint < 2; endpoint++) {
+            if (sc2(SYS_fstat, pipes[stream][endpoint], (i64)&after[stream][endpoint]) != 0 ||
+                (after[stream][endpoint].mode & S_IFMT) != S_IFIFO ||
+                (after[stream][endpoint].mode & 07777) != 0600 ||
+                after[stream][endpoint].uid != process->uid || after[stream][endpoint].gid != process->gid ||
+                after[stream][endpoint].dev != before[stream][endpoint].dev ||
+                after[stream][endpoint].ino != before[stream][endpoint].ino) goto failed;
+            flags = sc3(SYS_fcntl, pipes[stream][endpoint], F_GETFD, 0);
+            if (flags < 0 || !(flags & FD_CLOEXEC)) goto failed;
+        }
+        flags = sc3(SYS_fcntl, pipes[stream][0], F_GETFL, 0);
+        if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY ||
+            sc3(SYS_fcntl, pipes[stream][0], 4, flags | O_NONBLOCK) != 0) goto failed;
+        flags = sc3(SYS_fcntl, pipes[stream][0], F_GETFL, 0);
+        if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || !(flags & O_NONBLOCK)) goto failed;
+        flags = sc3(SYS_fcntl, pipes[stream][1], F_GETFL, 0);
+        if (flags < 0 || (flags & O_ACCMODE) != O_WRONLY || (flags & O_NONBLOCK)) goto failed;
+    }
+    main_output_pump_init(&main_output.pump);
+    for (stream = 0; stream < 2; stream++) {
+        main_output.read_fd[stream] = pipes[stream][0];
+        main_output.write_fd[stream] = pipes[stream][1];
+    }
+    return 1;
+failed:
+    while (created) {
+        created--;
+        if (pipes[created][0] >= 3) sc1(SYS_close, pipes[created][0]);
+        if (pipes[created][1] >= 3) sc1(SYS_close, pipes[created][1]);
+    }
+    return 0;
+}
+
+static int child_install_main_output(int error_fd) {
+    u32 stream;
+    for (stream = 0; stream < 2; stream++)
+        if (main_output.read_fd[stream] >= 0) {
+            int fd = main_output.read_fd[stream];
+            main_output.read_fd[stream] = -1;
+            if (sc1(SYS_close, fd) != 0) child_fail(error_fd, 43, EIO);
+        }
+    if (sc3(SYS_dup3, main_output.write_fd[0], 1, 0) != 1 ||
+        sc3(SYS_dup3, main_output.write_fd[1], 2, 0) != 2) child_fail(error_fd, 43, EIO);
+    for (stream = 0; stream < 2; stream++)
+        if (main_output.write_fd[stream] > 2) {
+            int fd = main_output.write_fd[stream];
+            main_output.write_fd[stream] = -1;
+            if (sc1(SYS_close, fd) != 0) child_fail(error_fd, 43, EIO);
+        }
+    return 1;
+}
+
+static int parent_close_main_output_writers(void) {
+    int close_ok = 1;
+    u32 stream;
+    for (stream = 0; stream < 2; stream++) {
+        int fd = main_output.write_fd[stream];
+        main_output.write_fd[stream] = -1;
+        if (fd >= 0 && sc1(SYS_close, fd) != 0) close_ok = 0;
+    }
+    if (!close_ok) main_console_queue.failed = 1;
+    return close_ok;
+}
+
+static main_output_count read_main_output_nonblocking(
+    void *context, unsigned int stream, unsigned char *bytes, main_output_size size) {
+    i64 count;
+    struct main_output_local *output = (struct main_output_local *)context;
+    if (!output || stream >= 2 || output->read_fd[stream] < 0) return 0;
+    count = sc3(SYS_read, output->read_fd[stream], (i64)bytes, (i64)size);
+    if (count == 0 && !close_main_output_fd(&output->read_fd[stream])) return -EIO;
+    return count;
+}
+
+static main_output_count enqueue_main_output(
+    void *context, const unsigned char *bytes, main_output_size size) {
+    (void)context;
+    if (!main_console_queue_valid(&main_console_queue)) return -EIO;
+    if (!main_console_enqueue_data(&main_console_queue, bytes, size)) {
+        if (!main_console_queue_valid(&main_console_queue)) return -EIO;
+        return -EAGAIN;
+    }
+    return (main_output_count)size;
+}
+
+/* One call is bounded to the pump's callback limits and one console write. */
+static int service_main_output(void) {
+    flush_main_console_tick();
+    if (!main_console_queue_valid(&main_console_queue)) {
+        main_output.pump.failed = 1;
+        return 0;
+    }
+    if (!main_output_pump_tick(&main_output.pump, &main_output,
+                               read_main_output_nonblocking, enqueue_main_output)) return 0;
+    return !main_output.pump.failed && main_console_queue_valid(&main_console_queue);
+}
+
+/* Append only descriptors that can make the bounded output service progress. */
+static u32 main_output_poll(struct pollfd_local *items, u32 capacity) {
+    u32 count = 0, stream;
+    if (main_output.pump.failed || !main_console_queue_valid(&main_console_queue)) return 0;
+    for (stream = 0; stream < 2 && count < capacity; stream++) {
+        if (main_output.read_fd[stream] >= 0 && !main_output.pump.stream[stream].eof &&
+            main_output.pump.stream[stream].used < MAIN_OUTPUT_BUFFER_BYTES) {
+            items[count].fd = main_output.read_fd[stream];
+            items[count].events = POLLIN;
+            items[count].revents = 0;
+            count++;
+        }
+    }
+    if (count < capacity && main_console_sink.fd >= 0 &&
+        !main_console_queue_empty(&main_console_queue)) {
+        items[count].fd = main_console_sink.fd;
+        items[count].events = POLLOUT;
+        items[count].revents = 0;
+        count++;
+    }
+    return count;
+}
+
 static void wipe_child_control_authority(struct lifecycle_session *lifecycle) {
     secure_zero(lifecycle, sizeof(*lifecycle));
     secure_zero(&lifecycle_binding, sizeof(lifecycle_binding));
@@ -4551,6 +4897,7 @@ static __attribute__((noreturn)) void exec_child(struct lifecycle_session *lifec
     u8 token = 1;
     i64 operation;
     if (!close_main_console_sink()) child_fail(error, 42, EIO);
+    if (!close_main_output()) child_fail(error, 43, EIO);
     if (sc3(SYS_dup3, error, 100, O_CLOEXEC) != 100 ||
         sc3(SYS_dup3, isolation, 101, O_CLOEXEC) != 101 ||
         sc3(SYS_dup3, release, 102, O_CLOEXEC) != 102) exit_now(127);
@@ -4757,33 +5104,37 @@ static int pump_remote_exec(struct workload_agent *agent, struct lifecycle_sessi
 
 static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent *agent,
                               struct exec_session *session,
-                              struct supervisor_result *result, struct lifecycle_session *lifecycle) {
-    int status;
-    int lifecycle_failed = 0;
-    u64 deadline = monotonic_millis() + 5000;
-    struct pollfd_local pollfds[2];
+                              struct supervisor_result *result, struct lifecycle_session *lifecycle,
+                              int main_already_reaped) {
+    int status, cleanup_ok = 1, lifecycle_failed = 0, children_done = 0;
+    u64 now = monotonic_millis(), deadline = 0;
+    struct pollfd_local pollfds[5];
     struct signalfd_siginfo_local info;
-    if (!cancel_remote_exec(3)) return 0;
+    (void)main_already_reaped;
+    if (!now) cleanup_ok = 0;
+    else deadline = main_workload_stop_deadline ? main_workload_stop_deadline : now + 5000;
+    main_workload_cleanup_deadline = deadline;
+    if (!cancel_remote_exec(3)) cleanup_ok = 0;
     /* Allow children already handling the forwarded signal to report their
      * own terminal status before enforcing the bounded teardown policy. */
     pollfds[0].fd = signal_fd; pollfds[0].events = POLLIN;
     pollfds[1].fd = lifecycle ? lifecycle->fd : -1; pollfds[1].events = POLLIN;
-    while (monotonic_millis() < deadline) {
+    while ((now = monotonic_millis()) != 0 && now < deadline) {
+        u32 output_count;
         int dispatch_stop = 0;
         i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
         if (reaped > 0) {
             remote_exec_reaped(reaped, status);
             if (!(remote_exec.active && reaped == remote_exec.pid)) record_reaped_child(result, reaped, main_pid, status);
         }
-        if (lifecycle && !pump_remote_exec(agent, lifecycle)) return 0;
-        if (reaped == -ECHILD) {
-            if (!remote_exec.active) {
-                int cleaned = kill_exec_session(session) && remove_empty_exec_session_and_agent(agent, session);
-                return cleaned ? (lifecycle_failed ? 2 : 1) : 0;
-            }
-        }
-        if (reaped < 0 && reaped != -EINTR && reaped != -ECHILD) return 0;
+        if (!service_main_output()) cleanup_ok = 0;
+        if (lifecycle && !pump_remote_exec(agent, lifecycle)) cleanup_ok = 0;
+        if (reaped == -ECHILD) children_done = 1;
+        if (reaped < 0 && reaped != -EINTR && reaped != -ECHILD) cleanup_ok = 0;
+        if (children_done && !remote_exec.active && !remote_exec.pending &&
+            main_output_console_drained(&main_output.pump, &main_console_queue)) break;
         pollfds[0].revents = 0; pollfds[1].revents = 0;
+        pollfds[1].fd = lifecycle ? lifecycle->fd : -1;
         pollfds[1].events = POLLIN | (remote_exec.wire_used ? POLLOUT : 0);
         {
             int count = lifecycle && lifecycle->state >= LIFECYCLE_READY &&
@@ -4791,31 +5142,78 @@ static int terminate_and_reap(i64 main_pid, int signal_fd, struct workload_agent
             int timeout = lifecycle && lifecycle->state >= LIFECYCLE_READY &&
                           lifecycle->connection == LIFECYCLE_DISCONNECTED
                               ? (int)lifecycle->reconnect_backoff_ms : 100;
+            u64 current = monotonic_millis();
+            u64 remaining;
+            if (!current) { cleanup_ok = 0; break; }
+            remaining = current < deadline ? deadline - current : 0;
+            if ((u64)timeout > remaining) timeout = (int)remaining;
+            output_count = main_output_poll(pollfds + count, 5u - (u32)count);
+            count += (int)output_count;
             i64 polled = sc3(SYS_poll, (i64)pollfds, count, timeout);
-            if (polled < 0 && polled != -EINTR) return 0;
+            if (polled < 0 && polled != -EINTR) { cleanup_ok = 0; break; }
         }
         if (pollfds[0].revents & POLLIN) sc3(SYS_read, signal_fd, (i64)&info, sizeof(info));
         if (lifecycle && lifecycle->state >= LIFECYCLE_READY && !lifecycle->natural_terminal_frozen) {
             int was_disconnected = lifecycle->connection == LIFECYCLE_DISCONNECTED;
-            if (!lifecycle_failed && !lifecycle_pump(lifecycle, result, &dispatch_stop))
+            int reconnect_due = lifecycle_reconnect_due(lifecycle);
+            if (reconnect_due && !lifecycle_failed && !lifecycle_pump(lifecycle, result, &dispatch_stop))
                 lifecycle_failed = 1;
-            if (was_disconnected && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
+            if (was_disconnected && reconnect_due && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
                 lifecycle->reconnect_backoff_ms < 100) {
                 lifecycle->reconnect_backoff_ms *= 2;
                 if (lifecycle->reconnect_backoff_ms > 100) lifecycle->reconnect_backoff_ms = 100;
+                lifecycle_schedule_reconnect(lifecycle);
             }
         }
     }
-    if (remote_exec.active || remote_exec.pending) return 0;
-    if (!kill_exec_session(session)) return 0;
-    for (;;) {
-        i64 reaped = sc4(SYS_wait4, -1, (i64)&status, 0, 0);
-        if (reaped > 0) { record_reaped_child(result, reaped, main_pid, status); continue; }
-        if (reaped == -EINTR) continue;
-        if (reaped == -ECHILD) break;
-        return 0;
+    if (!now) cleanup_ok = 0;
+    if (remote_exec.active || remote_exec.pending) cleanup_ok = 0;
+    if (!kill_exec_session(session)) cleanup_ok = 0;
+    now = monotonic_millis();
+    if (!now) cleanup_ok = 0;
+    deadline = now ? now + 1000 : 0;
+    main_workload_cleanup_deadline = deadline;
+    set_main_console_flush_deadline(deadline);
+    while ((now = monotonic_millis()) != 0 && now < deadline) {
+        u32 count;
+        i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
+        if (reaped > 0) {
+            remote_exec_reaped(reaped, status);
+            if (!(remote_exec.active && reaped == remote_exec.pid))
+                record_reaped_child(result, reaped, main_pid, status);
+        } else if (reaped == -ECHILD) children_done = 1;
+        else if (reaped < 0 && reaped != -EINTR) cleanup_ok = 0;
+        if (!service_main_output()) cleanup_ok = 0;
+        if (lifecycle && !pump_remote_exec(agent, lifecycle)) cleanup_ok = 0;
+        if (children_done && !remote_exec.active && !remote_exec.pending &&
+            main_output_console_drained(&main_output.pump, &main_console_queue)) break;
+        count = main_output_poll(pollfds, 5);
+        {
+            u64 current = monotonic_millis();
+            u64 remaining;
+            if (!current) { cleanup_ok = 0; break; }
+            remaining = current < deadline ? deadline - current : 0;
+            int timeout = remaining < 10 ? (int)remaining : 10;
+            i64 polled = sc3(SYS_poll, (i64)pollfds, count, timeout);
+            if (polled < 0 && polled != -EINTR) { cleanup_ok = 0; break; }
+        }
     }
-    if (!remove_empty_exec_session_and_agent(agent, session)) return 0;
+    if (!now) cleanup_ok = 0;
+    {
+        i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
+        if (reaped > 0) {
+            remote_exec_reaped(reaped, status);
+            if (!(remote_exec.active && reaped == remote_exec.pid))
+                record_reaped_child(result, reaped, main_pid, status);
+        } else if (reaped == -ECHILD) children_done = 1;
+        else if (reaped < 0 && reaped != -EINTR) cleanup_ok = 0;
+    }
+    if (!children_done || remote_exec.active || remote_exec.pending ||
+        !main_output_console_drained(&main_output.pump, &main_console_queue)) cleanup_ok = 0;
+    if (!close_main_output()) cleanup_ok = 0;
+    if (!remove_empty_exec_session_and_agent(agent, session)) cleanup_ok = 0;
+    main_workload_cleanup_deadline = 0;
+    if (!cleanup_ok) return 0;
     return lifecycle_failed ? 2 : 1;
 }
 
@@ -4827,7 +5225,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     struct workload_agent agent;
     struct exec_session session;
     i64 signal_fd, main_pid, n;
-    struct pollfd_local pollfds[6];
+    struct pollfd_local pollfds[9];
     struct signalfd_siginfo_local info;
     usize error_bytes = 0;
     i64 error_read = 0;
@@ -4921,11 +5319,22 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return 0;
     }
+    if (!prepare_main_output(process)) {
+        set_workload_failure(failure, 43, EIO);
+        if (!remove_empty_exec_session_and_agent(&agent, &session)) set_workload_failure(failure, 18, EIO);
+        sc1(SYS_close, release_pipe[0]); sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]); sc1(SYS_close, isolation_pipe[1]);
+        sc1(SYS_close, error_pipe[0]); sc1(SYS_close, error_pipe[1]);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return 0;
+    }
     main_pid = sc0(SYS_fork);
     if (main_pid == 0) {
         i64 operation;
         u8 isolation_ready = 1, release = 0;
         if (!close_main_console_sink()) child_fail(error_pipe[1], 42, EIO);
+        (void)child_install_main_output(error_pipe[1]);
         if (sc1(SYS_close, lifecycle->fd) != 0) child_fail(error_pipe[1], 32, EIO);
         sc1(SYS_close, error_pipe[0]);
         sc1(SYS_close, isolation_pipe[0]);
@@ -4960,15 +5369,29 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     sc1(SYS_close, error_pipe[1]);
     sc1(SYS_close, isolation_pipe[1]);
     sc1(SYS_close, release_pipe[0]);
+    n = parent_close_main_output_writers();
     if (main_pid < 0) {
         set_workload_failure(failure, 11, main_pid);
         sc1(SYS_close, release_pipe[1]);
         sc1(SYS_close, isolation_pipe[0]);
         sc1(SYS_close, error_pipe[0]);
+        if (!close_main_output()) set_workload_failure(failure, 43, EIO);
         if (!remove_empty_exec_session_and_agent(&agent, &session)) set_workload_failure(failure, 18, EIO);
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return 0;
+    }
+    if (!n) {
+        set_workload_failure(failure, 43, EIO);
+        sc1(SYS_close, release_pipe[1]);
+        sc1(SYS_close, isolation_pipe[0]);
+        sc1(SYS_close, error_pipe[0]);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
+        if (!n) set_workload_failure(failure, 18, EIO);
+        close_workload_agent(&agent, &session);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return n ? 0 : -1;
     }
     {
         struct child_error_local early_failure;
@@ -5001,7 +5424,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                 set_workload_failure(failure, isolation_stage,
                                      n < 0 ? n : (close_result < 0 ? close_result : EIO));
             sc1(SYS_close, release_pipe[1]);
-            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
             sc1(SYS_close, error_pipe[0]);
             if (!n) set_workload_failure(failure, 18, EIO);
             close_workload_agent(&agent, &session);
@@ -5014,7 +5437,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (n != 0 || !move_pid_to_exec_session(&agent, &session, main_pid)) {
         set_workload_failure(failure, 16, n != 0 ? n : EIO);
         sc1(SYS_close, release_pipe[1]);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
         sc1(SYS_close, error_pipe[0]);
         if (!n) set_workload_failure(failure, 18, EIO);
         close_workload_agent(&agent, &session);
@@ -5025,7 +5448,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (!authenticate_lifecycle_bootstrap(lifecycle)) {
         set_workload_failure(failure, 20, EIO);
         sc1(SYS_close, release_pipe[1]);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0, 0);
         sc1(SYS_close, error_pipe[0]);
         if (!n) set_workload_failure(failure, 18, EIO);
         close_workload_agent(&agent, &session);
@@ -5040,7 +5463,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     }
     if (sc1(SYS_close, release_pipe[1]) != 0 || n != 1) {
         set_workload_failure(failure, 17, n < 0 ? n : EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
         if (!n) set_workload_failure(failure, 18, EIO);
         sc1(SYS_close, error_pipe[0]);
         close_workload_agent(&agent, &session);
@@ -5057,7 +5480,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     if (error_bytes != 0 || error_read < 0) {
         if (error_bytes != sizeof(*failure))
             set_workload_failure(failure, 12, error_read < 0 ? error_read : EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
         if (!n) set_workload_failure(failure, 18, EIO);
         close_workload_agent(&agent, &session);
         sc1(SYS_close, signal_fd);
@@ -5067,7 +5490,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     write_all(1, WORKLOAD_STARTED_MARKER);
     if (!refresh_root_identity_evidence()) {
         set_workload_failure(failure, 41, EIO);
-        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0);
+        n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0, 0);
         close_workload_agent(&agent, &session);
         sc1(SYS_close, signal_fd);
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
@@ -5080,9 +5503,10 @@ static int supervise_workload(struct guest_process *process, struct child_error_
     pollfds[0].events = POLLIN;
     pollfds[1].fd = lifecycle->fd;
     pollfds[1].events = POLLIN;
-    while (!main_done) {
+    for (;;) {
         int dispatch_stop = 0;
-        for (;;) {
+        u32 reap_count;
+        for (reap_count = 0; reap_count < 64; reap_count++) {
             i64 reaped = sc4(SYS_wait4, -1, (i64)&status, WNOHANG, 0);
             if (reaped > 0) {
                 remote_exec_reaped(reaped, status);
@@ -5096,10 +5520,23 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             }
             if (reaped <= 0) break;
         }
+        if (!service_main_output()) {
+            set_workload_failure(failure, 43, EIO);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
+            if (!n) set_workload_failure(failure, 18, EIO);
+            close_workload_agent(&agent, &session);
+            sc1(SYS_close, signal_fd);
+            sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+            return n ? -2 : -1;
+        }
         if (main_done) break;
+        if (main_workload_stop_deadline) {
+            u64 now = monotonic_millis();
+            if (!now || now >= main_workload_stop_deadline) break;
+        }
         if (!pump_remote_exec(&agent, lifecycle)) {
             set_workload_failure(failure, 40, EIO);
-            (void)terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+            (void)terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
             close_workload_agent(&agent, &session);
             sc1(SYS_close, signal_fd);
             return -2;
@@ -5117,51 +5554,69 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                 pollfds[5].fd = remote_exec.errors;
             }
         }
-        n = sc3(SYS_poll, (i64)pollfds,
-                remote_exec.active ? 6 : (lifecycle->connection == LIFECYCLE_CONNECTED ? 2 : 1),
-                lifecycle_poll_timeout(lifecycle, remote_exec.active ? 100 : -1));
+        {
+            u32 count = remote_exec.active ? 6u :
+                        (lifecycle->connection == LIFECYCLE_CONNECTED ? 2u : 1u);
+            int timeout = lifecycle_poll_timeout(lifecycle, 100);
+            count += main_output_poll(pollfds + count, 9u - count);
+            if (main_workload_stop_deadline) {
+                u64 now = monotonic_millis();
+                u64 remaining;
+                if (!now || now >= main_workload_stop_deadline) timeout = 0;
+                else {
+                    remaining = main_workload_stop_deadline - now;
+                    if (timeout < 0 || remaining < (u64)timeout) timeout = (int)remaining;
+                }
+            }
+            n = sc3(SYS_poll, (i64)pollfds, count, timeout);
+        }
         if (n == -EINTR) continue;
         if (n < 0) {
             set_workload_failure(failure, 21, n);
-            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
             if (!n) set_workload_failure(failure, 18, EIO);
             close_workload_agent(&agent, &session);
             sc1(SYS_close, signal_fd);
             sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
             return n ? -2 : -1;
         }
-        if (lifecycle->connection == LIFECYCLE_CONNECTED || n == 0) {
+        {
             int was_disconnected = lifecycle->connection == LIFECYCLE_DISCONNECTED;
-            if (!lifecycle_pump(lifecycle, result, &dispatch_stop)) {
+            int reconnect_due = lifecycle_reconnect_due(lifecycle);
+            if (reconnect_due &&
+                !lifecycle_pump(lifecycle, result, &dispatch_stop)) {
                 set_workload_failure(failure, 21, EIO);
-                n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
                 if (!n) set_workload_failure(failure, 18, EIO);
                 close_workload_agent(&agent, &session);
                 sc1(SYS_close, signal_fd);
                 sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
                 return n ? -2 : -1;
             }
-            if (was_disconnected && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
+            if (was_disconnected && reconnect_due && lifecycle->connection == LIFECYCLE_DISCONNECTED &&
                 lifecycle->reconnect_backoff_ms < 100) {
                 lifecycle->reconnect_backoff_ms *= 2;
                 if (lifecycle->reconnect_backoff_ms > 100) lifecycle->reconnect_backoff_ms = 100;
+                lifecycle_schedule_reconnect(lifecycle);
             }
         }
         if (dispatch_stop) {
             if (!cancel_remote_exec(3)) {
                 set_workload_failure(failure, 40, EIO);
-                return -2;
+                    n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
+                if (!n) set_workload_failure(failure, 18, EIO);
+                close_workload_agent(&agent, &session);
+                sc1(SYS_close, signal_fd);
+                sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+                return n ? -2 : -1;
             }
             n = sc2(SYS_kill, -main_pid, process->stop_signal);
             if (n == -ESRCH) {
                 /* STOP was authenticated and committed, but the workload may
                  * win the narrow race between the preceding WNOHANG probe and
-                 * signal delivery.  Confirm that exact main process is now
-                 * waitable before treating this as its natural terminal
-                 * status under the accepted STOP identity. */
-                do {
-                    n = sc4(SYS_wait4, main_pid, (i64)&status, 0, 0);
-                } while (n == -EINTR);
+                 * signal delivery.  Take one nonblocking exact-main sample;
+                 * bounded teardown owns any remaining race. */
+                n = sc4(SYS_wait4, main_pid, (i64)&status, WNOHANG, 0);
                 if (n == main_pid) {
                     record_reaped_child(result, n, main_pid, status);
                     main_done = 1;
@@ -5170,11 +5625,12 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                     else result->main_signal = (u32)(status & 0x7f);
                     continue;
                 }
+                if (n == 0 || n == -EINTR) n = 0;
             }
             if (n != 0) {
                 lifecycle->poisoned = 1;
                 set_workload_failure(failure, 21, EIO);
-                n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+                n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
                 if (!n) set_workload_failure(failure, 18, EIO);
                 close_workload_agent(&agent, &session);
                 sc1(SYS_close, signal_fd);
@@ -5182,6 +5638,19 @@ static int supervise_workload(struct guest_process *process, struct child_error_
                 return n ? -2 : -1;
             }
             result->forwarded = process->stop_signal;
+            {
+                u64 now = monotonic_millis();
+                if (!now || main_workload_stop_deadline) {
+                    set_workload_failure(failure, 21, EIO);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, 0);
+                    if (!n) set_workload_failure(failure, 18, EIO);
+                    close_workload_agent(&agent, &session);
+                    sc1(SYS_close, signal_fd);
+                    sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+                    return n ? -2 : -1;
+                }
+                main_workload_stop_deadline = now + 5000;
+            }
             write_all(1, LIFECYCLE_STOP_DISPATCHED_MARKER);
         }
         if (pollfds[0].revents & POLLIN) {
@@ -5194,7 +5663,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             }
         }
     }
-    if (!lifecycle->stop_request_id) {
+    if (main_done && !lifecycle->stop_request_id) {
         /* The main workload won the natural-exit/late-STOP race.  Freeze that
          * terminal cause before teardown and do not parse a STOP during the
          * cleanup window; its terminal reply_to must remain null. */
@@ -5205,7 +5674,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         n = sc2(SYS_kill, -main_pid, process->stop_signal);
         if (n != 0 && n != -ESRCH) {
             set_workload_failure(failure, 21, EIO);
-            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0);
+            n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, 0, 0);
             if (!n) set_workload_failure(failure, 18, EIO);
             close_workload_agent(&agent, &session);
             sc1(SYS_close, signal_fd);
@@ -5213,7 +5682,7 @@ static int supervise_workload(struct guest_process *process, struct child_error_
             return n ? -2 : -1;
         }
     }
-    n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle);
+    n = terminate_and_reap(main_pid, (int)signal_fd, &agent, &session, result, lifecycle, main_done);
     if (!n) {
         set_workload_failure(failure, 18, EIO);
         close_workload_agent(&agent, &session);
@@ -5235,15 +5704,6 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
         return -1;
     }
-    /* The prepared sink is not terminal authority.  Retire it successfully
-     * before root quiescence and TERMINAL publication. */
-    if (!close_main_console_sink()) {
-        set_workload_failure(failure, 42, EIO);
-        close_workload_agent(&agent, &session);
-        sc1(SYS_close, signal_fd);
-        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
-        return -1;
-    }
     if (!quiesce_terminal_root()) {
         set_workload_failure(failure, 37, EIO);
         close_workload_agent(&agent, &session);
@@ -5252,6 +5712,16 @@ static int supervise_workload(struct guest_process *process, struct child_error_
         return -1;
     }
     write_all(1, TERMINAL_ROOT_QUIESCED_MARKER);
+    workload_terminal(result);
+    flush_main_console_bounded();
+    if (!main_console_queue_empty(&main_console_queue) || !revalidate_main_console_sink()) {
+        set_workload_failure(failure, 42, EIO);
+        close_workload_agent(&agent, &session);
+        sc1(SYS_close, signal_fd);
+        sc4(SYS_rt_sigprocmask, SIG_SETMASK, (i64)&empty_mask, 0, 8);
+        return -1;
+    }
+    main_console_diagnostics_retired = 1;
     lifecycle->state = LIFECYCLE_TERMINAL;
     lifecycle->terminal_exit_code = result->main_exit_code;
     lifecycle->terminal_signal = result->main_signal;
@@ -5351,7 +5821,6 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     if (argc != 1 || !prepare_live()) wait_closed("palimpsest guest stage1: bootstrap preparation failed; waiting fail-closed\n");
     if (!acquire_main_console_sink()) wait_closed(MAIN_CONSOLE_SINK_REJECTED_MARKER);
     code = run_consumer(0, 0);
-    if (code) (void)close_main_console_sink();
     if (code == EXIT_FILESYSTEM) wait_closed("palimpsest guest stage1: filesystem contract rejected; mount disabled; waiting fail-closed\n");
     if (code == EXIT_ASSEMBLY) wait_closed("palimpsest guest stage1: mount or staging assembly rejected; root is not slash; pivot and workload disabled; waiting fail-closed\n");
     if (code == EXIT_ROOT_TRANSITION) wait_closed("palimpsest guest stage1: root transition rejected; root state is indeterminate; workload disabled; waiting fail-closed\n");
@@ -5362,34 +5831,28 @@ static __attribute__((noreturn, used)) void start_c(u64 *stack) {
     }
     write_all(1, ROOT_TRANSITION_MARKER);
     if (!prepare_lifecycle(&lifecycle)) {
-        (void)close_main_console_sink();
         lifecycle_rejected(20, EIO);
-        for (;;) sc0(SYS_pause);
+        wait_closed("");
     }
     code = supervise_workload(&workload, &workload_failure, &workload_result, &lifecycle);
-    if (!close_main_console_sink() && code == 1) {
-        set_workload_failure(&workload_failure, 42, EIO);
-        code = -1;
-    }
     if (!code) {
         sc1(SYS_close, lifecycle.fd);
         wipe_lifecycle_secret(&lifecycle);
         workload_rejected(workload_failure.stage, workload_failure.error);
-        for (;;) sc0(SYS_pause);
+        wait_closed("");
     }
     if (code == -1) {
         sc1(SYS_close, lifecycle.fd);
         wipe_lifecycle_secret(&lifecycle);
         workload_cleanup_rejected(workload_failure.stage, workload_failure.error);
-        for (;;) sc0(SYS_pause);
+        wait_closed("");
     }
     if (code == -2) {
         sc1(SYS_close, lifecycle.fd);
         wipe_lifecycle_secret(&lifecycle);
         lifecycle_rejected(workload_failure.stage, workload_failure.error);
-        for (;;) sc0(SYS_pause);
+        wait_closed("");
     }
-    workload_terminal(&workload_result);
     service_terminal_lifecycle(&lifecycle, &workload_result);
 }
 

@@ -368,17 +368,43 @@ own; neither silently enables the other or substitutes for Gate 2. New exec
 protocol/mailbox/IPC/session/routing unit files belong to oci-monitor, while the
 actual guest C harness belongs to oci-guest with its own platform prerequisites.
 
-The component-only main-output pump has a dependency-free local C harness:
+The main-output pump and unified console queue have a dependency-free local C harness:
 
 ```sh
 uv run python -m pytest -q tests/unit/test_main_output_pump.py
 ```
 
 It compiles `tests/c/main_output_pump_harness.c` with the local C compiler and
-directly includes `guest/stage1/main_output_pump.h`. It exercises callback I/O
-and real nonblocking pipes without a VM. Production `init.c` does not include
-the header, so this test is not packaged-ELF, PID 1, STOP, teardown, console or
-TERMINAL integration evidence.
+directly includes the same `guest/stage1/main_output_pump.h` as production.
+It exercises callback I/O, queue backpressure versus sticky diagnostic overflow,
+partial writes, combined pump/queue drain and real full nonblocking pipe
+recovery without a VM. This is not packaged-ELF, PID 1 or native STOP proof.
+
+Run pipe ownership/wiring and bounded teardown independently:
+
+```sh
+uv run python -m pytest -q tests/unit/test_main_output_pipes.py
+uv run python -m pytest -q tests/unit/test_main_output_terminate.py
+uv run python -m pytest -q tests/unit/test_main_console_lifecycle.py
+uv run python -m pytest -q tests/unit/test_main_control_deadline.py
+```
+
+These source-based harnesses must run the actual production helpers/loop with
+deterministic syscall doubles; supplementary structural assertions are not
+runtime fault-injection evidence. The teardown contract is five seconds of
+grace followed by at most one additional second after force cleanup, with
+nonblocking reap and no normal TERMINAL for undrained or failed output.
+Each new portable file is explicitly registered in `oci-guest`; select it
+directly during edits rather than rerunning all portable lanes.
+The terminal-console helper tests check actual partial boundary delivery,
+permanent/closed-sink failure and deadline expiry. Their injected boundary
+bytes do not replace cryptographic frame construction or native reconnect
+proof. Ordinary diagnostics retire, but signed boundary frames must actually
+be delivered through the retained nonblocking sink; discard is not success.
+Control I/O and random acquisition use the current cleanup phase deadline;
+an expired STOP deadline cannot erase the separate post-kill drain budget.
+The parser yields on EINTR and lifecycle pumping yields after at most 64
+complete frames so repeated control traffic cannot starve output or teardown.
 
 The production console-sink helpers and their child/parent call sites have
 separate source-extraction harnesses:
@@ -392,6 +418,20 @@ These compile the current functions and call-site bodies from
 identity and descriptor validation, cleanup faults, and explicit close ordering
 before child isolation and parent TERMINAL handling. They do not replace the
 packaged-binary, PID 1, or native VM proof.
+
+After a guest source freeze, rebuild the sealed ELF with the pinned offline
+compiler and update both the binary digest and the versioned, named source
+bundle digest (`init.c` plus `main_output_pump.h`). Run `test_oci_initramfs.py`
+and `tests/integration/test_oci_guest_stage1_binary.py` separately, then the
+exact pushed SHA on the native host. Select the stage-1 matrix, UID0/101 stdio
+probe and cold public exec as distinct finite runs with inventory/archive
+preservation checks before and after every run, including failures. The
+updated stdio probe expects main and additional-exec output to be separate
+workload-owned FIFO0600 endpoints with successful self-FD reopen; aliases and
+PID1 access restrictions remain unchanged. Set a healthy private
+`PALIMPSEST_LOG_HOME` for stdio and cold guest-only stderr comparisons. Keep the separate
+host journal failure-warning tests; never strip a warning to pass the proof.
+These selections do not qualify NGINX, a new application build or full Gate 2.
 
 The cold public-CLI proof uses one fresh eight-hex UUID suffix for both its
 `/tmp/p-execcli-<suffix>` runtime and `exec-cli-<suffix>` run/domain name.

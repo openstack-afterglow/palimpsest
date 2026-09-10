@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCENARIOS = "partial fair source-eagain source-eintr full-buffer compact-refill eof sink-eagain sink-eintr sink-bad sink-zero sink-large read-bad read-large invalid real-pipe".split()
+SCENARIOS = "partial fair source-eagain source-eintr full-buffer compact-refill eof sink-eagain sink-eintr sink-bad sink-zero sink-large read-bad read-large invalid real-pipe console-queue console-queue-failures console-queue-order-capacity console-queue-real-pipe combined-drained".split()
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +39,10 @@ def test_main_output_pump_scenario(harness, scenario):
     assert result.stdout == b""
 
 
-def test_component_is_not_integrated_into_production_stage1():
+def test_component_is_integrated_into_production_stage1():
     source = (ROOT / "guest/stage1/init.c").read_text()
-    assert "main_output_pump.h" not in source and "main_output_pump_tick" not in source
+    assert '#include "main_output_pump.h"' in source
+    assert "main_output_pump_tick" in source
+    assert "main_console_enqueue_data" in source
+    assert "main_console_flush_tick" in source
+    assert "main_output_console_drained" in source

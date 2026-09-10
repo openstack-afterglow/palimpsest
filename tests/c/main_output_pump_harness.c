@@ -387,6 +387,157 @@ static int real_pipe(void) {
   return 0;
 }
 
+struct queue_sink {
+  unsigned char bytes[MAIN_CONSOLE_QUEUE_BYTES + MAIN_OUTPUT_QUANTUM];
+  main_output_size used, limit;
+  main_output_count result;
+  unsigned int calls, force_result;
+};
+static main_output_count queue_write(void *raw, const unsigned char *bytes, main_output_size size) {
+  struct queue_sink *sink = raw;
+  main_output_size i;
+  sink->calls++;
+  if (sink->force_result) return sink->result;
+  if (sink->limit && size > sink->limit) size = sink->limit;
+  CHECK(sink->used + size <= sizeof(sink->bytes));
+  for (i = 0; i < size; i++) sink->bytes[sink->used + i] = bytes[i];
+  sink->used += size;
+  return (main_output_count)size;
+}
+
+static int console_queue(void) {
+  struct main_console_queue q;
+  struct queue_sink sink;
+  unsigned char data[MAIN_CONSOLE_QUEUE_BYTES], extra = 'x';
+  main_output_size i;
+  for (i = 0; i < sizeof(data); i++) data[i] = (unsigned char)i;
+  memset(&sink, 0, sizeof(sink)); main_console_queue_init(&q);
+  CHECK(main_console_queue_empty(&q));
+  CHECK(main_console_enqueue_data(&q, data, sizeof(data)));
+  CHECK(!main_console_enqueue_data(&q, &extra, 1) && !q.failed);
+  sink.limit = 37;
+  CHECK(main_console_flush_tick(&q, &sink, queue_write));
+  CHECK(sink.calls == 1 && sink.used == 37 && q.offset == 37);
+  CHECK(main_console_enqueue_data(&q, &extra, 1));
+  sink.limit = 0;
+  while (!main_console_queue_empty(&q)) CHECK(main_console_flush_tick(&q, &sink, queue_write));
+  CHECK(sink.used == sizeof(data) + 1 && !memcmp(sink.bytes, data, sizeof(data)) && sink.bytes[sizeof(data)] == extra);
+  return 0;
+}
+
+static int console_queue_failures(void) {
+  struct main_console_queue q;
+  struct queue_sink sink;
+  unsigned char data[MAIN_CONSOLE_QUEUE_BYTES], extra = 0;
+  memset(data, 1, sizeof(data)); memset(&sink, 0, sizeof(sink)); main_console_queue_init(&q);
+  CHECK(main_console_enqueue_data(&q, data, sizeof(data)));
+  CHECK(!main_console_enqueue_diagnostic(&q, &extra, 1) && q.failed);
+  main_console_queue_init(&q); CHECK(main_console_enqueue_data(&q, &extra, 1));
+  sink.force_result = 1; sink.result = -MAIN_OUTPUT_AGAIN;
+  CHECK(main_console_flush_tick(&q, &sink, queue_write) && q.offset == 0 && !q.failed);
+  CHECK(sink.calls == 1);
+  sink.result = -MAIN_OUTPUT_INTR;
+  CHECK(main_console_flush_tick(&q, &sink, queue_write) && q.offset == 0 && !q.failed);
+  CHECK(sink.calls == 2);
+  sink.result = -5;
+  CHECK(!main_console_flush_tick(&q, &sink, queue_write) && q.failed);
+  CHECK(sink.calls == 3);
+  sink.result = 0;
+  CHECK(!main_console_flush_tick(&q, &sink, queue_write) && sink.calls == 3);
+  CHECK(!main_console_enqueue_data(&q, &extra, 1));
+  CHECK(!main_console_enqueue_diagnostic(&q, &extra, 1));
+  main_console_queue_init(&q); memset(&sink, 0, sizeof(sink));
+  CHECK(main_console_enqueue_data(&q, &extra, 1));
+  sink.force_result = 1; sink.result = 0;
+  CHECK(!main_console_flush_tick(&q, &sink, queue_write) && q.failed);
+  main_console_queue_init(&q); memset(&sink, 0, sizeof(sink));
+  CHECK(main_console_enqueue_data(&q, &extra, 1));
+  sink.force_result = 1; sink.result = (main_output_count)MAIN_OUTPUT_QUANTUM + 1;
+  CHECK(!main_console_flush_tick(&q, &sink, queue_write) && q.failed);
+  main_console_queue_init(&q); memset(&sink, 0, sizeof(sink));
+  CHECK(main_console_enqueue_data(&q, &extra, 1));
+  CHECK(!main_console_flush_tick(&q, &sink, 0) && q.failed && !sink.calls);
+  main_console_queue_init(&q);
+  CHECK(!main_console_enqueue_data(&q, 0, 1) && q.failed);
+  main_console_queue_init(&q);
+  CHECK(!main_console_enqueue_diagnostic(&q, 0, 1) && q.failed);
+  main_console_queue_init(&q); q.offset = 2;
+  CHECK(!main_console_enqueue_data(&q, &extra, 1) && q.failed);
+  CHECK(!main_console_queue_empty(0));
+  return 0;
+}
+
+static int console_queue_order_capacity(void) {
+  static const unsigned char data[] = "data:";
+  static const unsigned char diagnostic[] = "diagnostic";
+  static const unsigned char tail[] = "!";
+  struct main_console_queue q;
+  struct queue_sink sink;
+  unsigned char fill[MAIN_CONSOLE_QUEUE_BYTES];
+  memset(fill, 'f', sizeof(fill)); memset(&sink, 0, sizeof(sink));
+  main_console_queue_init(&q);
+  CHECK(main_console_enqueue_data(&q, data, sizeof(data) - 1));
+  CHECK(main_console_enqueue_diagnostic(&q, diagnostic, sizeof(diagnostic) - 1));
+  CHECK(main_console_enqueue_data(&q, fill,
+        MAIN_CONSOLE_QUEUE_BYTES - (sizeof(data) - 1) - (sizeof(diagnostic) - 1)));
+  CHECK(!main_console_enqueue_data(&q, tail, sizeof(tail) - 1) && !q.failed);
+  CHECK(q.offset == 0 && q.used == MAIN_CONSOLE_QUEUE_BYTES);
+  CHECK(main_console_flush_tick(&q, &sink, queue_write));
+  CHECK(main_console_enqueue_data(&q, tail, sizeof(tail) - 1));
+  while (!main_console_queue_empty(&q)) CHECK(main_console_flush_tick(&q, &sink, queue_write));
+  CHECK(sink.used == MAIN_CONSOLE_QUEUE_BYTES + 1);
+  CHECK(!memcmp(sink.bytes, data, sizeof(data) - 1));
+  CHECK(!memcmp(sink.bytes + sizeof(data) - 1, diagnostic, sizeof(diagnostic) - 1));
+  CHECK(sink.bytes[MAIN_CONSOLE_QUEUE_BYTES] == '!');
+  return 0;
+}
+
+static int console_queue_real_pipe(void) {
+  static const unsigned char payload[] = "queue-through-full-nonblocking-pipe";
+  unsigned char fill[4096], discard[8192], observed[sizeof(payload)];
+  struct main_console_queue q;
+  struct real r;
+  int out[2];
+  ssize_t count;
+  unsigned int calls;
+  memset(fill, 'p', sizeof(fill)); memset(&r, 0, sizeof(r));
+  CHECK(!pipe(out));
+  CHECK(!nonblock(out[0]) && !nonblock(out[1]));
+  while (write(out[1], fill, sizeof(fill)) > 0) {}
+  CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+  r.sink = out[1]; main_console_queue_init(&q);
+  CHECK(main_console_enqueue_data(&q, payload, sizeof(payload) - 1));
+  CHECK(main_console_flush_tick(&q, &r, real_write));
+  CHECK(r.writes == 1 && q.offset == 0 && q.used == sizeof(payload) - 1);
+  calls = r.writes;
+  while (read(out[0], discard, sizeof(discard)) > 0) {}
+  CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+  CHECK(main_console_flush_tick(&q, &r, real_write));
+  CHECK(r.writes == calls + 1 && main_console_queue_empty(&q));
+  close(out[1]);
+  count = read(out[0], observed, sizeof(observed));
+  CHECK(count == (ssize_t)sizeof(payload) - 1);
+  CHECK(!memcmp(observed, payload, sizeof(payload) - 1));
+  close(out[0]);
+  return 0;
+}
+
+static int combined_drained(void) {
+  struct main_output_pump p;
+  struct main_console_queue q;
+  unsigned char byte = 1;
+  main_output_pump_init(&p); main_console_queue_init(&q);
+  p.stream[0].eof = p.stream[1].eof = 1;
+  CHECK(main_output_console_drained(&p, &q));
+  CHECK(main_console_enqueue_data(&q, &byte, 1));
+  CHECK(!main_output_console_drained(&p, &q));
+  q.offset = q.used;
+  CHECK(main_output_console_drained(&p, &q));
+  p.stream[1].eof = 0;
+  CHECK(!main_output_console_drained(&p, &q));
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int line = 0;
   if (argc != 2)
@@ -423,6 +574,16 @@ int main(int argc, char **argv) {
     line = invalid();
   else if (!strcmp(argv[1], "real-pipe"))
     line = real_pipe();
+  else if (!strcmp(argv[1], "console-queue"))
+    line = console_queue();
+  else if (!strcmp(argv[1], "console-queue-failures"))
+    line = console_queue_failures();
+  else if (!strcmp(argv[1], "console-queue-order-capacity"))
+    line = console_queue_order_capacity();
+  else if (!strcmp(argv[1], "console-queue-real-pipe"))
+    line = console_queue_real_pipe();
+  else if (!strcmp(argv[1], "combined-drained"))
+    line = combined_drained();
   else
     return 3;
   if (line)

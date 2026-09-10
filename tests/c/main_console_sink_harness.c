@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "guest/stage1/main_output_pump.h"
+
 typedef unsigned int u32;
 typedef unsigned long u64;
 typedef long i64;
@@ -38,6 +40,9 @@ struct main_console_sink_local {
 };
 
 static struct main_console_sink_local main_console_sink = {.fd = -1};
+static struct main_console_queue main_console_queue;
+static int main_console_queue_active;
+static u64 main_console_flush_deadline;
 static int scenario;
 static int closes[16];
 static int calls;
