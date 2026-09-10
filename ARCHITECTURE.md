@@ -88,6 +88,7 @@ flowchart LR
 | 영역 | 주요 경로와 심볼 | 책임과 의존 방향 |
 | --- | --- | --- |
 | CLI와 routing | [`cli.py`](src/palimpsest_local/cli.py)의 `main`, `resolve_local_oci_run_request`; [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py) | argparse surface와 typed `RuntimeKind`/`RuntimeBackend`를 결정하고 cloud-image, Lima, OCI adapter로 분기 |
+| CLI reference and package tooling | [`scripts/generate_cli_reference.py`](scripts/generate_cli_reference.py), [`scripts/build_package.py`](scripts/build_package.py), [`docs/cli/README.md`](docs/cli/README.md) | 실제 argparse surface의 문서 drift 검사와 wheel/sdist 생성·격리 설치 검증. runtime dispatch나 privileged host provisioning을 대신하지 않음 |
 | local state | [`state.py`](src/palimpsest_local/state.py)의 `StatePaths`, `reserve_new_run`, `locked_existing_run`, `atomic_write_json` | owner-only selected state root, run/project ledgers, lock과 atomic publication. runtime adapter가 이 경계를 소비 |
 | Linux installation and command journal | [`linux_install.py`](src/palimpsest_local/linux_install.py)의 `provision`; [`host_journal.py`](src/palimpsest_local/host_journal.py)의 `begin`, `CommandJournal` | root-only dedicated account/group and fixed directory provisioning; CLI dispatch start/end observation with fail-open stderr warnings, separate from raw console and runtime authority |
 | conventional runtime | [`cloud_runtime.py`](src/palimpsest_local/cloud_runtime.py)의 `create_run`, lifecycle operations; [`lima.py`](src/palimpsest_local/lima.py); [`project_runtime.py`](src/palimpsest_local/project_runtime.py)의 `up_project`/`down_project` | verified cloud image와 layers를 KVM/libvirt 또는 Lima/VZ에 연결하고 compose-shaped project를 reconcile |
@@ -161,6 +162,7 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 
 ### 로컬 패키지
 
+- 빠른 설치 진입점은 [`install.md`](install.md), 상세 설치·운영 계정 설정은 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md)다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
 - base package는 `palimpsest-local` Python 3.12+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
 - conventional macOS Apple Silicon은 Lima 2.1+ VZ(`lima-vz`)를 기본으로 사용하고, Linux KVM은 `/dev/kvm`, QEMU, `qemu:///system`, `default` network와 `cloud-localds`, `mksquashfs`, OpenSSH가 필요하다.
 - OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. OCI network는 `none`만 현재 public intake에서 허용한다.
@@ -313,9 +315,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "f5bd1368b5b151791f58be9e2d8a971d22b07001b3e487e1849e61834520b81e",
-  "reviewed_at": "2026-09-10T07:17:50Z",
-  "summary": "Reviewed documentation-only final main-output checkpoint and guest README against exact9736132 native evidence. Production C/ELF and host code unchanged. Guest integration passed686 local/server selected checks atd32328a; proof synchronization passed423 local/server checks without duplicate-total claims. Native43boots/44QEMU+receipt, UID0/101stdio2 and existing-image coldpubliclifecycle1 passed; each21pre/post preservation checks and both28-record(14pair) privatejournals passed. Current architecture/process/guest docs distinguish native evidence from historical pending/failures and preserve remainingaliases/NGINX/newbuild/fullGate2/adminsetup limits."
+  "source_sha256": "b79aeb46ec4772a116c42b4b5fb142a33f4619705186c1f9835a8abf32f911bf",
+  "reviewed_at": "2026-09-10T07:41:58Z",
+  "summary": "Reviewed CLI parser/dispatch, installer and package assets against new reference and packaging source.74 command paths/216 argument definitions have checked syntax and authored usage. Package helper builds wheel from sdist, validates ELF, and tests separate isolated uv-pip plus uv-tool installations; corrected unsupported uv-tool --no-deps found by actual smoke. CI/core-cli mappings updated. No production runtime, guest, schema, privilege, data ownership or release gate change. Prior focused256 and core/qualification1347 tests passed; final artifact/server checks remain separate evidence, not native or Gate2 qualification."
 }
 ```
 <!-- architecture-review:end -->

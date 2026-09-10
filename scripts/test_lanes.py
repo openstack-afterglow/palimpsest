@@ -31,8 +31,8 @@ def _units(names: str) -> tuple[str, ...]:
 # globs: a new test file must be classified intentionally in code review.
 PORTABLE_FILES = {
     "core-cli": _units("""
-        afterglow_tracking architecture_guard cli_contract cli_project cli_registry completion
-        host_journal inventory linux_install log_stream metrics refs runtime_dispatch runtime_facade
+        afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
+        host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         sandbox_policy state test_lanes ui
     """),
     "host-runtime": _units("""
@@ -371,6 +371,9 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
             selected.update(direct & set(PORTABLE))
             suggested.update(direct - set(PORTABLE))
             reasons.append(f"{path}: direct test lane")
+        elif path in {"scripts/generate_cli_reference.py", "scripts/build_package.py"}:
+            selected.add("core-cli")
+            reasons.append(f"{path}: CLI documentation/package tooling; isolated package smoke also required")
         elif path in {"scripts/test_lanes.py", ".github/workflows/test.yml"}:
             selected.update(("core-cli", "qualification"))
             reasons.append(

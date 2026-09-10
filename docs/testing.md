@@ -55,6 +55,37 @@ assertions, fixtures or production safety checks. A documentation-only edit
 can produce an empty test recommendation; that is not a successful test run.
 Hub tests use their own environment and explicit lane.
 
+## CLI reference and distribution checks
+
+For command documentation and packaging-only edits, use the focused contracts:
+
+```sh
+uv run pytest -q tests/unit/test_cli_reference.py tests/unit/test_packaging.py \
+  tests/unit/test_test_lanes.py tests/unit/test_architecture_guard.py
+uv run python scripts/generate_cli_reference.py --check
+uv run python scripts/build_package.py --out-dir ./dist/verify-001
+```
+
+The unit checks and documentation drift check are distinct from the final
+command's real wheel/sdist build and isolated wheel installation. The package
+smoke runs outside the checkout, without installing optional KVM dependencies
+or provisioning host accounts. Build tooling may need to download its build
+backend; wheel installation itself uses only the newly built local artifact.
+Choose a new output directory on each invocation; existing packages are never
+overwritten. The wheel is rebuilt from the produced source distribution, and
+the installed package verifies the bundled stage-1 ELF digest and format.
+The helper also exercises the README's `uv tool install --no-index` path in
+temporary tool directories and runs that installed executable. `--no-deps`
+belongs to the separate `uv pip install` probe, not `uv tool install`.
+These checks do not boot a VM, qualify Gate 2, publish a release, or authorize
+changes to `/var/lib/palimpsest` or `/var/log/palimpsest`.
+
+The two tooling scripts select `core-cli` in the changed-file planner. CI also
+runs the real package smoke explicitly; ordinary unit lanes do not need to
+download and rebuild distributions for every test iteration. Run the same
+focused checks and package smoke on the exact pushed Linux server SHA with
+`umask 022` and `PYTHONPATH` unset. Preserve existing runtime state and evidence.
+
 ## Shards and full regression
 
 ```sh

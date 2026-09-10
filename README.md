@@ -7,32 +7,41 @@ It provides the `palimpsest` command and keeps local artifacts, tags, run state,
 ## Status
 
 - **macOS Apple Silicon:** default runtime using Lima/VZ (`lima-vz`), with experimental QEMU/libvirt Hypervisor.framework support (`libvirt-hvf`).
-- **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Standalone release `0.1.0` requires clean-host KVM integration proof.
+- **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Public `v0.1.0` publication remains blocked by the physical-host KVM release gate.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
 - **Version:** `0.1.0.dev0`.
 
 ## Install
 
-### Development checkout
+### Build and install locally
+
+From a trusted checkout with Python 3.12+ and
+[uv](https://docs.astral.sh/uv/):
+
+```sh
+uv run python scripts/build_package.py --out-dir dist/package-0.1.0.dev0
+uv tool install --no-index \
+  dist/package-0.1.0.dev0/palimpsest_local-0.1.0.dev0-py3-none-any.whl
+palimpsest --help
+```
+
+The build produces a wheel and source distribution, checks the packaged guest
+ELF and an isolated offline installation, and writes `SHA256SUMS`. Choose a new
+output directory on each run. This checkout is version `0.1.0.dev0`; do not
+assume a public PyPI package exists.
+
+For development:
 
 ```sh
 uv sync --extra dev
 uv run palimpsest --help
 ```
 
-### Package installation
-
-```sh
-pip install .
-# or
-uv pip install .
-```
-
-To use the Linux KVM runtime, install the optional extra:
-
-```sh
-pip install '.[kvm]'
-```
+On Linux, select a private `XDG_STATE_HOME` for user-owned artifact workflows or
+use the explicit administrator-managed account and storage provisioner. Package
+installation never creates accounts, changes privileged groups, or writes
+sudoers policy. KVM also needs the optional `kvm` dependency and host tools.
+See the [short install guide](install.md) and [detailed guide](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
@@ -335,8 +344,10 @@ palimpsest image  inspect|history|rm|save|load # Docker/OCI image
 palimpsest image  ls|pull|verify|import|push # Hub boot image
 palimpsest layer  ls|pull|pack|push
 palimpsest bundle pull|verify
+palimpsest oci materialize
 palimpsest build
 palimpsest run
+palimpsest start
 palimpsest compose config|up|down|ps|logs|exec|stop|port
 palimpsest ps|inspect|logs|shell|exec|stop|rm|commit
 palimpsest ui                                # web management dashboard
@@ -344,7 +355,8 @@ palimpsest store show|ls|rm|move|set         # storage state & artifact manageme
 palimpsest completion zsh|bash|fish          # shell completion generator
 ```
 
-Use `palimpsest <command> --help` for exact arguments.
+Use `palimpsest <command> --help` for exact arguments. The checked generated
+[CLI reference](docs/cli/README.md) records the complete command tree.
 
 ## Shell completion
 
