@@ -58,6 +58,107 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
-Native results for this new official-image matrix are pending. Existing
-NGINX-unprivileged, Redis explicit-user, and Gate 2 passes do not qualify these
-new images or application probes.
+### Native execution — `1752ba9`, 2026-09-11
+
+All five independently selected cases were executed on `pieroot-server` at
+exact `1752ba90ae604b5d1776c2e70ef8f9f28c3c3da3`. All five tests failed;
+none is a successful application compatibility qualification. The same
+focused portable selection passed locally (109 tests, 9.22 seconds) and on
+that exact server checkout (109 tests, 7.80 seconds). Those passes qualify
+the test contracts, not these services. The GitHub package build also
+[completed successfully](https://github.com/openstack-afterglow/palimpsest/actions/runs/34558389044).
+
+| Case | Observed stage and failure | Application response |
+| --- | --- | --- |
+| Postgres default | OCI root transition and workload start completed; directory `chmod` and switching to `postgres` failed with `Operation not permitted` | SQL probe not reached |
+| Redis default | OCI root transition and workload start completed; `setpriv: keep process capabilities failed: Operation not permitted` | PING probe not reached |
+| MySQL default | Stage-1 booted, then rejected root transition with `target=sys; check=mode`; workload was disabled fail-closed | MySQL entrypoint and socket probe not reached |
+| NGINX default | Entry point reached NGINX, but `chown` of `client_temp` to UID 101 failed with `Operation not permitted` | HTTP probe not reached |
+| Redis `--user redis` | Service readiness and version 7.4.11 succeeded; PING to `127.0.0.1:6379` failed with `Network unreachable` | Failed connectivity check, not a demonstrated server crash |
+
+Only the explicit-user Redis case reached the independent root/PID 1 probes.
+Its before/after authenticated root identity remained device 21, inode 2 and
+matched the application's actual `/`; direct `/proc/1/root` reading was denied.
+The other four cases did not reach those probes. Lifecycle READY is not
+application readiness. Neither database reached a missing-password error;
+initialization configuration remains a separate, untested dependency.
+
+A read-only header scan of the pinned MySQL archive found a root-owned `sys`
+directory with mode `0555` in its base layer and no later shallow replacement.
+The current transition contract accepts exact `0755` for `/sys`, unlike the
+separate `/proc` allowance. This explains the observed mode rejection; changing
+the accepted input mode still needs a separately reviewed contract and native
+proof, not a broad permission relaxation or archive mutation.
+
+The retained matrix receipt and bounded command evidence are under
+`/tmp/palimpsest-services-native-v563p6fq`, with `matrix-results.json` recording
+each runtime and healthy private command journal. Failed runtimes are:
+
+- Postgres: `/tmp/p-hub-svc-pg-a8da3859`
+- Redis default: `/tmp/p-hub-svc-rd-bf8995a1`
+- MySQL: `/tmp/p-hub-svc-my-44f35cad`
+- NGINX: `/tmp/p-hub-svc-ng-4707394c`
+- Redis explicit user: `/tmp/p-hub-svc-rdu-fde37c80`
+
+The native wrapper SHA-256 was
+`31cf7e19eb49679ba68f32fe836ba2135bae2790a29355877d467b5091ad85b5`.
+All 29 initial and 41 final preservation observations passed, as did each
+between-case check. The original four inactive domains and eight earlier
+archives, plus all four newly acquired archives, were preserved. Four new
+failed domains remain inactive; MySQL's failed launch left no registered
+domain but its runtime remains. No active VM/QEMU remained. Public `stop`
+was used for the owned running Redis-user failure; no force-destroy or manual
+failure deletion was used. These temporary host paths are retained evidence,
+not durable published artifacts. Production guest and security policy did not
+change, and prior unprivileged NGINX/Gate 2 successes are not promoted to
+official-image service successes.
+
+### Follow-up boundaries
+
+Prioritize a narrowly scoped guest-internal loopback design and focused Redis
+connectivity test; this must not silently add a NIC, host port, external route,
+or workload capability. Separately inspect the pinned MySQL `/sys` metadata
+against stage-1's exact mode contract before proposing any allowance. Keep
+Postgres/NGINX ownership and identity transitions distinct from database
+environment configuration. Explicit environment support and non-root launch
+configuration need their own contracts and verification; they cannot be
+claimed to solve these observed permission failures. These are next-step
+design boundaries, not implemented fixes or authorization to relax PID 1,
+capability, no-new-privileges or seccomp protection.
+
+### Fresh acquisition — 2026-09-11
+
+On the exact clean `f77e251ff07c94392215c1aa09b87058449013fe` server,
+external Skopeo acquisition completed for all four official sources. The
+private selection receipt is
+`/tmp/palimpsest-services-acquire-kytw4jez/selection-receipt.json`.
+Each selected platform manifest, config and compressed layer was size/hash
+checked; archives remain unmodified. All four configs have the default root
+user and their original entrypoint plus default command.
+
+| Image | Archive SHA-256 | Selected manifest SHA-256 | Archive bytes |
+| --- | --- | --- | ---: |
+| Postgres 17 | `ac62d2c7178f84938d23d45abcc6eeb17d7ac416f84742022b78737d39500174` | `d13db94ae661d517c5ed57c509a578d5ea64aae639871ba25294f4f42d83de28` | 161315328 |
+| Redis 7 Alpine | `91155f4ab07ee60968fb00651769e650c78cf5515aa4e9d0e03731b8565ebed7` | `1db42ccef14898aa29bae778452d567534b59c107129cbc1163fb552de184d3c` | 16277504 |
+| MySQL 8.4 | `84afe48b07fb60de7329f8200b10ad1f407b74ad0bb714d5ea73a5ad9bcfb3b5` | `d28300f0136cb6d4e24603b9da20460f216845ea778b3b9a4166825d78f0c7dd` | 239007232 |
+| NGINX stable Alpine | `ece37c1755bb11644bbba93602821cbb0669a45dc76030b3c6d641c3f959c572` | `862dc06c359bfe5d3211e4106269f040d261e269e58ebf17060d8328c45067c0` | 28558336 |
+
+The fixed Skopeo tool image ID was
+`sha256:6427ae801eaa5e1b4579e20dce5940015352d99506fd9c5a8e8f8ca4fb202f68`.
+It ran as the host user without capabilities, with no-new-privileges and a
+read-only root. Only the fresh acquisition directory and its temporary child
+were bind-mounted writable. No Docker socket was exposed inside the container.
+The final acquisition wrapper digest was
+`86215c2033a9b22ade2e8e7ecb47be9ef6bf854a8e4b0ef324c4271298409cf0`.
+All 25 preflight and 25 postflight observations preserved the original four
+inactive domains and eight earlier archives, with no active VM or QEMU.
+
+Two acquisition-procedure failures remain separate from image compatibility:
+`/tmp/palimpsest-services-acquire-j41fg6z0` stopped before container creation
+because of an invalid bare `rw` option in Docker's `--mount` syntax;
+`/tmp/palimpsest-services-acquire-s1bd9py1` resolved the Postgres manifest but
+could not create Skopeo's temporary directory under the read-only `/var/tmp`.
+Removing the unsupported mount option and binding a fresh owner-only temporary
+child to `/var/tmp` fixed the procedure without broadening host write access
+or container privileges. Both attempts passed all 25 pre/post preservation
+observations. These are not failed VM boots or successful service proofs.

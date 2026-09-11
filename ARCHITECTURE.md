@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+`1752ba9`의 공식 서비스 실기는 기본 Postgres·Redis·MySQL·NGINX 네 건과 별도 Redis `--user redis` 한 건 모두 실패했다. Postgres/NGINX는 소유권·사용자 전환 관련 권한 거부, 기본 Redis는 setpriv capability 유지 거부, MySQL은 root 전환의 sys mode 검사 거부로 서비스 probe에 도달하지 않았다. Redis 사용자 지정만 readiness·version·실제 /의 device 21·inode 2 및 PID1 접근 거부까지 확인했지만 PING은 Network unreachable이었다. 로컬·동일 서버 SHA 선별109건과 마지막41개 보존 검사는 통과했으며 활성 VM/QEMU는 없다. 새 실패 등록 네 개와 runtime·원본을 보존했다. Production guest·권한·네트워크 정책은 변경하지 않았고 다음 단계는 내부 loopback 및 이미지 초기화 요구의 분리 검토다. 상세 증거와 미검증 경계는 [service matrix](docs/docker-hub-service-matrix.md)에 기록한다.
+
 공식 Docker Hub 서비스 네 종류의 새 검증은 [service matrix](docs/docker-hub-service-matrix.md)로 분리한다. Postgres 17·Redis 7 Alpine·MySQL 8.4·NGINX stable Alpine의 원본 기본 실행과 별도 Redis user override를 각각 검사한다. 서비스 readiness와 실제 SQL/PING/HTTP 응답을 구분하며, 기존 비특권 NGINX나 Gate 2 성공을 이 matrix의 성공으로 간주하지 않는다. 이 추가는 테스트 경계이며 OCI env/argv override, guest loopback 설정, 권한 또는 production guest 변경이 아니다.
 
 현재 local build-to-run checkpoint는 exact `d72796c`다. 같은 qualified
@@ -352,8 +354,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 {
   "schema_version": 1,
   "source_sha256": "beb3cdeda94405c6f14b3134d79831ee9977ba15712b261410e8a967bac54dcb",
-  "reviewed_at": "2026-09-11T03:24:58Z",
-  "summary": "Reviewed new independently opted-in official service matrix and reused CLI/typed ledger helpers. Five cases separate default image process from Redis user override; readiness, application probe, authenticated root/PID1 and owned cleanup have distinct evidence. Native tests are defined but not yet executed. Production source, guest ELF, environment override and network/capability policies unchanged. Updated code map, limits and focused test documentation."
+  "reviewed_at": "2026-09-11T03:45:14Z",
+  "summary": "Reviewed executed official service matrix at 1752ba9, saved failure receipts and current root-transition/service-probe source. All five native cases failed; explicit-user Redis alone passed readiness/version/root/PID1 but not loopback PING. Documents now distinguish permission, sys-mode and connectivity failures, exact evidence and preservation. Documentation-only follow-up; production source, guest ELF, security and network contracts unchanged."
 }
 ```
 <!-- architecture-review:end -->

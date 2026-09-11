@@ -219,6 +219,14 @@ actual result, root/PID1 observations where reachable, failed runtime and
 source hashes. Only an exactly owned active failed VM may be publicly stopped;
 uncertain ownership or inactivity blocks subsequent native cases.
 
+Executed checkpoint `1752ba9` (2026-09-11): all five native cases failed;
+the default four never reached application probes, while explicit-user Redis
+passed readiness/version/root/PID1 checks but its PING failed with network
+unreachable. Focused portable contracts passed 109 tests on both local and
+exact-SHA server; these are not service passes. All 41 final preservation
+observations passed with no active VM/QEMU. See the matrix for exact source
+pins, retained evidence, reached stages and separately scoped next steps.
+
 ### Linux legacy ArgsEscaped
 
 For the Linux-only [process metadata contract](oci-linux-process.md), start
