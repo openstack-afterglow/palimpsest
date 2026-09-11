@@ -202,6 +202,23 @@ to implicitly enable either special lane in portable selection.
 
 ## When to broaden verification
 
+### Official service-image matrix
+
+The independent [official service matrix](docker-hub-service-matrix.md) uses
+`tests/kvm/test_oci_docker_hub_services_live.py` for PostgreSQL, Redis, MySQL,
+and NGINX defaults, with a separate explicit-user Redis case. Run one exact
+parameter or `-k` selection at a time; each needs its own
+`PALIMPSEST_OCI_DOCKER_HUB_SERVICE_<CASE>_LIVE` and source pins. Portable
+feedback is `tests/unit/test_oci_docker_hub_services_live_contract.py` plus
+the reused `test_oci_docker_hub_cli_live_contract.py`, lane-manifest and
+architecture checks. These tests do not implicitly enable VM execution.
+
+Readiness is not a SQL/PING/HTTP response. An absent client or unavailable
+guest loopback must not become a successful application proof. Preserve the
+actual result, root/PID1 observations where reachable, failed runtime and
+source hashes. Only an exactly owned active failed VM may be publicly stopped;
+uncertain ownership or inactivity blocks subsequent native cases.
+
 ### Linux legacy ArgsEscaped
 
 For the Linux-only [process metadata contract](oci-linux-process.md), start

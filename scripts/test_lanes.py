@@ -40,6 +40,7 @@ PORTABLE_FILES = {
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
+        oci_docker_hub_services_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
@@ -82,6 +83,7 @@ SPECIAL_FILES = {
         "tests/kvm/test_oci_exec_record_cli_live.py",
         "tests/kvm/test_oci_retained_root_cli_live.py",
         "tests/kvm/test_oci_docker_hub_cli_live.py",
+        "tests/kvm/test_oci_docker_hub_services_live.py",
         "tests/kvm/test_oci_stdio_cli_live.py",
         "tests/kvm/test_oci_console_ofd_live.py",
     ),

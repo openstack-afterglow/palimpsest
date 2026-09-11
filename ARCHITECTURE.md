@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+공식 Docker Hub 서비스 네 종류의 새 검증은 [service matrix](docs/docker-hub-service-matrix.md)로 분리한다. Postgres 17·Redis 7 Alpine·MySQL 8.4·NGINX stable Alpine의 원본 기본 실행과 별도 Redis user override를 각각 검사한다. 서비스 readiness와 실제 SQL/PING/HTTP 응답을 구분하며, 기존 비특권 NGINX나 Gate 2 성공을 이 matrix의 성공으로 간주하지 않는다. 이 추가는 테스트 경계이며 OCI env/argv override, guest loopback 설정, 권한 또는 production guest 변경이 아니다.
+
 현재 local build-to-run checkpoint는 exact `d72796c`다. 같은 qualified
 Linux/KVM host에서 기존 `g35` Linux amd64 OCI archive의 pinned manifest를
 안전한 local layout으로 읽고, fresh network-none Buildx builder를 사용한
@@ -127,6 +129,7 @@ flowchart LR
 | workload stdio aliases | [`guest/stage1/init.c`](guest/stage1/init.c)의 `safe_workload_stdio_aliases_at`, `make_safe_workload_stdio_aliases`, `safe_workload_dev_entries_at`; [`tests/unit/test_workload_dev_aliases.py`](tests/unit/test_workload_dev_aliases.py) | child-only private `/dev`의 고정 두 symlink 생성·nofollow 검증. 여섯 device node와 두 별칭의 정확한 entry 집합을 검사하며 부모가 symlink 대상 FD를 열지 않음 |
 | native workload proof fixtures | [`guest/workload-proof/proof.c`](guest/workload-proof/proof.c), [`_oci_stage1_kvm_proof.py`](src/palimpsest_local/_oci_stage1_kvm_proof.py), [`filesystem-fixtures.json`](tests/kvm/assets/filesystem-fixtures.json) | 테스트 전용 workload가 정확한 여덟 `/dev` 항목과 두 별칭을 독립 검증. 재현 빌드한 proof ELF를 SquashFS fixture에 포함하고 source/ELF/fixture pin을 함께 검증하며 production authority로 사용하지 않음 |
 | retained-root test fixture injection | [`test_oci_root_libvirt_live.py`](tests/kvm/test_oci_root_libvirt_live.py)의 `_inject_reuse_only_executable` | 테스트 전용 upper 주입도 shared fixture loader와 독립 ELF pin을 모두 확인. domain 부재·root identity·journal replay 확인 후에만 새 경로를 사용하며 production retain 동작과 분리 |
+| official service compatibility matrix | [`test_oci_docker_hub_services_live.py`](tests/kvm/test_oci_docker_hub_services_live.py), [`test_oci_docker_hub_services_live_contract.py`](tests/unit/test_oci_docker_hub_services_live_contract.py) | 공식 네 image default와 별도 Redis user override의 독립 opt-in. readiness·application probe·root/PID1·owned cleanup과 실패 보존을 구분하며 기존 CLI proof helper를 재사용 |
 | Hub API | [`hub/src/palimpsest_hub/main.py`](hub/src/palimpsest_hub/main.py), [`hub/src/palimpsest_hub/auth.py`](hub/src/palimpsest_hub/auth.py), [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py) | `/v1` discovery/health, Keystone token scope, layer/image query, resumable upload, bundle, image-export API |
 | Hub persistence/ops | [`hub/src/palimpsest_hub/models.py`](hub/src/palimpsest_hub/models.py), [`hub/src/palimpsest_hub/services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py) | SQL rows와 filesystem blobs를 source of truth로 유지하고 worker lease/conversion/GC를 수행 |
 
@@ -348,9 +351,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9c4a2525aa7b35eb555a1300380eeb60d32c11477917a4981dd89a357577db45",
-  "reviewed_at": "2026-09-11T02:27:42Z",
-  "summary": "Reviewed exact d72796c same-host local OCI build-to-run evidence: focused local/server selections each passed100; Gate1 passed2, fresh v2 artifact build and Gate2 passed1 with stable root proof/PID1 denial/owned cleanup. All24 pre/post-build/post observations preserved4 inactive domains and7 archives; builder removed and private journal passed. Docs-only checkpoint; production structure, guest ELF and security policy unchanged; excludes fresh third-party intake, direct registry run, HTTP and cross-host transfer."
+  "source_sha256": "beb3cdeda94405c6f14b3134d79831ee9977ba15712b261410e8a967bac54dcb",
+  "reviewed_at": "2026-09-11T03:24:58Z",
+  "summary": "Reviewed new independently opted-in official service matrix and reused CLI/typed ledger helpers. Five cases separate default image process from Redis user override; readiness, application probe, authenticated root/PID1 and owned cleanup have distinct evidence. Native tests are defined but not yet executed. Production source, guest ELF, environment override and network/capability policies unchanged. Updated code map, limits and focused test documentation."
 }
 ```
 <!-- architecture-review:end -->
