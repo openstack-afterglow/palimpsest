@@ -67,6 +67,7 @@ state root, including `PALIMPSEST_STATE_HOME`, rather than an assumed XDG path.
 On the BuildKit host, provide a bootable local OCI base pinned as `PATH@sha256:<manifest>` and create the transfer artifact:
 
 ```sh
+BUILDX_BUILDER=palimpsest-e2e \
 uv run python tests/e2e/prepare_local_oci_build.py \
   --base /srv/fixtures/base-layout@sha256:... \
   --platform linux/amd64 \
@@ -84,11 +85,60 @@ PALIMPSEST_OCI_ROOT_E2E_LIBVIRT_URI=qemu:///system \
 uv run pytest -q tests/e2e/test_local_oci_build_run.py
 ```
 
-The default suite still skips this opt-in test. Public run and exec have their
-own successful native proofs; that does not imply the revised Gate 2 passed.
+The default suite still skips this opt-in test. Separate public run and exec
+native proofs alone do not qualify this gate; explicit completed Gate 2 runs
+are recorded below.
 Legacy v1 artifacts do not satisfy this revised gate. The new contract requires
 a fresh Palimpsest-built v2 artifact and actual server verification; PID 1
 protection is not relaxed.
+
+### Same-host fresh build and Gate 2 checkpoint (2026-09-11)
+
+At exact clean SHA `d72796cd87d50981cc1a87d36e2f710481153d97`, the
+focused acceptance/lane/architecture selection passed locally (100 tests,
+7.74 seconds) and on the qualified server (100 tests, 6.48 seconds). Gate 1
+then passed both real BuildKit tests in 2.47 seconds using a fresh uniquely
+named `docker-container` builder with network mode `none`. The builder was
+removed by exact owned name after the run.
+
+The build input was the preserved `g35` Linux amd64 archive, whose pinned
+manifest and long-running default command were checked before use. The wrapper
+converted it to a local OCI layout by accepting only regular `oci-layout`,
+`index.json`, and digest-addressed blob members under bounded sizes; it did not
+perform generic tar extraction. `prepare_local_oci_build.py` added the fresh
+marker `palimpsest-local-build-66ce8ca2743a470ea4f2e6a2bc7a9eb9` and emitted:
+
+- archive SHA-256 `e7782db13bfd97bbf9cb2788007e51ffc7b2c4f7f61aed504b8b0f3b98492117`;
+- manifest `sha256:7844e9d0355d74cd435ede5a96681f7c87545ff15a17d6c02143e14ca38a87db`;
+- artifact directory `/tmp/palimpsest-gate12-artifact-parent-wq7pyej1/artifact`.
+
+Gate 2 passed once in 18.90 seconds from the fresh runtime
+`/tmp/p-g12-674b67602272`. It verified the v2 receipt and archive, detached
+startup with the test's default 4 GiB/two-vCPU request and a running libvirt
+domain, stable bracketed root proofs, the baked
+marker and actual OverlayFS root identity, denied direct PID 1 root access,
+normal stop/removal, domain/run absence, unchanged archive, and no Docker CLI
+fallback. The generated run `oci-root-e2e-16d2dbac7af5` reported the observed
+root identity as device 21/inode 2; these are observations, not acceptance
+constants. All six cleanup/guard checks passed. A private healthy command journal at
+`/tmp/palimpsest-gate12-journal-5wldsxx4` passed its identity, sequence and
+paired-record checks.
+
+All 24 preflight, 24 post-build and 24 final observations passed: the existing
+four inactive domains retained their UUID, shut-off state and disabled
+autostart; all seven preserved archive hashes remained exact; no active domain
+or QEMU remained. Bounded command evidence is under
+`/tmp/palimpsest-gate12-evidence-8ipfvokl`, including Gate 1 (`029`), artifact
+build (`030`) and Gate 2 (`056`). The first wrapper attempt remains preserved
+at `/tmp/palimpsest-gate12-evidence-d02b8ckl`; it stopped before Gate 1 because
+its Buildx driver-output check assumed fixed spacing. Its owned builder was
+removed and all pre/final preservation observations passed.
+
+This was a same-host local-build-to-KVM transfer through filesystem artifacts,
+not a cross-host transfer test. It reused the pinned existing base and did not
+download a fresh Docker Hub image, build a new third-party application, test
+HTTP, or implement direct registry-reference `run`. No production source,
+guest ELF, PID 1 isolation, capability, NNP, seccomp or device policy changed.
 
 ### Docker-coexistent host verification (2026-09-07)
 

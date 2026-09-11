@@ -13,6 +13,24 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+현재 local build-to-run checkpoint는 exact `d72796c`다. 같은 qualified
+Linux/KVM host에서 기존 `g35` Linux amd64 OCI archive의 pinned manifest를
+안전한 local layout으로 읽고, fresh network-none Buildx builder를 사용한
+Gate 1 두 건(2.47초)과 새 v2 artifact 생성, fresh runtime의 Gate 2 한 건
+(18.90초)이 통과했다. 새 archive SHA-256은
+`e7782db13bfd97bbf9cb2788007e51ffc7b2c4f7f61aed504b8b0f3b98492117`,
+manifest는 `sha256:7844e9d0355d74cd435ede5a96681f7c87545ff15a17d6c02143e14ca38a87db`다.
+Gate 2는 detached run, running domain, 전후 root proof, image-baked marker와
+실제 root identity 일치, PID 1 root 접근 거부, stop/rm, source 보존과 Docker
+CLI 미사용을 확인했다. 24개 pre/post-build/post 보존 검사는 기존 inactive
+domain 네 개와 archive 일곱 개, zero-active 상태를 유지했고 owned builder는
+제거됐으며 private command journal도 통과했다. 이는 같은 host의 기존 base를
+사용한 새 Palimpsest image proof이며 fresh third-party download, Docker Hub
+direct run, HTTP, cross-host transfer 또는 일반 application 호환성 증명이 아니다.
+Production source·guest ELF·PID 1·권한 정책은 바뀌지 않았다. 첫 wrapper는
+Buildx 출력 열 간격 가정 때문에 Gate 1 전에 실패했고 그 evidence를 보존했다.
+상세 범위와 evidence는 [build-to-run acceptance](docs/oci-root-build-run-acceptance.md)에 있다.
+
 현재 별칭 실기 checkpoint는 `c563867`이다. workload 전용 `/dev`에 `stdout → /proc/self/fd/1`, `stderr → /proc/self/fd/2`만 추가하고 기존 여섯 character device와 부모 전용 console, PID 1 보호·capability·NNP/seccomp 정책을 유지했다. 같은 서버 SHA에서 core/qualification1,357건과 guest/ELF623건을 별도 통과했고, 재현 빌드된 게스트로43 boots/44 QEMU(121.81초), UID0/101 stdio2건(31.26초), 원본 NGINX1건(31.65초), 기존 빌드 이미지 cold lifecycle1건(22.08초)을 순차 통과했다. 각 실행 전후24개 보존 검사에서 기존 inactive VM네 개와 archive일곱 개를 보존하고 활성 VM/QEMU 없음을 확인했다. NGINX는 원본 argv/user의 `run -d`, worker 시작, 공개 exec, 실제 root 비교, PID1 거부, stop/rm을 통과했으며 HTTP·네트워크·직접 registry run·새 build·전체 Gate2는 검증하지 않았다. 상세 source/ELF pin, 실패 기록과 journal 증거는 [현재 process checkpoint](docs/oci-linux-process.md#bounded-stdio-alias-verification-checkpoint-c563867-2026-09-11)에 있다. 아래 과거 별칭 부재와 NGINX 실패는 소급해 성공으로 바꾸지 않는다.
 
 2026-09-11 `7c7ac54`의 같은 Docker Hub `hello-world` archive는 기존 공개 foreground 실기 항목에서 1건 통과했다(13.68초). Linux KVM·512MiB·1vCPU·network none에서 원본 `/hello`의 출력·exit0와 새 run/domain 제거를 확인했다. 기존 inactive domain 네 개의 UUID/state/autostart와 archive 여섯 개의 hash를 전후 보존했다. 최초 preflight는 빈 `virsh` 출력의 줄바꿈 처리에서 VM 실행 전에 중단됐으며, 빈 줄 정규화만 수정한 후 본 검사를 실행했다. 이 항목은 독립적인 guest root/PID1 거부 검사·detached/exec·전체 Gate 2가 아니다. [실기 checkpoint](docs/docker-hub-intake-analysis.md)와 [GitHub 패키지 설치 검증](docs/install.md)을 구분한다. Production source·게스트 ELF·보안 정책 변경은 없다.
@@ -331,8 +349,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 {
   "schema_version": 1,
   "source_sha256": "9c4a2525aa7b35eb555a1300380eeb60d32c11477917a4981dd89a357577db45",
-  "reviewed_at": "2026-09-10T16:24:32Z",
-  "summary": "Reviewed final unchanged c563867 source and independently checked saved native evidence:43boots44QEMU121.81s, UID0/101stdio2cases31.26s, original NGINX default-process/publicexec/root/PID1/stop-rm31.65s, existing-built-image cold lifecycle22.08s all passed. Each run passed24 pre/post preservation checks for4inactive domains7archives; journals28/20/28 records with expected guest exec errors. Exact-server core/qualification1357 and guest/ELF623 passed separately. Docs-only checkpoint preserves preliminary/CI failures and excludes HTTP/directregistry/newbuild/fullGate2. No source, ELF, proof fixture or security changes in this evidence follow-up."
+  "reviewed_at": "2026-09-11T02:27:42Z",
+  "summary": "Reviewed exact d72796c same-host local OCI build-to-run evidence: focused local/server selections each passed100; Gate1 passed2, fresh v2 artifact build and Gate2 passed1 with stable root proof/PID1 denial/owned cleanup. All24 pre/post-build/post observations preserved4 inactive domains and7 archives; builder removed and private journal passed. Docs-only checkpoint; production structure, guest ELF and security policy unchanged; excludes fresh third-party intake, direct registry run, HTTP and cross-host transfer."
 }
 ```
 <!-- architecture-review:end -->

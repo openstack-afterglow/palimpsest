@@ -187,6 +187,19 @@ Gate 1 verifies the Palimpsest local OCI build. Gate 2 retains the full public
 `run -d → exec → stop → rm` contract on a qualified KVM host; Docker may coexist. Test
 partitioning neither enables Gate 2 nor changes its acceptance criteria.
 
+At exact `d72796c`, the focused local/server acceptance selection passed 100
+tests on each host (7.74/6.48 seconds), followed by Gate 1's two tests
+(2.47 seconds), a fresh v2 artifact build, and Gate 2's one test (18.90
+seconds) on the qualified server. The run used a fresh network-none Buildx
+builder, fresh runtime and private journal; the builder and successful Gate 2
+run/domain were removed through their owned cleanup. Each of the 24 preflight,
+post-build and final preservation observations passed for four existing
+inactive domains and seven archives, with no active QEMU. See
+[`oci-root-build-run-acceptance.md`](oci-root-build-run-acceptance.md) for exact
+artifact digests, evidence paths, the preserved pre-Gate-1 wrapper failure and
+the explicit non-claims. This is executed product-gate evidence, not permission
+to implicitly enable either special lane in portable selection.
+
 ## When to broaden verification
 
 ### Linux legacy ArgsEscaped
