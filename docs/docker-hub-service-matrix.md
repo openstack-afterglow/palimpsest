@@ -58,6 +58,44 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Redis diagnostic checkpoint — `bb879dd`, 2026-09-12
+
+Exact `bb879dd645ba38463abc6f5a13e4f9be2567a926` passed the focused
+service-contract and architecture selection locally (32 tests, 6.87 seconds)
+and on the server (32 tests, 4.50 seconds). Only Redis explicit-user native
+was rerun; stage-1 and stdio results at `f86e4da` are not new runs at this SHA.
+
+The unchanged official Redis archive, launched with `--user redis`, returned
+exact `PONG` with exit 0. The application's actual `/` matched both authenticated
+root receipts (overlayfs, device 21, inode 2). Reading `/proc/1/root/etc/os-release`
+was denied. The receipt shows UID 999/GID 1000, all capability sets zero,
+NNP 1, seccomp 2, and loopback `127.0.0.1/8` up.
+
+Raw interface evidence identifies `tunl0` (type 768, index 2) and `ip6tnl0`
+(type 769, index 3), both with flags `0x80` and therefore no UP bit. They
+explain the two extra entries; the retained domain XML has no NIC. The strict
+only-`lo` assertion still fails (one failed test, 23.62 seconds). This records
+working guest-local Redis communication, **not** a passing full compatibility
+case, default-user Redis success, or external connectivity. No acceptance
+criterion, production guest, packaged ELF, or privilege policy was changed.
+
+Evidence: `/tmp/palimpsest-loopback-native-1gjx3ss_`, runtime
+`/tmp/p-hub-svc-rdu-fbe72bb6`; wrapper SHA-256
+`5769b05187ca645ee21a5263913859c2b53a9df81620e56bb4620a205eb25d37`.
+The private journal `/tmp/palimpsest-loopback-journal-redis_user-g4qk_tjs`
+passed validation (20 records, 10 invocations, 4671 bytes). Existing nine
+inactive domains and twelve archive hashes were preserved, along with the
+new failed domain `hub-service-redis-user-c99a1a55`, UUID
+`6c5715b0-db35-4506-98d1-f5806eb98f5a`, shut off through public failure-stop.
+Final preservation checks passed with ten inactive domains and no active
+VM/QEMU; overall wrapper exit 1 retains the failed qualification. Evidence
+was not deleted. These host temporary paths are not durable published artifacts.
+
+Next review: distinguish known inactive kernel tunnel devices from external
+NICs without relaxing workload protection or treating arbitrary extra devices
+as safe. That contract remains pending; no revised network acceptance is
+claimed by this diagnostic.
+
 ### Loopback checkpoint — `f86e4da`, 2026-09-12
 
 Exact `f86e4daa8554fdd4b08f3c3c994263e486363d7a` passed 453 focused
