@@ -81,6 +81,69 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert '"result": "skipped", "reason": "image client absent", "returncode": 77' in source
     assert '"result": "passed" if probe_ok else "failed"' in source
     assert "assert probe_ok" in source
+    assert 'if case.key == "REDIS_USER"' in source
+    assert '"guest-loopback-security"' in source
+    assert 'netdev_path: str = "/proc/net/dev"' in source and "extra_interfaces=0" in source
+    assert 'status_path: str = "/proc/self/status"' in source
+    assert "Uid:|Gid:) printf" in source
+    assert "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:" in source
+    assert r"\binet 127\.0\.0\.1/8\b" in source
+    assert 'probe.stdout == case.probe_marker' in source
+
+
+def test_loopback_shell_probe_skips_both_headers_and_counts_only_lo(tmp_path: Path) -> None:
+    netdev = tmp_path / "net-dev"
+    status = tmp_path / "status"
+    netdev.write_text(
+        "Inter-|   Receive                                                |  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+        "    lo: 10 1 0 0 0 0 0 0 10 1 0 0 0 0 0 0\n",
+        encoding="ascii",
+    )
+    status.write_text(
+        "Uid:\t999\t999\t999\t999\nGid:\t1000\t1000\t1000\t1000\n"
+        "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+        "CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\n"
+        "NoNewPrivs:\t1\nSeccomp:\t2\n",
+        encoding="ascii",
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", services._loopback_security_command(str(netdev), str(status))],
+        env={"PATH": ""},
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    assert result.stderr == b""
+    services._assert_loopback_security(result.stdout)
+
+
+def test_loopback_security_receipt_parser_accepts_exact_bounded_sample() -> None:
+    services._assert_loopback_security(
+        b"loopback_count=1\nextra_interfaces=0\n"
+        b"Uid=999 999 999 999\nGid=1000 1000 1000 1000\n"
+        b"CapInh=0000000000000000\nCapPrm=0000000000000000\n"
+        b"CapEff=0000000000000000\nCapBnd=0000000000000000\nCapAmb=0000000000000000\n"
+        b"NoNewPrivs=1\nSeccomp=2\nip_tool=present\n1: lo    inet 127.0.0.1/8 scope host lo\n"
+    )
+
+
+@pytest.mark.parametrize("changed", [b"extra_interfaces=1", b"CapEff=1", b"NoNewPrivs=0", b"inet 127.0.0.2/8"])
+def test_loopback_security_receipt_parser_rejects_drift(changed: bytes) -> None:
+    sample = (
+        b"loopback_count=1\nextra_interfaces=0\n"
+        b"Uid=999 999 999 999\nGid=1000 1000 1000 1000\n"
+        b"CapInh=0\nCapPrm=0\nCapEff=0\nCapBnd=0\nCapAmb=0\n"
+        b"NoNewPrivs=1\nSeccomp=2\nip_tool=present\ninet 127.0.0.1/8\n"
+    )
+    originals = {
+        b"extra_interfaces=1": b"extra_interfaces=0",
+        b"CapEff=1": b"CapEff=0",
+        b"NoNewPrivs=0": b"NoNewPrivs=1",
+        b"inet 127.0.0.2/8": b"inet 127.0.0.1/8",
+    }
+    with pytest.raises(AssertionError):
+        services._assert_loopback_security(sample.replace(originals[changed], changed))
 
 
 def _install_retention_fakes(

@@ -555,8 +555,15 @@ def test_kernel_and_config_are_secure_bounded_built_in_fixtures(tmp_path: Path) 
 
 def test_kernel_config_rejects_modules_missing_and_duplicate_keys(tmp_path: Path) -> None:
     assert "CONFIG_CGROUPS" in _REQUIRED_KERNEL_CONFIG
+    assert "CONFIG_NET" in _REQUIRED_KERNEL_CONFIG
+    assert "CONFIG_INET" in _REQUIRED_KERNEL_CONFIG
     complete = {key: "y" for key in _REQUIRED_KERNEL_CONFIG}
-    for key, replacement in (("CONFIG_VIRTIO_BLK", "m"), ("CONFIG_PCI", None)):
+    for key, replacement in (
+        ("CONFIG_VIRTIO_BLK", "m"),
+        ("CONFIG_PCI", None),
+        ("CONFIG_NET", "m"),
+        ("CONFIG_INET", None),
+    ):
         changed = dict(complete)
         if replacement is None:
             del changed[key]

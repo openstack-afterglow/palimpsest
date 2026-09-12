@@ -83,6 +83,14 @@ The other four cases did not reach those probes. Lifecycle READY is not
 application readiness. Neither database reached a missing-password error;
 initialization configuration remains a separate, untested dependency.
 
+The next explicit-user Redis run is defined to retain a bounded guest-network
+and security receipt before its application probe. It requires `/proc/net/dev`
+to expose only `lo`, validates `127.0.0.1/8` when the unchanged image supplies
+`ip`, records one non-root numeric UID/GID with all capability sets zero,
+no-new-privileges 1 and seccomp mode 2, then requires exact `PONG`. This is a
+test definition, not a later native success and does not revise the failed
+`1752ba9` result above.
+
 A read-only header scan of the pinned MySQL archive found a root-owned `sys`
 directory with mode `0555` in its base layer and no later shallow replacement.
 The current transition contract accepts exact `0755` for `/sys`, unlike the

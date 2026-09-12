@@ -55,7 +55,7 @@ PORTABLE_FILES = {
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
         oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
         main_console_sink main_console_sink_callsites main_output_pipes main_output_terminate
-        main_console_lifecycle main_control_deadline workload_dev_aliases
+        main_console_lifecycle main_control_deadline workload_dev_aliases workload_loopback
     """),
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff

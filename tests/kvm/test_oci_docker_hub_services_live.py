@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import uuid
@@ -140,6 +141,36 @@ def _run_arguments(case: ServiceCase, selection, name: str) -> tuple[object, ...
     if case.user_override is not None:
         arguments += ("--user", case.user_override)
     return arguments
+
+
+def _assert_loopback_security(payload: bytes) -> None:
+    assert b"loopback_count=1\nextra_interfaces=0\n" in payload
+    uid = re.search(rb"^Uid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
+    gid = re.search(rb"^Gid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
+    assert uid is not None and int(uid.group(1)) != 0
+    assert gid is not None and int(gid.group(1)) != 0
+    for field in (b"CapInh", b"CapPrm", b"CapEff", b"CapBnd", b"CapAmb"):
+        assert re.search(rb"^" + field + rb"=0+\s*$", payload, re.M)
+    assert b"NoNewPrivs=1\n" in payload and b"Seccomp=2\n" in payload
+    if b"ip_tool=present\n" in payload:
+        assert re.search(rb"\binet 127\.0\.0\.1/8\b", payload)
+
+
+def _loopback_security_command(netdev_path: str = "/proc/net/dev", status_path: str = "/proc/self/status") -> str:
+    netdev = shlex.quote(netdev_path)
+    status = shlex.quote(status_path)
+    return (
+        "count=0; extra=0; "
+        "while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; dev=${1-}; "
+        "case $dev in lo) count=$((count+1));; *) extra=$((extra+1));; esac; "
+        f"done < {netdev}; printf 'loopback_count=%s\\nextra_interfaces=%s\\n' \"$count\" \"$extra\"; "
+        "while read -r key value rest; do case $key in "
+        "Uid:|Gid:) printf '%s=%s %s\\n' \"${key%:}\" \"$value\" \"$rest\";; "
+        "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:) "
+        f"printf '%s=%s\\n' \"${{key%:}}\" \"$value\";; esac; done < {status}; "
+        "if command -v ip >/dev/null 2>&1; then printf 'ip_tool=present\\n'; ip -4 addr show dev lo; "
+        "else printf 'ip_tool=absent\\n'; fi"
+    )
 
 
 def _domain_state(environment: dict[str, str], name: str):
@@ -279,10 +310,29 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         )
         legacy._success(version)
         assert case.version_marker in version.stdout + version.stderr
+        if case.key == "REDIS_USER":
+            loopback = legacy._save(
+                parent,
+                "guest-loopback-security",
+                legacy._cli(
+                    environment,
+                    "exec",
+                    name,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    _loopback_security_command(),
+                    timeout=60,
+                ),
+            )
+            legacy._success(loopback)
+            _assert_loopback_security(loopback.stdout)
         probe = legacy._save(
             parent, "service-probe", legacy._cli(environment, "exec", name, "--", *case.probe_argv, timeout=60)
         )
         probe_ok = probe.returncode == 0 and case.probe_marker in probe.stdout
+        if case.key == "REDIS_USER":
+            probe_ok = probe.returncode == 0 and probe.stdout == case.probe_marker
         if probe.returncode == 77:
             _save_json(
                 parent, "service-probe.json", {"result": "skipped", "reason": "image client absent", "returncode": 77}

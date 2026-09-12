@@ -61,6 +61,18 @@ the workload child's already-owned FIFO endpoints. These are setup-time checks
 inside the child's private mount namespace, not an immutability guarantee
 against a UID 0 workload after launch.
 
+Before credentials, capabilities, no-new-privileges, and seccomp are committed,
+each workload child idempotently validates and enables only the kernel-created
+IPv4 interface named `lo` in the guest's shared no-NIC network namespace. The
+raw `ifreq` ioctl sequence requires a positive index, an index-to-name `lo`
+round trip, an exact initial flag word of `IFF_LOOPBACK` or
+`IFF_UP|IFF_LOOPBACK|IFF_RUNNING`, and that the same index reaches the latter
+exact word. Every socket is close-on-exec and is closed before isolation
+continues. The guest does not create an interface or namespace and does not add
+an address, route, DNS configuration, host port, or host-network attachment.
+The qualified built-in IPv4 kernel behavior assigns `127.0.0.1/8` when the
+loopback device is brought up.
+
 PID 1 acquires and revalidates a distinct nonblocking console OFD through the
 fixed `/proc/self/fd/1` magic link before root transition. After acquisition,
 diagnostics use only the queue and pinned sink: there is no blocking fallback.

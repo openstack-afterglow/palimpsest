@@ -504,6 +504,14 @@ The frame's own five-second timeout remains distinct from the caller's STOP
 or cleanup slice: exhausted caller time yields without dropping parser state,
 while an expired partial-frame deadline still rejects the connection.
 
+`tests/unit/test_workload_loopback.py` extracts the production loopback helper
+into an actual-C syscall-double harness. It covers fresh and already-up success,
+exact ioctl order and payloads, interface index/name/flag drift, every ioctl
+failure, final-state rejection, and socket closure. A Linux-only compile check
+binds the freestanding constants and 40-byte `ifreq` layout to the Linux UAPI.
+The KVM kernel-config proof requires built-in `CONFIG_NET` and `CONFIG_INET`;
+module or missing values are rejected. Native service proof remains explicit.
+
 The production console-sink helpers and their child/parent call sites have
 separate source-extraction harnesses:
 

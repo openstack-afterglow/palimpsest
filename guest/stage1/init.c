@@ -33,6 +33,7 @@ struct span { const char *p; usize n; };
 #define SYS_rt_sigprocmask 14
 #define SYS_pause 34
 #define SYS_getpid 39
+#define SYS_socket 41
 #define SYS_fork 57
 #define SYS_execve 59
 #define SYS_exit 60
@@ -116,6 +117,17 @@ struct span { const char *p; usize n; };
 #define O_NOFOLLOW 0400000
 #define O_DIRECTORY 0200000
 #define O_ACCMODE 3
+#define SOCK_DGRAM 2
+#define SOCK_CLOEXEC O_CLOEXEC
+#define AF_INET 2
+#define IFNAMSIZ 16
+#define SIOCGIFNAME 0x8910
+#define SIOCGIFFLAGS 0x8913
+#define SIOCSIFFLAGS 0x8914
+#define SIOCGIFINDEX 0x8933
+#define IFF_UP 0x1
+#define IFF_LOOPBACK 0x8
+#define IFF_RUNNING 0x40
 #define F_GETFD 1
 #define F_GETFL 3
 #define FD_CLOEXEC 1
@@ -278,6 +290,17 @@ struct span { const char *p; usize n; };
 struct timespec_local {
     i64 sec;
     i64 nsec;
+};
+
+/* Linux x86_64 ifreq is a 16-byte name followed by a 24-byte union. */
+struct ifreq_local {
+    char name[IFNAMSIZ];
+    union {
+        i64 align;
+        int index;
+        short flags;
+        u8 bytes[24];
+    } value;
 };
 
 struct stat_local {
@@ -4305,6 +4328,61 @@ rejected:
     return 0;
 }
 
+static int prepare_workload_loopback(struct child_error_local *failure) {
+    struct ifreq_local request;
+    i64 descriptor, operation = -EIO;
+    int index = 0;
+    int valid = 0;
+
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, "lo", 3);
+    descriptor = sc3(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) {
+        set_workload_failure(failure, 44, descriptor);
+        return 0;
+    }
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFINDEX, (i64)&request);
+    if (operation != 0 || request.value.index <= 0) goto closed;
+    index = request.value.index;
+    memset(&request, 0, sizeof(request));
+    request.value.index = index;
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFNAME, (i64)&request);
+    if (operation != 0 || request.name[0] != 'l' || request.name[1] != 'o' ||
+        request.name[2] != 0) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, "lo", 3);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFFLAGS, (i64)&request);
+    if (operation != 0 || (request.value.flags != IFF_LOOPBACK &&
+                           request.value.flags != (IFF_UP | IFF_LOOPBACK | IFF_RUNNING)))
+        goto closed;
+    if (request.value.flags == IFF_LOOPBACK) {
+        request.value.flags = IFF_UP | IFF_LOOPBACK;
+        operation = sc3(SYS_ioctl, descriptor, SIOCSIFFLAGS, (i64)&request);
+        if (operation != 0) goto closed;
+    }
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, "lo", 3);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFINDEX, (i64)&request);
+    if (operation != 0 || request.value.index != index) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, "lo", 3);
+    request.value.flags = 0;
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFFLAGS, (i64)&request);
+    if (operation != 0 || request.value.flags != (IFF_UP | IFF_LOOPBACK | IFF_RUNNING))
+        goto closed;
+    valid = 1;
+closed:
+    if (sc1(SYS_close, descriptor) != 0) {
+        set_workload_failure(failure, 44, EIO);
+        return 0;
+    }
+    if (!valid) {
+        set_workload_failure(failure, 44, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    return 1;
+}
+
 static int read_cap_last_cap(u32 *last) {
     u8 text[32];
     i64 count = read_bounded_file("/proc/sys/kernel/cap_last_cap", text, sizeof(text), 1, 0);
@@ -4450,6 +4528,7 @@ static int install_workload_seccomp(struct child_error_local *failure) {
 static int prepare_workload_isolation(struct guest_process *process,
                                       struct child_error_local *failure) {
     return prepare_workload_mount_boundary(failure) &&
+           prepare_workload_loopback(failure) &&
            prepare_workload_securebits(failure) &&
            drop_workload_credentials(process, failure) &&
            clear_workload_capabilities(failure) &&

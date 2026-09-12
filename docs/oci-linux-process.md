@@ -145,6 +145,26 @@ failed definitions and use a reviewed unique-name strategy for cold testing;
 the existing fixed `exec-cli` test name now collides with retained evidence.
 No new native test or application build is claimed by this review.
 
+## Bounded guest loopback implementation (2026-09-11, test-defined)
+
+Stage 1 now brings up only the kernel-created interface named `lo` in the
+guest's existing no-NIC network namespace. The privileged child performs a
+close-on-exec IPv4 datagram-socket ioctl sequence before credential and
+capability drop: name-to-index, index-to-name, exact flags, an optional `UP`
+transition, then same-index and exact `UP|LOOPBACK|RUNNING` revalidation. The
+already-up state is idempotent. Any unexpected identity or flag, syscall
+failure, or socket-close failure rejects launch at a dedicated stage.
+
+This does not create a network namespace or device and does not configure an
+address, route, DNS, host port, default route, or host-network connection.
+Built-in `CONFIG_NET` and `CONFIG_INET` are now qualification prerequisites;
+the qualified kernel's IPv4 loopback-up event supplies `127.0.0.1/8`.
+`tests/unit/test_workload_loopback.py` is actual-C component evidence. The
+explicit Redis-user KVM case additionally records that `/proc/net/dev` contains
+only `lo`, checks `127.0.0.1/8` when the image has `ip`, rechecks numeric
+identity/capability-zero/NNP/seccomp, and requires exact `PONG`. Until that
+opt-in VM test passes, service compatibility remains unqualified.
+
 ## Bounded stdout/stderr alias implementation (2026-09-11, test-defined)
 
 The implemented guest source keeps the existing six private character devices
