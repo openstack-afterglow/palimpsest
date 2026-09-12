@@ -219,6 +219,14 @@ actual result, root/PID1 observations where reachable, failed runtime and
 source hashes. Only an exactly owned active failed VM may be publicly stopped;
 uncertain ownership or inactivity blocks subsequent native cases.
 
+Redis-user network qualification cross-checks proc/sysfs interface sets and
+unique positive indices: `lo` type772 with flags0x9/0x49, plus only optional
+`tunl0` type768 and `ip6tnl0` type769 with exact flags0x80. A live domain XML
+check independently rejects NIC devices. Reject malformed/duplicate/missing
+records, unexpected devices and UP tunnels; retain all workload security,
+PING, root/PID1 and cleanup checks. This test-only revision is distinct from
+the earlier literal-only-lo failures and does not change production networking.
+
 Executed checkpoint `1752ba9` (2026-09-11): all five native cases failed;
 the default four never reached application probes, while explicit-user Redis
 passed readiness/version/root/PID1 checks but its PING failed with network

@@ -83,7 +83,7 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert "assert probe_ok" in source
     assert 'if case.key == "REDIS_USER"' in source
     assert '"guest-loopback-security"' in source
-    assert 'netdev_path: str = "/proc/net/dev"' in source and "extra_interfaces=0" in source
+    assert 'netdev_path: str = "/proc/net/dev"' in source and "netdev_count" in source
     assert 'sysfs_net_path: str = "/sys/class/net"' in source
     assert "netdev_begin" in source and "interface name=%s flags=%s type=%s ifindex=%s" in source
     assert 'status_path: str = "/proc/self/status"' in source
@@ -93,13 +93,14 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert 'probe.stdout == case.probe_marker' in source
 
 
-def test_loopback_shell_probe_skips_both_headers_and_counts_only_lo(tmp_path: Path) -> None:
+def test_loopback_shell_probe_skips_both_headers_and_accepts_allowed_subset(tmp_path: Path) -> None:
     netdev = tmp_path / "net-dev"
     status = tmp_path / "status"
     netdev.write_text(
         "Inter-|   Receive                                                |  Transmit\n"
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
-        "    lo: 10 1 0 0 0 0 0 0 10 1 0 0 0 0 0 0\n",
+        "    lo: 10 1 0 0 0 0 0 0 10 1 0 0 0 0 0 0\n"
+        " tunl0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         encoding="ascii",
     )
     status.write_text(
@@ -115,6 +116,11 @@ def test_loopback_shell_probe_skips_both_headers_and_counts_only_lo(tmp_path: Pa
     (interface / "flags").write_text("0x49\n", encoding="ascii")
     (interface / "type").write_text("772\n", encoding="ascii")
     (interface / "ifindex").write_text("1\n", encoding="ascii")
+    tunnel = sysfs_net / "tunl0"
+    tunnel.mkdir()
+    (tunnel / "flags").write_text("0x80\n", encoding="ascii")
+    (tunnel / "type").write_text("768\n", encoding="ascii")
+    (tunnel / "ifindex").write_text("2\n", encoding="ascii")
     result = subprocess.run(
         ["/bin/sh", "-c", services._loopback_security_command(str(netdev), str(status), str(sysfs_net))],
         env={"PATH": ""},
@@ -124,36 +130,123 @@ def test_loopback_shell_probe_skips_both_headers_and_counts_only_lo(tmp_path: Pa
     )
     assert result.stderr == b""
     assert b"netdev_begin\n" in result.stdout and b"netdev_end\n" in result.stdout
-    assert b"interface name=lo flags=0x49 type=772 ifindex=1\n" in result.stdout
+    assert b"netdev_count=2\n" in result.stdout and b"sysfs_count=2\n" in result.stdout
     services._assert_loopback_security(result.stdout)
 
 
-def test_loopback_security_receipt_parser_accepts_exact_bounded_sample() -> None:
-    services._assert_loopback_security(
-        b"loopback_count=1\nextra_interfaces=0\n"
-        b"Uid=999 999 999 999\nGid=1000 1000 1000 1000\n"
+def _receipt(*interfaces: tuple[str, str, int, int], netdev_names: tuple[str, ...] | None = None) -> bytes:
+    names = netdev_names or tuple(interface[0] for interface in interfaces)
+    return (
+        f"netdev_count={len(names)}\nnetdev_begin\n".encode()
+        + b"".join(f"netdev_interface={name}\n".encode() for name in names)
+        + b"netdev_end\n"
+        + b"".join(
+            f"interface name={name} flags={flags} type={kind} ifindex={index}\n".encode()
+            for name, flags, kind, index in interfaces
+        )
+        + f"sysfs_count={len(interfaces)}\n".encode()
+        + b"Uid=999 999 999 999\nGid=1000 1000 1000 1000\n"
         b"CapInh=0000000000000000\nCapPrm=0000000000000000\n"
         b"CapEff=0000000000000000\nCapBnd=0000000000000000\nCapAmb=0000000000000000\n"
         b"NoNewPrivs=1\nSeccomp=2\nip_tool=present\n1: lo    inet 127.0.0.1/8 scope host lo\n"
     )
 
 
-@pytest.mark.parametrize("changed", [b"extra_interfaces=1", b"CapEff=1", b"NoNewPrivs=0", b"inet 127.0.0.2/8"])
+@pytest.mark.parametrize(
+    "interfaces",
+    [
+        (("lo", "0x9", 772, 1),),
+        (("lo", "0x49", 772, 1), ("tunl0", "0x80", 768, 2)),
+        (("lo", "0x49", 772, 1), ("ip6tnl0", "0x80", 769, 3)),
+        (("lo", "0x49", 772, 1), ("tunl0", "0x80", 768, 2), ("ip6tnl0", "0x80", 769, 3)),
+    ],
+)
+def test_loopback_security_receipt_parser_accepts_exact_allowed_subsets(interfaces) -> None:
+    services._assert_loopback_security(_receipt(*interfaces))
+
+
+@pytest.mark.parametrize("changed", [b"CapEff=1", b"NoNewPrivs=0", b"inet 127.0.0.2/8"])
 def test_loopback_security_receipt_parser_rejects_drift(changed: bytes) -> None:
-    sample = (
-        b"loopback_count=1\nextra_interfaces=0\n"
-        b"Uid=999 999 999 999\nGid=1000 1000 1000 1000\n"
-        b"CapInh=0\nCapPrm=0\nCapEff=0\nCapBnd=0\nCapAmb=0\n"
-        b"NoNewPrivs=1\nSeccomp=2\nip_tool=present\ninet 127.0.0.1/8\n"
-    )
+    sample = _receipt(("lo", "0x49", 772, 1))
     originals = {
-        b"extra_interfaces=1": b"extra_interfaces=0",
-        b"CapEff=1": b"CapEff=0",
+        b"CapEff=1": b"CapEff=0000000000000000",
         b"NoNewPrivs=0": b"NoNewPrivs=1",
         b"inet 127.0.0.2/8": b"inet 127.0.0.1/8",
     }
     with pytest.raises(AssertionError):
         services._assert_loopback_security(sample.replace(originals[changed], changed))
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    [b"Uid=0 0 0 0\n", b"CapEff=1\n", b"NoNewPrivs=0\n", b"Seccomp=0\n", b"ip_tool=absent\n"],
+)
+def test_loopback_security_receipt_rejects_contradictory_duplicate_security_fields(contradiction: bytes) -> None:
+    with pytest.raises(AssertionError):
+        services._assert_loopback_security(_receipt(("lo", "0x49", 772, 1)) + contradiction)
+
+
+@pytest.mark.parametrize(
+    "interfaces,names",
+    [
+        ((("lo", "0x49", 772, 1), ("eth0", "0x1003", 1, 2)), None),
+        ((("lo", "0x49", 772, 1), ("tunl0", "0x81", 768, 2)), None),
+        ((("lo", "0x49", 772, 1), ("tunl0", "0x80", 769, 2)), None),
+        ((("lo", "0x49", 772, 1), ("renamed", "0x80", 768, 2)), None),
+        ((("lo", "0x49", 772, 0),), None),
+        ((("lo", "0x49", 772, 1), ("tunl0", "0x80", 768, 1)), None),
+        ((("lo", "0x49", 772, 1),), ("lo", "tunl0")),
+        ((("lo", "0x49", 772, 1),), ("lo", "lo")),
+        ((("lo", "0x49", 772, 1), ("lo", "0x49", 772, 2)), None),
+    ],
+)
+def test_loopback_security_receipt_rejects_interface_drift(interfaces, names) -> None:
+    with pytest.raises(AssertionError):
+        services._assert_loopback_security(_receipt(*interfaces, netdev_names=names))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.replace(b"interface name=lo", b"interface malformed=lo"),
+        lambda value: value.replace(b"interface name=lo flags=0x49 type=772 ifindex=1\n", b""),
+        lambda value: value.replace(b"sysfs_count=1", b"sysfs_count=2"),
+    ],
+)
+def test_loopback_security_receipt_rejects_malformed_missing_or_count_mismatch(mutation) -> None:
+    with pytest.raises(AssertionError):
+        services._assert_loopback_security(mutation(_receipt(("lo", "0x49", 772, 1))))
+
+
+def test_running_domain_xml_requires_one_devices_container_and_no_interface(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(services.legacy.shutil, "which", lambda *args, **kwargs: "/usr/bin/virsh")
+    monkeypatch.setattr(
+        services.legacy,
+        "_bounded_command",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 0, b"<domain><uuid>expected</uuid><devices><disk/></devices></domain>", b""
+        ),
+    )
+    services._assert_running_domain_has_no_interface(tmp_path, {}, "proof", "expected")
+    assert (tmp_path / "running-domain-xml.stdout").is_file()
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [
+        b"<domain><uuid>expected</uuid><devices><interface type='network'/></devices></domain>",
+        b"<domain/>",
+        b"<domain><devices/></domain><extra/>",
+        b"<domain><uuid>wrong</uuid><devices/></domain>",
+    ],
+)
+def test_running_domain_xml_rejects_interface_missing_devices_or_malformed(monkeypatch, tmp_path: Path, xml: bytes) -> None:
+    monkeypatch.setattr(services.legacy.shutil, "which", lambda *args, **kwargs: "/usr/bin/virsh")
+    monkeypatch.setattr(
+        services.legacy, "_bounded_command", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, xml, b"")
+    )
+    with pytest.raises((AssertionError, services.ET.ParseError)):
+        services._assert_running_domain_has_no_interface(tmp_path, {}, "proof", "expected")
 
 
 def _install_retention_fakes(

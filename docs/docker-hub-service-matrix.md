@@ -58,6 +58,19 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Current network qualification contract
+
+The Redis-user proof requires matching `/proc/net/dev` and sysfs interface
+sets, unique positive indices, and exactly one `lo` (type 772, flags `0x9`
+or `0x49`). Only optional `tunl0` (type 768) and `ip6tnl0` (type 769), each
+with exact flags `0x80`, are accepted in addition. Unknown, renamed, UP,
+duplicate, missing or inconsistent interface evidence is rejected. This is
+a deliberate test-contract revision from literal only-`lo`, not a retrospective
+pass for the earlier failed runs. A separate live domain XML check rejects
+network interface devices before service probing. No guest networking,
+capabilities or packaged ELF are changed. The existing UID/GID, capability,
+NNP/seccomp, exact PONG, root/PID1 and public cleanup assertions remain.
+
 ### Redis diagnostic checkpoint — `bb879dd`, 2026-09-12
 
 Exact `bb879dd645ba38463abc6f5a13e4f9be2567a926` passed the focused

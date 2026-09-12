@@ -10,6 +10,7 @@ import shlex
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,15 +145,64 @@ def _run_arguments(case: ServiceCase, selection, name: str) -> tuple[object, ...
 
 
 def _assert_loopback_security(payload: bytes) -> None:
-    assert b"loopback_count=1\nextra_interfaces=0\n" in payload
-    uid = re.search(rb"^Uid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
-    gid = re.search(rb"^Gid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
-    assert uid is not None and int(uid.group(1)) != 0
-    assert gid is not None and int(gid.group(1)) != 0
+    assert len(payload) <= 64 * 1024
+    lines = payload.splitlines()
+    counters: dict[bytes, int] = {}
+    for key in (b"netdev_count", b"sysfs_count"):
+        matches = [line for line in lines if line.startswith(key + b"=")]
+        assert len(matches) == 1
+        value = matches[0][len(key) + 1 :]
+        assert re.fullmatch(rb"[0-9]+", value)
+        counters[key] = int(value)
+
+    assert lines.count(b"netdev_begin") == 1 and lines.count(b"netdev_end") == 1
+    begin, end = lines.index(b"netdev_begin"), lines.index(b"netdev_end")
+    assert begin < end
+    netdev_names: list[bytes] = []
+    for line in lines[begin + 1 : end]:
+        match = re.fullmatch(rb"netdev_interface=([A-Za-z0-9_.-]+)", line)
+        assert match is not None
+        netdev_names.append(match.group(1))
+
+    records: dict[bytes, tuple[int, int, int]] = {}
+    interface_lines = [line for line in lines if line.startswith(b"interface ")]
+    for line in interface_lines:
+        match = re.fullmatch(
+            rb"interface name=([A-Za-z0-9_.-]+) flags=(0x[0-9a-f]+) type=([0-9]+) ifindex=([0-9]+)", line
+        )
+        assert match is not None
+        name = match.group(1)
+        assert name not in records
+        flags, kind, index = int(match.group(2), 16), int(match.group(3)), int(match.group(4))
+        assert index > 0
+        records[name] = (flags, kind, index)
+
+    assert len(netdev_names) == len(set(netdev_names)) == counters[b"netdev_count"]
+    assert len(records) == counters[b"sysfs_count"]
+    assert len({record[2] for record in records.values()}) == len(records)
+    assert set(netdev_names) == set(records)
+    loopback = records.pop(b"lo", None)
+    assert loopback is not None
+    assert loopback[:2] in {(0x9, 772), (0x49, 772)}
+    allowed_tunnels = {b"tunl0": (0x80, 768), b"ip6tnl0": (0x80, 769)}
+    for name, (flags, kind, _index) in records.items():
+        assert name in allowed_tunnels
+        assert (flags, kind) == allowed_tunnels[name]
+    assert len([line for line in lines if line.startswith(b"Uid=")]) == 1
+    assert len([line for line in lines if line.startswith(b"Gid=")]) == 1
+    uid = re.findall(rb"^Uid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
+    gid = re.findall(rb"^Gid=([0-9]+)\s+\1\s+\1\s+\1\s*$", payload, re.M)
+    assert len(uid) == 1 and int(uid[0]) != 0
+    assert len(gid) == 1 and int(gid[0]) != 0
     for field in (b"CapInh", b"CapPrm", b"CapEff", b"CapBnd", b"CapAmb"):
-        assert re.search(rb"^" + field + rb"=0+\s*$", payload, re.M)
-    assert b"NoNewPrivs=1\n" in payload and b"Seccomp=2\n" in payload
-    if b"ip_tool=present\n" in payload:
+        assert len([line for line in lines if line.startswith(field + b"=")]) == 1
+        assert len(re.findall(rb"^" + field + rb"=0+\s*$", payload, re.M)) == 1
+    assert len([line for line in lines if line.startswith(b"NoNewPrivs=")]) == 1
+    assert len([line for line in lines if line.startswith(b"Seccomp=")]) == 1
+    assert lines.count(b"NoNewPrivs=1") == 1 and lines.count(b"Seccomp=2") == 1
+    ip_tool = [line for line in lines if line.startswith(b"ip_tool=")]
+    assert len(ip_tool) == 1 and ip_tool[0] in {b"ip_tool=present", b"ip_tool=absent"}
+    if ip_tool[0] == b"ip_tool=present":
         assert re.search(rb"\binet 127\.0\.0\.1/8\b", payload)
 
 
@@ -165,16 +215,19 @@ def _loopback_security_command(
     status = shlex.quote(status_path)
     sysfs_net = shlex.quote(sysfs_net_path)
     return (
-        "count=0; extra=0; "
+        "netdev_count=0; "
         "while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; dev=${1-}; "
-        "case $dev in lo) count=$((count+1));; *) extra=$((extra+1));; esac; "
-        f"done < {netdev}; printf 'loopback_count=%s\\nextra_interfaces=%s\\n' \"$count\" \"$extra\"; "
-        f"printf 'netdev_begin\\n'; while IFS= read -r line; do printf 'netdev=%s\\n' \"$line\"; done < {netdev}; "
+        "netdev_count=$((netdev_count+1)); "
+        f"done < {netdev}; printf 'netdev_count=%s\\n' \"$netdev_count\"; "
+        "printf 'netdev_begin\\n'; "
+        f"while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; printf 'netdev_interface=%s\\n' \"${{1-}}\"; done < {netdev}; "
         "printf 'netdev_end\\n'; "
+        "sysfs_count=0; "
         f"for entry in {sysfs_net}/*; do [ -e \"$entry\" ] || continue; name=${{entry##*/}}; "
         "IFS= read -r flags < \"$entry/flags\" || exit 78; IFS= read -r type < \"$entry/type\" || exit 78; "
         "IFS= read -r ifindex < \"$entry/ifindex\" || exit 78; "
-        "printf 'interface name=%s flags=%s type=%s ifindex=%s\\n' \"$name\" \"$flags\" \"$type\" \"$ifindex\"; done; "
+        "sysfs_count=$((sysfs_count+1)); printf 'interface name=%s flags=%s type=%s ifindex=%s\\n' \"$name\" \"$flags\" \"$type\" \"$ifindex\"; done; "
+        "printf 'sysfs_count=%s\\n' \"$sysfs_count\"; "
         "while read -r key value rest; do case $key in "
         "Uid:|Gid:) printf '%s=%s %s\\n' \"${key%:}\" \"$value\" \"$rest\";; "
         "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:) "
@@ -182,6 +235,26 @@ def _loopback_security_command(
         "if command -v ip >/dev/null 2>&1; then printf 'ip_tool=present\\n'; ip -4 addr show dev lo; "
         "else printf 'ip_tool=absent\\n'; fi"
     )
+
+
+def _assert_running_domain_has_no_interface(
+    parent: Path, environment: dict[str, str], name: str, expected_uuid: str
+) -> None:
+    virsh = legacy.shutil.which("virsh", path=environment.get("PATH"))
+    assert virsh
+    result = legacy._bounded_command(
+        [virsh, "-c", "qemu:///system", "dumpxml", name], environment=environment, timeout=15
+    )
+    assert len(result.stdout) <= 1024 * 1024 and len(result.stderr) <= 1024 * 1024
+    result = legacy._save(parent, "running-domain-xml", result)
+    legacy._success(result)
+    root = ET.fromstring(result.stdout)
+    assert root.tag == "domain"
+    identifiers = root.findall("./uuid")
+    assert len(identifiers) == 1 and identifiers[0].text == expected_uuid
+    devices = root.findall("./devices")
+    assert len(devices) == 1
+    assert devices[0].findall("interface") == []
 
 
 def _domain_state(environment: dict[str, str], name: str):
@@ -314,6 +387,7 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         _wait_ready_or_inactive(parent, environment, name, case.readiness)
         state, observed_uuid = _domain_state(environment, name)
         assert state == "running" and observed_uuid == domain_uuid
+        _assert_running_domain_has_no_interface(parent, environment, name, domain_uuid)
         before = legacy._root_proof(environment, name)
         _save_json(parent, "root-proof-before.json", before)
         assert before["domain"]["uuid"] == domain_uuid
