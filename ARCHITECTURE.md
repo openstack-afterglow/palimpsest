@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+`2cb6a3e`의 공식 Redis `--user redis` 실기1건이 새 테스트 계약으로 통과했다(27.96초). 공개 detached run, readiness/version, UUID-bound NIC 없는 XML, proc/sysfs 장치 대조, PONG, 실제 `/`와 인증 root 일치, PID1 거부, stop/rm을 확인했다. 동일 서버 SHA 선별139건(7.34초)도 통과했으며 기존10개 inactive domain·12개 archive를 보존하고 활성 VM/QEMU 없음까지 확인했다. 기본 Redis·Postgres·MySQL·NGINX 및 전체 Gate2의 새 성공은 아니며 production/ELF는 그대로다. [실기 증거](docs/docker-hub-service-matrix.md)를 참고한다.
+
 후속 Redis-user 테스트 계약은 proc/sysfs 인터페이스 집합·유일한 양수 index를 대조하고 `lo`(type772, flags0x9/0x49) 외에는 선택적 `tunl0`(type768)·`ip6tnl0`(type769)의 정확한 flags0x80만 허용한다. 실행 중 domain XML의 NIC 부재도 별도로 검사한다. 알 수 없는 장치·UP 터널·불일치·중복/누락은 거부하며 UID/GID·capability·NNP/seccomp·PING·root/PID1·정상 정리 검사는 유지한다. 이는 literal only-lo에서 명시적으로 바꾼 테스트 계약이며 production/ELF 변경이나 이전 실패의 소급 통과가 아니다. 새 native 결과는 별도로 기록한다.
 
 `bb879dd`의 Redis `--user redis` 재진단에서 실제 `PONG`(exit0), 앱 `/`와 전후 인증 root identity의 일치(device21/inode2), PID1 직접 접근 거부를 확인했다. 추가 장치는 `tunl0`(type768)·`ip6tnl0`(type769)이고 둘 다 flags0x80으로 UP 비트가 없다. 엄격한 only-lo 검사는 그대로 실패했다(23.62초). 서비스 응답 성공과 전체 qualification 실패를 구분한다. 기존9개 inactive domain·12개 archive 및 새 실패 domain 보존 검사는 통과했고 활성 VM/QEMU는 없다. Production/ELF나 검사 허용 기준은 변경하지 않았다. 다음 검토는 비활성 커널 터널과 외부 NIC를 구별하는 검증 계약이며, 상세 증거는 [service matrix](docs/docker-hub-service-matrix.md)에 있다.
@@ -367,8 +369,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 {
   "schema_version": 1,
   "source_sha256": "446741e75cb3679ad5213ab58ca4b1dc34de13384e06cc033091ae533cc7a48f",
-  "reviewed_at": "2026-09-12T13:33:00Z",
-  "summary": "Reviewed test-only network qualification: exact proc/sysfs device set and flags, unique indices/security fields, live UUID-bound no-NIC XML. Preserved PONG/root/PID1/cleanup and historical failures; no production or ELF change. Updated current contract docs."
+  "reviewed_at": "2026-09-12T13:36:16Z",
+  "summary": "Reviewed exact 2cb6a3e Redis-user native success and test control flow: revised network proof, PONG, root/PID1, public cleanup and preserved ten inactive domains/twelve archives. Documentation-only evidence update; no production/ELF or further contract change; default-service failures remain."
 }
 ```
 <!-- architecture-review:end -->

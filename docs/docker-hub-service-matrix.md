@@ -58,6 +58,33 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Redis-user qualification — `2cb6a3e`, 2026-09-12
+
+Exact `2cb6a3e86f9d00d1988db338a7de4bfdabb8058b` passed the
+Redis-user native case on `pieroot-server` (one test, 27.96 seconds) under
+the revised contract below. The original pinned Redis archive with explicit
+`--user redis` passed detached run, readiness/version, UUID-bound live XML
+without NICs, matching proc/sysfs identities with only the allowed inactive
+tunnels, exact PONG, actual `/` versus authenticated root, PID1 access denial,
+and public stop/rm. Default-user Redis remains a separate failed case.
+Postgres, MySQL and NGINX were not rerun or promoted to success.
+
+Local related contracts passed 126 tests (2.31 seconds) plus architecture
+13 (6.30 seconds); the same server SHA passed the combined 139 (7.34 seconds).
+Its [GitHub package build passed](https://github.com/openstack-afterglow/palimpsest/actions/runs/34696755309).
+Production guest and packaged ELF remain unchanged; this is not a new full
+guest matrix, Gate 2, direct registry intake or external-network proof.
+
+Evidence is `/tmp/palimpsest-loopback-native-og9m1dvx`, with retained test
+receipts at `/tmp/p-hub-svc-rdu-8eb7dbf9`. The successful new run/domain was
+removed through public cleanup. All pre/post/final checks preserved the same
+ten inactive domains and twelve archive hashes, with zero active VM/QEMU.
+The wrapper returned 0 with `verification_passed=true`; its SHA-256 was
+`8d57f4a0a6952be43247f7e0d7a3264ea6eff2c5b07a859f9bbb2355e23d750d`.
+Private journal `/tmp/palimpsest-loopback-journal-redis_user-ubgy089l`
+validated 22 records/11 invocations/5136 bytes. Earlier failed runtimes and
+their strict-only-lo results remain preserved, not rewritten.
+
 ### Current network qualification contract
 
 The Redis-user proof requires matching `/proc/net/dev` and sysfs interface
