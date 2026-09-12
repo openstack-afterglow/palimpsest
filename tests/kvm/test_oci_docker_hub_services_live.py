@@ -156,14 +156,25 @@ def _assert_loopback_security(payload: bytes) -> None:
         assert re.search(rb"\binet 127\.0\.0\.1/8\b", payload)
 
 
-def _loopback_security_command(netdev_path: str = "/proc/net/dev", status_path: str = "/proc/self/status") -> str:
+def _loopback_security_command(
+    netdev_path: str = "/proc/net/dev",
+    status_path: str = "/proc/self/status",
+    sysfs_net_path: str = "/sys/class/net",
+) -> str:
     netdev = shlex.quote(netdev_path)
     status = shlex.quote(status_path)
+    sysfs_net = shlex.quote(sysfs_net_path)
     return (
         "count=0; extra=0; "
         "while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; dev=${1-}; "
         "case $dev in lo) count=$((count+1));; *) extra=$((extra+1));; esac; "
         f"done < {netdev}; printf 'loopback_count=%s\\nextra_interfaces=%s\\n' \"$count\" \"$extra\"; "
+        f"printf 'netdev_begin\\n'; while IFS= read -r line; do printf 'netdev=%s\\n' \"$line\"; done < {netdev}; "
+        "printf 'netdev_end\\n'; "
+        f"for entry in {sysfs_net}/*; do [ -e \"$entry\" ] || continue; name=${{entry##*/}}; "
+        "IFS= read -r flags < \"$entry/flags\" || exit 78; IFS= read -r type < \"$entry/type\" || exit 78; "
+        "IFS= read -r ifindex < \"$entry/ifindex\" || exit 78; "
+        "printf 'interface name=%s flags=%s type=%s ifindex=%s\\n' \"$name\" \"$flags\" \"$type\" \"$ifindex\"; done; "
         "while read -r key value rest; do case $key in "
         "Uid:|Gid:) printf '%s=%s %s\\n' \"${key%:}\" \"$value\" \"$rest\";; "
         "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:) "
@@ -262,6 +273,7 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
     domain_uuid = None
     completed = False
     primary_error: BaseException | None = None
+    loopback_security_error: AssertionError | None = None
     try:
         process = legacy._authenticate(selection, parent)
         process.require_bootable()
@@ -326,7 +338,10 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                 ),
             )
             legacy._success(loopback)
-            _assert_loopback_security(loopback.stdout)
+            try:
+                _assert_loopback_security(loopback.stdout)
+            except AssertionError as exc:
+                loopback_security_error = exc
         probe = legacy._save(
             parent, "service-probe", legacy._cli(environment, "exec", name, "--", *case.probe_argv, timeout=60)
         )
@@ -373,6 +388,9 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         }
         assert before["root_identity"] == after["root_identity"]
         assert (device, inode) == (after["root_identity"]["device"], after["root_identity"]["inode"])
+        assert loopback_security_error is None, (
+            "guest loopback-only security receipt did not pass; service/root/PID1 evidence was retained"
+        )
         assert probe_ok, "official image service probe did not pass; root/PID1 evidence was retained"
         legacy._success(legacy._save(parent, "stop", legacy._cli(environment, "stop", name, timeout=90)))
         legacy._success(legacy._save(parent, "rm", legacy._cli(environment, "rm", name, timeout=90)))

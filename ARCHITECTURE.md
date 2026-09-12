@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+`f86e4da`의 같은 서버 SHA에서 선별453건, 새 배포 ELF의 stage-1 43 boots/44 QEMU(122.02초), UID0/101 stdio2건(31.00초)이 통과했다. Redis 사용자 지정은 lo의127.0.0.1/8·UID999/GID1000·capability0·NNP/seccomp를 확인했으나 추가 인터페이스2개를 감지한 테스트가 PING 전에 실패했다. NIC 없는 domain XML과 커널 내장 터널 설정을 확인했지만 장치 이름/상태는 다음 진단 대상이다. 새 실패 domain은 shut off로 보존했고 기존8개만 기대한 최종 inventory gate는 실패했다. 상세 범위는 [service matrix](docs/docker-hub-service-matrix.md)에 기록하며 Redis 서비스 통과를 주장하지 않는다.
+
 후속 guest loopback 구현은 workload 자식의 mount 격리 후, credential/capability 제거 전에 고정 `lo`만 검증하고 올린다. 메인과 추가 exec는 같은 VM 내부 network namespace를 공유하며 매 실행 준비에서 idempotent 검사를 수행한다. `network=none`은 외부 NIC·host port·DNS·default route를 추가하지 않는 경계로 유지한다. 이 source 변경의 packaged ELF 재현 빌드와 native Redis PING 결과는 별도 증거이며, 아래 `1752ba9` 실패를 소급 수정하지 않는다. `/sys` 모드·환경변수 override·DB 초기화 정책은 이번 변경에 포함하지 않는다.
 
 `1752ba9`의 공식 서비스 실기는 기본 Postgres·Redis·MySQL·NGINX 네 건과 별도 Redis `--user redis` 한 건 모두 실패했다. Postgres/NGINX는 소유권·사용자 전환 관련 권한 거부, 기본 Redis는 setpriv capability 유지 거부, MySQL은 root 전환의 sys mode 검사 거부로 서비스 probe에 도달하지 않았다. Redis 사용자 지정만 readiness·version·실제 /의 device 21·inode 2 및 PID1 접근 거부까지 확인했지만 PING은 Network unreachable이었다. 로컬·동일 서버 SHA 선별109건과 마지막41개 보존 검사는 통과했으며 활성 VM/QEMU는 없다. 새 실패 등록 네 개와 runtime·원본을 보존했다. Production guest·권한·네트워크 정책은 변경하지 않았고 다음 단계는 내부 loopback 및 이미지 초기화 요구의 분리 검토다. 상세 증거와 미검증 경계는 [service matrix](docs/docker-hub-service-matrix.md)에 기록한다.
@@ -360,9 +362,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0ee4323fc29d3af118560103a1c46ebf2a589e6c7eefe9a53ac07bd44ea49bb5",
-  "reviewed_at": "2026-09-11T04:15:35Z",
-  "summary": "Reviewed fixed guest lo ioctl setup, close-before-drop boundary, NET/INET kernel admission, C/parser/native probe tests and rebuilt source-bundle/ELF pins. Native shell regression covers actual proc net headers and UID/GID formatting. External NIC/ports/routes/DNS, PID1/cap0/NNP/seccomp, sys admission and image process policies unchanged. Loopback enables guest-internal communication; native qualification pending exact-SHA execution. Updated architecture and detailed docs."
+  "source_sha256": "9affe8ec91dcc926fc4369714505a4ffeeaf92a80e61853e7ac665a1d7c5ca51",
+  "reviewed_at": "2026-09-12T13:18:06Z",
+  "summary": "Reviewed f86e4da native stage1 and stdio successes and retained Redis interface-count failure. Test-only follow-up records interface identity/state and defers strict network assertion until independent PING/root/PID1 evidence is collected; no acceptance relaxation or production/ELF change. Updated actual evidence and verification limits; final inventory gate failure is preserved."
 }
 ```
 <!-- architecture-review:end -->

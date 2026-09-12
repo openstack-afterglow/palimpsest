@@ -512,6 +512,13 @@ binds the freestanding constants and 40-byte `ifreq` layout to the Linux UAPI.
 The KVM kernel-config proof requires built-in `CONFIG_NET` and `CONFIG_INET`;
 module or missing values are rejected. Native service proof remains explicit.
 
+After `f86e4da`, the Redis-user probe also records raw interface rows and sysfs
+name/flags/type/index. Only its security assertion is deferred until after
+service/root/PID1 observations; it still fails overall if that assertion fails.
+This diagnostic-only edit does not require another unchanged-ELF boot matrix;
+run the isolated Redis-user node after exact-SHA focused contract tests and
+reviewed preservation of every prior failed runtime/domain.
+
 The production console-sink helpers and their child/parent call sites have
 separate source-extraction harnesses:
 

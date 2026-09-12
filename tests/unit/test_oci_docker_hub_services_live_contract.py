@@ -84,6 +84,8 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert 'if case.key == "REDIS_USER"' in source
     assert '"guest-loopback-security"' in source
     assert 'netdev_path: str = "/proc/net/dev"' in source and "extra_interfaces=0" in source
+    assert 'sysfs_net_path: str = "/sys/class/net"' in source
+    assert "netdev_begin" in source and "interface name=%s flags=%s type=%s ifindex=%s" in source
     assert 'status_path: str = "/proc/self/status"' in source
     assert "Uid:|Gid:) printf" in source
     assert "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:" in source
@@ -107,14 +109,22 @@ def test_loopback_shell_probe_skips_both_headers_and_counts_only_lo(tmp_path: Pa
         "NoNewPrivs:\t1\nSeccomp:\t2\n",
         encoding="ascii",
     )
+    sysfs_net = tmp_path / "sys-class-net"
+    interface = sysfs_net / "lo"
+    interface.mkdir(parents=True)
+    (interface / "flags").write_text("0x49\n", encoding="ascii")
+    (interface / "type").write_text("772\n", encoding="ascii")
+    (interface / "ifindex").write_text("1\n", encoding="ascii")
     result = subprocess.run(
-        ["/bin/sh", "-c", services._loopback_security_command(str(netdev), str(status))],
+        ["/bin/sh", "-c", services._loopback_security_command(str(netdev), str(status), str(sysfs_net))],
         env={"PATH": ""},
         capture_output=True,
         check=True,
         timeout=10,
     )
     assert result.stderr == b""
+    assert b"netdev_begin\n" in result.stdout and b"netdev_end\n" in result.stdout
+    assert b"interface name=lo flags=0x49 type=772 ifindex=1\n" in result.stdout
     services._assert_loopback_security(result.stdout)
 
 

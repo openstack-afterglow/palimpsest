@@ -58,6 +58,43 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Loopback checkpoint — `f86e4da`, 2026-09-12
+
+Exact `f86e4daa8554fdd4b08f3c3c994263e486363d7a` passed 453 focused
+tests on `pieroot-server`, including Linux x86_64 ioctl ABI and packaged ELF
+checks (48.37 seconds). The packaged ELF digest is
+`40f9553d12454bfeb7f0ebd73367b334dd1005fec729153ef9cd2a880cbf6f50`,
+source-bundle digest
+`ae299ca7616637c2b93015e29540910631684bbfc880d32030985f696482a339`.
+The native stage-1 matrix passed (43 boots/44 QEMU; 122.02 seconds), as did
+UID 0/101 stdio (two tests; 31.00 seconds). Original eight inactive domains
+and twelve archives passed preservation checks through the stdio phase.
+
+Redis-user then failed before PING because the new network receipt counted
+two non-loopback interfaces. Nevertheless, its saved output directly shows
+`lo` up with `127.0.0.1/8`, UID 999/GID 1000, all capability sets zero,
+NNP 1 and seccomp 2. This is not yet a PING or completed root/PID1 proof.
+The retained domain XML has no network interface device. Built-in IPIP and
+IPv6 tunnel support in the qualified kernel suggests default tunnel devices,
+but their actual names and states were not captured by this first probe and
+must not be inferred as proven facts.
+
+Evidence is `/tmp/palimpsest-loopback-native-qjqzxze3`; failed runtime
+`/tmp/p-hub-svc-rdu-e8397910` retains domain
+`hub-service-redis-user-b4b346bb`, UUID
+`8e47605d-16b8-40c1-bc80-912e2a05db40`. The public test failure-stop path
+left it shut off; a separate read confirmed inactivity. The wrapper's final
+inventory rejected this additional retained domain, so its final preservation
+gate failed and is not reported as passed. No failure evidence was removed.
+The executed wrapper digest was
+`50de59cf4fc321d523b1169c0ce0288a82d0c00e14ebe5541121ba91c5d9656e`.
+
+The follow-up test retains raw net-device rows and each sysfs interface's
+name, flags, type and index. It defers only the loopback-security assertion
+until after the independent PING/root/PID1 observations, without accepting
+the unexpected interfaces or converting a failed case into a pass. The
+production guest and ELF are unchanged by this diagnostic-only follow-up.
+
 ### Native execution — `1752ba9`, 2026-09-11
 
 All five independently selected cases were executed on `pieroot-server` at
