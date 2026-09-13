@@ -21,10 +21,33 @@ from .errors import StateError
 from .oci_monitor_launch import MonitorLaunchAuthority
 
 _REQUEST_SCHEMA = "palimpsest.monitor-coordinator-request.v1"
-_RESPONSE_SCHEMA = "palimpsest.monitor-coordinator-response.v1"
+_RESPONSE_SCHEMA = "palimpsest.monitor-coordinator-response.v2"
 _MAX_REQUEST_BYTES = ipc._MAX_CONFIG_FRAME_BYTES
 _MAX_RESPONSE_BYTES = ipc._MAX_FRAME_BYTES
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_FAILURE_STAGES = frozenset(
+    {
+        "request-validate",
+        "authority-validate",
+        "monitor-spawn",
+        "response-send",
+        "parent-response",
+        "parent-discover",
+        "parent-exit",
+    }
+)
+
+
+class MonitorCoordinatorFailure(StateError):
+    def __init__(self, stage: str, category: ipc.MonitorIPCErrorCategory):
+        if stage not in _FAILURE_STAGES or not isinstance(category, ipc.MonitorIPCErrorCategory):
+            raise TypeError("monitor coordinator failure requires fixed codes")
+        self.stage = stage
+        self.category = category
+        super().__init__(
+            "OCI monitor coordinator outcome is uncertain; preserve and inspect the exact run evidence "
+            f"[{stage}:{category.value}]"
+        )
 
 
 def _invalid():
@@ -90,26 +113,41 @@ class MonitorCoordinatorRequest:
         return request
 
 
-def _response(nonce, endpoint=None):
+def _response(nonce, endpoint=None, *, failure_stage=None, failure_category=None):
+    failed = endpoint is None
+    if failed != (failure_stage is not None) or failed != (failure_category is not None):
+        raise _invalid()
+    if failed and (
+        failure_stage not in _FAILURE_STAGES or not isinstance(failure_category, ipc.MonitorIPCErrorCategory)
+    ):
+        raise _invalid()
     return {
         "schema": _RESPONSE_SCHEMA,
         "nonce": nonce,
         "state": "launch-accepted" if endpoint is not None else "refused",
         "endpoint": None if endpoint is None else endpoint.to_dict(),
+        "failure_stage": failure_stage,
+        "failure_category": failure_category.value if failure_category is not None else None,
     }
 
 
 def _parse_response(value, request, identity):
     if (
         type(value) is not dict
-        or set(value) != {"schema", "nonce", "state", "endpoint"}
+        or set(value) != {"schema", "nonce", "state", "endpoint", "failure_stage", "failure_category"}
         or value["schema"] != _RESPONSE_SCHEMA
         or value["nonce"] != request.nonce
     ):
         raise _invalid()
     if value["state"] == "refused" and value["endpoint"] is None:
-        raise _uncertain()
+        try:
+            category = ipc.MonitorIPCErrorCategory(value["failure_category"])
+            raise MonitorCoordinatorFailure(value["failure_stage"], category)
+        except (TypeError, ValueError):
+            raise _invalid() from None
     if value["state"] != "launch-accepted":
+        raise _invalid()
+    if value["failure_stage"] is not None or value["failure_category"] is not None:
         raise _invalid()
     endpoint = ipc.MonitorExecEndpoint.from_dict(value["endpoint"])
     if endpoint.identity != identity or endpoint.receipt_schema != ipc._RECEIPT_SCHEMA:
@@ -166,17 +204,22 @@ def spawn_monitor_coordinator(
         child.close()
         child = None
         ipc._send_all(local, payload)
-        response = ipc._recv_bounded_frame(local, _MAX_RESPONSE_BYTES)
+        try:
+            response = ipc._recv_bounded_frame(local, _MAX_RESPONSE_BYTES)
+        except ipc.MonitorIPCError as exc:
+            raise MonitorCoordinatorFailure("parent-response", exc.category) from None
         endpoint = _parse_response(response, request, identity)
         # The private pipe is only a delivery channel, not independent endpoint
         # authority. Re-authenticate the real monitor and exact durable journal.
         launch_authority.validate(binding=identity.binding)
         if ipc.discover_monitor_exec(monitor_fd, identity.binding, timeout=timeout) != endpoint:
-            raise _invalid()
+            raise MonitorCoordinatorFailure("parent-discover", ipc.MonitorIPCErrorCategory.BINDING_MISMATCH)
         launch_authority.validate(binding=identity.binding)
         if process.wait(timeout=coordinator_timeout) != 0:
-            raise _uncertain()
+            raise MonitorCoordinatorFailure("parent-exit", ipc.MonitorIPCErrorCategory.CHILD_FAILED)
         return endpoint
+    except MonitorCoordinatorFailure:
+        raise
     except StateError:
         if process is not None:
             raise _uncertain() from None
@@ -195,6 +238,7 @@ def _child_main(channel_fd):
     authority = handle = None
     directory_fd = -1
     nonce = "0" * 64
+    failure_stage = "request-validate"
     try:
         if type(channel_fd) is not int or channel_fd < 3:
             raise _invalid()
@@ -205,21 +249,30 @@ def _child_main(channel_fd):
         channel.settimeout(120.0)
         request = MonitorCoordinatorRequest.from_dict(ipc._recv_bounded_frame(channel, _MAX_REQUEST_BYTES))
         nonce = request.nonce
+        failure_stage = "authority-validate"
         authority = MonitorLaunchAuthority.from_dict(request.authority, excluded_fds=(channel_fd,))
         identity = ipc.MonitorExecIdentity(
             ipc.MonitorPreActivationBinding.from_dict(request.authority["binding"]), request.generation
         )
         directory_fd = os.dup(request.authority["entries"]["monitor"]["fd"])
         authority.validate(directory_fd=directory_fd, binding=identity.binding)
+        failure_stage = "monitor-spawn"
         handle = ipc.spawn_monitor_exec(
             directory_fd, identity, timeout=request.timeout_ms / 1000, launch_authority=authority
         )
+        failure_stage = "response-send"
         ipc._send_frame(channel, _response(nonce, handle.endpoint))
         return 0
-    except Exception:
+    except Exception as exc:
         if channel is not None:
             try:
-                ipc._send_frame(channel, _response(nonce))
+                category = (
+                    exc.category if isinstance(exc, ipc.MonitorIPCError) else ipc.MonitorIPCErrorCategory.CHILD_FAILED
+                )
+                ipc._send_frame(
+                    channel,
+                    _response(nonce, failure_stage=failure_stage, failure_category=category),
+                )
             except Exception:
                 pass
         return 1

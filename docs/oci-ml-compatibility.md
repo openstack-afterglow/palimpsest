@@ -21,6 +21,15 @@ recorded where defined. Receipt-write failure never replaces the original proof
 failure. The receipt is diagnostic evidence, not a success result or cleanup
 authority.
 
+Fresh monitor-coordinator failures expose only a fixed coarse stage and the
+existing `MonitorIPCErrorCategory` value. The child response distinguishes
+request validation, authority validation, monitor spawn, and response send;
+the parent can additionally identify response, discovery, and coordinator-exit
+boundaries. Unknown failures collapse to `child-failed`, malformed codes are
+rejected, and no child stderr, exception text, path, argv, or credential is
+forwarded. These codes improve the next proof's diagnosis but cannot recover a
+category discarded by an older run and do not alter timeout or cleanup policy.
+
 At `049a978`, the corrected tests collected, but neither framework reached a
 guest result. TensorFlow stopped before VM definition at the literal-backslash
 layer intake boundary. PyTorch completed conversion, then its libvirt
@@ -105,6 +114,24 @@ does not establish owned-resource attribution or whole-inventory/archive
 preservation. The domain is not adopted as owned and was not rerun, removed, or
 queried further. Both native failure causes require a separately approved,
 limited diagnostic before any fix is proposed. No GPU action was performed.
+
+The subsequent user-approved read-only diagnostic found both preserved runtimes
+without returning their paths or raw logs. TensorFlow had the expected detached
+name output and a schema/UUID-matching monitor journal, but no tensor or later
+probe files. PyTorch had no successful detached-name output and no preactivation
+journal; its fixed diagnostic marker identified the monitor handshake. This
+explains why the wrapper's binding loader failed and then rejected the unexpected
+domain during its inventory check. It does not establish the underlying
+handshake error or justify increasing a timeout. Neither framework reached the
+CPU tensor/root/PID1 proof at this checkpoint. The PyTorch domain remains
+unattributed: it must never be stopped or removed based on these diagnostics.
+An explicitly pinned foreign-domain preservation baseline for later tests is
+not adoption, ownership proof, or retroactive historical postflight success.
+
+At `a6a1d84`, the root-volume test correction and fixed phase receipts passed
+105 selected checks both locally and on the exact Linux checkout, with no other
+server test outcomes. The GitHub development package also succeeded. These are
+focused test/package results, not a new native framework pass.
 
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with

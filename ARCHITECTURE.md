@@ -214,6 +214,7 @@ flowchart LR
 | OCI command override | [`oci_run_request.py`](src/palimpsest_local/oci_run_request.py)의 `PreparedLocalOCIRun`; [`oci_boot_plan.py`](src/palimpsest_local/oci_boot_plan.py)의 `OCIBootPlanIntent`; [`oci_process.py`](src/palimpsest_local/oci_process.py)의 `image_process_vectors`, `with_command` | trusted CAS/config snapshot authority를 boot intent까지 전달하고 lease/root 획득 전 원본 process와 유효 argv를 검증. Cmd-only override를 v4 provenance에 결합 |
 | OCI root preparation | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py)의 `prepare_oci_root_run`, `release_oci_root_transaction`; [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py) | lower lease와 VM-exclusive ext4 root volume을 durable transaction으로 claim/release; retained root는 별도 identity로 재사용 |
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
+| coordinator failure diagnostics | [`oci_monitor_coordinator.py`](src/palimpsest_local/oci_monitor_coordinator.py)의 `MonitorCoordinatorFailure`, `_response`, `_parse_response` | private response v2의 고정 stage/category만 부모에 전달하고 CLI 오류에도 보존; endpoint 재인증·기존 uncertainty와 no-kill/ownership 정책은 유지 |
 | guest boundary | [`guest/stage1/init.c`](guest/stage1/init.c), [`src/palimpsest_local/oci_guest_stage1.py`](src/palimpsest_local/oci_guest_stage1.py), [`src/palimpsest_local/oci_lifecycle_transport.py`](src/palimpsest_local/oci_lifecycle_transport.py) | authenticated root/lower block을 read-only 정책으로 확인하고 OverlayFS를 `/`로 move-mount-chroot한 뒤 PID 1이 workload와 lifecycle protocol을 감독 |
 | main-output transport | [`guest/stage1/main_output_pump.h`](guest/stage1/main_output_pump.h), [`guest/stage1/init.c`](guest/stage1/init.c)의 `prepare_main_output`, `service_main_output`, `terminate_and_reap` | workload 소유 FIFO 두 개와 stream별 4KiB 버퍼, 공통 16KiB 큐로 메인 출력과 PID 1 진단을 독립 nonblocking console sink에 전달. polling·STOP·회수·TERMINAL 권한은 supervisor 책임 |
 | parent-owned console sink | [`guest/stage1/init.c`](guest/stage1/init.c)의 `acquire_main_console_sink`, `revalidate_main_console_sink`, `close_main_console_sink` | 루트 전환 전 독립 nonblocking console FD 확보, 양 자식의 조기 close, 루트 전환·TERMINAL 전 identity 재검증. PID1은 종료 후 인증된 reconnect 제어 메시지를 위해 통로를 유지하며 실패 대기에서 닫음 |
@@ -365,6 +366,16 @@ ML proof의 private setup evidence에는 고정 framework/phase/status enum과
 정책이나 ML 성공 판정을 바꾸지 않는다. Receipt는 cleanup 권한 또는 실제
 실기 통과의 대체 증거가 아니며 상세 범위는 [ML proof](docs/oci-ml-compatibility.md)에 있다.
 
+별도 coordinator 관측성 변경은 private response v2에 고정된 coordinator
+실패 단계와 기존 `MonitorIPCErrorCategory` 값만 전달한다. 성공 response에는
+진단 값이 없고 endpoint의 실제 journal/identity 재인증을 그대로 수행한다.
+실패는 기존 불확실 결과 안내에 고정 코드만 덧붙이며 raw exception·자식
+stderr·경로·argv를 노출하지 않는다. 관찰할 수 없는 내부 prepare/commit
+단계를 추정하지 않고 unknown exception은 고정 child-failed 범주로 제한한다.
+Request v1·spawn/handshake 시간 제한·실패 자원 보존·정리 권한·guest 정책은
+그대로다. 과거 PyTorch의 상세 오류는 이미 폐기된 출력에서 복원할 수 없으며,
+이 변경은 다음 실행의 진단을 위한 것이지 timeout 원인 확정이나 수정이 아니다.
+
 ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
@@ -485,9 +496,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d23d5eabd04329c8d5d50617f918f7a735f657899d0f70b4e30080af5479c5f0",
-  "reviewed_at": "2026-09-13T17:49:57Z",
-  "summary": "Reviewed ML test-only phase receipts and confirmed132 TensorFlow root-volume-count assertion mismatch against oci_root_volume._paths. Proof now binds transaction volume ID to exact raw/json files and both cleanup targets; fixed bounded private phase enums preserve original failures. Real proof failure-injection and focused105 passed locally. No production/guest/schema/GPU policy change or native ML success claimed."
+  "source_sha256": "6656dab1406f311dc5f8af423878e7846fda5922bc4a2513da0933a11d5f50ff",
+  "reviewed_at": "2026-09-13T17:57:39Z",
+  "summary": "Reviewed coordinator response v2 fixed failure stage/IPC category propagation, strict success/refusal envelopes and safe CLI suffix. Original uncertainty guidance, endpoint journal reauthentication, deadlines/no-kill/ownership/guest policy remain. a6a1d84 ML proof focused105 passed local and Linux/package; coordinator focused228 passed locally with6 Linux-only skips pending server. PT historical category irrecoverable; new diagnostic codes are not a timeout fix."
 }
 ```
 <!-- architecture-review:end -->

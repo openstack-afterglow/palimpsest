@@ -47,6 +47,31 @@ def test_request_actual_socket_roundtrip(case):
         right.close()
 
 
+def test_fixed_refusal_preserves_only_stage_and_monitor_category(case):
+    response = coordinator._response(
+        "a" * 64,
+        failure_stage="monitor-spawn",
+        failure_category=ipc.MonitorIPCErrorCategory.TIMEOUT,
+    )
+    with pytest.raises(coordinator.MonitorCoordinatorFailure) as failure:
+        coordinator._parse_response(response, request(case), case.identity)
+    assert failure.value.stage == "monitor-spawn"
+    assert failure.value.category is ipc.MonitorIPCErrorCategory.TIMEOUT
+    assert str(failure.value).endswith("[monitor-spawn:timeout]")
+
+
+@pytest.mark.parametrize("field,value", [("failure_stage", "prepare"), ("failure_category", "raw-error")])
+def test_malformed_refusal_diagnostic_is_rejected(case, field, value):
+    response = coordinator._response(
+        "a" * 64,
+        failure_stage="monitor-spawn",
+        failure_category=ipc.MonitorIPCErrorCategory.TIMEOUT,
+    )
+    response[field] = value
+    with pytest.raises(StateError, match="invalid"):
+        coordinator._parse_response(response, request(case), case.identity)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -112,6 +137,12 @@ def install_peer(case, monkeypatch, *, damage=None):
                 if damage == "lost":
                     return
                 response = coordinator._response(value["nonce"], case.endpoint)
+                if damage == "refused":
+                    response = coordinator._response(
+                        value["nonce"],
+                        failure_stage="monitor-spawn",
+                        failure_category=ipc.MonitorIPCErrorCategory.TIMEOUT,
+                    )
                 if damage == "nonce":
                     response["nonce"] = "b" * 64
                 if damage == "ready":
@@ -177,6 +208,14 @@ def test_ambiguous_response_preserves_evidence_and_never_kills(case, monkeypatch
     case.authority.validate()
 
 
+def test_parent_preserves_typed_child_refusal(case, monkeypatch):
+    install_peer(case, monkeypatch, damage="refused")
+    with pytest.raises(coordinator.MonitorCoordinatorFailure) as failure:
+        coordinator.spawn_monitor_coordinator(case.identity, case.authority)
+    assert failure.value.stage == "monitor-spawn"
+    assert failure.value.category is ipc.MonitorIPCErrorCategory.TIMEOUT
+
+
 @pytest.mark.parametrize("timeout", [None, True, float("nan"), float("inf"), "5", 0.09, 30.01])
 def test_spawn_timeout_must_remain_finite(case, monkeypatch, timeout):
     monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("bad timeout spawned"))
@@ -224,6 +263,41 @@ def test_child_reconstructs_then_spawns_and_detaches_without_shutdown(case, monk
     finally:
         sender.join(5)
         assert not sender.is_alive()
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        (ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.TIMEOUT), "timeout"),
+        (RuntimeError("private child detail"), "child-failed"),
+    ],
+)
+def test_child_failure_returns_fixed_spawn_category(case, monkeypatch, failure, expected):
+    left, right = socket.socketpair()
+    value = request(case).to_dict()
+    descriptors = []
+    for entry in value["authority"]["entries"].values():
+        entry["fd"] = os.dup(entry["fd"])
+        descriptors.append(entry["fd"])
+    monkeypatch.setattr(ipc, "_require_spawn_boundary", lambda: None)
+    monkeypatch.setattr(
+        ipc,
+        "spawn_monitor_exec",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    sender = threading.Thread(target=ipc._send_all, args=(left, ipc._canonical_bytes(value)))
+    sender.start()
+    try:
+        assert coordinator._child_main(right.detach()) == 1
+        response = ipc._recv_frame(left)
+        assert response["failure_stage"] == "monitor-spawn"
+        assert response["failure_category"] == expected
+        assert "private child detail" not in str(response)
+        assert response["endpoint"] is None and response["state"] == "refused"
+    finally:
+        sender.join(5)
         left.close()
         right.close()
 
