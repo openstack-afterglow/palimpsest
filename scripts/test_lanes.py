@@ -34,7 +34,7 @@ PORTABLE_FILES = {
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
         development_package_workflow
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
-        sandbox_policy state test_lanes ui
+        registry_intake sandbox_policy state test_lanes ui
     """),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima

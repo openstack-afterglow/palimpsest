@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **74 command paths**, **216 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **75 command paths**, **220 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -330,10 +330,10 @@ usage: palimpsest bundle verify [-h] directory
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci [-h] {init-runtime,materialize,root-proof,exec-status,exec-record,resource-status,root-volumes,root-volume} ...
+usage: palimpsest oci [-h] {init-runtime,pull,materialize,root-proof,exec-status,exec-record,resource-status,root-volumes,root-volume} ...
 ```
 
-Subcommands: `init-runtime`, `materialize`, `root-proof`, `exec-status`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
+Subcommands: `init-runtime`, `pull`, `materialize`, `root-proof`, `exec-status`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
 
 ### `palimpsest oci init-runtime`
 
@@ -348,6 +348,23 @@ usage: palimpsest oci init-runtime [-h] path
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `path` | Path | required | Parent directory in which to create secured OCI runtime state. |
+
+### `palimpsest oci pull`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci pull [-h] --output OUTPUT [--platform {linux/amd64}] [--timeout TIMEOUT] reference
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `reference` | string | required | Docker image reference or ID. |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--platform` | one of: `linux/amd64` | `'linux/amd64'` | Select an OCI platform. |
+| `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
 
 ### `palimpsest oci materialize`
 

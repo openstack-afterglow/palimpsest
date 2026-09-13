@@ -22,9 +22,9 @@ Do not treat these similarly named surfaces as interchangeable:
 | --- | --- | --- |
 | Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer *`, `bundle *` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
-| Local OCI root | `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Local OCI archive/layout only; private source CAS and Linux KVM runtime |
+| Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
 
-Palimpsest Hub is not an OCI Distribution `/v2` registry. A Docker Hub reference such as `docker.io/library/nginx:latest` cannot be passed directly to `palimpsest run`; first use an external tool to create a digest-preserving local OCI archive or layout, then run that local source.
+Palimpsest Hub is not an OCI Distribution `/v2` registry. A fully qualified anonymously accessible reference such as `quay.io/example/nginx:stable` can be acquired with `palimpsest oci pull ... --output ./nginx.oci.tar`; `run` still accepts only the resulting verified local source. See [anonymous TLS OCI registry intake](../registry-intake.md) for its authentication, TLS, endpoint, platform, path, size, and timeout limits.
 
 ## Hub cloud images, layers, and bundles
 
@@ -136,7 +136,7 @@ palimpsest rm app
 
 `rm --volumes` is the conventional/project volume-removal request and is explicitly rejected for OCI-root runs; OCI root deletion/retention follows the owned run policy. OCI-root also rejects `start`, `shell`, and `commit`; use `exec` for additional processes and `stop`/`rm` for lifecycle control. `commit NAME --tag TAG` commits a conventional runtime layer.
 
-OCI diagnostic commands emit JSON: `root-proof NAME`, `exec-status NAME`, `exec-record PATH`, `resource-status`, `root-volumes`, and `root-volume UUID`. `oci init-runtime PATH` securely creates a runtime parent and prints the `PALIMPSEST_STATE_HOME=...` assignment. `oci materialize SOURCE` snapshots and verifies a local archive/layout, converts layers with the selected SquashFS packer, and emits a receipt (or writes it to a new `--output` file). Its only platform is `linux/amd64`; timeout defaults to 300 seconds and must be positive and finite.
+OCI diagnostic commands emit JSON: `root-proof NAME`, `exec-status NAME`, `exec-record PATH`, `resource-status`, `root-volumes`, and `root-volume UUID`. `oci init-runtime PATH` securely creates a runtime parent and prints the `PALIMPSEST_STATE_HOME=...` assignment. `oci pull FULLREF --output ARCHIVE` uses installed Skopeo to acquire one anonymously accessible HTTPS `linux/amd64` image, verifies it through the private source CAS, and only then publishes a new local archive. The caller-selected endpoint may be Internet, private-network, or local. `oci materialize SOURCE` snapshots and verifies a local archive/layout, converts layers with the selected SquashFS packer, and emits a receipt (or writes it to a new `--output` file). Their timeout defaults to 300 seconds and must be positive and finite.
 
 ## Compose-shaped projects
 

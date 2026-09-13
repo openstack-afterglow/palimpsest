@@ -91,6 +91,8 @@ from .registry import (
     update_registry_config,
     use_profile,
 )
+from .registry_intake import DEFAULT_TIMEOUT_SECONDS as REGISTRY_PULL_TIMEOUT
+from .registry_intake import pull_anonymous_oci_archive
 from .runtime_types import (
     CloudImageInspectDetail,
     ExpectedRunIdentity,
@@ -631,6 +633,11 @@ def build_parser() -> argparse.ArgumentParser:
     oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
     oci_init_runtime = oci_commands.add_parser("init-runtime")
     oci_init_runtime.add_argument("path", type=Path)
+    oci_pull = oci_commands.add_parser("pull")
+    oci_pull.add_argument("reference")
+    oci_pull.add_argument("--output", required=True, type=Path)
+    oci_pull.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
+    oci_pull.add_argument("--timeout", type=float, default=REGISTRY_PULL_TIMEOUT)
     oci_materialize = oci_commands.add_parser("materialize")
     oci_materialize.add_argument("source", type=Path)
     oci_materialize.add_argument("--manifest", help="pin a root descriptor; required when the local index is ambiguous")
@@ -1473,6 +1480,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
             raise PalimpsestError("--user is supported only for local OCI-root runs")
 
     if op == "oci":
+        if args.oci_operation == "pull":
+            receipt = pull_anonymous_oci_archive(
+                args.reference,
+                args.output,
+                roots,
+                platform=args.platform,
+                timeout_seconds=args.timeout,
+            )
+            print(json.dumps(receipt.to_dict(), indent=2, sort_keys=True))
+            return 0
         if args.oci_operation == "root-proof":
             from .oci_root_proof import root_proof
 

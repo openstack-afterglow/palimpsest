@@ -6,6 +6,13 @@ publication remains blocked pending the documented physical Linux KVM release
 gate. Build and install a local artifact, or select an exact-SHA GitHub
 development package, rather than assuming PyPI availability.
 
+Anonymous TLS OCI registry acquisition through `palimpsest oci pull` additionally
+requires Skopeo 1.13 or newer on `PATH`; it is an external executable rather
+than a Python package dependency. See the [anonymous registry intake
+contract](registry-intake.md) before relying on its authentication,
+TLS, platform, storage, and output-path limits. Other local archive operations
+do not require Skopeo.
+
 ## Download an exact-SHA development package
 
 Successful workflow runs for `main`, `dev`, and `codex/oci-root-phase1`

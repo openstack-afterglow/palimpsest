@@ -166,6 +166,8 @@ For a local standard OCI archive/layout, the experimental OCI-root converter
 can verify and materialize its layers without Docker:
 
 ```sh
+# Anonymous TLS acquisition requires Skopeo 1.13+ and an explicit registry.
+palimpsest oci pull quay.io/example/application:v1 --output ./image.oci.tar
 palimpsest oci materialize ./image.oci.tar --output ./materialization.json
 # If the local index lists multiple roots, choose one explicitly:
 palimpsest oci materialize ./image-layout --manifest 'sha256:<root-digest>'
@@ -176,8 +178,10 @@ and currently supports `linux/amd64`. It produces verified layer artifacts,
 not a running VM by itself. Public local OCI-root `run/-d` and the protected-root
 Gate 2 have separate qualified proofs on Linux/x86_64 KVM; see the
 [public-runtime roadmap](docs/oci-public-runtime-roadmap.md). Docker Hub
-references are not yet accepted directly by OCI-root `run`, and the Docker
-`pull` wrapper does not bridge into that runtime. See
+references are not accepted directly by OCI-root `run`; `oci pull` first
+terminates acquisition at the verified local archive boundary, while the Docker
+`pull` wrapper does not bridge into that runtime. See the
+[anonymous registry intake contract](docs/registry-intake.md) and
 [Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
 digest-preserving local-archive workflow and its real-image verification scope.
 

@@ -89,7 +89,7 @@ Buildx 출력 열 간격 가정 때문에 Gate 1 전에 실패했고 그 evidenc
 | guest stage-1 root transition와 PID 1 | implemented | source-reviewed, test-defined | production host lifecycle와 hostile-root availability 보장은 아님 | [`guest/stage1/init.c`](guest/stage1/init.c), [`guest/stage1/README.md`](guest/stage1/README.md), [`tests/kvm/test_oci_guest_stage1_live.py`](tests/kvm/test_oci_guest_stage1_live.py) |
 | native Hub `/v1` upload/download/bundle | implemented | source-reviewed, test-defined | native `/v2` registry protocol은 없음 | [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`hub/tests/test_hub_api.py`](hub/tests/test_hub_api.py) |
 | Hub Glance export worker | partial | source-reviewed, test-defined | OpenStack/DB/Redis와 qemu-img 전제가 있는 비동기 worker; worker 자체의 live 실행은 별도 운영 검증 | [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py), [`hub/tests/test_image_exports.py`](hub/tests/test_image_exports.py) |
-| direct Docker Hub → `run` intake | not-implemented | source-reviewed, test-defined | Skopeo 등 외부 도구로 digest-preserving OCI archive를 만든 뒤에만 local OCI 경계로 들어감 | [`oci_source.py`](src/palimpsest_local/oci_source.py), [`docs/oci-docker-hub-compatibility.md`](docs/oci-docker-hub-compatibility.md) |
+| anonymous registry → local OCI archive | implemented | source-reviewed, test-defined | `oci pull`은 명시적 registry의 익명 HTTPS Linux amd64 이미지를 Skopeo로 취득하고 source CAS 검증 후 archive를 게시함. 인증 및 직접 registry `run`은 미지원 | [`registry_intake.py`](src/palimpsest_local/registry_intake.py), [`registry-intake.md`](docs/registry-intake.md) |
 
 `162cebe` 진단 checkpoint: exact-SHA 서버 집중 검사 198건과 전용 게스트 native 43 boots / 44 QEMU proof가 통과했다. 당시 원본 Redis 실기는 실패했고, 고정 로그가 root-owned `/proc`0555와 exact0755 검사 충돌을 확인했다. entrypoint는 실행되지 않았다. 후속 사용자 승인에 따라 `/proc`에만 0555를 추가 허용하는 구현을 반영하며, 해당 수정의 native 결과는 별도로 검증한다. PID 1 보호는 유지한다. 이전 기존 빌드 이미지의 cold public exec 성공을 새 게스트 검증·전체 Gate 2·일반 이미지 호환성 완료로 확대하지 않는다. 자세한 결과는 [compatibility checkpoint](docs/oci-docker-hub-compatibility.md)에 기록한다.
 
@@ -147,6 +147,7 @@ flowchart LR
 
 | 영역 | 주요 경로와 심볼 | 책임과 의존 방향 |
 | --- | --- | --- |
+| anonymous registry acquisition | [`registry_intake.py`](src/palimpsest_local/registry_intake.py)의 `pull_anonymous_oci_archive`; CLI `oci pull` | 명시적 registry reference → 익명 TLS Skopeo → private staging → 기존 LocalArchiveSource/SourceCAS 검증 → non-overwrite archive. Docker store/Hub credential과 분리; caller가 지정한 local/private authority도 허용하되 system TLS trust는 유지 |
 | CLI와 routing | [`cli.py`](src/palimpsest_local/cli.py)의 `main`, `resolve_local_oci_run_request`; [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py) | argparse surface와 typed `RuntimeKind`/`RuntimeBackend`를 결정하고 cloud-image, Lima, OCI adapter로 분기 |
 | CLI reference and package tooling | [`scripts/generate_cli_reference.py`](scripts/generate_cli_reference.py), [`scripts/build_package.py`](scripts/build_package.py), [`docs/cli/README.md`](docs/cli/README.md) | 실제 argparse surface의 문서 drift 검사와 wheel/sdist 생성·격리 설치 검증. runtime dispatch나 privileged host provisioning을 대신하지 않음 |
 | GitHub development packages | [`.github/workflows/development-package.yml`](.github/workflows/development-package.yml), [`tests/unit/test_development_package_workflow.py`](tests/unit/test_development_package_workflow.py) | 허용 branch의 검증·빌드 결과만 별도 publish job으로 전달하고 checksum을 확인한 뒤 commit별 `package-<SHA>` prerelease로 공개. 기존 `v*` 정식 릴리스·KVM·PyPI gate와 분리 |
@@ -185,6 +186,8 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 `image import/pull`이 검증된 `qcow2` 또는 `raw` base를 local content store에 둔다. `cloud_runtime` 또는 `lima`는 실행마다 writable qcow2 overlay를 만들고 base는 read-only로 유지한다. layer SquashFS는 KVM의 `vdb..vdz` read-only virtio disks 또는 Lima guest 복사본으로 전달된다. NoCloud/cloud-init이 guest에서 layer disks를 `/mnt/palimpsest/lowerN`에 mount하고 leaf → root 순서의 OverlayFS를 `/opt/layers/merged`에 만든다. `exec`, `shell`, `logs`, `stop`, `rm`은 owner ledger와 backend identity를 재확인한다. Linux KVM의 project `ports`는 현재 안전한 forwarding 경계가 없어 거부되며, Lima는 static TCP forwarding만 제공한다.
 
 ### OCI-root materialize → run flow
+
+선택적 선행 단계인 `oci pull REGISTRY/REPOSITORY:TAG --output ARCHIVE`는 native Skopeo를 사용한다. `--src-no-creds`와 `--src-tls-verify=true`, digest 보존 및 Linux amd64 선택을 강제하고 외부 도구 출력을 버린다. 기본300초 deadline과 staging 크기 감시는 disk quota나 모든 syscall의 hard deadline이 아니다. 검증 뒤 caller-owned 비공유 쓰기 parent에0600 archive를 atomic no-overwrite로 게시하며 CAS 복사본은 별도 보관한다. 태그 취득 시 remote index identity와 선택된 archive manifest identity를 동일하다고 가정하지 않는다. 명령이 성공해도 VM 부팅 또는 서비스 호환성 통과는 아니며, 아래 기존 local 경계를 그대로 거친다. [전체 옵션과 제한](docs/registry-intake.md)을 참고한다.
 
 1. `LocalArchiveSource` 또는 `LocalLayoutSource`가 `oci-layout`, `index.json`, manifest, config, compressed layer descriptor를 안전하게 읽고 하나의 `SnapshottedOCIImage`와 `source_snapshot_binding_digest`를 만든다. 자동 root 선택은 정확히 하나일 때만 허용한다.
 2. `SourceCAS`가 원본 descriptor bytes를 private owner-only CAS에 저장한다. `materialize_image_hard`는 occurrence마다 `DerivedSquashFSKey`를 구성하고 worker를 새 process group으로 실행한다. deadline, bounded JSON, resource limit과 process-group reap이 실패 경계를 이룬다.
@@ -396,9 +399,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "435235129c3f8f7b430c0d0aac234981a7800cdd2be0aca5a57a13f4bbba21fe",
-  "reviewed_at": "2026-09-13T12:33:25Z",
-  "summary": "Reviewed test-only random-MySQL ping interpretation against official exit-status contract: rc0 means Unix-socket reachability, never authenticated SQL; all original marker cases and secret-safe owned cleanup unchanged. Recorded exact93c1eb0 stage1/stdios/cold passes, prior wrapper failures and disposed MySQL marker failure without rewriting history. Updated code map/current limits; no production or guest ELF changes. Focused147 passed; new MySQL native rerun pending."
+  "source_sha256": "36660b13f8d53d9ccefaa72a4908eb955a324245ed7089da669afd4ecb35ae6c",
+  "reviewed_at": "2026-09-13T13:09:16Z",
+  "summary": "Reviewed anonymous registry acquisition, CLI routing and focused regressions: explicit caller-selected TLS endpoint, system trust/no ambient auth, isolated polled staging limits, process-group teardown, existing OCI SourceCAS verification and atomic nonoverwrite archive publication. Updated code map, flow, dependency and limits; guest ELF, lifecycle and credential policy unchanged. Focused intake27 and registryCLI162 passed; source/CLI319 passed plus one socket test passed outside sandbox and one Linux-only skip. Native acquisition remains pending."
 }
 ```
 <!-- architecture-review:end -->
