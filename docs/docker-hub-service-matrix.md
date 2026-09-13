@@ -80,6 +80,53 @@ historical failed runs remain untouched.
 
 ## Results
 
+### Disposable-password initialization — `89fad3c`, 2026-09-13
+
+Exact `89fad3c1fa5d7f5c88dfa303d04809025b60cb87` passed 152 focused tests
+locally (10.36 seconds) and on `pieroot-server` (7.23 seconds).
+[Package workflow 34753154345](https://github.com/openstack-afterglow/palimpsest/actions/runs/34753154345)
+succeeded. The separate random-password native case failed in 103.24 seconds;
+the original default and explicit-user cases were not rerun or promoted.
+
+Public `run -d --user mysql` returned exit 0. The fixed guest wrapper generated
+the disposable password before calling the original entrypoint. The entrypoint
+passed its missing-password gate, initialized the database files, and started
+the temporary server. It then reported `Failed to open required defaults file`
+for `/dev/fd/63`, followed by fatal defaults handling and workload status 1.
+Initialization completion and the final-server readiness pair were absent.
+Version/socket service probes and independent application-root/PID1 probes were
+not reached; temporary-server readiness is not service qualification.
+
+The pinned image entrypoint's `docker_process_sql` uses Bash process substitution
+for `_mysql_passfile` (line 257; entrypoint SHA-256
+`30f0e863cd9de49752045c01b2e4a4e3e065da48889d464a65ceeb4d69be4e5a`).
+The current workload `/dev` exposes six devices and `stdout`/`stderr` aliases,
+not `/dev/fd`. This source comparison explains the observed client failure;
+adding a workload self-FD alias and testing its isolation is a separate runtime
+change, not implemented or validated by this diagnostic. PID1/capability policy
+and the packaged guest ELF remain unchanged.
+
+The failed workload was quiesced/reaped, and public removal completed.
+`application_completed=false` and `owned_resources_disposed=true` were verified
+against absence of the newly owned domain, run, and root-volume files. This
+discarded the test workload and its writable database, not the historical
+failure evidence. No generated-password pattern was detected in the checked
+outputs, retained redacted console, or authenticated-process receipt; this is
+not a forensic memory/storage erasure or arbitrary-image secrecy guarantee.
+
+Evidence is `/tmp/palimpsest-mysql-random-native-94jy705o`, runtime evidence
+`/tmp/p-hub-svc-myr-b4a7e90a`; removed test name
+`hub-service-mysql-random-30c0a741`. The original twelve domains and twelve
+archive hashes were preserved, with zero active VM/QEMU. The private journal
+`/tmp/palimpsest-mysql-random-journal-r9zf12q4` contained six records/three
+invocations/1393 bytes. Derived archive digest remained
+`sha256:d3d2229437f67558fc53152c945f11b6c17d2c1765ccb53b3c5347031582a71e`.
+Wrapper SHA-256 was
+`6e9baa54d43024a7fe90ffbe1ba2173c40edb32b4ea9274007838caa86591dc7`.
+Analysis retrieved only fixed error/stage classifications and allowlisted
+receipt fields from the server, not raw guest output. The wrapper correctly
+returned failure despite successful disposal.
+
 ### Random-password diagnostic preflight — `2626229`, 2026-09-13
 
 The first separately approved random-password diagnostic stopped at the host
