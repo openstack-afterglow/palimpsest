@@ -90,10 +90,10 @@ def _boot(command: list[str], evidence: Path, name: str, terminal: bytes) -> tup
                     data.extend(chunk)
             assert len(data) <= 1024 * 1024
             lines = _completed_probe_lines(bytes(data))
-            if terminal in lines or _PREFIX + b"FAIL" in lines or process.poll() is not None:
+            if terminal in lines or any(line.startswith(_PREFIX + b"FAIL_") for line in lines) or process.poll() is not None:
                 break
         assert terminal in lines, f"evidence retained at {evidence}"
-        assert _PREFIX + b"FAIL" not in lines, f"evidence retained at {evidence}"
+        assert not any(line.startswith(_PREFIX + b"FAIL_") for line in lines), f"evidence retained at {evidence}"
         return lines
     finally:
         error = _finalize_probe(process, selector, boot_evidence, data)

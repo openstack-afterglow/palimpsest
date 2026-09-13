@@ -94,6 +94,17 @@ Stage-1 and MySQL phases were not run. The follow-up removes redundant archive
 entries because the C probe already seeds its explicit tmpfs, and adds a
 portable construction test; it does not relax production initramfs modes.
 
+Follow-up `513291869eb5974895545d9d467b3dd96ea416dc` passed the focused
+110 tests locally (8.19 seconds) and on the server (6.44 seconds). Its diagnostic
+then booted but failed (12.13 seconds) with kernel message
+`devtmpfs: Too few inodes for current use`, followed by the fixed FAIL marker.
+The test-only devtmpfs `nr_inodes=32` request conflicts with the kernel's
+already-populated device filesystem. The correction matches production's
+devtmpfs mount options while retaining the separate fixture/child tmpfs limits.
+Evidence is `/tmp/palimpsest-dev-native-4roxhovc` and
+`/tmp/palimpsest-dev-cover-fyxb5dcg`; ten inactive domains/twelve archives and
+zero active VM/QEMU passed preservation again. Neither stage-1 nor MySQL ran.
+
 The subsequent documentation commit `16ca781` reached package verification,
 build, checksums and SHA-tag creation, but release creation returned GitHub
 HTTP 502 in [run 34749473630](https://github.com/openstack-afterglow/palimpsest/actions/runs/34749473630).

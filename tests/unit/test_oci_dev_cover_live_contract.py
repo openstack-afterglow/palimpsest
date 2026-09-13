@@ -40,6 +40,8 @@ def test_native_dev_cover_proof_is_explicit_bounded_and_uses_production_policies
     assert 'transition_target_ready_checked("/dev", TRANSITION_TARGET_DEV' in probe
     assert '"/trusted", (i64)"/dev", 0, MS_MOVE' in probe
     assert 'hold_filesystem("/trusted", 0x01021994, &trusted)' in probe
+    assert '(i64)"devtmpfs",\n            MS_NOSUID | MS_NOEXEC, 0)' in probe
+    assert 'size=64k,nr_inodes=32' not in probe
     assert 'verify_held_filesystem("/dev", &trusted)' in probe
     assert 'sc0(SYS_fork)' in probe
     assert 'sc3(SYS_close_range, 3, 0xffffffffU, 0)' in probe
@@ -53,3 +55,9 @@ def test_native_dev_cover_proof_is_explicit_bounded_and_uses_production_policies
         'DEV_COVER_PREFIX "TRUSTED_DEVTMPFS'
     )
     assert 'DEV_COVER_PREFIX "PARENT_DEVTMPFS_UNCHANGED' in probe
+    for stage in (
+        "PROC_MOUNT", "FIXTURE_BUILD", "TARGET_POLICY", "NEGATIVE_CONTROL",
+        "TARGET_READY", "TRUSTED_DEVTMPFS", "CHILD_NAMESPACE",
+    ):
+        assert f'failure_stage = "{stage}"' in probe
+    assert 'DEV_COVER_PREFIX "FAIL_"' in probe

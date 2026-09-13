@@ -377,9 +377,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9d8da5cee4a09cd885c959f55e3c65fc56f7ba9b74b783c3408228ffb8fdb0de",
-  "reviewed_at": "2026-09-13T09:45:18Z",
-  "summary": "Reviewed standalone DEV diagnostic pre-boot fixture correction: remove unsupported redundant mode0400 entries, generate minimal initramfs through testable helper and isolated portable construction regression. Production C/ELF and device/security contracts unchanged. Preserve67cb80c pre-QEMU failure and package/server evidence; native retry pending."
+  "source_sha256": "3f772ec0dfaebd90e2ec94a652a63618bb4207b2b84e530c1fbcc6bdfb297d3d",
+  "reviewed_at": "2026-09-13T09:48:27Z",
+  "summary": "Reviewed test-only devtmpfs mount quota mismatch exposed by5132918 KVM kernel error; diagnostic now uses production null mount data and fixed bounded failure labels. Fixture/child tmpfs limits and production C/ELF remain unchanged. Portable guards added; retained native failures and not-run stage1/MySQL are documented."
 }
 ```
 <!-- architecture-review:end -->

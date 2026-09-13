@@ -31,9 +31,11 @@ static __attribute__((noreturn, used)) void probe_main(void) {
     i64 operation;
     int fail, status = -1, parent_dev_fd = -1, current_dev_fd = -1;
     i64 child;
+    const char *failure_stage = "PROC_MOUNT";
 
     if (sc5(SYS_mount, (i64)"proc", (i64)"/proc", (i64)"proc",
             MS_NOSUID | MS_NODEV | MS_NOEXEC, 0) != 0) goto failed;
+    failure_stage = "FIXTURE_BUILD";
     fail = cmdline_has_fail();
     if (fail < 0 || sc5(SYS_mount, (i64)"tmpfs", (i64)"/dev", (i64)"tmpfs",
                          MS_NOSUID | MS_NODEV | MS_NOEXEC,
@@ -48,10 +50,12 @@ static __attribute__((noreturn, used)) void probe_main(void) {
                     MS_NOSUID | MS_NODEV | MS_NOEXEC, (i64)"mode=0755,size=4k,nr_inodes=2");
     if (operation != 0) goto failed;
     marker_fd = sc3(SYS_open, (i64)"/dev/image-marker", O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
+    failure_stage = "TARGET_POLICY";
     if (marker_fd < 0 ||
         !transition_target_policy_checked("/dev", TRANSITION_TARGET_DEV, 0,
                                           &target_fd, &target_identity, &reason)) goto failed;
     if (fail) {
+        failure_stage = "NEGATIVE_CONTROL";
         if (sc2(SYS_chmod, (i64)"/dev", 0555) != 0 ||
             transition_target_ready_checked("/dev", TRANSITION_TARGET_DEV, (int)target_fd,
                                              &target_identity, 0x01021994)) goto failed;
@@ -60,6 +64,7 @@ static __attribute__((noreturn, used)) void probe_main(void) {
         write_all(1, DEV_COVER_PREFIX "REJECT\n");
         exit_now(0);
     }
+    failure_stage = "TARGET_READY";
     if (!transition_target_ready_checked("/dev", TRANSITION_TARGET_DEV, target_fd,
                                          &target_identity, 0x01021994) ||
         sc1(SYS_close, marker_fd) != 0 || sc1(SYS_close, target_fd) != 0) goto failed;
@@ -68,8 +73,9 @@ static __attribute__((noreturn, used)) void probe_main(void) {
     marker_fd = target_fd = -1;
     if (sc2(SYS_fstat, closed_marker_fd, (i64)&ignored) != -9 ||
         sc2(SYS_fstat, closed_target_fd, (i64)&ignored) != -9) goto failed;
+    failure_stage = "TRUSTED_DEVTMPFS";
     if (sc5(SYS_mount, (i64)"devtmpfs", (i64)"/trusted", (i64)"devtmpfs",
-            MS_NOSUID | MS_NOEXEC, (i64)"mode=0755,size=64k,nr_inodes=32") != 0 ||
+            MS_NOSUID | MS_NOEXEC, 0) != 0 ||
         !hold_filesystem("/trusted", 0x01021994, &trusted) ||
         sc5(SYS_mount, (i64)"/trusted", (i64)"/dev", 0, MS_MOVE, 0) != 0 ||
         !verify_held_filesystem("/dev", &trusted) ||
@@ -80,6 +86,7 @@ static __attribute__((noreturn, used)) void probe_main(void) {
     trusted.fd = -1;
     write_all(1, DEV_COVER_PREFIX "TRUSTED_DEVTMPFS\n");
 
+    failure_stage = "CHILD_NAMESPACE";
     parent_dev_fd = sc3(SYS_open, (i64)"/dev", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
     if (parent_dev_fd < 0 || sc2(SYS_fstat, parent_dev_fd, (i64)&parent_before) != 0) goto failed;
     child = sc0(SYS_fork);
@@ -121,7 +128,9 @@ failed:
     if (current_dev_fd >= 0) sc1(SYS_close, current_dev_fd);
     if (parent_dev_fd >= 0) sc1(SYS_close, parent_dev_fd);
     if (trusted.fd >= 0) sc1(SYS_close, trusted.fd);
-    write_all(1, DEV_COVER_PREFIX "FAIL\n");
+    write_all(1, DEV_COVER_PREFIX "FAIL_");
+    write_all(1, failure_stage);
+    write_all(1, "\n");
     exit_now(1);
 }
 
