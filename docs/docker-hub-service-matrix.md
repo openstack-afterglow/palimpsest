@@ -12,8 +12,9 @@ source; each actual run must record its selected manifest and archive digest.
 | `mysql` | `docker.io/library/mysql:8.4` | 2048 MiB / 1 | Image default | Local Unix-socket server ping |
 | `nginx` | `docker.io/library/nginx:stable-alpine` | 512 MiB / 1 | Image default | Guest-loopback HTTP response |
 | `redis_user` | Same pinned Redis archive | 512 MiB / 1 | Explicit `--user redis` | Guest-loopback Redis `PING` |
+| `mysql_user` | Same MySQL image, independently pinned archive | 2048 MiB / 1 | Explicit `--user mysql` | Local Unix-socket server ping |
 
-The Redis override is a separate result, never a correction of a failed default
+The user overrides are separate results, never corrections of a failed default
 run. No host port, network interface, capability, initialization secret, or
 image environment is added by these tests. Application checks do not imply
 external connectivity. Readiness, version, application response, authenticated
@@ -47,6 +48,8 @@ uv run pytest -q -s tests/kvm/test_oci_docker_hub_services_live.py -k postgres
 
 Without its opt-in, a skipped case is not qualification. Portable contracts
 belong to the ordinary lanes; VM cases stay in the explicit native lane.
+`MYSQL_USER` has its own `PALIMPSEST_OCI_DOCKER_HUB_SERVICE_MYSQL_USER_*`
+opt-ins and source pins; it does not inherit or alter the default MYSQL selection.
 
 Before and after each case, verify the exact preserved domain names, UUIDs,
 states, autostart settings, source archive hashes, and absence of active QEMU.
@@ -59,6 +62,45 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 ## Results
 
 ### Approved populated `/dev` follow-up
+
+The corrected diagnostic at exact `b7b81626924892ee54ed50f32cd8de8dbfde9987`
+passed on `pieroot-server` (13.62 seconds, two boots). The positive path verified
+coverage of the populated fixture and nested mount, closed fixture FDs, the
+child's separate six-device/two-alias tmpfs and unchanged parent filesystem.
+The negative boot rejected 0755→0555 target drift before cover/child markers.
+Receipt `/tmp/palimpsest-dev-cover-jkrljsyo/receipt.json` records `result=passed`,
+two executed boots, 128 MiB/one-vCPU/no-network and probe source SHA-256
+`cb496a2f950da38c314cb0dc5481f4dd4788a66f5208dedbed0ba6fcd60bedf9`.
+This is a standalone helper/mount diagnostic, not the packaged guest or MySQL
+qualification. The same SHA's focused 110 tests passed in 6.19 seconds on the
+server (9.47 seconds locally).
+
+The same `b7b8162` then passed the packaged stage-1 matrix (43 boots/44 QEMU,
+122.61 seconds). Its receipt and separate control consoles are under
+`/tmp/palimpsest-dev-native-43d0_4qy/stage1-kvm-evidence`. The GitHub package
+workflow [34750322868](https://github.com/openstack-afterglow/palimpsest/actions/runs/34750322868)
+also published successfully. These checks remain distinct from the original
+MySQL service result below.
+
+Original default MySQL at `b7b8162` failed before service readiness (61.04
+seconds), but now completed root transition, workload isolation and lifecycle
+READY. MySQL 8.4.11's entrypoint began, then `mysqld --verbose --help` failed
+with `setgid: Operation not permitted`; terminal status was 1 and the guest
+reported quiesced root and reaped workload. The current capability-zero policy
+does not grant CAP_SETGID; `setgid` is not in the seccomp deny list. The requested
+target GID is not established. No service socket or independent application
+root/PID1 probe was reached, so this is not MySQL compatibility success.
+
+Runtime `/tmp/p-hub-svc-my-1e3628d4` and domain `hub-service-mysql-23e569a5`
+(UUID `ac7ea44a-df46-4dee-a659-8cda841a60cb`) remain, shut off. The sequential
+wrapper `/tmp/palimpsest-dev-native-43d0_4qy` returned 1 and preserved the
+original ten domains, the new inactive failure, all twelve archive hashes and
+zero active VM/QEMU. Private journal `/tmp/palimpsest-dev-journal-mysql-l55lqo89`
+validated four records/two invocations/930 bytes. Wrapper SHA-256 was
+`ed47d3aa8034b506fe6ceac8a1f8484f949719ddcf278ec5484aecf2d126526a`.
+The next separate `MYSQL_USER` diagnostic uses the existing public `--user mysql`
+only; no environment, argv, image or privilege change is authorized by the
+default failure. Its result must not replace the default result.
 
 The user approved covering an existing populated image `/dev`, without admitting
 its entries. Only the DEV transition target drops its emptiness requirement;

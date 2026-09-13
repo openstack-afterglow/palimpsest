@@ -479,6 +479,21 @@ execute the packaged ELF, OCI application, credential drop, or PID1 protection
 proof; run the existing stage-1 matrix and service case separately. Temporary
 receipts and consoles remain on failure; opt-out skips are not qualification.
 
+The official MySQL explicit-user diagnostic is a separate service case:
+
+```sh
+uv run pytest -q -s \
+  'tests/kvm/test_oci_docker_hub_services_live.py::test_official_service_default_process_compatibility[mysql_user]'
+```
+
+Set `PALIMPSEST_OCI_DOCKER_HUB_SERVICE_MYSQL_USER_LIVE=1` and its own
+`IMAGE`, `ARCHIVE_SHA256`, `MANIFEST_SHA256` variables with the same service
+prefix, plus the existing qualified host settings. It changes only the existing
+public `--user mysql` flag, retains image argv/environment, and leaves the
+default `[mysql]` case untouched. It needs 2048 MiB/one vCPU sequentially and
+does not add initialization credentials or capabilities. A missing opt-in is a
+skip, not proof; retain failed runtime/source evidence.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire

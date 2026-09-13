@@ -38,6 +38,7 @@ def test_matrix_pins_exact_images_resources_and_separate_redis_user() -> None:
         ("MYSQL", "mysql:8.4", 2048, None),
         ("NGINX", "nginx:stable-alpine", 512, None),
         ("REDIS_USER", "redis:7-alpine", 512, "redis"),
+        ("MYSQL_USER", "mysql:8.4", 2048, "mysql"),
     ]
 
 
@@ -58,8 +59,29 @@ def test_each_case_has_independent_opt_in_and_exact_run_arguments(tmp_path: Path
         "--memory",
     )
     assert arguments[7:] == (str(case.memory_mib), "--vcpus", "1", "-d") + (
-        ("--user", "redis") if case.user_override else ()
+        ("--user", case.user_override) if case.user_override else ()
     )
+
+
+def test_mysql_user_is_a_separate_no_injection_copy_of_the_default_case() -> None:
+    default = next(case for case in services.CASES if case.key == "MYSQL")
+    diagnostic = next(case for case in services.CASES if case.key == "MYSQL_USER")
+    assert diagnostic.user_override == "mysql" and default.user_override is None
+    assert diagnostic.image == default.image
+    assert diagnostic.memory_mib == default.memory_mib
+    assert diagnostic.argv_suffix == default.argv_suffix
+    assert diagnostic.readiness == default.readiness
+    assert diagnostic.version_argv == default.version_argv
+    assert diagnostic.version_marker == default.version_marker
+    assert diagnostic.probe_argv == default.probe_argv
+    assert diagnostic.probe_marker == default.probe_marker
+    arguments = services._run_arguments(
+        diagnostic,
+        SimpleNamespace(archive=Path("/tmp/mysql.oci.tar"), manifest_digest="sha256:" + "a" * 64),
+        "proof",
+    )
+    assert arguments[-2:] == ("--user", "mysql")
+    assert "--env" not in arguments and "-e" not in arguments
 
 
 def test_matrix_uses_public_cli_and_preserves_failed_runtime_without_rm_or_hypervisor_force() -> None:
@@ -81,7 +103,7 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert '"result": "skipped", "reason": "image client absent", "returncode": 77' in source
     assert '"result": "passed" if probe_ok else "failed"' in source
     assert "assert probe_ok" in source
-    assert 'if case.key == "REDIS_USER"' in source
+    assert source.count("if case.user_override is not None:") >= 3
     assert '"guest-loopback-security"' in source
     assert 'netdev_path: str = "/proc/net/dev"' in source and "netdev_count" in source
     assert 'sysfs_net_path: str = "/sys/class/net"' in source

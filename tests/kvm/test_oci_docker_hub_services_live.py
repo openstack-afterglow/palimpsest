@@ -105,6 +105,18 @@ CASES = (
         b"PONG\n",
         user_override="redis",
     ),
+    ServiceCase(
+        "MYSQL_USER",
+        "mysql:8.4",
+        2048,
+        ("mysqld",),
+        b"ready for connections",
+        ("mysqld", "--version"),
+        b"Ver 8.4",
+        ("/bin/sh", "-c", "command -v mysqladmin >/dev/null || exit 77; mysqladmin --protocol=socket ping"),
+        b"mysqld is alive\n",
+        user_override="mysql",
+    ),
 )
 
 
@@ -339,7 +351,10 @@ def _preserve_failed_owned_runtime(
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.key.lower())
 def test_official_service_default_process_compatibility(case: ServiceCase) -> None:
     selection = _selection(case, os.environ)
-    short = {"POSTGRES": "pg", "REDIS": "rd", "MYSQL": "my", "NGINX": "ng", "REDIS_USER": "rdu"}[case.key]
+    short = {
+        "POSTGRES": "pg", "REDIS": "rd", "MYSQL": "my", "NGINX": "ng",
+        "REDIS_USER": "rdu", "MYSQL_USER": "myu",
+    }[case.key]
     parent, environment = legacy._setup(legacy._environment(), "svc-" + short)
     name = "hub-service-" + case.key.lower().replace("_", "-") + "-" + uuid.uuid4().hex[:8]
     source_hash = legacy._file_sha256(selection.archive)
@@ -396,7 +411,7 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         )
         legacy._success(version)
         assert case.version_marker in version.stdout + version.stderr
-        if case.key == "REDIS_USER":
+        if case.user_override is not None:
             loopback = legacy._save(
                 parent,
                 "guest-loopback-security",
@@ -420,7 +435,7 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             parent, "service-probe", legacy._cli(environment, "exec", name, "--", *case.probe_argv, timeout=60)
         )
         probe_ok = probe.returncode == 0 and case.probe_marker in probe.stdout
-        if case.key == "REDIS_USER":
+        if case.user_override is not None:
             probe_ok = probe.returncode == 0 and probe.stdout == case.probe_marker
         if probe.returncode == 77:
             _save_json(
