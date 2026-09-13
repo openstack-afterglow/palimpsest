@@ -59,6 +59,7 @@ _EVENT_DRIVER_PID: int | None = None
 _EVENT_DRIVER_POISONED = False
 _EVENT_DRIVER_TOKEN = object()
 _EVENT_STREAM_QUARANTINE: list[tuple[Any, Any]] = []
+_EVENT_STARTUP_QUARANTINE: list[tuple[Any, Any]] = []
 _EVENT_WAIT_MAX_MILLISECONDS = 10
 
 
@@ -177,6 +178,171 @@ def connect_oci_root_libvirt(uri: str) -> _OCIRootEventConnection:
                 pass
             raise StateError("libvirt default event implementation identity changed")
     return _OCIRootEventConnection(connection, libvirt, pid, _EVENT_DRIVER_TOKEN)
+
+
+def _poison_event_driver() -> None:
+    global _EVENT_DRIVER_POISONED
+    with _EVENT_DRIVER_LOCK:
+        _EVENT_DRIVER_POISONED = True
+
+
+def close_oci_root_libvirt(conn: _OCIRootEventConnection) -> None:
+    with _EVENT_DRIVER_LOCK:
+        if any(candidate is conn for _service, candidate in _EVENT_STARTUP_QUARANTINE):
+            raise StateError("OCI-root quarantined startup connection cannot be closed")
+        conn.close()
+
+
+class OCIStartupEventServiceError(StateError):
+    """The exact startup event authority is unhealthy or cleanup is ambiguous."""
+
+
+class OCIStartupEventService:
+    """Service server keepalives on one startup connection until lifecycle owns events."""
+
+    def __init__(self, conn: _OCIRootEventConnection):
+        with _EVENT_DRIVER_LOCK:
+            if (
+                type(conn) is not _OCIRootEventConnection
+                or conn.token is not _EVENT_DRIVER_TOKEN
+                or conn.pid != os.getpid()
+                or conn.pid != _EVENT_DRIVER_PID
+                or conn.libvirt is not _EVENT_DRIVER_LIBVIRT
+                or _EVENT_DRIVER_POISONED
+            ):
+                raise OCIStartupEventServiceError("OCI-root startup event connection identity is invalid")
+        self._conn = conn
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._failed = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="palimpsest-oci-startup-events", daemon=True)
+        self._timer_id: int | None = None
+        self._worker_ident: int | None = None
+        self._closed = False
+        self._started = False
+
+    @staticmethod
+    def _timer_event(_timer: Any, _opaque: Any) -> None:
+        return
+
+    def _fail(self) -> None:
+        _poison_event_driver()
+        self._failed.set()
+        self._ready.set()
+
+    def _identity_valid(self) -> bool:
+        with _EVENT_DRIVER_LOCK:
+            return (
+                not _EVENT_DRIVER_POISONED
+                and self._conn.pid == os.getpid() == _EVENT_DRIVER_PID
+                and self._conn.token is _EVENT_DRIVER_TOKEN
+                and self._conn.libvirt is _EVENT_DRIVER_LIBVIRT
+            )
+
+    def _run(self) -> None:
+        try:
+            self._worker_ident = threading.get_ident()
+            while not self._stop.is_set():
+                if not self._identity_valid():
+                    raise RuntimeError
+                if not _EVENT_RUN_LOCK.acquire(timeout=0.1):
+                    raise RuntimeError
+                try:
+                    result = self._conn.libvirt.virEventRunDefaultImpl()
+                finally:
+                    _EVENT_RUN_LOCK.release()
+                alive = self._conn.connection.isAlive()
+                if type(result) is not int or result != 0 or type(alive) is not int or alive != 1:
+                    raise RuntimeError
+                self._ready.set()
+        except BaseException:
+            self._fail()
+
+    def start(self) -> None:
+        if self._started or self._closed:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self._started = True
+        try:
+            timer = self._conn.libvirt.virEventAddTimeout(_EVENT_WAIT_MAX_MILLISECONDS, self._timer_event, self)
+        except Exception:
+            timer = -1
+        if type(timer) is not int or timer < 0:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self._timer_id = timer
+        try:
+            self._thread.start()
+        except Exception:
+            self._fail()
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed") from None
+        if not self._ready.wait(timeout=1) or self._failed.is_set():
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        if (
+            type(self._worker_ident) is not int
+            or self._worker_ident == threading.get_ident()
+            or self._thread.ident != self._worker_ident
+        ):
+            self._fail()
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self.check()
+
+    def check(self) -> None:
+        valid = self._identity_valid()
+        if self._failed.is_set() or not valid or (not self._closed and not self._thread.is_alive()):
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service is unhealthy")
+        try:
+            alive = self._conn.connection.isAlive()
+        except Exception:
+            alive = -1
+        if type(alive) is not int or alive != 1:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup libvirt connection is not alive")
+
+    def stop(self) -> None:
+        if self._closed:
+            self.check()
+            return
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=1)
+        if self._thread.is_alive():
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        acquired = _EVENT_RUN_LOCK.acquire(timeout=1)
+        if acquired:
+            _EVENT_RUN_LOCK.release()
+        else:
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        cleanup_failed = False
+        if self._timer_id is not None:
+            try:
+                removed = self._conn.libvirt.virEventRemoveTimeout(self._timer_id)
+                cleanup_failed = cleanup_failed or type(removed) is not int or removed != 0
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    disabled = self._conn.libvirt.virEventUpdateTimeout(self._timer_id, -1)
+                    cleanup_failed = cleanup_failed or type(disabled) is not int or disabled != 0
+                except Exception:
+                    cleanup_failed = True
+        self._closed = True
+        if cleanup_failed or self._failed.is_set():
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        self.check()
+
+    def _quarantine(self) -> None:
+        _poison_event_driver()
+        with _EVENT_DRIVER_LOCK:
+            if not any(service is self for service, _conn in _EVENT_STARTUP_QUARANTINE):
+                _EVENT_STARTUP_QUARANTINE.append((self, self._conn))
 
 
 class _LibvirtLifecycleEventPump:
@@ -1073,6 +1239,7 @@ def define_committed_oci_root_domain(
     *,
     conn: Any,
     runner: CommandRunner = _default_runner,
+    health_check: Callable[[], None] | None = None,
 ) -> DefinedOCIRootDomain:
     """Define, validate, and durably record one inactive OCI-root domain.
 
@@ -1107,6 +1274,8 @@ def define_committed_oci_root_domain(
         attempted = False
         domain_uuid: str | None = None
         try:
+            if health_check is not None:
+                health_check()
             mutation.verify_binding()
             runtime_io.verify(require_socket_absent=True)
             attempted = True
@@ -1118,6 +1287,8 @@ def define_committed_oci_root_domain(
             if current is None:
                 raise StateError("defined OCI-root domain is missing")
             projection_digest = _validate_defined_domain(current, resolved, domain_uuid, conn=conn)
+            if health_check is not None:
+                health_check()
             mutation.verify_binding()
             runtime_io.verify(require_socket_absent=True)
             data = mutation.mutable_state()
@@ -1694,6 +1865,13 @@ def launch_defined_oci_root_domain(
     with _EVENT_DRIVER_LOCK:
         if _EVENT_DRIVER_POISONED:
             raise StateError("libvirt default event implementation is poisoned")
+    startup_events = OCIStartupEventService(conn) if monitor_binding is not None else None
+    startup_events_stopped = startup_events is None
+
+    def startup_check() -> None:
+        if startup_events is not None:
+            startup_events.check()
+
     started_intent = False
     journal_activation_attempted = False
     terminal_durable = False
@@ -1708,6 +1886,8 @@ def launch_defined_oci_root_domain(
     ready_lifecycle: OCILifecycleHandoffReceipt | None = None
     definition_projection_digest: str | None = None
     try:
+        if startup_events is not None:
+            startup_events.start()
         with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
             libvirt_uri = _connection_uri(conn, profile)
             domain_uuid, definition_digest, definition_projection_digest = _definition_ledger(
@@ -1722,6 +1902,7 @@ def launch_defined_oci_root_domain(
                 runner=runner,
                 expected_status="defined",
             )
+            startup_check()
             runtime_io = io_guards.enter_context(
                 runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
             )
@@ -1734,6 +1915,7 @@ def launch_defined_oci_root_domain(
                 domain_uuid,
                 expected_projection_digest=definition_projection_digest,
             )
+            startup_check()
             if monitor_binding is not None and monitor_binding != _resolved_monitor_binding(
                 mutation.snapshot,
                 resolved,
@@ -1826,6 +2008,7 @@ def launch_defined_oci_root_domain(
             if monitor_lease is not None:
                 verify_monitor_lease(mutation, monitor_lease, monitor_binding, activating=True)
             runtime_io.verify(require_socket_absent=True)
+            startup_check()
             try:
                 domain.create()
             except Exception:
@@ -1866,6 +2049,8 @@ def launch_defined_oci_root_domain(
                 raise StateError("OCI-root starting intent was not durably recorded")
             ledger_phase = "starting"
 
+        startup_check()
+
         try:
             if monitor_lease is not None:
                 with locked_existing_run(roots, name) as mutation:
@@ -1889,6 +2074,10 @@ def launch_defined_oci_root_domain(
             stream = None
             raise
 
+        startup_check()
+        if startup_events is not None:
+            startup_events.stop()
+            startup_events_stopped = True
         event_pump = _LibvirtLifecycleEventPump(libvirt, stream)
 
         def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
@@ -2127,6 +2316,13 @@ def launch_defined_oci_root_domain(
             lifecycle,
         )
     except BaseException as launch_failure:
+        effective_failure = launch_failure
+        if startup_events is not None and not startup_events_stopped:
+            try:
+                startup_events.stop()
+                startup_events_stopped = True
+            except BaseException as stop_failure:
+                effective_failure = stop_failure
         if stop_control is not None:
             stop_control.mark_control_lost()
         if stream is not None and not stream_handed_off:
@@ -2157,7 +2353,8 @@ def launch_defined_oci_root_domain(
                         journal_authority_valid = False
                 if (
                     not journal_authority_valid
-                    or isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError)
+                    or isinstance(effective_failure, OCIStartupEventServiceError)
+                    or isinstance(effective_failure, OCILifecycleStreamCallbackCleanupError)
                     or (stop_control is not None and stop_control.accepted)
                 ):
                     _record_launch_cleanup_required(
@@ -2220,6 +2417,7 @@ __all__ = [
     "CompletedOCIRootHandoff",
     "DefinedOCIRootDomain",
     "connect_oci_root_libvirt",
+    "close_oci_root_libvirt",
     "define_committed_oci_root_domain",
     "launch_defined_oci_root_domain",
     "prepare_oci_root_monitor_binding",

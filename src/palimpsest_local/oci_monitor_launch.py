@@ -544,7 +544,11 @@ class MonitorLaunchAuthority:
     ) -> Any:
         # This import is intentionally worker-local: no libvirt/event state is
         # inherited from the spawning process or initialized by the IPC loop.
-        from .oci_root_runtime import connect_oci_root_libvirt, launch_defined_oci_root_domain
+        from .oci_root_runtime import (
+            close_oci_root_libvirt,
+            connect_oci_root_libvirt,
+            launch_defined_oci_root_domain,
+        )
 
         connection = None
         try:
@@ -574,7 +578,7 @@ class MonitorLaunchAuthority:
         finally:
             try:
                 if connection is not None:
-                    connection.close()
+                    close_oci_root_libvirt(connection)
             finally:
                 self.close()
 

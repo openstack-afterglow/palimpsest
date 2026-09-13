@@ -31,6 +31,8 @@ from .oci_root_access import grant_oci_root_access
 from .oci_root_kvm import build_oci_root_domain_plan, commit_oci_root_domain_plan
 from .oci_root_prepare import prepare_oci_root_run
 from .oci_root_runtime import (
+    OCIStartupEventService,
+    close_oci_root_libvirt,
     connect_oci_root_libvirt,
     define_committed_oci_root_domain,
     prepare_oci_root_monitor_binding,
@@ -101,7 +103,11 @@ def _launch_local_oci(roots, request, host_config, interrupted):
     selected = materialize_local_oci_run(request, roots=roots, packer_path=config.packer, toolchain=toolchain)
     store = OCIStore(roots)
     conn = connect_oci_root_libvirt(profile.uri)
+    startup_events = None
+    startup_events_stopped = False
     try:
+        startup_events = OCIStartupEventService(conn)
+        startup_events.start()
         with first_party_boot(config, roots) as source_boot:
             with reserve_new_run(roots, request.name, request.dispatch_key) as reservation:
                 command_authority = (
@@ -123,9 +129,12 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                     user_override=request.user_override,
                     **command_authority,
                 )
+            startup_events.check()
             publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
+            startup_events.check()
             boot = load_oci_boot_exports(roots, request.name)
             publish_oci_lower_exports(roots, prepared, store, conn=conn)
+            startup_events.check()
             resolved = build_oci_root_domain_plan(
                 roots,
                 prepared,
@@ -136,8 +145,13 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                 vcpus=request.vcpus,
                 network=request.network,
             )
+            startup_events.check()
             commit_oci_root_domain_plan(roots, resolved, store)
-            define_committed_oci_root_domain(roots, request.name, store, boot, profile, conn=conn)
+            startup_events.check()
+            define_committed_oci_root_domain(
+                roots, request.name, store, boot, profile, conn=conn, health_check=startup_events.check
+            )
+            startup_events.check()
             with locked_existing_run(roots, request.name) as mutation:
                 os.mkdir("monitor-private", 0o700, dir_fd=mutation._run_fd)
                 os.fsync(mutation._run_fd)
@@ -150,6 +164,7 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                 conn=conn,
                 boot_attempt_id=str(uuid.uuid4()),
             )
+            startup_events.check()
             for grant in (
                 grant_oci_runtime_access,
                 join_oci_shared_traversal,
@@ -158,12 +173,17 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                 grant_oci_boot_access,
                 grant_oci_lower_access,
             ):
+                startup_events.check()
                 grant(roots, binding, conn=conn)
+                startup_events.check()
             # No fixture grants/remapping: outside state, ancestors must still
             # satisfy the explicit readonly host admission policy.
             verify_runtime_parent(roots.state.parent)
             if interrupted:
                 raise StateError(f"OCI startup interrupted before activation; exact run {request.name!r} is retained")
+            startup_events.check()
+            startup_events.stop()
+            startup_events_stopped = True
             with prepare_monitor_launch_authority(
                 roots,
                 store,
@@ -177,7 +197,13 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                     MonitorExecIdentity(binding, str(uuid.uuid4())), authority, timeout=15
                 )
     finally:
-        conn.close()
+        try:
+            if startup_events is not None and not startup_events_stopped:
+                startup_events.stop()
+                startup_events_stopped = True
+        finally:
+            if startup_events is None or startup_events_stopped:
+                close_oci_root_libvirt(conn)
     with MonitorClient(roots, binding, endpoint) as client:
         try:
             observation = client.wait_ready(timeout=75)

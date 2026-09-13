@@ -25,6 +25,15 @@ mksquashfs - <output> -tar -noappend -xattrs -mkfs-time 0 -processors 1 \
 
 The probe consumes an already decompressed, diff-id-verified tar stream on standard input. Registry media-type decompression and diff-id verification belong to the later ingestion stage; this boundary explicitly rejects gzip/zstd blobs. It does not extract archive paths or create archive device/FIFO entries in a host directory.
 
+Layer path parsing follows Linux/POSIX rules: `/` is the only hierarchy
+separator and a literal backslash is preserved as an ordinary filename
+character. It is never translated into `/`. NUL, absolute paths, slash-delimited
+`..` components, normalized root escapes, and the reserved `.palimpsest`
+subtree remain rejected. Consequently `a\\b` and `a/b` are distinct entries,
+including through hardlink and whiteout normalization. This admission change is
+bound by `palimpsest.oci-layer-intake.v2` in every derived-cache recipe; the
+normalized-tar and SquashFS pack contracts are otherwise unchanged.
+
 ## Retained EROFS comparison
 
 EROFS 1.7.1 is not selected. With the tested tar path, `-T 0` makes the image deterministic but overwrites member mtimes with zero. Omitting the fixed timestamp preserves member metadata but produces different image digests on repeated builds. The privileged regression test retains this timestamp failure so a future toolchain improvement is visible rather than silently changing the backend.

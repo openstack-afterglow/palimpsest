@@ -75,6 +75,7 @@ def test_real_packer_component_tests_are_native_only():
     nodes = {
         f"{lanes.FS_FILE}::test_real_staged_squashfs_accepts_minimal_layer",
         f"{lanes.FS_FILE}::test_real_staged_squashfs_build_is_byte_deterministic",
+        f"{lanes.FS_FILE}::test_real_squashfs_preserves_literal_backslash_as_a_linux_filename",
     }
     assert nodes <= set(lanes.selectors("native-live"))
     assert all(nodes.isdisjoint(lanes.selectors(lane)) for lane in lanes.LANES if lane != "native-live")

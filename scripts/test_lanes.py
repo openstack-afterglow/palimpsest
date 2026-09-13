@@ -193,6 +193,7 @@ MIXED = {
             """
             test_real_staged_squashfs_accepts_minimal_layer
             test_real_staged_squashfs_build_is_byte_deterministic
+            test_real_squashfs_preserves_literal_backslash_as_a_linux_filename
         """.split()
         ),
         "filesystem": tuple(

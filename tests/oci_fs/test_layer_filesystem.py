@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import tarfile
 import uuid
 from dataclasses import replace
@@ -135,6 +137,12 @@ def _minimal_layer_tar(layer_kind: str) -> bytes:
             member.mode = 0o644
             member.size = len(b"payload")
             archive.addfile(member, io.BytesIO(b"payload"))
+        elif layer_kind == "literal-backslash":
+            for name, payload in ((r"name\part", b"literal"), ("name/part", b"separated")):
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
     return output.getvalue()
 
 
@@ -172,6 +180,35 @@ def test_real_staged_squashfs_build_is_byte_deterministic(tmp_path: Path) -> Non
                 built.append((b"".join(packed.chunks()), packed.receipt))
 
     assert built[0] == built[1]
+
+
+def test_real_squashfs_preserves_literal_backslash_as_a_linux_filename(tmp_path: Path) -> None:
+    packer, packer_digest = _live_packer()
+    unsquashfs = shutil.which("unsquashfs", path=os.defpath)
+    assert unsquashfs is not None
+    cas, image = _snapshot_fixture(tmp_path, _minimal_layer_tar("literal-backslash"))
+    output = tmp_path / "literal-backslash.squashfs"
+
+    with cas.lease_layer(image, 0) as source, stage_layer(source, limits=_MINIMAL_LAYER_LIMITS) as staged:
+        with pack_staged_squashfs(
+            staged,
+            packer_path=packer,
+            expected_packer_sha256=packer_digest,
+            policy=_MINIMAL_PACK_POLICY,
+        ) as packed:
+            output.write_bytes(b"".join(packed.chunks()))
+
+    for name, expected in ((r"name\part", b"literal"), ("name/part", b"separated")):
+        result = subprocess.run(
+            [unsquashfs, "-cat", output, name],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=15,
+            check=False,
+            env={"PATH": os.defpath, "LC_ALL": "C"},
+        )
+        assert result.returncode == 0 and result.stdout == expected
+        assert len(result.stderr) <= 4096
 
 
 def _snapshot_fixtures(root: Path, payloads: tuple[bytes, ...]):

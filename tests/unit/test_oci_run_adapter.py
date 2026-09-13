@@ -3,6 +3,7 @@
 import os
 import signal
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import test_oci_store as fixtures
 
+from palimpsest_local import oci_root_runtime as root_runtime
 from palimpsest_local import oci_run_adapter as adapter
 from palimpsest_local import oci_run_cleanup as cleanup
 from palimpsest_local import state
@@ -89,6 +91,22 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "materialize_local_oci_run", materialize)
     value.conn = SimpleNamespace(close=note("close"))
     monkeypatch.setattr(adapter, "connect_oci_root_libvirt", note("connect", value.conn))
+    monkeypatch.setattr(adapter, "close_oci_root_libvirt", lambda conn: conn.close())
+
+    class StartupEvents:
+        def __init__(self, conn):
+            assert conn is value.conn
+
+        def start(self):
+            value.calls.append("events-start")
+
+        def check(self):
+            value.calls.append("events-check")
+
+        def stop(self):
+            value.calls.append("events-stop")
+
+    monkeypatch.setattr(adapter, "OCIStartupEventService", StartupEvents)
 
     @contextmanager
     def boot(*args):
@@ -205,6 +223,116 @@ def launch(case):
     return adapter.run_local_oci(case.roots, case.request, case.config)
 
 
+class _EventLibvirt:
+    def __init__(self, *, alive=1, remove=0, run=0):
+        self.alive = alive
+        self.remove = remove
+        self.run = run
+        self.runs = 0
+
+    def virEventAddTimeout(self, milliseconds, callback, opaque):
+        assert milliseconds == root_runtime._EVENT_WAIT_MAX_MILLISECONDS and callable(callback) and opaque is not None
+        return 7
+
+    def virEventRunDefaultImpl(self):
+        self.runs += 1
+        threading.Event().wait(0.001)
+        return self.run
+
+    def virEventRemoveTimeout(self, timer):
+        assert timer == 7
+        return self.remove
+
+    def virEventUpdateTimeout(self, timer, milliseconds):
+        assert (timer, milliseconds) == (7, -1)
+        return 0
+
+
+def _event_service(monkeypatch, libvirt):
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_LIBVIRT", libvirt)
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_PID", os.getpid())
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_POISONED", False)
+    connection = SimpleNamespace(isAlive=lambda: libvirt.alive)
+    wrapped = root_runtime._OCIRootEventConnection(connection, libvirt, os.getpid(), root_runtime._EVENT_DRIVER_TOKEN)
+    return root_runtime.OCIStartupEventService(wrapped)
+
+
+def test_startup_event_service_runs_health_checks_and_joins(monkeypatch):
+    libvirt = _EventLibvirt()
+    service = _event_service(monkeypatch, libvirt)
+    service.start()
+    deadline = time.monotonic() + 0.1
+    while libvirt.runs < 2 and time.monotonic() < deadline:
+        threading.Event().wait(0.001)
+    service.check()
+    service.stop()
+    assert libvirt.runs >= 2
+    assert service._worker_ident == service._thread.ident
+    assert not service._thread.is_alive()
+    assert root_runtime._EVENT_RUN_LOCK.acquire(blocking=False)
+    root_runtime._EVENT_RUN_LOCK.release()
+
+
+@pytest.mark.parametrize("failure", ["dead", "run", "cleanup"])
+def test_startup_event_service_latches_failure_and_poisons(monkeypatch, failure):
+    libvirt = _EventLibvirt(
+        alive=0 if failure == "dead" else 1,
+        run=1 if failure == "run" else 0,
+        remove=1 if failure == "cleanup" else 0,
+    )
+    service = _event_service(monkeypatch, libvirt)
+    with pytest.raises(StateError, match="startup event service"):
+        service.start()
+        service.stop()
+    assert root_runtime._EVENT_DRIVER_POISONED
+    assert not service._thread.is_alive()
+
+
+@pytest.mark.parametrize("identity", ["type", "pid", "token", "libvirt", "poisoned"])
+def test_startup_event_service_rejects_unregistered_identity(monkeypatch, identity):
+    libvirt = _EventLibvirt()
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_LIBVIRT", libvirt)
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_PID", os.getpid())
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_POISONED", identity == "poisoned")
+    wrapped = root_runtime._OCIRootEventConnection(
+        SimpleNamespace(isAlive=lambda: 1),
+        object() if identity == "libvirt" else libvirt,
+        os.getpid() + 1 if identity == "pid" else os.getpid(),
+        object() if identity == "token" else root_runtime._EVENT_DRIVER_TOKEN,
+    )
+    candidate = object() if identity == "type" else wrapped
+    with pytest.raises(StateError, match="connection identity"):
+        root_runtime.OCIStartupEventService(candidate)
+
+
+def test_startup_event_service_rejects_boolean_health(monkeypatch):
+    libvirt = _EventLibvirt(alive=True)
+    service = _event_service(monkeypatch, libvirt)
+    with pytest.raises(StateError, match="startup event service"):
+        service.start()
+    assert root_runtime._EVENT_DRIVER_POISONED
+
+
+def test_quarantined_startup_connection_is_not_closed(monkeypatch):
+    libvirt = _EventLibvirt()
+    closed = []
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_LIBVIRT", libvirt)
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_PID", os.getpid())
+    monkeypatch.setattr(root_runtime, "_EVENT_DRIVER_POISONED", False)
+    wrapped = root_runtime._OCIRootEventConnection(
+        SimpleNamespace(close=lambda: closed.append(True), isAlive=lambda: 1),
+        libvirt,
+        os.getpid(),
+        root_runtime._EVENT_DRIVER_TOKEN,
+    )
+    service = root_runtime.OCIStartupEventService(wrapped)
+    service._quarantine()
+
+    with pytest.raises(StateError, match="quarantined startup connection"):
+        root_runtime.close_oci_root_libvirt(wrapped)
+    assert closed == []
+
+
 @pytest.mark.parametrize("detached", [False, True])
 def test_pipeline_prepares_exact_run_before_six_grants_and_waits_for_ready(case, detached):
     case.request = replace(case.request, detached=detached)
@@ -216,18 +344,28 @@ def test_pipeline_prepares_exact_run_before_six_grants_and_waits_for_ready(case,
         "init",
         "materialize",
         "connect",
+        "events-start",
         "boot-enter",
         "reserve",
         "prepare",
+        "events-check",
         "boot-publish",
+        "events-check",
         "boot-load",
         "lower-publish",
+        "events-check",
         "plan",
+        "events-check",
         "commit-plan",
+        "events-check",
         "define",
+        "events-check",
         "binding",
-        *_GRANTS,
+        "events-check",
+        *[item for grant in _GRANTS for item in ("events-check", grant, "events-check")],
         "parent",
+        "events-check",
+        "events-stop",
         "authority-enter",
         "spawn",
         "authority-exit",

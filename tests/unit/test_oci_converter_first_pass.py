@@ -310,6 +310,59 @@ def test_layer_intake_rejects_raw_paths_and_wrong_diffid(tmp_path: Path) -> None
             pass
 
 
+def test_linux_literal_backslash_paths_remain_distinct_through_normalization(tmp_path: Path) -> None:
+    literal, literal_payload = _file(r"tree\name", b"literal")
+    separated, separated_payload = _file("tree/name", b"separated")
+    reserved_literal, reserved_payload = _file(r".palimpsest\state", b"ordinary")
+    hardlink = tarfile.TarInfo(r"hard\link")
+    hardlink.type = tarfile.LNKTYPE
+    hardlink.linkname = r"tree\name"
+    whiteout = tarfile.TarInfo(r"tree/.wh.name\gone")
+    uncompressed = _tar(
+        literal,
+        separated,
+        reserved_literal,
+        hardlink,
+        whiteout,
+        payloads={
+            literal.name: literal_payload,
+            separated.name: separated_payload,
+            reserved_literal.name: reserved_payload,
+        },
+    )
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
+        entries = staged.changeset.by_path()
+        assert entries[r"tree\name"].payload is not None
+        assert entries["tree/name"].payload is not None
+        assert entries[r".palimpsest\state"].payload is not None
+        assert entries[r"hard\link"].link_target == r"tree\name"
+        assert entries[r"tree/name\gone"].kind is EntryKind.WHITEOUT
+        assert "tree/name/gone" not in entries
+        output = io.BytesIO()
+        staged.emit_overlay_tar(output)
+        output.seek(0)
+        with tarfile.open(fileobj=output, mode="r:") as archive:
+            names = {member.name: member for member in archive}
+        assert r"tree\name" in names and "tree/name" in names
+        assert names[r"hard\link"].linkname == r"tree\name"
+        assert r"tree/name\gone" in names and "tree/name/gone" not in names
+
+
+@pytest.mark.parametrize("name", ["/absolute", "tree/../escape", "../escape"])
+def test_literal_backslash_admission_does_not_weaken_slash_path_rejections(tmp_path: Path, name: str) -> None:
+    member, payload = _file(name)
+    cas, image, _ = _snapshot(
+        tmp_path,
+        _tar(member, payloads={member.name: payload}),
+        OCI_LAYER_MEDIA_TYPE,
+    )
+    with pytest.raises(LayerIntakeError, match="oci-invalid-path"):
+        with cas.lease_layer(image, 0) as lease, stage_layer(lease):
+            pass
+
+
 @pytest.mark.parametrize("mutation", ["truncated", "crc", "trailing", "codec"])
 def test_corrupt_or_mismatched_gzip_fails_closed(tmp_path: Path, mutation: str) -> None:
     member, payload = _file("value")
@@ -1499,7 +1552,7 @@ def test_production_policy_constants_match_pr4_contract() -> None:
     assert limits.max_path_bytes == 4096
     assert limits.max_compression_ratio == 2048
     assert limits.timeout_seconds == 300.0
-    assert LAYER_INTAKE_POLICY_ID.endswith(".v1")
+    assert LAYER_INTAKE_POLICY_ID.endswith(".v2")
     assert limits.fingerprint.startswith("sha256:")
     assert replace(limits, max_members=limits.max_members - 1).fingerprint != limits.fingerprint
 

@@ -199,6 +199,15 @@ def test_derived_recipe_v3_differs_from_v2_without_invalidating_old_key_records(
     assert DerivedSquashFSKey.from_dict(old.to_dict()) == old
 
 
+def test_literal_backslash_intake_policy_has_a_distinct_cache_recipe() -> None:
+    current = _key(_occurrence())
+    old = replace(current, intake_policy_id="palimpsest.oci-layer-intake.v1")
+
+    assert current.intake_policy_id == "palimpsest.oci-layer-intake.v2"
+    assert current.digest != old.digest
+    assert DerivedSquashFSKey.from_dict(old.to_dict()) == old
+
+
 def _receipts(occurrence: DerivedLayerOccurrence, image: bytes) -> tuple[LayerIntakeReceipt, PackedSquashFSReceipt]:
     intake = LayerIntakeReceipt(
         policy_id=LAYER_INTAKE_POLICY_ID,
@@ -1972,6 +1981,7 @@ class _FakeLibvirt:
         self.calls.append(("run",))
         if self.on_run is not None:
             self.on_run()
+        threading.Event().wait(0.001)
         return 0
 
 
@@ -2118,6 +2128,9 @@ class _DefinitionConnection:
     def newStream(self, flags: int) -> object:
         self.stream_flags.append(flags)
         return self.stream
+
+    def isAlive(self) -> int:
+        return 1
 
     def defineXML(self, xml: str) -> _DefinedDomain:
         self.define_calls += 1
@@ -2421,6 +2434,118 @@ def test_oci_root_define_revalidates_and_durably_records_inactive_domain(
         ),
         "schema": "palimpsest.oci-root-definition.v2",
     }
+
+
+def test_oci_root_define_health_loss_after_definition_uses_exact_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "health-race")
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    calls = 0
+
+    def health_check() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise StateError("startup event service is unhealthy")
+
+    with pytest.raises(StateError, match="startup event service"):
+        define_committed_oci_root_domain(
+            roots,
+            "health-race",
+            store,
+            boot,
+            profile,
+            conn=conn,
+            runner=tools,
+            health_check=health_check,
+        )
+    assert calls == 2
+    assert "health-race" not in conn.domains
+    snapshot = read_run_ledger_snapshot(roots, "health-race")
+    assert snapshot.state["status"] == "creating"
+    assert "oci_root_definition" not in snapshot.state
+
+
+def test_health_loss_after_durable_definition_retains_exact_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, "health-after")
+    conn = _DefinitionConnection()
+    monkeypatch.setattr(oci_root_runtime_module.kvm, "_libvirt", lambda: _FAKE_LIBVIRT)
+    calls = 0
+
+    def health_check() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise StateError("startup event service is unhealthy")
+
+    defined = define_committed_oci_root_domain(
+        roots,
+        "health-after",
+        store,
+        boot,
+        profile,
+        conn=conn,
+        runner=tools,
+        health_check=health_check,
+    )
+    with pytest.raises(StateError, match="startup event service"):
+        health_check()
+
+    assert defined.domain_uuid == conn.domains["health-after"].UUIDString()
+    snapshot = read_run_ledger_snapshot(roots, "health-after")
+    assert snapshot.state["status"] == "defined"
+    assert snapshot.state["oci_root_definition"]["phase"] == "defined"
+
+
+def test_monitor_startup_event_cleanup_failure_retains_defined_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    name = "startup-cleanup-retain"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    libvirt = _FakeLibvirt()
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch, libvirt=libvirt)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    binding = prepare_oci_root_monitor_binding(
+        roots,
+        name,
+        store,
+        boot,
+        profile,
+        conn=conn,
+        boot_attempt_id=str(uuid.uuid4()),
+        runner=tools,
+    )
+    lease = _committed_monitor_lease(roots, name, binding, monkeypatch, request)
+    domain = conn.domains[name]
+    monkeypatch.setattr(libvirt, "virEventRemoveTimeout", lambda _timer: 1)
+
+    with pytest.raises(StateError, match="cleanup is required"):
+        launch_defined_oci_root_domain(
+            roots,
+            name,
+            store,
+            boot,
+            profile,
+            conn=conn,
+            runner=tools,
+            monitor_binding=binding,
+            monitor_lease=lease,
+            authority_guard=lambda: None,
+        )
+
+    assert domain.destroy_calls == 0 and domain.undefine_calls == 0
+    snapshot = read_run_ledger_snapshot(roots, name)
+    assert snapshot.state["oci_root_handoff"]["phase"] == "cleanup-required"
+    assert snapshot.state["oci_root_handoff"]["domain_uuid"] == domain.UUIDString()
+    assert any(candidate is conn for _service, candidate in oci_root_runtime_module._EVENT_STARTUP_QUARANTINE)
 
 
 def test_oci_root_define_accepts_only_bounded_non_resource_libvirt_defaults(
@@ -3847,6 +3972,13 @@ def test_oci_root_stop_terminal_ack_requires_durable_state_and_journal(tmp_path,
             stream.free()
 
     original_mark_terminal = control.mark_terminal
+    original_pump = oci_root_runtime_module._LibvirtLifecycleEventPump
+
+    def lifecycle_pump(libvirt, stream):
+        assert not any(
+            thread.name == "palimpsest-oci-startup-events" and thread.is_alive() for thread in threading.enumerate()
+        )
+        return original_pump(libvirt, stream)
 
     def mark_terminal():
         assert read_run_ledger_snapshot(roots, name).state["status"] == "exited"
@@ -3854,6 +3986,7 @@ def test_oci_root_stop_terminal_ack_requires_durable_state_and_journal(tmp_path,
         original_mark_terminal()
 
     control.mark_terminal = mark_terminal
+    monkeypatch.setattr(oci_root_runtime_module, "_LibvirtLifecycleEventPump", lifecycle_pump)
     monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff)
     result = launch_defined_oci_root_domain(
         roots,

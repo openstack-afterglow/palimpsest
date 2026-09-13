@@ -10,6 +10,29 @@ the ML proof used a bare sibling-module import. No VM was created; the existing
 uses an explicit file-based helper import and adds an independent collect-only
 regression. CPU execution results are recorded separately when available.
 
+At `049a978`, the corrected tests collected, but neither framework reached a
+guest result. TensorFlow stopped before VM definition at the literal-backslash
+layer intake boundary. PyTorch completed conversion, then its libvirt
+connection expired during the long export/rehash interval before definition.
+The follow-up startup-event contract services that same validated connection
+during slow preparation, forbids reconnect, and stops fully before lifecycle
+event handling. Failure handling is phase-specific: health loss after a
+`defineXML` attempt but before its durable record uses the existing exact
+cleanup; loss after the durable public definition retains the exact inactive
+domain and `defined` ledger; a bound-monitor failure after activation intent or
+creation quarantines the connection and records exact cleanup-required
+evidence. Portable tests do not turn either prior native failure into a
+compatibility pass.
+
+The service is limited to the public preparation connection and the fresh
+bound-monitor connection. It uses a 10 ms event timer, a one-second startup and
+join bound, and a 100 ms serialized event-lock wait; those bounds do not make a
+blocked libvirt syscall a hard wall-clock deadline. It never reconnects and is
+fully stopped before lifecycle stream pumping. Quarantined connections are not
+closed or used for cleanup. Before quarantine, definition failures follow the
+phase-specific exact-cleanup or durable-definition retention rules above.
+Guest code and the monitor protocol are unchanged.
+
 ## CPU proof contract
 
 Palimpsest's first ML compatibility proof is deliberately CPU-only and opt-in.
@@ -23,6 +46,13 @@ uses the public local-run command override to replace `Cmd` with fixed
 `/bin/sleep infinity`; the authenticated image `Entrypoint` remains in front of
 that command. Boot-plan v4 provenance binds the original process vectors and
 the override. Image config, layers, DiffIDs, and archive remain unchanged.
+
+TensorFlow's pinned image also exercises a Linux filename containing a literal
+backslash in layer ordinal 4. Intake preserves that character rather than
+treating it as a separator; slash traversal, reserved-tree, and other path
+rejections remain in force. A successful portable or packer test defines this
+compatibility behavior, while an actual TensorFlow VM result remains a separate
+native proof.
 
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with

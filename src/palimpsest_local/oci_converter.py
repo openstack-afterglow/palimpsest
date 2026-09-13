@@ -43,7 +43,7 @@ _BLOCK = 512
 _ZERO_BLOCK = b"\0" * _BLOCK
 _IO_CHUNK = 1024 * 1024
 
-LAYER_INTAKE_POLICY_ID = "palimpsest.oci-layer-intake.v1"
+LAYER_INTAKE_POLICY_ID = "palimpsest.oci-layer-intake.v2"
 
 
 class LayerIntakeError(ArtifactValidationError):
@@ -280,7 +280,7 @@ def _validate_path(path: str, limit: int) -> str:
         raise LayerIntakeError("oci-path-limit", "member path exceeds the byte limit")
     if not path or path == ".":
         return "."
-    if "\0" in path or "\\" in path or ".." in path.split("/"):
+    if "\0" in path or ".." in path.split("/"):
         raise LayerIntakeError("oci-invalid-path", "member path is unsafe")
     normalized = os.path.normpath(path)
     if normalized.startswith("/") or normalized in {"..", "."} or normalized.startswith("../"):
