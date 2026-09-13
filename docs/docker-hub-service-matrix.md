@@ -61,6 +61,44 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### MySQL explicit-user diagnostic — `aef88ef`, 2026-09-13
+
+Exact `aef88efde011d2d50c6b52aee9b5f54a9744b0ec` passed the focused
+124 tests locally (9.20 seconds) and on the server (6.33 seconds), and
+[package workflow 34750645168](https://github.com/openstack-afterglow/palimpsest/actions/runs/34750645168)
+published successfully. Only the new `MYSQL_USER` native case ran; production
+C/ELF and the original default case were unchanged. The wrapper supplied the
+same preserved MySQL archive/manifest pins used by the default run.
+
+With public `--user mysql`, the guest completed root transition and workload
+isolation/start, and the MySQL 8.4.11 entrypoint reached
+`Database is uninitialized and password option is not specified`. The prior
+`setgid` error was absent. This establishes advancement to initialization
+configuration, not database readiness or service success. The workload exited
+status 1 before the public detached run could return successfully (61.44 seconds);
+version/socket and independent application root/PID1 probes were not reached.
+The guest reported quiesced root and a reaped workload. The transient libvirt
+name-lookup error in run stderr is not treated as the primary failure: the
+retained domain identity and inactive state were verified afterwards.
+
+Evidence is `/tmp/palimpsest-mysql-user-native-rzri277p`, runtime
+`/tmp/p-hub-svc-myu-6900cad5`, retained domain
+`hub-service-mysql-user-0d62d399`, UUID
+`5cb4e57b-9872-41cf-926f-b4dbb44e7cf2`, shut off. Preservation passed for the
+eleven prior domains plus this new failure, twelve unchanged archive hashes,
+and zero active VM/QEMU. Journal `/tmp/palimpsest-mysql-user-journal-cz6e11tb`
+validated four records/two invocations/928 bytes. Wrapper SHA-256 is
+`56312cd4dcc03591dbee6283e220707baac222791410669c056af25f2c63fe59`.
+It correctly returned 1 with `verification_passed=false`; no failed runtime
+or source was deleted.
+
+Next boundary: explicit secret-safe initialization configuration. Public OCI
+environment/command overrides are not currently supported. Do not enable an
+empty-password mode, bake a password into an image, inherit host environment,
+or weaken capability/PID1 protection automatically. A new input/secret-storage
+contract requires a separate decision and tests for log/ledger redaction;
+the default and explicit-user failures remain distinct evidence.
+
 ### Approved populated `/dev` follow-up
 
 The corrected diagnostic at exact `b7b81626924892ee54ed50f32cd8de8dbfde9987`
