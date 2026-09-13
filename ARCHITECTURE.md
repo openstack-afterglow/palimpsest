@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+`2626229`의 난수 비밀번호 진단은 같은 서버 SHA 선별173건(66.06초)을 통과했지만 실기1건은 host preflight에서4.04초에 실패했다. 테스트의 lifecycle 경로104B가 임시 suffix를 고려한97B 제한을 초과했으며 VM 부팅·난수 생성 전이다. 기존12개 domain/archive와 zero-active 상태는 보존됐다. 후속은 이 테스트의 VM 이름만 줄여90B로 만들며 production 경로 제한·guest·권한은 그대로다. [실패 증거](docs/docker-hub-service-matrix.md)를 서비스 또는 비밀번호 폐기 성공과 구분한다.
+
 사용자 승인 후속 MySQL 난수 비밀번호 진단은 제품의 secret 입력 기능이 아니라 별도 테스트다. 원본 archive/layer는 보존하고 테스트용 파생 config의 고정 wrapper가 게스트 안에서만 난수를 생성한다. 값 자체는 host argv/environment나 OCI config에 넣지 않는다. 기존 default·`--user mysql` 실패와 별개로 초기화 완료 후 최종 서버 준비를 검사하며, socket ping은 인증 SQL 검증으로 확대하지 않는다. 비밀번호가 남을 수 있는 이번 테스트의 workload와 root disk는 성공·실패 모두 정확한 소유권을 확인한 공개 stop/rm으로 폐기한다. 정리 실패는 폐기 성공이 아니며 기존 실패 VM을 삭제하지 않는다. Production CLI·guest ELF·PID1·capability 정책은 변경하지 않는다. 구현·실행 증거는 [service matrix](docs/docker-hub-service-matrix.md)에 구분한다.
 
 `aef88ef`의 별도 `--user mysql` 진단은 setgid 오류 없이 초기화 비밀번호 옵션 누락까지 진행했으나61.44초에 실패했다. 실제 `/` 전환·workload 시작은 확인했지만 detached run 반환·서비스 준비/socket과 독립 앱 root/PID1 검사는 통과하지 않았다. 같은 SHA 선별124건과 GitHub 패키지 발행은 통과했다. 기존11개+새 실패1개 domain·archive12개를 보존하고 활성 VM/QEMU 없음까지 확인했다. 다음 경계는 secret-safe 초기화 설정 전달이며 환경변수/secret 입력 계약과 사용자 결정 없이 비밀번호·빈 비밀번호 모드·권한 완화를 추가하지 않는다. [MySQL 결과](docs/docker-hub-service-matrix.md)를 참고한다.
@@ -386,9 +388,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ff9e07dd5c79c8c2e21814b1ed9873059ceedb6bc264219b12acce406d32efa2",
-  "reviewed_at": "2026-09-13T10:49:23Z",
-  "summary": "Reviewed disposable MySQL random-password test: pinned config-only derivative, guest-only generator, ordered readiness, bounded redaction, failure-independent public cleanup attempts and separate application/disposal receipts. Behavioral error-injection regressions and independent review required before native execution; production runtime and guest ELF unchanged."
+  "source_sha256": "021f148dea80c292af0d1e337937345d320c9ed1b958f2995ba70537d450f871",
+  "reviewed_at": "2026-09-13T10:55:56Z",
+  "summary": "Reviewed random-test-only short run name and exact90-byte lifecycle regression against unchanged97-byte host limit. Recorded2626229 preboot4.04s rejection,173 focused server passes and preserved12domains/12archives. No VM/password generation in failed attempt; production and ELF unchanged."
 }
 ```
 <!-- architecture-review:end -->

@@ -80,6 +80,28 @@ historical failed runs remain untouched.
 
 ## Results
 
+### Random-password diagnostic preflight — `2626229`, 2026-09-13
+
+The first separately approved random-password diagnostic stopped at the host
+runtime path-length preflight before VM creation or guest password generation.
+Its 104-byte lifecycle socket path exceeded the stricter 97-byte product bound.
+The test-only random case now uses the shorter `hub-service-mysql-random-<8hex>`
+name (90 bytes under the qualified `/tmp/p-hub-svc-myr-<8hex>` root). Production
+limits and the existing default and explicit-user case names remain unchanged.
+This preflight failure is not MySQL execution evidence.
+
+Exact `26262290017893d1fb5084081da374b91463daaf` passed 173 focused tests
+locally (25.21 seconds) and on the server (66.06 seconds); the native case
+failed in 4.04 seconds. Evidence is `/tmp/palimpsest-mysql-random-native-ae8jkx_z`,
+runtime `/tmp/p-hub-svc-myr-98715d0d`. Application completion is false and owned
+resources disposed is true: no new run/domain/root remained, not removal of an
+executed MySQL workload. All twelve original domains and twelve archives were
+preserved with zero active VM/QEMU. The private journal had four records/two
+invocations/928 bytes. Wrapper SHA-256 was
+`00ea91c65d77e9ca38a02399ad7c7b69e12d03ba74c2250ee33b4fadfd165850`.
+The error was identified using fixed category/source-location matching on the
+server without retrieving raw guest logs.
+
 ### MySQL explicit-user diagnostic — `aef88ef`, 2026-09-13
 
 Exact `aef88efde011d2d50c6b52aee9b5f54a9744b0ec` passed the focused

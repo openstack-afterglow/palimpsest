@@ -224,6 +224,16 @@ def test_random_password_cleanup_is_flagged_and_missing_root_directory_is_an_emp
     assert 'cleanup_evidence_errors' in source
 
 
+def test_random_password_name_keeps_exact_qualified_lifecycle_path_within_97_bytes() -> None:
+    parent = Path("/tmp/p-hub-svc-myr-12345678")
+    name = "hub-service-mysql-random-12345678"
+    lifecycle = parent / "state" / "runs" / name / "io" / "lifecycle.sock"
+    assert len(str(lifecycle).encode()) == 90
+    assert len(str(lifecycle).encode()) <= 97
+    source = PATH.read_text()
+    assert 'name_prefix = "hub-service-mysql-random-" if case.test_only_random_password' in source
+
+
 def test_matrix_uses_public_cli_and_preserves_failed_runtime_without_rm_or_hypervisor_force() -> None:
     source = PATH.read_text(encoding="utf-8")
     assert 'legacy._cli(environment, "stop", name' in source

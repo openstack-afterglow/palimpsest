@@ -554,7 +554,10 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         if case.test_only_random_password and root_volume_directory.is_dir()
         else set()
     )
-    name = "hub-service-" + case.key.lower().replace("_", "-") + "-" + uuid.uuid4().hex[:8]
+    name_prefix = "hub-service-mysql-random-" if case.test_only_random_password else (
+        "hub-service-" + case.key.lower().replace("_", "-") + "-"
+    )
+    name = name_prefix + uuid.uuid4().hex[:8]
     if case.test_only_random_password:
         assert not (resolve_roots(environment).runs / name).exists()
         virsh = legacy.shutil.which("virsh", path=environment.get("PATH"))
