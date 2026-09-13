@@ -58,6 +58,14 @@ inventory는 새 persistent domain 하나가 shut off·autostart disable 상태�
 해당 domain은 owned로 채택하거나 재실행·제거·추가 조회하지 않았다. 두 native
 실패 원인과 후속 수정은 제한된 진단의 별도 승인을 기다린다.
 
+후속 사용자 승인으로 서버 원문을 반출하지 않고 분석한 결과, `132c6c5`
+TensorFlow는 root-volume entry 수 assertion에서 중단됐음을 확인했다.
+테스트가 디렉터리 한 개를 기대했지만 실제 `oci_root_volume._paths` 계약은
+동일 volume ID의 `.raw`·`.json` 두 regular file이다. 후속 테스트는 preparation
+transaction의 volume ID에 묶인 두 파일과 정확한 생성/제거 집합을 검사한다.
+이는 테스트 계약 수정이며 CPU tensor·인증 root/PID1 검사 통과 또는 production
+저장 구조 변경이 아니다. 과거 실패는 유지하고 수정 후 실기를 별도로 기록한다.
+
 `de304ea`의 익명 registry intake는 같은 Linux checkout 선별76건과 공개 `oci pull`을 통한 GHCR 비특권 NGINX·Quay Prometheus BusyBox 취득/OCI CAS 검증을 통과했다. 새 archive의 부팅 성공은 아니다. 직전 동일 guest/runtime `cfb8015`의 별도 VM 재검증은 Redis user override와 비특권 NGINX가 통과했고 기본 PostgreSQL·Redis·NGINX는 권한 거부와 함께 실패했다. 실패는 inactive로 보존하고 성공 자원은 정상 제거했으며 guest 권한 정책은 바꾸지 않았다. 새 [registry 검증 기록](docs/registry-intake.md#verified-checkpoint)은 취득 성공과 VM 호환성 결과를 분리한다.
 
 `93c1eb0`의 self-FD 변경은 같은 서버 SHA 선별481건·packaged-binary34건과 stage1 43boots/44QEMU(121.28초), UID0/101 stdio V3(16.16/16.11초), 기존 v2 빌드 이미지 cold 공개 lifecycle(22.56초)을 통과했다. MySQL 일회용 진단은 최종 초기화·서버 준비, 실제 `/`와 인증 root 일치, PID1 거부까지 통과했지만 passwordless ping의 exit0/인증 거부에 alive 문자열을 추가 요구한 테스트가 실패했다(116.21초). 새 VM/root는 폐기했고 기존12개 domain/archive와 zero-active를 보존했다. 후속은 일회용 테스트의 도달성 판정만 공식 ping exit-status 계약에 맞추며 인증 SQL 성공이나 기본 이미지 성공으로 확대하지 않는다. [상세 결과와 중간 실패](docs/oci-linux-process.md#self-fd-verification-checkpoint--93c1eb0)를 구분한다.
@@ -348,6 +356,15 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ML 실기 모듈은 sibling CLI proof helper를 명시적 파일 위치로 로드한다. portable contract가 `sys.path`를 바꾸어 단독 실행의 import 결함을 가리지 않으며, 별도 subprocess `--collect-only`로 두 native 노드의 독립 수집을 검사한다. `581061f`의 첫 시도는 이 import 문제로 pytest 수집 단계에서 중단됐고 VM을 만들지 않았다. 원본 archive와 기존 runtime 보존은 통과했으며 framework 실행 성공은 아니다.
 
+ML proof의 private setup evidence에는 고정 framework/phase/status enum과
+확인 가능한 정수 returncode만 담는 `ml-phase.json`을 추가한다. 명령 실패와
+명령 반환 후 assertion 실패를 구분하며 argv·경로·예외 문장·guest 출력은
+이 receipt에 넣지 않는다. 0700 evidence의 0600 파일에 크기 제한된 원자적
+교체를 사용하고 기록 실패가 원래 테스트 예외를 대체하지 않는다. 이는
+테스트 관측성 변경이며 production journal·monitor ownership·guest/PID1
+정책이나 ML 성공 판정을 바꾸지 않는다. Receipt는 cleanup 권한 또는 실제
+실기 통과의 대체 증거가 아니며 상세 범위는 [ML proof](docs/oci-ml-compatibility.md)에 있다.
+
 ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
@@ -468,9 +485,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e1a47114a29bcdf241d6be07debbeaab81f23a10a570c7d761bde5269d9fba60",
-  "reviewed_at": "2026-09-13T17:35:00Z",
-  "summary": "Reviewed selected Nova-instance OCI-root GPU target against local runtime XML, stage1 block/control bindings, initramfs and Hub export direction. Documentation-only plan separates portable disk/cloud bootstrap trust, guest GPU runtime and exclusive Cinder root lifecycle from unselected local/nested host assignment. No source, GPU or cloud mutation; ML diagnosis pending."
+  "source_sha256": "d23d5eabd04329c8d5d50617f918f7a735f657899d0f70b4e30080af5479c5f0",
+  "reviewed_at": "2026-09-13T17:49:57Z",
+  "summary": "Reviewed ML test-only phase receipts and confirmed132 TensorFlow root-volume-count assertion mismatch against oci_root_volume._paths. Proof now binds transaction volume ID to exact raw/json files and both cleanup targets; fixed bounded private phase enums preserve original failures. Real proof failure-injection and focused105 passed locally. No production/guest/schema/GPU policy change or native ML success claimed."
 }
 ```
 <!-- architecture-review:end -->

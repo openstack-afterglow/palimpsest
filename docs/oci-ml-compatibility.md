@@ -10,6 +10,17 @@ the ML proof used a bare sibling-module import. No VM was created; the existing
 uses an explicit file-based helper import and adds an independent collect-only
 regression. CPU execution results are recorded separately when available.
 
+After private setup establishes its evidence directory, the proof best-effort
+replaces a private `ml-phase.json` diagnostic receipt. Selection or setup
+failure therefore has no receipt guarantee. The receipt contains only fixed
+framework, phase, and status enums plus a strict integer return code when the
+immediately preceding bounded command returned one. It does not retain argv,
+paths, exception text, stdout, or stderr. Nonzero commands retain their command
+phase and return code; separately named subsequent assertion phases are
+recorded where defined. Receipt-write failure never replaces the original proof
+failure. The receipt is diagnostic evidence, not a success result or cleanup
+authority.
+
 At `049a978`, the corrected tests collected, but neither framework reached a
 guest result. TensorFlow stopped before VM definition at the literal-backslash
 layer intake boundary. PyTorch completed conversion, then its libvirt
@@ -23,6 +34,17 @@ domain and `defined` ledger; a bound-monitor failure after activation intent or
 creation quarantines the connection and records exact cleanup-required
 evidence. Portable tests do not turn either prior native failure into a
 compatibility pass.
+
+At `132c6c5`, TensorFlow again returned pytest code 1 with retained evidence,
+no wrapper accounting error, and preserved host baselines. A bounded reviewed
+classifier mapped the `AssertionError` to the proof's root-volume-count check,
+before root proof or framework execution. The proof incorrectly expected one
+new directory, while the production volume contract publishes the authenticated
+volume UUID as two regular siblings, `<uuidhex>.raw` and `<uuidhex>.json`. The
+corrected proof binds those exact files to the durable preparation transaction,
+checks the raw size and safe file identities, and requires both to disappear on
+successful cleanup. This diagnosis and test correction are not a TensorFlow
+framework or VM compatibility pass.
 
 The service is limited to the public preparation connection and the fresh
 bound-monitor connection. It uses a 10 ms event timer, a one-second startup and

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
@@ -29,6 +31,30 @@ _SPEC.loader.exec_module(legacy)
 _PREFIX = "PALIMPSEST_OCI_ML_"
 _KEEPALIVE = ("/bin/sleep", "infinity")
 _PRIVATE_DISK_BUDGET = 40 * 1024 * 1024 * 1024
+_PHASES = frozenset(
+    {
+        "setup",
+        "preflight",
+        "authenticate",
+        "public-run-command",
+        "public-run-assertion",
+        "provenance",
+        "root-volume",
+        "root-proof",
+        "root-proof-after",
+        "domain-check",
+        "framework-exec-command",
+        "framework-exec-assertion",
+        "root-identity",
+        "pid1-refusal",
+        "stop",
+        "remove",
+        "cleanup-assertion",
+        "source-hash-assertion",
+        "source-preservation",
+        "complete",
+    }
+)
 pytestmark = pytest.mark.kvm
 
 
@@ -62,6 +88,90 @@ CASES = (
 )
 
 
+def _write_phase_receipt(evidence: Path, framework: str, phase: str, status: str, returncode: int | None) -> None:
+    if (
+        framework not in {"tensorflow", "pytorch"}
+        or phase not in _PHASES
+        or status not in {"entered", "failed", "passed"}
+    ):
+        raise AssertionError("invalid ML phase receipt")
+    if returncode is not None and (type(returncode) is not int or not -255 <= returncode <= 255):
+        raise AssertionError("invalid ML phase return code")
+    directory_fd = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    temporary = ".ml-phase-" + uuid.uuid4().hex
+    descriptor = -1
+    try:
+        info = os.fstat(directory_fd)
+        assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700
+        try:
+            current = os.stat("ml-phase.json", dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            assert stat.S_ISREG(current.st_mode) and current.st_uid == os.geteuid()
+            assert stat.S_IMODE(current.st_mode) == 0o600 and current.st_nlink == 1
+        payload = (
+            json.dumps(
+                {
+                    "framework": framework,
+                    "phase": phase,
+                    "returncode": returncode,
+                    "schema": "palimpsest.oci-ml-phase.v1",
+                    "status": status,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+        assert len(payload) <= 512
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if type(written) is not int or written <= 0:
+                raise OSError("ML phase receipt write failed")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, "ml-phase.json", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _record_phase(
+    evidence: Path,
+    framework: str,
+    state: list[object],
+    phase: str,
+    status: str,
+    returncode: int | None = None,
+) -> None:
+    state[:] = [phase, returncode]
+    try:
+        _write_phase_receipt(evidence, framework, phase, status, returncode)
+    except BaseException:
+        pass
+
+
+def _require_success(state: list[object], phase: str, result: subprocess.CompletedProcess[bytes]) -> None:
+    state[:] = [phase, result.returncode if type(result.returncode) is int else None]
+    legacy._success(result)
+
+
 def _selection(case: MLCase):
     stem = _PREFIX + case.key + "_"
     if os.environ.get(stem + "LIVE") != "1":
@@ -88,7 +198,9 @@ def _assert_cpu_only_domain(environment: dict[str, str], name: str) -> None:
     assert devices.findall("./devices/filesystem") == []
 
 
-def _assert_override_provenance(environment: dict[str, str], name: str, image_process: OCIProcessSpec) -> None:
+def _assert_override_provenance(
+    environment: dict[str, str], name: str, image_process: OCIProcessSpec
+) -> OCIRootPreparationTransaction:
     snapshot = read_run_ledger_snapshot(resolve_roots(environment), name)
     transaction = OCIRootPreparationTransaction.from_dict(snapshot.state.get("oci_root"))
     provenance = transaction.boot_plan["process_provenance"]
@@ -99,6 +211,22 @@ def _assert_override_provenance(environment: dict[str, str], name: str, image_pr
     entrypoint = tuple(provenance["image_entrypoint"])
     effective = OCIProcessSpec.from_dict(transaction.boot_plan["process"])
     assert effective == image_process.with_command(entrypoint, _KEEPALIVE)
+    return transaction
+
+
+def _assert_new_root_volume_files(roots, before: set[str], transaction: OCIRootPreparationTransaction):
+    stem = transaction.volume_id.replace("-", "")
+    expected = {f"{stem}.raw", f"{stem}.json"}
+    current = {entry.name for entry in roots.oci_root_volumes.iterdir()}
+    assert current - before == expected
+    raw = roots.oci_root_volumes / f"{stem}.raw"
+    record = roots.oci_root_volumes / f"{stem}.json"
+    raw_info = raw.stat(follow_symlinks=False)
+    record_info = record.stat(follow_symlinks=False)
+    assert stat.S_ISREG(raw_info.st_mode) and raw_info.st_uid == os.geteuid() and raw_info.st_nlink == 1
+    assert raw_info.st_size == transaction.volume_size_bytes
+    assert stat.S_ISREG(record_info.st_mode) and record_info.st_uid == os.geteuid() and record_info.st_nlink == 1
+    return raw, record
 
 
 def _setup(environment: dict[str, str], name: str):
@@ -138,13 +266,20 @@ def _proof(case: MLCase) -> None:
     selection = _selection(case)
     name = "ml-" + case.key.lower() + "-" + uuid.uuid4().hex[:8]
     parent, environment = _setup(legacy._environment(), name)
-    source_hash = legacy._file_sha256(selection.archive)
-    roots = resolve_roots(environment)
-    assert shutil.disk_usage(parent).free >= _PRIVATE_DISK_BUDGET
-    root_volumes_before = _fresh_root_volume_baseline(roots)
+    evidence = Path(environment["PALIMPSEST_PROOF_EVIDENCE_DIR"])
+    phase_state: list[object] = ["setup", None]
+    _record_phase(evidence, case.key.lower(), phase_state, "setup", "passed")
+    source_hash: str | None = None
     try:
+        _record_phase(evidence, case.key.lower(), phase_state, "preflight", "entered")
+        source_hash = legacy._file_sha256(selection.archive)
+        roots = resolve_roots(environment)
+        assert shutil.disk_usage(parent).free >= _PRIVATE_DISK_BUDGET
+        root_volumes_before = _fresh_root_volume_baseline(roots)
+        _record_phase(evidence, case.key.lower(), phase_state, "authenticate", "entered")
         original = legacy._authenticate(selection, parent)
         assert original.argv[-1:] == ("/bin/bash",)
+        _record_phase(evidence, case.key.lower(), phase_state, "public-run-command", "entered")
         launched = legacy._save(
             parent,
             "run",
@@ -168,33 +303,44 @@ def _proof(case: MLCase) -> None:
                 timeout=900,
             ),
         )
-        legacy._success(launched)
+        _require_success(phase_state, "public-run-command", launched)
+        _record_phase(evidence, case.key.lower(), phase_state, "public-run-assertion", "entered", launched.returncode)
         assert launched.stdout == (name + "\n").encode()
-        _assert_override_provenance(environment, name, original)
-        root_volumes_running = {entry.name for entry in roots.oci_root_volumes.iterdir()}
-        created_root_volumes = root_volumes_running - root_volumes_before
-        assert len(created_root_volumes) == 1
-        root_volume_path = roots.oci_root_volumes / created_root_volumes.pop()
-        root_volume_info = root_volume_path.stat(follow_symlinks=False)
-        assert stat.S_ISDIR(root_volume_info.st_mode) and root_volume_info.st_uid == os.geteuid()
+        _record_phase(evidence, case.key.lower(), phase_state, "provenance", "entered")
+        transaction = _assert_override_provenance(environment, name, original)
+        _record_phase(evidence, case.key.lower(), phase_state, "root-volume", "entered")
+        root_volume_path, root_volume_record = _assert_new_root_volume_files(roots, root_volumes_before, transaction)
+        _record_phase(evidence, case.key.lower(), phase_state, "root-proof", "entered")
         before = legacy._root_proof(environment, name)
         domain_uuid = before["domain"]["uuid"]
+        _record_phase(evidence, case.key.lower(), phase_state, "domain-check", "entered")
         _assert_cpu_only_domain(environment, name)
+        _record_phase(evidence, case.key.lower(), phase_state, "framework-exec-command", "entered")
         calculation = legacy._save(
             parent,
             "tensor",
             legacy._cli(environment, "exec", name, "--", case.python, "-c", case.program, timeout=180),
         )
-        legacy._success(calculation)
+        _require_success(phase_state, "framework-exec-command", calculation)
+        _record_phase(
+            evidence,
+            case.key.lower(),
+            phase_state,
+            "framework-exec-assertion",
+            "entered",
+            calculation.returncode,
+        )
         assert case.output.fullmatch(calculation.stdout)
 
+        _record_phase(evidence, case.key.lower(), phase_state, "root-identity", "entered")
         identity = legacy._save(
             parent,
             "root",
             legacy._cli(environment, "exec", name, "--", "/bin/sh", "-c", "stat -c '%d %i' /", timeout=60),
         )
-        legacy._success(identity)
+        _require_success(phase_state, "root-identity", identity)
         device, inode = (int(value) for value in identity.stdout.split())
+        _record_phase(evidence, case.key.lower(), phase_state, "pid1-refusal", "entered")
         refusal = legacy._save(
             parent,
             "pid1-refusal",
@@ -210,21 +356,44 @@ def _proof(case: MLCase) -> None:
             ),
         )
         assert refusal.returncode != 0 and refusal.stdout == b"" and b"Permission denied" in refusal.stderr
+        _record_phase(evidence, case.key.lower(), phase_state, "root-proof-after", "entered")
         after = legacy._root_proof(environment, name)
         assert before["root_identity"] == after["root_identity"]
         assert (device, inode) == (after["root_identity"]["device"], after["root_identity"]["inode"])
-        legacy._success(legacy._save(parent, "stop", legacy._cli(environment, "stop", name, timeout=90)))
-        legacy._success(legacy._save(parent, "rm", legacy._cli(environment, "rm", name, timeout=90)))
+        _record_phase(evidence, case.key.lower(), phase_state, "stop", "entered")
+        stopped = legacy._save(parent, "stop", legacy._cli(environment, "stop", name, timeout=90))
+        _require_success(phase_state, "stop", stopped)
+        _record_phase(evidence, case.key.lower(), phase_state, "remove", "entered")
+        removed = legacy._save(parent, "rm", legacy._cli(environment, "rm", name, timeout=90))
+        _require_success(phase_state, "remove", removed)
+        _record_phase(evidence, case.key.lower(), phase_state, "cleanup-assertion", "entered")
         legacy._assert_domain_absent(environment, name, domain_uuid)
         assert not (roots.runs / name).exists()
         assert not root_volume_path.exists()
+        assert not root_volume_record.exists()
         assert {entry.name for entry in roots.oci_root_volumes.iterdir()} == root_volumes_before
+        _record_phase(evidence, case.key.lower(), phase_state, "source-hash-assertion", "entered")
         assert legacy._file_sha256(selection.archive) == source_hash == selection.archive_digest
+        _record_phase(evidence, case.key.lower(), phase_state, "source-preservation", "entered")
     except BaseException:
+        _record_phase(
+            evidence,
+            case.key.lower(),
+            phase_state,
+            str(phase_state[0]),
+            "failed",
+            phase_state[1] if type(phase_state[1]) is int else None,
+        )
         print(f"ML CPU proof failure preserved: {parent}", flush=True)
         raise
     finally:
-        legacy._record_source_hashes(parent, source_hash, selection.archive)
+        if source_hash is not None:
+            try:
+                legacy._record_source_hashes(parent, source_hash, selection.archive)
+            except BaseException:
+                _record_phase(evidence, case.key.lower(), phase_state, "source-preservation", "failed")
+                raise
+    _record_phase(evidence, case.key.lower(), phase_state, "complete", "passed")
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.key.lower())
