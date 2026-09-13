@@ -317,7 +317,7 @@ class ProofFilesystemSet:
     manifest_digest: str
 
 
-_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:bbcedfb70b81d463f89b9bc99104f78e254fa65ba8f2a548a2be41ae55249027"
+_PROOF_FILESYSTEM_MANIFEST_DIGEST = "sha256:de06327197062add9fdc3038d512a42f7cb07074569e408a216250373d5e495b"
 _PROOF_ASSEMBLY_PROBE = {
     "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
     "path": "/.__palimpsest_overlay_order_probe_v1",
@@ -349,10 +349,10 @@ def _verify_workload_proof_provenance(
         "build_script": "scripts/build_oci_guest_workload_proof.sh",
         "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
         "elf_mode": 0o755,
-        "elf_sha256": "0d01eeed6b695be965abeda6b7b6caefb4f4efa91228364ba9b2dbdcaf8a6cf4",
-        "elf_size_bytes": 10028,
+        "elf_sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+        "elf_size_bytes": 14328,
         "source": "guest/workload-proof/proof.c",
-        "source_sha256": "519e458dec5cbe61de6bc0208c63d32c311e8596f99f3beb6a303d510c1d4b1e",
+        "source_sha256": "7f2da9a6bca521721f70e468da2aa408410c48e7d7a56b2fe67e0c4bc88f88e8",
         "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1",
     }
     if not isinstance(provenance, Mapping) or dict(provenance) != expected:

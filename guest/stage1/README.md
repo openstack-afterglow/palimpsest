@@ -50,14 +50,19 @@ order and observed enqueue order are preserved, but independent stdout and
 stderr have no reconstructed real-time total order.
 
 The child-private mode-0755 `/dev` contains the same six root-owned character
-devices plus exactly two root-owned links: `stdout -> /proc/self/fd/1` and
-`stderr -> /proc/self/fd/2`. There is no `/dev/stdin` or general `/dev/fd`
+devices plus exactly three root-owned links: `stdout -> /proc/self/fd/1`,
+`stderr -> /proc/self/fd/2`, and `fd -> /proc/self/fd`. There is no `/dev/stdin`
 alias. The workload child creates the links without replacing an existing
 entry and checks their no-follow type, owner, mode, link count, and exact
-bounded target before dropping credentials. The complete eight-entry directory
+bounded target before dropping credentials. The complete nine-entry directory
 and all device identities are checked again after temporary cgroup staging is
 removed. The privileged parent never follows these aliases; reopening resolves
-the workload child's already-owned FIFO endpoints. These are setup-time checks
+the workload child's own descriptors, including application-created pipe FDs.
+The existing `/proc/1/fd` and `fdinfo` read-only empty masks and child FD closure
+policy remain unchanged. The self-FD alias does not grant another process's FD
+authority. Native probes check the entry descriptor inventory before opening
+their own files; main and additional exec must inherit only FD 0, 1, and 2.
+These are setup-time checks
 inside the child's private mount namespace, not an immutability guarantee
 against a UID 0 workload after launch.
 
@@ -102,7 +107,7 @@ the named `init.c` and `main_output_pump.h` inputs. The separate native stage-1,
 UID 0/101 stdout-stderr and existing-image public lifecycle proofs passed at
 `9736132`; see the [native checkpoint](../../docs/oci-linux-process.md#main-output-native-checkpoint-9736132-2026-09-10).
 Component/portable checks are distinct evidence. Source and focused real-C
-tests define the two standard-output aliases separately from native
+tests define the two standard-output aliases and the self-FD alias separately from native
 qualification; they do not by themselves qualify original NGINX, a new
 application build or full Gate 2.
 
@@ -167,7 +172,7 @@ root-owned empty `proc` and `sys` targets accept either exact `0755` or `0555`.
 populated-device-directory approval, only the `dev` transition target may be
 nonempty. Its contents are never opened, copied or admitted as workload devices:
 the verified initramfs devtmpfs is moved over it before root transition completes,
-and each workload receives its own verified six-device/two-alias tmpfs. `proc`,
+and each workload receives its own verified six-device/three-alias tmpfs. `proc`,
 `sys` and generic emptiness requirements remain unchanged. No permissions are
 normalized and no source image is changed. The ordered nofollow/type/owner/
 mode/emptiness checks retain the initial device/inode/mode/UID/GID snapshot;

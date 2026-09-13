@@ -45,11 +45,15 @@ leaf `cgroup.procs` to fail, proving the admitted UID 65534 cannot move itself
 through any visible level of the hierarchy.
 
 The private `/dev` proof permits exactly the six required character devices
-plus root-owned mode-0777 single-link `/dev/stdout` and `/dev/stderr` symlinks.
+plus root-owned mode-0777 single-link `/dev/stdout`, `/dev/stderr`, and `/dev/fd` symlinks.
 It validates their targets without following them as exactly
-`/proc/self/fd/1` and `/proc/self/fd/2`; `/dev/stdin`, `/dev/fd`, and every
-other entry remain forbidden. The existing character-device behavior checks
-remain unchanged.
+`/proc/self/fd/1`, `/proc/self/fd/2`, and `/proc/self/fd`; `/dev/stdin` and every
+other entry remain forbidden. Before opening any probe resource it enumerates
+`/proc/self/fd` and requires only inherited descriptors 0, 1, and 2 plus the
+enumeration descriptor itself. A probe-owned nonblocking pipe then checks
+dynamic `/dev/fd/N` read/write reopening, underlying pipe identity, and rejection
+after the referenced descriptor is closed. The existing character-device
+behavior and PID 1 descriptor-hiding checks remain unchanged.
 
 After validating the contract, the main process blocks SIGTERM and forks two
 same-process-group descendants. The cooperative descendant consumes PID 1's

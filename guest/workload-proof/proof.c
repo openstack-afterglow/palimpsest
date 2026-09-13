@@ -33,6 +33,7 @@ typedef unsigned long usize;
 #define SYS_pipe2 293
 #define SYS_getdents64 217
 #define SYS_fstat 5
+#define SYS_fstatfs 138
 #define SYS_mount 165
 #define SYS_mknod 133
 #define SYS_unshare 272
@@ -51,6 +52,7 @@ typedef unsigned long usize;
 #define PID1_STATUS_MAX 8192
 #define EINTR 4
 #define EACCES 13
+#define ENOENT 2
 #define EPERM 1
 #define EROFS 30
 #define ENOSPC 28
@@ -60,6 +62,8 @@ typedef unsigned long usize;
 #define CLONE_NEWNS 0x00020000
 #define AT_FDCWD -100
 #define AT_SYMLINK_NOFOLLOW 0x100
+#define TMPFS_MAGIC 0x01021994
+#define ST_RDONLY 1
 
 #define MAIN_SUCCESS 42
 #define DESCENDANT_SUCCESS 43
@@ -223,8 +227,45 @@ static int verify_capabilityless_boundary(void) {
     return 1;
 }
 
+static int inherited_fd_inventory(void) {
+    u8 entries[1024];
+    u64 seen = 0;
+    int directory = (int)sc3(SYS_open, (i64)"/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (directory < 0 || directory >= 63) return 0;
+    for (;;) {
+        i64 count = sc3(SYS_getdents64, directory, (i64)entries, sizeof(entries));
+        usize offset = 0;
+        if (count < 0) return 0;
+        if (!count) break;
+        while (offset < (usize)count) {
+            const u8 *entry = entries + offset;
+            u32 reclen;
+            usize length = 0, at;
+            u64 value = 0;
+            if ((usize)count - offset < 20) return 0;
+            reclen = (u32)entry[16] | ((u32)entry[17] << 8);
+            if (reclen < 20 || reclen > (usize)count - offset) return 0;
+            while (length < reclen - 19 && entry[19 + length]) length++;
+            if (length == reclen - 19) return 0;
+            if (!((length == 1 && entry[19] == '.') ||
+                  (length == 2 && entry[19] == '.' && entry[20] == '.'))) {
+                if (!length) return 0;
+                for (at = 0; at < length; at++) {
+                    if (entry[19 + at] < '0' || entry[19 + at] > '9') return 0;
+                    value = value * 10 + (entry[19 + at] - '0');
+                }
+                if (value >= 63 || (seen & (1ul << value))) return 0;
+                seen |= 1ul << value;
+            }
+            offset += reclen;
+        }
+    }
+    if (sc1(SYS_close, directory) != 0) return 0;
+    return seen == ((1ul << 0) | (1ul << 1) | (1ul << 2) | (1ul << directory));
+}
+
 static int allowed_dev_name(const u8 *name, usize size) {
-    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr"};
+    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr", "fd"};
     usize i;
     for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
         if (size == slen(allowed[i])) {
@@ -265,7 +306,7 @@ static int verify_private_devices(void) {
             offset += reclen;
         }
     }
-    if (sc1(SYS_close, directory) != 0 || seen != 0xff) return 0;
+    if (sc1(SYS_close, directory) != 0 || seen != 0x1ff) return 0;
     {
         static const char *paths[] = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"};
         usize i;
@@ -276,8 +317,8 @@ static int verify_private_devices(void) {
         }
     }
     {
-        static const char *paths[] = {"/dev/stdout", "/dev/stderr"};
-        static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2"};
+        static const char *paths[] = {"/dev/stdout", "/dev/stderr", "/dev/fd"};
+        static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2", "/proc/self/fd"};
         usize i;
         for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
             char target[32];
@@ -293,6 +334,38 @@ static int verify_private_devices(void) {
             for (at = 0; at < expected_size; at++) difference |= (u8)target[at] ^ (u8)targets[i][at];
             if (difference != 0) return 0;
         }
+    }
+    {
+        int pipe_descriptors[2];
+        struct stat_local original, reopened;
+        char path[32];
+        char byte;
+        int descriptor, closed;
+        if (sc2(SYS_pipe2, (i64)pipe_descriptors, O_CLOEXEC | O_NONBLOCK) != 0) return 0;
+        path[0] = '/'; path[1] = 'd'; path[2] = 'e'; path[3] = 'v'; path[4] = '/';
+        path[5] = 'f'; path[6] = 'd'; path[7] = '/'; path[8] = (char)('0' + pipe_descriptors[0]); path[9] = 0;
+        if (pipe_descriptors[0] < 3 || pipe_descriptors[0] > 9 || pipe_descriptors[1] < 3 ||
+            sc2(SYS_fstat, pipe_descriptors[0], (i64)&original) != 0) return 0;
+        descriptor = (int)sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NONBLOCK, 0);
+        if (descriptor < 0 || sc2(SYS_fstat, descriptor, (i64)&reopened) != 0 ||
+            original.dev != reopened.dev || original.ino != reopened.ino || original.rdev != reopened.rdev ||
+            original.mode != reopened.mode || original.uid != reopened.uid || original.gid != reopened.gid ||
+            sc3(SYS_write, pipe_descriptors[1], (i64)"r", 1) != 1 ||
+            sc3(SYS_read, descriptor, (i64)&byte, 1) != 1 || byte != 'r' ||
+            sc1(SYS_close, descriptor) != 0) return 0;
+        path[8] = (char)('0' + pipe_descriptors[1]);
+        if (pipe_descriptors[1] > 9 || sc2(SYS_fstat, pipe_descriptors[1], (i64)&original) != 0) return 0;
+        descriptor = (int)sc3(SYS_open, (i64)path, O_WRONLY | O_CLOEXEC | O_NONBLOCK, 0);
+        if (descriptor < 0 || sc2(SYS_fstat, descriptor, (i64)&reopened) != 0 ||
+            original.dev != reopened.dev || original.ino != reopened.ino || original.rdev != reopened.rdev ||
+            original.mode != reopened.mode || original.uid != reopened.uid || original.gid != reopened.gid ||
+            sc3(SYS_write, descriptor, (i64)"w", 1) != 1 ||
+            sc3(SYS_read, pipe_descriptors[0], (i64)&byte, 1) != 1 || byte != 'w' ||
+            sc1(SYS_close, descriptor) != 0) return 0;
+        closed = pipe_descriptors[1];
+        if (sc1(SYS_close, closed) != 0) return 0;
+        descriptor = (int)sc3(SYS_open, (i64)path, O_WRONLY | O_CLOEXEC | O_NONBLOCK, 0);
+        if (descriptor != -ENOENT || sc1(SYS_close, pipe_descriptors[0]) != 0) return 0;
     }
     {
         u8 byte = 0xff;
@@ -337,6 +410,17 @@ static int directory_is_empty(const char *path) {
     return sc1(SYS_close, directory) == 0;
 }
 
+struct statfs_local { i64 type,bsize;u64 blocks,bfree,bavail,files,ffree;int fsid[2];i64 namelen,frsize,flags,spare[4]; };
+
+static int masked_directory_is_empty_readonly(const char *path) {
+    struct statfs_local filesystem;
+    i64 directory = sc3(SYS_open, (i64)path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory < 0) return 0;
+    if (sc2(SYS_fstatfs, directory, (i64)&filesystem) != 0 || filesystem.type != TMPFS_MAGIC ||
+        !(filesystem.flags & ST_RDONLY) || sc1(SYS_close, directory) != 0) return 0;
+    return directory_is_empty(path);
+}
+
 static int denied_open(const char *path, int flags) {
     i64 descriptor = sc3(SYS_open, (i64)path, flags | O_CLOEXEC | O_NOFOLLOW, 0);
     if (descriptor >= 0) { sc1(SYS_close, descriptor); return 0; }
@@ -345,8 +429,8 @@ static int denied_open(const char *path, int flags) {
 
 static int authority_escape_failure(void) {
     i64 operation;
-    if (!directory_is_empty("/proc/1/fd")) return 1;
-    if (!directory_is_empty("/proc/1/fdinfo")) return 2;
+    if (!masked_directory_is_empty_readonly("/proc/1/fd")) return 1;
+    if (!masked_directory_is_empty_readonly("/proc/1/fdinfo")) return 2;
     if (!denied_open("/proc/1/mem", O_RDONLY)) return 3;
     if (!denied_open("/proc/sys/kernel/randomize_va_space", O_WRONLY)) return 4;
     if (!directory_is_empty("/sys/class/virtio-ports")) return 5;
@@ -436,6 +520,7 @@ static int invocation_failure(u64 argc, char **argv, char **environment) {
     i64 cwd_size;
     int authority_error;
     int uid0_mode;
+    if (!inherited_fd_inventory()) return 32;
     if ((argc != 4 && argc != 5) || !same_text(argv[0], ".__palimpsest_workload_proof_v1") ||
         !same_text(argv[1], "palimpsest-argv-one") || !same_text(argv[2], "") ||
         !same_text(argv[3], "line\nbreak") ||

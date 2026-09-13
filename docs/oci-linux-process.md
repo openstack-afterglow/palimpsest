@@ -1,5 +1,45 @@
 # Linux OCI process metadata
 
+## Current self-FD compatibility contract
+
+The approved follow-up to the MySQL `/dev/fd/63` initialization failure adds
+exactly `/dev/fd -> /proc/self/fd` in each workload child's private `/dev`.
+The exact setup-time inventory is six character devices and the three
+`stdout`, `stderr`, and `fd` symlinks. `/dev/stdin` remains absent. Each alias
+must be root-owned `0:0`, mode `0777`, single-link, no-follow verified, and
+have its exact bounded target. Neither existing entries nor image devices are
+adopted. Main and additional exec share this setup; the parent never opens an
+alias target. The 64 KiB/16-inode tmpfs limit is unchanged.
+
+This is a pathname alias for an already accessible self-FD directory, not a
+new PID1 or cross-process permission. PID1 `fd`/`fdinfo` empty read-only masks,
+root refusal, child FD closure, credentials, capability removal, securebits,
+no-new-privileges, and seccomp remain unchanged. A UID0 workload can still
+modify its own `/dev` after launch; setup verification is not immutability.
+Linux applies additional permissions when reopening proc FD paths; the
+original FD access mode alone does not define those permissions. See
+[proc_pid_fd(5)](https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html).
+
+The proof contract checks initial inherited FD0/1/2 only, before opening its
+own descriptors; the directory FD used for that inventory is excluded.
+Unexpected supervisor descriptors, including 100–102, fail the check. A
+caller-created pipe exercises dynamic `/dev/fd/N` read/write data and inode
+identity, then closed-FD rejection. UID0/101 main/exec tests retain output FIFO
+ownership and authenticated root/PID1 checks. These test definitions are not
+native results. The stage1 ELF is rebuilt twice with the pinned recipe, and
+the separate workload-proof ELF/SquashFS fixtures are regenerated with their
+own provenance pins before native execution.
+
+Native qualification is split into stage1 boot matrix, UID0/101 stdio, cold
+public exec, and disposable MySQL initialization. MySQL keeps its guest-only
+random password and exact owned public stop/rm on success or failure; no
+password value belongs in host arguments, logs, documentation, or receipts.
+Final initialization followed by final readiness is required: a temporary
+server starting is insufficient. Original default-image failures and earlier
+two-alias checkpoints below remain historical evidence, not retroactive passes.
+
+## Linux argument metadata
+
 Palimpsest's OCI intake supports exactly Linux amd64. The legacy image-config
 field `ArgsEscaped` may be absent, null, `false` or `true`; a present non-null
 value must be a JSON boolean. Numbers (including 0 and 1), strings, arrays

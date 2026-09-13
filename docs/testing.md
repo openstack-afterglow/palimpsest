@@ -326,13 +326,21 @@ opted in with `PALIMPSEST_OCI_STDIO_CLI_LIVE=1`. Run the two explicit pytest
 nodes in `tests/kvm/test_oci_stdio_cli_live.py` sequentially with `-x`: UID 0
 and UID 101 each receive a fresh 512 MiB, one-vCPU, no-network runtime and a
 tiny test-only scratch OCI image. The probe records bounded FD 1/2 metadata and
-requires exactly two pre-existing root-owned mode-0777 single-link aliases:
-`/dev/stdout -> /proc/self/fd/1` and `/dev/stderr -> /proc/self/fd/2`;
-`/dev/stdin` and `/dev/fd` remain absent. Only after exact no-follow metadata
+requires exactly three pre-existing root-owned mode-0777 single-link aliases:
+`/dev/stdout -> /proc/self/fd/1`, `/dev/stderr -> /proc/self/fd/2`, and
+`/dev/fd -> /proc/self/fd`; `/dev/stdin` remains absent. Only after exact no-follow metadata
 and bounded target validation does it open each alias with the NGINX-relevant
 write/create/append flags plus diagnostic `O_NONBLOCK`, require full reopened
 FD identity, and emit one stream-specific marker through the pathname. It
 never truncates, reads standard I/O, changes permissions, or creates an alias.
+Before opening its own files it requires only inherited FD 0/1/2 (excluding
+the inventory directory FD itself). The fixed record schema is V3; V2 receipts
+are historical and must not be parsed as the new proof. It also checks the exact nine `/dev`
+entries, opens its own dynamic pipe via `/dev/fd/N`, compares identities and
+known read/write data, and requires ENOENT after closing that descriptor.
+Direct `/dev/fd/1` and `/dev/fd/2` writes must retain endpoint identity, and
+the PID1 `fd`/`fdinfo` masks must remain empty and read-only.
+Do not infer pathname read denial merely from an original write-only FD.
 Its portable parser/source contract is
 `tests/unit/test_oci_stdio_cli_live_contract.py`. Until independent review, a
 new guest ELF and exact-SHA native UID 0/101 passes, this remains `test-defined`
@@ -613,11 +621,27 @@ probe and cold public exec as distinct finite runs with inventory/archive
 preservation checks before and after every run, including failures. The
 updated stdio probe expects main and additional-exec output to be separate
 workload-owned FIFO0600 endpoints with successful self-FD reopen, exact fixed
-stdout/stderr aliases, identity-preserving pathname reopen and one observed
+stdout/stderr/self-FD aliases, identity-preserving pathname reopen and observed
 write on each stream. PID1 access restrictions remain unchanged. Set a healthy private
 `PALIMPSEST_LOG_HOME` for stdio and cold guest-only stderr comparisons. Keep the separate
 host journal failure-warning tests; never strip a warning to pass the proof.
 These selections do not qualify NGINX, a new application build or full Gate 2.
+
+For the self-FD change, run the narrow alias and parser contracts first:
+
+```sh
+PALIMPSEST_WORKLOAD_DEV_ALIAS_DOCKER_TESTS=1 uv run pytest -q -x tests/unit/test_workload_dev_aliases.py
+uv run pytest -q -x tests/unit/test_oci_stdio_cli_live_contract.py tests/unit/test_oci_initramfs.py
+```
+
+The first command requires the existing pinned local Docker compiler image;
+an opt-out skip is not real-C evidence. After proof-fixture provenance is
+synchronized, run the filesystem/proof contracts separately. Only after
+independent review, package rebuild and commit/push should the exact-SHA
+server execute stage1, UID0/101 stdio, cold exec and the independent
+`mysql_user_random_password` service node sequentially. Preserve all existing
+failed domains and source archives. MySQL's own new root is the explicit
+disposable exception, even on failure; never transfer its raw logs to debug it.
 
 When the test-only `guest/workload-proof/proof.c` changes, also rebuild its
 ELF and SquashFS fixtures, synchronize their canonical manifest/source/ELF

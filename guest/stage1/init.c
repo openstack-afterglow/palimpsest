@@ -4165,8 +4165,8 @@ static int make_safe_workload_device(const char *path, u32 major, u32 minor) {
 }
 
 static int safe_workload_stdio_aliases_at(int directory, int create) {
-    static const char *names[] = {"stdout", "stderr"};
-    static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2"};
+    static const char *names[] = {"stdout", "stderr", "fd"};
+    static const char *targets[] = {"/proc/self/fd/1", "/proc/self/fd/2", "/proc/self/fd"};
     usize i;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         struct stat_local st;
@@ -4203,7 +4203,9 @@ static int safe_workload_device_at(int directory, const char *name, u32 major, u
 }
 
 static int safe_workload_dev_entries_at(int directory) {
-    static const char *allowed[] = {"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr"};
+    static const char *allowed[] = {
+        "null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr", "fd"
+    };
     static const u32 majors[] = {1, 1, 1, 1, 1, 5};
     static const u32 minors[] = {3, 5, 7, 8, 9, 0};
     u8 entries[2048];

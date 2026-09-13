@@ -82,7 +82,24 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
             if (sc3(SYS_unlinkat, directory, (i64)"stderr", 0) != 0 ||
                 safe_workload_dev_entries_at(directory)) exit_now(87);
         } else if (text_equal(scenario, "extra")) {
-            if (sc3(SYS_symlinkat, (i64)"/proc/self/fd", directory, (i64)"fd") != 0 ||
+            if (sc3(SYS_symlinkat, (i64)"/proc/self/fd", directory, (i64)"console") != 0 ||
+                safe_workload_dev_entries_at(directory)) exit_now(88);
+        } else if (text_equal(scenario, "fd-wrong-target")) {
+            if (sc3(SYS_unlinkat, directory, (i64)"fd", 0) != 0 ||
+                sc3(SYS_symlinkat, (i64)"/proc/1/fd", directory, (i64)"fd") != 0 ||
+                safe_workload_dev_entries_at(directory)) exit_now(88);
+        } else if (text_equal(scenario, "fd-wrong-type")) {
+            if (sc3(SYS_unlinkat, directory, (i64)"fd", 0) != 0 ||
+                sc4(SYS_mknodat, directory, (i64)"fd", S_IFCHR | 0666,
+                    make_device_number(1, 3)) != 0 || safe_workload_dev_entries_at(directory)) exit_now(88);
+        } else if (text_equal(scenario, "fd-wrong-owner")) {
+            if (sc5(SYS_fchownat, directory, (i64)"fd", 1, 1, AT_SYMLINK_NOFOLLOW) != 0 ||
+                safe_workload_dev_entries_at(directory)) exit_now(88);
+        } else if (text_equal(scenario, "fd-hardlink")) {
+            if (sc5(SYS_linkat, directory, (i64)"fd", directory, (i64)"fd-linked", 0) != 0 ||
+                safe_workload_stdio_aliases_at(directory, 0)) exit_now(88);
+        } else if (text_equal(scenario, "fd-missing")) {
+            if (sc3(SYS_unlinkat, directory, (i64)"fd", 0) != 0 ||
                 safe_workload_dev_entries_at(directory)) exit_now(88);
         } else if (text_equal(scenario, "device-wrong-type")) {
             if (sc3(SYS_unlinkat, directory, (i64)"null", 0) != 0 ||
@@ -181,6 +198,11 @@ def alias_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "long-target",
         "missing",
         "extra",
+        "fd-wrong-target",
+        "fd-wrong-type",
+        "fd-wrong-owner",
+        "fd-hardlink",
+        "fd-missing",
         "getdents-error",
         "device-wrong-type",
         "device-wrong-mode",
@@ -244,11 +266,13 @@ def test_production_callsite_is_child_private_and_revalidates_after_cgroup_stagi
             )
         ]
     )
-    assert (
-        '"fd"'
-        not in source[
-            source.index("static int safe_workload_stdio_aliases_at") : source.index(
-                "static i64 install_read_only_cgroup_view"
-            )
-        ]
-    )
+    aliases = source[
+        source.index("static int safe_workload_stdio_aliases_at") : source.index(
+            "static i64 install_read_only_cgroup_view"
+        )
+    ]
+    assert '"fd"' in aliases and '"/proc/self/fd"' in aliases
+    assert '"/proc/1/fd"' not in aliases
+    assert 'static const char *names[] = {"stdout", "stderr", "fd"};' in aliases
+    assert '"/proc/self/fd/1", "/proc/self/fd/2", "/proc/self/fd"' in aliases
+    assert '"null", "zero", "full", "random", "urandom", "tty", "stdout", "stderr", "fd"' in aliases

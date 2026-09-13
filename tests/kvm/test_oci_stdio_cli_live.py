@@ -29,8 +29,8 @@ from .test_oci_public_cli_live import _image_layout
 
 _ENABLE = "PALIMPSEST_OCI_STDIO_CLI_LIVE"
 _TOOLCHAIN = "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
-_PREFIX = b"PALIMPSEST_STDIO_FD_V2 "
-_ALIAS_PREFIX = b"PALIMPSEST_STDIO_ALIAS_V2 "
+_PREFIX = b"PALIMPSEST_STDIO_FD_V3 "
+_ALIAS_PREFIX = b"PALIMPSEST_STDIO_ALIAS_V3 "
 _MAX_LINE = 2048
 _MAX_CONSOLE = 8 * 1024 * 1024
 _FIELDS = (
@@ -39,7 +39,10 @@ _FIELDS = (
     "fd2type fd2mode fd2uid fd2gid fd2dev fd2ino fd2reopen "
     "stdout_alias stdout_meta stdout_target stdout_open stdout_same stdout_write "
     "stderr_alias stderr_meta stderr_target stderr_open stderr_same stderr_write "
-    "stdin_alias fd_alias rootdev rootino pid1root"
+    "stdin_alias fd_alias fd_meta fd_target inherited_fds dev_entries "
+    "fd1path_same fd2path_same fd1path_write fd2path_write "
+    "pipe_read_same pipe_write_same pipe_read pipe_write closed_fd "
+    "pid1fdempty pid1fdinfoempty rootdev rootino pid1root"
 ).split()
 _DECIMAL = re.compile(r"0|[1-9][0-9]*")
 _HEX16 = re.compile(r"[0-9a-f]{16}")
@@ -194,13 +197,18 @@ def _assert_security(record: dict[str, int | str], uid: int) -> None:
     assert record["uid"] == record["gid"] == uid and record["groups"] == 0
     assert all(record[key] == 0 for key in ("capinh", "capprm", "capeff", "capbnd", "capamb"))
     assert (record["securebits"], record["nnp"], record["seccomp"]) == (239, 1, 2)
-    assert record["stdout_alias"] == record["stderr_alias"] == 0o120000
+    assert record["stdout_alias"] == record["stderr_alias"] == record["fd_alias"] == 0o120000
     assert all(
         record[f"{stream}_{field}"] == expected
         for stream in ("stdout", "stderr")
         for field, expected in (("meta", 1), ("target", 1), ("open", 0), ("same", 1), ("write", 0))
     )
-    assert record["stdin_alias"] == record["fd_alias"] == 2
+    assert record["stdin_alias"] == 2
+    assert (record["fd_meta"], record["fd_target"], record["inherited_fds"], record["dev_entries"]) == (1, 1, 1, 9)
+    assert (record["pipe_read_same"], record["pipe_write_same"], record["pipe_read"], record["pipe_write"]) == (1, 1, 0, 0)
+    assert record["closed_fd"] == 2
+    assert (record["fd1path_same"], record["fd2path_same"], record["fd1path_write"], record["fd2path_write"]) == (1, 1, 0, 0)
+    assert (record["pid1fdempty"], record["pid1fdinfoempty"]) == (1, 1)
     assert record["pid1root"] == 13
     for fd in (1, 2):
         assert record[f"fd{fd}type"] in {0o010000, 0o020000, 0o100000, 0o140000}
@@ -262,6 +270,8 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     _payload, main_records = _wait_main(console)
     assert _alias_marker_count(_payload, role="service", stream="stdout", console=True) == 1
     assert _alias_marker_count(_payload, role="service", stream="stderr", console=True) == 1
+    assert _payload.count(b"PALIMPSEST_STDIO_FD_ALIAS_V3 service stdout\r\n") == 1
+    assert _payload.count(b"PALIMPSEST_STDIO_FD_ALIAS_V3 service stderr\r\n") == 1
     assert len(main_records) == 2 and main_records[0] == main_records[1]
     main = main_records[0]
     _assert_security(main, uid)
@@ -284,6 +294,8 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
     assert _alias_marker_count(executed.stdout, role="exec", stream="stderr") == 0
     assert _alias_marker_count(executed.stderr, role="exec", stream="stderr") == 1
     assert _alias_marker_count(executed.stderr, role="exec", stream="stdout") == 0
+    assert executed.stdout.count(b"PALIMPSEST_STDIO_FD_ALIAS_V3 exec stdout\n") == 1
+    assert executed.stderr.count(b"PALIMPSEST_STDIO_FD_ALIAS_V3 exec stderr\n") == 1
     assert len(stdout_records) == len(stderr_records) == 1 and stdout_records[0] == stderr_records[0]
     additional = stdout_records[0]
     _assert_security(additional, uid)
