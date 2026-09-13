@@ -23,6 +23,17 @@ entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
 `palimpsest.oci-layer-intake.v2`로 derived recipe에 결합되어 v1 cache와
 alias하지 않는다. pack/normalization contract와 guest 정책은 바꾸지 않는다.
 
+GPU 후속 목표는 사용자가 선택한 **OpenStack GPU instance 자체의 OCI rootfs
+부팅**이다. 중첩 L2나 로컬 host GPU 재할당을 선행 조건으로 삼지 않는다.
+Nova가 장치 할당을 소유하고 Palimpsest는 self-contained boot disk·cloud 전용
+bootstrap/control 신뢰 계약·kernel-matched guest driver를 별도로 제공해야 한다.
+현재 local kernel/initrd·virtio serial/monitor binding은 일반 Nova 부팅에 자동
+이식되지 않으며 Hub의 Glance-to-Hub export도 반대 방향이다. Cinder root는
+instance별 exclusive attachment와 명시 delete/retain 정책을 목표로 하고,
+보존된 detached root 재사용과 shared data volume을 구분한다. 이는
+[선택된 구현 경로](docs/oci-gpu-support.md#selected-target-the-nova-instance-itself-owns-the-oci-root)의
+계획이며 새 boot exporter·GPU·OpenStack 실기 성공 또는 cloud 변경 승인이 아니다.
+
 `049a978`의 ML 실기는 두 framework 모두 VM 전에 중단됐다. TensorFlow는
 격리 materializer의 layer ordinal4에서 `oci-invalid-path`로 실패했고, 후속
 bounded 진단은 경로 원문 없이 원인이 리터럴 backslash임을 확인했다.
@@ -458,8 +469,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "e1a47114a29bcdf241d6be07debbeaab81f23a10a570c7d761bde5269d9fba60",
-  "reviewed_at": "2026-09-13T15:40:54Z",
-  "summary": "Reviewed documentation-only ML checkpoints: exact3f8 Linux763 passed,132 fresh synthetic1 passed and packages; TF nativefailed with wrapper-proven inactive retention/preservation but unknown guest stage; PT nativefailed with attribution/postflight failure and separately observed inactive domain only. Neither ML guest nor GPU qualified. Further limited diagnostics await approval; no runtime/guest/schema changes."
+  "reviewed_at": "2026-09-13T17:35:00Z",
+  "summary": "Reviewed selected Nova-instance OCI-root GPU target against local runtime XML, stage1 block/control bindings, initramfs and Hub export direction. Documentation-only plan separates portable disk/cloud bootstrap trust, guest GPU runtime and exclusive Cinder root lifecycle from unselected local/nested host assignment. No source, GPU or cloud mutation; ML diagnosis pending."
 }
 ```
 <!-- architecture-review:end -->
