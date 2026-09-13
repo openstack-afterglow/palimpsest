@@ -168,6 +168,13 @@ command started or completed, and it does not change the existing deadlines,
 same-request retry, locking, authority, or cleanup behavior. Historical runs
 that emitted only the generic message cannot be classified retroactively.
 
+At `aad3d492`, the timeout-origin client and exec-session selection passed
+105 checks locally and exactly 105 with no other outcomes on the Linux
+checkout. Public CLI propagation and malformed enum rejection are included.
+The local architecture-guard regression passed 13 checks and the GitHub
+development package succeeded. No native VM was launched for these focused
+checks; the prior TensorFlow failure and PyTorch qualification limits remain.
+
 At `5b94a728`, the coordinator, monitor IPC, monitor launch and run-adapter
 selection passed 228 checks locally with six Linux-only skips, then exactly
 234 checks with no other outcomes on the pinned Linux checkout. Its GitHub

@@ -401,6 +401,11 @@ host session40초, 개별 monitor 교환 최대5초와 동일 payload 재시도�
 않는다. 과거 TensorFlow stderr에는 이 코드가 없어 소급 분류할 수 없으며,
 새 진단 코드의 테스트 통과가 실제 ML 연산 성공을 의미하지 않는다.
 
+`aad3d492`의 timeout-origin client/exec 선별105건은 로컬과 정확한 Linux
+checkout 모두 다른 outcome 없이 통과했다. 로컬 architecture guard 회귀13건과
+GitHub 패키지도 통과했다. 이번 검증에서는 새 VM을 실행하지 않았으며,
+기존 TensorFlow timeout의 세부 원인 또는 ML/GPU 실기 성공을 주장하지 않는다.
+
 ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
@@ -522,8 +527,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "fec7602f6549c680c94e56ef05d0cc59131102bbbbeb1054148ae9123af485c3",
-  "reviewed_at": "2026-09-13T18:20:46Z",
-  "summary": "Reviewed MonitorClientTimeoutSource fixed three-origin mapping, typed error preservation and unchanged non-timeout behavior. Source and actual deadline/lock/IPC, exec-session and public CLI regressions reviewed; focused105 passed locally. Existing TensorFlow a6 generic timeout cannot be retroactively classified; new suffix changes observability only, not deadlines, retry identity, authority, cleanup or guest/PID1 policy. Linux exact-SHA focused verification pending; prior5b234 proof remains separate."
+  "reviewed_at": "2026-09-13T18:24:35Z",
+  "summary": "Reviewed unchanged timeout-origin implementation and focused verification receipts. aad3d492 client/exec105 passed locally and exact Linux checkout with zero other outcomes; local architecture guard13 and GitHub package passed. Documentation-only evidence update; no further architecture, timeout, retry, authority, cleanup or guest change. No new native execution; historical TensorFlow generic timeout and PyTorch limits remain unresolved."
 }
 ```
 <!-- architecture-review:end -->
