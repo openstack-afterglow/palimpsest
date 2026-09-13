@@ -54,6 +54,14 @@ rejections remain in force. A successful portable or packer test defines this
 compatibility behavior, while an actual TensorFlow VM result remains a separate
 native proof.
 
+The first synthetic pack/readback attempt at `3f8e79e` packed successfully but
+failed before any VM work because `unsquashfs -cat` treated the literal
+backslash as part of its default wildcard selector. Source and installed-tool
+help diagnosis led to adding the exact-name `-no-wildcards` mode; this is a
+test-harness correction, not a converter, intake-policy, cache, or pack-format
+change. The corrected native node has not yet run, so the failed attempt remains
+failure evidence rather than a compatibility pass.
+
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with
 single-thread framework settings, checks the exact result and sum, CPU device,

@@ -358,7 +358,8 @@ Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않
 실제 `mksquashfs`를 호출하는 최소 레이어·재현성 검사는 `tests/oci_fs/test_layer_filesystem.py`의 정확한 `native-live` 노드로 분리했다. `PALIMPSEST_OCI_PACK_LIVE=1`과 절대 도구 경로·SHA256 고정값이 있어야 실행하며 portable 선택에서는 제외한다. 입력/tar 64KiB, 검증 출력 1MiB, packer 호출 30초로 제한한 알려진 작은 fixture의 독립 component 검사다. mount·VM·외부 materializer worker의 자원 격리 검증이 아니며, 출력 크기는 생성 뒤 확인하고 최종 reap의 hard deadline이나 부모 강제 종료 뒤 정리를 보장하지 않는다. 실제 실패를 skip/xfail로 바꾸지 않는다. 수정 전 `d255fd2`의 서버에서 디렉터리 전용·빈 레이어가 각각 fragment accounting 오류로 실패했다(0.57초·0.37초). v3 수정의 실제 도구 및 VM 결과는 별도 검증하며 이 실패 재현을 성공 증거로 대신하지 않는다. 정확한 선택 방법은 [테스트 안내](docs/testing.md)에 기록한다.
 
 같은 `native-live` 그룹의 literal-backslash 노드는 작은 tar에 `name\\part`와
-`name/part`를 함께 넣고 pinned `mksquashfs`로 pack한 뒤 `unsquashfs -cat`의
+`name/part`를 함께 넣고 pinned `mksquashfs`로 pack한 뒤 wildcard selector가
+literal backslash를 escape하지 않도록 `unsquashfs -no-wildcards -cat`의
 각 argv readback을 대조한다. 알려진 synthetic payload만 읽는 no-VM component
 proof이며 unpinned read-only `unsquashfs`는 artifact authority가 아니다. 이 노드와
 portable normalization/cache 검사가 통과해도 원본 TensorFlow VM 성공을
@@ -431,13 +432,18 @@ Architecture maintenance는 다음 순서로 수행한다.
 5. 완료/commit 전에 `python3 scripts/check_architecture.py` 또는 staged 제출 범위라면 `python3 scripts/check_architecture.py --staged`를 실행한다. pre-commit의 `architecture` hook도 같은 staged 검사를 수행한다.
 6. marker의 summary는 변경 경로와 구조 영향/영향 없음을 한 건의 최신 검토로 남기며, credential/token은 기록하지 않는다.
 
+`3f8e79e` synthetic readback 실패의 source review 결과, production converter나
+packer가 아니라 검증 도구의 기본 wildcard selector가 literal backslash를
+escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcards`를 더하는
+변경은 intake/cache/packer artifact 계약을 바꾸지 않는다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "db6eef994f66e80079cd31b7a592e84f5cebf49138587739cc0d6b062038bb66",
-  "reviewed_at": "2026-09-13T15:05:09Z",
-  "summary": "Reviewed Linux literal-backslash intake v2/cache separation and same-connection public/bound-monitor startup event service, typed health failure quarantine and lifecycle handoff. Guest ELF/protocol/device authority unchanged. Independent source approval; local focused runtime591 passed and path/cache/lane/filesystem505 passed with16 explicit opt-in/platform skips (overlapping suites not summed). Actual ML VM success remains unverified; prior049a978 failures retained."
+  "source_sha256": "e1a47114a29bcdf241d6be07debbeaab81f23a10a570c7d761bde5269d9fba60",
+  "reviewed_at": "2026-09-13T15:17:52Z",
+  "summary": "Reviewed test-only exact-name unsquashfs readback flag and accurate prior synthetic failure record. Production/intake-v2/cache/guest unchanged from3f8e79e, whose exact Linux focused suite passed763. Current lane/ML contracts passed70 locally; corrected fresh synthetic and ML native runs remain pending. Old log-derived artifact read was not performed."
 }
 ```
 <!-- architecture-review:end -->

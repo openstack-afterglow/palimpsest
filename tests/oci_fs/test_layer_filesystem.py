@@ -200,7 +200,7 @@ def test_real_squashfs_preserves_literal_backslash_as_a_linux_filename(tmp_path:
 
     for name, expected in ((r"name\part", b"literal"), ("name/part", b"separated")):
         result = subprocess.run(
-            [unsquashfs, "-cat", output, name],
+            [unsquashfs, "-no-wildcards", "-cat", output, name],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=15,
