@@ -76,6 +76,12 @@ wrapper attribution은 RuntimeError로 실패했다. 따라서 부팅 전 실패
 로컬228건과 Linux 전용6skip 뒤 정확한 Linux checkout에서234건 모두 통과했고
 GitHub 패키지도 성공했다. 새 ML 또는 GPU 실기 성공과 구분한다.
 
+같은 TensorFlow 실패의 후속 제한 진단은 고정 monitor-client timeout
+표시만 확인했다. 자체 deadline·IPC timeout·run-lock timeout이 동일 오류로
+합쳐지므로 어느 대기에서 만료됐는지, Python이 실행됐는지는 미확정이다.
+나머지15개 고정 오류 표시 부재를 guest 성공으로 해석하지 않으며,
+실행 경로·시간 제한·guest 정책 변경이나 새 VM 재시험은 하지 않았다.
+
 `de304ea`의 익명 registry intake는 같은 Linux checkout 선별76건과 공개 `oci pull`을 통한 GHCR 비특권 NGINX·Quay Prometheus BusyBox 취득/OCI CAS 검증을 통과했다. 새 archive의 부팅 성공은 아니다. 직전 동일 guest/runtime `cfb8015`의 별도 VM 재검증은 Redis user override와 비특권 NGINX가 통과했고 기본 PostgreSQL·Redis·NGINX는 권한 거부와 함께 실패했다. 실패는 inactive로 보존하고 성공 자원은 정상 제거했으며 guest 권한 정책은 바꾸지 않았다. 새 [registry 검증 기록](docs/registry-intake.md#verified-checkpoint)은 취득 성공과 VM 호환성 결과를 분리한다.
 
 `93c1eb0`의 self-FD 변경은 같은 서버 SHA 선별481건·packaged-binary34건과 stage1 43boots/44QEMU(121.28초), UID0/101 stdio V3(16.16/16.11초), 기존 v2 빌드 이미지 cold 공개 lifecycle(22.56초)을 통과했다. MySQL 일회용 진단은 최종 초기화·서버 준비, 실제 `/`와 인증 root 일치, PID1 거부까지 통과했지만 passwordless ping의 exit0/인증 거부에 alive 문자열을 추가 요구한 테스트가 실패했다(116.21초). 새 VM/root는 폐기했고 기존12개 domain/archive와 zero-active를 보존했다. 후속은 일회용 테스트의 도달성 판정만 공식 ping exit-status 계약에 맞추며 인증 SQL 성공이나 기본 이미지 성공으로 확대하지 않는다. [상세 결과와 중간 실패](docs/oci-linux-process.md#self-fd-verification-checkpoint--93c1eb0)를 구분한다.
@@ -225,6 +231,7 @@ flowchart LR
 | OCI root preparation | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py)의 `prepare_oci_root_run`, `release_oci_root_transaction`; [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py) | lower lease와 VM-exclusive ext4 root volume을 durable transaction으로 claim/release; retained root는 별도 identity로 재사용 |
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
 | coordinator failure diagnostics | [`oci_monitor_coordinator.py`](src/palimpsest_local/oci_monitor_coordinator.py)의 `MonitorCoordinatorFailure`, `_response`, `_parse_response` | private response v2의 고정 stage/category만 부모에 전달하고 CLI 오류에도 보존; endpoint 재인증·기존 uncertainty와 no-kill/ownership 정책은 유지 |
+| monitor-client timeout diagnostics | [`oci_monitor_client.py`](src/palimpsest_local/oci_monitor_client.py)의 `MonitorClientTimeoutSource`, `MonitorClientError`, `_Deadline`, `_stable_errors` | 고정 client-deadline·ipc-timeout·run-lock-timeout 원인만 기존 보존 안내에 덧붙임; 대기 시간·동일 요청 재시도·권한·정리 계약은 변경하지 않음 |
 | guest boundary | [`guest/stage1/init.c`](guest/stage1/init.c), [`src/palimpsest_local/oci_guest_stage1.py`](src/palimpsest_local/oci_guest_stage1.py), [`src/palimpsest_local/oci_lifecycle_transport.py`](src/palimpsest_local/oci_lifecycle_transport.py) | authenticated root/lower block을 read-only 정책으로 확인하고 OverlayFS를 `/`로 move-mount-chroot한 뒤 PID 1이 workload와 lifecycle protocol을 감독 |
 | main-output transport | [`guest/stage1/main_output_pump.h`](guest/stage1/main_output_pump.h), [`guest/stage1/init.c`](guest/stage1/init.c)의 `prepare_main_output`, `service_main_output`, `terminate_and_reap` | workload 소유 FIFO 두 개와 stream별 4KiB 버퍼, 공통 16KiB 큐로 메인 출력과 PID 1 진단을 독립 nonblocking console sink에 전달. polling·STOP·회수·TERMINAL 권한은 supervisor 책임 |
 | parent-owned console sink | [`guest/stage1/init.c`](guest/stage1/init.c)의 `acquire_main_console_sink`, `revalidate_main_console_sink`, `close_main_console_sink` | 루트 전환 전 독립 nonblocking console FD 확보, 양 자식의 조기 close, 루트 전환·TERMINAL 전 identity 재검증. PID1은 종료 후 인증된 reconnect 제어 메시지를 위해 통로를 유지하며 실패 대기에서 닫음 |
@@ -386,6 +393,14 @@ Request v1·spawn/handshake 시간 제한·실패 자원 보존·정리 권한·
 그대로다. 과거 PyTorch의 상세 오류는 이미 폐기된 출력에서 복원할 수 없으며,
 이 변경은 다음 실행의 진단을 위한 것이지 timeout 원인 확정이나 수정이 아니다.
 
+후속 monitor-client 오류는 `timeout-source`에 client-deadline·ipc-timeout·
+run-lock-timeout 세 고정 enum만 허용한다. 기존 보존 안내를 유지하고 raw
+exception·경로·argv를 추가하지 않는다. 이미 typed인 오류는 바깥 경계에서도
+유지하며 non-timeout 오류의 기존 일반화도 그대로다. Guest exec30초,
+host session40초, 개별 monitor 교환 최대5초와 동일 payload 재시도는 바꾸지
+않는다. 과거 TensorFlow stderr에는 이 코드가 없어 소급 분류할 수 없으며,
+새 진단 코드의 테스트 통과가 실제 ML 연산 성공을 의미하지 않는다.
+
 ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
@@ -506,9 +521,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6656dab1406f311dc5f8af423878e7846fda5922bc4a2513da0933a11d5f50ff",
-  "reviewed_at": "2026-09-13T17:57:39Z",
-  "summary": "Reviewed unchanged ML phase/proof ordering, root-volume two-file contract and coordinator fixed response codes. Documentation-only checkpoint: a6a1d84 focused105 passed locally and Linux; TF native framework-exec-command failed rc1 after initial root/domain checks with attribution failure, not cleanup/CPU/PID1 success. 5b94a728 coordinator focused228 plus6 Linux-only skips locally and234 passed on Linux; packages succeeded. No further architecture change from this documentation-only checkpoint; historical PT error remains unrecoverable."
+  "source_sha256": "fec7602f6549c680c94e56ef05d0cc59131102bbbbeb1054148ae9123af485c3",
+  "reviewed_at": "2026-09-13T18:20:46Z",
+  "summary": "Reviewed MonitorClientTimeoutSource fixed three-origin mapping, typed error preservation and unchanged non-timeout behavior. Source and actual deadline/lock/IPC, exec-session and public CLI regressions reviewed; focused105 passed locally. Existing TensorFlow a6 generic timeout cannot be retroactively classified; new suffix changes observability only, not deadlines, retry identity, authority, cleanup or guest/PID1 policy. Linux exact-SHA focused verification pending; prior5b234 proof remains separate."
 }
 ```
 <!-- architecture-review:end -->

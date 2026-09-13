@@ -12,6 +12,7 @@ import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 
 from . import oci_monitor_ipc as ipc
 from .errors import StateError
@@ -22,8 +23,22 @@ from .state import StatePaths, locked_existing_run
 _ORDER = {phase: number for number, phase in enumerate(("committed", "activating", "active", "ready", "terminal"))}
 
 
+class MonitorClientTimeoutSource(StrEnum):
+    CLIENT_DEADLINE = "client-deadline"
+    IPC_TIMEOUT = "ipc-timeout"
+    RUN_LOCK_TIMEOUT = "run-lock-timeout"
+
+
 class MonitorClientError(StateError):
     """Path-free failure; uncertain execution and its evidence remain owned."""
+
+    def __init__(self, message: str, *, timeout_source: MonitorClientTimeoutSource | None = None):
+        if timeout_source is not None and type(timeout_source) is not MonitorClientTimeoutSource:
+            raise TypeError("OCI monitor client timeout source is invalid")
+        self.timeout_source = timeout_source
+        if timeout_source is not None:
+            message += f"; timeout-source={timeout_source.value}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +59,10 @@ class _Deadline:
     def remaining(self, *, minimum: float = 0.0) -> float:
         value = 5.0 if self.end is None else self.end - time.monotonic()
         if value <= minimum:
-            raise MonitorClientError("OCI monitor client timed out; preserve the run evidence")
+            raise MonitorClientError(
+                "OCI monitor client timed out; preserve the run evidence",
+                timeout_source=MonitorClientTimeoutSource.CLIENT_DEADLINE,
+            )
         return value
 
 
@@ -56,11 +74,17 @@ def _stable_errors():
         raise
     except ipc.MonitorIPCError as exc:
         if exc.category is ipc.MonitorIPCErrorCategory.TIMEOUT:
-            raise MonitorClientError("OCI monitor client timed out; preserve the run evidence") from None
+            raise MonitorClientError(
+                "OCI monitor client timed out; preserve the run evidence",
+                timeout_source=MonitorClientTimeoutSource.IPC_TIMEOUT,
+            ) from None
         raise MonitorClientError("OCI monitor client authority or control is unavailable") from None
     except StateError as exc:
         if str(exc) == "run lock timed out":
-            raise MonitorClientError("OCI monitor client timed out; preserve the run evidence") from None
+            raise MonitorClientError(
+                "OCI monitor client timed out; preserve the run evidence",
+                timeout_source=MonitorClientTimeoutSource.RUN_LOCK_TIMEOUT,
+            ) from None
         raise MonitorClientError("OCI monitor client run evidence is invalid") from None
     except (OSError, ValueError, TypeError):
         raise MonitorClientError("OCI monitor client run evidence is invalid") from None

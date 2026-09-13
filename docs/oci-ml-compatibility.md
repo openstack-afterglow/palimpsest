@@ -150,6 +150,24 @@ the phase receipt establishes later progress. No manual stop/remove or
 adoption followed this accounting failure, and the remaining evidence is
 preserved for bounded diagnosis.
 
+A subsequent approved classifier found only the fixed host
+`monitor_client_timed_out` marker in that TensorFlow command's saved stderr.
+The other 15 selected Python/TensorFlow and host-error markers were absent;
+absence of those markers is not proof that Python ran or that no guest error
+occurred. At `a6a1d84`, `MonitorClient._stable_errors` mapped its own deadline,
+an IPC timeout, and a run-lock timeout to the same message. The result therefore identifies
+the public exec monitor-client timeout boundary, not which wait expired or
+why. No interpreter, timeout, guest privilege or cleanup policy was changed,
+and no new native run followed this diagnostic.
+
+Current monitor-client errors preserve that original path-free timeout
+guidance and append one fixed `timeout-source` value: `client-deadline`,
+`ipc-timeout`, or `run-lock-timeout`. The value identifies only the host wait
+boundary that reported the timeout. It does not establish whether the guest
+command started or completed, and it does not change the existing deadlines,
+same-request retry, locking, authority, or cleanup behavior. Historical runs
+that emitted only the generic message cannot be classified retroactively.
+
 At `5b94a728`, the coordinator, monitor IPC, monitor launch and run-adapter
 selection passed 228 checks locally with six Linux-only skips, then exactly
 234 checks with no other outcomes on the pinned Linux checkout. Its GitHub

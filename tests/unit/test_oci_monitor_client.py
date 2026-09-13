@@ -21,6 +21,19 @@ from palimpsest_local.state import locked_existing_run
 case = _recovery_case
 
 
+def test_timeout_source_surface_is_exact_and_constructor_rejects_untyped_values():
+    assert {member.value for member in client.MonitorClientTimeoutSource} == {
+        "client-deadline",
+        "ipc-timeout",
+        "run-lock-timeout",
+    }
+    ordinary = client.MonitorClientError("ordinary")
+    assert ordinary.timeout_source is None and str(ordinary) == "ordinary"
+    for invalid in ("ipc-timeout", True, 1):
+        with pytest.raises(TypeError, match="timeout source is invalid"):
+            client.MonitorClientError("invalid", timeout_source=invalid)
+
+
 @pytest.fixture
 def transport(case, monkeypatch):
     calls = []
@@ -293,8 +306,10 @@ def test_invalid_deadline_refused_before_io(case, transport, timeout):
 def test_run_lock_contention_has_finite_deadline(case, transport):
     with locked_existing_run(case.roots, case.binding.record.name):
         started = time.monotonic()
-        with pytest.raises(client.MonitorClientError, match="timed out"):
+        with pytest.raises(client.MonitorClientError, match="timed out") as error:
             _open(case, timeout=0.1)
+        assert error.value.timeout_source is client.MonitorClientTimeoutSource.RUN_LOCK_TIMEOUT
+        assert str(error.value).endswith("; timeout-source=run-lock-timeout")
         assert time.monotonic() - started < 1
     assert transport[0] == []
 
@@ -355,9 +370,19 @@ def test_poll_never_rounds_up_remaining_ipc_deadline(case, transport, monkeypatc
             return result
 
         monkeypatch.setattr(monitor, "_read", read)
-        with pytest.raises(client.MonitorClientError, match="timed out"):
+        with pytest.raises(client.MonitorClientError, match="timed out") as error:
             monitor.poll(timeout=0.2)
+        assert error.value.timeout_source is client.MonitorClientTimeoutSource.CLIENT_DEADLINE
+        assert str(error.value).endswith("; timeout-source=client-deadline")
     assert transport[0] == []
+
+
+def test_ipc_timeout_retains_fixed_source_without_transport_detail():
+    with pytest.raises(client.MonitorClientError) as error:
+        with client._stable_errors():
+            raise ipc.MonitorIPCError(ipc.MonitorIPCErrorCategory.TIMEOUT)
+    assert error.value.timeout_source is client.MonitorClientTimeoutSource.IPC_TIMEOUT
+    assert str(error.value) == ("OCI monitor client timed out; preserve the run evidence; timeout-source=ipc-timeout")
 
 
 def test_terminal_snapshot_still_needs_valid_describe(case, transport):

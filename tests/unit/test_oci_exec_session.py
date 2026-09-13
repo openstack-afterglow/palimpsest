@@ -10,6 +10,7 @@ import pytest
 from palimpsest_local import oci_exec_session as sessions
 from palimpsest_local.errors import StateError
 from palimpsest_local.oci_exec_control import MonitorExecControl
+from palimpsest_local.oci_monitor_client import MonitorClientError, MonitorClientTimeoutSource
 from palimpsest_local.runtime_types import (
     ProcessExit,
     ProcessExitCategory,
@@ -404,6 +405,31 @@ def test_control_lost_poll_does_not_fabricate_an_observation(case):
     session.close()
 
 
+def test_monitor_timeout_source_survives_exec_session_boundary(case):
+    expected = MonitorClientError(
+        "OCI monitor client timed out; preserve the run evidence",
+        timeout_source=MonitorClientTimeoutSource.IPC_TIMEOUT,
+    )
+    original = sessions.MonitorClient
+
+    class TimeoutClient(original):
+        def exec_request(self, operation, payload, *, timeout):
+            if operation == "poll":
+                raise expected
+            return super().exec_request(operation, payload, timeout=timeout)
+
+    sessions.MonitorClient = TimeoutClient
+    try:
+        session = open_session()
+        with pytest.raises(MonitorClientError) as error:
+            list(session.events())
+        assert error.value is expected
+        assert error.value.timeout_source is MonitorClientTimeoutSource.IPC_TIMEOUT
+        assert str(error.value).endswith("; timeout-source=ipc-timeout")
+    finally:
+        sessions.MonitorClient = original
+
+
 def test_cli_ack_failure_prints_observed_facts_once_and_returns_nonzero(case, monkeypatch, tmp_path, capsys):
     from palimpsest_local import cli, runtime_dispatch
 
@@ -433,6 +459,28 @@ def test_cli_ack_failure_prints_observed_facts_once_and_returns_nonzero(case, mo
     assert sessions_opened[0]._result is None
     assert sessions_opened[0].observed_completion.acknowledgement == "unconfirmed"
     assert len([call for call in case.calls if isinstance(call, tuple) and call[0] == "submit"]) == 1
+
+
+def test_cli_preserves_fixed_monitor_timeout_source(monkeypatch, tmp_path, capsys):
+    from palimpsest_local import cli, runtime_dispatch
+
+    expected = MonitorClientError(
+        "OCI monitor client timed out; preserve the run evidence",
+        timeout_source=MonitorClientTimeoutSource.RUN_LOCK_TIMEOUT,
+    )
+
+    def execute(*_args, **_kwargs):
+        raise expected
+
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(runtime_dispatch, "exec", execute)
+
+    assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == str(expected)
+    assert captured.err.endswith("; timeout-source=run-lock-timeout\n")
 
 
 def test_repeated_embedded_cli_exec_closes_each_client_after_ack(case, monkeypatch, tmp_path, capsys):
