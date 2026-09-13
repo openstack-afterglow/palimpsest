@@ -13,6 +13,8 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+`67cb80c`의 정확한 서버 checkout에서 선별475건(71.35초)이 통과했고 GitHub SHA별 패키지도 발행됐다. 별도 `/dev` 진단은 지원하지 않는 테스트 fixture mode0400 때문에 QEMU 시작 전에 실패했다. 기존10개 inactive domain·12개 archive·활성 VM/QEMU 없음 보존 검사는 통과했다. 중복 fixture 제거와 portable 생성 회귀를 추가하며, 아직 새 stage1/MySQL 실기 성공으로 기록하지 않는다. [실패와 후속 증거](docs/docker-hub-service-matrix.md)를 구분한다.
+
 사용자 승인 후속은 `/dev` transition target에만 populated 입력을 허용하고, 원본 항목은 읽거나 복사하지 않은 채 검증된 devtmpfs로 덮는다. root0:0·정확한0755·nofollow·OverlayFS 및 mount 직전 identity 검사를 유지한다. `/proc`·`/sys`·generic의 빈 디렉터리 조건과 workload 전용6개 장치/2개 alias·PID1 보호는 그대로다. 별도 real-mount 진단과 새 ELF 부팅/MySQL 결과는 구현과 분리한다.
 
 `71704b2`의 `/sys`0555 변경은 같은 서버 SHA 선별393건과 새 ELF의43 boots/44QEMU(122.74초)를 통과했다. 원본 MySQL은 다음 `dev; nonempty` 검사에서 실패(119.94초)해 root 전환·앱·socket 성공은 아니다. 원본 base layer에 `/dev` 장치/FIFO10개가 있으며 빈 디렉터리 정책은 유지했다. 기존10개 inactive domain·12개 archive·활성 VM/QEMU 없음 보존 검사는 통과했고 새 실패 runtime은 보존, 해당 domain은 없다. GitHub 패키지 workflow는 jobs 없이 startup_failure여서 패키지 공개 성공을 주장하지 않는다. [상세 증거와 다음 계약](docs/docker-hub-service-matrix.md)을 참고한다.
@@ -375,9 +377,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1d8846bf6a9b8453238377926980f7265ada09bf3cc5723245ca60fe7308e12f",
-  "reviewed_at": "2026-09-13T09:39:39Z",
-  "summary": "Reviewed DEV-only populated transition policy, unchanged exact mode/owner/nofollow/OverlayFS and pre-move identity checks, rebuilt sealed ELF pins and real-C controls. Added separate tmpfs-to-devtmpfs/child-namespace KVM diagnostic and explicit lane; native and MySQL outcomes remain pending. No workload privilege or storage policy changes."
+  "source_sha256": "9d8da5cee4a09cd885c959f55e3c65fc56f7ba9b74b783c3408228ffb8fdb0de",
+  "reviewed_at": "2026-09-13T09:45:18Z",
+  "summary": "Reviewed standalone DEV diagnostic pre-boot fixture correction: remove unsupported redundant mode0400 entries, generate minimal initramfs through testable helper and isolated portable construction regression. Production C/ELF and device/security contracts unchanged. Preserve67cb80c pre-QEMU failure and package/server evidence; native retry pending."
 }
 ```
 <!-- architecture-review:end -->

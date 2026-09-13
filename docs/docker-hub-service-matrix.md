@@ -76,6 +76,24 @@ covered-directory descriptors must not survive to the tested child, and the
 child device entries must match the existing allowlist. The small diagnostic
 does not replace packaged stage-1/root/PID1 checks or original MySQL testing.
 
+Implementation `67cb80c61af0aa8d96573a09adb556e8e3f6e74c` passed 475
+focused tests on the exact server checkout (71.35 seconds), including opted-in
+real-C and packaged ELF tests. ELF SHA-256 is
+`759e6d3ca73fdc5c5687f73998a4670fb52a95469cfcb0fbf380901f434f5b11`;
+source-bundle digest is
+`63e70ae008e564a22e134799d988208c2492848d422f0b8b19fed2d018ccc535`.
+The [SHA-specific package](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-67cb80c61af0aa8d96573a09adb556e8e3f6e74c)
+was published successfully in run 34749985157.
+
+Its first standalone native attempt failed before QEMU startup (11.22 seconds):
+the redundant `dev/image-marker` initramfs entry requested unsupported `0400`.
+Evidence remains at `/tmp/palimpsest-dev-native-icswe73e` and
+`/tmp/palimpsest-dev-cover-lsbal0ju`. Initial/final preservation checks passed
+for ten inactive domains, twelve archive hashes and zero active VM/QEMU.
+Stage-1 and MySQL phases were not run. The follow-up removes redundant archive
+entries because the C probe already seeds its explicit tmpfs, and adds a
+portable construction test; it does not relax production initramfs modes.
+
 The subsequent documentation commit `16ca781` reached package verification,
 build, checksums and SHA-tag creation, but release creation returned GitHub
 HTTP 502 in [run 34749473630](https://github.com/openstack-afterglow/palimpsest/actions/runs/34749473630).

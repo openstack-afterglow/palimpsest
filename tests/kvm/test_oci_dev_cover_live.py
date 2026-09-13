@@ -35,6 +35,15 @@ _ENABLE = "PALIMPSEST_OCI_DEV_COVER_LIVE"
 _PREFIX = b"PALIMPSEST_DEV_COVER_V1 "
 
 
+def _build_probe_initramfs(init_payload: bytes) -> bytes:
+    return build_newc([
+        NewcEntry("dev", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("init", stat.S_IFREG | 0o755, init_payload),
+        NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
+        NewcEntry("trusted", stat.S_IFDIR | 0o755, b""),
+    ])
+
+
 def _compile(root: Path) -> Path:
     source = Path(__file__).with_name("assets") / "dev-cover-probe.c"
     command = [
@@ -107,14 +116,7 @@ def test_populated_image_dev_is_covered_by_trusted_devtmpfs_then_private_child_t
     evidence.chmod(0o700)
     print(f"dev cover proof evidence: {evidence}")
     init = _compile(evidence)
-    archive = build_newc([
-        NewcEntry("dev", stat.S_IFDIR | 0o755, b""),
-        NewcEntry("dev/image-child", stat.S_IFDIR | 0o755, b""),
-        NewcEntry("dev/image-marker", stat.S_IFREG | 0o400, b"image-owned\n"),
-        NewcEntry("init", stat.S_IFREG | 0o755, init.read_bytes()),
-        NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
-        NewcEntry("trusted", stat.S_IFDIR | 0o755, b""),
-    ])
+    archive = _build_probe_initramfs(init.read_bytes())
     kernel_path = _secure_write(evidence, "kernel", kernel.payload, mode=0o400)
     initrd = _secure_write(evidence, "initramfs.cpio", archive, mode=0o400)
     qemu_path = _secure_write(evidence, "qemu-system-x86_64", qemu.payload, mode=0o500)
