@@ -59,8 +59,30 @@ failed before any VM work because `unsquashfs -cat` treated the literal
 backslash as part of its default wildcard selector. Source and installed-tool
 help diagnosis led to adding the exact-name `-no-wildcards` mode; this is a
 test-harness correction, not a converter, intake-policy, cache, or pack-format
-change. The corrected native node has not yet run, so the failed attempt remains
-failure evidence rather than a compatibility pass.
+change. At that checkpoint the corrected node had not run, so the failed
+attempt remains failure evidence rather than a compatibility pass.
+
+The exact Linux checkout at `3f8e79e` passed the focused server selection with
+763 passed and no other outcomes. At the test-only follow-up `132c6c5`, a fresh
+synthetic pack and exact-name readback passed once; GitHub packages succeeded
+for both revisions. The TensorFlow native case at `132c6c5` reached VM creation
+but returned pytest rc1. Its newly owned domain was stopped and retained
+inactive with no accounting errors, its journal was present, and the 15 prior
+domains plus that new domain, all 16 archive pins, and zero-active postflight
+were preserved. The exact failing command and whether guest root transition,
+CPU execution, authenticated root, or PID 1 refusal were reached remain
+unknown. A request to retrieve further redacted remote diagnostics was denied
+or aborted, so it was not retried; explicit narrow approval remains pending.
+This result establishes none of those guest assertions. The PyTorch case at the
+same revision also returned pytest rc1, but its wrapper could not attribute the
+resource: the inner attribution and snapshot failed, as did the outer
+attribution and postflight. Its journal was present. A separate read-only
+inventory observed one new shut-off persistent domain with autostart disabled
+and recorded its UUID and inactive XML digest privately, but that observation
+does not establish owned-resource attribution or whole-inventory/archive
+preservation. The domain is not adopted as owned and was not rerun, removed, or
+queried further. Both native failure causes require a separately approved,
+limited diagnostic before any fix is proposed. No GPU action was performed.
 
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with

@@ -31,6 +31,22 @@ PyTorch는 큰 export 준비 중 libvirt keepalive 연결 만료로 defineXML �
 또는 cleanup 성공이 아니고, 기존 inactive domain15개·archive16개와
 zero-active 상태 보존만 확인했다.
 
+`3f8e79e`의 정확한 Linux checkout 선별 검사는763건이 다른 outcome 없이
+통과했고, 테스트 전용 `132c6c5`의 새 synthetic pack/exact-name readback도1건
+통과했다. 두 SHA의 GitHub 패키지가 성공했다. 같은 `132c6c5` TensorFlow 실기는
+VM 생성까지 진행한 뒤 pytest rc1로 실패했다. 새 domain은 accounting error 없이
+inactive로 보존됐고 journal, 기존15개와 새1개 domain, archive16개 및 zero-active
+postflight를 확인했다. 정확한 실패 명령과 guest root 전환·CPU tensor·인증 root·
+PID1 거부 도달 여부는 미확정이다. 제한된 원격 진단 조회는 거부 또는 중단되어
+재시도하지 않았으며 별도 명시 승인을 기다린다. 따라서 이 항목은 해당 guest
+검사의 성공 증거가 아니고 GPU 작업도 수행하지 않았다. 동일 SHA의 PyTorch 실기도
+pytest rc1로 실패했고 wrapper의 inner attribution/snapshot과 outer attribution/
+postflight가 모두 실패해 resource disposition을 확인하지 못했다. 별도 read-only
+inventory는 새 persistent domain 하나가 shut off·autostart disable 상태임을
+확인했지만 이는 owned attribution이나 전체 domain/archive 보존 성공이 아니다.
+해당 domain은 owned로 채택하거나 재실행·제거·추가 조회하지 않았다. 두 native
+실패 원인과 후속 수정은 제한된 진단의 별도 승인을 기다린다.
+
 `de304ea`의 익명 registry intake는 같은 Linux checkout 선별76건과 공개 `oci pull`을 통한 GHCR 비특권 NGINX·Quay Prometheus BusyBox 취득/OCI CAS 검증을 통과했다. 새 archive의 부팅 성공은 아니다. 직전 동일 guest/runtime `cfb8015`의 별도 VM 재검증은 Redis user override와 비특권 NGINX가 통과했고 기본 PostgreSQL·Redis·NGINX는 권한 거부와 함께 실패했다. 실패는 inactive로 보존하고 성공 자원은 정상 제거했으며 guest 권한 정책은 바꾸지 않았다. 새 [registry 검증 기록](docs/registry-intake.md#verified-checkpoint)은 취득 성공과 VM 호환성 결과를 분리한다.
 
 `93c1eb0`의 self-FD 변경은 같은 서버 SHA 선별481건·packaged-binary34건과 stage1 43boots/44QEMU(121.28초), UID0/101 stdio V3(16.16/16.11초), 기존 v2 빌드 이미지 cold 공개 lifecycle(22.56초)을 통과했다. MySQL 일회용 진단은 최종 초기화·서버 준비, 실제 `/`와 인증 root 일치, PID1 거부까지 통과했지만 passwordless ping의 exit0/인증 거부에 alive 문자열을 추가 요구한 테스트가 실패했다(116.21초). 새 VM/root는 폐기했고 기존12개 domain/archive와 zero-active를 보존했다. 후속은 일회용 테스트의 도달성 판정만 공식 ping exit-status 계약에 맞추며 인증 SQL 성공이나 기본 이미지 성공으로 확대하지 않는다. [상세 결과와 중간 실패](docs/oci-linux-process.md#self-fd-verification-checkpoint--93c1eb0)를 구분한다.
@@ -442,8 +458,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "e1a47114a29bcdf241d6be07debbeaab81f23a10a570c7d761bde5269d9fba60",
-  "reviewed_at": "2026-09-13T15:17:52Z",
-  "summary": "Reviewed test-only exact-name unsquashfs readback flag and accurate prior synthetic failure record. Production/intake-v2/cache/guest unchanged from3f8e79e, whose exact Linux focused suite passed763. Current lane/ML contracts passed70 locally; corrected fresh synthetic and ML native runs remain pending. Old log-derived artifact read was not performed."
+  "reviewed_at": "2026-09-13T15:40:54Z",
+  "summary": "Reviewed documentation-only ML checkpoints: exact3f8 Linux763 passed,132 fresh synthetic1 passed and packages; TF nativefailed with wrapper-proven inactive retention/preservation but unknown guest stage; PT nativefailed with attribution/postflight failure and separately observed inactive domain only. Neither ML guest nor GPU qualified. Further limited diagnostics await approval; no runtime/guest/schema changes."
 }
 ```
 <!-- architecture-review:end -->
