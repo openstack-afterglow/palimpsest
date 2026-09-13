@@ -58,6 +58,25 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Approved MySQL root-transition follow-up — 2026-09-13
+
+The user approved exact `0555` as an additional mode for the root-owned,
+empty `/sys` transition target. This is the same narrow input allowance as
+`/proc`; `/dev` and generic directory checks remain unchanged. No chmod,
+archive mutation, workload capability, identity-switch permission or database
+configuration is added. No-follow/type/owner/emptiness checks and the complete
+initial-versus-retained/reopened identity comparison before mount remain,
+including rejection of `0555` to `0755` drift or its reverse. Missing targets
+are still created with `0755`.
+
+Before modification, exact server `13bd2e9` reproduced the current C behavior
+with three selected tests (3.36 seconds): `/sys` 0555 rejection, `/sys` 0755
+acceptance and generic 0555 rejection. The saved original MySQL console still
+reports `target=sys; check=mode`, and its archive hash remains unchanged.
+These are diagnosis results, not a successful MySQL boot. New source/ELF and
+native results must be recorded separately; resolving this first rejection
+does not imply that MySQL initialization or its socket probe will succeed.
+
 ### Redis-user qualification — `2cb6a3e`, 2026-09-12
 
 Exact `2cb6a3e86f9d00d1988db338a7de4bfdabb8058b` passed the

@@ -189,13 +189,16 @@ def transition_harness(tmp_path_factory):
 @pytest.mark.parametrize(
     ("kind", "target", "mode", "uid", "reason"),
     [
-        pytest.param("mode", "sys", "0555", 0, "mode", id="root-empty-0555-sys"),
         pytest.param("mode", "dev", "0555", 0, "mode", id="root-empty-0555-dev"),
         pytest.param("nonempty", "proc", "0755", 0, "nonempty", id="root-nonempty"),
         pytest.param("symlink", "proc", "0755", 0, "open", id="nofollow-symlink"),
         pytest.param("owner", "proc", "0755", 12345, "owner", id="wrong-owner"),
         pytest.param("owner-nonempty", "proc", "0777", 12345, "owner", id="owner-before-emptiness"),
         pytest.param("regular", "proc", "0755", 0, "open", id="special-regular-file"),
+        pytest.param("nonempty", "sys", "0755", 0, "nonempty", id="sys-root-nonempty"),
+        pytest.param("symlink", "sys", "0755", 0, "open", id="sys-nofollow-symlink"),
+        pytest.param("owner", "sys", "0555", 12345, "owner", id="sys-wrong-owner"),
+        pytest.param("regular", "sys", "0755", 0, "open", id="sys-special-regular-file"),
     ],
 )
 def test_real_c_transition_target_rejections_are_exact_and_do_not_normalize(
@@ -213,6 +216,7 @@ def test_real_c_transition_target_rejections_are_exact_and_do_not_normalize(
         pytest.param("proc", "0755", id="proc-0755"),
         pytest.param("proc", "0555", id="proc-0555"),
         pytest.param("sys", "0755", id="sys-0755"),
+        pytest.param("sys", "0555", id="sys-0555"),
         pytest.param("dev", "0755", id="dev-0755"),
     ],
 )
@@ -223,9 +227,12 @@ def test_real_c_transition_target_accepts_only_approved_modes(transition_harness
     assert result.stderr == b""
 
 
+@pytest.mark.parametrize("target", ["proc", "sys"])
 @pytest.mark.parametrize("mode", ["0555", "0755"])
-def test_real_c_transition_target_readiness_accepts_unchanged_proc_mode(transition_harness, mode):
-    result = transition_harness("ready", target="proc", fixture_mode=mode)
+def test_real_c_transition_target_readiness_accepts_unchanged_approved_mode(
+    transition_harness, target, mode
+):
+    result = transition_harness("ready", target=target, fixture_mode=mode)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
     assert result.stderr == b""
@@ -235,10 +242,11 @@ def test_real_c_transition_target_readiness_accepts_unchanged_proc_mode(transiti
     ("initial_mode", "kind"),
     [("0755", "ready-to-0555"), ("0555", "ready-to-0755")],
 )
+@pytest.mark.parametrize("target", ["proc", "sys"])
 def test_real_c_transition_target_readiness_rejects_mode_identity_change(
-    transition_harness, initial_mode, kind
+    transition_harness, target, initial_mode, kind
 ):
-    result = transition_harness(kind, target="proc", fixture_mode=initial_mode)
+    result = transition_harness(kind, target=target, fixture_mode=initial_mode)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
     assert result.stderr == b""
@@ -249,17 +257,21 @@ def test_real_c_generic_safe_dir_still_rejects_0555(transition_harness):
     assert result.returncode == 0, result.stderr.decode(errors="replace")
 
 
+@pytest.mark.parametrize("target", ["proc", "sys"])
 @pytest.mark.parametrize("kind", ["ready-wrong-fs", "ready-replaced"])
-def test_real_c_transition_target_readiness_rejects_identity_controls(transition_harness, kind):
-    result = transition_harness(kind, target="proc", fixture_mode="0755")
+def test_real_c_transition_target_readiness_rejects_identity_controls(
+    transition_harness, target, kind
+):
+    result = transition_harness(kind, target=target, fixture_mode="0755")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
     assert result.stderr == b""
 
 
+@pytest.mark.parametrize("target", ["proc", "sys"])
 @pytest.mark.parametrize("mode", ["01755", "02755", "04755", "0775"])
-def test_real_c_transition_target_rejects_other_modes(transition_harness, mode):
-    result = transition_harness("mode", fixture_mode=mode)
+def test_real_c_transition_target_rejects_other_modes(transition_harness, target, mode):
+    result = transition_harness("mode", target=target, fixture_mode=mode)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
-    assert result.stderr.decode() == _MARKER.format("mode")
+    assert result.stderr.decode() == _MARKER.replace("target=proc", f"target={target}").format("mode")

@@ -204,6 +204,15 @@ to implicitly enable either special lane in portable selection.
 
 ### Official service-image matrix
 
+The approved `/sys` 0555 compatibility change uses the focused real-C
+`tests/unit/test_oci_guest_transition.py` with
+`PALIMPSEST_GUEST_TRANSITION_DOCKER_TESTS=1`. Both proc/sys need unchanged-mode
+and mode-drift cases; sys needs explicit owner, nonempty, symlink/file,
+replacement, wrong-filesystem and disallowed-mode negatives. Keep dev/generic
+0555 rejection. A production guest change also requires reproducible packaged
+ELF/provenance checks, the explicit stage-1 boot matrix, then one pinned MySQL
+case. Portable success cannot stand in for either native proof.
+
 The independent [official service matrix](docker-hub-service-matrix.md) uses
 `tests/kvm/test_oci_docker_hub_services_live.py` for PostgreSQL, Redis, MySQL,
 and NGINX defaults, with a separate explicit-user Redis case. Run one exact
@@ -435,14 +444,14 @@ second injects failures through the production start callsite and requires
 pre-fork refusal, complete endpoint cleanup and unchanged root-owned control
 pipes. These tests do not qualify the packaged ELF or native lifecycle.
 
-The approved proc-only `0555` exception uses the same production policy in
+The approved proc/sys `0555` exceptions use the same production policy in
 the real C fixture module. It separately checks acceptance, pre-move readiness,
 unchanged metadata and initial-identity retention across `0755`/`0555` changes.
-Generic directory checks and `dev`/`sys` still reject `0555`; wrong owner,
+Generic directory checks and `dev` still reject `0555`; wrong owner,
 nonempty/nofollow/type, special bits, replaced inode and filesystem identity
 remain negative controls. The internal readiness checker uses tmpfs magic in
 the restricted fixture only; the runtime wrapper fixes OverlayFS magic.
-Retain the existing native guest matrix and an unchanged original Redis run
+Retain the existing native guest matrix and unchanged original-image runs
 as separate real mount/workload evidence. A later Redis entrypoint failure
 must not be hidden by changing its user, command, image or privileges.
 

@@ -3664,7 +3664,8 @@ static int transition_target_policy_checked(const char *path, enum transition_ta
                                             struct stat_local *initial_identity,
                                             enum safe_dir_reason *reason) {
     return safe_dir_policy_checked(path, create, 1, 0755,
-                                   target == TRANSITION_TARGET_PROC ? 0555 : 0,
+                                   (target == TRANSITION_TARGET_PROC ||
+                                    target == TRANSITION_TARGET_SYS) ? 0555 : 0,
                                    kept_fd, initial_identity, reason);
 }
 
