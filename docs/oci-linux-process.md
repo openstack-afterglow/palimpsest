@@ -38,7 +38,91 @@ Final initialization followed by final readiness is required: a temporary
 server starting is insufficient. Original default-image failures and earlier
 two-alias checkpoints below remain historical evidence, not retroactive passes.
 
-## Linux argument metadata
+## Self-FD verification checkpoint — `93c1eb0`
+
+The self-FD implementation commit is
+`93c1eb0c70879e0f7e037847340b18d4fdd022f6`. Local focused contracts passed
+468 tests (24.92 seconds), and the packaged-binary gate passed 34 tests
+(17.09 seconds). The exact server checkout passed the focused selection plus
+architecture guard, 481 tests (36.83 seconds), and its separate packaged-binary
+gate, 34 tests (17.58 seconds). Do not sum overlapping selections. The
+[GitHub development package](https://github.com/openstack-afterglow/palimpsest/actions/runs/34756369963)
+built successfully.
+
+Stage1 source-bundle SHA-256 is
+`9b0efacf48c958b90664e45e525314b744e1c5614107b30aea9480c3956b9a73`;
+the twice-reproduced packaged ELF is
+`60af41542e258a13c1f6e59d094e1687914acc4b5bdad71305abfdccdc6f179e`
+(103360 bytes, mode0644). Workload-proof source is
+`7f2da9a6bca521721f70e468da2aa408410c48e7d7a56b2fe67e0c4bc88f88e8`,
+its twice-reproduced ELF is
+`269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c`
+(14328 bytes, mode0755), and canonical fixture-manifest digest is
+`de06327197062add9fdc3038d512a42f7cb07074569e408a216250373d5e495b`.
+
+Intermediate failures remain separate: local fixture-dependent tests were
+started while source/artifact provenance was still being synchronized and
+interrupted after stale-binding rejection; an unfinished new validator fixture
+also lacked positive device identifiers. Neither changed a production check.
+The final synchronized selections above passed. The first server wrapper
+stopped before VM boot with 1 failed/43 passed (9.99 seconds): its umask077
+created a mode0700 test directory where the existing fixture contract required
+0755. Evidence is `/tmp/palimpsest-self-fd-native-1_ms3r32`. The revised wrapper
+sets umask022 only in focused/binary test children; parent evidence and native
+phases retain umask077. No verifier was relaxed. Git checkout's group-write
+bits on the exact new fixture/ELF files were restored to their pinned modes
+before testing; source bytes and Git identity were unchanged.
+
+On the same server SHA, the native stage1 matrix passed 43 boots/44 QEMU
+invocations (121.28 seconds). Stdio V3 passed independently for UID0
+(16.16 seconds) and UID101 (16.11 seconds), including both main and additional
+exec, entry FD inventory, self-FD writes/dynamic pipe data, PID1 read-only empty
+FD masks, and authenticated root comparisons. Each stdio journal contained
+14 records/7 complete invocations. Evidence is
+`/tmp/palimpsest-self-fd-native-6_wgxoyi`; wrapper SHA-256 is
+`c29f0c3c81500c45e2bd3f35d7b1e40f47794464c4ad53d590b00cb79e9e1f46`.
+All completed pre/post checks preserved the exact 12 inactive domains and 12
+archives, with no active QEMU.
+
+The following cold public-exec selection failed before its first CLI call
+(0.05 seconds): the wrapper chose the older exec archive whose acceptance
+receipt is not v2. Checking its nonexistent command journal then reported
+FileNotFoundError, so the overall wrapper remains failed. The final preservation
+check still passed with no new domain. The existing Gate12 artifact has a
+matching v2 acceptance receipt and archive SHA
+`e7782db13bfd97bbf9cb2788007e51ffc7b2c4f7f61aed504b8b0f3b98492117`;
+it is the correct input for a separate cold retest. The completed stage1 and
+stdio results are not rerun or promoted to cold/MySQL success.
+
+The independent MySQL random-password retest at this SHA failed its full test
+in 116.21 seconds, but reached final initialization/readiness, version, the
+loopback/security check, and before/after authenticated root matching the
+application's actual `/` (device21/inode2). Direct PID1 root reading was denied.
+The prior `/dev/fd` defaults failure was absent. `mysqladmin ping` returned0,
+empty stdout, and an authentication-denied diagnostic for a passwordless call;
+the old test additionally required an alive string and therefore failed.
+This is not an authenticated SQL result. The planned follow-up changes only
+the disposable test's reachability interpretation to the documented ping
+exit status, preserving all other cases and security checks.
+
+Evidence is `/tmp/palimpsest-mysql-random-native-ga0uslra`, with runtime evidence
+`/tmp/p-hub-svc-myr-525b1bae`. The failed test still completed exact owned
+stop/rm: its domain/run/root are absent, `owned_resources_disposed=true`, while
+`application_completed=false` records the failed full test. Its healthy journal
+had22 records/11 calls. Checked output/console had no generated-password pattern.
+The final12-domain/12-archive preservation checks and zero-active check passed.
+This does not claim physical memory/storage secure erasure.
+
+The corrected v2-image cold follow-up then passed at the same `93c1eb0`
+(1 test,22.56 seconds), including public run/exec, literal argv/split streams,
+authenticated root/PID1 refusal and stop/rm. Its28-record/14-call journal was
+healthy and all12 original domains/archives remained unchanged, with no active
+QEMU. Evidence: `/tmp/palimpsest-self-fd-cold-w0q0cx7j`; cold-wrapper SHA-256:
+`59c38a60884cceb413d9ffa512f0da6fa654a122f5adf9ca59412e3b8fd2e36a`.
+This separate success does not erase the earlier wrong-fixture failure or
+qualify a fresh build/full Gate2.
+
+## Argument-vector interpretation
 
 Palimpsest's OCI intake supports exactly Linux amd64. The legacy image-config
 field `ArgsEscaped` may be absent, null, `false` or `true`; a present non-null

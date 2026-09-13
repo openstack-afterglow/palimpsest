@@ -415,6 +415,17 @@ def _save_service_result(parent: Path, name: str, result, *, secret_safe: bool):
     return legacy._save(parent, name, result)
 
 
+def _service_probe_ok(case: ServiceCase, probe: subprocess.CompletedProcess[bytes]) -> bool:
+    if case.test_only_random_password:
+        # mysqladmin documents that ping succeeds when the server is reachable
+        # even if authentication is denied. This passwordless probe deliberately
+        # proves Unix-socket reachability only.
+        return probe.returncode == 0
+    if case.user_override is not None:
+        return probe.returncode == 0 and probe.stdout == case.probe_marker
+    return probe.returncode == 0 and case.probe_marker in probe.stdout
+
+
 def _save_cleanup_result(parent: Path, name: str, result) -> tuple[object, bool, str | None]:
     pattern = rb"palimpsest-test-[0-9a-f]{64}"
     leaked = re.search(pattern, result.stdout + result.stderr) is not None
@@ -671,23 +682,20 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             _case_cli(case, parent, environment, "exec", name, "--", *case.probe_argv, timeout=60),
             secret_safe=case.test_only_random_password,
         )
-        probe_ok = probe.returncode == 0 and case.probe_marker in probe.stdout
-        if case.user_override is not None:
-            probe_ok = probe.returncode == 0 and probe.stdout == case.probe_marker
+        probe_ok = _service_probe_ok(case, probe)
         if probe.returncode == 77:
             _save_json(
                 parent, "service-probe.json", {"result": "skipped", "reason": "image client absent", "returncode": 77}
             )
         else:
-            _save_json(
-                parent,
-                "service-probe.json",
-                {
-                    "result": "passed" if probe_ok else "failed",
-                    "returncode": probe.returncode,
-                    "transport": "guest loopback-or-unix",
-                },
-            )
+            receipt = {
+                "result": "passed" if probe_ok else "failed",
+                "returncode": probe.returncode,
+                "transport": "guest loopback-or-unix",
+            }
+            if case.test_only_random_password:
+                receipt.update(transport="unix-socket", reachability=probe_ok, authenticated_sql=False)
+            _save_json(parent, "service-probe.json", receipt)
         root = _save_service_result(
             parent,
             "root",

@@ -66,6 +66,13 @@ public stop/removal of only its bound new run and verifies the root-volume
 inventory returns to its baseline. Failure to prove disposal is a hard failure,
 not a discard claim. The password is transiently visible to same-UID application
 processes and its database hash exists until the disposable root is removed.
+Per the [MySQL 8.4 `mysqladmin` documentation](https://dev.mysql.com/doc/refman/8.4/en/mysqladmin.html),
+`ping` returns success when the server is running even if authentication is
+rejected. Therefore this one diagnostic accepts return code zero without the
+`mysqld is alive` stdout marker; return code 77 records the missing-client skip
+but still fails overall qualification, as does every other nonzero status. Its `service-probe.json` records
+`transport: unix-socket`, the bounded reachability result, and
+`authenticated_sql: false` explicitly.
 
 Before and after each case, verify the exact preserved domain names, UUIDs,
 states, autostart settings, source archive hashes, and absence of active QEMU.

@@ -147,6 +147,35 @@ def test_final_mysql_readiness_rejects_temporary_server_and_requires_ordered_fin
     assert services._mysql_final_ready(ready + initialized + ready)
 
 
+def test_random_password_mysqladmin_ping_accepts_documented_unauthenticated_reachability() -> None:
+    diagnostic = next(case for case in services.CASES if case.key == "MYSQL_USER_RANDOM_PASSWORD")
+    denied = subprocess.CompletedProcess(
+        ["mysqladmin", "--protocol=socket", "ping"],
+        0,
+        b"",
+        b"mysqladmin: connect failed: Access denied for user 'mysql' (using password: NO)\n",
+    )
+    assert services._service_probe_ok(diagnostic, denied)
+
+
+@pytest.mark.parametrize("returncode", [1, 2, 76, 77, 126, 255])
+def test_random_password_mysqladmin_ping_rejects_every_nonzero_status(returncode: int) -> None:
+    diagnostic = next(case for case in services.CASES if case.key == "MYSQL_USER_RANDOM_PASSWORD")
+    failed = subprocess.CompletedProcess(["mysqladmin"], returncode, b"mysqld is alive\n", b"")
+    assert not services._service_probe_ok(diagnostic, failed)
+
+
+def test_existing_service_probe_marker_contracts_are_unchanged() -> None:
+    for case in (case for case in services.CASES if not case.test_only_random_password):
+        exact = subprocess.CompletedProcess(["probe"], 0, case.probe_marker, b"")
+        assert services._service_probe_ok(case, exact)
+        failed = subprocess.CompletedProcess(["probe"], 1, case.probe_marker, b"")
+        assert not services._service_probe_ok(case, failed)
+    mysql_user = next(case for case in services.CASES if case.key == "MYSQL_USER")
+    extra = subprocess.CompletedProcess(["probe"], 0, mysql_user.probe_marker + b"extra", b"")
+    assert not services._service_probe_ok(mysql_user, extra)
+
+
 def test_secret_output_is_redacted_before_persistence_and_raises_constant_failure(tmp_path: Path) -> None:
     secret = b"palimpsest-test-" + b"a" * 64
     result = subprocess.CompletedProcess(["fixed"], 1, b"before " + secret + b" after", secret)
@@ -253,7 +282,11 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert '"result": "skipped", "reason": "image client absent", "returncode": 77' in source
     assert '"result": "passed" if probe_ok else "failed"' in source
     assert "assert probe_ok" in source
-    assert source.count("if case.user_override is not None:") >= 3
+    assert "def _service_probe_ok" in source
+    assert "if case.test_only_random_password:" in source
+    assert "return probe.returncode == 0" in source
+    assert source.count("if case.user_override is not None:") >= 2
+    assert 'receipt.update(transport="unix-socket", reachability=probe_ok, authenticated_sql=False)' in source
     assert '"guest-loopback-security"' in source
     assert 'netdev_path: str = "/proc/net/dev"' in source and "netdev_count" in source
     assert 'sysfs_net_path: str = "/sys/class/net"' in source
