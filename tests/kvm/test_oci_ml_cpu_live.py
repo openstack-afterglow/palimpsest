@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import stat
-import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -94,30 +93,47 @@ def _assert_override_provenance(environment: dict[str, str], name: str, image_pr
     assert effective == image_process.with_command(entrypoint, _KEEPALIVE)
 
 
-def _setup(environment: dict[str, str], label: str):
+def _setup(environment: dict[str, str], name: str):
     root = Path(environment.get("PALIMPSEST_OCI_ML_PROOF_ROOT", ""))
     assert root.is_absolute() and root.resolve(strict=True) == root
     info = root.stat(follow_symlinks=False)
-    assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700
-    parent = Path(tempfile.mkdtemp(prefix=f"{label}-", dir=root))
-    evidence = parent / "setup-evidence"
-    evidence.mkdir(mode=0o700)
+    assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o711
+    for _attempt in range(16):
+        parent = root / ("m-" + uuid.uuid4().hex[:8])
+        try:
+            parent.lstat()
+        except FileNotFoundError:
+            break
+    else:
+        raise AssertionError("could not select a fresh ML runtime parent")
     selected = dict(environment)
-    selected["PALIMPSEST_PROOF_EVIDENCE_DIR"] = str(evidence)
     legacy._success(legacy._cli(selected, "oci", "init-runtime", parent))
     selected["PALIMPSEST_STATE_HOME"] = str(parent / "state")
     selected["XDG_CONFIG_HOME"] = str(parent / "config")
+    evidence = parent / "setup-evidence"
+    evidence.mkdir(mode=0o700)
+    selected["PALIMPSEST_PROOF_EVIDENCE_DIR"] = str(evidence)
+    roots = resolve_roots(selected)
+    assert len(os.fsencode(roots.runs / name / "io" / "lifecycle.sock")) <= 97
     return parent, selected
+
+
+def _fresh_root_volume_baseline(roots) -> set[str]:
+    try:
+        roots.oci_root_volumes.lstat()
+    except FileNotFoundError:
+        return set()
+    raise AssertionError("fresh ML runtime root-volume path already exists")
 
 
 def _proof(case: MLCase) -> None:
     selection = _selection(case)
-    parent, environment = _setup(legacy._environment(), "ml-" + case.key.lower())
     name = "ml-" + case.key.lower() + "-" + uuid.uuid4().hex[:8]
+    parent, environment = _setup(legacy._environment(), name)
     source_hash = legacy._file_sha256(selection.archive)
     roots = resolve_roots(environment)
     assert shutil.disk_usage(parent).free >= _PRIVATE_DISK_BUDGET
-    root_volumes_before = {entry.name for entry in roots.oci_root_volumes.iterdir()}
+    root_volumes_before = _fresh_root_volume_baseline(roots)
     try:
         original = legacy._authenticate(selection, parent)
         assert original.argv[-1:] == ("/bin/bash",)

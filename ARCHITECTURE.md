@@ -302,7 +302,7 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
-ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 사전 private filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
+ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
 
@@ -409,9 +409,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2cc96776e650338cb15a9f1ae51e67d8b24d608de54edf1094aefa9b9a797d8f",
-  "reviewed_at": "2026-09-13T13:55:54Z",
-  "summary": "Reviewed public OCI Cmd-only override across CLI/request, trusted SourceCAS revalidation before leases, canonical v4 provenance and recovery; v2/v3, source/lower and guest security unchanged. Reviewed original-image TensorFlow/PyTorch CPU matmul opt-ins, exact DeviceSpec CPU checks and docs; GPU/OpenStack remain proposals. Independent review approved; broader focused 616 passed after constructor regression repair, mechanical formatting affected 379 passed, lint/reference/lane checks passed. Native CPU results remain separate."
+  "source_sha256": "352513db7f16e7a4ff6532b8c028ecc29a1e74a544feddf55bfd9d71cf76800c",
+  "reviewed_at": "2026-09-13T14:07:05Z",
+  "summary": "Reviewed ML proof setup against create_runtime_parent and read-only resolve_roots: new absent runtime paths under short public-created search-only0711 ancestors, private0700 evidence, actual lifecycle path97B preflight and lstat-verified absent root-volume baseline. Behavioral negatives reject directory and dangling symlink; independent review approved. Focused82 passed before final absence correction and affected3 passed after it. Production/guest/schema unchanged; prior exact0a2ef08 server616 passed with private journal and standard umask. Native ML execution remains separate."
 }
 ```
 <!-- architecture-review:end -->

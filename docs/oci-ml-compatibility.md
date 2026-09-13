@@ -45,7 +45,19 @@ native harness additionally monitors the proof-owned tree against that 40 GiB
 budget because compressed registry size does not bound materialized storage.
 
 Run the cases independently after supplying their exact inputs and the normal
-native boot variables:
+native boot variables. `PALIMPSEST_OCI_ML_PROOF_ROOT` must name a canonical,
+caller-owned runtime parent created through `palimpsest oci init-runtime`; the
+resulting `0711` directory and each ancestor must retain all search bits so the
+native QEMU identity can traverse to the proof-owned runtime. Use a short path
+to keep the lifecycle socket within the platform bound. Do not place this root
+beneath a private `0700` evidence directory.
+
+```bash
+palimpsest oci init-runtime /tmp/pml-example
+export PALIMPSEST_OCI_ML_PROOF_ROOT=/tmp/pml-example
+mkdir -m 700 /tmp/pml-journal-example
+export PALIMPSEST_LOG_HOME=/tmp/pml-journal-example
+```
 
 ```bash
 uv run pytest -q tests/kvm/test_oci_ml_cpu_live.py::test_official_ml_image_cpu_tensor_with_public_command_override[tensorflow]
