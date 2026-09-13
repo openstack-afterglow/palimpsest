@@ -14,12 +14,32 @@ from types import SimpleNamespace
 import pytest
 
 _PROOF = Path(__file__).resolve().parents[1] / "kvm" / "test_oci_ml_cpu_live.py"
-sys.path.insert(0, str(_PROOF.parent))
 _SPEC = importlib.util.spec_from_file_location("oci_ml_cpu_live_proof", _PROOF)
 assert _SPEC is not None and _SPEC.loader is not None
 proof = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = proof
 _SPEC.loader.exec_module(proof)
+
+
+def test_live_proof_collects_standalone_without_test_directory_on_pythonpath():
+    project = _PROOF.parents[2]
+    environment = {
+        "HOME": os.environ.get("HOME", "/nonexistent"),
+        "PATH": os.defpath,
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "/nonexistent-untrusted-pythonpath",
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--collect-only", str(_PROOF)],
+        cwd=project,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-4096:]
+    assert result.stdout.count(b"test_official_ml_image_cpu_tensor_with_public_command_override") == 2
 
 
 def test_each_framework_requires_independent_complete_pins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

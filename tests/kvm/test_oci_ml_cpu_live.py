@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
 import stat
+import sys
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-import test_oci_docker_hub_cli_live as legacy
 
 from palimpsest_local.oci_process import OCIProcessSpec
 from palimpsest_local.oci_root_prepare import OCIRootPreparationTransaction
 from palimpsest_local.state import read_run_ledger_snapshot, resolve_roots
+
+_LEGACY_PATH = Path(__file__).with_name("test_oci_docker_hub_cli_live.py")
+_SPEC = importlib.util.spec_from_file_location("palimpsest_ml_legacy_helpers", _LEGACY_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+legacy = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = legacy
+_SPEC.loader.exec_module(legacy)
 
 _PREFIX = "PALIMPSEST_OCI_ML_"
 _KEEPALIVE = ("/bin/sleep", "infinity")

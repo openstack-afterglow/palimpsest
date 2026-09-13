@@ -1,5 +1,17 @@
 # OCI machine-learning image compatibility
 
+## Execution checkpoints
+
+Both pinned archives below were acquired and verified through the public
+anonymous registry intake. Acquisition does not establish VM compatibility.
+At `581061f`, the first native attempt stopped during pytest collection because
+the ML proof used a bare sibling-module import. No VM was created; the existing
+15 inactive domains and 16 archive pins passed preservation checks. The follow-up
+uses an explicit file-based helper import and adds an independent collect-only
+regression. CPU execution results are recorded separately when available.
+
+## CPU proof contract
+
 Palimpsest's first ML compatibility proof is deliberately CPU-only and opt-in.
 It covers pinned official TensorFlow 2.21 CPU and PyTorch 2.8 CUDA-runtime
 images after registry acquisition, without adding a GPU device, external

@@ -302,6 +302,8 @@ Hub `/v1`와 external Docker/OCI registry는 API, storage, credential domain이 
 
 ## Development and verification
 
+ML 실기 모듈은 sibling CLI proof helper를 명시적 파일 위치로 로드한다. portable contract가 `sys.path`를 바꾸어 단독 실행의 import 결함을 가리지 않으며, 별도 subprocess `--collect-only`로 두 native 노드의 독립 수집을 검사한다. `581061f`의 첫 시도는 이 import 문제로 pytest 수집 단계에서 중단됐고 VM을 만들지 않았다. 원본 archive와 기존 runtime 보존은 통과했으며 framework 실행 성공은 아니다.
+
 ML CPU proof는 `native-live`에 등록하되 TensorFlow/PyTorch별 opt-in과 archive/manifest pin을 따로 요구한다. 전체 native suite 대신 [ML 문서](docs/oci-ml-compatibility.md)의 정확한 단일 노드를 순차 실행한다. 짧은 전용 runtime root는 공개 `oci init-runtime`으로0711·search-enabled ancestor 조건을 유지하며, 각 absent child도 같은 생성 API로만 준비한다. 비공개 evidence는0700 자식 또는 별도 sibling이며 runtime ancestor로 사용하지 않는다. 실제 `state/runs/<name>/io/lifecycle.sock` 길이97B와 초기 root-volume 디렉터리 부재를 부팅 전에 확인한다. 사전 filesystem 여유40GiB를 요구하며 큰 이미지의 실제 저장량은 별도 native harness가 감시한다. 이것은 filesystem quota가 아니고 다운로드 크기만으로 materialization 크기를 보장하지 않는다. CPU 실행 성공을 GPU·대화형 개발환경·외부 network·OpenStack 또는 전체 Gate2 성공으로 확대하지 않는다.
 
 제어 메시지의 실제 partial-frame 제한5초와 supervisor 호출의 남은 STOP/cleanup 시간을 구분한다. `control_read_deadline_status`는 전자의 만료나 clock 오류만 거부하고, 후자만 만료하면 parser 상태를 보존한 채 양보한다. 이는 `e585ce1`의 첫 native STOP 후 stage21 거부를 재현해 좁힌 수정이며, 해당 실패와 후속 검증은 [process evidence](docs/oci-linux-process.md)에 별도로 남긴다.
@@ -409,9 +411,9 @@ Architecture maintenance는 다음 순서로 수행한다.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "352513db7f16e7a4ff6532b8c028ecc29a1e74a544feddf55bfd9d71cf76800c",
-  "reviewed_at": "2026-09-13T14:07:05Z",
-  "summary": "Reviewed ML proof setup against create_runtime_parent and read-only resolve_roots: new absent runtime paths under short public-created search-only0711 ancestors, private0700 evidence, actual lifecycle path97B preflight and lstat-verified absent root-volume baseline. Behavioral negatives reject directory and dangling symlink; independent review approved. Focused82 passed before final absence correction and affected3 passed after it. Production/guest/schema unchanged; prior exact0a2ef08 server616 passed with private journal and standard umask. Native ML execution remains separate."
+  "source_sha256": "8365f523929d0bbf362fab88ed27e54ce86b493c083d5ae3db07635ab5b73a7b",
+  "reviewed_at": "2026-09-13T14:14:43Z",
+  "summary": "Reviewed ML standalone collection fix: explicit sibling helper import with sys.modules registration, removed sys.path masking, bounded isolated collect-only regression. Test-only change; production/guest/schema unchanged. Focused83 passed; recorded prior581061f pre-VM collection failure separately from successful archive acquisition and preserved15 domains/16 archive pins. Native framework execution remains unverified."
 }
 ```
 <!-- architecture-review:end -->
