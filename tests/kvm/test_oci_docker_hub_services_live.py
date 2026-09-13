@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+import tarfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -42,6 +46,18 @@ class ServiceCase:
     probe_argv: tuple[str, ...]
     probe_marker: bytes
     user_override: str | None = None
+    test_only_random_password: bool = False
+
+
+_MYSQL_RANDOM_WRAPPER = """set -euo pipefail
+set +x
+umask 077
+secret_hex=$(/usr/bin/od -An -N32 -tx1 /dev/urandom | /usr/bin/tr -d ' \\n')
+[[ $secret_hex =~ ^[0-9a-f]{64}$ ]]
+export MYSQL_ROOT_PASSWORD="palimpsest-test-${secret_hex}"
+unset secret_hex
+exec /usr/local/bin/docker-entrypoint.sh "$@"
+"""
 
 
 CASES = (
@@ -117,7 +133,52 @@ CASES = (
         b"mysqld is alive\n",
         user_override="mysql",
     ),
+    ServiceCase(
+        "MYSQL_USER_RANDOM_PASSWORD", "mysql:8.4", 2048, ("mysqld",),
+        b"ready for connections", ("mysqld", "--version"), b"Ver 8.4",
+        ("/bin/sh", "-c", "command -v mysqladmin >/dev/null || exit 77; mysqladmin --protocol=socket ping"),
+        b"mysqld is alive\n", user_override="mysql", test_only_random_password=True,
+    ),
 )
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _derived_mysql_random_password_archive(selection, destination: Path):
+    assert selection.archive.stat().st_size <= 512 * 1024 * 1024
+    with tarfile.open(selection.archive, "r:*") as source:
+        members = source.getmembers()
+        payloads = {member.name: source.extractfile(member).read() for member in members if member.isfile()}
+    manifest_name = "blobs/sha256/" + selection.manifest_digest.removeprefix("sha256:")
+    manifest = json.loads(payloads[manifest_name])
+    config_name = "blobs/sha256/" + manifest["config"]["digest"].removeprefix("sha256:")
+    config = json.loads(payloads[config_name])
+    assert config["config"]["Entrypoint"] == ["docker-entrypoint.sh"]
+    assert config["config"]["Cmd"] == ["mysqld"]
+    forbidden = {"MYSQL_ROOT_PASSWORD", "MYSQL_ALLOW_EMPTY_PASSWORD", "MYSQL_RANDOM_ROOT_PASSWORD"}
+    assert not any(item.split("=", 1)[0] in forbidden for item in config["config"].get("Env", []))
+    config["config"]["Entrypoint"] = ["/usr/bin/bash", "-c", _MYSQL_RANDOM_WRAPPER, "palimpsest-mysql-random"]
+    config_payload = _json_bytes(config)
+    config_hex = hashlib.sha256(config_payload).hexdigest()
+    manifest["config"] = {**manifest["config"], "digest": "sha256:" + config_hex, "size": len(config_payload)}
+    manifest_payload = _json_bytes(manifest)
+    manifest_hex = hashlib.sha256(manifest_payload).hexdigest()
+    index = json.loads(payloads["index.json"])
+    selected = [item for item in index["manifests"] if item["digest"] == selection.manifest_digest]
+    assert len(selected) == 1
+    selected[0].update(digest="sha256:" + manifest_hex, size=len(manifest_payload))
+    payloads["index.json"] = _json_bytes(index)
+    payloads["blobs/sha256/" + config_hex] = config_payload
+    payloads["blobs/sha256/" + manifest_hex] = manifest_payload
+    with tarfile.open(destination, "w", format=tarfile.PAX_FORMAT) as output:
+        for name in sorted(payloads):
+            info = tarfile.TarInfo(name)
+            info.mode, info.size = 0o644, len(payloads[name])
+            output.addfile(info, io.BytesIO(payloads[name]))
+    digest = legacy._file_sha256(destination)
+    return type(selection)(destination.resolve(), digest, "sha256:" + manifest_hex)
 
 
 def _selection(case: ServiceCase, environment: dict[str, str]):
@@ -294,6 +355,135 @@ def _wait_ready_or_inactive(parent: Path, environment: dict[str, str], name: str
     pytest.fail(f"missing default workload readiness {marker!r}; preserve {path}")
 
 
+def _wait_mysql_final_ready(parent: Path, environment: dict[str, str], name: str) -> None:
+    path = parent / "state" / "runs" / name / "io" / "console.log"
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        if path.is_file():
+            with path.open("rb") as stream:
+                payload = stream.read(legacy._MAX_CONSOLE_BYTES + 1)
+            assert len(payload) <= legacy._MAX_CONSOLE_BYTES
+            assert re.search(rb"palimpsest-test-[0-9a-f]{64}", payload) is None, (
+                "generated password appeared on the guest console"
+            )
+            if _mysql_final_ready(payload):
+                return
+        state, _ = _domain_state(environment, name)
+        if state is not None and state != "running":
+            pytest.fail(f"random-password workload became {state!r} before final readiness; preserve {path}")
+        time.sleep(0.1)
+    pytest.fail(f"final MySQL readiness was not observed; preserve {path}")
+
+
+def _mysql_final_ready(payload: bytes) -> bool:
+    initialized, ready = b"MySQL init process done", b"ready for connections"
+    boundary = payload.find(initialized)
+    return boundary >= 0 and payload.find(ready, boundary + len(initialized)) >= 0
+
+
+def _retain_redacted_console(parent: Path, environment: dict[str, str], name: str) -> bool:
+    console = resolve_roots(environment).runs / name / "io" / "console.log"
+    if not console.is_file():
+        return False
+    with console.open("rb") as stream:
+        payload = stream.read(legacy._MAX_CONSOLE_BYTES + 1)
+    assert len(payload) <= legacy._MAX_CONSOLE_BYTES
+    leaked = re.search(rb"palimpsest-test-[0-9a-f]{64}", payload) is not None
+    (parent / "random-password-console.redacted").write_bytes(
+        re.sub(rb"palimpsest-test-[0-9a-f]{64}", b"[REDACTED]", payload)
+    )
+    return leaked
+
+
+def _assert_no_password_leak(parent: Path) -> None:
+    for path in parent.iterdir():
+        if not path.is_file() or path.suffix not in {".json", ".stdout", ".stderr", ".redacted"}:
+            continue
+        with path.open("rb") as stream:
+            payload = stream.read(legacy._MAX_COMMAND_OUTPUT + 1)
+        assert len(payload) <= legacy._MAX_COMMAND_OUTPUT
+        assert re.search(rb"palimpsest-test-[0-9a-f]{64}", payload) is None, "generated password in evidence"
+
+
+def _save_service_result(parent: Path, name: str, result, *, secret_safe: bool):
+    if secret_safe and re.search(rb"palimpsest-test-[0-9a-f]{64}", result.stdout + result.stderr):
+        pattern = rb"palimpsest-test-[0-9a-f]{64}"
+        redacted = type(result)(result.args, result.returncode, re.sub(pattern, b"[REDACTED]", result.stdout),
+                                re.sub(pattern, b"[REDACTED]", result.stderr))
+        legacy._save(parent, name, redacted)
+        raise AssertionError("generated password appeared in command output")
+    return legacy._save(parent, name, result)
+
+
+def _save_cleanup_result(parent: Path, name: str, result) -> tuple[object, bool, str | None]:
+    pattern = rb"palimpsest-test-[0-9a-f]{64}"
+    leaked = re.search(pattern, result.stdout + result.stderr) is not None
+    redacted = type(result)(result.args, result.returncode, re.sub(pattern, b"[REDACTED]", result.stdout),
+                            re.sub(pattern, b"[REDACTED]", result.stderr))
+    try:
+        saved = legacy._save(parent, name, redacted)
+    except OSError as exc:
+        return redacted, leaked, type(exc).__name__
+    return saved, leaked, None
+
+
+def _run_disposal_commands(parent: Path, name: str, state: str, command) -> tuple[bool, tuple[str, ...]]:
+    leaked = False
+    evidence_errors: list[str] = []
+    if state == "running":
+        try:
+            stopped, stop_leak, stop_error = _save_cleanup_result(parent, "failure-stop", command("stop"))
+            leaked = leaked or stop_leak
+            if stop_error:
+                evidence_errors.append(stop_error)
+            legacy._success(stopped)
+        except (AssertionError, OSError) as exc:
+            evidence_errors.append("stop-" + type(exc).__name__)
+    try:
+        removed, rm_leak, rm_error = _save_cleanup_result(parent, "failure-rm", command("rm"))
+        leaked = leaked or rm_leak
+        if rm_error:
+            evidence_errors.append(rm_error)
+        legacy._success(removed)
+    except (AssertionError, OSError) as exc:
+        evidence_errors.append("rm-" + type(exc).__name__)
+    return leaked, tuple(evidence_errors)
+
+
+def _capture_then_dispose(
+    parent: Path, environment: dict[str, str], name: str, state: str, command
+) -> tuple[bool, tuple[str, ...]]:
+    errors: list[str] = []
+    try:
+        leaked = _retain_redacted_console(parent, environment, name)
+    except (OSError, AssertionError) as exc:
+        leaked = False
+        errors.append(type(exc).__name__)
+    command_leak, command_errors = _run_disposal_commands(parent, name, state, command)
+    return leaked or command_leak, tuple(errors) + command_errors
+
+
+def _secret_safe_cli(parent: Path, environment: dict[str, str], *args: object, timeout: int):
+    try:
+        return legacy._cli(environment, *args, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
+        pattern = rb"palimpsest-test-[0-9a-f]{64}"
+        redacted = subprocess.CompletedProcess(
+            tuple(map(str, args)), 124, re.sub(pattern, b"[REDACTED]", stdout),
+            re.sub(pattern, b"[REDACTED]", stderr),
+        )
+        legacy._save(parent, "timeout", redacted)
+        raise AssertionError("secret-safe owned command timed out") from None
+
+
+def _case_cli(case: ServiceCase, parent: Path, environment: dict[str, str], *args: object, timeout: int):
+    if case.test_only_random_password:
+        return _secret_safe_cli(parent, environment, *args, timeout=timeout)
+    return legacy._cli(environment, *args, timeout=timeout)
+
+
 def _preserve_failed_owned_runtime(
     parent: Path, environment: dict[str, str], name: str, expected_uuid: str | None
 ) -> None:
@@ -353,19 +543,53 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
     selection = _selection(case, os.environ)
     short = {
         "POSTGRES": "pg", "REDIS": "rd", "MYSQL": "my", "NGINX": "ng",
-        "REDIS_USER": "rdu", "MYSQL_USER": "myu",
+        "REDIS_USER": "rdu", "MYSQL_USER": "myu", "MYSQL_USER_RANDOM_PASSWORD": "myr",
     }[case.key]
     parent, environment = legacy._setup(legacy._environment(), "svc-" + short)
+    if case.test_only_random_password:
+        environment.pop("PALIMPSEST_PROOF_EVIDENCE_DIR", None)
+    root_volume_directory = resolve_roots(environment).oci_root_volumes
+    root_volume_before = (
+        {path.name for path in root_volume_directory.iterdir()}
+        if case.test_only_random_password and root_volume_directory.is_dir()
+        else set()
+    )
     name = "hub-service-" + case.key.lower().replace("_", "-") + "-" + uuid.uuid4().hex[:8]
-    source_hash = legacy._file_sha256(selection.archive)
+    if case.test_only_random_password:
+        assert not (resolve_roots(environment).runs / name).exists()
+        virsh = legacy.shutil.which("virsh", path=environment.get("PATH"))
+        assert virsh
+        inventory = legacy._bounded_command(
+            [virsh, "-c", "qemu:///system", "list", "--all", "--name"],
+            environment=environment, timeout=15,
+        )
+        legacy._success(inventory)
+        assert name not in legacy._inventory_lines(inventory.stdout, encoding="utf-8")
+    original_selection = selection
+    original_source_hash = legacy._file_sha256(selection.archive)
+    assert original_source_hash == selection.archive_digest
+    source_hash = original_source_hash
     domain_uuid = None
     completed = False
+    disposed = False
     primary_error: BaseException | None = None
     loopback_security_error: AssertionError | None = None
     try:
         process = legacy._authenticate(selection, parent)
         process.require_bootable()
         assert process.argv[-len(case.argv_suffix) :] == case.argv_suffix
+        if case.test_only_random_password:
+            original_environment = dict(process.environment)
+            assert not any(
+                key in original_environment
+                for key in ("MYSQL_ROOT_PASSWORD", "MYSQL_ALLOW_EMPTY_PASSWORD", "MYSQL_RANDOM_ROOT_PASSWORD")
+            )
+            selection = _derived_mysql_random_password_archive(selection, parent / "mysql-random-derived.oci.tar")
+            source_hash = legacy._file_sha256(selection.archive)
+            assert source_hash == selection.archive_digest
+            process = legacy._authenticate(selection, parent)
+            process.require_bootable()
+            assert process.argv[-len(case.argv_suffix) :] == case.argv_suffix
         _save_json(
             parent,
             "case.json",
@@ -374,12 +598,14 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                 "memory_mib": case.memory_mib,
                 "name": name,
                 "user_override": case.user_override,
+                "test_only_random_password": case.test_only_random_password,
                 "vcpus": 1,
             },
         )
         _save_json(parent, "authenticated-process.json", process.to_dict())
-        launched = legacy._save(
-            parent, "run", legacy._cli(environment, *_run_arguments(case, selection, name), timeout=240)
+        launched = _save_service_result(
+            parent, "run", _case_cli(case, parent, environment, *_run_arguments(case, selection, name), timeout=240),
+            secret_safe=case.test_only_random_password,
         )
         _save_json(
             parent,
@@ -399,24 +625,29 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         binding = load_oci_run_binding(resolve_roots(environment), name)
         assert binding.record.name == name
         domain_uuid = binding.domain_uuid
-        _wait_ready_or_inactive(parent, environment, name, case.readiness)
+        if case.test_only_random_password:
+            _wait_mysql_final_ready(parent, environment, name)
+        else:
+            _wait_ready_or_inactive(parent, environment, name, case.readiness)
         state, observed_uuid = _domain_state(environment, name)
         assert state == "running" and observed_uuid == domain_uuid
         _assert_running_domain_has_no_interface(parent, environment, name, domain_uuid)
         before = legacy._root_proof(environment, name)
         _save_json(parent, "root-proof-before.json", before)
         assert before["domain"]["uuid"] == domain_uuid
-        version = legacy._save(
-            parent, "version", legacy._cli(environment, "exec", name, "--", *case.version_argv, timeout=60)
+        version = _save_service_result(
+            parent, "version",
+            _case_cli(case, parent, environment, "exec", name, "--", *case.version_argv, timeout=60),
+            secret_safe=case.test_only_random_password,
         )
         legacy._success(version)
         assert case.version_marker in version.stdout + version.stderr
         if case.user_override is not None:
-            loopback = legacy._save(
+            loopback = _save_service_result(
                 parent,
                 "guest-loopback-security",
-                legacy._cli(
-                    environment,
+                _case_cli(
+                    case, parent, environment,
                     "exec",
                     name,
                     "--",
@@ -425,14 +656,17 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                     _loopback_security_command(),
                     timeout=60,
                 ),
+                secret_safe=case.test_only_random_password,
             )
             legacy._success(loopback)
             try:
                 _assert_loopback_security(loopback.stdout)
             except AssertionError as exc:
                 loopback_security_error = exc
-        probe = legacy._save(
-            parent, "service-probe", legacy._cli(environment, "exec", name, "--", *case.probe_argv, timeout=60)
+        probe = _save_service_result(
+            parent, "service-probe",
+            _case_cli(case, parent, environment, "exec", name, "--", *case.probe_argv, timeout=60),
+            secret_safe=case.test_only_random_password,
         )
         probe_ok = probe.returncode == 0 and case.probe_marker in probe.stdout
         if case.user_override is not None:
@@ -451,23 +685,27 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                     "transport": "guest loopback-or-unix",
                 },
             )
-        root = legacy._save(
+        root = _save_service_result(
             parent,
             "root",
-            legacy._cli(
-                environment, "exec", name, "--", "/bin/sh", "-c", "stat -c '%d %i' /; cat /etc/os-release", timeout=60
+            _case_cli(
+                case, parent, environment, "exec", name, "--", "/bin/sh", "-c",
+                "stat -c '%d %i' /; cat /etc/os-release", timeout=60,
             ),
+            secret_safe=case.test_only_random_password,
         )
         legacy._success(root)
         lines = root.stdout.decode("utf-8").splitlines()
         device, inode = (int(value) for value in lines[0].split())
         assert any(line.startswith("ID=") for line in lines[1:])
-        denied = legacy._save(
+        denied = _save_service_result(
             parent,
             "pid1-refusal",
-            legacy._cli(
-                environment, "exec", name, "--", "/bin/sh", "-c", "LC_ALL=C cat /proc/1/root/etc/os-release", timeout=60
+            _case_cli(
+                case, parent, environment, "exec", name, "--", "/bin/sh", "-c",
+                "LC_ALL=C cat /proc/1/root/etc/os-release", timeout=60,
             ),
+            secret_safe=case.test_only_random_password,
         )
         assert denied.returncode != 0 and denied.stdout == b"" and b"Permission denied" in denied.stderr
         after = legacy._root_proof(environment, name)
@@ -481,23 +719,70 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             "guest loopback-only security receipt did not pass; service/root/PID1 evidence was retained"
         )
         assert probe_ok, "official image service probe did not pass; root/PID1 evidence was retained"
-        legacy._success(legacy._save(parent, "stop", legacy._cli(environment, "stop", name, timeout=90)))
-        legacy._success(legacy._save(parent, "rm", legacy._cli(environment, "rm", name, timeout=90)))
+        if case.test_only_random_password:
+            assert not _retain_redacted_console(parent, environment, name), "generated password appeared on console"
+            _assert_no_password_leak(parent)
+        stopped = _save_service_result(
+            parent, "stop", _case_cli(case, parent, environment, "stop", name, timeout=90),
+            secret_safe=case.test_only_random_password,
+        )
+        legacy._success(stopped)
+        removed = _save_service_result(
+            parent, "rm", _case_cli(case, parent, environment, "rm", name, timeout=90),
+            secret_safe=case.test_only_random_password,
+        )
+        legacy._success(removed)
         legacy._assert_domain_absent(environment, name, domain_uuid)
         assert not (parent / "state" / "runs" / name).exists()
+        if case.test_only_random_password:
+            remaining = {path.name for path in root_volume_directory.iterdir()} if root_volume_directory.is_dir() else set()
+            assert remaining == root_volume_before
         assert legacy._file_sha256(selection.archive) == source_hash == selection.archive_digest
+        disposed = True
         completed = True
     except BaseException as exc:
         primary_error = exc
         try:
-            _preserve_failed_owned_runtime(parent, environment, name, domain_uuid)
+            if case.test_only_random_password:
+                run_path = resolve_roots(environment).runs / name
+                cleanup_evidence_errors: list[str] = []
+                leak_detected = False
+                if run_path.exists():
+                    binding = load_oci_run_binding(resolve_roots(environment), name)
+                    assert binding.record.name == name
+                    if domain_uuid is None:
+                        domain_uuid = binding.domain_uuid
+                    assert binding.domain_uuid == domain_uuid
+                    state, observed_uuid = _domain_state(environment, name)
+                    assert observed_uuid == domain_uuid
+                    leak_detected, command_errors = _capture_then_dispose(
+                        parent, environment, name, state,
+                        lambda operation: _secret_safe_cli(parent, environment, operation, name, timeout=90),
+                    )
+                    cleanup_evidence_errors.extend(command_errors)
+                    legacy._assert_domain_absent(environment, name, domain_uuid)
+                    assert not run_path.exists()
+                remaining = (
+                    {path.name for path in root_volume_directory.iterdir()} if root_volume_directory.is_dir() else set()
+                )
+                assert remaining == root_volume_before
+                disposed = True
+                _assert_no_password_leak(parent)
+                assert not cleanup_evidence_errors, "console evidence capture failed before owned disposal"
+                assert not leak_detected, "generated password was detected and redacted before owned disposal"
+            else:
+                _preserve_failed_owned_runtime(parent, environment, name, domain_uuid)
         except BaseException as cleanup_exc:
-            exc.add_note(f"failure preservation also failed: {cleanup_exc!r}")
+            exc.add_note(f"owned failure handling also failed: {cleanup_exc!r}")
         raise
     finally:
         try:
             assert legacy._record_source_hashes(parent, source_hash, selection.archive) == source_hash
-            _save_json(parent, "completion.json", {"successful_owned_cleanup": completed})
+            assert legacy._file_sha256(original_selection.archive) == original_source_hash
+            _save_json(
+                parent, "completion.json",
+                {"application_completed": completed, "owned_resources_disposed": disposed},
+            )
         except BaseException as evidence_exc:
             if primary_error is None:
                 raise

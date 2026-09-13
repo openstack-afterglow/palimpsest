@@ -494,6 +494,22 @@ default `[mysql]` case untouched. It needs 2048 MiB/one vCPU sequentially and
 does not add initialization credentials or capabilities. A missing opt-in is a
 skip, not proof; retain failed runtime/source evidence.
 
+The test-only random-password follow-up is separately selected:
+
+```sh
+uv run pytest -q -s \
+  'tests/kvm/test_oci_docker_hub_services_live.py::test_official_service_default_process_compatibility[mysql_user_random_password]'
+```
+
+Set `PALIMPSEST_OCI_DOCKER_HUB_SERVICE_MYSQL_USER_RANDOM_PASSWORD_LIVE=1`
+and its matching `IMAGE`, `ARCHIVE_SHA256`, and `MANIFEST_SHA256` values, which
+pin the unchanged original archive. The test derives a no-secret config wrapper,
+generates the password only inside the guest, uses public `--user mysql`, and
+requires ordered initialization-complete then final-ready markers. Its socket
+ping proves liveness only. The newly owned run/root must be removed on either
+application success or failure; inability to prove exact cleanup fails the test.
+No existing retained failure may be removed.
+
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
 cold materialization and public run/exec/stop/rm without running the entire

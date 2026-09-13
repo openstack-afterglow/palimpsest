@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
+import json
+import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +43,7 @@ def test_matrix_pins_exact_images_resources_and_separate_redis_user() -> None:
         ("NGINX", "nginx:stable-alpine", 512, None),
         ("REDIS_USER", "redis:7-alpine", 512, "redis"),
         ("MYSQL_USER", "mysql:8.4", 2048, "mysql"),
+        ("MYSQL_USER_RANDOM_PASSWORD", "mysql:8.4", 2048, "mysql"),
     ]
 
 
@@ -82,6 +87,141 @@ def test_mysql_user_is_a_separate_no_injection_copy_of_the_default_case() -> Non
     )
     assert arguments[-2:] == ("--user", "mysql")
     assert "--env" not in arguments and "-e" not in arguments
+
+
+def test_random_password_derivation_contains_only_fixed_guest_generator_code(tmp_path: Path) -> None:
+    config = {"config": {"Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["mysqld"], "Env": ["PATH=/usr/bin"]}}
+    config_payload = services._json_bytes(config)
+    config_hex = hashlib.sha256(config_payload).hexdigest()
+    manifest = {"schemaVersion": 2, "config": {"digest": "sha256:" + config_hex, "size": len(config_payload)}}
+    manifest_payload = services._json_bytes(manifest)
+    manifest_hex = hashlib.sha256(manifest_payload).hexdigest()
+    payloads = {
+        "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+        "index.json": services._json_bytes({"manifests": [{"digest": "sha256:" + manifest_hex, "size": len(manifest_payload)}]}),
+        "blobs/sha256/" + config_hex: config_payload,
+        "blobs/sha256/" + manifest_hex: manifest_payload,
+    }
+    source = tmp_path / "source.tar"
+    with tarfile.open(source, "w") as archive:
+        for name, payload in payloads.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    original = source.read_bytes()
+    selected = services.legacy.DockerHubImageSelection(
+        source, services.legacy._file_sha256(source), "sha256:" + manifest_hex
+    )
+    derived = services._derived_mysql_random_password_archive(selected, tmp_path / "derived.tar")
+    assert source.read_bytes() == original
+    with tarfile.open(derived.archive) as archive:
+        index = json.load(archive.extractfile("index.json"))
+        derived_manifest = json.load(archive.extractfile("blobs/sha256/" + index["manifests"][0]["digest"][7:]))
+        derived_config = json.load(archive.extractfile("blobs/sha256/" + derived_manifest["config"]["digest"][7:]))
+    entrypoint = derived_config["config"]["Entrypoint"]
+    assert entrypoint[:2] == ["/usr/bin/bash", "-c"] and entrypoint[-1] == "palimpsest-mysql-random"
+    assert derived_config["config"]["Cmd"] == ["mysqld"]
+    assert "MYSQL_RANDOM_ROOT_PASSWORD" not in entrypoint[2]
+    assert "palimpsest-test-${secret_hex}" in entrypoint[2]
+    assert re.search(r"palimpsest-test-[0-9a-f]{64}", entrypoint[2]) is None
+
+
+def test_random_password_wrapper_generates_without_printing_and_unsets_intermediate() -> None:
+    validation = (
+        "[[ $MYSQL_ROOT_PASSWORD =~ ^palimpsest-test-[0-9a-f]{64}$ ]] && "
+        "[[ -z ${secret_hex+x} ]]"
+    )
+    command = services._MYSQL_RANDOM_WRAPPER.replace(
+        'exec /usr/local/bin/docker-entrypoint.sh "$@"', validation
+    )
+    completed = subprocess.run(["/bin/bash", "-c", command, "test", "mysqld"], capture_output=True, timeout=5)
+    assert completed.returncode == 0
+    assert completed.stdout == completed.stderr == b""
+
+
+def test_final_mysql_readiness_rejects_temporary_server_and_requires_ordered_final_server() -> None:
+    ready = b"ready for connections"
+    initialized = b"MySQL init process done"
+    assert not services._mysql_final_ready(ready)
+    assert not services._mysql_final_ready(ready + initialized)
+    assert services._mysql_final_ready(ready + initialized + ready)
+
+
+def test_secret_output_is_redacted_before_persistence_and_raises_constant_failure(tmp_path: Path) -> None:
+    secret = b"palimpsest-test-" + b"a" * 64
+    result = subprocess.CompletedProcess(["fixed"], 1, b"before " + secret + b" after", secret)
+    with pytest.raises(AssertionError, match="generated password appeared in command output"):
+        services._save_service_result(tmp_path, "leak", result, secret_safe=True)
+    assert secret not in (tmp_path / "leak.stdout").read_bytes()
+    assert secret not in (tmp_path / "leak.stderr").read_bytes()
+    assert b"[REDACTED]" in (tmp_path / "leak.stdout").read_bytes()
+
+
+def test_cleanup_secret_output_is_redacted_without_interrupting_caller(tmp_path: Path) -> None:
+    secret = b"palimpsest-test-" + b"b" * 64
+    result = subprocess.CompletedProcess(["stop"], 0, secret, b"")
+    saved, leaked, error = services._save_cleanup_result(tmp_path, "cleanup", result)
+    assert saved.returncode == 0 and leaked is True and error is None
+    assert secret not in (tmp_path / "cleanup.stdout").read_bytes()
+
+
+def test_cleanup_write_failure_does_not_prevent_following_rm(monkeypatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(services.legacy, "_save", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("full")))
+
+    def command(operation: str):
+        calls.append(operation)
+        return subprocess.CompletedProcess([operation], 0, b"", b"")
+
+    leaked, errors = services._run_disposal_commands(tmp_path, "owned", "running", command)
+    assert calls == ["stop", "rm"]
+    assert leaked is False and errors == ("OSError", "OSError")
+
+
+def test_cleanup_stop_command_failure_still_attempts_public_rm(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def command(operation: str):
+        calls.append(operation)
+        if operation == "stop":
+            raise AssertionError("constant sanitized timeout")
+        return subprocess.CompletedProcess([operation], 1, b"", b"still running")
+
+    leaked, errors = services._run_disposal_commands(tmp_path, "owned", "running", command)
+    assert calls == ["stop", "rm"]
+    assert leaked is False and errors == ("stop-AssertionError", "rm-AssertionError")
+
+
+def test_oversized_console_does_not_prevent_stop_and_rm(monkeypatch, tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    console = runs / "owned" / "io" / "console.log"
+    console.parent.mkdir(parents=True)
+    console.write_bytes(b"x" * (services.legacy._MAX_CONSOLE_BYTES + 1))
+    monkeypatch.setattr(services, "resolve_roots", lambda environment: SimpleNamespace(runs=runs))
+    calls: list[str] = []
+
+    def command(operation: str):
+        calls.append(operation)
+        return subprocess.CompletedProcess([operation], 0, b"", b"")
+
+    leaked, errors = services._capture_then_dispose(tmp_path, {}, "owned", "running", command)
+    assert calls == ["stop", "rm"]
+    assert leaked is False and errors == ("AssertionError",)
+
+
+def test_random_password_cleanup_is_flagged_and_missing_root_directory_is_an_empty_baseline() -> None:
+    diagnostic = next(case for case in services.CASES if case.key == "MYSQL_USER_RANDOM_PASSWORD")
+    assert diagnostic.test_only_random_password is True
+    source = PATH.read_text()
+    assert 'if case.test_only_random_password and root_volume_directory.is_dir()' in source
+    assert 'remaining == root_volume_before' in source
+    assert 'legacy._cli(environment, "failure-rm"' not in source
+    assert "_capture_then_dispose(" in source
+    assert 'lambda operation: _secret_safe_cli(parent, environment, operation, name' in source
+    assert '"application_completed": completed' in source
+    assert '"owned_resources_disposed": disposed' in source
+    assert 'stream.read(legacy._MAX_CONSOLE_BYTES + 1)' in source
+    assert 'cleanup_evidence_errors' in source
 
 
 def test_matrix_uses_public_cli_and_preserves_failed_runtime_without_rm_or_hypervisor_force() -> None:
