@@ -133,6 +133,29 @@ At `a6a1d84`, the root-volume test correction and fixed phase receipts passed
 server test outcomes. The GitHub development package also succeeded. These are
 focused test/package results, not a new native framework pass.
 
+The subsequent TensorFlow-only native attempt at `a6a1d84` failed at
+`framework-exec-command` with return code 1, as confirmed by its bounded
+`ml-phase.json` receipt. Public detached run, provenance, root-volume checks,
+the initial authenticated root proof and CPU-only domain checks completed
+before that phase. Framework output, the independent app-root comparison,
+PID 1 refusal and normal stop/remove did not complete. An exit code alone
+does not distinguish a guest Python error from host exec/control failure.
+
+Postflight preserved the explicitly pinned 17 inactive foreign/baseline
+domains, 16 original archive pins and zero-active state, with no additional
+domain remaining. The wrapper nevertheless rejected resource attribution
+with `RuntimeError`, so the new runtime's ledger/domain ownership relation
+was not established. This is not cleanup success, nor evidence that failure preceded VM creation;
+the phase receipt establishes later progress. No manual stop/remove or
+adoption followed this accounting failure, and the remaining evidence is
+preserved for bounded diagnosis.
+
+At `5b94a728`, the coordinator, monitor IPC, monitor launch and run-adapter
+selection passed 228 checks locally with six Linux-only skips, then exactly
+234 checks with no other outcomes on the pinned Linux checkout. Its GitHub
+development package succeeded. This qualifies the selected diagnostic-code
+regressions, not a fresh PyTorch/TensorFlow native execution or GPU support.
+
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with
 single-thread framework settings, checks the exact result and sum, CPU device,

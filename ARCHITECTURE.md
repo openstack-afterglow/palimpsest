@@ -66,6 +66,16 @@ transaction의 volume ID에 묶인 두 파일과 정확한 생성/제거 집합�
 이는 테스트 계약 수정이며 CPU tensor·인증 root/PID1 검사 통과 또는 production
 저장 구조 변경이 아니다. 과거 실패는 유지하고 수정 후 실기를 별도로 기록한다.
 
+`a6a1d84`의 후속 TensorFlow 실기는 고정 phase receipt 기준
+`framework-exec-command`에서 rc1로 실패했다. 공개 detached run·provenance·
+root volume·초기 인증 root·CPU-only domain 검사는 앞서 완료했지만 CPU 연산,
+독립 앱 root 비교·PID1 거부·정상 stop/rm 성공은 아니다. 사후17개 baseline
+domain·16개 archive·zero-active 보존은 통과했고 추가 domain은 남지 않았으나
+wrapper attribution은 RuntimeError로 실패했다. 따라서 부팅 전 실패나
+정리 성공을 추론하지 않는다. `5b94a728`의 coordinator 관련 선별 검사는
+로컬228건과 Linux 전용6skip 뒤 정확한 Linux checkout에서234건 모두 통과했고
+GitHub 패키지도 성공했다. 새 ML 또는 GPU 실기 성공과 구분한다.
+
 `de304ea`의 익명 registry intake는 같은 Linux checkout 선별76건과 공개 `oci pull`을 통한 GHCR 비특권 NGINX·Quay Prometheus BusyBox 취득/OCI CAS 검증을 통과했다. 새 archive의 부팅 성공은 아니다. 직전 동일 guest/runtime `cfb8015`의 별도 VM 재검증은 Redis user override와 비특권 NGINX가 통과했고 기본 PostgreSQL·Redis·NGINX는 권한 거부와 함께 실패했다. 실패는 inactive로 보존하고 성공 자원은 정상 제거했으며 guest 권한 정책은 바꾸지 않았다. 새 [registry 검증 기록](docs/registry-intake.md#verified-checkpoint)은 취득 성공과 VM 호환성 결과를 분리한다.
 
 `93c1eb0`의 self-FD 변경은 같은 서버 SHA 선별481건·packaged-binary34건과 stage1 43boots/44QEMU(121.28초), UID0/101 stdio V3(16.16/16.11초), 기존 v2 빌드 이미지 cold 공개 lifecycle(22.56초)을 통과했다. MySQL 일회용 진단은 최종 초기화·서버 준비, 실제 `/`와 인증 root 일치, PID1 거부까지 통과했지만 passwordless ping의 exit0/인증 거부에 alive 문자열을 추가 요구한 테스트가 실패했다(116.21초). 새 VM/root는 폐기했고 기존12개 domain/archive와 zero-active를 보존했다. 후속은 일회용 테스트의 도달성 판정만 공식 ping exit-status 계약에 맞추며 인증 SQL 성공이나 기본 이미지 성공으로 확대하지 않는다. [상세 결과와 중간 실패](docs/oci-linux-process.md#self-fd-verification-checkpoint--93c1eb0)를 구분한다.
@@ -498,7 +508,7 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
   "schema_version": 1,
   "source_sha256": "6656dab1406f311dc5f8af423878e7846fda5922bc4a2513da0933a11d5f50ff",
   "reviewed_at": "2026-09-13T17:57:39Z",
-  "summary": "Reviewed coordinator response v2 fixed failure stage/IPC category propagation, strict success/refusal envelopes and safe CLI suffix. Original uncertainty guidance, endpoint journal reauthentication, deadlines/no-kill/ownership/guest policy remain. a6a1d84 ML proof focused105 passed local and Linux/package; coordinator focused228 passed locally with6 Linux-only skips pending server. PT historical category irrecoverable; new diagnostic codes are not a timeout fix."
+  "summary": "Reviewed unchanged ML phase/proof ordering, root-volume two-file contract and coordinator fixed response codes. Documentation-only checkpoint: a6a1d84 focused105 passed locally and Linux; TF native framework-exec-command failed rc1 after initial root/domain checks with attribution failure, not cleanup/CPU/PID1 success. 5b94a728 coordinator focused228 plus6 Linux-only skips locally and234 passed on Linux; packages succeeded. No further architecture change from this documentation-only checkpoint; historical PT error remains unrecoverable."
 }
 ```
 <!-- architecture-review:end -->
