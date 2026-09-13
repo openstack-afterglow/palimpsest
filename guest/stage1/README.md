@@ -163,7 +163,12 @@ The marker is diagnostic console output, not authenticated READY/root proof,
 and does not imply rollback or authorize workload execution. Success emits
 no new marker. Following the user's narrow compatibility approvals, the
 root-owned empty `proc` and `sys` targets accept either exact `0755` or `0555`.
-`dev` and generic directory checks remain exact `0755`. No permissions are
+`dev` and generic directory checks remain exact `0755`. Following the separate
+populated-device-directory approval, only the `dev` transition target may be
+nonempty. Its contents are never opened, copied or admitted as workload devices:
+the verified initramfs devtmpfs is moved over it before root transition completes,
+and each workload receives its own verified six-device/two-alias tmpfs. `proc`,
+`sys` and generic emptiness requirements remain unchanged. No permissions are
 normalized and no source image is changed. The ordered nofollow/type/owner/
 mode/emptiness checks retain the initial device/inode/mode/UID/GID snapshot;
 immediately before each mount move, both retained and reopened target FDs

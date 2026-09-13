@@ -58,6 +58,31 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ## Results
 
+### Approved populated `/dev` follow-up
+
+The user approved covering an existing populated image `/dev`, without admitting
+its entries. Only the DEV transition target drops its emptiness requirement;
+root ownership, exact 0755, no-follow directory opening, OverlayFS identity and
+the pre-move retained/reopened identity check remain. Proc/sys and generic
+emptiness checks stay in place. No directory-entry scan, image mutation or
+workload capability is added. The original content remains beneath the trusted
+devtmpfs mount; children receive the existing private tmpfs with six devices
+and two stdio aliases. This is an explicit input-contract change, not a pass
+for the prior MySQL failure.
+
+Verification requires both policy tests and a separate opt-in real-mount
+diagnostic: populated entries and nested mount sentinels must be hidden,
+covered-directory descriptors must not survive to the tested child, and the
+child device entries must match the existing allowlist. The small diagnostic
+does not replace packaged stage-1/root/PID1 checks or original MySQL testing.
+
+The subsequent documentation commit `16ca781` reached package verification,
+build, checksums and SHA-tag creation, but release creation returned GitHub
+HTTP 502 in [run 34749473630](https://github.com/openstack-afterglow/palimpsest/actions/runs/34749473630).
+This is a publication failure, not a compiler or native-test failure. The
+existing tag is not overwritten; a new implementation commit has its own
+publication attempt.
+
 ### Approved MySQL root-transition follow-up — 2026-09-13
 
 The production behavior change in implementation commit

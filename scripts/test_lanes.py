@@ -56,6 +56,7 @@ PORTABLE_FILES = {
         oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
         main_console_sink main_console_sink_callsites main_output_pipes main_output_terminate
         main_console_lifecycle main_control_deadline workload_dev_aliases workload_loopback
+        oci_dev_cover_live_contract
     """),
     "oci-monitor": _units("""
         oci_lifecycle_transport oci_monitor oci_monitor_control oci_monitor_handoff
@@ -87,7 +88,10 @@ SPECIAL_FILES = {
         "tests/kvm/test_oci_stdio_cli_live.py",
         "tests/kvm/test_oci_console_ofd_live.py",
     ),
-    "guest-kvm": ("tests/kvm/test_oci_guest_stage1_live.py",),
+    "guest-kvm": (
+        "tests/kvm/test_oci_guest_stage1_live.py",
+        "tests/kvm/test_oci_dev_cover_live.py",
+    ),
     "guest-binary": ("tests/integration/test_oci_guest_stage1_binary.py",),
     "filesystem": (),
     "gate1": ("tests/integration/test_buildkit_named_oci_context.py",),
@@ -96,7 +100,7 @@ SPECIAL_FILES = {
 }
 SPECIAL_NOTES = {
     "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec engine/public CLI proofs require PALIMPSEST_OCI_EXEC_LIVE=1 / PALIMPSEST_OCI_EXEC_CLI_LIVE=1 respectively and their image. The stdio ownership diagnostic separately requires PALIMPSEST_OCI_STDIO_CLI_LIVE=1 and runs UID 0/101 nodes; it is not compatibility qualification. The PID 1 console-OFD diagnostic separately requires PALIMPSEST_OCI_CONSOLE_OFD_LIVE=1 and does not change the packaged guest. The separate durable-record and retained-root CLI proofs require PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1 / PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1 and the existing exec image. Docker Hub proofs independently require PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,REDIS_USER,NGINX}_LIVE=1 plus that selection's exact local IMAGE, ARCHIVE_SHA256, and MANIFEST_SHA256 pins; REDIS_USER is the separate explicit --user redis proof and REDIS remains the unchanged default-process compatibility proof. Standalone real-packer component tests require PALIMPSEST_OCI_PACK_LIVE=1 plus an absolute packer path and SHA-256 pin. Runtime proofs require explicit host BOOT config; offline record inspection does not. Missing opt-ins skip their proof, not qualify it.",
-    "guest-kvm": "Explicit KVM guest proof; requires PALIMPSEST_REQUIRE_STAGE1_KVM=1 and proof fixtures.",
+    "guest-kvm": "Explicit KVM guest proof; requires PALIMPSEST_REQUIRE_STAGE1_KVM=1 and proof fixtures. The standalone populated-image /dev cover proof additionally requires PALIMPSEST_OCI_DEV_COVER_LIVE=1.",
     "guest-binary": "Runs guest ELF under Docker when its existing prerequisites permit it.",
     "filesystem": "Privileged Linux filesystem proof; PALIMPSEST_REQUIRE_OCI_FS=1 makes prerequisites mandatory.",
     "gate1": "BuildKit build gate; set PALIMPSEST_BUILDKIT_E2E=1 and configure its builder explicitly.",

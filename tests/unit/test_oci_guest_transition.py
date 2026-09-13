@@ -25,7 +25,7 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
     enum transition_target label = TRANSITION_TARGET_PROC;
     const char *target = "@FIXTURE@";
     enum safe_dir_reason reason = SAFE_DIR_REASON_UNKNOWN;
-    struct stat_local before, after, initial_identity;
+    struct stat_local before, after, child_before, child_after, initial_identity;
     int fd = -1;
     i64 child;
     if (stack[0] != 3) exit_now(89);
@@ -40,11 +40,17 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
         child = sc3(SYS_open, (i64)"@FIXTURE@/target", O_WRONLY | O_CREAT | O_EXCL, 0755);
         if (child < 0 || sc1(SYS_close, child) != 0) exit_now(91);
         target = "@FIXTURE@/target";
-    } else if (text_equal(kind, "nonempty") || text_equal(kind, "owner-nonempty")) {
+    } else if (text_equal(kind, "dev-populated-no-entry-open")) {
+        if (sc2(SYS_symlink, (i64)"missing-target", (i64)"@FIXTURE@/child") != 0 ||
+            sc2(SYS_lstat, (i64)"@FIXTURE@/child", (i64)&child_before) != 0) exit_now(90);
+    } else if (text_equal(kind, "nonempty") || text_equal(kind, "owner-nonempty") ||
+               text_equal(kind, "dev-populated") || text_equal(kind, "dev-populated-ready")) {
         child = sc3(SYS_open, (i64)"@FIXTURE@/child", O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (child < 0 || sc1(SYS_close, child) != 0) exit_now(91);
+        if (sc2(SYS_lstat, (i64)"@FIXTURE@/child", (i64)&child_before) != 0) exit_now(92);
     } else if (text_equal(kind, "ready-replaced")) {
-        if (sc2(SYS_mkdir, (i64)"@FIXTURE@/target", 0555) != 0) exit_now(90);
+        if (sc2(SYS_mkdir, (i64)"@FIXTURE@/target",
+                label == TRANSITION_TARGET_DEV ? 0755 : 0555) != 0) exit_now(90);
         target = "@FIXTURE@/target";
     }
     if (sc2(SYS_lstat, (i64)target, (i64)&before) != 0) exit_now(92);
@@ -54,7 +60,7 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
         exit_now(0);
     }
     if (transition_target_policy_checked(target, label, 1, &fd, &initial_identity, &reason)) {
-        if (text_equal(kind, "ready")) {
+        if (text_equal(kind, "ready") || text_equal(kind, "dev-populated-ready")) {
             if (!transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(96);
         } else if (text_equal(kind, "ready-to-0555")) {
             if (sc2(SYS_chmod, (i64)target, 0555) != 0 ||
@@ -68,11 +74,20 @@ static __attribute__((noreturn, used)) void harness_main(u64 *stack) {
             if (sc2(SYS_rename, (i64)target, (i64)"@FIXTURE@/old") != 0 ||
                 sc2(SYS_mkdir, (i64)target, initial_identity.mode & 07777) != 0 ||
                 transition_target_ready_checked(target, label, fd, &initial_identity, 0x01021994)) exit_now(96);
-        } else if (!text_equal(kind, "accepted")) exit_now(93);
+        } else if (!text_equal(kind, "accepted") && !text_equal(kind, "dev-populated") &&
+                   !text_equal(kind, "dev-populated-no-entry-open")) exit_now(93);
         if (fd < 0 || sc1(SYS_close, fd) != 0) exit_now(93);
-        if ((text_equal(kind, "accepted") || text_equal(kind, "ready")) &&
+        if ((text_equal(kind, "accepted") || text_equal(kind, "ready") ||
+             text_equal(kind, "dev-populated") || text_equal(kind, "dev-populated-ready") ||
+             text_equal(kind, "dev-populated-no-entry-open")) &&
             (sc2(SYS_lstat, (i64)target, (i64)&after) != 0 ||
              before.mode != after.mode || before.uid != after.uid || before.gid != after.gid)) exit_now(94);
+        if ((text_equal(kind, "dev-populated") || text_equal(kind, "dev-populated-ready") ||
+             text_equal(kind, "dev-populated-no-entry-open")) &&
+            (sc2(SYS_lstat, (i64)"@FIXTURE@/child", (i64)&child_after) != 0 ||
+             child_before.dev != child_after.dev || child_before.ino != child_after.ino ||
+             child_before.mode != child_after.mode || child_before.uid != child_after.uid ||
+             child_before.gid != child_after.gid || child_before.size != child_after.size)) exit_now(94);
         exit_now(0);
     }
     transition_target_rejected(label, reason);
@@ -199,6 +214,9 @@ def transition_harness(tmp_path_factory):
         pytest.param("symlink", "sys", "0755", 0, "open", id="sys-nofollow-symlink"),
         pytest.param("owner", "sys", "0555", 12345, "owner", id="sys-wrong-owner"),
         pytest.param("regular", "sys", "0755", 0, "open", id="sys-special-regular-file"),
+        pytest.param("symlink", "dev", "0755", 0, "open", id="dev-nofollow-symlink"),
+        pytest.param("owner", "dev", "0755", 12345, "owner", id="dev-wrong-owner"),
+        pytest.param("regular", "dev", "0755", 0, "open", id="dev-special-regular-file"),
     ],
 )
 def test_real_c_transition_target_rejections_are_exact_and_do_not_normalize(
@@ -227,8 +245,20 @@ def test_real_c_transition_target_accepts_only_approved_modes(transition_harness
     assert result.stderr == b""
 
 
-@pytest.mark.parametrize("target", ["proc", "sys"])
-@pytest.mark.parametrize("mode", ["0555", "0755"])
+@pytest.mark.parametrize("kind", ["dev-populated", "dev-populated-ready", "dev-populated-no-entry-open"])
+def test_real_c_dev_transition_accepts_populated_directory_without_mutating_entries(
+    transition_harness, kind
+):
+    result = transition_harness(kind, target="dev", fixture_mode="0755")
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize(
+    ("target", "mode"),
+    [("proc", "0555"), ("proc", "0755"), ("sys", "0555"), ("sys", "0755"), ("dev", "0755")],
+)
 def test_real_c_transition_target_readiness_accepts_unchanged_approved_mode(
     transition_harness, target, mode
 ):
@@ -252,12 +282,19 @@ def test_real_c_transition_target_readiness_rejects_mode_identity_change(
     assert result.stderr == b""
 
 
+def test_real_c_dev_transition_readiness_rejects_mode_drift(transition_harness):
+    result = transition_harness("ready-to-0555", target="dev", fixture_mode="0755")
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
 def test_real_c_generic_safe_dir_still_rejects_0555(transition_harness):
     result = transition_harness("generic-mode", target="proc", fixture_mode="0555")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
 
 
-@pytest.mark.parametrize("target", ["proc", "sys"])
+@pytest.mark.parametrize("target", ["proc", "sys", "dev"])
 @pytest.mark.parametrize("kind", ["ready-wrong-fs", "ready-replaced"])
 def test_real_c_transition_target_readiness_rejects_identity_controls(
     transition_harness, target, kind
@@ -268,7 +305,7 @@ def test_real_c_transition_target_readiness_rejects_identity_controls(
     assert result.stderr == b""
 
 
-@pytest.mark.parametrize("target", ["proc", "sys"])
+@pytest.mark.parametrize("target", ["proc", "sys", "dev"])
 @pytest.mark.parametrize("mode", ["01755", "02755", "04755", "0775"])
 def test_real_c_transition_target_rejects_other_modes(transition_harness, target, mode):
     result = transition_harness("mode", target=target, fixture_mode=mode)

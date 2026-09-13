@@ -448,12 +448,36 @@ The approved proc/sys `0555` exceptions use the same production policy in
 the real C fixture module. It separately checks acceptance, pre-move readiness,
 unchanged metadata and initial-identity retention across `0755`/`0555` changes.
 Generic directory checks and `dev` still reject `0555`; wrong owner,
-nonempty/nofollow/type, special bits, replaced inode and filesystem identity
+nonempty proc/sys, nofollow/type, special bits, replaced inode and filesystem identity
 remain negative controls. The internal readiness checker uses tmpfs magic in
 the restricted fixture only; the runtime wrapper fixes OverlayFS magic.
+The separately approved DEV-only populated target is covered, not adopted:
+test unchanged contents/readiness and continued DEV owner/mode/identity refusal,
+then separately exercise real mount coverage and child-private devices in the
+opt-in native diagnostic (a defined test, not yet an executed result).
 Retain the existing native guest matrix and unchanged original-image runs
 as separate real mount/workload evidence. A later Redis entrypoint failure
 must not be hidden by changing its user, command, image or privileges.
+
+The populated-device component diagnostic is independently selectable:
+
+```sh
+PALIMPSEST_OCI_DEV_COVER_LIVE=1 uv run pytest -q -s \
+  tests/kvm/test_oci_dev_cover_live.py
+```
+
+It requires the qualified `PALIMPSEST_KVM_KERNEL` and
+`PALIMPSEST_KVM_KERNEL_CONFIG`, Linux KVM/QEMU, and the already-local pinned
+GCC container. Two sequential 128 MiB/one-vCPU/no-network boots use a separate
+test PID1: positive mount coverage and a pre-move mode-drift rejection.
+Each boot has a 20-second observation budget and 1 MiB console limit, followed
+by bounded QEMU process-group cleanup. Compilation has a 60-second host budget.
+The fixture explicitly uses tmpfs, not the production OverlayFS root. It
+checks retained image-FD closure, trusted filesystem identity across the move,
+and private child device entries with the parent mount unchanged. It does not
+execute the packaged ELF, OCI application, credential drop, or PID1 protection
+proof; run the existing stage-1 matrix and service case separately. Temporary
+receipts and consoles remain on failure; opt-out skips are not qualification.
 
 After changes to these paths, run the separate public exec CLI native file
 below with the existing immutable Palimpsest-built image. This exercises real
