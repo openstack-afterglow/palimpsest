@@ -60,6 +60,52 @@ force-destroy as fallback, or remove failure evidence to make the next case pass
 
 ### Approved MySQL root-transition follow-up — 2026-09-13
 
+The production behavior change in implementation commit
+`71704b2de21cdc97295f56c8ef576a57a68a3a9d` is limited to the compile-time
+alternate-mode selection in the guest.
+Packaged ELF SHA-256 is
+`f7dab6baa2996bc83a5b5f0c9f0de10263174f3f4ed931cf2034b501e8fb504b`;
+source-bundle digest is
+`aef5b477b1395170b9f139f978ac1a4cf48ee29d15bed437f10d261700a90468`.
+Pinned GCC, build recipe and seal recipe are unchanged. The selected
+provenance, exact-mode-bit and two-build reproducibility checks passed
+three tests (4.71 seconds).
+Real-C transition checks passed 36 (8.84 seconds). The initial red run also
+exposed three fixture setup errors when creating children inside 0555;
+those controls now use 0755 to reach their intended nonempty/type checks.
+Local related/ELF checks passed 343 with one macOS-only Linux ABI skip
+(26.29 seconds), after seven socket tests initially failed under the local
+sandbox's bind restriction and were rerun with socket access. The exact
+server SHA passed the combined selection, including C, Linux ABI, ELF and
+architecture checks: 393 tests (61.49 seconds). Native evidence is separate.
+
+The same SHA's stage-1 matrix passed 43 boots/44 QEMU (122.74 seconds).
+Original MySQL still failed (119.94 seconds), but its retained console now
+reports `target=dev; check=nonempty`, not the earlier sys mode rejection.
+This demonstrates advancement to the next ordered target check, not a completed
+root transition, workload start, or MySQL socket response. A read-only scan of
+the pinned archive found `/dev` plus ten children in layer zero: nine character
+nodes (`console`, `full`, `null`, `ptmx`, `random`, `tty`, `tty0`, `urandom`,
+`zero`) and FIFO `initctl`; later layers have no dev entries. The current
+empty-directory requirement is unchanged. These source metadata observations
+do not authorize exposing image device nodes or clearing them automatically.
+Any handling of populated `/dev` requires a separately reviewed input/mount
+contract that preserves the workload's private device boundary.
+
+Evidence is `/tmp/palimpsest-sys-native-nobdpz_t`; MySQL runtime
+`/tmp/p-hub-svc-my-2e2d2e42` remains, while its domain is absent. Wrapper
+SHA-256 is `65d9f3845cdbffdf4a1d48b13550f6c29e9c53e4804abeb9e603ad465c791212`.
+The wrapper correctly returned 1 with `verification_passed=false`; all
+initial/between/final preservation checks passed for ten inactive domains,
+twelve unchanged archives and zero active VM/QEMU. MySQL private journal
+`/tmp/palimpsest-sys-journal-mysql-4k1y1_bf` validated four records/two
+invocations/928 bytes. No failed runtime or historical source was deleted.
+
+The [GitHub package run](https://github.com/openstack-afterglow/palimpsest/actions/runs/34749221077)
+ended with `startup_failure`, zero jobs and no check-run diagnostic at inspection.
+The cause is not established; this commit has no demonstrated new GitHub
+package publication despite successful server tests and stage-1 proof.
+
 The user approved exact `0555` as an additional mode for the root-owned,
 empty `/sys` transition target. This is the same narrow input allowance as
 `/proc`; `/dev` and generic directory checks remain unchanged. No chmod,
