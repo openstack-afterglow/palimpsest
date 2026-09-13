@@ -104,6 +104,15 @@ def _launch_local_oci(roots, request, host_config, interrupted):
     try:
         with first_party_boot(config, roots) as source_boot:
             with reserve_new_run(roots, request.name, request.dispatch_key) as reservation:
+                command_authority = (
+                    {
+                        "command_override": request.command_override,
+                        "source_cas": selected.source_cas,
+                        "config_snapshot": selected.config_snapshot,
+                    }
+                    if request.command_override is not None
+                    else {}
+                )
                 prepared = prepare_oci_root_run(
                     reservation,
                     selected.receipt,
@@ -112,6 +121,7 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                     retained_volume_id=request.root_volume_id,
                     retention_policy=request.root_retention,
                     user_override=request.user_override,
+                    **command_authority,
                 )
             publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
             boot = load_oci_boot_exports(roots, request.name)

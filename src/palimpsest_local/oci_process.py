@@ -178,6 +178,11 @@ class OCIProcessSpec:
             raise ArtifactValidationError("OCI process user override is invalid")
         return OCIProcessSpec(self.argv, self.environment, self.cwd, user, self.stop_signal)
 
+    def with_command(self, entrypoint: tuple[str, ...], command: tuple[str, ...]) -> OCIProcessSpec:
+        if not isinstance(entrypoint, tuple) or not isinstance(command, tuple) or not command:
+            raise ArtifactValidationError("OCI process command override is invalid")
+        return OCIProcessSpec((*entrypoint, *command), self.environment, self.cwd, self.user, self.stop_signal)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "argv": list(self.argv),
@@ -256,6 +261,24 @@ class OCIProcessSpec:
         if process.to_dict() != dict(value):
             raise ArtifactValidationError("image process contract is not canonical")
         return process
+
+
+def image_process_vectors(value: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Strictly recover the Docker Entrypoint/Cmd boundary from verified config JSON."""
+    if not isinstance(value, Mapping):
+        raise ArtifactValidationError("image config.config must be an object")
+    vectors = []
+    for field_name in ("Entrypoint", "Cmd"):
+        raw = value.get(field_name)
+        if raw is None:
+            vectors.append(())
+            continue
+        if not isinstance(raw, list):
+            raise ArtifactValidationError(f"image process {field_name} must be an array or null")
+        vectors.append(
+            tuple(_plain_string(item, f"image process {field_name}[{index}]") for index, item in enumerate(raw))
+        )
+    return vectors[0], vectors[1]
 
 
 def _account_number(value: str, field_name: str) -> int:

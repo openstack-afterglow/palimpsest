@@ -16,7 +16,7 @@ from palimpsest_local import (
     state,
 )
 from palimpsest_local.errors import StateError
-from palimpsest_local.oci_process import OCIUserSpec
+from palimpsest_local.oci_process import MAX_PROCESS_BYTES, OCIUserSpec
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.runtime_types import (
     CapabilityCheck,
@@ -117,6 +117,32 @@ def test_public_local_run_accepts_redis_user_as_separate_compatibility_mode(tmp_
 
     assert cli.main(["run", str(source), "--name", "redis", "--user", "redis", "-d"]) == 0
     assert seen[0].user_override == OCIUserSpec("redis", None)
+
+
+def test_public_local_run_accepts_literal_command_after_separator(tmp_path, monkeypatch):
+    source = tmp_path / "ml.oci.tar"
+    source.touch()
+    seen = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **_kwargs: (
+            seen.append(request) or SimpleNamespace(record=SimpleNamespace(name="ml"), terminal=None, session=None)
+        ),
+    )
+    assert cli.main(["run", str(source), "--name", "ml", "-d", "--", "python", "-x", "--", "literal"]) == 0
+    assert seen[0].command_override == ("python", "-x", "--", "literal")
+
+
+def test_public_run_rejects_empty_or_cloud_command_override(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "ml.oci.tar"
+    source.touch()
+    assert cli.main(["run", str(source), "--name", "ml", "--"]) == 1
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *args, **kwargs: pytest.fail("cloud resolution entered"))
+    assert cli.main(["run", "cloud:latest", "--name", "ml", "--", "python"]) == 1
+    assert cli.main(["run", str(source), "--name", "ml", "--", "bad\0arg"]) == 1
+    assert cli.main(["run", str(source), "--name", "ml", "--", "x" * MAX_PROCESS_BYTES]) == 1
+    assert "command override" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["1000", "1000:1001", "redis:staff"])

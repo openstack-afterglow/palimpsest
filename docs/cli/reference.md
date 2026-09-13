@@ -801,7 +801,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle
+usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -819,6 +819,8 @@ usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpu
 | `--user` | string | `None` | run a local OCI image as USER[:GROUP] |
 | `--root-retention` | one of: `delete`, `retain` | `None` | OCI writable-root removal policy (default: delete) |
 | `--root-volume` | string | `None` | reuse an explicitly retained OCI writable-root UUID |
+
+For a local OCI-root image, a literal `--` followed by a nonempty command replaces the image Cmd while preserving its Entrypoint. The suffix is literal exec argv, not shell syntax.
 
 ## `palimpsest compose`
 

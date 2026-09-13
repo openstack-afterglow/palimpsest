@@ -7,9 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import ArtifactValidationError
+from .oci_image import strict_json_object
 from .oci_materializer import OCIImageMaterializationReceipt
-from .oci_process import OCIProcessSpec, OCIUserSpec
+from .oci_process import OCIProcessSpec, OCIUserSpec, image_process_vectors
 from .oci_provenance import canonical_json_bytes
+from .oci_source import SourceCAS, SourceSnapshot
 from .oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
@@ -21,6 +23,7 @@ from .oci_store import (
 
 OCI_ROOT_BOOT_PLAN_SCHEMA = "palimpsest.oci-root-boot-plan.v2"
 OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA = "palimpsest.oci-root-boot-plan.v3"
+OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA = "palimpsest.oci-root-boot-plan.v4"
 OCI_ROOT_LOWER_ROLE = "root-lower"
 
 
@@ -32,6 +35,9 @@ class OCIBootPlanIntent:
     run_name: str
     materialization: OCIImageMaterializationReceipt
     user_override: OCIUserSpec | None = None
+    command_override: tuple[str, ...] | None = None
+    source_cas: SourceCAS | None = None
+    config_snapshot: SourceSnapshot | None = None
 
     def __post_init__(self) -> None:
         ArtifactLeaseOwner(self.run_id, self.run_name, OCI_ROOT_LOWER_ROLE)
@@ -43,6 +49,16 @@ class OCIBootPlanIntent:
             raise OCIStoreError("oci-boot-plan", "OCI image process is not bootable") from None
         if self.user_override is not None and not isinstance(self.user_override, OCIUserSpec):
             raise OCIStoreError("oci-boot-plan", "OCI process user override is invalid")
+        if self.command_override is not None:
+            if not isinstance(self.command_override, tuple) or not self.command_override:
+                raise OCIStoreError("oci-boot-plan", "OCI process command override is invalid")
+            if not isinstance(self.source_cas, SourceCAS) or not isinstance(self.config_snapshot, SourceSnapshot):
+                raise OCIStoreError("oci-boot-plan", "OCI command override config authority is invalid")
+            if self.config_snapshot.descriptor != self.materialization.config_descriptor:
+                raise OCIStoreError("oci-boot-plan", "OCI command override config descriptor is invalid")
+            # Resolve and validate the complete effective process before any
+            # lease or writable-root state can be acquired by callers.
+            self.process.require_bootable()
 
     @property
     def owner(self) -> ArtifactLeaseOwner:
@@ -108,7 +124,24 @@ class OCIBootPlanIntent:
     @property
     def process(self) -> OCIProcessSpec:
         image_process = self.materialization.process
-        return image_process if self.user_override is None else image_process.with_user(self.user_override)
+        process = image_process
+        if self.command_override is not None:
+            entrypoint, _command = self._image_vectors()
+            process = process.with_command(entrypoint, self.command_override)
+        return process if self.user_override is None else process.with_user(self.user_override)
+
+    def _image_vectors(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        if self.source_cas is None or self.config_snapshot is None:
+            raise OCIStoreError("oci-boot-plan", "OCI command override config authority is invalid")
+        try:
+            document = strict_json_object(self.source_cas.read_metadata(self.config_snapshot), "OCI image config")
+            config = document.get("config")
+            entrypoint, command = image_process_vectors(config)
+            if OCIProcessSpec.from_config(config) != self.materialization.process:
+                raise ArtifactValidationError("process mismatch")
+            return entrypoint, command
+        except ArtifactValidationError:
+            raise OCIStoreError("oci-boot-plan", "OCI command override config is invalid") from None
 
     def to_dict(self) -> dict[str, Any]:
         lower_graph = self.lower_graph_dict()
@@ -132,6 +165,16 @@ class OCIBootPlanIntent:
             plan["process_provenance"] = {
                 "image_process": self.materialization.process.to_dict(),
                 "user_override": self.user_override.to_dict(),
+            }
+        if self.command_override is not None:
+            entrypoint, command = self._image_vectors()
+            plan["schema"] = OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA
+            plan["process_provenance"] = {
+                "command_override": list(self.command_override),
+                "image_command": list(command),
+                "image_entrypoint": list(entrypoint),
+                "image_process": self.materialization.process.to_dict(),
+                "user_override": None if self.user_override is None else self.user_override.to_dict(),
             }
         return plan
 
@@ -182,11 +225,16 @@ def prepare_oci_boot_plan(
     run_name: str,
     store: OCIStore,
     user_override: OCIUserSpec | None = None,
+    command_override: tuple[str, ...] | None = None,
+    source_cas: SourceCAS | None = None,
+    config_snapshot: SourceSnapshot | None = None,
 ) -> PreparedOCIBootPlan:
     """Create or crash-recover the deterministic lower reservation for a run."""
     if not isinstance(store, OCIStore):
         raise OCIStoreError("oci-boot-plan", "boot-plan store is invalid")
-    intent = OCIBootPlanIntent(run_id, run_name, materialization, user_override)
+    intent = OCIBootPlanIntent(
+        run_id, run_name, materialization, user_override, command_override, source_cas, config_snapshot
+    )
     store.validate_receipt_occurrences(intent.receipts, intent.occurrences)
     lower_leases = store.acquire_lease_set(
         intent.receipts,
@@ -216,6 +264,7 @@ def release_oci_boot_plan(prepared: PreparedOCIBootPlan, store: OCIStore) -> Non
 __all__ = [
     "OCI_ROOT_BOOT_PLAN_SCHEMA",
     "OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA",
+    "OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA",
     "OCI_ROOT_LOWER_ROLE",
     "OCIBootPlanIntent",
     "PreparedOCIBootPlan",

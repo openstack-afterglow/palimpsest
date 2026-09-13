@@ -279,7 +279,7 @@ def render() -> str:
                 help_note,
                 "",
                 "```text",
-                _format_usage(command),
+                _format_usage(command) + (" [-- COMMAND [ARG...]]" if path == ("run",) else ""),
                 "```",
                 "",
             ]
@@ -301,6 +301,13 @@ def render() -> str:
                     f"{_display_default(action)} | {_description(path, action)} |"
                 )
             lines.append("")
+        if path == ("run",):
+            lines.extend(
+                [
+                    "For a local OCI-root image, a literal `--` followed by a nonempty command replaces the image Cmd while preserving its Entrypoint. The suffix is literal exec argv, not shell syntax.",
+                    "",
+                ]
+            )
     return "\n".join(lines)
 
 

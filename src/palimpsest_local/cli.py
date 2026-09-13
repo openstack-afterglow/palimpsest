@@ -2145,6 +2145,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 name=args.name,
                 manifest_digest=require_digest(args.manifest) if args.manifest is not None else None,
                 user_override=OCIUserSpec.from_override_value(args.user) if args.user is not None else None,
+                command_override=getattr(args, "command_override", None),
                 detached=args.detach,
                 memory_mib=args.memory,
                 vcpus=args.vcpus,
@@ -2166,9 +2167,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
             or getattr(args, "root_retention", None) is not None
             or getattr(args, "root_volume", None) is not None
             or getattr(args, "user", None) is not None
+            or getattr(args, "command_override", None) is not None
         ):
             raise PalimpsestError(
-                "--detach, --manifest, --root-retention, --root-volume and --user are supported only for local OCI-root runs"
+                "--detach, --manifest, --root-retention, --root-volume, --user and command overrides are supported only for local OCI-root runs"
             )
         network = args.network if args.network is not None else "default"
         stack = _resolve_runtime_stack(
@@ -2334,6 +2336,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
+        command_override = None
+        if raw_args[:1] == ["run"] and "--" in raw_args:
+            separator = raw_args.index("--")
+            command_override = tuple(raw_args[separator + 1 :])
+            if not command_override:
+                raise PalimpsestError("OCI run command override after -- must be nonempty")
+            raw_args = raw_args[:separator]
         if raw_args[:1] == ["__complete"]:
             comp_args = raw_args[1:]
             if comp_args[:1] == ["--"]:
@@ -2346,6 +2355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args = argparse.Namespace(operation="docker", docker_args=raw_args[1:])
         else:
             args = parser.parse_args(raw_args)
+        if args.operation == "run":
+            args.command_override = command_override
         _validate_args(args, parser)
         journal = host_journal.begin(args.operation)
         try:

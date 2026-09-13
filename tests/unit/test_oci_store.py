@@ -33,8 +33,9 @@ import palimpsest_local.oci_store as oci_store_module
 import palimpsest_local.platforms as platforms
 import palimpsest_local.state as state_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
-from palimpsest_local.errors import StateError
+from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.oci_boot_plan import (
+    OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA,
     OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
     OCI_ROOT_BOOT_PLAN_SCHEMA,
     OCIBootPlanIntent,
@@ -68,6 +69,7 @@ from palimpsest_local.oci_provenance import (
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OCI_LAYER_MEDIA_TYPE,
     Descriptor,
+    canonical_json_bytes,
 )
 from palimpsest_local.oci_root_kvm import (
     build_oci_root_domain_plan,
@@ -93,6 +95,7 @@ from palimpsest_local.oci_root_volume import (
     oci_root_volume_label,
     release_oci_root_volume,
 )
+from palimpsest_local.oci_source import SourceCAS, SourceSnapshot
 from palimpsest_local.oci_stage1 import OCIStage1Plan
 from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
@@ -1564,6 +1567,166 @@ def test_explicit_user_boot_plan_binds_original_override_and_effective_process(t
     assert materialization.process == original_process
     assert materialization.to_dict()["process"] == original_process.to_dict()
     release_oci_boot_plan(prepared, store)
+
+
+def test_command_boot_plan_rereads_trusted_config_and_preserves_entrypoint(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    config = {
+        "Entrypoint": ["/sbin/init"],
+        "Cmd": [],
+        "Env": ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"],
+        "User": "0:0",
+    }
+    payload = json.dumps({"config": config}, sort_keys=True, separators=(",", ":")).encode()
+    descriptor = Descriptor(OCI_IMAGE_CONFIG_MEDIA_TYPE, "sha256:" + hashlib.sha256(payload).hexdigest(), len(payload))
+    materialization = replace(materialization, config_descriptor=descriptor)
+    source = tmp_path / "config-source"
+    source.mkdir()
+    (source / descriptor.digest[7:]).write_bytes(payload)
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        cas = SourceCAS(roots.oci_source_cas)
+        snapshot = cas.import_source_blob(source_fd, descriptor)
+    finally:
+        os.close(source_fd)
+    prepared = prepare_oci_boot_plan(
+        materialization,
+        run_id=str(uuid.uuid4()),
+        run_name="ml",
+        store=store,
+        command_override=("python", "-c", "print(1)"),
+        source_cas=cas,
+        config_snapshot=snapshot,
+    )
+    plan = prepared.intent.to_dict()
+    assert plan["schema"] == OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA
+    assert plan["process"]["argv"] == ["/sbin/init", "python", "-c", "print(1)"]
+    assert plan["process_provenance"] == {
+        "command_override": ["python", "-c", "print(1)"],
+        "image_command": [],
+        "image_entrypoint": ["/sbin/init"],
+        "image_process": materialization.process.to_dict(),
+        "user_override": None,
+    }
+    invalid_plans = []
+    for field, value in (
+        ("image_entrypoint", "/sbin/init"),
+        ("image_command", {}),
+        ("command_override", "python"),
+        ("command_override", []),
+        ("command_override", [7]),
+    ):
+        changed = deepcopy(plan)
+        changed["process_provenance"][field] = value
+        invalid_plans.append(changed)
+    changed = deepcopy(plan)
+    changed["process_provenance"]["extra"] = None
+    invalid_plans.append(changed)
+    changed = deepcopy(plan)
+    del changed["process_provenance"]["image_command"]
+    invalid_plans.append(changed)
+    changed = deepcopy(plan)
+    changed["process_provenance"]["image_entrypoint"] = []
+    invalid_plans.append(changed)
+    changed = deepcopy(plan)
+    changed["process"]["argv"] = ["different"]
+    invalid_plans.append(changed)
+    for changed in invalid_plans:
+        digest = "sha256:" + hashlib.sha256(canonical_json_bytes(changed)).hexdigest()
+        with pytest.raises(StateError):
+            OCIRootPreparationTransaction(
+                "resources-planned",
+                changed,
+                digest,
+                prepared.lower_leases.lease_set_id,
+                str(uuid.uuid4()),
+                16 * 1024**2,
+                prepared.intent.lower_graph_digest,
+                "delete",
+                "delete",
+            )
+    combined = prepare_oci_boot_plan(
+        materialization,
+        run_id=str(uuid.uuid4()),
+        run_name="ml-user",
+        store=store,
+        user_override=OCIUserSpec("101", "101"),
+        command_override=("serve",),
+        source_cas=cas,
+        config_snapshot=snapshot,
+    ).intent.to_dict()
+    assert combined["schema"] == OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA
+    assert combined["process"]["argv"] == ["/sbin/init", "serve"]
+    assert combined["process"]["user"] == {"group": "101", "user": "101"}
+    assert combined["process_provenance"]["user_override"] == {"group": "101", "user": "101"}
+
+    empty_config = dict(config, Entrypoint=[], Cmd=["old"])
+    empty_payload = json.dumps({"config": empty_config}, sort_keys=True, separators=(",", ":")).encode()
+    empty_descriptor = Descriptor(
+        OCI_IMAGE_CONFIG_MEDIA_TYPE, "sha256:" + hashlib.sha256(empty_payload).hexdigest(), len(empty_payload)
+    )
+    (source / empty_descriptor.digest[7:]).write_bytes(empty_payload)
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        empty_snapshot = cas.import_source_blob(source_fd, empty_descriptor)
+    finally:
+        os.close(source_fd)
+    empty_process = OCIProcessSpec.from_config(empty_config)
+    empty_materialization = replace(materialization, config_descriptor=empty_descriptor, process=empty_process)
+    empty_plan = prepare_oci_boot_plan(
+        empty_materialization,
+        run_id=str(uuid.uuid4()),
+        run_name="ml-empty",
+        store=store,
+        command_override=("python",),
+        source_cas=cas,
+        config_snapshot=empty_snapshot,
+    ).intent.to_dict()
+    assert empty_plan["process"]["argv"] == ["python"]
+    mismatched = replace(materialization, process=replace(materialization.process, cwd="/mismatch"))
+    with pytest.raises(OCIStoreError, match="config is invalid"):
+        prepare_oci_boot_plan(
+            mismatched,
+            run_id=str(uuid.uuid4()),
+            run_name="ml-mismatch",
+            store=store,
+            command_override=("python",),
+            source_cas=cas,
+            config_snapshot=snapshot,
+        )
+    lease_sets_before = {path.name for path in (roots.oci_derived_store / "lease-sets").iterdir()}
+    (roots.oci_source_cas / "blobs" / "sha256" / descriptor.digest[7:]).unlink()
+    with pytest.raises(OCIStoreError, match="config is invalid"):
+        prepare_oci_boot_plan(
+            materialization,
+            run_id=str(uuid.uuid4()),
+            run_name="ml-missing",
+            store=store,
+            command_override=("python",),
+            source_cas=cas,
+            config_snapshot=snapshot,
+        )
+    assert {path.name for path in (roots.oci_derived_store / "lease-sets").iterdir()} == lease_sets_before
+
+
+def test_command_boot_plan_rejects_wrong_cas_or_descriptor_before_leases(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    materialization = _image_materialization(store)
+    cas = SourceCAS(roots.oci_source_cas)
+    other = SourceCAS(tmp_path / "other-cas")
+    wrong_cas = SourceSnapshot(materialization.config_descriptor, other.identity)
+    with pytest.raises((ArtifactValidationError, OCIStoreError)):
+        prepare_oci_boot_plan(
+            materialization,
+            run_id=str(uuid.uuid4()),
+            run_name="ml",
+            store=store,
+            command_override=("python",),
+            source_cas=cas,
+            config_snapshot=wrong_cas,
+        )
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
 
 
 @pytest.mark.parametrize("invalid_schema", [[], {}])

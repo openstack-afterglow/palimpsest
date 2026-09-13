@@ -205,11 +205,23 @@ def test_intake_snapshots_local_input_and_preserves_process_and_layer_occurrence
     assert process.cwd == "/work"
     assert (process.user.user, process.user.group, process.stop_signal) == ("1000", "1001", 15)
     assert prepared.request.user_override is None
+    assert prepared.source_cas.identity == intake.SourceCAS(roots.oci_source_cas).identity
+    assert prepared.config_snapshot.descriptor == prepared.receipt.config_descriptor
     assert list(roots.runs.iterdir()) == []
     with pytest.raises(ArtifactValidationError, match="root pin"):
-        intake.PreparedLocalOCIRun(replace(request, manifest_digest="sha256:" + "a" * 64), prepared.receipt)
+        intake.PreparedLocalOCIRun(
+            replace(request, manifest_digest="sha256:" + "a" * 64),
+            prepared.receipt,
+            prepared.source_cas,
+            prepared.config_snapshot,
+        )
     with pytest.raises(ArtifactValidationError, match="no Entrypoint"):
-        intake.PreparedLocalOCIRun(request, replace(prepared.receipt, process=OCIProcessSpec.empty()))
+        intake.PreparedLocalOCIRun(
+            request,
+            replace(prepared.receipt, process=OCIProcessSpec.empty()),
+            prepared.source_cas,
+            prepared.config_snapshot,
+        )
 
 
 def test_materialization_receipt_keeps_image_process_when_request_has_override(tmp_path, monkeypatch):

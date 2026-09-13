@@ -11,6 +11,7 @@ from typing import Any
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
 from .oci_boot_plan import (
+    OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA,
     OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
     OCI_ROOT_BOOT_PLAN_SCHEMA,
     OCIBootPlanIntent,
@@ -29,6 +30,7 @@ from .oci_root_volume import (
     release_oci_root_volume,
     rollback_oci_root_volume_claim,
 )
+from .oci_source import SourceCAS, SourceSnapshot
 from .oci_store import (
     ArtifactLeaseOwner,
     DerivedLayerOccurrence,
@@ -142,10 +144,13 @@ class OCIRootPreparationTransaction:
         if not isinstance(schema, str) or schema not in {
             OCI_ROOT_BOOT_PLAN_SCHEMA,
             OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA,
+            OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA,
         }:
             raise StateError("OCI-root preparation boot plan schema is invalid")
         expected_fields = (
-            _OVERRIDE_BOOT_PLAN_FIELDS if schema == OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA else _BOOT_PLAN_FIELDS
+            _OVERRIDE_BOOT_PLAN_FIELDS
+            if schema in {OCI_ROOT_BOOT_PLAN_OVERRIDE_SCHEMA, OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA}
+            else _BOOT_PLAN_FIELDS
         )
         if set(plan) != expected_fields:
             raise StateError("OCI-root preparation boot plan fields are invalid")
@@ -176,6 +181,41 @@ class OCIRootPreparationTransaction:
                 effective_process = image_process.with_user(user_override)
             except (ArtifactValidationError, TypeError, ValueError):
                 raise StateError("OCI-root preparation process provenance is invalid") from None
+            if process != effective_process:
+                raise StateError("OCI-root preparation effective process binding is invalid")
+        if schema == OCI_ROOT_BOOT_PLAN_COMMAND_SCHEMA:
+            provenance = plan.get("process_provenance")
+            expected = {"command_override", "image_command", "image_entrypoint", "image_process", "user_override"}
+            if not isinstance(provenance, Mapping) or set(provenance) != expected:
+                raise StateError("OCI-root preparation command provenance is invalid")
+            try:
+                image_process = OCIProcessSpec.from_dict(provenance["image_process"])
+                raw_entrypoint = provenance["image_entrypoint"]
+                raw_image_command = provenance["image_command"]
+                raw_command_override = provenance["command_override"]
+                if not all(
+                    isinstance(value, list) for value in (raw_entrypoint, raw_image_command, raw_command_override)
+                ):
+                    raise ArtifactValidationError("command vectors are invalid")
+                if not all(
+                    type(item) is str
+                    for value in (raw_entrypoint, raw_image_command, raw_command_override)
+                    for item in value
+                ):
+                    raise ArtifactValidationError("command vector entries are invalid")
+                entrypoint = tuple(raw_entrypoint)
+                image_command = tuple(raw_image_command)
+                command_override = tuple(raw_command_override)
+                if not command_override or image_process.argv != (*entrypoint, *image_command):
+                    raise ArtifactValidationError("command provenance mismatch")
+                effective_process = image_process.with_command(entrypoint, command_override)
+                raw_user = provenance["user_override"]
+                if raw_user is not None:
+                    if not isinstance(raw_user, Mapping):
+                        raise ArtifactValidationError("command user override is invalid")
+                    effective_process = effective_process.with_user(OCIUserSpec.from_dict(raw_user))
+            except (ArtifactValidationError, TypeError, ValueError):
+                raise StateError("OCI-root preparation command provenance is invalid") from None
             if process != effective_process:
                 raise StateError("OCI-root preparation effective process binding is invalid")
         if (
@@ -387,6 +427,9 @@ def prepare_oci_root_run(
     retained_volume_id: str | None = None,
     retention_policy: str = "delete",
     user_override: OCIUserSpec | None = None,
+    command_override: tuple[str, ...] | None = None,
+    source_cas: SourceCAS | None = None,
+    config_snapshot: SourceSnapshot | None = None,
     runner: CommandRunner = _default_runner,
 ) -> PreparedOCIRootRun:
     """Durably prepare immutable lowers and one exclusive writable root."""
@@ -394,7 +437,9 @@ def prepare_oci_root_run(
     if not isinstance(store, OCIStore):
         raise StateError("OCI-root preparation store is invalid")
     size_bytes = _validate_size(root_volume_size_bytes)
-    intent = OCIBootPlanIntent(owner.run_id, owner.run_name, materialization, user_override)
+    intent = OCIBootPlanIntent(
+        owner.run_id, owner.run_name, materialization, user_override, command_override, source_cas, config_snapshot
+    )
     store.validate_receipt_occurrences(intent.receipts, intent.occurrences)
     lease_set_id = store.lease_set_id(intent.receipts, owner, plan_digest=intent.digest)
     rollback_action = "retain" if retained_volume_id is not None else "delete"
@@ -431,6 +476,9 @@ def prepare_oci_root_run(
             run_name=owner.run_name,
             store=store,
             user_override=user_override,
+            command_override=command_override,
+            source_cas=source_cas,
+            config_snapshot=config_snapshot,
         )
         claimed = claim_oci_root_volume(
             reservation.roots,

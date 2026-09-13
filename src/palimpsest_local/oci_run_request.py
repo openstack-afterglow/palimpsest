@@ -20,8 +20,8 @@ from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_materializer import OCIImageMaterializationReceipt, materialize_image_hard
 from .oci_packer import VerifiedSquashFSToolchain
-from .oci_process import OCIUserSpec
-from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
+from .oci_process import OCIProcessSpec, OCIUserSpec
+from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS, SourceSnapshot
 from .oci_store import OCIStore
 from .project_volumes import _validate_size
 from .runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
@@ -45,6 +45,7 @@ class LocalOCIRunRequest:
     platform: str = "linux/amd64"
     backend: str = "kvm"
     user_override: OCIUserSpec | None = None
+    command_override: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name) is None:
@@ -64,6 +65,11 @@ class LocalOCIRunRequest:
                 raise ArtifactValidationError("local OCI run manifest digest must be canonical")
         if self.user_override is not None and not isinstance(self.user_override, OCIUserSpec):
             raise ArtifactValidationError("local OCI run user override must be typed")
+        if self.command_override is not None:
+            if not isinstance(self.command_override, tuple) or not self.command_override:
+                raise ArtifactValidationError("local OCI run command override must be a nonempty tuple")
+            # Reuse the canonical process aggregate/string validation.
+            OCIProcessSpec(self.command_override, (), "/", OCIUserSpec("0", "0"), 15)
         if type(self.detached) is not bool:
             raise ArtifactValidationError("OCI run detached policy must be a boolean")
         if type(self.memory_mib) is not int or not 256 <= self.memory_mib <= 1_048_576:
@@ -98,6 +104,8 @@ class PreparedLocalOCIRun:
 
     request: LocalOCIRunRequest
     receipt: OCIImageMaterializationReceipt
+    source_cas: SourceCAS
+    config_snapshot: SourceSnapshot
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, LocalOCIRunRequest) or not isinstance(
@@ -109,6 +117,10 @@ class PreparedLocalOCIRun:
             and self.request.manifest_digest != self.receipt.root_descriptor.digest
         ):
             raise ArtifactValidationError("prepared local OCI run does not match its root pin")
+        if not isinstance(self.source_cas, SourceCAS) or not isinstance(self.config_snapshot, SourceSnapshot):
+            raise ArtifactValidationError("prepared local OCI run config authority is invalid")
+        if self.config_snapshot.descriptor != self.receipt.config_descriptor:
+            raise ArtifactValidationError("prepared local OCI run config descriptor is invalid")
         self.receipt.process.require_bootable()
 
 
@@ -118,6 +130,7 @@ def resolve_local_oci_run_request(
     name: str,
     manifest_digest: str | None = None,
     user_override: OCIUserSpec | None = None,
+    command_override: tuple[str, ...] | None = None,
     detached: bool = False,
     memory_mib: int = 512,
     vcpus: int = 1,
@@ -142,6 +155,7 @@ def resolve_local_oci_run_request(
         source=selected,
         manifest_digest=manifest_digest,
         user_override=user_override,
+        command_override=command_override,
         detached=detached,
         memory_mib=memory_mib,
         vcpus=vcpus,
@@ -178,7 +192,8 @@ def materialize_local_oci_run(
         if request.source.is_dir()
         else LocalArchiveSource(request.source, request.manifest_digest)
     )
-    image = source.snapshot(None, SourceCAS(roots.oci_source_cas))
+    source_cas = SourceCAS(roots.oci_source_cas)
+    image = source.snapshot(None, source_cas)
     image.image.config.process.require_bootable()
     receipt = materialize_image_hard(
         image,
@@ -189,4 +204,4 @@ def materialize_local_oci_run(
         toolchain=toolchain,
         timeout_seconds=timeout_seconds,
     )
-    return PreparedLocalOCIRun(request, receipt)
+    return PreparedLocalOCIRun(request, receipt, source_cas, image.config)

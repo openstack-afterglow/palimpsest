@@ -693,6 +693,11 @@ This run did not reproduce the earlier ancestor-change failure, but did not
 identify or fix its cause. It is not a new application build, NGINX test,
 standard-I/O pathname qualification, or full Gate 2 run.
 
+Pinned TensorFlow and PyTorch CPU compatibility uses separate per-image opt-ins
+and exact archive/manifest digests. See [OCI machine-learning image
+compatibility](oci-ml-compatibility.md) for the two explicit native nodes,
+resource bounds, and non-GPU scope.
+
 - Per edit: relevant lane(s), regression tests for the change, lint and format.
 - Before push: inspect the changed-file plan and run the affected portable
   lanes; include the required native/build proof for changed runtime surfaces.
