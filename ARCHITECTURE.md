@@ -26,6 +26,8 @@ GPU 점검 승인이 아니며 기존 staged PCI 구현과 미승인 증거 변�
 
 공개 `exec`은 이제 `--timeout SECONDS`(정수1–600, 기본30)로 한 명령의 guest 실행 기한만 정한다. protocol v2와 guest PID 1의 상한은600,000 ms이고 생략 시 기존30초 동작이 그대로다. OCI-root 전용이며 cloud-image run에 지정하면 adapter 호출 전에 거부한다. 재시도·run lock·monitor 대기·권한·정리·64KiB 출력 한도는 바꾸지 않으므로 이 변경만으로 `9239dbd`에서 관측된 coordinator spawn 또는 run lock 경계가 사라지지는 않는다. `init.c` 변경에 따라 봉인 stage-1 ELF를 고정 toolchain image로 두 번 재현 빌드해 `1fe7b61cdf856d85d7ab37681e386e303534658f1874846859c43d48788052bf`(103,360 bytes, mode0644)를 확인하고 source-bundle pin을 `b2788f5f9609b27157b382bd884442ff8c1b9cb8f7dba7a2b6f10dc708614bf0`으로 갱신했다. 변경 ELF의 native 부팅 matrix와 ML 재검증은 별도 증거다.
 
+정확한 Linux checkout `06697bde83f4e0734955320577a59cc9c7e06f27`에서 timeout/CLI/guest-C/dispatch 선별605건(4 skip)과 monitor/ML/lane contract 186건이 통과했고, 변경된 packaged stage-1은 43-boot KVM matrix를 122.35초에 통과했다. 이어진 TensorFlow 실기는 공개 `exec --timeout 150`을 실제 사용했지만 126.39초 뒤 동일한 `framework-exec-command`/`timeout-source=run-lock-timeout` 경계에서 실패했다. 따라서 넓어진 guest 기한이 host run-lock 경계를 제거하지 않았다는 것만 확인하며 guest 명령 admit·실행·인과 순서는 여전히 미확정이다. 새 domain은 남지 않았다. PyTorch는 303.18초 뒤 `public-run-command`에서 `[parent-response:timeout]`으로 실패했고 새 `ml-pytorch-8be2db32`(UUID `bfed8772-c656-41ac-8514-164c3e7bb00b`)를 inactive·persistent·autostart disable로 보존했다. 최종 full inventory는 기존18개와 새1개 domain 모두 inactive, active0, 원본 archive16개 전체 digest 불변이다. 어느 retained domain도 stop·undefine·adopt하지 않았고 두 framework 모두 CPU tensor·root identity·PID1 검증에는 도달하지 못했다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -557,8 +559,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "eb3bd17e84fd6d8cbabdc862c4f888d4e56ae5d3bfd04e33d0329ed324bb2f4f",
-  "reviewed_at": "2026-09-14T14:27:00Z",
-  "summary": "Reviewed test-only host isolation for the recorded-exec CLI case: pin state, config and journal roots so ambient Linux state-root resolution cannot change the observed exit code. No source, runtime, guest or policy change beyond the already-reviewed exec --timeout contract at 5e9473a; native stage-1 matrix and ML re-verification remain separate evidence."
+  "reviewed_at": "2026-09-14T15:47:12Z",
+  "summary": "Reviewed exact 06697bd Linux timeout checks, the 43-boot packaged stage-1 KVM matrix, sequential TensorFlow and PyTorch native outcomes, retained-resource invariants, and the full 19-domain/16-archive zero-active postflight; no guest-admission or timeout-causality claim."
 }
 ```
 <!-- architecture-review:end -->

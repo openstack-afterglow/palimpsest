@@ -221,6 +221,41 @@ identifying the run-lock holder, remain separate reviewed changes. A larger
 public exec deadline changes only the guest execution bound and therefore
 cannot by itself remove either observed boundary.
 
+At exact checkout `06697bde83f4e0734955320577a59cc9c7e06f27`, the
+timeout implementation from `5e9473a` and its test-isolation follow-up were
+reverified on the same Linux host. The focused selections passed 605 checks
+with four skips, then 186 additional checks; the packaged stage-1 completed
+its 43-boot KVM control matrix in 122.35 seconds (one pytest node passed).
+
+The pinned TensorFlow case then failed after 126.39 seconds at
+`framework-exec-command`. Its saved stdout was empty and stderr contained only
+`timeout-source=run-lock-timeout`. The calculation was issued with public
+`exec --timeout 150`, so increasing the guest execution deadline from 30 to
+150 seconds did not remove the separately bounded host run-lock failure. Since
+the client takes that lock before and after mailbox exchange, the preserved
+evidence still does not establish guest-command admission, execution, or
+causal ordering. The archive hash was unchanged, no new domain remained, and
+the exact 18-domain, zero-active, 16-archive baseline was preserved.
+
+The pinned PyTorch case failed after 303.18 seconds at `public-run-command`.
+Its saved stdout was empty; stderr contained the fixed
+`[parent-response:timeout]` coordinator outcome plus a contemporaneous
+`Domain not found` diagnostic for `ml-pytorch-8be2db32`. The later postflight
+found that domain retained shut off and persistent with autostart disabled,
+UUID `bfed8772-c656-41ac-8514-164c3e7bb00b`, and no interface, hostdev, or
+host-filesystem device. That timing difference does not establish when the
+definition became visible or why the coordinator response expired. The
+archive hash was unchanged. Final postflight matched all 18 prior domain
+names, UUIDs, states, and autostart settings plus this one retained domain:
+19 inactive domains, zero active domains, and all 16 full archive SHA-256
+values unchanged. Neither case reached a CPU tensor result, root-identity
+comparison, or PID 1 refusal; no retained domain was stopped, undefined, or
+adopted.
+
+One preceding SSH orchestration attempt exited pytest code 4 before collection
+because the remote working directory was not applied; zero tests ran and no
+domain was created. It is not counted as a native case result.
+
 The small-image control lane attempted for comparison could not run: the pinned
 build artifact's `acceptance.json` still declares
 `palimpsest.oci-root-build-run-acceptance.v1` while

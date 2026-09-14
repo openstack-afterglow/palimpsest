@@ -27,30 +27,34 @@ files_modified:
 ## 현재 스냅샷
 
 - branch: `codex/oci-root-phase1`
-- HEAD: `9239dbda232896d881047ce8840f224d4a46ba93` (`origin`과 동일).
-  이 세션에서 `86fe832` PCI snapshot과 `9239dbd` 문서 인계를 각각 commit·push했고
-  GitHub development package workflow(run `34850666453`)의 verify/publish가 통과해
-  `package-9239dbda232896d881047ce8840f224d4a46ba93` prerelease가 생성됐다.
-  prerelease는 안정 release나 Gate 2 qualification이 아니다.
-- architecture review marker: `9239dbd` 시점 staged marker는
-  `909f9e273842a5812466f9bf450446647f121bfb44ec9d93d9b850d3212806b9`
-  (381 files)이며 이전 PCI staged marker
-  `4abcefaea57086a4856417bd3f8cce6becb755f0eee377b0b8384a6c302a473b`는
-  `86fe832`에 그대로 들어갔다. 두 값은 서로 다른 범위의 point-in-time 증거다.
-- 서버 `pieroot-server` checkout: `/home/pieroot/code/palimpsest`가 detached
-  `9239dbda232896d881047ce8840f224d4a46ba93`, `git status --porcelain` 0줄.
-  native venv는 `/tmp/palimpsest-30y-venv.B5P9EO/bin/python`(3.12.3, libvirt 10.0.0)이며
-  `~/code/palimpsest/.venv`에는 libvirt가 없으므로 실기에 쓰지 않는다.
-- 서버 선별 Linux 검사는 `9239dbd`에서 250건 통과(다른 outcome 없음)했다.
-  두 host 전제가 필요하다. `umask 022`가 없으면 기본 umask 002의 group-writable
-  fixture 때문에 `verify_host_boot_artifacts`가 합성 kernel metadata를 거부해
-  setup error 48건이 나고, 격리된 `PALIMPSEST_LOG_HOME`이 없으면 부재한
-  `/var/log/palimpsest` 경고가 stderr 정확 비교 assertion 3건을 깨뜨린다.
-  두 전제는 proof 계약이 아니라 실행 환경 조건이다.
-- 현재 working tree에는 다른 작성자가 소유한 변경이 남아 있다. 오래된 MySQL 관련
-  `ARCHITECTURE.md` hunk, `docs/docker-hub-service-matrix.md` 36줄,
-  `docs/oci-linux-process.md` 8줄은 이 세션의 검토·게시 범위가 아니며 복원, 정리,
-  stage 또는 함께 commit하지 않았다.
+- native re-verification checkout: detached
+  `06697bde83f4e0734955320577a59cc9c7e06f27`, clean and equal to the then-current
+  branch origin. The public timeout implementation is commit `5e9473a`; the
+  exact checkout adds test-only ambient-state isolation. GitHub development
+  package workflows `34855348288` and `34855721201` both passed. The final
+  evidence document commit follows this point-in-time checkout and cannot
+  self-reference its own SHA.
+- final evidence staged architecture marker:
+  `eb3bd17e84fd6d8cbabdc862c4f888d4e56ae5d3bfd04e33d0329ed324bb2f4f`
+  (381 files), covering the exact SHA2 checks and native evidence while excluding
+  the unrelated MySQL hunk.
+- server `pieroot-server` checkout: `/home/pieroot/code/palimpsest` is detached
+  at `06697bde83f4e0734955320577a59cc9c7e06f27`, with zero porcelain lines before
+  native verification. The native venv remains
+  `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python 3.12.3, libvirt 10.0.0).
+- SHA2 Linux verification: 605 passed / 4 skipped in the timeout, CLI, guest-C,
+  dispatch, record-integration and architecture selections; 186 additional
+  monitor/ML/lane contract checks passed. The packaged stage-1 43-boot KVM
+  matrix passed its single pytest node in 122.35 seconds.
+- local timeout implementation verification passed 551 focused tests, 31
+  Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
+  lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
+  manifest checks passed; Ruff check passed. Whole-repository format check
+  still names 11 unrelated pre-existing files and was not used to widen scope.
+- current working tree still has other-author changes. The MySQL-related
+  `ARCHITECTURE.md` hunk, `docs/docker-hub-service-matrix.md`, and
+  `docs/oci-linux-process.md` remain unstaged and outside this session's
+  publication scope.
 - 로컬 선별 검증은 PCI/lane 91건, define-failure 15건, architecture guard 13건,
   lane manifest, working/staged architecture guard, `git diff --check`가 통과했다.
 
@@ -198,6 +202,25 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   `ml-pytorch-69afe41a`(UUID `d20cd3df-768b-400a-a35c-ddbe011630f0`)는
   inactive·autostart disable로 보존했다. 총 18 domain, active 0, archive
   digest 불변이다. 이 domain을 stop·undefine·adopt하지 않는다.
+- `06697bd` native TensorFlow used public `exec --timeout 150` and still failed
+  at `framework-exec-command` after 126.39 seconds with empty stdout and the
+  sole `timeout-source=run-lock-timeout` marker. The larger guest deadline did
+  not remove the host lock boundary; guest admission and causal ordering remain
+  unestablished. Its source hash was unchanged, no new domain remained, and the
+  exact 18-domain/zero-active/16-archive baseline was preserved.
+- `06697bd` native PyTorch again failed at `public-run-command`, after 303.18
+  seconds, with empty stdout and `[parent-response:timeout]` plus a
+  contemporaneous `Domain not found` line. Postflight retained the later-visible
+  `ml-pytorch-8be2db32` domain (UUID
+  `bfed8772-c656-41ac-8514-164c3e7bb00b`) shut off, persistent and autostart
+  disabled, without interface/hostdev/host-filesystem devices. The message and
+  later visibility do not establish definition timing or timeout cause. Final
+  full inventory is 19 inactive domains, active 0, and all 16 exact archive
+  SHA-256 values unchanged. No retained domain was stopped, undefined or
+  adopted.
+- An earlier SSH command-shaping attempt at the same checkout exited pytest 4
+  before collection, ran zero tests and created no domain; it is excluded from
+  the two native case results.
 - 관측된 두 경계는 guest 실행 기한이 아니라 coordinator spawn handshake와
   host run lock이다. 승인된 공개 `exec --timeout` 계약 변경은 guest 실행
   기한만 넓히므로 이 두 경계를 그 자체로 제거하지 못한다. 남은 진단은
