@@ -3742,8 +3742,10 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
         return ET.tostring(root, encoding="unicode")
 
     conn = _DefinitionConnection(transform=transform)
-    with pytest.raises(StateError):
+    with pytest.raises(StateError) as error:
         define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+    if failure == "hostdev":
+        assert str(error.value) == "defined OCI-root device class is forbidden: hostdev"
 
     assert name not in conn.domains
     assert read_run_ledger_snapshot(roots, name).state["status"] == "creating"

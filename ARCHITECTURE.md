@@ -34,6 +34,14 @@ instance별 exclusive attachment와 명시 delete/retain 정책을 목표로 하
 [선택된 구현 경로](docs/oci-gpu-support.md#selected-target-the-nova-instance-itself-owns-the-oci-root)의
 계획이며 새 boot exporter·GPU·OpenStack 실기 성공 또는 cloud 변경 승인이 아니다.
 
+로컬 KVM PCI 검증의 첫 구현은 독립적인 read-only sysfs 사전 점검기다.
+PCI 주소 하나의 장치 ID·현재 드라이버·부팅 화면 표시·reset 파일 존재와
+IOMMU 그룹 구성원을 관찰할 뿐, 할당 가능 판정이나 장치 소유권을 부여하지
+않는다. OCI-root의 `hostdev` 거부·guest 장치 집합은 그대로이며
+passthrough 연결·게스트 GPU 드라이버·CUDA 성공은 아직 미구현/미검증이다.
+이번 원격 hardware 점검 helper는 내부 코드 전송 승인 단계에서 차단되어
+실행하지 않았고, 새 서버 GPU 상태나 VFIO 할당 결과를 얻지 못했다.
+
 `049a978`의 ML 실기는 두 framework 모두 VM 전에 중단됐다. TensorFlow는
 격리 materializer의 layer ordinal4에서 `oci-invalid-path`로 실패했고, 후속
 bounded 진단은 경로 원문 없이 원인이 리터럴 backslash임을 확인했다.
@@ -232,6 +240,7 @@ flowchart LR
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
 | coordinator failure diagnostics | [`oci_monitor_coordinator.py`](src/palimpsest_local/oci_monitor_coordinator.py)의 `MonitorCoordinatorFailure`, `_response`, `_parse_response` | private response v2의 고정 stage/category만 부모에 전달하고 CLI 오류에도 보존; endpoint 재인증·기존 uncertainty와 no-kill/ownership 정책은 유지 |
 | monitor-client timeout diagnostics | [`oci_monitor_client.py`](src/palimpsest_local/oci_monitor_client.py)의 `MonitorClientTimeoutSource`, `MonitorClientError`, `_Deadline`, `_stable_errors` | 고정 client-deadline·ipc-timeout·run-lock-timeout 원인만 기존 보존 안내에 덧붙임; 대기 시간·동일 요청 재시도·권한·정리 계약은 변경하지 않음 |
+| read-only PCI preflight | [`pci_preflight.py`](src/palimpsest_local/pci_preflight.py)의 `inspect_pci_device`, `PCIPreflightReport`; [`test_pci_preflight.py`](tests/unit/test_pci_preflight.py) | canonical BDF의 bounded sysfs 관찰과 IOMMU 구성원 목록; public run/boot-plan/XML에 연결되지 않으며 할당·드라이버 변경·reset·VM 작업을 하지 않음 |
 | guest boundary | [`guest/stage1/init.c`](guest/stage1/init.c), [`src/palimpsest_local/oci_guest_stage1.py`](src/palimpsest_local/oci_guest_stage1.py), [`src/palimpsest_local/oci_lifecycle_transport.py`](src/palimpsest_local/oci_lifecycle_transport.py) | authenticated root/lower block을 read-only 정책으로 확인하고 OverlayFS를 `/`로 move-mount-chroot한 뒤 PID 1이 workload와 lifecycle protocol을 감독 |
 | main-output transport | [`guest/stage1/main_output_pump.h`](guest/stage1/main_output_pump.h), [`guest/stage1/init.c`](guest/stage1/init.c)의 `prepare_main_output`, `service_main_output`, `terminate_and_reap` | workload 소유 FIFO 두 개와 stream별 4KiB 버퍼, 공통 16KiB 큐로 메인 출력과 PID 1 진단을 독립 nonblocking console sink에 전달. polling·STOP·회수·TERMINAL 권한은 supervisor 책임 |
 | parent-owned console sink | [`guest/stage1/init.c`](guest/stage1/init.c)의 `acquire_main_console_sink`, `revalidate_main_console_sink`, `close_main_console_sink` | 루트 전환 전 독립 nonblocking console FD 확보, 양 자식의 조기 close, 루트 전환·TERMINAL 전 identity 재검증. PID1은 종료 후 인증된 reconnect 제어 메시지를 위해 통로를 유지하며 실패 대기에서 닫음 |
@@ -343,6 +352,15 @@ API는 401 Keystone validation, 403 system-admin, 404 visibility/ownership, 409 
 stage-1은 첫 mount move 전 `proc`/`sys`/`dev` 대상 준비 실패에 한해 고정 target/check 진단을 남긴다. `safe_dir_policy_checked`는 기존 mkdir/open/fstat-type/owner/mode와 요청 시 getdents 검사를 유지한다. generic `safe_dir_checked` wrapper는 기존 exact mode만 허용하고, compile-time `proc`와 `sys` 대상은 각각 사용자 승인에 따라 정확한0755 또는0555 및 빈 디렉터리를 요구한다. `dev`는 정확한0755와 root 소유·nofollow·filesystem identity를 유지하되, 별도 승인에 따라 비어 있지 않아도 trusted devtmpfs의 mount target으로만 사용한다. 원본 자식 항목은 열거나 장치로 채택하지 않는다. 초기 검사에서 보존한 device/inode/mode/UID/GID와 retained/current FD를 mount 직전에 다시 대조하므로 허용된 두 mode 사이의 변경도 거부한다. runtime readiness wrapper의 filesystem magic은 OverlayFS로 고정한다. chmod·재시도·이미지 수정은 없고 PID 1 및 workload 권한은 바꾸지 않는다. 원본 경로·이미지 데이터·errno·식별자·비밀은 출력하지 않는다. 기존 exit71·indeterminate wait를 유지하며 진단 console은 authenticated READY/root 증거가 아니다. 이미지 입력 호환성을 위한 좁은 정책 변경이며 이후 entrypoint 호환성은 별도 실기로 확인한다.
 
 ## Security boundaries
+
+PCI 사전 점검은 내부 관찰 API이며 authorization·exclusive lease가 아니다.
+Known sysfs link의 canonical target과 열린 directory identity를 확인하고
+고정 attribute 파일만 byte 제한 안에서 읽는다. sysfs의 보고된 `st_size`를
+실제 payload 길이로 가정하지 않는다. `resource`·`config`·`rom`·`enable`은
+읽지 않으며 reset은 파일 존재만 관찰한다. 결과의 unknown/absent를 할당
+허가로 해석하지 않고, snapshot 전체가 원자적이거나 실행 중 device 변경을
+잠그는 것으로 주장하지 않는다. 실제 재할당은 별도 권한·장치 lease·전체
+IOMMU 그룹과 host 사용자 확인을 요구한다. 상세 제한은 [GPU 경계](docs/oci-gpu-support.md)에 있다.
 
 표준 출력과 self-FD 별칭은 workload 자식이 새 mount namespace의 private `/dev` tmpfs를 만든 뒤에만 생성한다. 고정 디렉터리 FD 기준 `symlinkat`은 기존 object를 채택하거나 덮어쓰지 않는다. `newfstatat(AT_SYMLINK_NOFOLLOW)`로 root0:0·0777·single-link symlink를 확인하고 bounded `readlinkat`으로 `stdout → /proc/self/fd/1`, `stderr → /proc/self/fd/2`, `fd → /proc/self/fd`의 정확한 대응만 허용한다. 초기 entry 검사와 임시 cgroup staging 제거 뒤 재검사 모두 여섯 character device의 type/mode/owner/link-count/장치번호와 세 별칭을 확인한다. `/dev/stdin`은 추가하지 않으며 64KiB·16 inode 한도도 유지한다. supervisor 계약의 `isolation.devices`는 여섯 장치 목록 그대로이고 별칭은 장치가 아니다. 변경 source/ELF는 기존 source-bundle provenance에 결합한다. 이 검증은 실행 준비 시점의 경계이며 UID0 workload가 자기 `/dev`의 내용을 실행 후 바꾸지 못한다는 영구 불변성 보장은 아니다.
 
@@ -526,9 +544,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "fec7602f6549c680c94e56ef05d0cc59131102bbbbeb1054148ae9123af485c3",
-  "reviewed_at": "2026-09-13T18:24:35Z",
-  "summary": "Reviewed unchanged timeout-origin implementation and focused verification receipts. aad3d492 client/exec105 passed locally and exact Linux checkout with zero other outcomes; local architecture guard13 and GitHub package passed. Documentation-only evidence update; no further architecture, timeout, retry, authority, cleanup or guest change. No new native execution; historical TensorFlow generic timeout and PyTorch limits remain unresolved."
+  "source_sha256": "4abcefaea57086a4856417bd3f8cce6becb755f0eee377b0b8384a6c302a473b",
+  "reviewed_at": "2026-09-14T10:31:58Z",
+  "summary": "Reviewed pci_preflight source, synthetic sysfs tests, hostdev rejection regression, lane mapping and GPU limits. Added an internal bounded read-only inventory API with canonical PCI facts, IOMMU members and detected-link identity checks; no public CLI, allocation, XML, driver, guest or authority change. Local focused PCI/lane91 and existing define-failure15 plus architecture guard13 passed. Remote hardware helper transfer was denied before execution: no fresh server hardware facts, passthrough, CUDA or native success. Existing hostdev rejection and selected Nova-instance target remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

@@ -37,7 +37,7 @@ PORTABLE_FILES = {
         registry_intake sandbox_policy state test_lanes ui
     """),
     "host-runtime": _units("""
-        cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima
+        cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima pci_preflight
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract
@@ -227,6 +227,7 @@ LANES = (*PORTABLE, *SPECIAL_FILES)
 # an import graph or a guarantee. Shared infrastructure/unknown changes fall
 # back to every portable lane. Suggested external proofs still need opt-in.
 DEPENDENCIES = (
+    ("pci_preflight", ("host-runtime",), ()),
     ("oci_root_volume_inventory", ("core-cli", "host-runtime", "oci-store"), ()),
     ("oci_resource_status", ("host-runtime", "core-cli"), ()),
     ("oci_worker_limits", ("host-runtime", "oci-store"), ("native-live",)),

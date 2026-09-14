@@ -128,7 +128,28 @@ The sequence below is an alternative for a Palimpsest-managed local hypervisor,
 not work required for the selected Nova-instance topology. Its host-side
 allocation, libvirt XML and rebinding steps must not be applied by Palimpsest
 to Nova-managed compute hosts. Nested assignment would need its own additional
-qualification. None of this alternative is implemented or live-qualified.
+qualification. Only the read-only inventory primitive below is implemented;
+allocation, assignment, guest GPU runtime and CUDA qualification are neither
+implemented nor live-qualified.
+
+The internal PCI preflight collector is a read-only inventory primitive for
+the first step below. Given one canonical PCI BDF, it reports bounded vendor,
+device, subsystem, class and revision facts; the current driver; boot-display
+state; reset-file presence; and the complete bounded IOMMU-group member list.
+Optional facts are explicitly bound, unbound/absent, or unknown. It returns no
+eligibility or assignability verdict. The collector never reads PCI resource,
+configuration, ROM or enable surfaces and never probes, loads, unbinds, binds,
+resets, authors XML or touches a domain. Its snapshot is not transactional, so
+detected identity substitution or malformed/bounded input fails closed and a successful
+report is only a point-in-time observation.
+
+Linux deliberately exposes PCI bus entries and IOMMU-group members as sysfs
+symlinks. The collector follows only those known link positions after checking
+their canonical targets and pinning the target directories; it caps bytes
+actually read rather than trusting sysfs `st_size`. See the kernel's
+[sysfs reading and layout contract](https://docs.kernel.org/filesystems/sysfs.html),
+[PCI sysfs interface](https://docs.kernel.org/PCI/sysfs-pci.html), and
+[VFIO IOMMU-group ownership model](https://docs.kernel.org/driver-api/vfio.html).
 
 1. Read-only GPU preflight: vendor/device identity, current driver/consumers,
    complete IOMMU group, boot-display status, reset support, virtualization
@@ -153,3 +174,5 @@ qualification. None of this alternative is implemented or live-qualified.
 
 No GPU driver was unbound, no PCI device was reassigned, and no GPU VM or
 OpenStack integration success is claimed by this design document.
+The first private read-only hardware-helper transfer was blocked before
+execution, so it produced no fresh host PCI or GPU facts.
