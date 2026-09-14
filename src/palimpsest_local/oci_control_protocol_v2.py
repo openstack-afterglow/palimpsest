@@ -33,7 +33,8 @@ MAX_OCI_EXEC_ARGV_BYTES = 8192
 MAX_OCI_EXEC_ARGS = 64
 MAX_OCI_EXEC_OUTPUT_BYTES = 65536
 MAX_OCI_EXEC_CHUNK_BYTES = 1024
-MAX_OCI_EXEC_TIMEOUT_MS = 30000
+MAX_OCI_EXEC_TIMEOUT_MS = 600000
+DEFAULT_OCI_EXEC_TIMEOUT_MS = 30000
 _MAX_PAYLOAD_BYTES = MAX_OCI_CONTROL_FRAME_BYTES - 4
 _MAX_COUNTER = (1 << 63) - 1
 _MAX_U64 = (1 << 64) - 1
@@ -1053,7 +1054,7 @@ class HostOCIControlV2Session:
             self._key,
         )
 
-    def exec(self, argv: tuple[str, ...], *, timeout_ms: int = MAX_OCI_EXEC_TIMEOUT_MS) -> OCIControlV2Envelope:
+    def exec(self, argv: tuple[str, ...], *, timeout_ms: int = DEFAULT_OCI_EXEC_TIMEOUT_MS) -> OCIControlV2Envelope:
         argv = validate_exec_argv(argv)
         validate_exec_timeout(timeout_ms)
         if (

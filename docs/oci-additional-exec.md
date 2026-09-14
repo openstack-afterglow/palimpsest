@@ -8,10 +8,12 @@ qualification; the unchanged Gate 2 is a separate product check.
 ## Request and process boundary
 
 Requests contain literal argv (1–64 arguments, at most 8 KiB canonical UTF-8
-JSON) and a finite timeout (1–30,000 ms). Environment, cwd and credentials come
-from the immutable image process configuration. No shell is inserted, and no
-environment/user/cwd overrides, stdin, TTY, per-command signal or parallel exec
-are supported. A caller can explicitly request an image-provided shell as argv.
+JSON) and a finite timeout (1–600,000 ms; the public CLI default is 30,000 ms
+and `--timeout SECONDS` selects 1–600 s explicitly). Environment, cwd and
+credentials come from the immutable image process configuration. No shell is
+inserted, and no environment/user/cwd overrides, stdin, TTY, per-command signal
+or parallel exec are supported. A caller can explicitly request an
+image-provided shell as argv.
 
 The additional fork occurs after boot authentication. PID 1 explicitly wipes
 the inherited lifecycle key/session and control buffers in the child, closes

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
@@ -74,6 +75,15 @@ def case(monkeypatch):
 
 def open_session():
     return sessions.OCIExecProcessSession(object(), object(), object(), ("/bin/probe", "literal $HOME"))
+
+
+def isolate_cli(monkeypatch, tmp_path):
+    """Pin state, config and the host command journal so stderr stays exact."""
+    journal = tmp_path / "journal"
+    journal.mkdir(mode=0o700)
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(journal))
 
 
 def test_split_exact_output_and_nonzero_exit_drain_before_ack(case):
@@ -444,8 +454,7 @@ def test_cli_ack_failure_prints_observed_facts_once_and_returns_nonzero(case, mo
         sessions_opened.append(session)
         return session
 
-    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(runtime_dispatch, "exec", execute)
 
     assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 1
@@ -472,8 +481,7 @@ def test_cli_preserves_fixed_monitor_timeout_source(monkeypatch, tmp_path, capsy
     def execute(*_args, **_kwargs):
         raise expected
 
-    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(runtime_dispatch, "exec", execute)
 
     assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 1
@@ -486,8 +494,7 @@ def test_cli_preserves_fixed_monitor_timeout_source(monkeypatch, tmp_path, capsy
 def test_repeated_embedded_cli_exec_closes_each_client_after_ack(case, monkeypatch, tmp_path, capsys):
     from palimpsest_local import cli, runtime_dispatch
 
-    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    isolate_cli(monkeypatch, tmp_path)
     monkeypatch.setattr(runtime_dispatch, "exec", lambda *args, **kwargs: open_session())
     for _ in range(2):
         assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 23
@@ -496,3 +503,78 @@ def test_repeated_embedded_cli_exec_closes_each_client_after_ack(case, monkeypat
     assert case.calls.count("client") == case.calls.count("close") == 2
     assert case.control.status()["next_sequence"] == 3
     assert not case.control.status()["occupied"]
+
+
+@pytest.mark.parametrize("requested,expected", [(None, 30000), (1, 1), (150000, 150000), (600000, 600000)])
+def test_effective_timeout_resolves_absent_request_to_thirty_seconds(requested, expected):
+    request = sessions.ExecRequest.from_argv(["/bin/probe"], timeout_ms=requested)
+    assert sessions.effective_exec_timeout_ms(request) == expected
+
+
+@pytest.mark.parametrize("timeout_ms,submitted", [(None, 30000), (150000, 150000)])
+def test_session_submits_its_resolved_guest_timeout(case, timeout_ms, submitted):
+    arguments = {} if timeout_ms is None else {"timeout_ms": timeout_ms}
+    session = sessions.OCIExecProcessSession(object(), object(), object(), ("/bin/probe",), **arguments)
+    payloads = [call[1] for call in case.calls if isinstance(call, tuple) and call[0] == "submit"]
+    assert [item["timeout_ms"] for item in payloads] == [submitted]
+    session.close()
+
+
+@pytest.mark.parametrize("requested,submitted", [(None, 30000), (150000, 150000)])
+def test_exec_session_submits_the_requested_guest_timeout(case, monkeypatch, requested, submitted):
+    record = object()
+    binding = SimpleNamespace(record=record)
+    monkeypatch.setattr(sessions, "load_oci_run_binding", lambda _roots, _name: binding)
+    monkeypatch.setattr(sessions, "locked_existing_run", lambda *_args, **_kwargs: nullcontext(SimpleNamespace()))
+    monkeypatch.setattr(sessions, "_read_run_journal", lambda _mutation, _binding: SimpleNamespace(endpoint=object()))
+    session = sessions.exec_session(
+        "demo",
+        sessions.ExecRequest.from_argv(["/bin/probe"], timeout_ms=requested),
+        roots=object(),
+        _expected_record=record,
+    )
+    payloads = [call[1] for call in case.calls if isinstance(call, tuple) and call[0] == "submit"]
+    assert [item["timeout_ms"] for item in payloads] == [submitted]
+    session.close()
+
+
+def test_cli_timeout_seconds_reach_dispatch_as_milliseconds(case, monkeypatch, tmp_path, capsys):
+    from palimpsest_local import cli, runtime_dispatch
+
+    observed = {}
+
+    def execute(name, argv, **kwargs):
+        observed.update(name=name, argv=list(argv), **kwargs)
+        return open_session()
+
+    isolate_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime_dispatch, "exec", execute)
+    assert cli.main(["exec", "--timeout", "150", "demo", "--", "/bin/probe"]) == 23
+    assert observed["timeout_ms"] == 150000 and observed["argv"] == ["/bin/probe"]
+
+
+def test_cli_omitted_timeout_leaves_the_dispatch_default(case, monkeypatch, tmp_path, capsys):
+    from palimpsest_local import cli, runtime_dispatch
+
+    observed = {}
+
+    def execute(name, argv, **kwargs):
+        observed.update(kwargs)
+        return open_session()
+
+    isolate_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime_dispatch, "exec", execute)
+    assert cli.main(["exec", "demo", "--", "/bin/probe"]) == 23
+    assert observed["timeout_ms"] is None
+
+
+@pytest.mark.parametrize("seconds", ["0", "601", "-5", "1.5", "30s"])
+def test_cli_rejects_out_of_range_timeout_without_dispatching(monkeypatch, tmp_path, seconds):
+    from palimpsest_local import cli, runtime_dispatch
+
+    def execute(*_args, **_kwargs):
+        raise AssertionError("dispatch must not run for an invalid timeout")
+
+    isolate_cli(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime_dispatch, "exec", execute)
+    assert cli.main(["exec", "--timeout", seconds, "demo", "--", "/bin/probe"]) == 2

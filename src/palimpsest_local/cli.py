@@ -835,6 +835,13 @@ def build_parser() -> argparse.ArgumentParser:
     shell.add_argument("name")
     execute = commands.add_parser("exec")
     execute.add_argument("--completion-record")
+    execute.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="OCI-root guest exec timeout in whole seconds (1-600; default 30)",
+    )
     execute.add_argument("name")
     execute.add_argument("command", nargs=argparse.REMAINDER)
     start = commands.add_parser("start")
@@ -889,6 +896,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             args.command = args.command[1:]
         if not args.command:
             parser.error("exec requires a command after --")
+        if args.timeout is not None and not 1 <= args.timeout <= 600:
+            parser.error("--timeout must be an integer between 1 and 600 seconds")
     if args.operation == "compose":
         if args.compose_operation == "exec":
             if args.command[:1] == ["--"]:
@@ -2247,6 +2256,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return _run_process_session(runtime_dispatch.shell(args.name, roots=roots), interactive=True)
 
     elif op == "exec":
+        timeout_ms = None if args.timeout is None else args.timeout * 1000
         if args.completion_record is not None:
             return _run_process_session(
                 runtime_dispatch.exec(
@@ -2254,11 +2264,12 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     args.command,
                     roots=roots,
                     completion_record=args.completion_record,
+                    timeout_ms=timeout_ms,
                 ),
                 interactive=False,
             )
         return _run_process_session(
-            runtime_dispatch.exec(args.name, args.command, roots=roots),
+            runtime_dispatch.exec(args.name, args.command, roots=roots, timeout_ms=timeout_ms),
             interactive=False,
         )
     elif op == "start":

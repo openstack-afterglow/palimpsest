@@ -319,7 +319,9 @@ def _proof(case: MLCase) -> None:
         calculation = legacy._save(
             parent,
             "tensor",
-            legacy._cli(environment, "exec", name, "--", case.python, "-c", case.program, timeout=180),
+            legacy._cli(
+                environment, "exec", "--timeout", "150", name, "--", case.python, "-c", case.program, timeout=180
+            ),
         )
         _require_success(phase_state, "framework-exec-command", calculation)
         _record_phase(

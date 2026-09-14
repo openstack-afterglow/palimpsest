@@ -397,6 +397,12 @@ def test_real_c_parser_accepts_authenticated_literal_argv_and_inherited_policy(r
     assert result.stdout == b"".join(item.encode() + b"\0" for item in argv)
 
 
+def test_real_c_parser_accepts_the_ten_minute_timeout_ceiling(runner):
+    result = runner(_frame(timeout=600000))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"/bin/demo\0"
+
+
 @pytest.mark.parametrize("mode,expected", [(1, 0), (3, 2), (7, 0), (8, 2), (9, 2)])
 def test_real_c_parser_rejects_duplicate_nonready_replayed_or_busy_exec(runner, mode, expected):
     assert runner(_frame(), mode).returncode == expected
@@ -436,7 +442,7 @@ def test_real_c_root_identity_drift_clears_evidence_and_suppresses_ready(runner)
         {"argv": ["x"] * 65, "timeout_ms": 1},
         {"argv": ["x" * 8192], "timeout_ms": 1},
         {"argv": ["x"], "timeout_ms": 0},
-        {"argv": ["x"], "timeout_ms": 30001},
+        {"argv": ["x"], "timeout_ms": 600001},
         {"argv": ["x"], "timeout_ms": 1, "env": {}},
     ],
 )

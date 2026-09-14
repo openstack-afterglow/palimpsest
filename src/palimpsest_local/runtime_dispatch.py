@@ -941,17 +941,20 @@ def exec(
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
     completion_record: str | None = None,
+    timeout_ms: int | None = None,
 ) -> ProcessSession:
-    request = ExecRequest.from_argv(argv)
+    request = ExecRequest.from_argv(argv, timeout_ms=timeout_ms)
     resolved_roots = roots or state.resolve_roots()
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
+    if request.timeout_ms is not None and record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT:
+        raise StateError("exec --timeout requires the OCI-root runtime")
     if completion_record is not None:
         from .oci_exec_control import validate_exec_request
         from .oci_exec_record import OCIExecRecordWriter
-        from .oci_exec_session import OCIExecRecordingError
+        from .oci_exec_session import OCIExecRecordingError, effective_exec_timeout_ms
 
-        validate_exec_request(request.argv, 30000)
+        validate_exec_request(request.argv, effective_exec_timeout_ms(request))
         if record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT:
             raise StateError("OCI exec completion records require the OCI-root runtime")
         adapter = _preflight_existing_adapter(record, RuntimeOperation.EXEC, resolved_roots)

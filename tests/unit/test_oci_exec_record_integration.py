@@ -544,8 +544,8 @@ def test_public_recorded_exec_forwards_raw_path_and_literal_argv(monkeypatch):
     candidate = object()
     seen = []
 
-    def execute(name, argv, *, roots, completion_record):
-        seen.append((name, argv, roots, completion_record))
+    def execute(name, argv, *, roots, completion_record, timeout_ms=None):
+        seen.append((name, argv, roots, completion_record, timeout_ms))
         return candidate
 
     monkeypatch.setattr(cli.runtime_dispatch, "exec", execute)
@@ -556,7 +556,7 @@ def test_public_recorded_exec_forwards_raw_path_and_literal_argv(monkeypatch):
     )
     assert cli.main(["exec", "--completion-record", raw, "demo", "--", "printf", "%s", "$HOME"]) == 23
     assert seen[0][0:2] == ("demo", ["printf", "%s", "$HOME"])
-    assert seen[0][3] == raw and type(seen[0][3]) is str
+    assert seen[0][3] == raw and type(seen[0][3]) is str and seen[0][4] is None
 
 
 @pytest.mark.parametrize(

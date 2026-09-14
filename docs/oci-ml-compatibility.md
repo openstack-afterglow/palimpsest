@@ -235,6 +235,11 @@ root identity, direct PID 1 root refusal, NIC-, hostdev-, and
 host-filesystem-free domain XML, normal stop/remove, and original archive
 preservation.
 
+The framework calculation is issued as `exec --timeout 150` so the guest
+execution deadline (150 s) stays inside the harness's 180-second outer command
+bound; the identity, PID 1 and lifecycle commands keep the default 30-second
+deadline.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

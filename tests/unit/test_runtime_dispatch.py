@@ -3472,6 +3472,29 @@ def test_process_operations_route_by_durable_record_without_returning_host_argv(
     assert kwargs["_expected_record"].dispatch_key.backend is RuntimeBackend(backend)
 
 
+def test_exec_timeout_is_refused_for_cloud_image_runs_before_the_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+    monkeypatch.setattr(
+        runtime_dispatch.cloud_runtime,
+        "exec_session",
+        lambda *_args, **_kwargs: pytest.fail("cloud-image exec must not receive a guest timeout"),
+    )
+
+    with pytest.raises(StateError, match="exec --timeout requires the OCI-root runtime"):
+        runtime_dispatch.exec("demo", ["/bin/true"], roots=roots, timeout_ms=1000)
+
+
 @pytest.mark.parametrize(
     ("operation", "dispatch"),
     [(RuntimeOperation.EXEC, runtime_dispatch.exec), (RuntimeOperation.SHELL, runtime_dispatch.shell)],

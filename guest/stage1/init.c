@@ -269,6 +269,7 @@ struct span { const char *p; usize n; };
 #define CONTROL_GUEST_OUTPUT_MAX 8192
 #define EXEC_ARGV_BYTES_MAX 8192
 #define EXEC_OUTPUT_BYTES_MAX 65536
+#define EXEC_TIMEOUT_MS_MAX 600000
 #define LIFECYCLE_CONNECTION_MAX 16
 #define LIFECYCLE_REQUEST_LEDGER_MAX 17
 #define LIFECYCLE_DISCONNECTED 0
@@ -2679,7 +2680,7 @@ static int parse_signed_host(struct lifecycle_session *session, usize size, int 
         }
         if (j->p - argv_start > EXEC_ARGV_BYTES_MAX || !take_char(j, ',') ||
             !key(j, "timeout_ms") || !uint_value(j, &signal_value) ||
-            !signal_value || signal_value > 30000) return 0;
+            !signal_value || signal_value > EXEC_TIMEOUT_MS_MAX) return 0;
         remote_exec.process.argc = argc;
         remote_exec.process.argv[argc] = 0;
     }

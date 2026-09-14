@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **75 command paths**, **220 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **75 command paths**, **221 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -1023,12 +1023,13 @@ usage: palimpsest shell [-h] name
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest exec [-h] [--completion-record COMPLETION_RECORD] name ...
+usage: palimpsest exec [-h] [--completion-record COMPLETION_RECORD] [--timeout SECONDS] name ...
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--completion-record` | string | `None` | Persist the OCI exec completion record at this path. |
+| `--timeout` | int | `None` | OCI-root guest exec timeout in whole seconds (1-600; default 30) |
 | `name` | string | required | Managed object, run, profile, or publication name. |
 | `command` | string (remainder) | `None` | Command and arguments passed to the managed workload. |
 

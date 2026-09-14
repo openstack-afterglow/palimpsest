@@ -193,6 +193,12 @@ unchanged. PID 1 protections and the capabilityless workload policy remain
 enabled; this is not privileged mode or general Docker compatibility. See
 [explicit OCI run users](docs/oci-run-user.md) for the contract and limits.
 
+OCI-root `exec` accepts `--timeout SECONDS` (integer 1–600, default 30) to set
+the guest execution deadline for that one command; the option is rejected for
+cloud-image runs. Retry, locking, privilege, cleanup and the 64 KiB output
+limit are unchanged, and a longer deadline does not change host monitor or run
+lock bounds.
+
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 
 ```sh

@@ -754,11 +754,11 @@ def test_top_level_exec_consumes_dispatcher_session_without_spawning_in_cli(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = object()
-    calls: list[tuple[str, list[str]]] = []
+    calls: list[tuple[str, list[str], int | None]] = []
 
-    def fake_exec(name, argv, *, roots):
+    def fake_exec(name, argv, *, roots, timeout_ms=None):
         del roots
-        calls.append((name, argv))
+        calls.append((name, argv, timeout_ms))
         return session
 
     monkeypatch.setattr(cli.runtime_dispatch, "exec", fake_exec)
@@ -769,7 +769,7 @@ def test_top_level_exec_consumes_dispatcher_session_without_spawning_in_cli(
     )
 
     assert cli.main(["exec", "demo", "--", "printf", "%s", "literal value"]) == 23
-    assert calls == [("demo", ["printf", "%s", "literal value"])]
+    assert calls == [("demo", ["printf", "%s", "literal value"], None)]
 
 
 def test_cli_run_attached_result_bridges_generic_session_and_returns_its_exit(

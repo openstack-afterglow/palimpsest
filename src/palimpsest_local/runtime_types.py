@@ -292,21 +292,24 @@ class ProcessExitCategory(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ExecRequest:
-    """Validated literal guest argv for one non-interactive exec operation."""
+    """Validated literal guest argv and optional guest deadline for one exec."""
 
     argv: tuple[str, ...]
+    timeout_ms: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.argv, tuple) or not self.argv:
             raise ValueError("exec requires a nonempty argv")
         if any(not isinstance(item, str) or "\x00" in item for item in self.argv):
             raise ValueError("exec argv must contain only NUL-free strings")
+        if self.timeout_ms is not None and (type(self.timeout_ms) is not int or self.timeout_ms < 1):
+            raise ValueError("exec timeout_ms must be a positive integer or None")
 
     @classmethod
-    def from_argv(cls, argv: Sequence[str]) -> ExecRequest:
+    def from_argv(cls, argv: Sequence[str], *, timeout_ms: int | None = None) -> ExecRequest:
         if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
             raise TypeError("exec argv must be a sequence of strings")
-        return cls(tuple(argv))
+        return cls(tuple(argv), timeout_ms)
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass, replace
 
 from .errors import StateError
+from .oci_control_protocol_v2 import DEFAULT_OCI_EXEC_TIMEOUT_MS
 from .oci_exec_control import MAX_EXEC_CHUNK, MAX_EXEC_OUTPUT, MAX_EXEC_SEQUENCE, validate_exec_request
 from .oci_exec_record import OCIExecRecordWriter
 from .oci_monitor_client import MonitorClient, _Deadline
@@ -136,10 +137,16 @@ def validate_exec_status(value):
         raise StateError("OCI exec mailbox status is invalid")
 
 
+def effective_exec_timeout_ms(request: ExecRequest) -> int:
+    """Resolve the guest exec deadline; None keeps the historical 30-second bound."""
+    return DEFAULT_OCI_EXEC_TIMEOUT_MS if request.timeout_ms is None else request.timeout_ms
+
+
 def exec_session(name, request, *, roots, _expected_record, _record_writer=None):
     if type(request) is not ExecRequest:
         raise StateError("OCI exec requires literal guest argv")
-    argv = validate_exec_request(request.argv, 30000)
+    timeout_ms = effective_exec_timeout_ms(request)
+    argv = validate_exec_request(request.argv, timeout_ms)
     if _record_writer is not None and type(_record_writer) is not OCIExecRecordWriter:
         raise StateError("OCI exec record writer is invalid")
     binding = load_oci_run_binding(roots, name)
@@ -147,11 +154,11 @@ def exec_session(name, request, *, roots, _expected_record, _record_writer=None)
         raise StateError("OCI exec run identity changed")
     with locked_existing_run(roots, name, expected=binding.record, lock_timeout=5) as mutation:
         endpoint = _read_run_journal(mutation, binding).endpoint
-    return OCIExecProcessSession(roots, binding, endpoint, argv, _record_writer=_record_writer)
+    return OCIExecProcessSession(roots, binding, endpoint, argv, timeout_ms=timeout_ms, _record_writer=_record_writer)
 
 
 class OCIExecProcessSession:
-    def __init__(self, roots, binding, endpoint, argv, *, timeout_ms=30000, _record_writer=None):
+    def __init__(self, roots, binding, endpoint, argv, *, timeout_ms=DEFAULT_OCI_EXEC_TIMEOUT_MS, _record_writer=None):
         if _record_writer is not None:
             if type(_record_writer) is not OCIExecRecordWriter:
                 raise StateError("OCI exec record writer is invalid")

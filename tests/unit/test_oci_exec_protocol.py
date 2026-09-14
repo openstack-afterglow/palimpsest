@@ -107,10 +107,18 @@ def test_invalid_argv_is_rejected_without_state_change(session, argv):
     assert before == (session._host_wire, session._request, session.state)
 
 
-@pytest.mark.parametrize("timeout", [0, -1, 30001, True, 1.5, "30"])
+@pytest.mark.parametrize("timeout", [0, -1, 600001, True, 1.5, "30"])
 def test_timeout_is_finite_strict_and_bounded(session, timeout):
     with pytest.raises(OCIControlProtocolV2Error):
         session.exec(("/bin/echo",), timeout_ms=timeout)
+
+
+def test_timeout_defaults_to_thirty_seconds(session):
+    assert session.exec(("/bin/echo",)).body.payload["timeout_ms"] == 30000
+
+
+def test_timeout_ceiling_is_admitted(session):
+    assert session.exec(("/bin/echo",), timeout_ms=600000).body.payload["timeout_ms"] == 600000
 
 
 def test_request_is_immutable_and_authenticated(session):

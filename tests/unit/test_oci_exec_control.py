@@ -55,7 +55,7 @@ def test_single_job_duplicate_submit_and_take_are_exactly_once():
         (["/p"] * 65, 1),
         (["/p"], True),
         (["/p"], 0),
-        (["/p"], 30001),
+        (["/p"], 600001),
     ],
 )
 def test_invalid_submission_does_not_poison_ready_mailbox(argv, timeout):
@@ -64,6 +64,13 @@ def test_invalid_submission_does_not_poison_ready_mailbox(argv, timeout):
     with pytest.raises(MonitorExecControlError, match="invalid-request"):
         control.submit(1, str(uuid.uuid4()), argv, timeout)
     assert control.status() == before and control.take_exec() is None
+
+
+def test_mailbox_admits_the_ten_minute_timeout_ceiling():
+    control = ready()
+    token = str(uuid.uuid4())
+    assert control.submit(1, token, ["/p"], 600000)["state"] == "queued"
+    assert control.take_exec().timeout_ms == 600000
 
 
 def test_parallel_submissions_admit_only_one_literal_request():
