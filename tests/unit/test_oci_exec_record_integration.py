@@ -539,10 +539,15 @@ def test_parser_keeps_record_path_raw_and_option_after_name_literal():
     assert literal.completion_record is None and literal.command == ["--completion-record", raw]
 
 
-def test_public_recorded_exec_forwards_raw_path_and_literal_argv(monkeypatch):
+def test_public_recorded_exec_forwards_raw_path_and_literal_argv(monkeypatch, tmp_path):
     raw = "/private/parent/../record"
     candidate = object()
     seen = []
+    journal = tmp_path / "journal"
+    journal.mkdir(mode=0o700)
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(journal))
 
     def execute(name, argv, *, roots, completion_record, timeout_ms=None):
         seen.append((name, argv, roots, completion_record, timeout_ms))

@@ -556,9 +556,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "37858f76d7cf83726e36c477390a52650a05c300816795194d7fefb3512a7ee8",
-  "reviewed_at": "2026-09-14T14:23:11Z",
-  "summary": "Reviewed the bounded public exec deadline: CLI --timeout SECONDS (1-600, default 30) reaches runtime_dispatch.exec as milliseconds, ExecRequest carries the optional bound, exec_session resolves it through effective_exec_timeout_ms, protocol v2 and guest PID 1 admit up to 600000 ms, and cloud-image runs are refused before the adapter. Retry, run lock, monitor waits, privilege, cleanup and the 64 KiB output limit are unchanged, so this does not remove the 9239dbd coordinator-spawn or run-lock boundaries. Sealed stage-1 ELF rebuilt twice to 1fe7b61c with source pin b2788f5f; local changed-lane 5728 passed with 217 skips, guest-binary 34 passed, Docker guest C 31 passed, CLI reference check current. Changed-ELF native boot matrix and ML re-verification remain separate evidence."
+  "source_sha256": "eb3bd17e84fd6d8cbabdc862c4f888d4e56ae5d3bfd04e33d0329ed324bb2f4f",
+  "reviewed_at": "2026-09-14T14:27:00Z",
+  "summary": "Reviewed test-only host isolation for the recorded-exec CLI case: pin state, config and journal roots so ambient Linux state-root resolution cannot change the observed exit code. No source, runtime, guest or policy change beyond the already-reviewed exec --timeout contract at 5e9473a; native stage-1 matrix and ML re-verification remain separate evidence."
 }
 ```
 <!-- architecture-review:end -->
