@@ -13,6 +13,13 @@ Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 
 
 ## Development status
 
+개발 세션 재개는 [개발 인계 문서](docs/development-handoff.md)에서 시작한다.
+이 문서는 전체 목표·최근 검증·작업트리의 미게시 변경·승인 대기와 다음 순서를
+모으는 탐색 문서이며, 아래 source 계약이나 실행 증거를 대체하지 않는다.
+[`README.md`](README.md)와 [`agent.md`](agent.md), [`AGENTS.md`](AGENTS.md)가
+같은 인계로 연결된다. 2026-09-14 문서화 작업은 런타임 변경 또는 원격 게시·
+GPU 점검 승인이 아니며 기존 staged PCI 구현과 미승인 증거 변경을 보존한다.
+
 공개 OCI `run IMAGE [OPTIONS] -- COMMAND [ARG...]`는 원본 Entrypoint를 유지하고 Cmd만 교체한다. trusted SourceCAS의 descriptor-verified config를 다시 읽어 원본 process 전체와 대조하며, 새 boot-plan v4에 원본 벡터·명시 command·선택 user·실행 process를 결합한다. 기본 v2와 user-only v3, source/lower receipt와 guest ELF·권한 정책은 유지한다. 공식 TensorFlow 2.21 CPU와 PyTorch 2.8 CUDA runtime 원본 archive의 취득은 통과했으며, 각각의 실제 CPU 행렬 연산·root/PID1·정리 증거는 별도 [ML 검증](docs/oci-ml-compatibility.md)으로 구분한다. GPU passthrough/sharing은 미구현이며 [GPU 및 OpenStack 경계](docs/oci-gpu-support.md)에 조사와 제안만 기록한다.
 
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
@@ -544,9 +551,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4abcefaea57086a4856417bd3f8cce6becb755f0eee377b0b8384a6c302a473b",
-  "reviewed_at": "2026-09-14T10:31:58Z",
-  "summary": "Reviewed pci_preflight source, synthetic sysfs tests, hostdev rejection regression, lane mapping and GPU limits. Added an internal bounded read-only inventory API with canonical PCI facts, IOMMU members and detected-link identity checks; no public CLI, allocation, XML, driver, guest or authority change. Local focused PCI/lane91 and existing define-failure15 plus architecture guard13 passed. Remote hardware helper transfer was denied before execution: no fresh server hardware facts, passthrough, CUDA or native success. Existing hostdev rejection and selected Nova-instance target remain unchanged."
+  "source_sha256": "909f9e273842a5812466f9bf450446647f121bfb44ec9d93d9b850d3212806b9",
+  "reviewed_at": "2026-09-14T13:39:09Z",
+  "summary": "Documentation-only handoff after reviewed PCI commit: add README, AGENTS.md, agent.md, development handoff, and architecture resume entrypoint. Preserve unrelated MySQL/service/process working changes outside this commit. Local PCI/lane91, hostdev15, architecture guard13, manifest, working architecture, and diff checks passed; no native, GPU, server, package, or release result yet."
 }
 ```
 <!-- architecture-review:end -->

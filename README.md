@@ -436,6 +436,23 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 ## Development
 
+### Resume ongoing development
+
+Start with the [development handoff](docs/development-handoff.md) for the
+2026-09-14 checkpoint: completed work, image-specific verification, unresolved
+ML failures, the local PCI preflight, pending approvals, and ordered next tasks.
+Read [AGENTS.md](AGENTS.md) for contributor rules and [ARCHITECTURE.md](ARCHITECTURE.md)
+for the current source contracts before changing code. [agent.md](agent.md) is
+a short agent entrypoint to the same documents, not a separate policy.
+
+At this checkpoint, PCI inventory is implemented and locally tested, but actual
+GPU passthrough/CUDA is **not** qualified. The PCI changes remain uncommitted;
+GitHub publication and a private read-only server helper both await explicit
+approval after their execution requests were blocked. Saving this handoff does
+not approve either action. Recheck the current Git state before resuming; do not
+treat this dated checkpoint as fresh server inventory or an instruction to
+commit every existing change.
+
 ```sh
 uv sync --frozen --extra dev
 uv run ruff format --check .

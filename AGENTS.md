@@ -1,5 +1,15 @@
 # Palimpsest Local contributor rules
 
+## Resume ongoing work
+
+- 새 세션에서는 [`README.md`](README.md)의 Development, [`docs/development-handoff.md`](docs/development-handoff.md), [`ARCHITECTURE.md`](ARCHITECTURE.md)를 읽고 현재 Git/source 상태와 대조한다. [`agent.md`](agent.md)는 이 파일로 연결하는 진입점이며 별도 규칙이 아니다.
+- 인계 문서에는 전체 목표·확정 결정·이미지별 결과·미완료 작업·승인 대기·정확한 재개 순서가 있다. 날짜가 있는 기록을 현재 서버 상태나 새 승인으로 해석하지 않는다.
+- 먼저 `git status --short`, `git diff --stat`, `git diff --cached --stat`, `git log -5 --oneline`으로 staged/unstaged와 마지막 commit을 구분한다. 기존 미승인 증거 문서와 새 작업을 섞어 commit하지 않는다.
+- 사용자 지정 역할은 Astra의 계획·오케스트레이션·관리, Sol의 개발이며 독립 검토를 거친다. 호스트에서 해당 모델/검토가 불가능하면 대체를 조용히 확정하지 말고 제약을 보고한다.
+- 개발 중에는 정확한 노드 또는 영향받은 test lane부터 실행한다. native/ML/GPU 실기는 별도 전제와 승인 범위에서 순차 실행하고, portable 통과를 실기 성공으로 기록하지 않는다.
+- 인계에 남은 GitHub 게시 및 원격 helper 전송 차단은 명시적 승인 전까지 유지한다. 문서화·계속 진행 요청만으로 해제하지 않으며 다른 경로로 같은 차단 작업을 우회하지 않는다. 장치 재할당·driver unbind/reset·기존 실패 VM 제거는 읽기 전용 점검과 별도 권한이다.
+- 작업 종료 시 인계의 다음 작업·근거 SHA·실행한 검사·실패·승인 대기를 갱신한다. 과거 결과를 새 성공으로 덮어쓰거나 실제 비밀값을 기록하지 않는다.
+
 ## Architecture maintenance
 
 - 작업 전에 root [`ARCHITECTURE.md`](ARCHITECTURE.md)와 영향을 받는 상세 문서를 읽는다.
