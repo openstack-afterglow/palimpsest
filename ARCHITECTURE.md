@@ -22,6 +22,8 @@ GPU 점검 승인이 아니며 기존 staged PCI 구현과 미승인 증거 변�
 
 공개 OCI `run IMAGE [OPTIONS] -- COMMAND [ARG...]`는 원본 Entrypoint를 유지하고 Cmd만 교체한다. trusted SourceCAS의 descriptor-verified config를 다시 읽어 원본 process 전체와 대조하며, 새 boot-plan v4에 원본 벡터·명시 command·선택 user·실행 process를 결합한다. 기본 v2와 user-only v3, source/lower receipt와 guest ELF·권한 정책은 유지한다. 공식 TensorFlow 2.21 CPU와 PyTorch 2.8 CUDA runtime 원본 archive의 취득은 통과했으며, 각각의 실제 CPU 행렬 연산·root/PID1·정리 증거는 별도 [ML 검증](docs/oci-ml-compatibility.md)으로 구분한다. GPU passthrough/sharing은 미구현이며 [GPU 및 OpenStack 경계](docs/oci-gpu-support.md)에 조사와 제안만 기록한다.
 
+`9239dbd`에서 ML native 두 사례를 각각 1회 실행했고 둘 다 CPU tensor·root identity·PID 1 단계에 도달하지 못했다. TensorFlow의 detached run은 116.6초에 이름과 exit 0을 반환했고 guest console에 root 전환·workload 시작·READY commit이 남았지만, 이어진 공개 `exec`이 5.09초에 `timeout-source=run-lock-timeout` 하나만 남기고 실패했다. 저장된 stdout은 비어 있고 `did not complete: timeout` 안내도 없어 만료한 경계는 30초 guest exec 기한이 아니라 host run lock 획득이다. `MonitorClient.exec_request`는 각 mailbox 교환의 전과 후에 그 lock을 잡으므로 guest 명령이 이미 admit됐는지는 확정되지 않고, lock 보유자도 어떤 receipt에도 남지 않는다. 별개로 ledger는 status `failed`와 일반 메시지 `OCI-root launch failed`, handoff `failed`(lifecycle receipt는 `ready`), monitor owner journal `control-lost` revision 7을 남겼다. 이는 durable READY 이후 detached worker가 제어를 잃었음을 보여 주지만 exec lock 대기와의 시간 순서는 기록되지 않아 인과는 미확정이다. PyTorch는 더 앞선 `public-run-command`에서 고정 coordinator 코드 `[parent-response:timeout]`으로 실패했고 ledger는 `defined`에 머물렀다. 관측된 두 경계는 모두 guest 실행 기한이 아니라 coordinator spawn handshake와 host run lock이다. 남은 진단 대상은 post-READY worker 실패 사유가 일반 메시지로 소실되는 점, run lock 보유자 식별, coordinator spawn 15초·launch authority 60초·run lock 5초 고정 한도의 대용량 materialization 적합성이다. 자원 보존은 확인했다. TensorFlow 실행 뒤 새 domain은 남지 않았고 PyTorch의 새 `ml-pytorch-69afe41a`는 inactive로 보존했으며 archive digest와 zero-active는 그대로다. GPU·CUDA·외부 network는 여전히 범위 밖이다. 상세는 [ML 검증](docs/oci-ml-compatibility.md)에 있다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -552,8 +554,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "909f9e273842a5812466f9bf450446647f121bfb44ec9d93d9b850d3212806b9",
-  "reviewed_at": "2026-09-14T13:39:09Z",
-  "summary": "Documentation-only handoff after reviewed PCI commit: add README, AGENTS.md, agent.md, development handoff, and architecture resume entrypoint. Preserve unrelated MySQL/service/process working changes outside this commit. Local PCI/lane91, hostdev15, architecture guard13, manifest, working architecture, and diff checks passed; no native, GPU, server, package, or release result yet."
+  "reviewed_at": "2026-09-14T14:04:11Z",
+  "summary": "Reviewed unchanged runtime source against the 9239dbd native ML results: recorded the TensorFlow host run-lock exec boundary with unestablished guest admission and ordering, the PyTorch coordinator-spawn parent-response timeout, preserved inactive ml-pytorch-69afe41a, intact 17-domain/16-archive/zero-active baselines, and the umask 022 plus isolated PALIMPSEST_LOG_HOME host prerequisites behind the 250 focused Linux passes. Documentation only; no source, guest, timeout, lock or cleanup policy changed, and no framework CPU tensor, root, PID 1 or GPU result is claimed."
 }
 ```
 <!-- architecture-review:end -->

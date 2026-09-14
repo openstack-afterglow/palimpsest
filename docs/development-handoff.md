@@ -27,24 +27,32 @@ files_modified:
 ## 현재 스냅샷
 
 - branch: `codex/oci-root-phase1`
-- HEAD: `cfa727133449c2b710babfc4f140a2990859054c`
-- staged PCI snapshot의 architecture review marker source SHA-256:
-  `4abcefaea57086a4856417bd3f8cce6becb755f0eee377b0b8384a6c302a473b`
-  (381 files). 이후 문서 연결 작업으로 현재 working marker는
+- HEAD: `9239dbda232896d881047ce8840f224d4a46ba93` (`origin`과 동일).
+  이 세션에서 `86fe832` PCI snapshot과 `9239dbd` 문서 인계를 각각 commit·push했고
+  GitHub development package workflow(run `34850666453`)의 verify/publish가 통과해
+  `package-9239dbda232896d881047ce8840f224d4a46ba93` prerelease가 생성됐다.
+  prerelease는 안정 release나 Gate 2 qualification이 아니다.
+- architecture review marker: `9239dbd` 시점 staged marker는
   `909f9e273842a5812466f9bf450446647f121bfb44ec9d93d9b850d3212806b9`
-  (381 files)로 다시 stamp됐다. 두 값은 서로 다른 범위의 point-in-time
-  증거이며 어느 하나로 다른 범위를 대체하지 않는다.
-- 마지막 Linux 선별 검증 기준 commit: `aad3d492` — monitor-client timeout
-  origin 계약의 client/exec 선별 105건이 로컬과 정확한 Linux checkout에서
-  통과했다. 이는 ML native 성공이나 전체 regression 성공이 아니다.
-- 현재 working tree에는 아래 PCI 변경 외에도 다른 작성자가 소유한 변경이
-  섞여 있다. 특히 오래된 MySQL 관련 `ARCHITECTURE.md` hunk,
-  `docs/docker-hub-service-matrix.md` 36줄, `docs/oci-linux-process.md` 8줄은
-  아직 이 인계 작업의 검토 범위가 아니다. 복원, 정리, stage 또는 함께
-  commit하지 않는다.
-- 이 문서 작성 직전 문서-only 검증은 architecture guard 13 passed,
-  working/staged architecture guard 및 lane `list --check` 통과였다. PCI
-  source snapshot의 119 tests를 다시 실행한 결과는 아니다.
+  (381 files)이며 이전 PCI staged marker
+  `4abcefaea57086a4856417bd3f8cce6becb755f0eee377b0b8384a6c302a473b`는
+  `86fe832`에 그대로 들어갔다. 두 값은 서로 다른 범위의 point-in-time 증거다.
+- 서버 `pieroot-server` checkout: `/home/pieroot/code/palimpsest`가 detached
+  `9239dbda232896d881047ce8840f224d4a46ba93`, `git status --porcelain` 0줄.
+  native venv는 `/tmp/palimpsest-30y-venv.B5P9EO/bin/python`(3.12.3, libvirt 10.0.0)이며
+  `~/code/palimpsest/.venv`에는 libvirt가 없으므로 실기에 쓰지 않는다.
+- 서버 선별 Linux 검사는 `9239dbd`에서 250건 통과(다른 outcome 없음)했다.
+  두 host 전제가 필요하다. `umask 022`가 없으면 기본 umask 002의 group-writable
+  fixture 때문에 `verify_host_boot_artifacts`가 합성 kernel metadata를 거부해
+  setup error 48건이 나고, 격리된 `PALIMPSEST_LOG_HOME`이 없으면 부재한
+  `/var/log/palimpsest` 경고가 stderr 정확 비교 assertion 3건을 깨뜨린다.
+  두 전제는 proof 계약이 아니라 실행 환경 조건이다.
+- 현재 working tree에는 다른 작성자가 소유한 변경이 남아 있다. 오래된 MySQL 관련
+  `ARCHITECTURE.md` hunk, `docs/docker-hub-service-matrix.md` 36줄,
+  `docs/oci-linux-process.md` 8줄은 이 세션의 검토·게시 범위가 아니며 복원, 정리,
+  stage 또는 함께 commit하지 않았다.
+- 로컬 선별 검증은 PCI/lane 91건, define-failure 15건, architecture guard 13건,
+  lane manifest, working/staged architecture guard, `git diff --check`가 통과했다.
 
 증거 용어는 엄격히 구분한다.
 
@@ -172,6 +180,34 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   fixed-enum observability가 후속 구현·검토됐지만, 이 변경들로 PyTorch native
   성공이 새로 증명되지는 않았다. 실패 증거와 inactive resource를 임의로
   삭제하거나 성공으로 재분류하지 않는다.
+- `9239dbd` native TensorFlow는 detached run이 116.6초에 이름과 exit 0을
+  반환하고 guest console에 root 전환·workload 시작·READY commit을 남겼지만,
+  이어진 공개 `exec`이 5.09초에 `timeout-source=run-lock-timeout` 하나만
+  남기고 실패했다. 저장된 stdout은 비어 있고 `did not complete: timeout`
+  안내도 없으므로 만료한 경계는 30초 guest exec 기한이 아니라 host run lock
+  획득이다. `MonitorClient.exec_request`는 mailbox 교환 전후로 그 lock을
+  잡으므로 guest 명령의 admit 여부는 확정되지 않고 lock 보유자도 receipt에
+  없다. 별개로 ledger는 status `failed`·일반 메시지 `OCI-root launch failed`,
+  handoff `failed`(lifecycle receipt는 `ready`), monitor owner journal
+  `control-lost` revision 7을 남겼다. durable READY 이후 worker가 제어를
+  잃었다는 사실은 확인되지만 exec lock 대기와의 순서·인과는 미확정이다.
+  새 domain은 남지 않았고 기존 17 domain·16 archive·zero-active는 보존됐다.
+- `9239dbd` native PyTorch는 더 앞선 `public-run-command`에서 300초 뒤
+  고정 coordinator 코드 `[parent-response:timeout]`으로 실패했다. ledger는
+  `defined`에 머물고 handoff와 monitor owner journal이 없다. 새
+  `ml-pytorch-69afe41a`(UUID `d20cd3df-768b-400a-a35c-ddbe011630f0`)는
+  inactive·autostart disable로 보존했다. 총 18 domain, active 0, archive
+  digest 불변이다. 이 domain을 stop·undefine·adopt하지 않는다.
+- 관측된 두 경계는 guest 실행 기한이 아니라 coordinator spawn handshake와
+  host run lock이다. 승인된 공개 `exec --timeout` 계약 변경은 guest 실행
+  기한만 넓히므로 이 두 경계를 그 자체로 제거하지 못한다. 남은 진단은
+  post-READY worker 실패 사유가 일반 메시지로 소실되는 문제, run lock
+  보유자 식별, coordinator spawn 15초·launch authority 60초·run lock 5초
+  고정 한도의 대용량 materialization 적합성이다.
+- 비교용 소용량 control lane은 실행 불가였다. 핀된 build artifact의
+  `acceptance.json`이 아직 `palimpsest.oci-root-build-run-acceptance.v1`이고
+  `tests/kvm/test_oci_exec_cli_live.py`는 v2를 요구하므로 입력 검증에서
+  실패했고 VM은 만들지 않았다.
 
 GPU assignment는 구현 또는 live-qualified 상태가 아니다. 선택한 장기
 topology는 Nova GPU instance 자체가 OCI-root workload VM이 되는 경로이며,
@@ -212,10 +248,9 @@ Latest, PyPI release, KVM 또는 Gate 2 증거가 아니다. 설치 및 검증�
 [development-package workflow](../.github/workflows/development-package.yml)를
 따른다.
 
-## 현재 commit 전 PCI preflight 변경
+## 게시된 PCI preflight 변경
 
-다음 여섯 파일의 한 묶음이 현재 stage/index 또는 working tree에 있으며
-**아직 commit/push되지 않았다**.
+다음 여섯 파일의 한 묶음은 `86fe832`로 commit되고 `9239dbd`와 함께 push됐다.
 
 1. `src/palimpsest_local/pci_preflight.py`
 2. `tests/unit/test_pci_preflight.py`
@@ -239,18 +274,20 @@ inventory이며 allocation authority가 아니다. 기존 OCI domain validator�
 - hostile device-class define failure matrix: 15 passed
 - architecture guard: 13 passed
 
-source/test/doc은 독립 검토 승인됐다. 아직 commit, push, Linux hardware query,
-GPU attach는 없었다. 다음 세션은 먼저 현재 diff가 이 인계의 여섯 파일과
-타 작성자 hunk를 그대로 보존하는지 재확인해야 한다.
+source/test/doc은 독립 검토 승인 뒤 이 세션에서 commit·push됐다. Linux
+hardware query와 GPU attach는 여전히 없었고, `9239dbd` 서버 선별 검사에서
+PCI 노드도 함께 통과했다.
 
 ## 명시적 승인 대기 — 실행 금지
 
-다음 두 작업은 사용자 승인 전 단계에서 멈춰 있다. 이번 인계 문서 요청은
-어느 쪽의 승인도 아니다. 우회 수단으로 같은 결과를 만들지 않는다.
+다음 작업은 사용자 승인 전 단계에서 멈춰 있다. 문서화·계속 진행 요청은
+승인이 아니며 우회 수단으로 같은 결과를 만들지 않는다. GitHub remote
+`git@github.com:openstack-afterglow/palimpsest.git`로의 publication은 이 세션에서
+명시적으로 승인되어 `86fe832`·`9239dbd` push와 exact-SHA prerelease까지 수행됐다.
+이 승인은 branch `codex/oci-root-phase1`의 commit/push/package publication에만
+해당하며 아래 helper 전송을 포함하지 않는다.
 
-1. GitHub remote `git@github.com:openstack-afterglow/palimpsest.git`로 publication
-   (commit/push/package publication 포함).
-2. private read-only helper
+1. private read-only helper
    `/private/tmp/palimpsest-gpu-preflight.py`
    (SHA-256 `d551bd901ba3795856f015f9ef83fd7a9c457065c9d004a9f8c1cd1720a3cb9c`)
    를 `pieroot-server:/tmp/palimpsest-gpu-preflight-d551bd90.py`로 전송한 뒤
@@ -317,10 +354,12 @@ GPU attach는 없었다. 다음 세션은 먼저 현재 diff가 이 인계의 �
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
 7. **ML 재검증:** 새 exact SHA와 보존 baseline에서 TensorFlow와 PyTorch를
-   순차 실행한다. 새 timeout-source 오류 코드와 고정 coordinator code를
-   별도 `ml-phase.json` phase/status/rc receipt와 함께 해석하고, framework
-   matrix/root/PID1/cleanup이 실제 통과하기 전에는 ML 또는 GPU 성공으로
-   표시하지 않는다.
+   순차 실행한다. `9239dbd` 결과가 보여 준 실제 경계는 coordinator spawn
+   handshake와 host run lock이므로 guest 실행 기한 변경만으로 통과를
+   기대하지 않는다. 먼저 post-READY worker 실패 사유 보존과 run lock 보유자
+   식별을 설계하고, framework matrix/root/PID1/cleanup이 실제 통과하기 전에는
+   ML 또는 GPU 성공으로 표시하지 않는다. 보존된 `ml-pytorch-69afe41a`는
+   진단 자료이며 stop·undefine·adopt 대상이 아니다.
 
 ### 이후 backlog — 현재 승인 아님
 

@@ -181,6 +181,52 @@ selection passed 228 checks locally with six Linux-only skips, then exactly
 development package succeeded. This qualifies the selected diagnostic-code
 regressions, not a fresh PyTorch/TensorFlow native execution or GPU support.
 
+At `9239dbd`, both pinned cases ran once each on the exact Linux checkout, and
+neither reached the CPU tensor, root-identity, or PID 1 assertions.
+
+TensorFlow's detached public run returned its name with exit 0 after 116.6
+seconds, and its guest console recorded root transition, workload start, and a
+committed READY. The following public `exec` failed after 5.09 seconds with the
+single fixed marker `timeout-source=run-lock-timeout`; its saved stdout was
+empty and the `OCI exec did not complete: timeout` guidance was absent, so the
+30-second guest exec deadline was not the boundary that expired. The failing
+wait was a host run-lock acquisition. `MonitorClient.exec_request` takes that
+lock both before and after each mailbox exchange, so whether the guest command
+had already been admitted is not established, and the lock holder is not
+identified by any preserved receipt. The run ledger separately recorded
+`status` `failed` with the generic `OCI-root launch failed`, a handoff phase of
+`failed` while its lifecycle receipt still read `ready`, and a monitor owner
+journal of `control-lost` at revision 7. Those receipts establish that the
+detached worker lost control after durable READY; their ordering against the
+exec lock wait is not recorded, so the causal relation remains unestablished.
+No new domain remained, and the pinned 17 inactive domains, 16 archive digests
+and zero-active postflight were preserved.
+
+PyTorch failed earlier, at `public-run-command`, after 300 seconds of wall
+time, with the fixed coordinator code `[parent-response:timeout]`: the parent's
+bounded coordinator-spawn response expired. Its run ledger stopped at `defined`
+with no handoff and no monitor owner journal. The new `ml-pytorch-69afe41a`
+domain (UUID `d20cd3df-768b-400a-a35c-ddbe011630f0`) is retained inactive with
+autostart disabled, giving 18 total domains, zero active and unchanged archive
+digests. It must not be stopped, removed or adopted.
+
+Neither observed boundary is a guest execution deadline: PyTorch expired in the
+coordinator-spawn handshake, and TensorFlow expired on a host run-lock wait.
+The open diagnosis is that a post-READY worker failure collapses into one
+generic message, and that the fixed coordinator-spawn (15 s), launch-authority
+(60 s) and run-lock (5 s) bounds have not been evaluated against
+multi-hundred-megabyte and multi-gigabyte materialization on this host.
+Preserving a bounded fixed-enum reason for post-READY worker loss, and
+identifying the run-lock holder, remain separate reviewed changes. A larger
+public exec deadline changes only the guest execution bound and therefore
+cannot by itself remove either observed boundary.
+
+The small-image control lane attempted for comparison could not run: the pinned
+build artifact's `acceptance.json` still declares
+`palimpsest.oci-root-build-run-acceptance.v1` while
+`tests/kvm/test_oci_exec_cli_live.py` requires v2, so it failed during input
+validation without creating a VM.
+
 The two cases run sequentially with 8 GiB RAM, two vCPUs, and `network none`.
 Public `exec` performs a deterministic 2-by-2 matrix multiplication with
 single-thread framework settings, checks the exact result and sum, CPU device,
