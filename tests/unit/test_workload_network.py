@@ -157,8 +157,8 @@ static i64 sc3(i64 number, i64 a, i64 b, i64 c) {
         }
         if (b == SIOCGIFFLAGS) {
             if (scenario == FLAGS_DOWN) request->value.flags = IFF_RUNNING;
-            else if (scenario == LOOPBACK_FLAGS) request->value.flags = IFF_UP | IFF_RUNNING | IFF_LOOPBACK;
-            else request->value.flags = IFF_UP | IFF_RUNNING;
+            else if (scenario == LOOPBACK_FLAGS) request->value.flags = IFF_UP | IFF_LOOPBACK;
+            else request->value.flags = IFF_UP;
             return 0;
         }
         if (b == SIOCGIFHWADDR) {

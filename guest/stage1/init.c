@@ -4613,7 +4613,10 @@ static int prepare_workload_network(const struct guest_network *net, struct chil
     memset(&request, 0, sizeof(request));
     memcpy(request.name, net->interface, slen(net->interface) + 1);
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFFLAGS, (i64)&request);
-    if (operation != 0 || (request.value.flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) ||
+    /* Administrative state and device class are contract properties; carrier
+     * (IFF_RUNNING) is transient runtime state and is deliberately not a boot
+     * requirement. Identity below is proven by MAC, address, mask and route. */
+    if (operation != 0 || !(request.value.flags & IFF_UP) ||
         (request.value.flags & IFF_LOOPBACK)) goto closed;
     stage = 51;
     memset(&request, 0, sizeof(request));
