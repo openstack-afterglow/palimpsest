@@ -4586,6 +4586,7 @@ static int prepare_workload_network(const struct guest_network *net, struct chil
     struct ifreq_local request;
     i64 descriptor, operation = -EIO;
     int index = 0;
+    int stage = 45;
     int valid = 0;
     descriptor = sc3(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (descriptor < 0) {
@@ -4593,9 +4594,11 @@ static int prepare_workload_network(const struct guest_network *net, struct chil
         return 0;
     }
     if (!net->enabled) {
+        stage = 48;
         valid = verify_configured_interfaces((int)descriptor, net);
         goto closed;
     }
+    stage = 47;
     memset(&request, 0, sizeof(request));
     if (!copy_span(request.name, sizeof(request.name),
                    (struct span){net->interface, slen(net->interface)})) goto closed;
@@ -4606,27 +4609,34 @@ static int prepare_workload_network(const struct guest_network *net, struct chil
     request.value.index = index;
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFNAME, (i64)&request);
     if (operation != 0 || !text_equal(request.name, net->interface)) goto closed;
+    stage = 50;
     memset(&request, 0, sizeof(request));
     memcpy(request.name, net->interface, slen(net->interface) + 1);
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFFLAGS, (i64)&request);
     if (operation != 0 || (request.value.flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) ||
         (request.value.flags & IFF_LOOPBACK)) goto closed;
+    stage = 51;
     memset(&request, 0, sizeof(request));
     memcpy(request.name, net->interface, slen(net->interface) + 1);
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFHWADDR, (i64)&request);
     if (operation != 0 || request.value.hardware.family != ARPHRD_ETHER ||
         !bytes_equal((const char *)request.value.hardware.mac, (const char *)net->mac, 6)) goto closed;
+    stage = 52;
     memset(&request, 0, sizeof(request));
     memcpy(request.name, net->interface, slen(net->interface) + 1);
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFADDR, (i64)&request);
     if (operation != 0 || request.value.inet.family != AF_INET ||
         request.value.inet.address != net->address) goto closed;
+    stage = 53;
     memset(&request, 0, sizeof(request));
     memcpy(request.name, net->interface, slen(net->interface) + 1);
     operation = sc3(SYS_ioctl, descriptor, SIOCGIFNETMASK, (i64)&request);
     if (operation != 0 || request.value.inet.family != AF_INET ||
         request.value.inet.address != net->netmask) goto closed;
-    if (!verify_configured_interfaces((int)descriptor, net) || !verify_default_route(net)) goto closed;
+    stage = 48;
+    if (!verify_configured_interfaces((int)descriptor, net)) goto closed;
+    stage = 49;
+    if (!verify_default_route(net)) goto closed;
     valid = 1;
 closed:
     if (sc1(SYS_close, descriptor) != 0) {
@@ -4634,7 +4644,7 @@ closed:
         return 0;
     }
     if (!valid) {
-        set_workload_failure(failure, 45, operation != 0 ? operation : EIO);
+        set_workload_failure(failure, (u32)stage, operation != 0 ? operation : EIO);
         return 0;
     }
     if (!write_workload_resolver(net)) {

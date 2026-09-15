@@ -217,12 +217,20 @@ int main(int argc, char **argv) {
         if (failure.stage != 46) return 4;
         return 0;
     }
-    if (failure.stage != 45 || !failure.error) return 5;
+    if (!failure.error) return 5;
     if (scenario == SOCKET_FAIL) {
-        if (close_event) return 6;
+        if (failure.stage != 45 || close_event) return 6;
         return 0;
     }
     if (!close_event) return 7;
+    if (scenario == INDEX_FAIL && failure.stage != 47) return 10;
+    if (scenario == FLAGS_DOWN && failure.stage != 50) return 11;
+    if (scenario == LOOPBACK_FLAGS && failure.stage != 50) return 12;
+    if (scenario == WRONG_MAC && failure.stage != 51) return 13;
+    if (scenario == WRONG_ADDRESS && failure.stage != 52) return 14;
+    if (scenario == WRONG_NETMASK && failure.stage != 53) return 15;
+    if (scenario == EXTRA_INTERFACE && failure.stage != 48) return 16;
+    if (scenario == MISSING_ROUTE && failure.stage != 49) return 17;
     if (scenario != MISSING_ROUTE && route_calls) return 8;
     if (resolver_calls) return 9;
     return 0;
