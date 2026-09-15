@@ -50,6 +50,10 @@ files_modified:
   `run-lock-holder-pid=1727406` (the detached monitor child worker). Run ledger
   recorded `oci_root_launch_failure={"stage": "post-ready-worker", "source":
   "lifecycle-transport", "category": "timeout"}` despite receiving durable READY.
+  The observed flock holder PID and post-READY worker timeout receipt are
+  separate facts with unresolved causal ordering; exec calls `before_stop_send`
+  under the run lock and stream I/O can subsequently raise transport `TIMEOUT`,
+  so contention may precede worker failure instead.
   No new domain remained; exact 19-domain/zero-active baseline was preserved.
 - `2bb3a2d` native PyTorch: failed after 297.04 seconds at `public-run-command`
   with `[parent-response:timeout]` and empty stdout, leaving its ledger at
@@ -254,9 +258,11 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   The `2bb3a2d` native rerun successfully captured both facts: TensorFlow's
   lock holder was PID 1727406 (`palimpsest_local.oci_monitor_ipc --private-child-v2 3 5`),
   and its ledger recorded `stage=post-ready-worker`, `source=lifecycle-transport`,
-  `category=timeout`. This establishes that the detached worker timed out in
-  lifecycle transport post-READY while holding the host run lock, causing the
-  subsequent `exec` client's 5-second lock acquisition to expire. PyTorch
+  `category=timeout`. The observed flock holder PID and post-READY worker
+  timeout receipt are separate facts and establish no causal sequence: exec
+  calls `before_stop_send` under the run lock and stream I/O can subsequently
+  raise transport `TIMEOUT`, so contention may precede worker failure instead.
+  Causal ordering and the exact transport timeout site remain unresolved. PyTorch
   expired at coordinator spawn response (`[parent-response:timeout]`) after
   297.04 seconds and retained `ml-pytorch-484e1dda` (UUID
   `74cc9561-61cc-45d1-a070-a4262b6c73a9`), leaving 20 inactive domains.

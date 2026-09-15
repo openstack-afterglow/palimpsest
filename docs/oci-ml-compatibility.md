@@ -271,10 +271,14 @@ on `pieroot-server` (187 focused state/monitor/lifecycle/store checks passed in
 `ready` lifecycle receipt, and the new typed failure receipt:
 `oci_root_launch_failure={"stage": "post-ready-worker", "source":
 "lifecycle-transport", "category": "timeout", "schema":
-"palimpsest.oci-root-launch-failure.v1"}`. This establishes that the detached
-worker experienced a lifecycle transport timeout after guest READY and held
-the run lock during failure handling, causing the public `exec` client's
-5-second lock acquisition to expire. The VM domain was cleanly cleaned up; no
+"palimpsest.oci-root-launch-failure.v1"}`. The observed flock holder PID and
+the post-READY worker timeout receipt are separate facts; they do not establish
+that the transport timeout preceded the lock wait or that the lock was held
+during failure handling. In source, exec invokes `before_stop_send` under the run
+lock, and `_send_all` or `_recv_frame` can subsequently raise transport
+`TIMEOUT`, so lock contention may precede the worker failure or share a common
+root cause. Causal ordering, execution admission, and the specific transport
+timeout site remain unresolved. The VM domain was cleanly cleaned up; no
 new domain remained, and the 19-domain zero-active baseline was preserved.
 The pinned PyTorch case failed after 297.04 seconds at `public-run-command` with
 `[parent-response:timeout]` and empty stdout, leaving its ledger at
