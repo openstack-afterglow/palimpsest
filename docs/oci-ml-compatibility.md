@@ -443,7 +443,7 @@ is created in memory and proves framework/service execution, not pretrained
 model quality. The proof adds no GPU, model download, secret, mount, retry, or
 derived image; CUDA and the blocked GPU helper remain untested.
 
-### Current TensorFlow post-READY diagnosis
+### TensorFlow interpreter correction and CPU qualification
 
 At exact checkout `f6fa271ce0804ad85f09362da3328822ad1b5ce8`, five
 focused lifecycle/ML failure-contract checks passed on Linux. The current
@@ -467,10 +467,26 @@ does not retroactively establish the cause of the older timeout.
 
 The native proof now selects `/usr/bin/python`, matching the pinned official
 archive. This is a proof-input correction only: no runtime protocol, timeout,
-retry, authority, or cleanup behavior changes. A new exact-SHA execution of
-the complete case remains required before TensorFlow CPU-only qualification,
-including authenticated root identity, PID 1 refusal, proof-owned stop/remove,
-run/root-volume cleanup, and source-archive preservation.
+retry, authority, or cleanup behavior changes.
+
+At exact checkout `84b30f86e569aa93999e192002d3682ea6b98b8f`, 30 focused ML
+proof-contract checks passed in 1.99 seconds and the corrected TensorFlow
+native case passed in 112.27 seconds. The case asserted the exact guest output
+`ML_OK tensorflow 2.21.0 [19, 22, 43, 50] 134 CPU:0 []`, a CPU-only domain with
+no interface, hostdev, or host-filesystem device, an authenticated root
+identity matching the actual guest `/`, refusal of direct `/proc/1/root`
+access, proof-owned stop and remove, and empty run and root-volume
+directories. The source archive digest
+`sha256:7ae425e96903deec47ba048fa72cdbecf02bf66a681876d6b8aac92eb5a6eb92`
+was unchanged after the run. Postflight found no new domain: the 22-domain
+inventory kept `ml-pytorch-ed03b448` and the earlier failed
+`ml-tensorflow-f70228a2` running, persistent, and untouched, with
+32,435,343,360 bytes free under `/tmp` and 4,280,346,697,728 bytes free under
+`/mnt/hdd/WD_8TB`.
+
+This completes the TensorFlow CPU-only qualification. It does not test CUDA,
+attach a GPU, authorize the blocked GPU helper, or resolve the historical
+post-READY transport timeout, which the corrected case did not reproduce.
 
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:

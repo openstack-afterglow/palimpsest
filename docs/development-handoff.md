@@ -310,10 +310,11 @@ provenance를 유지하며 원본 default 결과를 소급 변경하지 않는�
 ## ML CPU와 GPU 현황
 
 The pinned inputs are TensorFlow 2.21 CPU and the PyTorch 2.8 CUDA 12.6 runtime
-image. Separate PyTorch nodes now prove the original single-thread 2x2 CPU
-tensor command and a deterministic six-layer Transformer HTTP service through
-guest loopback. Both use the original archive, Cmd-only override, network none,
-8192 MiB/2 vCPU, no GPU exposure, and actual root/PID1/lifecycle assertions.
+image. Separate nodes now prove the original single-thread 2x2 CPU tensor
+command for both frameworks and a deterministic six-layer Transformer HTTP
+service through PyTorch guest loopback. All use the original archive, Cmd-only
+override, network none, 8192 MiB/2 vCPU, no GPU exposure, and actual
+root/PID1/lifecycle assertions.
 These results do not qualify an interactive development image, pretrained model
 quality, CUDA/GPU, or host/external networking. [ML compatibility](oci-ml-compatibility.md)
 is the checkpoint source of truth.
@@ -407,11 +408,17 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   through public `exec` with `/usr/bin/python` in 6.47 seconds and returned
   `ML_OK tensorflow 2.21.0 [19, 22, 43, 50] 134 CPU:0 []`.
 - The proof now selects the image's actual `/usr/bin/python`; runtime protocol,
-  deadline, retry, authority, and cleanup contracts are unchanged. Full
-  TensorFlow qualification still requires a fresh exact-SHA case pass through
-  root identity, PID1 refusal, proof-owned stop/remove, cleanup, and archive
-  preservation. Preserve `/mnt/hdd/WD_8TB/code/pn/m-ff72021c` and its running
-  `ml-tensorflow-f70228a2`; do not stop, undefine, adopt, or delete them.
+  deadline, retry, authority, and cleanup contracts are unchanged. At exact
+  checkout `84b30f86e569aa93999e192002d3682ea6b98b8f`, 30 focused Linux ML
+  proof contracts (1.99초) and the corrected TensorFlow native case (112.27초)
+  passed with the exact tensor output, CPU-only XML, authenticated root
+  identity, `/proc/1/root` refusal, proof-owned stop/remove, run/root-volume
+  cleanup, and unchanged source archive digest. Postflight kept the same 22
+  domains with no new domain; `/tmp` had 32,435,343,360 bytes free. TensorFlow
+  CPU-only qualification is therefore complete, and the historical post-READY
+  transport timeout stays unreproduced and causally unresolved. Preserve
+  `/mnt/hdd/WD_8TB/code/pn/m-ff72021c` and the running `ml-tensorflow-f70228a2`
+  from the earlier failure; do not stop, undefine, adopt, or delete them.
 - The historical PyTorch coordinator response failures are closed by later
   exact-SHA tensor and service passes. Do not reuse or rewrite those qualified
   results for the separate TensorFlow case.
@@ -581,15 +588,13 @@ PCI 노드도 함께 통과했다.
    libvirt changes. Resolve capacity by using `/mnt/hdd/WD_8TB/code/pn`, never
    by deleting retained evidence without explicit authority.
    This decision changes documentation only, so it does not trigger a native
-   networking rerun. With no guest ELF, QEMU, or libvirt change, the next
-   active implementation task is the corrected TensorFlow proof rerun.
+   networking rerun. With no guest ELF, QEMU, or libvirt change, no native
+   networking node is pending.
 8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback
-   service at exact `fac2ec5`, and the NAT/host-only/publication nodes at
-   `9ada8ca` all passed. Commit the TensorFlow proof's `/usr/bin/python`
-   correction, run the focused Linux contracts at that exact SHA, and execute
-   the complete pinned TensorFlow native case once. Require the exact tensor,
-   CPU-only XML, authenticated root, PID1 refusal, proof-owned stop/remove,
-   cleanup, and archive-preservation assertions before qualification. Preserve
+   service at exact `fac2ec5`, the NAT/host-only/publication nodes at
+   `9ada8ca`, and the corrected TensorFlow CPU tensor at exact `84b30f8` all
+   passed, so no ML CPU node is pending. The remaining ML items are the
+   backlog usability contracts below and GPU work, which stays gated. Preserve
    `ml-pytorch-ed03b448`, `ml-tensorflow-f70228a2`, and all existing inactive
    domains; do not stop, undefine, adopt, or delete their retained trees. Do
    not run the GPU helper, attach, or rebind.
