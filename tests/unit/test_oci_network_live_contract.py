@@ -64,6 +64,18 @@ def test_host_only_node_requires_proven_absence_of_egress() -> None:
     assert 'status["egress"] is False' in SOURCE
 
 
+def test_isolation_probe_cannot_record_tool_absence_as_isolation() -> None:
+    # A missing or unusable tool must fail the node instead of printing the
+    # success marker, and each tool is proven against a reachable target first.
+    for guard in ("getent", "nc", "ip"):
+        assert f"command -v {guard} >/dev/null 2>&1 || {{ echo NET_TOOL_MISSING={guard}; exit 94; }}" in SOURCE
+    assert "getent hosts localhost >/dev/null 2>&1 || { echo NET_RESOLVER_UNUSABLE; exit 95; }" in SOURCE
+    assert "nc -w 3 -z 127.0.0.1 %(service_port)s >/dev/null 2>&1 || { echo NET_PROBE_UNUSABLE; exit 96; }" in SOURCE
+    assert "echo NET_ADDRESS_MISSING; exit 97" in SOURCE
+    assert 'assert isolation.stdout.strip() == b"NET_NO_EGRESS_OK"' in SOURCE
+    assert 'endswith(b"NET_NO_EGRESS_OK")' not in SOURCE
+
+
 def test_published_listeners_are_proven_gone_after_owned_removal() -> None:
     assert SOURCE.count("with pytest.raises(OSError):") == 2
     assert SOURCE.count("_cleanup(environment, parent, name, domain_uuid, roots)") == 3

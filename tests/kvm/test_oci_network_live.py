@@ -178,12 +178,21 @@ assert isinstance(payload.get("api"), list) and payload["api"], sorted(payload)
 print("NET_EGRESS_OK", mode, len(resolved), status, len(payload["api"]))
 """
 
+# Fail-closed isolation probe. A missing or unusable tool must never be
+# recorded as proven isolation, so the program first refuses unless both tools
+# exist and then proves each one actually works against a reachable target
+# inside the guest before any negative result is trusted.
 _NO_EGRESS_PROGRAM = (
-    "set -e; "
+    "set -u; "
+    "command -v getent >/dev/null 2>&1 || { echo NET_TOOL_MISSING=getent; exit 94; }; "
+    "command -v nc >/dev/null 2>&1 || { echo NET_TOOL_MISSING=nc; exit 94; }; "
+    "command -v ip >/dev/null 2>&1 || { echo NET_TOOL_MISSING=ip; exit 94; }; "
+    "getent hosts localhost >/dev/null 2>&1 || { echo NET_RESOLVER_UNUSABLE; exit 95; }; "
+    "nc -w 3 -z 127.0.0.1 %(service_port)s >/dev/null 2>&1 || { echo NET_PROBE_UNUSABLE; exit 96; }; "
     "if getent hosts api.github.com >/dev/null 2>&1; then echo NET_DNS_REACHED; exit 91; fi; "
     "if nc -w 3 -z 1.1.1.1 443 >/dev/null 2>&1; then echo NET_TCP_REACHED; exit 92; fi; "
     "if nc -w 3 -z %(gateway)s 22 >/dev/null 2>&1; then echo NET_HOST_REACHED; exit 93; fi; "
-    'ip -4 addr show eth0 | grep -q "inet %(address)s/24"; '
+    'ip -4 addr show eth0 | grep -q "inet %(address)s/24" || { echo NET_ADDRESS_MISSING; exit 97; }; '
     "echo NET_NO_EGRESS_OK"
 )
 
@@ -519,12 +528,13 @@ def test_host_only_publishes_a_service_without_any_egress() -> None:
                 "--",
                 "/bin/sh",
                 "-c",
-                _NO_EGRESS_PROGRAM % values,
+                _NO_EGRESS_PROGRAM % {**values, "service_port": 6379},
                 timeout=90,
             ),
         )
         legacy._success(isolation)
-        assert isolation.stdout.strip().endswith(b"NET_NO_EGRESS_OK")
+        # Fail-closed: the probe only prints this after proving both tools work.
+        assert isolation.stdout.strip() == b"NET_NO_EGRESS_OK"
 
         _cleanup(environment, parent, name, domain_uuid, roots)
         assert legacy._file_sha256(selection.archive) == source_hash == selection.archive_digest
