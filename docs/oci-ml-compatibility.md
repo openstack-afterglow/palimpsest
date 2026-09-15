@@ -346,6 +346,39 @@ avoidable repeated I/O without adding retries, cleanup authority, process
 termination, devices, or GPU access. CPU tensor success still requires a fresh
 exact-SHA native proof.
 
+At exact checkout `021dd38c3d3d4f37ccd136c85e555f6ee405369c`, 248
+focused Linux monitor/lower/run-adapter checks passed. The next pinned PyTorch
+native case crossed the earlier coordinator response boundary but still failed
+at `public-run-command` after 193.63 seconds. Its fixed diagnostics were a
+contemporaneous `Domain not found` line followed by
+`run-lock-holder-pid=2063885; timeout-source=run-lock-timeout`. The preserved
+ledger subsequently reached `status=running` and durable READY for
+`ml-pytorch-ed03b448` (UUID `b02f65da-773e-4767-b9a8-63c373abc9a7`), and the
+domain was observed running, persistent, autostart-disabled, and without
+interface, hostdev, or host-filesystem devices. No operator stop, undefine, or
+adoption was performed. The earlier `ml-pytorch-aeed93b0` was no longer visible
+to libvirt after its own monitor progressed; this is observed automatic runtime
+behavior, not operator cleanup or proof success.
+
+After that preserved worker reached durable READY, the same public
+`exec --timeout 150` operation was issued against its exact run and state root.
+It succeeded in 5.30 seconds with the exact guest output
+`ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`. This is direct
+evidence that the pinned official image imports PyTorch and completes the
+specified matrix operation on CPU with CUDA unavailable. It does not convert
+the earlier failed pytest invocation into a passing qualification: that
+invocation did not reach the root-identity, PID 1 refusal, proof-owned stop,
+remove, or cleanup assertions.
+
+The startup caller previously gave `MonitorClient` only its general five-second
+constructor deadline immediately after the coordinator returned. During a
+large-image launch, the worker can still hold the run lock while resolving and
+validating the committed domain before activation. The current follow-up gives
+only this initial client acquisition a 60-second bounded deadline; later public
+`exec`, `stop`, IPC, guest execution, READY, retry, and cleanup policies are
+unchanged. A fresh exact-SHA native run must determine whether that initial
+lock wait is sufficient and whether the tensor and cleanup assertions pass.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

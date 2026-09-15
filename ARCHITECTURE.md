@@ -34,6 +34,10 @@ PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-co
 
 `32ac1c3` exact checkout의 Linux 선별119건은 통과했지만 첫 PyTorch 재실기는 326.87초 뒤 다시 `public-run-command`의 `[parent-response:timeout]`에서 실패했다. 새 `ml-pytorch-aeed93b0`(UUID `a1ed4f44-4dd5-48ac-b948-86425eb2e710`)은 inactive·persistent·autostart disable로 보존됐고, monitor journal은 `committed` revision3과 `active_binding=null`, worker PID1980445를 남겼다. 부모 만료 뒤 살아 있던 worker의 `/proc/1980445/io`는 `rchar=183498278198`을 기록했다. Source 추적 결과 `MonitorLaunchAuthority.validate()`의 각 monitor-lease guard가 3.7GB lower payload 전체를 다시 digest했으며, 단순 30/60초 확대만으로는 이 반복 검증을 수용할 수 없었다. 현재 source는 각 process의 authority reconstruction과 worker launch 직전에 full payload/ACL 검증을 수행하고 그 결과의 immutable stamp를 보존한다. 그 뒤 같은 authority의 checkpoint는 held FD와 visible path의 device·inode·owner·mode·link count·size·mtime·ctime 및 기존 receipt/ACL 경계를 stamp와 재검증하되 payload를 다시 읽지 않는다. 선행 full validation 없는 metadata-only 요청은 거부한다. 이는 GPU 경로를 추가하지 않으며, CPU tensor proof는 다음 exact-SHA native 실기 전까지 미통과다.
 
+`021dd38` exact checkout의 Linux monitor/lower/run-adapter 선별248건은 통과했다. 이어진 PyTorch 실기는 이전 coordinator response 경계를 넘어섰지만 193.63초 뒤 `public-run-command`에서 `Domain not found` 진단과 `run-lock-holder-pid=2063885; timeout-source=run-lock-timeout`으로 실패했다. 보존 ledger는 이후 `ml-pytorch-ed03b448`(UUID `b02f65da-773e-4767-b9a8-63c373abc9a7`)의 `status=running`과 durable READY에 도달했고 domain은 running·persistent·autostart disable, interface/hostdev/host-filesystem 없음으로 관측됐다. 작업자가 stop·undefine·adopt하지 않았다. 원인은 coordinator 반환 직후 initial `MonitorClient` 생성만 일반5초 기한으로 run lock을 기다린 반면 worker가 activation 전 committed-domain resolution과 검증 중 같은 lock을 더 오래 보유할 수 있는 경계다. 현재 source는 이 최초 client 획득만60초로 제한한다. 이후 public exec/stop의 client 기한, IPC5초, READY75초, guest exec, retry·cleanup·kill 정책은 바꾸지 않으며 성공은 새 exact-SHA native proof로만 판정한다.
+
+같은 보존 run이 durable READY에 도달한 뒤 exact state root에서 동일한 공개 `exec --timeout 150`을 실행했고 5.30초에 `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`를 반환했다. 이는 핀된 공식 image의 PyTorch import·정확한 행렬 연산·CPU device·CUDA unavailable을 guest 안에서 직접 확인한 증거다. 앞선 pytest 호출은 실패했으므로 root identity·PID1 거부·proof-owned stop/rm/cleanup까지 통과한 전체 qualification으로 승격하지 않는다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -590,9 +594,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "bac7a2d4f9e6c71741020de9d03b126cbf0e1694cff514e07ecf72fc77835f2f",
-  "reviewed_at": "2026-09-15T04:56:21Z",
-  "summary": "Reviewed per-process full launch-authority validation with immutable metadata-stamp revalidation for later guards; repeated multi-gigabyte lower rehashes are removed while descriptor/path identity, ctime, ACL, receipt, no-retry, no-kill, cleanup, and GPU boundaries remain enforced."
+  "source_sha256": "d36359bb80b036f7ffe4359447f79ab394fe7477c0d7c126790fdb452f7276a2",
+  "reviewed_at": "2026-09-15T05:18:54Z",
+  "summary": "Reviewed the initial OCI monitor client run-lock boundary; only launch acquisition changes from 5 to 60 seconds."
 }
 ```
 <!-- architecture-review:end -->

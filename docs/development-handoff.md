@@ -75,6 +75,28 @@ files_modified:
   run before a full validation. Focused monitor/runtime selections passed
   242 checks with 6 skips; broader launch-access/store selections passed 564.
   This is not yet native CPU tensor success and adds no GPU path.
+- exact checkout `021dd38c3d3d4f37ccd136c85e555f6ee405369c` passed 248
+  focused Linux checks. Its PyTorch native case crossed the coordinator response
+  boundary but failed after 193.63 seconds at `public-run-command` with
+  `Domain not found` followed by `run-lock-holder-pid=2063885;
+  timeout-source=run-lock-timeout`. The ledger subsequently reached running and
+  durable READY for `ml-pytorch-ed03b448` (UUID
+  `b02f65da-773e-4767-b9a8-63c373abc9a7`); the domain was observed running,
+  persistent, autostart-disabled, and CPU-only. No operator stop, undefine, or
+  adoption was performed. The prior `ml-pytorch-aeed93b0` later disappeared
+  from libvirt through automatic runtime behavior, not an operator command.
+- after that exact preserved run reached durable READY, public
+  `exec --timeout 150` against the same state root succeeded in 5.30 seconds:
+  `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`. This directly
+  proves CPU PyTorch execution and CUDA unavailability in the pinned guest.
+  The failed pytest invocation did not reach root identity, PID 1 refusal,
+  proof-owned stop/rm, or cleanup, so full qualification remains incomplete.
+- current follow-up sets a 60-second bounded deadline only for the initial
+  `MonitorClient` acquisition after coordinator return. The worker may hold the
+  run lock longer than the former generic five-second constructor deadline
+  while resolving the committed large-image domain before activation. Later
+  exec/stop client deadlines, IPC, READY, guest execution, retry, cleanup, and
+  GPU boundaries remain unchanged. A fresh full native case is still required.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
@@ -225,6 +247,12 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   fixed-enum observability가 후속 구현·검토됐지만, 이 변경들로 PyTorch native
   성공이 새로 증명되지는 않았다. 실패 증거와 inactive resource를 임의로
   삭제하거나 성공으로 재분류하지 않는다.
+- `021dd38` removed the repeated launch-authority payload hashes and crossed the
+  earlier coordinator response boundary. Its case then exposed the next typed
+  boundary: initial monitor-client run-lock acquisition expired after five
+  seconds while the worker still held that lock during pre-activation domain
+  resolution. The current source widens only that initial acquisition to 60
+  seconds; a fresh exact-SHA native run remains required.
 - `9239dbd` native TensorFlow는 detached run이 116.6초에 이름과 exit 0을
   반환하고 guest console에 root 전환·workload 시작·READY commit을 남겼지만,
   이어진 공개 `exec`이 5.09초에 `timeout-source=run-lock-timeout` 하나만

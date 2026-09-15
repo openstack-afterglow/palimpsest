@@ -47,6 +47,7 @@ from .state import init_resolved_roots, locked_existing_run, reserve_new_run
 
 _MONITOR_SPAWN_TIMEOUT_SECONDS = 30
 _MONITOR_COORDINATOR_TIMEOUT_SECONDS = 60
+_MONITOR_CLIENT_STARTUP_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +211,7 @@ def _launch_local_oci(roots, request, host_config, interrupted):
         finally:
             if startup_events is None or startup_events_stopped:
                 close_oci_root_libvirt(conn)
-    with MonitorClient(roots, binding, endpoint) as client:
+    with MonitorClient(roots, binding, endpoint, timeout=_MONITOR_CLIENT_STARTUP_TIMEOUT_SECONDS) as client:
         try:
             observation = client.wait_ready(timeout=75)
             if interrupted:

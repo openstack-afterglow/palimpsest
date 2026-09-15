@@ -195,8 +195,10 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "spawn_monitor_coordinator", spawn)
 
     class Client:
-        def __init__(self, selected_roots, binding, endpoint):
+        def __init__(self, selected_roots, binding, endpoint, *, timeout=None):
             assert selected_roots == roots and binding == value.binding and endpoint is value.endpoint
+            if timeout is not None:
+                assert timeout == 60
             value.calls.append("client")
 
         def __enter__(self):
