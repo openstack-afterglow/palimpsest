@@ -443,6 +443,35 @@ is created in memory and proves framework/service execution, not pretrained
 model quality. The proof adds no GPU, model download, secret, mount, retry, or
 derived image; CUDA and the blocked GPU helper remain untested.
 
+### Current TensorFlow post-READY diagnosis
+
+At exact checkout `f6fa271ce0804ad85f09362da3328822ad1b5ce8`, five
+focused lifecycle/ML failure-contract checks passed on Linux. The current
+TensorFlow native case then reached durable READY, and its public framework
+`exec` returned process exit 127 in 88.63 seconds rather than timing out at the
+historical 5.09-second public-exec run-lock boundary. The separately recorded
+post-READY lifecycle-transport receipt remains causally unresolved. The failed
+proof retained private evidence under `/mnt/hdd/WD_8TB/code/pn/m-ff72021c` and
+left `ml-tensorflow-f70228a2` running, persistent, and autostart-disabled; it
+was not stopped, undefined, or adopted.
+
+A bounded public probe of that exact guest found regular mode-0755
+`/usr/bin/python` and `/usr/bin/python3`, while the proof-selected
+`/usr/local/bin/python` and `/usr/local/bin/python3` were absent. Reissuing the
+exact TensorFlow matrix command through public `exec` with `/usr/bin/python`
+succeeded in 6.47 seconds and returned exactly
+`ML_OK tensorflow 2.21.0 [19, 22, 43, 50] 134 CPU:0 []`. This proves that the
+current source's post-READY transport admitted and completed the diagnostic
+command and that the pinned image performs the required computation on CPU; it
+does not retroactively establish the cause of the older timeout.
+
+The native proof now selects `/usr/bin/python`, matching the pinned official
+archive. This is a proof-input correction only: no runtime protocol, timeout,
+retry, authority, or cleanup behavior changes. A new exact-SHA execution of
+the complete case remains required before TensorFlow CPU-only qualification,
+including authenticated root identity, PID 1 refusal, proof-owned stop/remove,
+run/root-volume cleanup, and source-archive preservation.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

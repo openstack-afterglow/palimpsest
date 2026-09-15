@@ -394,20 +394,27 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   run-lock 만료 시 kernel `/proc/locks`에서 exact lock inode의 `flock` owner
   PID를 best-effort로 `run-lock-holder-pid`에 추가한다. raw exception·path·argv·
   guest output은 기록하지 않고 lock 5초·retry·cleanup authority도 바꾸지 않는다.
-  The `2bb3a2d` native rerun successfully captured both facts: TensorFlow's
-  lock holder was PID 1727406 (`palimpsest_local.oci_monitor_ipc --private-child-v2 3 5`),
-  and its ledger recorded `stage=post-ready-worker`, `source=lifecycle-transport`,
-  `category=timeout`. The observed flock holder PID and post-READY worker
-  timeout receipt are separate facts and establish no causal sequence: exec
-  calls `before_stop_send` under the run lock and stream I/O can subsequently
-  raise transport `TIMEOUT`, so contention may precede worker failure instead.
-  Causal ordering and the exact transport timeout site remain unresolved for
-  TensorFlow. The historical PyTorch coordinator response failure after 297.04
-  seconds retained `ml-pytorch-484e1dda` (UUID
-  `74cc9561-61cc-45d1-a070-a4262b6c73a9`), but later exact-SHA tensor and
-  service runs passed after the bounded launch fixes. The remaining ML runtime
-  diagnosis is TensorFlow's post-READY lifecycle transport; it must not reuse
-  or rewrite the now-qualified PyTorch result.
+- The `2bb3a2d` native rerun captured TensorFlow's historical lock holder PID
+  and a post-READY worker lifecycle-transport timeout receipt, but those facts
+  did not establish causal ordering or the exact transport timeout site.
+- At exact checkout `f6fa271ce0804ad85f09362da3328822ad1b5ce8`, five focused
+  Linux lifecycle/ML failure-contract checks passed. The current TensorFlow
+  native case then reached durable READY and returned framework process exit
+  127 after 88.63 seconds instead of reproducing the historical lifecycle
+  transport timeout. Bounded public probing of the preserved run found regular
+  mode-0755 `/usr/bin/python` and `/usr/bin/python3`, while the proof-selected
+  `/usr/local/bin/python` paths were absent. The exact matrix command succeeded
+  through public `exec` with `/usr/bin/python` in 6.47 seconds and returned
+  `ML_OK tensorflow 2.21.0 [19, 22, 43, 50] 134 CPU:0 []`.
+- The proof now selects the image's actual `/usr/bin/python`; runtime protocol,
+  deadline, retry, authority, and cleanup contracts are unchanged. Full
+  TensorFlow qualification still requires a fresh exact-SHA case pass through
+  root identity, PID1 refusal, proof-owned stop/remove, cleanup, and archive
+  preservation. Preserve `/mnt/hdd/WD_8TB/code/pn/m-ff72021c` and its running
+  `ml-tensorflow-f70228a2`; do not stop, undefine, adopt, or delete them.
+- The historical PyTorch coordinator response failures are closed by later
+  exact-SHA tensor and service passes. Do not reuse or rewrite those qualified
+  results for the separate TensorFlow case.
 - 비교용 소용량 control lane은 실행 불가였다. 핀된 build artifact의
   `acceptance.json`이 아직 `palimpsest.oci-root-build-run-acceptance.v1`이고
   `tests/kvm/test_oci_exec_cli_live.py`는 v2를 요구하므로 입력 검증에서
@@ -575,15 +582,17 @@ PCI 노드도 함께 통과했다.
    by deleting retained evidence without explicit authority.
    This decision changes documentation only, so it does not trigger a native
    networking rerun. With no guest ELF, QEMU, or libvirt change, the next
-   active implementation task is the separate TensorFlow transport diagnosis.
+   active implementation task is the corrected TensorFlow proof rerun.
 8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback
    service at exact `fac2ec5`, and the NAT/host-only/publication nodes at
-   `9ada8ca` all passed. Continue the separate TensorFlow post-READY lifecycle
-   transport diagnosis. Preserve `ml-pytorch-ed03b448` and all existing
-   inactive domains; do not stop, undefine, or adopt them, and do not run the
-   GPU helper, attach, or rebind. Do not delete any retained failure tree
-   without explicit authorization; the earlier networking reclamation is
-   recorded in the snapshot above.
+   `9ada8ca` all passed. Commit the TensorFlow proof's `/usr/bin/python`
+   correction, run the focused Linux contracts at that exact SHA, and execute
+   the complete pinned TensorFlow native case once. Require the exact tensor,
+   CPU-only XML, authenticated root, PID1 refusal, proof-owned stop/remove,
+   cleanup, and archive-preservation assertions before qualification. Preserve
+   `ml-pytorch-ed03b448`, `ml-tensorflow-f70228a2`, and all existing inactive
+   domains; do not stop, undefine, adopt, or delete their retained trees. Do
+   not run the GPU helper, attach, or rebind.
 
 ### 이후 backlog — 현재 승인 아님
 

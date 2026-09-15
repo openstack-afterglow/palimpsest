@@ -76,7 +76,7 @@ CASES = (
         "TENSORFLOW",
         "docker.io/tensorflow/tensorflow:2.21.0",
         "sha256:f325279f01a3e742a1285d8d736b7e600f72ccf8b55cc19ee0a90b8cbfce4c7a",
-        "/usr/local/bin/python",
+        "/usr/bin/python",
         "import tensorflow as f; f.config.threading.set_intra_op_parallelism_threads(1); f.config.threading.set_inter_op_parallelism_threads(1); a=f.constant([[1,2],[3,4]]); b=f.constant([[5,6],[7,8]]); c=f.matmul(a,b); d=f.DeviceSpec.from_string(c.device); assert d.device_type=='CPU' and d.device_index==0; print('ML_OK tensorflow',f.__version__,c.numpy().reshape(-1).tolist(),int(f.reduce_sum(c).numpy()),'CPU:0',f.config.list_physical_devices('GPU'))",
         re.compile(rb"^ML_OK tensorflow 2\.21\.0 \[19, 22, 43, 50\] 134 CPU:0 \[\]\n$"),
     ),
