@@ -633,6 +633,18 @@ drift를 보고했고, guard source/test는 포함하지 않았다. 이 local ga
 3.13 package build 증거이며 GitHub의 Python 3.12 workflow 실행이나 publication은
 아니다.
 
+후속 exact checkout `2621c7431ab696f5532cf91bee7ecef18ca4a3d5`에서는
+local CPython 3.12.13으로 development-package workflow 순서를 다시 실행했다.
+Architecture, generated CLI, lane manifest, workflow-contract Ruff check가
+통과했고 `core-cli qualification`은 1,384건 통과·7건 skip(31.74초)이었다.
+같은 Python으로 wheel/sdist build, source asset 검증, 격리 wheel·`uv tool`
+install과 CLI version/help smoke test가 통과했다. Wheel SHA-256은
+`bcdb57fce74021ca59d5d7a3ea5bc62f773321696a681bdaf3f4f914ef96034a`,
+sdist SHA-256은
+`ea2d8f9aee2edda57cb3b4d5bd64ce22f1481efe295d528881cc63e8f037fa4c`다.
+이는 workflow의 설정 Python version과 일치하는 local 증거지만 GitHub Actions
+run 또는 SHA-specific prerelease publication은 아니다.
+
 안전한 로컬 focused 명령:
 
 ```sh
