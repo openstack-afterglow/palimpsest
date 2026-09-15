@@ -397,6 +397,34 @@ of the successful proof-owned cleanup. This completes the PyTorch CPU-only
 qualification. It does not test CUDA, attach a GPU, or authorize the blocked
 GPU helper.
 
+### PyTorch loopback inference service
+
+The next opt-in proof reuses the same original pinned PyTorch archive and
+manifest without deriving or modifying the image. A public command override
+starts `/opt/conda/bin/python` as a persistent HTTP service bound only to guest
+`127.0.0.1:18080`. The service constructs a six-layer, 256-wide
+`torch.nn.TransformerEncoder`, publishes `/healthz`, and accepts one fixed
+`/infer` request contract. Each request runs four sequential inference passes
+over a `[1,128,256]` tensor under `torch.inference_mode()`.
+
+The host waits for the service's bounded console readiness marker, then uses
+public `exec --timeout 300` to make one health request and two inference
+requests through guest loopback. Success requires HTTP 200, PyTorch version,
+model and shape identity, finite output, device `cpu`, CUDA unavailable,
+monotonic request counters, and the same 64-hex output SHA-256 for both
+identical requests. The proof also repeats the CPU-only domain XML,
+authenticated root/PID 1, source preservation, proof-owned stop/remove, and
+root-volume cleanup assertions from the tensor qualification.
+
+This is a real long-running HTTP inference service and a materially larger CPU
+workload than the 2x2 tensor smoke test. It deliberately proves only guest-local
+service behavior: the domain still has `network none`, no interface, hostdev,
+or host filesystem, and the listener is not host- or externally reachable.
+External API reachability requires a separate network authority and forwarding
+contract. The service test adds no GPU, model download, secret, mount, retry,
+or derived image. Its implementation and portable contracts are not native
+success evidence until the exact published SHA passes on Linux KVM.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

@@ -110,6 +110,14 @@ files_modified:
   access was denied; proof-owned stop/rm and run/root-volume cleanup passed.
   The newly qualified domain is absent. Full postflight kept all 16 archive
   hashes unchanged with 48,021,008,384 bytes free under `/tmp`.
+- current follow-up adds a separate PyTorch HTTP inference-service proof using
+  the same pinned original archive. A public command override binds only guest
+  `127.0.0.1:18080`, builds a six-layer 256-wide TransformerEncoder, and serves
+  health plus fixed inference requests. Public exec must observe HTTP 200 and
+  two repeatable four-pass `[1,128,256]` CPU results with CUDA unavailable,
+  then repeat root/PID1 and proof-owned cleanup checks. This does not expose a
+  host/external endpoint or add networking/GPU authority; exact-SHA native
+  service success is not yet established.
 - the earlier failed `ml-pytorch-ed03b448` remained running, persistent, and
   autostart-disabled in postflight. It was not stopped, undefined, or adopted;
   it is separate from the successful proof-owned cleanup. GPU helper, attach,
@@ -476,12 +484,14 @@ PCI 노드도 함께 통과했다.
 6. **그 이후 GPU 개발:** inventory와 운영자 승인이 확보된 뒤에만 allocation
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
-7. **ML 다음 단계:** PyTorch CPU-only case는 exact `58e9cb8`에서 matrix·sum·
-   `cpu`·CUDA unavailable, root/PID1, CPU-only XML과 proof-owned cleanup까지
-   통과했다. 다음 ML 작업은 별도 TensorFlow post-READY lifecycle transport
-   timeout 진단이다. 보존된 `ml-pytorch-ed03b448`과 기존 inactive domain은
-   stop·undefine·adopt하지 않는다. GPU helper·attach·rebind도 계속 실행하지
-   않는다.
+7. **ML 다음 단계:** PyTorch CPU tensor case는 exact `58e9cb8`에서 통과했다.
+   이제 같은 pinned archive의 loopback HTTP inference-service node를 새 exact
+   SHA에서 한 번 실행한다. 성공 조건은 health와 동일 inference2건, 반복 가능한
+   four-pass Transformer output, CPU/CUDA false, CPU-only XML, root/PID1 및
+   proof-owned cleanup이다. 성공 후 별도 TensorFlow post-READY lifecycle
+   transport timeout 진단을 계속한다. 보존된 `ml-pytorch-ed03b448`과 기존
+   inactive domain은 stop·undefine·adopt하지 않고 GPU helper·attach·rebind도
+   실행하지 않는다.
 
 ### 이후 backlog — 현재 승인 아님
 

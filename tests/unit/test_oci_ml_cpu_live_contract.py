@@ -42,6 +42,7 @@ def test_live_proof_collects_standalone_without_test_directory_on_pythonpath():
     )
     assert result.returncode == 0, result.stderr[-4096:]
     assert result.stdout.count(b"test_official_ml_image_cpu_tensor_with_public_command_override") == 2
+    assert result.stdout.count(b"test_official_pytorch_cpu_http_inference_service") == 1
 
 
 def test_each_framework_requires_independent_complete_pins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -90,6 +91,27 @@ def test_proof_uses_original_archive_public_override_and_bounded_cpu_resources()
     assert "assert not root_volume_path.exists()" in source
     assert "assert not (roots.runs / name).exists()" in source
     assert "derived" not in source.lower()
+
+
+def test_pytorch_service_embedded_programs_are_executable_python():
+    compile(proof._PYTORCH_SERVICE_PROGRAM, "<pytorch-service>", "exec")
+    compile(proof._PYTORCH_SERVICE_PROBE, "<pytorch-service-probe>", "exec")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"ML_SERVICE_OK pytorch 2.8.0+cu126 transformer-encoder-6x256 [1, 64, 256] 4 cpu False " + b"a" * 64 + b"\n",
+        b"ML_SERVICE_OK pytorch 2.8.0+cu126 transformer-encoder-6x256 [1, 128, 256] 4 cuda True " + b"a" * 64 + b"\n",
+        b"ML_SERVICE_OK pytorch 2.8.0+cu126 transformer-encoder-6x256 [1, 128, 256] 4 cpu False short\n",
+    ],
+)
+def test_pytorch_service_output_contract_rejects_wrong_shape_device_or_digest(output: bytes):
+    valid = (
+        b"ML_SERVICE_OK pytorch 2.8.0+cu126 transformer-encoder-6x256 [1, 128, 256] 4 cpu False " + b"a" * 64 + b"\n"
+    )
+    assert proof._PYTORCH_SERVICE_OUTPUT.fullmatch(valid)
+    assert proof._PYTORCH_SERVICE_OUTPUT.fullmatch(output) is None
 
 
 def test_setup_leaves_runtime_creation_to_init_runtime_and_keeps_evidence_private(

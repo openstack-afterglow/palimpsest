@@ -45,6 +45,9 @@ _PHASES = frozenset(
         "domain-check",
         "framework-exec-command",
         "framework-exec-assertion",
+        "service-readiness",
+        "service-probe-command",
+        "service-probe-assertion",
         "root-identity",
         "pid1-refusal",
         "stop",
@@ -86,6 +89,158 @@ CASES = (
         re.compile(rb"^ML_OK pytorch 2\.8\.0(?:\+cu126)? \[19, 22, 43, 50\] 134 cpu False\n$"),
     ),
 )
+
+_PYTORCH_SERVICE_READY = b"ML_SERVICE_READY pytorch transformer-encoder-6x256 cpu"
+_PYTORCH_SERVICE_OUTPUT = re.compile(
+    rb"^ML_SERVICE_OK pytorch 2\.8\.0(?:\+cu126)? transformer-encoder-6x256 "
+    rb"\[1, 128, 256\] 4 cpu False [0-9a-f]{64}\n$"
+)
+_PYTORCH_SERVICE_PROGRAM = """import hashlib
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import torch
+
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
+torch.manual_seed(0)
+layer = torch.nn.TransformerEncoderLayer(
+    d_model=256,
+    nhead=8,
+    dim_feedforward=1024,
+    dropout=0.0,
+    activation="gelu",
+    batch_first=True,
+)
+model = torch.nn.TransformerEncoder(layer, num_layers=6).eval()
+sample = torch.linspace(-1.0, 1.0, steps=128 * 256, dtype=torch.float32).reshape(1, 128, 256)
+request_count = 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, _format, *_args):
+        pass
+
+    def send_json(self, status, value):
+        body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/healthz":
+            self.send_json(404, {"error": "not-found"})
+            return
+        self.send_json(
+            200,
+            {
+                "cuda": torch.cuda.is_available(),
+                "device": "cpu",
+                "framework": "pytorch",
+                "model": "transformer-encoder-6x256",
+                "status": "ready",
+                "version": torch.__version__,
+            },
+        )
+
+    def do_POST(self):
+        global request_count
+        if self.path != "/infer":
+            self.send_json(404, {"error": "not-found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+            if not 1 <= length <= 256:
+                raise ValueError
+            request = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self.send_json(400, {"error": "invalid-request"})
+            return
+        if request != {"iterations": 4, "scale": 1.0}:
+            self.send_json(400, {"error": "unsupported-request"})
+            return
+        value = sample * request["scale"]
+        with torch.inference_mode():
+            for _iteration in range(request["iterations"]):
+                value = model(value)
+        request_count += 1
+        self.send_json(
+            200,
+            {
+                "cuda": torch.cuda.is_available(),
+                "device": str(value.device),
+                "finite": bool(torch.isfinite(value).all().item()),
+                "iterations": request["iterations"],
+                "model": "transformer-encoder-6x256",
+                "output_sha256": hashlib.sha256(value.contiguous().numpy().tobytes()).hexdigest(),
+                "requests": request_count,
+                "shape": list(value.shape),
+            },
+        )
+
+
+server = HTTPServer(("127.0.0.1", 18080), Handler)
+print("ML_SERVICE_READY pytorch transformer-encoder-6x256 cpu", flush=True)
+server.serve_forever()
+"""
+_PYTORCH_SERVICE_PROBE = """import json
+import re
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=10) as response:
+    health = json.load(response)
+assert response.status == 200
+assert health == {
+    "cuda": False,
+    "device": "cpu",
+    "framework": "pytorch",
+    "model": "transformer-encoder-6x256",
+    "status": "ready",
+    "version": health["version"],
+}
+payload = json.dumps({"iterations": 4, "scale": 1.0}, sort_keys=True).encode()
+
+
+def infer():
+    request = urllib.request.Request(
+        "http://127.0.0.1:18080/infer",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        result = json.load(response)
+    assert response.status == 200
+    return result
+
+
+first = infer()
+second = infer()
+for expected_requests, result in enumerate((first, second), start=1):
+    assert result["cuda"] is False
+    assert result["device"] == "cpu"
+    assert result["finite"] is True
+    assert result["iterations"] == 4
+    assert result["model"] == "transformer-encoder-6x256"
+    assert result["requests"] == expected_requests
+    assert result["shape"] == [1, 128, 256]
+    assert re.fullmatch(r"[0-9a-f]{64}", result["output_sha256"])
+assert first["output_sha256"] == second["output_sha256"]
+print(
+    "ML_SERVICE_OK pytorch",
+    health["version"],
+    first["model"],
+    first["shape"],
+    first["iterations"],
+    first["device"],
+    first["cuda"],
+    first["output_sha256"],
+)
+"""
 
 
 def _write_phase_receipt(evidence: Path, framework: str, phase: str, status: str, returncode: int | None) -> None:
@@ -199,18 +354,21 @@ def _assert_cpu_only_domain(environment: dict[str, str], name: str) -> None:
 
 
 def _assert_override_provenance(
-    environment: dict[str, str], name: str, image_process: OCIProcessSpec
+    environment: dict[str, str],
+    name: str,
+    image_process: OCIProcessSpec,
+    command_override: tuple[str, ...] = _KEEPALIVE,
 ) -> OCIRootPreparationTransaction:
     snapshot = read_run_ledger_snapshot(resolve_roots(environment), name)
     transaction = OCIRootPreparationTransaction.from_dict(snapshot.state.get("oci_root"))
     provenance = transaction.boot_plan["process_provenance"]
     assert OCIProcessSpec.from_dict(provenance["image_process"]) == image_process
     assert tuple(provenance["image_command"]) == ("/bin/bash",)
-    assert tuple(provenance["command_override"]) == _KEEPALIVE
+    assert tuple(provenance["command_override"]) == command_override
     assert provenance["user_override"] is None
     entrypoint = tuple(provenance["image_entrypoint"])
     effective = OCIProcessSpec.from_dict(transaction.boot_plan["process"])
-    assert effective == image_process.with_command(entrypoint, _KEEPALIVE)
+    assert effective == image_process.with_command(entrypoint, command_override)
     return transaction
 
 
@@ -396,6 +554,151 @@ def _proof(case: MLCase) -> None:
                 _record_phase(evidence, case.key.lower(), phase_state, "source-preservation", "failed")
                 raise
     _record_phase(evidence, case.key.lower(), phase_state, "complete", "passed")
+
+
+def _pytorch_service_proof() -> None:
+    case = next(selected for selected in CASES if selected.key == "PYTORCH")
+    selection = _selection(case)
+    name = "ml-pytorch-service-" + uuid.uuid4().hex[:8]
+    parent, environment = _setup(legacy._environment(), name)
+    evidence = Path(environment["PALIMPSEST_PROOF_EVIDENCE_DIR"])
+    phase_state: list[object] = ["setup", None]
+    _record_phase(evidence, "pytorch", phase_state, "setup", "passed")
+    source_hash: str | None = None
+    service_command = (case.python, "-u", "-c", _PYTORCH_SERVICE_PROGRAM)
+    try:
+        _record_phase(evidence, "pytorch", phase_state, "preflight", "entered")
+        source_hash = legacy._file_sha256(selection.archive)
+        roots = resolve_roots(environment)
+        assert shutil.disk_usage(parent).free >= _PRIVATE_DISK_BUDGET
+        root_volumes_before = _fresh_root_volume_baseline(roots)
+        _record_phase(evidence, "pytorch", phase_state, "authenticate", "entered")
+        original = legacy._authenticate(selection, parent)
+        assert original.argv[-1:] == ("/bin/bash",)
+        _record_phase(evidence, "pytorch", phase_state, "public-run-command", "entered")
+        launched = legacy._save(
+            parent,
+            "service-run",
+            legacy._cli(
+                environment,
+                "run",
+                selection.archive,
+                "--manifest",
+                selection.manifest_digest,
+                "--name",
+                name,
+                "--memory",
+                "8192",
+                "--vcpus",
+                "2",
+                "--network",
+                "none",
+                "-d",
+                "--",
+                *service_command,
+                timeout=900,
+            ),
+        )
+        _require_success(phase_state, "public-run-command", launched)
+        _record_phase(evidence, "pytorch", phase_state, "public-run-assertion", "entered", launched.returncode)
+        assert launched.stdout == (name + "\n").encode()
+        _record_phase(evidence, "pytorch", phase_state, "provenance", "entered")
+        transaction = _assert_override_provenance(environment, name, original, service_command)
+        _record_phase(evidence, "pytorch", phase_state, "root-volume", "entered")
+        root_volume_path, root_volume_record = _assert_new_root_volume_files(roots, root_volumes_before, transaction)
+        _record_phase(evidence, "pytorch", phase_state, "root-proof", "entered")
+        before = legacy._root_proof(environment, name)
+        domain_uuid = before["domain"]["uuid"]
+        _record_phase(evidence, "pytorch", phase_state, "domain-check", "entered")
+        _assert_cpu_only_domain(environment, name)
+        _record_phase(evidence, "pytorch", phase_state, "service-readiness", "entered")
+        legacy._wait_console(roots.runs / name / "io" / "console.log", _PYTORCH_SERVICE_READY, timeout=120)
+        _record_phase(evidence, "pytorch", phase_state, "service-probe-command", "entered")
+        probe = legacy._save(
+            parent,
+            "service-probe",
+            legacy._cli(
+                environment,
+                "exec",
+                "--timeout",
+                "300",
+                name,
+                "--",
+                case.python,
+                "-c",
+                _PYTORCH_SERVICE_PROBE,
+                timeout=330,
+            ),
+        )
+        _require_success(phase_state, "service-probe-command", probe)
+        _record_phase(evidence, "pytorch", phase_state, "service-probe-assertion", "entered", probe.returncode)
+        assert _PYTORCH_SERVICE_OUTPUT.fullmatch(probe.stdout)
+        _record_phase(evidence, "pytorch", phase_state, "root-identity", "entered")
+        identity = legacy._save(
+            parent,
+            "service-root",
+            legacy._cli(environment, "exec", name, "--", "/bin/sh", "-c", "stat -c '%d %i' /", timeout=60),
+        )
+        _require_success(phase_state, "root-identity", identity)
+        device, inode = (int(value) for value in identity.stdout.split())
+        _record_phase(evidence, "pytorch", phase_state, "pid1-refusal", "entered")
+        refusal = legacy._save(
+            parent,
+            "service-pid1-refusal",
+            legacy._cli(
+                environment,
+                "exec",
+                name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "LC_ALL=C cat /proc/1/root/etc/os-release",
+                timeout=60,
+            ),
+        )
+        assert refusal.returncode != 0 and refusal.stdout == b"" and b"Permission denied" in refusal.stderr
+        _record_phase(evidence, "pytorch", phase_state, "root-proof-after", "entered")
+        after = legacy._root_proof(environment, name)
+        assert before["root_identity"] == after["root_identity"]
+        assert (device, inode) == (after["root_identity"]["device"], after["root_identity"]["inode"])
+        _record_phase(evidence, "pytorch", phase_state, "stop", "entered")
+        stopped = legacy._save(parent, "service-stop", legacy._cli(environment, "stop", name, timeout=90))
+        _require_success(phase_state, "stop", stopped)
+        _record_phase(evidence, "pytorch", phase_state, "remove", "entered")
+        removed = legacy._save(parent, "service-rm", legacy._cli(environment, "rm", name, timeout=90))
+        _require_success(phase_state, "remove", removed)
+        _record_phase(evidence, "pytorch", phase_state, "cleanup-assertion", "entered")
+        legacy._assert_domain_absent(environment, name, domain_uuid)
+        assert not (roots.runs / name).exists()
+        assert not root_volume_path.exists()
+        assert not root_volume_record.exists()
+        assert {entry.name for entry in roots.oci_root_volumes.iterdir()} == root_volumes_before
+        _record_phase(evidence, "pytorch", phase_state, "source-hash-assertion", "entered")
+        assert legacy._file_sha256(selection.archive) == source_hash == selection.archive_digest
+        _record_phase(evidence, "pytorch", phase_state, "source-preservation", "entered")
+    except BaseException:
+        _record_phase(
+            evidence,
+            "pytorch",
+            phase_state,
+            str(phase_state[0]),
+            "failed",
+            phase_state[1] if type(phase_state[1]) is int else None,
+        )
+        print(f"PyTorch service proof failure preserved: {parent}", flush=True)
+        raise
+    finally:
+        if source_hash is not None:
+            try:
+                legacy._record_source_hashes(parent, source_hash, selection.archive)
+            except BaseException:
+                _record_phase(evidence, "pytorch", phase_state, "source-preservation", "failed")
+                raise
+    _record_phase(evidence, "pytorch", phase_state, "complete", "passed")
+
+
+def test_official_pytorch_cpu_http_inference_service():
+    _pytorch_service_proof()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.key.lower())

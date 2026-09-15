@@ -40,6 +40,8 @@ PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-co
 
 정확한 Linux checkout `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`에서 run-adapter/monitor-client 선별103건(49.67초)과 PyTorch native case 1건(289.62초)이 통과했다. 성공 run `ml-pytorch-451d9107`은 interface/hostdev/host-filesystem 없이 공개 `exec --timeout 150`에서 exact `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`를 반환했고, 인증 root identity device21/inode2, `/proc/1/root` 접근 거부, proof-owned stop/rm, run/root-volume 제거, source archive hash 불변까지 확인했다. Full postflight에서 새 domain은 없고 archive16개 hash는 모두 불변이며 `/tmp` 48,021,008,384 bytes가 남았다. 이전 실패에서 보존된 `ml-pytorch-ed03b448`은 running·persistent·autostart disable로 그대로 두었고 성공 cleanup 대상에 포함하거나 adopt하지 않았다. 따라서 PyTorch CPU-only qualification은 완료됐지만 CUDA/GPU helper·attach·rebind·TensorFlow post-READY 진단은 수행하지 않았다.
 
+후속 opt-in PyTorch service proof는 같은 핀 archive/manifest를 변경하지 않고 공개 command override로 `/opt/conda/bin/python` HTTP server를 guest `127.0.0.1:18080`에만 띄운다. 내장 six-layer/256-wide `torch.nn.TransformerEncoder`가 `[1,128,256]` 입력을 request당4회 inference하고, public exec가 `/healthz`와 동일 `/infer` 요청2건의 HTTP200·finite output·CPU/CUDA false·증가 request counter·동일 output SHA-256을 검증한다. 8GiB/2vCPU, network none, interface/hostdev/host-filesystem 없음, root/PID1, proof-owned cleanup과 source hash 불변 계약은 유지한다. 이는 test/qualification 추가이며 host·외부 endpoint, network forwarding, GPU, model download, mount나 secret authority를 구현하지 않는다. Exact published SHA의 Linux native 성공 전에는 service qualification 통과로 간주하지 않는다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -596,9 +598,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d36359bb80b036f7ffe4359447f79ab394fe7477c0d7c126790fdb452f7276a2",
-  "reviewed_at": "2026-09-15T05:29:50Z",
-  "summary": "Reviewed the bounded initial OCI monitor-client lock wait and exact Linux PyTorch CPU qualification: tensor output, CPU-only devices, root/PID1 boundaries, proof-owned cleanup, and archive preservation passed; GPU and TensorFlow boundaries remain unchanged."
+  "source_sha256": "713d2e8c36410fd66a93b05aeb469ab1cba25d21cf2e8c2c13ef0ff4b611910a",
+  "reviewed_at": "2026-09-15T07:56:16Z",
+  "summary": "Reviewed the PyTorch loopback HTTP inference-service qualification: the pinned image runs a bounded six-layer Transformer CPU workload through health and repeated inference requests, while network-none, CPU-only devices, root/PID1, cleanup, source preservation, and GPU boundaries remain explicit."
 }
 ```
 <!-- architecture-review:end -->
