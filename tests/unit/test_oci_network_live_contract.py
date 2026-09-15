@@ -66,14 +66,23 @@ def test_host_only_node_requires_proven_absence_of_egress() -> None:
 
 def test_isolation_probe_cannot_record_tool_absence_as_isolation() -> None:
     # A missing or unusable tool must fail the node instead of printing the
-    # success marker, and each tool is proven against a reachable target first.
+    # success marker, and the TCP probe is proven against a reachable target.
     for guard in ("getent", "nc", "ip"):
         assert f"command -v {guard} >/dev/null 2>&1 || {{ echo NET_TOOL_MISSING={guard}; exit 94; }}" in SOURCE
-    assert "getent hosts localhost >/dev/null 2>&1 || { echo NET_RESOLVER_UNUSABLE; exit 95; }" in SOURCE
     assert "nc -w 3 -z 127.0.0.1 %(service_port)s >/dev/null 2>&1 || { echo NET_PROBE_UNUSABLE; exit 96; }" in SOURCE
     assert "echo NET_ADDRESS_MISSING; exit 97" in SOURCE
     assert 'assert isolation.stdout.strip() == b"NET_NO_EGRESS_OK"' in SOURCE
     assert 'endswith(b"NET_NO_EGRESS_OK")' not in SOURCE
+
+
+def test_host_only_isolation_rests_on_controlled_tcp_negatives() -> None:
+    # The resolver legs are policy checks: PID 1 must have written no nameserver
+    # for host-only. Egress evidence comes from the controlled TCP probe, so the
+    # unusable /etc/hosts-only control is gone and the weight is documented.
+    assert "echo NET_RESOLVER_PRESENT; exit 98" in SOURCE
+    assert "nc -w 3 -z 1.1.1.1 443" in SOURCE and "nc -w 3 -z %(gateway)s 22" in SOURCE
+    assert "getent hosts localhost" not in SOURCE
+    assert "kept only as a redundant signal" in SOURCE
 
 
 def test_published_listeners_are_proven_gone_after_owned_removal() -> None:

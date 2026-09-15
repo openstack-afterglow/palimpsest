@@ -159,8 +159,12 @@ Its three nodes prove, with real traffic rather than status fields:
    guest completes one real HTTPS API request through NAT after resolving the
    name through the virtual network's DNS.
 2. `host-only` plus a published loopback port: the host completes a Redis
-   `PING`/`+PONG` exchange while the guest proves DNS, external TCP, and
-   host-directed TCP all fail.
+   `PING`/`+PONG` exchange while the guest proves egress is absent. The
+   evidence is the two TCP negatives — an external address and the virtual
+   gateway — made with a probe that must first succeed against a reachable
+   in-guest listener. The resolver legs are policy checks (PID 1 wrote no
+   nameserver, and a name lookup must not resolve), not independent egress
+   evidence.
 3. `nat` plus an explicit `0.0.0.0` publication: the service answers on the
    host's own LAN address, and the listener is gone after owned removal.
 
@@ -188,8 +192,9 @@ At exact checkout `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8` on `pieroot-server`
   and 26 published API ranges parsed.
 - **host-only with a published loopback port** (`net-host-only-60435d58`): the
   host completed a real Redis exchange (`+PONG`) through the forwarded port
-  while the guest proved `NET_NO_EGRESS_OK`: DNS resolution, an external TCP
-  connect, and a host-directed TCP connect all failed.
+  while the guest proved `NET_NO_EGRESS_OK`: the controlled TCP probe reached
+  the in-guest listener and then failed against both an external address and
+  the virtual gateway, and no nameserver was present.
 - **NAT with an explicit wildcard publication** (`net-external-9c14c501`): the
   service answered HTTP 200 on the host's own LAN address `172.31.0.60:50711`,
   and that listener refused connections after the proof-owned removal.
@@ -213,9 +218,10 @@ hexadecimal. Those runs are not networking qualification.
 
 The first host-only node was also fail-open: a missing or unusable guest
 `getent`/`nc` would have printed the isolation marker without testing
-egress. At exact `e5bc4f74ac144b03d45fbc9ebf50a0a7c439bc0c` the probe
-refuses unless the tools exist, proves the resolver and TCP probe against
-reachable in-guest targets, fails distinctly on any unexpected state, and
-requires `NET_NO_EGRESS_OK` as the exact sole output. That rerun passed in
-40.37 seconds as `net-host-only-e388c8bf` with a real `+PONG` through the
-published port and owned stop/remove.
+egress. The probe now refuses unless the tools exist, proves the TCP probe
+against a reachable in-guest listener, rejects a present nameserver, fails
+distinctly on any unexpected state, and requires `NET_NO_EGRESS_OK` as the
+exact sole output. Its first fail-closed rerun passed in 40.37 seconds as
+`net-host-only-e388c8bf`; the `/etc/hosts`-only resolver control was then
+dropped because it proved only that the binary runs, and the current form was
+re-run natively as recorded above.

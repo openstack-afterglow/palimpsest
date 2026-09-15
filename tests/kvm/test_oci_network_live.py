@@ -179,16 +179,23 @@ print("NET_EGRESS_OK", mode, len(resolved), status, len(payload["api"]))
 """
 
 # Fail-closed isolation probe. A missing or unusable tool must never be
-# recorded as proven isolation, so the program first refuses unless both tools
-# exist and then proves each one actually works against a reachable target
-# inside the guest before any negative result is trusted.
+# recorded as proven isolation, so the program refuses unless every tool exists
+# and proves the TCP probe against a reachable in-guest target before any
+# negative result is trusted.
+#
+# The isolation evidence is the two TCP negatives — an external address and the
+# virtual gateway — because those use the positively controlled probe. The
+# resolver legs are policy checks, not independent egress evidence: PID 1 must
+# have written no nameserver for host-only, and a name lookup must not resolve.
+# The lookup alone would be near-tautological with an empty resolver file, so it
+# is kept only as a redundant signal.
 _NO_EGRESS_PROGRAM = (
     "set -u; "
     "command -v getent >/dev/null 2>&1 || { echo NET_TOOL_MISSING=getent; exit 94; }; "
     "command -v nc >/dev/null 2>&1 || { echo NET_TOOL_MISSING=nc; exit 94; }; "
     "command -v ip >/dev/null 2>&1 || { echo NET_TOOL_MISSING=ip; exit 94; }; "
-    "getent hosts localhost >/dev/null 2>&1 || { echo NET_RESOLVER_UNUSABLE; exit 95; }; "
     "nc -w 3 -z 127.0.0.1 %(service_port)s >/dev/null 2>&1 || { echo NET_PROBE_UNUSABLE; exit 96; }; "
+    'if grep -q "^nameserver" /etc/resolv.conf 2>/dev/null; then echo NET_RESOLVER_PRESENT; exit 98; fi; '
     "if getent hosts api.github.com >/dev/null 2>&1; then echo NET_DNS_REACHED; exit 91; fi; "
     "if nc -w 3 -z 1.1.1.1 443 >/dev/null 2>&1; then echo NET_TCP_REACHED; exit 92; fi; "
     "if nc -w 3 -z %(gateway)s 22 >/dev/null 2>&1; then echo NET_HOST_REACHED; exit 93; fi; "
