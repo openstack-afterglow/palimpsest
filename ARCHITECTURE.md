@@ -46,6 +46,8 @@ PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-co
 
 상위 runtime 관찰은 OCI-root publication을 별도 writable state로 복제하지 않는다. [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py)는 한 번 읽은 ledger snapshot의 `oci_root_domain` plan과 digest/run identity를 순수하게 재검증한 뒤 `ps`의 immutable `ports` projection과 [`OCIRootInspectDetail`](src/palimpsest_local/runtime_types.py)을 만든다. `ps`는 `PORTS` 열에 `HOST_IP:HOST_PORT->GUEST_PORT/PROTOCOL`을 출력하고 `inspect`는 같은 값을 typed JSON으로 출력한다. 두 명령은 backend call·state write를 하지 않으며 committed plan 전에는 publication을 보고하지 않는다. 종료된 run에도 설정값은 보존되므로 이 출력은 listener liveness 증명이 아니다. 강한 OCI-specific plan/stage-1 transport 검증과 external 분류는 `oci network NAME`에 남는다.
 
+후속 network 범위는 두 계약으로 분리한다. **IPv6 publication**은 기존 IPv4 guest로 전달되는 host-side IPv6 listener 계약이며 guest IPv6 주소·route·DNS·egress를 포함하지 않는다. 현재 colon-delimited IPv4 parser를 넓히지 않고 별도 grammar/schema에서 canonical 주소, `::1`/`::` 노출 분류, IPv4/IPv6 wildcard 충돌, v6-only 동작과 exact QEMU TCP/UDP 실기를 먼저 정의해야 한다. **VM-to-VM networking**은 현재 per-domain SLIRP mode의 네 번째 값이 아니라 owner-bound shared-network resource/backend 계약이다. membership, 주소/MAC 할당과 충돌 방지, egress/host reachability, 동시 attach/remove, recovery와 unrelated host network 비채택을 먼저 정하고 두 실제 guest의 양방향 application traffic·negative isolation·owned cleanup으로 검증한다. 두 범위는 서로의 선행 조건이 아니며 현재 network v1 record를 재해석하지 않는다. QEMU socket/stream/multicast backend 존재만으로 backend 선택이나 qualification을 주장하지 않는다.
+
 정확한 Linux checkout `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8`에서 변경된 stage-1 ELF의 43 boots/44 QEMU matrix(122.23초)와 networking native 3 node(513.02초)가 모두 통과했다. NAT+loopback publication node `net-nat-service-31d0ee9e`는 host에서 forwarded port로 `/healthz` HTTP200(`pytorch 2.8.0+cu126`·`cpu`·CUDA false)과 동일 `/infer` 2건(counter 1·2, `[1,128,256]`, finite, 동일 SHA-256 `73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`)을 받았고, guest는 `NET_EGRESS_OK verified 1 200 26`으로 가상 network DNS 해석·인증서 검증 TLS·`https://api.github.com/meta` HTTP200을 실제 수행했다. host-only node `net-host-only-60435d58`은 published port로 실제 Redis `+PONG`을 받으면서 guest의 DNS·외부 TCP·host TCP 시도가 모두 실패하는 `NET_NO_EGRESS_OK`를 증명했다. wildcard publication node `net-external-9c14c501`은 host 자신의 LAN 주소 `172.31.0.60:50711`에서 HTTP200을 반환하고 owned 제거 후 listener가 사라졌다. 세 node 모두 authored QEMU 인자 벡터, libvirt interface/hostdev/host filesystem 부재, `oci network` 노출 투영, 인증 root identity, PID1 거부, owned stop/rm, source archive hash 불변을 확인했고 위에 이름으로 적은 domain 집합과 archive hash는 전후 동일했다. 이어서 exact `e5bc4f74ac144b03d45fbc9ebf50a0a7c439bc0c`에서 fail-closed로 고친 host-only isolation probe를 다시 실기했고 `net-host-only-e388c8bf`가 40.37초에 통과했다(`+PONG`, `NET_NO_EGRESS_OK`, owned stop/rm). 앞선 세 차례 native 실패는 각각 주소 미지정 NIC의 PCI slot 0x1 충돌, carrier 미보고 시점의 link-state 거부, `/proc/net/route` 대문자 hex 파싱 거부였고 현재 source가 이를 고쳤다. IPv6·privileged host port·VM 간 L2·다른 image는 여전히 미검증이다.
 
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
@@ -302,11 +304,11 @@ OCI `run --user`는 `OCIUserSpec.from_override_value`에서 빈 값 없는 이�
 
 Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 허용하고 boolean 값과 무관하게 원본 Entrypoint+Cmd 벡터를 그대로 전달한다. 숫자·문자열·배열·객체는 거부하며 shell 삽입·인자 분할·unescape는 없다. `oci_image.py`의 기존 Linux amd64 gate와 source config descriptor/CAS bytes/snapshot identity를 보존한다. canonical process가 같더라도 원본 config digest는 다를 수 있다. Windows 지원·process/boot-plan schema·recipe·게스트 C/ELF·PID 1 및 workload 보호 변경은 없다. 자세한 근거와 제한은 [Linux process metadata](docs/oci-linux-process.md), 선별 검사와 독립 NGINX native 경계는 [testing](docs/testing.md)에 있다.
 
-### Conventional cloud-image flow
-
 ## Runtime flows
 
 `image import/pull`이 검증된 `qcow2` 또는 `raw` base를 local content store에 둔다. `cloud_runtime` 또는 `lima`는 실행마다 writable qcow2 overlay를 만들고 base는 read-only로 유지한다. layer SquashFS는 KVM의 `vdb..vdz` read-only virtio disks 또는 Lima guest 복사본으로 전달된다. NoCloud/cloud-init이 guest에서 layer disks를 `/mnt/palimpsest/lowerN`에 mount하고 leaf → root 순서의 OverlayFS를 `/opt/layers/merged`에 만든다. `exec`, `shell`, `logs`, `stop`, `rm`은 owner ledger와 backend identity를 재확인한다. Linux KVM의 project `ports`는 현재 안전한 forwarding 경계가 없어 거부되며, Lima는 static TCP forwarding만 제공한다.
+
+### Conventional cloud-image flow
 
 ### OCI-root materialize → run flow
 
@@ -608,8 +610,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "4785596fbc9bd02c077f69611ce08c0ce092e0ae1a49d78046bc0ee05ca247ec",
-  "reviewed_at": "2026-09-15T17:35:57Z",
-  "summary": "Reviewed OCI-root publication reporting: runtime dispatch derives immutable ps and typed inspect fields from one committed domain-plan snapshot, the CLI renders configured endpoints without backend calls or writes, lifecycle output is explicitly not a listener-liveness claim, and portable behavior plus command smoke proofs cover both surfaces."
+  "reviewed_at": "2026-09-15T17:47:15Z",
+  "summary": "Reviewed the future OCI networking boundary: IPv6 host publication and VM-to-VM networking are separate independently gated contracts, neither widens or reinterprets network v1, each has explicit authority and native proof requirements, and this documentation-only decision does not trigger the existing three-node native rerun."
 }
 ```
 <!-- architecture-review:end -->

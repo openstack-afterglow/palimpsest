@@ -221,7 +221,9 @@ them as typed JSON, and `palimpsest oci network NAME` performs the stronger
 OCI-specific committed-plan verification and external-exposure classification.
 Configured publications on a stopped run are not live-listener claims. See the
 [network contract](docs/oci-network.md) for limits, including no IPv6, no
-privileged host ports and no VM-to-VM network.
+privileged host ports and no VM-to-VM network. IPv6 host publication and a
+shared VM network are separately gated future contracts; neither is implied by
+the current per-VM network modes.
 
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 

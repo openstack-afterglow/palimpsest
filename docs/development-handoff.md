@@ -563,11 +563,19 @@ PCI 노드도 함께 통과했다.
    `inspect` supports OCI-root with typed network/port/guest-address fields,
    projected from one committed-plan ledger snapshot without backend calls or
    writes. These are configured endpoints, not listener-liveness claims.
-   Remaining work, in order: decide whether IPv6 publication and VM-to-VM
-   networking become separate contracts; and re-run the three nodes whenever
-   the guest ELF, QEMU or libvirt changes. Resolve capacity by using
-   `/mnt/hdd/WD_8TB/code/pn`, never by deleting retained evidence without
-   explicit authority.
+   IPv6 host publication and VM-to-VM networking are now fixed as separate,
+   independently gated future contracts. IPv6 publication covers only a host
+   IPv6 listener forwarded to the existing IPv4 guest and requires a new
+   grammar/schema plus exact dual-stack socket proofs; guest IPv6 is outside
+   that scope. VM-to-VM requires an owner-bound shared-network resource and
+   lifecycle rather than a fourth per-VM SLIRP mode. Neither is implemented,
+   neither reinterprets network v1 records, and neither is a prerequisite for
+   the other. Re-run the three existing nodes whenever the guest ELF, QEMU or
+   libvirt changes. Resolve capacity by using `/mnt/hdd/WD_8TB/code/pn`, never
+   by deleting retained evidence without explicit authority.
+   This decision changes documentation only, so it does not trigger a native
+   networking rerun. With no guest ELF, QEMU, or libvirt change, the next
+   active implementation task is the separate TensorFlow transport diagnosis.
 8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback
    service at exact `fac2ec5`, and the NAT/host-only/publication nodes at
    `9ada8ca` all passed. Continue the separate TensorFlow post-READY lifecycle

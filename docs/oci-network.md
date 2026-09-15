@@ -76,6 +76,53 @@ Consequences that are part of the contract:
 - The MAC is derived deterministically from the run ID inside QEMU's
   `52:54:00` range, so the guest can identify the exact authored NIC.
 
+## Future contract decision
+
+IPv6 host publication and VM-to-VM networking are **separate future
+contracts**. Neither is an implicit extension of
+`palimpsest.oci-root-network.v1`, and neither is implemented or qualified by
+this decision.
+
+### IPv6 host publication
+
+This contract is limited to binding an IPv6 host listener and forwarding it to
+the existing guest service. It does not imply guest IPv6 addressing, routing,
+DNS, or egress; those would be another guest-network contract. Implementation
+must use a new explicit publication grammar and durable schema rather than
+widening the current colon-delimited IPv4 parser. It must define canonical
+address syntax, loopback versus external classification (`::1` versus `::`),
+IPv4/IPv6 wildcard collision behavior, and whether a listener is v6-only.
+
+The exact supported QEMU version must prove TCP and UDP forwarding, safe
+loopback defaults, real IPv6 host traffic, launch-time bind failure, and
+listener removal. [QEMU's invocation reference](https://www.qemu.org/docs/master/system/invocation.html)
+documents IPv4/IPv6 controls for its user-mode backend and a generic `hostfwd`
+host address, but that documentation alone does not qualify the required
+host-bind grammar or dual-stack socket behavior. Existing
+v1 records therefore remain IPv4-only and are never reinterpreted.
+
+### VM-to-VM networking
+
+This requires a shared network resource and backend; it is not a fourth value
+beside the current per-VM `nat`, `host-only`, and `none` modes. The contract
+must define owner/tenant identity, network creation and removal authority,
+membership, deterministic address and MAC allocation, duplicate prevention,
+egress and host-reachability policy, optional name resolution, concurrent
+attach/remove behavior, and recovery without adopting unrelated host network
+objects.
+
+QEMU exposes socket/stream and multicast backends that can connect virtual
+machines, but those add shared listeners and topology state that the current
+per-domain SLIRP ownership model intentionally lacks. Backend selection is
+deferred until the shared-resource lifecycle is specified. Qualification must
+use at least two real guests, bidirectional application traffic, negative
+isolation cases, exact owned cleanup, and preservation of unrelated domains
+and host network state.
+
+The two workstreams are independently gated: IPv6 host publication neither
+requires nor grants VM-to-VM reachability, and a future shared VM network does
+not silently enable IPv6 or external exposure.
+
 ## Durable binding and guest verification
 
 The complete intent — mode, backend, subnet, and the sorted publication tuple —
