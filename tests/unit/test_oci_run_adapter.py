@@ -146,7 +146,7 @@ def case(tmp_path, monkeypatch):
 
     def build(*args, **kwargs):
         value.calls.append("plan")
-        assert kwargs == {"memory_mib": request.memory_mib, "vcpus": request.vcpus, "network": None}
+        assert kwargs == {"memory_mib": request.memory_mib, "vcpus": request.vcpus, "network": request.network}
         return value.plan
 
     monkeypatch.setattr(adapter, "build_oci_root_domain_plan", build)

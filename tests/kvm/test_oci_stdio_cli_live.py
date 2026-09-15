@@ -205,9 +205,19 @@ def _assert_security(record: dict[str, int | str], uid: int) -> None:
     )
     assert record["stdin_alias"] == 2
     assert (record["fd_meta"], record["fd_target"], record["inherited_fds"], record["dev_entries"]) == (1, 1, 1, 9)
-    assert (record["pipe_read_same"], record["pipe_write_same"], record["pipe_read"], record["pipe_write"]) == (1, 1, 0, 0)
+    assert (record["pipe_read_same"], record["pipe_write_same"], record["pipe_read"], record["pipe_write"]) == (
+        1,
+        1,
+        0,
+        0,
+    )
     assert record["closed_fd"] == 2
-    assert (record["fd1path_same"], record["fd2path_same"], record["fd1path_write"], record["fd2path_write"]) == (1, 1, 0, 0)
+    assert (record["fd1path_same"], record["fd2path_same"], record["fd1path_write"], record["fd2path_write"]) == (
+        1,
+        1,
+        0,
+        0,
+    )
     assert (record["pid1fdempty"], record["pid1fdinfoempty"]) == (1, 1)
     assert record["pid1root"] == 13
     for fd in (1, 2):
@@ -253,6 +263,8 @@ def test_public_stdio_fd_ownership_and_reopen_diagnostic(uid: int) -> None:
             archive,
             "--name",
             name,
+            "--network",
+            "none",
             "--memory",
             "512",
             "--vcpus",

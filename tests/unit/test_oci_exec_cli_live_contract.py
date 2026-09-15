@@ -67,7 +67,7 @@ def test_every_public_operation_and_domain_lookup_routes_the_fresh_name(monkeypa
     assert target.domain_info(environment, "/usr/bin/virsh") is result
 
     assert cli_calls == [
-        (environment, ("run", archive, "--name", target.name, "-d"), 180),
+        (environment, ("run", archive, "--name", target.name, "--network", "none", "-d"), 180),
         (environment, ("oci", "exec-status", target.name), 90),
         (environment, ("oci", "root-proof", target.name), 90),
         (environment, ("exec", target.name, "--", "/bin/sh", "-c", "cat /proc/1/root/marker"), 60),

@@ -26,6 +26,7 @@ from pathlib import Path
 
 from . import lima
 from .errors import ArtifactValidationError, LifecycleError
+from .oci_network import OCI_NETWORK_MODE_NONE, OCI_NETWORK_MODES
 from .runtime_types import (
     CapabilityCheck,
     CapabilityErrorCategory,
@@ -191,18 +192,18 @@ def capability_profile(
     else:  # pragma: no cover - DispatchKey rejects unknown combinations
         raise RuntimeCapabilityError(operation, dispatch_key)
     requirements = _requirements(*identifiers)
-    if (
-        operation is RuntimeOperation.RUN
-        and network is not None
-        and not (backend is RuntimeBackend.KVM and network == "none")
-    ):
-        if backend is RuntimeBackend.LIMA_VZ:
-            network_capability = "network.lima"
-        elif backend is RuntimeBackend.LIBVIRT_HVF:
-            network_capability = "network.user-hostfwd"
-        else:
-            network_capability = "network.libvirt"
-        requirements += (CapabilityRequirement(network_capability, network),)
+    if operation is RuntimeOperation.RUN and network is not None:
+        if kind is RuntimeKind.OCI_ROOT:
+            if network != OCI_NETWORK_MODE_NONE:
+                requirements += (CapabilityRequirement("network.oci-user-mode", network),)
+        elif not (backend is RuntimeBackend.KVM and network == "none"):
+            if backend is RuntimeBackend.LIMA_VZ:
+                network_capability = "network.lima"
+            elif backend is RuntimeBackend.LIBVIRT_HVF:
+                network_capability = "network.user-hostfwd"
+            else:
+                network_capability = "network.libvirt"
+            requirements += (CapabilityRequirement(network_capability, network),)
     return CapabilityProfile(1, dispatch_key, operation, requirements)
 
 
@@ -404,6 +405,45 @@ def _check_capability(
             CapabilityErrorCategory.CHECK_FAILED,
             "user-mode host forwarding is unavailable for this backend",
         )
+    if identifier == "network.oci-user-mode":
+        assert requirement.selector is not None
+        if requirement.selector not in OCI_NETWORK_MODES or requirement.selector == OCI_NETWORK_MODE_NONE:
+            return _failed(
+                requirement,
+                "unsupported-mode",
+                CapabilityErrorCategory.UNSUPPORTED,
+                "OCI-root networking supports only nat and host-only",
+            )
+        try:
+            domain = resolve_domain_profile(
+                dispatch_key.backend.value,
+                normalize_machine(arch or host.machine),
+                host=host,
+            )
+            result = subprocess.run(
+                [str(domain.emulator), "-netdev", "help"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            )
+        except (LifecycleError, OSError, subprocess.SubprocessError):
+            return _failed(
+                requirement,
+                "probe-failed",
+                CapabilityErrorCategory.CHECK_FAILED,
+                "QEMU user-mode network capability check failed",
+            )
+        if result.returncode != 0 or "user" not in {line.strip() for line in result.stdout.splitlines()}:
+            return _failed(
+                requirement,
+                "unsupported",
+                CapabilityErrorCategory.UNSUPPORTED,
+                "the qualified QEMU build has no user-mode (SLIRP) network backend; "
+                "install a QEMU with user networking or run with --network none",
+            )
+        return _passed(requirement, "user-mode")
     if identifier == "network.lima":
         assert requirement.selector is not None
         try:

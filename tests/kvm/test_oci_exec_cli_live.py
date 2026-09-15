@@ -38,7 +38,7 @@ class _ExecCLIProofTarget:
     name: str
 
     def launch(self, environment, archive):
-        return _cli(environment, "run", archive, "--name", self.name, "-d", timeout=180)
+        return _cli(environment, "run", archive, "--name", self.name, "--network", "none", "-d", timeout=180)
 
     def exec_status(self, environment):
         return _cli(environment, "oci", "exec-status", self.name)

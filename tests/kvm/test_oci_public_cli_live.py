@@ -203,6 +203,8 @@ def test_public_oci_foreground_detached_stop_and_rm():
             "oci-root",
             "--name",
             "public-fg",
+            "--network",
+            "none",
             "--memory",
             "512",
             "--vcpus",
@@ -216,7 +218,19 @@ def test_public_oci_foreground_detached_stop_and_rm():
         _success(_cli(environment, "rm", "public-fg"))
         assert not (parent / "state" / "runs" / "public-fg").exists()
         detached = _cli(
-            environment, "run", archive, "--name", "public-bg", "--memory", "512", "--vcpus", "1", "-d", timeout=120
+            environment,
+            "run",
+            archive,
+            "--name",
+            "public-bg",
+            "--memory",
+            "512",
+            "--vcpus",
+            "1",
+            "--network",
+            "none",
+            "-d",
+            timeout=120,
         )
         (parent / "detached.stdout").write_bytes(detached.stdout)
         (parent / "detached.stderr").write_bytes(detached.stderr)
@@ -240,6 +254,8 @@ def test_public_oci_foreground_detached_stop_and_rm():
                     str(archive),
                     "--name",
                     "public-int",
+                    "--network",
+                    "none",
                     "--memory",
                     "512",
                     "--vcpus",

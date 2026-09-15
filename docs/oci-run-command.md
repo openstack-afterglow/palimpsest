@@ -22,11 +22,13 @@ whose original Entrypoint and Cmd are both empty remain rejected during current
 image intake; a command override does not broaden that existing subset.
 
 Command override is local OCI-root-only. Cloud-image runs reject it. It can be
-combined with the existing `--user USER[:GROUP]`, but it does not change image
-environment, working directory, stop signal, filesystem ownership, capabilities,
-supplementary groups, networking, or VM XML. It adds no default keepalive,
-interactive terminal, pseudo-TTY, stdin attachment, GPU access, or device
-permission.
+combined with the existing `--user USER[:GROUP]` and with
+`--network`/`--publish`, but it does not change image environment, working
+directory, stop signal, filesystem ownership, capabilities, or supplementary
+groups. It adds no default keepalive, interactive terminal, pseudo-TTY, stdin
+attachment, GPU access, or device permission. Networking is selected separately
+by [`--network` and `--publish`](oci-network.md); an override never enables or
+widens it.
 
 ## Durable binding
 

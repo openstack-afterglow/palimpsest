@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -54,16 +55,18 @@ def test_each_case_has_independent_opt_in_and_exact_run_arguments(tmp_path: Path
     archive, environment = _environment(tmp_path, case.key)
     selected = services._selection(case, environment)
     arguments = services._run_arguments(case, selected, "proof")
-    assert arguments[:7] == (
+    assert arguments[:9] == (
         "run",
         archive.resolve(),
         "--manifest",
         "sha256:" + "a" * 64,
         "--name",
         "proof",
+        "--network",
+        "none",
         "--memory",
     )
-    assert arguments[7:] == (str(case.memory_mib), "--vcpus", "1", "-d") + (
+    assert arguments[9:] == (str(case.memory_mib), "--vcpus", "1", "-d") + (
         ("--user", case.user_override) if case.user_override else ()
     )
 
@@ -98,7 +101,9 @@ def test_random_password_derivation_contains_only_fixed_guest_generator_code(tmp
     manifest_hex = hashlib.sha256(manifest_payload).hexdigest()
     payloads = {
         "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
-        "index.json": services._json_bytes({"manifests": [{"digest": "sha256:" + manifest_hex, "size": len(manifest_payload)}]}),
+        "index.json": services._json_bytes(
+            {"manifests": [{"digest": "sha256:" + manifest_hex, "size": len(manifest_payload)}]}
+        ),
         "blobs/sha256/" + config_hex: config_payload,
         "blobs/sha256/" + manifest_hex: manifest_payload,
     }
@@ -127,13 +132,8 @@ def test_random_password_derivation_contains_only_fixed_guest_generator_code(tmp
 
 
 def test_random_password_wrapper_generates_without_printing_and_unsets_intermediate() -> None:
-    validation = (
-        "[[ $MYSQL_ROOT_PASSWORD =~ ^palimpsest-test-[0-9a-f]{64}$ ]] && "
-        "[[ -z ${secret_hex+x} ]]"
-    )
-    command = services._MYSQL_RANDOM_WRAPPER.replace(
-        'exec /usr/local/bin/docker-entrypoint.sh "$@"', validation
-    )
+    validation = "[[ $MYSQL_ROOT_PASSWORD =~ ^palimpsest-test-[0-9a-f]{64}$ ]] && [[ -z ${secret_hex+x} ]]"
+    command = services._MYSQL_RANDOM_WRAPPER.replace('exec /usr/local/bin/docker-entrypoint.sh "$@"', validation)
     completed = subprocess.run(["/bin/bash", "-c", command, "test", "mysqld"], capture_output=True, timeout=5)
     assert completed.returncode == 0
     assert completed.stdout == completed.stderr == b""
@@ -242,25 +242,27 @@ def test_random_password_cleanup_is_flagged_and_missing_root_directory_is_an_emp
     diagnostic = next(case for case in services.CASES if case.key == "MYSQL_USER_RANDOM_PASSWORD")
     assert diagnostic.test_only_random_password is True
     source = PATH.read_text()
-    assert 'if case.test_only_random_password and root_volume_directory.is_dir()' in source
-    assert 'remaining == root_volume_before' in source
+    assert "if case.test_only_random_password and root_volume_directory.is_dir()" in source
+    assert "remaining == root_volume_before" in source
     assert 'legacy._cli(environment, "failure-rm"' not in source
     assert "_capture_then_dispose(" in source
-    assert 'lambda operation: _secret_safe_cli(parent, environment, operation, name' in source
+    assert "lambda operation: _secret_safe_cli(parent, environment, operation, name" in source
     assert '"application_completed": completed' in source
     assert '"owned_resources_disposed": disposed' in source
-    assert 'stream.read(legacy._MAX_CONSOLE_BYTES + 1)' in source
-    assert 'cleanup_evidence_errors' in source
+    assert "stream.read(legacy._MAX_CONSOLE_BYTES + 1)" in source
+    assert "cleanup_evidence_errors" in source
 
 
-def test_random_password_name_keeps_exact_qualified_lifecycle_path_within_97_bytes() -> None:
+def test_every_service_case_keeps_its_qualified_lifecycle_path_within_97_bytes() -> None:
     parent = Path("/tmp/p-hub-svc-myr-12345678")
-    name = "hub-service-mysql-random-12345678"
-    lifecycle = parent / "state" / "runs" / name / "io" / "lifecycle.sock"
-    assert len(str(lifecycle).encode()) == 90
-    assert len(str(lifecycle).encode()) <= 97
-    source = PATH.read_text()
-    assert 'name_prefix = "hub-service-mysql-random-" if case.test_only_random_password' in source
+    for case in services.CASES:
+        prefix = (
+            "hub-service-mysql-random-"
+            if case.test_only_random_password
+            else ("hub-service-" + case.key.lower().replace("_", "-") + "-")
+        )
+        lifecycle = parent / "state" / "runs" / (prefix + "0" * 8) / "io" / "lifecycle.sock"
+        assert len(os.fsencode(lifecycle)) <= 97, case.key
 
 
 def test_matrix_uses_public_cli_and_preserves_failed_runtime_without_rm_or_hypervisor_force() -> None:
@@ -295,7 +297,7 @@ def test_service_probes_are_guest_internal_and_missing_client_is_not_a_pass() ->
     assert "Uid:|Gid:) printf" in source
     assert "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:" in source
     assert r"\binet 127\.0\.0\.1/8\b" in source
-    assert 'probe.stdout == case.probe_marker' in source
+    assert "probe.stdout == case.probe_marker" in source
 
 
 def test_loopback_shell_probe_skips_both_headers_and_accepts_allowed_subset(tmp_path: Path) -> None:
@@ -445,7 +447,9 @@ def test_running_domain_xml_requires_one_devices_container_and_no_interface(monk
         b"<domain><uuid>wrong</uuid><devices/></domain>",
     ],
 )
-def test_running_domain_xml_rejects_interface_missing_devices_or_malformed(monkeypatch, tmp_path: Path, xml: bytes) -> None:
+def test_running_domain_xml_rejects_interface_missing_devices_or_malformed(
+    monkeypatch, tmp_path: Path, xml: bytes
+) -> None:
     monkeypatch.setattr(services.legacy.shutil, "which", lambda *args, **kwargs: "/usr/bin/virsh")
     monkeypatch.setattr(
         services.legacy, "_bounded_command", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, xml, b"")

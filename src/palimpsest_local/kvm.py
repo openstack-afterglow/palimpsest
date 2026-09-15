@@ -17,6 +17,7 @@ from .cloudinit import BUILD_CHANNEL_NAME
 from .digest import normalize_digest
 from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
 from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
+from .oci_network import OCINetworkConfig
 from .platforms import DomainProfile
 
 _logger = logging.getLogger(__name__)
@@ -28,7 +29,9 @@ MAX_OCI_ROOT_LAYER_DISKS = MAX_LAYER_DISKS - 1
 LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES = 107
 DOMAIN_MARKER_VERSION = "0.1.0"
 DOMAIN_MARKER_NAMESPACE = "https://afterglow.dev/palimpsest-local/domain/v1"
+QEMU_DOMAIN_NAMESPACE = "http://libvirt.org/schemas/domain/qemu/1.0"
 ET.register_namespace("palimpsest", DOMAIN_MARKER_NAMESPACE)
+ET.register_namespace("qemu", QEMU_DOMAIN_NAMESPACE)
 
 
 class KvmError(RuntimeError):
@@ -111,7 +114,7 @@ class OCIRootDomainSpec:
     root_serial: str
     layers: tuple[LayerDisk, ...]
     stage1_transport: Stage1TransportDisk
-    network: str | None = "default"
+    network: OCINetworkConfig | None = None
     console_log: Path | None = None
     run_id: str | None = None
     boot_contract_digest: str | None = None
@@ -312,8 +315,8 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         raise KvmError("OCI-root kernel command line contains control characters")
     if re.fullmatch(r"[0-9a-f]{20}", spec.root_serial or "") is None:
         raise KvmError("OCI-root root disk serial is invalid")
-    if spec.network is not None and _NETWORK_NAME_RE.fullmatch(spec.network) is None:
-        raise KvmError("OCI-root network name is invalid")
+    if spec.network is not None and not isinstance(spec.network, OCINetworkConfig):
+        raise KvmError("OCI-root network configuration must be typed")
     try:
         run_id = str(uuid.UUID(spec.run_id or ""))
     except (AttributeError, TypeError, ValueError):
@@ -439,10 +442,7 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         "target",
         {"type": "virtio", "name": spec.lifecycle_channel_name},
     )
-    if profile.network_mode == "libvirt-network" and spec.network is not None:
-        interface = ET.SubElement(devices, "interface", {"type": "network"})
-        ET.SubElement(interface, "source", {"network": spec.network})
-        ET.SubElement(interface, "model", {"type": "virtio"})
+    network_arguments = () if spec.network is None else spec.network.qemu_arguments(run_id)
     if spec.console_log is None:
         console = ET.SubElement(devices, "console", {"type": "pty"})
     else:
@@ -451,6 +451,14 @@ def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -
         if source_dac_override:
             ET.SubElement(console_source, "seclabel", {"model": "dac", "relabel": "no"})
     ET.SubElement(console, "target", {"type": "serial", "port": "0"})
+    if network_arguments:
+        # The NIC is authored as an explicit QEMU user-mode netdev: libvirt
+        # never creates, adopts, or mutates a host network, bridge, firewall
+        # rule, or DHCP service for an OCI-root run. Every host listener
+        # belongs to this QEMU process and disappears with it.
+        commandline = ET.SubElement(domain, f"{{{QEMU_DOMAIN_NAMESPACE}}}commandline")
+        for value in network_arguments:
+            ET.SubElement(commandline, f"{{{QEMU_DOMAIN_NAMESPACE}}}arg", {"value": value})
     return ET.tostring(domain, encoding="unicode")
 
 

@@ -16,6 +16,7 @@ from palimpsest_local import (
     state,
 )
 from palimpsest_local.errors import StateError
+from palimpsest_local.oci_network import OCINetworkConfig
 from palimpsest_local.oci_process import MAX_PROCESS_BYTES, OCIUserSpec
 from palimpsest_local.oci_run_request import LocalOCIRunRequest
 from palimpsest_local.runtime_types import (
@@ -81,7 +82,7 @@ def test_public_local_run_foreground_or_detached(tmp_path, monkeypatch, capsys, 
     assert cli.main(args) == (0 if detached else 23)
     request = seen[0]
     assert isinstance(request, LocalOCIRunRequest)
-    assert request.detached is detached and request.network is None
+    assert request.detached is detached and request.network == OCINetworkConfig("none")
     assert request.root_retention == "delete" and request.root_volume_id is None
     assert request.user_override is None
     assert request.source == source.resolve()

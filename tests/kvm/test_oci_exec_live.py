@@ -91,7 +91,7 @@ def test_real_guest_exec_streams_limits_descendants_and_concurrent_stop():
     completed = False
     results = []
     try:
-        launched = _cli(environment, "run", archive, "--name", name, "-d", timeout=180)
+        launched = _cli(environment, "run", archive, "--name", name, "--network", "none", "-d", timeout=180)
         (parent / "launch.stdout").write_bytes(launched.stdout)
         (parent / "launch.stderr").write_bytes(launched.stderr)
         _success(launched)

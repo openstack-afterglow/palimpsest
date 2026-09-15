@@ -108,7 +108,7 @@ def test_public_recorded_exec_survives_vm_removal_without_runtime_or_boot_config
     name = f"exec-record-cli-{suffix}"
     completed = False
     try:
-        launched = _cli(environment, "run", archive, "--name", name, "-d", timeout=180)
+        launched = _cli(environment, "run", archive, "--name", name, "--network", "none", "-d", timeout=180)
         (runtime_parent / "launch.stdout").write_bytes(launched.stdout)
         (runtime_parent / "launch.stderr").write_bytes(launched.stderr)
         _success(launched)

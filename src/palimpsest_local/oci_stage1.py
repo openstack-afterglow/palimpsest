@@ -19,6 +19,7 @@ from .digest import normalize_digest
 from .errors import ArtifactValidationError, InvalidDigestError, StateError
 from .kvm import MAX_OCI_ROOT_LAYER_DISKS
 from .oci_guest_filesystems import MAX_STAGE1_FILESYSTEM_VERIFY_BYTES
+from .oci_network import OCI_NETWORK_NONE, OCINetworkConfig
 from .oci_packer import SQUASHFS_BLOCK_DEVICE_ALIGNMENT
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
@@ -29,8 +30,8 @@ from .project_volumes import MAX_VOLUME_BYTES, MIN_VOLUME_BYTES
 if TYPE_CHECKING:
     from .oci_root_kvm import OCIRootDomainPlan
 
-OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v15"
-OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v15"
+OCI_STAGE1_PLAN_SCHEMA = "palimpsest.oci-stage1-plan.v16"
+OCI_STAGE1_PROTOCOL = "palimpsest.guest-stage1.v16"
 OCI_STAGE1_HANDOFF = "first-party-pid1-supervisor.v9"
 OCI_STAGE1_DEVICE_POLICY = "virtio-serial-sysfs.v1"
 OCI_STAGE1_ROOT_LAYOUT = "overlay-upper-work.v1"
@@ -91,6 +92,7 @@ class OCIStage1Plan:
     layers: tuple[Mapping[str, Any], ...]
     process: OCIProcessSpec
     assembly_probes: tuple[Mapping[str, Any], ...] = ()
+    network: OCINetworkConfig = OCI_NETWORK_NONE
 
     def __post_init__(self) -> None:
         try:
@@ -173,6 +175,8 @@ class OCIStage1Plan:
             self.process.require_bootable()
         except ArtifactValidationError:
             raise StateError("stage-1 process is not bootable") from None
+        if not isinstance(self.network, OCINetworkConfig):
+            raise StateError("stage-1 network contract is invalid")
         if not isinstance(self.assembly_probes, tuple) or len(self.assembly_probes) > MAX_OCI_STAGE1_ASSEMBLY_PROBES:
             raise StateError("stage-1 assembly probes are invalid")
         probes: list[dict[str, Any]] = []
@@ -212,6 +216,7 @@ class OCIStage1Plan:
         root_volume: Mapping[str, Any],
         layers: tuple[Mapping[str, Any], ...],
         process: OCIProcessSpec,
+        network: OCINetworkConfig = OCI_NETWORK_NONE,
     ) -> OCIStage1Plan:
         """Build the guest projection without depending on the final domain digest."""
 
@@ -242,6 +247,7 @@ class OCIStage1Plan:
                     }
                     for layer in layers
                 ),
+                network=network,
                 process=process,
             )
         except (KeyError, TypeError):
@@ -260,6 +266,7 @@ class OCIStage1Plan:
             domain_core_digest=plan.domain_core_digest,
             root_volume=plan.root_volume,
             layers=plan.layers,
+            network=plan.network,
             process=plan.process,
         )
 
@@ -278,6 +285,7 @@ class OCIStage1Plan:
             "domain_core_digest": self.domain_core_digest,
             "handoff": OCI_STAGE1_HANDOFF,
             "isolation": OCI_STAGE1_WORKLOAD_ISOLATION,
+            "network": self.network.guest_contract(self.run_id),
             "phase": "stage1-contract",
             "process": self.process.to_dict(),
             "process_policy": OCI_STAGE1_PROCESS_POLICY,
@@ -302,6 +310,7 @@ class OCIStage1Plan:
             "domain_core_digest",
             "handoff",
             "isolation",
+            "network",
             "phase",
             "process",
             "process_policy",
@@ -353,6 +362,7 @@ class OCIStage1Plan:
             root=assembly["root"],
             layers=tuple(assembly["layers"]),
             process=process,
+            network=expected_domain_plan.network,
             assembly_probes=tuple(assembly["probes"]),
         )
         if plan.to_dict() != value:

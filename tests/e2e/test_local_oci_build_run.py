@@ -166,7 +166,7 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
     try:
         launched = command(
             "run",
-            ["run", os.fspath(archive), "--name", run_name, "--backend", "kvm", "-d"],
+            ["run", os.fspath(archive), "--name", run_name, "--backend", "kvm", "--network", "none", "-d"],
             timeout=180,
         )
         assert launched.returncode == 0, launched.stderr
@@ -182,7 +182,9 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
             timeout=60,
         )
         assert executed.returncode == 0, executed.stderr
-        match = re.fullmatch(rf"{re.escape(_SUCCESS)}:{re.escape(marker)}:(0|[1-9][0-9]*):([1-9][0-9]*)\n", executed.stdout)
+        match = re.fullmatch(
+            rf"{re.escape(_SUCCESS)}:{re.escape(marker)}:(0|[1-9][0-9]*):([1-9][0-9]*)\n", executed.stdout
+        )
         assert match is not None
         device_text, inode_text = match.groups()
         device, inode = int(device_text), int(inode_text)
@@ -190,9 +192,13 @@ def test_local_build_runs_detached_with_oci_root_as_vm_root(tmp_path: Path) -> N
         denied = command(
             "pid1-root-denied",
             [
-                "exec", run_name, "--", "/bin/sh", "-c",
+                "exec",
+                run_name,
+                "--",
+                "/bin/sh",
+                "-c",
                 "message=$(cat /proc/1/root/palimpsest-e2e-root-marker 2>&1); status=$?; "
-                "if test \"$status\" -eq 0; then exit 95; fi; "
+                'if test "$status" -eq 0; then exit 95; fi; '
                 "case \"$message\" in *'Permission denied'*) exit 0;; *) exit 96;; esac",
             ],
         )

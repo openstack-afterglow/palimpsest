@@ -134,10 +134,17 @@ CASES = (
         user_override="mysql",
     ),
     ServiceCase(
-        "MYSQL_USER_RANDOM_PASSWORD", "mysql:8.4", 2048, ("mysqld",),
-        b"ready for connections", ("mysqld", "--version"), b"Ver 8.4",
+        "MYSQL_USER_RANDOM_PASSWORD",
+        "mysql:8.4",
+        2048,
+        ("mysqld",),
+        b"ready for connections",
+        ("mysqld", "--version"),
+        b"Ver 8.4",
         ("/bin/sh", "-c", "command -v mysqladmin >/dev/null || exit 77; mysqladmin --protocol=socket ping"),
-        b"mysqld is alive\n", user_override="mysql", test_only_random_password=True,
+        b"mysqld is alive\n",
+        user_override="mysql",
+        test_only_random_password=True,
     ),
 )
 
@@ -206,6 +213,8 @@ def _run_arguments(case: ServiceCase, selection, name: str) -> tuple[object, ...
         selection.manifest_digest,
         "--name",
         name,
+        "--network",
+        "none",
         "--memory",
         str(case.memory_mib),
         "--vcpus",
@@ -289,22 +298,22 @@ def _loopback_security_command(
     sysfs_net = shlex.quote(sysfs_net_path)
     return (
         "netdev_count=0; "
-        "while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; dev=${1-}; "
+        'while IFS=: read -r iface rest; do [ -n "$rest" ] || continue; set -- $iface; dev=${1-}; '
         "netdev_count=$((netdev_count+1)); "
         f"done < {netdev}; printf 'netdev_count=%s\\n' \"$netdev_count\"; "
         "printf 'netdev_begin\\n'; "
-        f"while IFS=: read -r iface rest; do [ -n \"$rest\" ] || continue; set -- $iface; printf 'netdev_interface=%s\\n' \"${{1-}}\"; done < {netdev}; "
+        f'while IFS=: read -r iface rest; do [ -n "$rest" ] || continue; set -- $iface; printf \'netdev_interface=%s\\n\' "${{1-}}"; done < {netdev}; '
         "printf 'netdev_end\\n'; "
         "sysfs_count=0; "
-        f"for entry in {sysfs_net}/*; do [ -e \"$entry\" ] || continue; name=${{entry##*/}}; "
-        "IFS= read -r flags < \"$entry/flags\" || exit 78; IFS= read -r type < \"$entry/type\" || exit 78; "
-        "IFS= read -r ifindex < \"$entry/ifindex\" || exit 78; "
-        "sysfs_count=$((sysfs_count+1)); printf 'interface name=%s flags=%s type=%s ifindex=%s\\n' \"$name\" \"$flags\" \"$type\" \"$ifindex\"; done; "
+        f'for entry in {sysfs_net}/*; do [ -e "$entry" ] || continue; name=${{entry##*/}}; '
+        'IFS= read -r flags < "$entry/flags" || exit 78; IFS= read -r type < "$entry/type" || exit 78; '
+        'IFS= read -r ifindex < "$entry/ifindex" || exit 78; '
+        'sysfs_count=$((sysfs_count+1)); printf \'interface name=%s flags=%s type=%s ifindex=%s\\n\' "$name" "$flags" "$type" "$ifindex"; done; '
         "printf 'sysfs_count=%s\\n' \"$sysfs_count\"; "
         "while read -r key value rest; do case $key in "
-        "Uid:|Gid:) printf '%s=%s %s\\n' \"${key%:}\" \"$value\" \"$rest\";; "
+        'Uid:|Gid:) printf \'%s=%s %s\\n\' "${key%:}" "$value" "$rest";; '
         "CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:|NoNewPrivs:|Seccomp:) "
-        f"printf '%s=%s\\n' \"${{key%:}}\" \"$value\";; esac; done < {status}; "
+        f'printf \'%s=%s\\n\' "${{key%:}}" "$value";; esac; done < {status}; '
         "if command -v ip >/dev/null 2>&1; then printf 'ip_tool=present\\n'; ip -4 addr show dev lo; "
         "else printf 'ip_tool=absent\\n'; fi"
     )
@@ -408,8 +417,12 @@ def _assert_no_password_leak(parent: Path) -> None:
 def _save_service_result(parent: Path, name: str, result, *, secret_safe: bool):
     if secret_safe and re.search(rb"palimpsest-test-[0-9a-f]{64}", result.stdout + result.stderr):
         pattern = rb"palimpsest-test-[0-9a-f]{64}"
-        redacted = type(result)(result.args, result.returncode, re.sub(pattern, b"[REDACTED]", result.stdout),
-                                re.sub(pattern, b"[REDACTED]", result.stderr))
+        redacted = type(result)(
+            result.args,
+            result.returncode,
+            re.sub(pattern, b"[REDACTED]", result.stdout),
+            re.sub(pattern, b"[REDACTED]", result.stderr),
+        )
         legacy._save(parent, name, redacted)
         raise AssertionError("generated password appeared in command output")
     return legacy._save(parent, name, result)
@@ -429,8 +442,12 @@ def _service_probe_ok(case: ServiceCase, probe: subprocess.CompletedProcess[byte
 def _save_cleanup_result(parent: Path, name: str, result) -> tuple[object, bool, str | None]:
     pattern = rb"palimpsest-test-[0-9a-f]{64}"
     leaked = re.search(pattern, result.stdout + result.stderr) is not None
-    redacted = type(result)(result.args, result.returncode, re.sub(pattern, b"[REDACTED]", result.stdout),
-                            re.sub(pattern, b"[REDACTED]", result.stderr))
+    redacted = type(result)(
+        result.args,
+        result.returncode,
+        re.sub(pattern, b"[REDACTED]", result.stdout),
+        re.sub(pattern, b"[REDACTED]", result.stderr),
+    )
     try:
         saved = legacy._save(parent, name, redacted)
     except OSError as exc:
@@ -482,7 +499,9 @@ def _secret_safe_cli(parent: Path, environment: dict[str, str], *args: object, t
         stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
         pattern = rb"palimpsest-test-[0-9a-f]{64}"
         redacted = subprocess.CompletedProcess(
-            tuple(map(str, args)), 124, re.sub(pattern, b"[REDACTED]", stdout),
+            tuple(map(str, args)),
+            124,
+            re.sub(pattern, b"[REDACTED]", stdout),
             re.sub(pattern, b"[REDACTED]", stderr),
         )
         legacy._save(parent, "timeout", redacted)
@@ -553,8 +572,13 @@ def _preserve_failed_owned_runtime(
 def test_official_service_default_process_compatibility(case: ServiceCase) -> None:
     selection = _selection(case, os.environ)
     short = {
-        "POSTGRES": "pg", "REDIS": "rd", "MYSQL": "my", "NGINX": "ng",
-        "REDIS_USER": "rdu", "MYSQL_USER": "myu", "MYSQL_USER_RANDOM_PASSWORD": "myr",
+        "POSTGRES": "pg",
+        "REDIS": "rd",
+        "MYSQL": "my",
+        "NGINX": "ng",
+        "REDIS_USER": "rdu",
+        "MYSQL_USER": "myu",
+        "MYSQL_USER_RANDOM_PASSWORD": "myr",
     }[case.key]
     parent, environment = legacy._setup(legacy._environment(), "svc-" + short)
     if case.test_only_random_password:
@@ -565,8 +589,10 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         if case.test_only_random_password and root_volume_directory.is_dir()
         else set()
     )
-    name_prefix = "hub-service-mysql-random-" if case.test_only_random_password else (
-        "hub-service-" + case.key.lower().replace("_", "-") + "-"
+    name_prefix = (
+        "hub-service-mysql-random-"
+        if case.test_only_random_password
+        else ("hub-service-" + case.key.lower().replace("_", "-") + "-")
     )
     name = name_prefix + uuid.uuid4().hex[:8]
     if case.test_only_random_password:
@@ -575,7 +601,8 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         assert virsh
         inventory = legacy._bounded_command(
             [virsh, "-c", "qemu:///system", "list", "--all", "--name"],
-            environment=environment, timeout=15,
+            environment=environment,
+            timeout=15,
         )
         legacy._success(inventory)
         assert name not in legacy._inventory_lines(inventory.stdout, encoding="utf-8")
@@ -618,7 +645,9 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         )
         _save_json(parent, "authenticated-process.json", process.to_dict())
         launched = _save_service_result(
-            parent, "run", _case_cli(case, parent, environment, *_run_arguments(case, selection, name), timeout=240),
+            parent,
+            "run",
+            _case_cli(case, parent, environment, *_run_arguments(case, selection, name), timeout=240),
             secret_safe=case.test_only_random_password,
         )
         _save_json(
@@ -650,7 +679,8 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
         _save_json(parent, "root-proof-before.json", before)
         assert before["domain"]["uuid"] == domain_uuid
         version = _save_service_result(
-            parent, "version",
+            parent,
+            "version",
             _case_cli(case, parent, environment, "exec", name, "--", *case.version_argv, timeout=60),
             secret_safe=case.test_only_random_password,
         )
@@ -661,7 +691,9 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                 parent,
                 "guest-loopback-security",
                 _case_cli(
-                    case, parent, environment,
+                    case,
+                    parent,
+                    environment,
                     "exec",
                     name,
                     "--",
@@ -678,7 +710,8 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             except AssertionError as exc:
                 loopback_security_error = exc
         probe = _save_service_result(
-            parent, "service-probe",
+            parent,
+            "service-probe",
             _case_cli(case, parent, environment, "exec", name, "--", *case.probe_argv, timeout=60),
             secret_safe=case.test_only_random_password,
         )
@@ -700,8 +733,16 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             parent,
             "root",
             _case_cli(
-                case, parent, environment, "exec", name, "--", "/bin/sh", "-c",
-                "stat -c '%d %i' /; cat /etc/os-release", timeout=60,
+                case,
+                parent,
+                environment,
+                "exec",
+                name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "stat -c '%d %i' /; cat /etc/os-release",
+                timeout=60,
             ),
             secret_safe=case.test_only_random_password,
         )
@@ -713,8 +754,16 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             parent,
             "pid1-refusal",
             _case_cli(
-                case, parent, environment, "exec", name, "--", "/bin/sh", "-c",
-                "LC_ALL=C cat /proc/1/root/etc/os-release", timeout=60,
+                case,
+                parent,
+                environment,
+                "exec",
+                name,
+                "--",
+                "/bin/sh",
+                "-c",
+                "LC_ALL=C cat /proc/1/root/etc/os-release",
+                timeout=60,
             ),
             secret_safe=case.test_only_random_password,
         )
@@ -734,19 +783,25 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             assert not _retain_redacted_console(parent, environment, name), "generated password appeared on console"
             _assert_no_password_leak(parent)
         stopped = _save_service_result(
-            parent, "stop", _case_cli(case, parent, environment, "stop", name, timeout=90),
+            parent,
+            "stop",
+            _case_cli(case, parent, environment, "stop", name, timeout=90),
             secret_safe=case.test_only_random_password,
         )
         legacy._success(stopped)
         removed = _save_service_result(
-            parent, "rm", _case_cli(case, parent, environment, "rm", name, timeout=90),
+            parent,
+            "rm",
+            _case_cli(case, parent, environment, "rm", name, timeout=90),
             secret_safe=case.test_only_random_password,
         )
         legacy._success(removed)
         legacy._assert_domain_absent(environment, name, domain_uuid)
         assert not (parent / "state" / "runs" / name).exists()
         if case.test_only_random_password:
-            remaining = {path.name for path in root_volume_directory.iterdir()} if root_volume_directory.is_dir() else set()
+            remaining = (
+                {path.name for path in root_volume_directory.iterdir()} if root_volume_directory.is_dir() else set()
+            )
             assert remaining == root_volume_before
         assert legacy._file_sha256(selection.archive) == source_hash == selection.archive_digest
         disposed = True
@@ -767,7 +822,10 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
                     state, observed_uuid = _domain_state(environment, name)
                     assert observed_uuid == domain_uuid
                     leak_detected, command_errors = _capture_then_dispose(
-                        parent, environment, name, state,
+                        parent,
+                        environment,
+                        name,
+                        state,
                         lambda operation: _secret_safe_cli(parent, environment, operation, name, timeout=90),
                     )
                     cleanup_evidence_errors.extend(command_errors)
@@ -791,7 +849,8 @@ def test_official_service_default_process_compatibility(case: ServiceCase) -> No
             assert legacy._record_source_hashes(parent, source_hash, selection.archive) == source_hash
             assert legacy._file_sha256(original_selection.archive) == original_source_hash
             _save_json(
-                parent, "completion.json",
+                parent,
+                "completion.json",
                 {"application_completed": completed, "owned_resources_disposed": disposed},
             )
         except BaseException as evidence_exc:

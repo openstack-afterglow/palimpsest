@@ -40,7 +40,7 @@ PORTABLE_FILES = {
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima pci_preflight
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
-        oci_docker_hub_services_live_contract oci_ml_cpu_live_contract
+        oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units("build buildkit hub_contract registry"),
@@ -55,7 +55,7 @@ PORTABLE_FILES = {
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
         oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
         main_console_sink main_console_sink_callsites main_output_pipes main_output_terminate
-        main_console_lifecycle main_control_deadline workload_dev_aliases workload_loopback
+        main_console_lifecycle main_control_deadline workload_dev_aliases workload_loopback workload_network
         oci_dev_cover_live_contract
     """),
     "oci-monitor": _units("""
@@ -88,6 +88,7 @@ SPECIAL_FILES = {
         "tests/kvm/test_oci_stdio_cli_live.py",
         "tests/kvm/test_oci_console_ofd_live.py",
         "tests/kvm/test_oci_ml_cpu_live.py",
+        "tests/kvm/test_oci_network_live.py",
     ),
     "guest-kvm": (
         "tests/kvm/test_oci_guest_stage1_live.py",
@@ -230,6 +231,11 @@ DEPENDENCIES = (
     ("pci_preflight", ("host-runtime",), ()),
     ("oci_root_volume_inventory", ("core-cli", "host-runtime", "oci-store"), ()),
     ("oci_resource_status", ("host-runtime", "core-cli"), ()),
+    (
+        "oci_network oci_network_status",
+        ("host-runtime", "core-cli", "oci-guest", "oci-monitor", "oci-store", "qualification"),
+        ("native-live", "guest-kvm", "gate2"),
+    ),
     ("oci_worker_limits", ("host-runtime", "oci-store"), ("native-live",)),
     (
         "oci_materializer oci_materializer_worker oci_packer oci_worker_protocol",

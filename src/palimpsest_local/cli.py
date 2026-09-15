@@ -34,6 +34,7 @@ from .inventory import import_cloud_image
 from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
 from .oci_materializer import materialize_image_hard
+from .oci_network import OCI_NETWORK_MODES
 from .oci_packer import discover_squashfs_toolchain
 from .oci_process import OCIUserSpec
 from .oci_run_cleanup import OCIRunRemovalResult
@@ -649,6 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
     oci_root_proof.add_argument("name")
     oci_exec_status = oci_commands.add_parser("exec-status")
     oci_exec_status.add_argument("name")
+    oci_network = oci_commands.add_parser("network")
+    oci_network.add_argument("name")
     oci_exec_record = oci_commands.add_parser("exec-record")
     oci_exec_record.add_argument("path")
     oci_commands.add_parser("resource-status")
@@ -779,6 +782,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--memory", type=int, default=4096)
     run.add_argument("--vcpus", type=int, default=2)
     run.add_argument("--network", default=None)
+    run.add_argument(
+        "-p",
+        "--publish",
+        action="append",
+        default=[],
+        metavar="[HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]",
+        help="publish one OCI-root guest port on the host (default host address 127.0.0.1)",
+    )
     run.add_argument("--backend", choices=("auto", "kvm", "lima-vz", "libvirt-hvf"), default="auto")
     run.add_argument("--runtime-kind", choices=("cloud-image", "oci-root"))
     run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
@@ -1470,7 +1481,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
-    read_only_oci_operations = {"root-proof", "exec-status"}
+    read_only_oci_operations = {"root-proof", "exec-status", "network"}
     roots = (
         resolve_roots()
         if op in read_only_root_operations or (op == "oci" and args.oci_operation in read_only_oci_operations)
@@ -1508,6 +1519,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             from .oci_exec_status import exec_status
 
             print(json.dumps(exec_status(roots, args.name), indent=2, sort_keys=True))
+            return 0
+        if args.oci_operation == "network":
+            from .oci_network_status import network_status
+
+            print(json.dumps(network_status(roots, args.name), indent=2, sort_keys=True))
             return 0
         oci_roots = StatePaths(
             config=roots.config.resolve(strict=True),
@@ -2147,8 +2163,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 raise PalimpsestError("OCI-root run does not accept cloud --layer attachments")
             if args.backend not in {"auto", "kvm"}:
                 raise PalimpsestError("OCI-root run supports only the KVM backend")
-            if args.network not in {None, "none"}:
-                raise PalimpsestError("OCI-root run networking is not available yet; use --network none")
+            if args.network is not None and args.network not in OCI_NETWORK_MODES:
+                raise PalimpsestError(
+                    "OCI-root run networking accepts --network nat, --network host-only, or --network none"
+                )
             request = resolve_local_oci_run_request(
                 source,
                 name=args.name,
@@ -2160,6 +2178,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 vcpus=args.vcpus,
                 root_retention=args.root_retention or "delete",
                 root_volume_id=args.root_volume,
+                network=args.network,
+                published_ports=tuple(args.publish),
             )
             result = runtime_dispatch.run_local_oci(request, roots=roots)
             if args.detach:
@@ -2177,9 +2197,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             or getattr(args, "root_volume", None) is not None
             or getattr(args, "user", None) is not None
             or getattr(args, "command_override", None) is not None
+            or getattr(args, "publish", None)
         ):
             raise PalimpsestError(
-                "--detach, --manifest, --root-retention, --root-volume, --user and command overrides are supported only for local OCI-root runs"
+                "--detach, --manifest, --root-retention, --root-volume, --user, --publish and command overrides "
+                "are supported only for local OCI-root runs"
             )
         network = args.network if args.network is not None else "default"
         stack = _resolve_runtime_stack(

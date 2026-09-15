@@ -23,6 +23,7 @@ from typing import Any
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, StateError
+from .oci_network import OCINetworkConfig
 from .oci_packer import SQUASHFS_BLOCK_DEVICE_ALIGNMENT
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
@@ -38,7 +39,7 @@ from .oci_stage1 import (
 )
 from .oci_stage1_transport import MAX_OCI_STAGE1_TRANSPORT_BYTES, MAX_OCI_STAGE1_TRANSPORT_PAYLOAD_BYTES
 
-OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v18"
+OCI_GUEST_STAGE1_CONTRACT = "palimpsest.guest-stage1-consumer.x86_64.v19"
 OCI_GUEST_STAGE1_CAPABILITY = "authenticated-overlay-switch-root-pid1-supervisor-workload-isolation"
 OCI_GUEST_STAGE1_PLAN_TRANSPORT = "virtio-blk-raw-envelope-4k.v1"
 MAX_GUEST_KERNEL_CMDLINE_BYTES = 4096
@@ -461,6 +462,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
         "domain_core_digest",
         "handoff",
         "isolation",
+        "network",
         "phase",
         "process",
         "process_policy",
@@ -509,6 +511,7 @@ def _semantic_stage1_plan(value: Any) -> OCIStage1Plan:
             root=assembly["root"],
             layers=tuple(assembly["layers"]),
             process=process,
+            network=OCINetworkConfig.from_guest_contract(value["network"], run_id=run["run_id"]),
             assembly_probes=tuple(assembly["probes"]),
         )
     except (ArtifactValidationError, KeyError, TypeError, ValueError):

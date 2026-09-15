@@ -652,7 +652,11 @@ def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
     """Enter the distinct typed local-image launcher, with its own host preflight."""
     if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
         raise TypeError("local OCI create requires a typed request and state paths")
-    platforms.capability_profile(request.dispatch_key, RuntimeOperation.RUN, network=None)
+    platforms.capability_profile(
+        request.dispatch_key,
+        RuntimeOperation.RUN,
+        network=request.network.mode if request.network.enabled else None,
+    )
     result = _oci_adapter().run_local_oci(roots, request)
     if (
         not isinstance(result.record, ExistingRunRecord)

@@ -332,6 +332,8 @@ def _detached_run_arguments(
         selection.manifest_digest,
         "--name",
         name,
+        "--network",
+        "none",
         "--memory",
         "512",
         "--vcpus",

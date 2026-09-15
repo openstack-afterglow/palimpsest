@@ -34,6 +34,7 @@ from .kvm import (
 from .oci_control_protocol_v2 import OCI_CONTROL_CHANNEL_NAME
 from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2 as OCI_CONTROL_PROTOCOL
 from .oci_initramfs import MAX_OCI_INITRAMFS_BYTES, OCIInitramfsManifest, verify_bootstrap_initramfs
+from .oci_network import OCI_NETWORK_NONE, OCINetworkConfig
 from .oci_process import OCIProcessSpec
 from .oci_provenance import canonical_json_bytes
 from .oci_root_prepare import OCIRootPreparationTransaction, PreparedOCIRootRun
@@ -58,8 +59,8 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import RuntimeBackend, RuntimeKind
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run, read_run_ledger_snapshot, run_paths
 
-OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v15"
-OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v9"
+OCI_ROOT_DOMAIN_PLAN_SCHEMA = "palimpsest.oci-root-domain-plan.v16"
+OCI_ROOT_DOMAIN_CORE_SCHEMA = "palimpsest.oci-root-domain-core.v10"
 OCI_ROOT_BOOT_ARTIFACT_POLICY = "palimpsest.host-boot-artifacts.x86_64.v1"
 OCI_ROOT_LIFECYCLE_ENDPOINT = f"run-private/{OCI_RUNTIME_DIRECTORY}/{OCI_RUNTIME_LIFECYCLE_FILENAME}"
 OCI_ROOT_LIFECYCLE_SOCKET_FILENAME = OCI_RUNTIME_LIFECYCLE_FILENAME
@@ -137,7 +138,7 @@ def _domain_core_dict(
     process: OCIProcessSpec,
     memory_mib: int,
     vcpus: int,
-    network: str | None,
+    network: OCINetworkConfig,
 ) -> dict[str, Any]:
     return {
         "boot_artifacts": _plain_json(boot_artifacts),
@@ -151,7 +152,7 @@ def _domain_core_dict(
             "protocol": OCI_CONTROL_PROTOCOL,
             "transport": "virtio-serial",
         },
-        "machine": {"memory_mib": memory_mib, "network": network, "vcpus": vcpus},
+        "machine": {"memory_mib": memory_mib, "network": network.to_dict(), "vcpus": vcpus},
         "process": process.to_dict(),
         "resource_plan_digest": resource_plan_digest,
         "root_volume": _plain_json(root_volume),
@@ -364,7 +365,7 @@ class OCIRootDomainPlan:
     process: OCIProcessSpec
     memory_mib: int
     vcpus: int
-    network: str | None
+    network: OCINetworkConfig
     kernel_cmdline: str
 
     def __post_init__(self) -> None:
@@ -479,8 +480,8 @@ class OCIRootDomainPlan:
         serials.add(transport_serial)
         if not 256 <= self.memory_mib <= 1_048_576 or not 1 <= self.vcpus <= 256:
             raise StateError("OCI-root domain compute shape is invalid")
-        if self.network is not None and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,62}", self.network) is None:
-            raise StateError("OCI-root domain network is invalid")
+        if not isinstance(self.network, OCINetworkConfig):
+            raise StateError("OCI-root domain network contract is invalid")
         expected_lowers = ",".join(f"virtio-{layer['serial']}" for layer in self.layers)
         expected_cmdline = (
             "console=ttyS0,115200n8 panic=1 rdinit=/init "
@@ -490,6 +491,9 @@ class OCIRootDomainPlan:
             f"palimpsest.stage1dev=virtio-{transport_serial} "
             f"palimpsest.root=virtio-{root['serial']} palimpsest.lowers={expected_lowers}"
         )
+        network_fragment = self.network.kernel_cmdline_fragment()
+        if network_fragment:
+            expected_cmdline = f"{expected_cmdline} {network_fragment}"
         if self.kernel_cmdline != expected_cmdline or len(self.kernel_cmdline) > 4096:
             raise StateError("OCI-root domain kernel command line is invalid")
         expected_core = _json_digest(
@@ -519,6 +523,7 @@ class OCIRootDomainPlan:
             root_volume=root,
             layers=tuple(self.layers),
             process=self.process,
+            network=self.network,
         )
         expected_transport = build_stage1_transport(expected_stage1)
         if expected_transport.receipt != transport_receipt:
@@ -543,7 +548,7 @@ class OCIRootDomainPlan:
                 "protocol": OCI_CONTROL_PROTOCOL,
                 "transport": "virtio-serial",
             },
-            "machine": {"memory_mib": self.memory_mib, "network": self.network, "vcpus": self.vcpus},
+            "machine": {"memory_mib": self.memory_mib, "network": self.network.to_dict(), "vcpus": self.vcpus},
             "phase": "domain-planned",
             "process": self.process.to_dict(),
             "resource_plan_digest": self.resource_plan_digest,
@@ -571,6 +576,7 @@ class OCIRootDomainPlan:
             "palimpsest.oci-root-domain-plan.v12",
             "palimpsest.oci-root-domain-plan.v13",
             "palimpsest.oci-root-domain-plan.v14",
+            "palimpsest.oci-root-domain-plan.v15",
         }:
             version = str(value["schema"]).rsplit(".", 1)[-1]
             raise StateError(f"pre-production OCI-root domain plan {version} is invalidated; rebuild it before launch")
@@ -635,7 +641,7 @@ class OCIRootDomainPlan:
                 process=OCIProcessSpec.from_dict(value["process"]),
                 memory_mib=machine["memory_mib"],
                 vcpus=machine["vcpus"],
-                network=machine["network"],
+                network=OCINetworkConfig.from_dict(machine["network"]),
                 kernel_cmdline=value["kernel_cmdline"],
             )
         except (ArtifactValidationError, KeyError, TypeError, ValueError):
@@ -736,7 +742,7 @@ def build_oci_root_domain_plan(
     *,
     memory_mib: int = 1024,
     vcpus: int = 1,
-    network: str | None = "default",
+    network: OCINetworkConfig = OCI_NETWORK_NONE,
     runner: CommandRunner = _default_runner,
 ) -> ResolvedOCIRootDomainPlan:
     """Resolve prepared resources to a non-launching XML preview after validation."""
@@ -845,6 +851,7 @@ def build_oci_root_domain_plan(
         root_volume=root_contract,
         layers=tuple(layers),
         process=process,
+        network=network,
     )
     transport = build_stage1_transport(stage1_plan)
     transport_serial = _serial("stage1-transport", transport.receipt.artifact_digest)
@@ -862,6 +869,9 @@ def build_oci_root_domain_plan(
         f"palimpsest.stage1dev=virtio-{transport_serial} "
         f"palimpsest.root=virtio-{root_serial} palimpsest.lowers={lower_ids}"
     )
+    network_fragment = network.kernel_cmdline_fragment()
+    if network_fragment:
+        cmdline = f"{cmdline} {network_fragment}"
     plan = OCIRootDomainPlan(
         run_id=transaction.owner.run_id,
         run_name=transaction.owner.run_name,

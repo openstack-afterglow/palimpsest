@@ -128,6 +128,18 @@ struct span { const char *p; usize n; };
 #define IFF_UP 0x1
 #define IFF_LOOPBACK 0x8
 #define IFF_RUNNING 0x40
+#define IFF_BROADCAST 0x2
+#define IFF_MULTICAST 0x1000
+#define SIOCGIFCONF 0x8912
+#define SIOCGIFADDR 0x8915
+#define SIOCGIFNETMASK 0x891b
+#define SIOCGIFHWADDR 0x8927
+#define ARPHRD_ETHER 1
+#define O_CREAT 0100
+#define O_TRUNC 01000
+#define GUEST_NAMESERVER_MAX 3
+#define GUEST_INTERFACE_MAX 8
+#define ROUTE_TABLE_MAX 8192
 #define F_GETFD 1
 #define F_GETFL 3
 #define FD_CLOEXEC 1
@@ -300,8 +312,29 @@ struct ifreq_local {
         i64 align;
         int index;
         short flags;
+        struct { unsigned short family; unsigned short port; u32 address; u8 pad[8]; } inet;
+        struct { unsigned short family; u8 mac[14]; } hardware;
         u8 bytes[24];
     } value;
+};
+
+/* Linux x86_64 ifconf is a 4-byte length, 4 bytes of padding, and a pointer. */
+struct ifconf_local {
+    int len;
+    int pad;
+    void *buffer;
+};
+
+/* The authenticated stage-1 network contract projected to PID 1. */
+struct guest_network {
+    int enabled;
+    char interface[IFNAMSIZ];
+    u32 address;
+    u32 netmask;
+    u32 gateway;
+    u8 mac[6];
+    char nameservers[GUEST_NAMESERVER_MAX][16];
+    u32 nameserver_count;
 };
 
 struct stat_local {
@@ -477,6 +510,7 @@ struct lifecycle_session {
 };
 
 static struct lifecycle_binding lifecycle_binding;
+static struct guest_network workload_network;
 
 struct root_identity_evidence { u64 device; u64 inode; int verified; };
 static struct root_identity_evidence root_identity_evidence;
@@ -1449,6 +1483,86 @@ static int parse_process(struct parser *j, struct guest_process *process) {
     return path_seen && j->process_bytes <= PROCESS_MAX_LOCAL && process->used <= PROCESS_MAX_LOCAL + 1;
 }
 
+static int parse_ipv4_span(struct span s, u32 *out) {
+    u32 octets[4];
+    usize position = 0, index;
+    if (!s.n || s.n > 15) return 0;
+    for (index = 0; index < 4; index++) {
+        usize start = position;
+        u32 value = 0;
+        while (position < s.n && s.p[position] >= '0' && s.p[position] <= '9') {
+            value = value * 10 + (u32)(s.p[position] - '0');
+            if (value > 255 || position - start >= 3) return 0;
+            position++;
+        }
+        if (position == start || (position - start > 1 && s.p[start] == '0')) return 0;
+        octets[index] = value;
+        if (index < 3) {
+            if (position >= s.n || s.p[position] != '.') return 0;
+            position++;
+        }
+    }
+    if (position != s.n) return 0;
+    /* Keep network byte order so ioctl and /proc/net/route compare directly. */
+    *out = octets[0] | (octets[1] << 8) | (octets[2] << 16) | (octets[3] << 24);
+    return 1;
+}
+
+static int parse_mac_span(struct span s, u8 out[6]) {
+    usize index;
+    if (s.n != 17) return 0;
+    for (index = 0; index < 6; index++) {
+        const char *pair = s.p + index * 3;
+        if (!is_hex(pair[0]) || !is_hex(pair[1])) return 0;
+        if (index < 5 && pair[2] != ':') return 0;
+        out[index] = (u8)((hex_value(pair[0]) << 4) | hex_value(pair[1]));
+    }
+    return 1;
+}
+
+/* Parse the authenticated network contract exactly: fixed key order, closed
+ * mode set, literal IPv4 text, and a resolver policy that only NAT may set.
+ * No value is inferred from the host. */
+static int parse_network(struct parser *j, struct guest_network *net) {
+    struct span s;
+    int enabled, nat = 0;
+    memset(net, 0, sizeof(*net));
+    if (!take_char(j, '{') || !key(j, "address") || !plain_string(j, &s, 0)) return 0;
+    enabled = s.n != 0;
+    if (enabled && !parse_ipv4_span(s, &net->address)) return 0;
+    if (!take_char(j, ',') || !key(j, "gateway") || !plain_string(j, &s, 0)) return 0;
+    if (enabled ? !parse_ipv4_span(s, &net->gateway) : s.n != 0) return 0;
+    if (!take_char(j, ',') || !key(j, "interface") || !plain_string(j, &s, 0) ||
+        s.n == 0 || s.n >= IFNAMSIZ || !copy_span(net->interface, sizeof(net->interface), s) ||
+        !text_equal(net->interface, "eth0")) return 0;
+    if (!take_char(j, ',') || !key(j, "mac") || !plain_string(j, &s, 0)) return 0;
+    if (enabled ? !parse_mac_span(s, net->mac) : s.n != 0) return 0;
+    if (!take_char(j, ',') || !key(j, "mode") || !plain_string(j, &s, 0)) return 0;
+    if (enabled) {
+        if (s.n == 3 && bytes_equal(s.p, "nat", 3)) nat = 1;
+        else if (s.n != 9 || !bytes_equal(s.p, "host-only", 9)) return 0;
+        net->enabled = 1;
+    } else if (s.n != 4 || !bytes_equal(s.p, "none", 4)) return 0;
+    if (!take_char(j, ',') || !key(j, "nameservers") || !take_char(j, '[')) return 0;
+    if (!take_char(j, ']')) {
+        for (;;) {
+            u32 nameserver = 0;
+            if (net->nameserver_count >= GUEST_NAMESERVER_MAX || !plain_string(j, &s, 0) ||
+                !parse_ipv4_span(s, &nameserver) ||
+                !copy_span(net->nameservers[net->nameserver_count],
+                           sizeof(net->nameservers[net->nameserver_count]), s)) return 0;
+            net->nameserver_count++;
+            if (take_char(j, ']')) break;
+            if (!take_char(j, ',')) return 0;
+        }
+    }
+    /* Only outbound NAT may publish a resolver; host-only and none must not. */
+    if (nat ? net->nameserver_count == 0 : net->nameserver_count != 0) return 0;
+    if (!take_char(j, ',') || !key(j, "netmask") || !plain_string(j, &s, 0)) return 0;
+    if (enabled ? !parse_ipv4_span(s, &net->netmask) : s.n != 0) return 0;
+    return take_char(j, '}');
+}
+
 static int parse_plan(const u8 *payload, usize size, const struct bindings *b, struct expected_device_set *devices,
                       struct guest_process *process) {
     struct parser j;
@@ -1553,16 +1667,17 @@ static int parse_plan(const u8 *payload, usize size, const struct bindings *b, s
         !exact_string(&j, "first-party-pid1-supervisor.v9") || !take_char(&j, ',') ||
         !key(&j, "isolation") ||
         !exact_string(&j, "palimpsest.workload-lifecycle-authority-isolation.v3") || !take_char(&j, ',') ||
+        !key(&j, "network") || !parse_network(&j, &workload_network) || !take_char(&j, ',') ||
         !key(&j, "phase") || !exact_string(&j, "stage1-contract") || !take_char(&j, ',') ||
         !key(&j, "process") || !parse_process(&j, process) || !take_char(&j, ',') ||
         !key(&j, "process_policy") ||
         !exact_string(&j, "image-root-account-path-capabilityless-isolated-user-group.v3") ||
-        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v15") ||
+        !take_char(&j, ',') || !key(&j, "protocol") || !exact_string(&j, "palimpsest.guest-stage1.v16") ||
         !take_char(&j, ',') || !key(&j, "run") || !take_char(&j, '{') || !key(&j, "name") ||
         !plain_string(&j, &s, 0) || !valid_run_name(s) || !take_char(&j, ',') || !key(&j, "run_id") ||
         !plain_string(&j, &s, 0) || !valid_uuid_span(s) || !take_char(&j, '}') || !take_char(&j, ',') ||
         !copy_span(lifecycle_binding.run_id, sizeof(lifecycle_binding.run_id), s) ||
-        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v15") || !take_char(&j, '}') ||
+        !key(&j, "schema") || !exact_string(&j, "palimpsest.oci-stage1-plan.v16") || !take_char(&j, '}') ||
         j.p != j.end) return 0;
     memcpy(lifecycle_binding.core, b->core, sizeof(lifecycle_binding.core));
     memcpy(lifecycle_binding.stage1, b->transport, sizeof(lifecycle_binding.stage1));
@@ -4334,6 +4449,201 @@ rejected:
     return 0;
 }
 
+static int parse_hex_u32(const char *p, usize n, u32 *out) {
+    u32 value = 0;
+    usize index;
+    if (!n || n > 8) return 0;
+    for (index = 0; index < n; index++) {
+        if (!is_hex(p[index])) return 0;
+        value = (value << 4) | (u32)hex_value(p[index]);
+    }
+    *out = value;
+    return 1;
+}
+
+static int route_field(const char *line, usize length, u32 wanted, struct span *out) {
+    usize start = 0, position = 0, field = 0;
+    for (;;) {
+        if (position == length || line[position] == '\t') {
+            if (field == wanted) {
+                out->p = line + start;
+                out->n = position - start;
+                return out->n != 0;
+            }
+            if (position == length) return 0;
+            field++;
+            position++;
+            start = position;
+            continue;
+        }
+        position++;
+    }
+}
+
+/* Require exactly one default route, on the committed interface, through the
+ * committed gateway. A missing, extra, or foreign default route fails closed. */
+static int verify_default_route(const struct guest_network *net) {
+    static u8 table[ROUTE_TABLE_MAX];
+    i64 count = read_bounded_file("/proc/net/route", table, sizeof(table), 1, 0);
+    usize offset = 0;
+    u32 defaults = 0, line_index = 0;
+    if (count <= 0) return 0;
+    while (offset < (usize)count) {
+        usize end = offset;
+        struct span interface, destination, gateway, mask;
+        u32 destination_value = 0, gateway_value = 0, mask_value = 0;
+        while (end < (usize)count && table[end] != '\n') end++;
+        if (end > offset && line_index++) {
+            const char *line = (const char *)table + offset;
+            usize length = end - offset;
+            if (!route_field(line, length, 0, &interface) ||
+                !route_field(line, length, 1, &destination) ||
+                !route_field(line, length, 2, &gateway) ||
+                !route_field(line, length, 7, &mask) ||
+                !parse_hex_u32(destination.p, destination.n, &destination_value) ||
+                !parse_hex_u32(gateway.p, gateway.n, &gateway_value) ||
+                !parse_hex_u32(mask.p, mask.n, &mask_value)) return 0;
+            if (destination_value == 0 && mask_value == 0) {
+                defaults++;
+                if (gateway_value != net->gateway || interface.n != slen(net->interface) ||
+                    !bytes_equal(interface.p, net->interface, interface.n)) return 0;
+            }
+        }
+        offset = end + 1;
+    }
+    return defaults == 1;
+}
+
+/* Require the exact set of IPv4-configured interfaces: loopback alone without
+ * networking, loopback plus the committed NIC with networking. */
+static int verify_configured_interfaces(int descriptor, const struct guest_network *net) {
+    struct ifreq_local entries[GUEST_INTERFACE_MAX];
+    struct ifconf_local configuration;
+    int expected = net->enabled ? 2 : 1;
+    int found = 0, index;
+    memset(entries, 0, sizeof(entries));
+    configuration.len = (int)sizeof(entries);
+    configuration.pad = 0;
+    configuration.buffer = entries;
+    if (sc3(SYS_ioctl, descriptor, SIOCGIFCONF, (i64)&configuration) != 0) return 0;
+    if (configuration.len < 0 || configuration.len % (int)sizeof(entries[0]) ||
+        configuration.len != expected * (int)sizeof(entries[0])) return 0;
+    for (index = 0; index < expected; index++) {
+        const struct ifreq_local *entry = &entries[index];
+        if (entry->value.inet.family != AF_INET) return 0;
+        if (text_equal(entry->name, "lo")) {
+            if (entry->value.inet.address != 0x0100007f) return 0;
+            found |= 1;
+            continue;
+        }
+        if (!net->enabled || !text_equal(entry->name, net->interface) ||
+            entry->value.inet.address != net->address) return 0;
+        found |= 2;
+    }
+    return found == (net->enabled ? 3 : 1);
+}
+
+static int write_workload_resolver(const struct guest_network *net) {
+    char text[PATH_MAX_LOCAL];
+    struct stat_local st;
+    usize used = 0, index;
+    i64 directory, descriptor, written;
+    if (!net->nameserver_count) return 1;
+    text[0] = 0;
+    for (index = 0; index < net->nameserver_count; index++)
+        if (!append_text(text, &used, "nameserver ") || !append_text(text, &used, net->nameservers[index]) ||
+            !append_text(text, &used, "\n")) return 0;
+    directory = sc3(SYS_open, (i64)"/etc", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    if (directory == -ENOENT) {
+        if (sc3(SYS_mkdirat, AT_FDCWD, (i64)"/etc", 0755) != 0) return 0;
+        directory = sc3(SYS_open, (i64)"/etc", O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY, 0);
+    }
+    if (directory < 0) return 0;
+    if (sc2(SYS_fstat, directory, (i64)&st) != 0 || (st.mode & S_IFMT) != S_IFDIR) {
+        sc1(SYS_close, directory);
+        return 0;
+    }
+    descriptor = sc4(SYS_openat, directory, (i64)"resolv.conf",
+                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY, 0644);
+    if (sc1(SYS_close, directory) != 0 || descriptor < 0) {
+        if (descriptor >= 0) sc1(SYS_close, descriptor);
+        return 0;
+    }
+    if (sc2(SYS_fstat, descriptor, (i64)&st) != 0 || (st.mode & S_IFMT) != S_IFREG || st.nlink != 1) {
+        sc1(SYS_close, descriptor);
+        return 0;
+    }
+    written = sc3(SYS_write, descriptor, (i64)text, (i64)used);
+    if (sc1(SYS_close, descriptor) != 0 || written != (i64)used) return 0;
+    return 1;
+}
+
+/* Verify the authenticated NIC contract before the workload exists: exactly
+ * one committed non-loopback interface with the committed MAC, address, mask,
+ * default route, and resolver policy. Networking is never inferred from the
+ * host: every value comes from the digest-bound stage-1 plan. */
+static int prepare_workload_network(const struct guest_network *net, struct child_error_local *failure) {
+    struct ifreq_local request;
+    i64 descriptor, operation = -EIO;
+    int index = 0;
+    int valid = 0;
+    descriptor = sc3(SYS_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) {
+        set_workload_failure(failure, 45, descriptor);
+        return 0;
+    }
+    if (!net->enabled) {
+        valid = verify_configured_interfaces((int)descriptor, net);
+        goto closed;
+    }
+    memset(&request, 0, sizeof(request));
+    if (!copy_span(request.name, sizeof(request.name),
+                   (struct span){net->interface, slen(net->interface)})) goto closed;
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFINDEX, (i64)&request);
+    if (operation != 0 || request.value.index <= 0) goto closed;
+    index = request.value.index;
+    memset(&request, 0, sizeof(request));
+    request.value.index = index;
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFNAME, (i64)&request);
+    if (operation != 0 || !text_equal(request.name, net->interface)) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, net->interface, slen(net->interface) + 1);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFFLAGS, (i64)&request);
+    if (operation != 0 || (request.value.flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING) ||
+        (request.value.flags & IFF_LOOPBACK)) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, net->interface, slen(net->interface) + 1);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFHWADDR, (i64)&request);
+    if (operation != 0 || request.value.hardware.family != ARPHRD_ETHER ||
+        !bytes_equal((const char *)request.value.hardware.mac, (const char *)net->mac, 6)) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, net->interface, slen(net->interface) + 1);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFADDR, (i64)&request);
+    if (operation != 0 || request.value.inet.family != AF_INET ||
+        request.value.inet.address != net->address) goto closed;
+    memset(&request, 0, sizeof(request));
+    memcpy(request.name, net->interface, slen(net->interface) + 1);
+    operation = sc3(SYS_ioctl, descriptor, SIOCGIFNETMASK, (i64)&request);
+    if (operation != 0 || request.value.inet.family != AF_INET ||
+        request.value.inet.address != net->netmask) goto closed;
+    if (!verify_configured_interfaces((int)descriptor, net) || !verify_default_route(net)) goto closed;
+    valid = 1;
+closed:
+    if (sc1(SYS_close, descriptor) != 0) {
+        set_workload_failure(failure, 45, EIO);
+        return 0;
+    }
+    if (!valid) {
+        set_workload_failure(failure, 45, operation != 0 ? operation : EIO);
+        return 0;
+    }
+    if (!write_workload_resolver(net)) {
+        set_workload_failure(failure, 46, EIO);
+        return 0;
+    }
+    return 1;
+}
+
 static int prepare_workload_loopback(struct child_error_local *failure) {
     struct ifreq_local request;
     i64 descriptor, operation = -EIO;
@@ -4535,6 +4845,7 @@ static int prepare_workload_isolation(struct guest_process *process,
                                       struct child_error_local *failure) {
     return prepare_workload_mount_boundary(failure) &&
            prepare_workload_loopback(failure) &&
+           prepare_workload_network(&workload_network, failure) &&
            prepare_workload_securebits(failure) &&
            drop_workload_credentials(process, failure) &&
            clear_workload_capabilities(failure) &&

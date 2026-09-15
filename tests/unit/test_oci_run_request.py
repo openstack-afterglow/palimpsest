@@ -10,6 +10,7 @@ import test_oci_source as source_tests
 from palimpsest_local import oci_materializer
 from palimpsest_local import oci_run_request as intake
 from palimpsest_local.errors import ArtifactValidationError, PalimpsestError, UnsupportedPlatformError
+from palimpsest_local.oci_network import OCINetworkConfig
 from palimpsest_local.oci_process import OCIProcessSpec, OCIUserSpec
 from palimpsest_local.oci_provenance import OCI_IMAGE_CONFIG_MEDIA_TYPE, OCI_IMAGE_MANIFEST_MEDIA_TYPE
 from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
@@ -55,7 +56,8 @@ def test_request_defaults_are_foreground_local_linux_kvm_without_cloud_spec(tmp_
     request = intake.LocalOCIRunRequest("demo", tmp_path / "source")
     assert request.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
     assert not request.detached
-    assert request.network is None
+    assert request.network == OCINetworkConfig("nat")
+    assert request.network.egress and request.network.published_ports == ()
     assert request.root_size_bytes == 4 * 1024**3
     assert request.root_retention == "delete" and request.root_volume_id is None
     assert request.user_override is None
@@ -78,7 +80,7 @@ def test_request_preserves_legacy_positional_field_order(tmp_path):
         8 * 1024**3,
         "retain",
         None,
-        None,
+        OCINetworkConfig("none"),
         "linux/amd64",
         "kvm",
     )
@@ -87,6 +89,7 @@ def test_request_preserves_legacy_positional_field_order(tmp_path):
     assert (request.memory_mib, request.vcpus, request.root_size_bytes) == (768, 2, 8 * 1024**3)
     assert request.root_retention == "retain"
     assert request.user_override is None
+    assert request.network == OCINetworkConfig("none")
 
 
 @pytest.mark.parametrize(
@@ -109,7 +112,8 @@ def test_request_preserves_legacy_positional_field_order(tmp_path):
         {"vcpus": False},
         {"vcpus": 0},
         {"vcpus": 257},
-        {"network": "default"},
+        {"network": "nat"},
+        {"network": None},
         {"network": "none"},
         {"platform": "linux/arm64"},
         {"platform": "windows/amd64"},

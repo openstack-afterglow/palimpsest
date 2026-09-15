@@ -13,12 +13,14 @@ import os
 import re
 import sys
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_materializer import OCIImageMaterializationReceipt, materialize_image_hard
+from .oci_network import OCI_NETWORK_DEFAULT, OCINetworkConfig
 from .oci_packer import VerifiedSquashFSToolchain
 from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS, SourceSnapshot
@@ -41,7 +43,7 @@ class LocalOCIRunRequest:
     root_size_bytes: int = 4 * 1024**3
     root_retention: str = "delete"
     root_volume_id: str | None = None
-    network: None = None
+    network: OCINetworkConfig = OCI_NETWORK_DEFAULT
     platform: str = "linux/amd64"
     backend: str = "kvm"
     user_override: OCIUserSpec | None = None
@@ -88,8 +90,10 @@ class LocalOCIRunRequest:
                 raise ArtifactValidationError("OCI run root volume ID must be a canonical UUID")
             if self.root_retention != "retain":
                 raise ArtifactValidationError("OCI run retained root reuse requires --root-retention retain")
-        if self.network is not None:
-            raise ArtifactValidationError("local OCI run networking is not available yet")
+        if not isinstance(self.network, OCINetworkConfig):
+            raise ArtifactValidationError(
+                "OCI run networking must be a typed configuration; the CLI resolves --network and --publish"
+            )
         if self.platform != "linux/amd64" or self.backend != "kvm":
             raise ArtifactValidationError("local OCI run supports only linux/amd64 on KVM")
 
@@ -137,7 +141,8 @@ def resolve_local_oci_run_request(
     root_size_bytes: int = 4 * 1024**3,
     root_retention: str = "delete",
     root_volume_id: str | None = None,
-    network: None = None,
+    network: str | OCINetworkConfig | None = None,
+    published_ports: Sequence[str] = (),
     platform: str = "linux/amd64",
     backend: str = "kvm",
 ) -> LocalOCIRunRequest:
@@ -162,7 +167,9 @@ def resolve_local_oci_run_request(
         root_size_bytes=root_size_bytes,
         root_retention=root_retention,
         root_volume_id=root_volume_id,
-        network=network,
+        network=(
+            network if isinstance(network, OCINetworkConfig) else OCINetworkConfig.resolve(network, published_ports)
+        ),
         platform=platform,
         backend=backend,
     )

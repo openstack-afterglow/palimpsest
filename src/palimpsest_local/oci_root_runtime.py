@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import kvm
-from .errors import PalimpsestError, StableFailureError, StateError
+from .errors import ArtifactValidationError, PalimpsestError, StableFailureError, StateError
 from .oci_control_protocol_v2 import (
     OCI_CONTROL_CHANNEL_NAME,
     HostOCIControlV2Session,
@@ -39,6 +39,7 @@ from .oci_lifecycle_transport import (
 from .oci_monitor import MonitorBinding
 from .oci_monitor_control import MonitorStopControl
 from .oci_monitor_ipc import MonitorPreActivationBinding, _PreactivationJournalLease
+from .oci_network import validated_qemu_arguments
 from .oci_root_kvm import (
     ResolvedOCIRootDomainPlan,
     VerifiedHostBootArtifacts,
@@ -54,6 +55,7 @@ from .state import RunLedgerSnapshot, StatePaths, locked_existing_run
 OCI_ROOT_LAUNCH_FAILURE_SCHEMA = "palimpsest.oci-root-launch-failure.v1"
 OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+_QEMU_NAMESPACE = "{" + kvm.QEMU_DOMAIN_NAMESPACE + "}"
 _EVENT_DRIVER_LOCK = threading.Lock()
 _EVENT_RUN_LOCK = threading.Lock()
 _EVENT_DRIVER_LIBVIRT: Any | None = None
@@ -749,13 +751,50 @@ def _dac_projection(root: ET.Element) -> str | None:
     return value
 
 
+def _qemu_network_projection(root: ET.Element) -> tuple[str, ...]:
+    """Return the authored user-mode NIC arguments, or an empty tuple.
+
+    OCI-root authors its NIC as an explicit QEMU user-mode netdev, so the
+    defined domain carries one closed ``qemu:commandline`` element. Any other
+    namespaced element, attribute, child shape, or argument value is rejected.
+    """
+
+    elements = root.findall(f"{_QEMU_NAMESPACE}commandline")
+    if not elements:
+        return ()
+    if len(elements) != 1:
+        raise StateError("defined OCI-root QEMU command line is invalid")
+    element = elements[0]
+    if element.attrib or (element.text is not None and element.text.strip()):
+        raise StateError("defined OCI-root QEMU command line is invalid")
+    values: list[str] = []
+    for child in element:
+        if (
+            child.tag != f"{_QEMU_NAMESPACE}arg"
+            or set(child.attrib) != {"value"}
+            or list(child)
+            or (child.text is not None and child.text.strip())
+        ):
+            raise StateError("defined OCI-root QEMU argument is invalid")
+        values.append(child.get("value", ""))
+    try:
+        return validated_qemu_arguments(values)
+    except ArtifactValidationError as exc:
+        raise StateError("defined OCI-root QEMU network argument is invalid") from exc
+
+
 def _validate_top_level_surface(root: ET.Element) -> None:
     authored = {"cpu", "devices", "features", "memory", "metadata", "name", "os", "vcpu"}
     safe_defaults = {"clock", "currentMemory", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
     counts: dict[str, int] = {}
     _dac_projection(root)
+    _qemu_network_projection(root)
     for child in list(root):
-        if not isinstance(child.tag, str) or "}" in child.tag:
+        if not isinstance(child.tag, str):
+            raise StateError("defined OCI-root top-level extension is forbidden")
+        if child.tag == f"{_QEMU_NAMESPACE}commandline":
+            continue
+        if "}" in child.tag:
             raise StateError("defined OCI-root top-level extension is forbidden")
         if child.tag == "seclabel":
             continue
@@ -1012,6 +1051,7 @@ def _domain_projection(xml: str) -> dict[str, Any]:
         "current_memory": memory,
         "memory": memory,
         "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
+        "qemu_network": _qemu_network_projection(root),
         "cpu": cpu,
         "console": console_projection,
         "vcpus": _text(root, "./vcpu", "defined OCI-root vCPU contract is invalid"),

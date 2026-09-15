@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **75 command paths**, **221 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **76 command paths**, **223 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -330,10 +330,10 @@ usage: palimpsest bundle verify [-h] directory
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci [-h] {init-runtime,pull,materialize,root-proof,exec-status,exec-record,resource-status,root-volumes,root-volume} ...
+usage: palimpsest oci [-h] {init-runtime,pull,materialize,root-proof,exec-status,network,exec-record,resource-status,root-volumes,root-volume} ...
 ```
 
-Subcommands: `init-runtime`, `pull`, `materialize`, `root-proof`, `exec-status`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
+Subcommands: `init-runtime`, `pull`, `materialize`, `root-proof`, `exec-status`, `network`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
 
 ### `palimpsest oci init-runtime`
 
@@ -407,6 +407,20 @@ Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
 usage: palimpsest oci exec-status [-h] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | Managed object, run, profile, or publication name. |
+
+### `palimpsest oci network`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci network [-h] name
 ```
 
 | Argument | Value | Parser default | Description |
@@ -801,7 +815,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
+usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -812,6 +826,7 @@ usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpu
 | `--memory` | int | `4096` | Guest memory in MiB (valid range: 256–1,048,576). |
 | `--vcpus` | int | `2` | Guest virtual CPUs (valid range: 1–256). |
 | `--network` | string | `None` | Runtime network; OCI-root currently permits only &#96;none&#96;. |
+| `-p`, `--publish` | string; repeatable | `[]` | publish one OCI-root guest port on the host (default host address 127.0.0.1) |
 | `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf` | `'auto'` | Select or automatically detect the runtime backend. |
 | `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | Disambiguate cloud-image and local OCI-root execution. |
 | `-d`, `--detach` | flag | `False` | leave an OCI-root VM running after READY |

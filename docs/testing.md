@@ -202,6 +202,29 @@ to implicitly enable either special lane in portable selection.
 
 ## When to broaden verification
 
+### Selectable guest networking
+
+Networking policy, CLI parsing, domain XML and the durable contract are
+portable: `tests/unit/test_oci_network.py`,
+`tests/unit/test_oci_network_live_contract.py`, `tests/unit/test_kvm_contract.py`
+and the real-C guest harness `tests/unit/test_workload_network.py` (the harness
+needs a working `cc`). Because the guest ELF changed, a production networking
+change also requires the reproducible packaged-ELF/provenance checks and the
+explicit stage-1 boot matrix before any networking proof counts.
+
+The native proof `tests/kvm/test_oci_network_live.py` is a separate `native-live`
+opt-in and never runs from changed-file selection. It needs
+`PALIMPSEST_OCI_NETWORK_LIVE=1`, a `0711` runtime parent in
+`PALIMPSEST_OCI_NETWORK_PROOF_ROOT`, the ordinary native boot variables, and
+per-node `PALIMPSEST_OCI_NETWORK_{PYTORCH,REDIS,NGINX}_{IMAGE,ARCHIVE_SHA256,MANIFEST_SHA256}`
+pins. Its three nodes are independent: NAT with a published loopback port plus
+one real outbound HTTPS API request, host-only with a published port plus proven
+absence of DNS/TCP egress, and NAT with an explicit `0.0.0.0` publication
+reached through the host's own address. Record each node separately; a passing
+portable contract is not a networking proof, and one node's success says nothing
+about the others. See the [network contract](oci-network.md) for the exact
+commands and limits.
+
 ### Official service-image matrix
 
 The approved `/sys` 0555 compatibility change uses the focused real-C

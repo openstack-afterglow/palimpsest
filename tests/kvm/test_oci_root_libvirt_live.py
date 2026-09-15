@@ -51,6 +51,7 @@ from palimpsest_local.oci_converter import (
 from palimpsest_local.oci_initramfs import build_bootstrap_initramfs
 from palimpsest_local.oci_lifecycle_transport import OCILifecycleHandoffReceipt
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
+from palimpsest_local.oci_network import OCI_NETWORK_NONE
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
@@ -4426,7 +4427,9 @@ def _qualify_retained_root_reuse(
     )
     assert read_run_ledger_snapshot(roots, first_binding.record.name).state == after_handoff
 
-    resolved = build_oci_root_domain_plan(roots, second, store, boot, profile, memory_mib=512, vcpus=1, network=None)
+    resolved = build_oci_root_domain_plan(
+        roots, second, store, boot, profile, memory_mib=512, vcpus=1, network=OCI_NETWORK_NONE
+    )
     plan = commit_oci_root_domain_plan(roots, resolved, store)
     defined = define_committed_oci_root_domain(roots, second_name, store, boot, profile, conn=conn)
     second_monitor = roots.runs / second_name / "monitor-private"
@@ -4691,7 +4694,7 @@ def test_live_oci_root(
             profile,
             memory_mib=512,
             vcpus=1,
-            network=None,
+            network=OCI_NETWORK_NONE,
         )
         plan = commit_oci_root_domain_plan(roots, resolved, store)
         if stale_cleanup:

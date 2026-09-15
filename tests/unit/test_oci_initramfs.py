@@ -146,7 +146,7 @@ def test_bootstrap_manifest_is_canonical_path_free_switch_root_checkpoint() -> N
     assert value["stage1"]["capability"] == ("authenticated-overlay-switch-root-pid1-supervisor-workload-isolation")
     assert value["stage1"]["plan_transport"] == "virtio-blk-raw-envelope-4k.v1"
     assert value["stage1"]["embedded_consumer"] is True
-    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v18"
+    assert value["stage1"]["consumer_contract"] == "palimpsest.guest-stage1-consumer.x86_64.v19"
     assert value["stage1"]["root_assembly"] is True
     assert value["stage1"]["root_is_slash"] is True
     assert value["stage1"]["pivot_root"] is False
@@ -366,7 +366,7 @@ def test_post_fork_launch_failures_prioritize_cleanup_uncertainty() -> None:
     assert "SYS_kill, -1" not in source
     assert b"kill(-1" not in packaged
     assert b"whole-guest" not in packaged
-    assert 'exact_string(&j, "palimpsest.guest-stage1.v15")' in source
+    assert 'exact_string(&j, "palimpsest.guest-stage1.v16")' in source
     assert 'exact_string(&j, "first-party-pid1-supervisor.v9")' in source
     assert '"palimpsest.agent"' in source
     assert 'append_text(expected, &expected_used, "0::/palimpsest.agent/")' in source

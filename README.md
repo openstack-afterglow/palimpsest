@@ -199,6 +199,27 @@ cloud-image runs. Retry, locking, privilege, cleanup and the 64 KiB output
 limit are unchanged, and a longer deadline does not change host monitor or run
 lock bounds.
 
+OCI-root runs select one virtual network with `--network nat|host-only|none`
+and publish guest ports with the repeatable
+`--publish [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]` (`-p`):
+
+```sh
+palimpsest run ./service.oci.tar --name api -d \
+  --network nat --publish 127.0.0.1:18080:8080
+```
+
+Omitting `--network` now means `nat`: the guest gets a private `10.0.2.15/24`
+address with outbound NAT and DNS. This is an explicit breaking change from the
+previous no-NIC default, so use `--network none` to keep the old isolation.
+`host-only` keeps the private address but blocks every outbound path. Inbound
+traffic only reaches published ports, host addresses default to `127.0.0.1`,
+and external exposure requires writing `0.0.0.0` explicitly. Palimpsest creates
+no libvirt network, bridge, firewall rule or DNS service: the NIC and every
+host listener belong to the VM's own QEMU process. `palimpsest oci network NAME`
+projects the committed mode, publications and external exposure. See the
+[network contract](docs/oci-network.md) for limits, including no IPv6, no
+privileged host ports and no VM-to-VM network.
+
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 
 ```sh

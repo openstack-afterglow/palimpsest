@@ -2303,7 +2303,7 @@ def test_oci_root_kvm_domain_plan_is_path_free_ordered_and_durable(tmp_path: Pat
     assert stage1.domain_core_digest == plan.domain_core_digest
     assert "domain_plan_digest" not in stage1.to_dict()
     assert stage1.to_dict()["assembly"]["lowerdir_ordinals"] == [2, 1, 0]
-    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v15"
+    assert stage1.to_dict()["protocol"] == "palimpsest.guest-stage1.v16"
     assert stage1.to_dict()["handoff"] == "first-party-pid1-supervisor.v9"
     assert stage1.to_dict()["isolation"] == "palimpsest.workload-lifecycle-authority-isolation.v3"
     assert str(tmp_path) not in json.dumps(stage1.to_dict(), sort_keys=True)
@@ -3687,7 +3687,7 @@ def test_oci_root_define_fails_closed_for_ambiguous_lookup_and_foreign_domain(
         "shmem",
         "unknown-device",
         "disk-backing-store",
-        "interface-script",
+        "qemu-foreign-netdev",
         "qemu-commandline",
         "xml-uuid",
     ],
@@ -3732,8 +3732,10 @@ def test_oci_root_define_failure_cleans_only_exact_new_owned_domain(
         elif failure == "disk-backing-store":
             backing = ET.SubElement(root.find("./devices/disk"), "backingStore")
             ET.SubElement(backing, "source", {"file": "/etc/passwd"})
-        elif failure == "interface-script":
-            ET.SubElement(root.find("./devices/interface"), "script", {"path": "/tmp/attacker"})
+        elif failure == "qemu-foreign-netdev":
+            commandline = ET.SubElement(root, "{http://libvirt.org/schemas/domain/qemu/1.0}commandline")
+            for value in ("-netdev", "tap,id=pnet0,ifname=tap0", "-device", "virtio-net-pci,netdev=pnet0"):
+                ET.SubElement(commandline, "{http://libvirt.org/schemas/domain/qemu/1.0}arg", {"value": value})
         elif failure == "qemu-commandline":
             commandline = ET.SubElement(root, "{http://libvirt.org/schemas/domain/qemu/1.0}commandline")
             ET.SubElement(commandline, "{http://libvirt.org/schemas/domain/qemu/1.0}arg", {"value": "-S"})
