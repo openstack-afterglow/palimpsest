@@ -51,6 +51,7 @@ MARKER_RE = re.compile(
 HEADING_RE = re.compile(rb"^## ([^\r\n]+?)[ \t]*\r?$", re.MULTILINE)
 TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_UTC = dt.timezone.utc  # noqa: UP017 - standalone guard runs under system Python 3.9.
 
 
 class GuardError(Exception):
@@ -395,7 +396,7 @@ def _review_block(source_digest: str, summary: str) -> bytes:
     payload = {
         "schema_version": 1,
         "source_sha256": source_digest,
-        "reviewed_at": dt.datetime.now(dt.UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reviewed_at": dt.datetime.now(_UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": summary,
     }
     encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")

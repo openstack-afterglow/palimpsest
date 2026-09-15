@@ -609,13 +609,15 @@ packer가 아니라 검증 도구의 기본 wildcard selector가 literal backsla
 escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcards`를 더하는
 변경은 intake/cache/packer artifact 계약을 바꾸지 않는다.
 
+Architecture freshness guard는 package runtime과 분리된 standard-library/Git 도구로, pre-commit과 초기 CI에서 system `python3`로 실행된다. Stamp timestamp는 Python 3.11 전용 `datetime.UTC` alias 대신 `datetime.timezone.utc`를 사용해 Python 3.9에서도 동일한 UTC `Z` JSON 계약을 생성한다. Digest, marker schema, atomic write, staged/working 범위와 package의 Python 3.12+ 지원 계약은 바뀌지 않는다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e8c7131cd9dac0cf55ad424696bb7757f7f67a1de75b9e3c9424e50515dc9150",
-  "reviewed_at": "2026-09-15T18:24:47Z",
-  "summary": "Reviewed the corrected TensorFlow ML proof after its exact-SHA native pass: the pinned image interpreter is /usr/bin/python, CPU tensor, root identity, PID 1 refusal, and proof-owned cleanup all passed, and no runtime protocol, deadline, retry, authority, or architecture boundary changed."
+  "source_sha256": "a771390c6f6608ea1b2f9dce1f4ca4299551b27c9917f78dd54d85c660421214",
+  "reviewed_at": "2026-09-15T18:49:18Z",
+  "summary": "Reviewed standalone architecture guard portability: timezone.utc preserves UTC Z timestamps when system Python lacks datetime.UTC; digest, schema, atomicity, staged/working boundaries, and package Python support remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

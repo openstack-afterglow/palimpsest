@@ -25,6 +25,7 @@ All notable changes to Palimpsest Local are documented here.
 - Split OCI image publication (`build --push`) from Hub runtime-block publication (`build --runtime-push`) and kept legacy Hub boot-image commands distinct from Docker image commands.
 - Hardened registry/cache inputs against inline credentials, kept cache specifications out of receipts, and made strict-offline builds reject every registry-facing option before solving.
 - Moved KVM readiness after typed provisioning and added a fresh per-boot readiness service so project restarts cannot reuse an old console sentinel.
+- Made architecture review stamping compatible with the documented system-Python entry point when `datetime.UTC` is unavailable.
 
 ### Documentation
 

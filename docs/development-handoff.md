@@ -612,6 +612,13 @@ PCI 노드도 함께 통과했다.
 이 표는 즉시 PCI/ML 진단보다 뒤의 우선순위이며 외부 실행, 권한 확대 또는
 publication을 새로 승인하지 않는다.
 
+Architecture guard는 package interpreter가 준비되기 전에도 실행되는 독립
+standard-library/Git 도구다. 현재 source는 stamp timestamp에
+`datetime.timezone.utc`를 사용하므로 문서·pre-commit의 system `python3`가
+3.9여도 `--stamp`가 동작한다. `datetime.UTC` alias를 제거한 subprocess
+regression이 이 경계를 고정하며 package의 Python 3.12+ 지원 범위는 낮추지
+않는다.
+
 안전한 로컬 focused 명령:
 
 ```sh

@@ -301,6 +301,31 @@ def test_stamp_preserves_mode_and_json_contract(fixture_repo: Path) -> None:
     assert payload["summary"] == "mode-preserving review"
 
 
+def test_stamp_does_not_require_datetime_utc_alias(fixture_repo: Path) -> None:
+    script = fixture_repo / "scripts" / "check_architecture.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import datetime, runpy, sys; "
+            "delattr(datetime, 'UTC') if hasattr(datetime, 'UTC') else None; "
+            "script = sys.argv[1]; sys.argv = sys.argv[1:]; "
+            "runpy.run_path(script, run_name='__main__')",
+            str(script),
+            "--stamp",
+            "--summary",
+            "legacy datetime review",
+        ],
+        cwd=fixture_repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert run_guard(fixture_repo).returncode == 0
+
+
 def test_failure_does_not_echo_source_content(fixture_repo: Path) -> None:
     secret = "DO_NOT_PRINT_SOURCE_9d4d1e"
     (fixture_repo / "app.py").write_text(secret + "\n", encoding="utf-8")
