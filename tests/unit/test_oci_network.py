@@ -91,7 +91,7 @@ def test_qemu_argument_vector_is_deterministic_and_run_bound() -> None:
         "-netdev",
         "user,id=pnet0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,hostfwd=tcp:127.0.0.1:18080-:18080",
         "-device",
-        f"virtio-net-pci,netdev=pnet0,mac={config.guest_mac_address(RUN_ID)}",
+        f"virtio-net-pci,netdev=pnet0,mac={config.guest_mac_address(RUN_ID)},bus=pcie.0,addr=0x14",
     )
     assert validated_qemu_arguments(arguments) == arguments
     assert config.guest_mac_address(RUN_ID).startswith("52:54:00")
@@ -104,13 +104,18 @@ def test_qemu_argument_vector_is_deterministic_and_run_bound() -> None:
     [
         (),
         ("-netdev", "user,id=pnet0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3"),
-        ("-netdev", "tap,id=pnet0,ifname=tap0", "-device", "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef"),
+        (
+            "-netdev",
+            "tap,id=pnet0,ifname=tap0",
+            "-device",
+            "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef,bus=pcie.0,addr=0x14",
+        ),
         ("-device", "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef", "-netdev", "user,id=pnet0"),
         (
             "-netdev",
             "user,id=pnet0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,smb=/etc",
             "-device",
-            "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef",
+            "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef,bus=pcie.0,addr=0x14",
         ),
         (
             "-netdev",
@@ -122,7 +127,7 @@ def test_qemu_argument_vector_is_deterministic_and_run_bound() -> None:
             "-netdev",
             "user,id=pnet0,net=10.0.2.0/24,host=192.168.1.1,dns=10.0.2.3",
             "-device",
-            "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef",
+            "virtio-net-pci,netdev=pnet0,mac=52:54:00:ab:cd:ef,bus=pcie.0,addr=0x14",
         ),
     ],
 )

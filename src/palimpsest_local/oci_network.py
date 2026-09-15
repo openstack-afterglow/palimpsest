@@ -37,6 +37,12 @@ OCI_NETWORK_NETMASK = "255.255.255.0"
 OCI_NETWORK_NAMESERVER = "10.0.2.3"
 OCI_NETWORK_INTERFACE = "eth0"
 OCI_NETWORK_NETDEV_ID = "pnet0"
+# libvirt allocates its own pcie-root-ports from slot 0x1 upward and never
+# reaches slot 0x14 for the bounded OCI-root device set. An unaddressed
+# passthrough device would race libvirt for slot 0x1 and abort the domain, so
+# the authored NIC pins its own root-complex address.
+OCI_NETWORK_PCI_BUS = "pcie.0"
+OCI_NETWORK_PCI_ADDRESS = "0x14"
 OCI_NETWORK_MAC_PREFIX = "52:54:00"
 OCI_NETWORK_PROTOCOLS = ("tcp", "udp")
 OCI_NETWORK_LOOPBACK_HOST_IP = "127.0.0.1"
@@ -303,7 +309,10 @@ class OCINetworkConfig:
             options.append("restrict=on")
         for port in self.published_ports:
             options.append(f"hostfwd={port.protocol}:{port.host_ip}:{port.host_port}-:{port.guest_port}")
-        device = f"virtio-net-pci,netdev={OCI_NETWORK_NETDEV_ID},mac={self.guest_mac_address(run_id)}"
+        device = (
+            f"virtio-net-pci,netdev={OCI_NETWORK_NETDEV_ID},mac={self.guest_mac_address(run_id)},"
+            f"bus={OCI_NETWORK_PCI_BUS},addr={OCI_NETWORK_PCI_ADDRESS}"
+        )
         return ("-netdev", ",".join(options), "-device", device)
 
     def endpoints(self) -> tuple[str, ...]:
@@ -408,7 +417,11 @@ _DEVICE_RE = re.compile(
     + re.escape(OCI_NETWORK_NETDEV_ID)
     + ",mac="
     + re.escape(OCI_NETWORK_MAC_PREFIX)
-    + "(?::[0-9a-f]{2}){3}$"
+    + "(?::[0-9a-f]{2}){3},bus="
+    + re.escape(OCI_NETWORK_PCI_BUS)
+    + ",addr="
+    + re.escape(OCI_NETWORK_PCI_ADDRESS)
+    + "$"
 )
 
 

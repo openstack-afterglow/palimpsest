@@ -53,7 +53,7 @@ directly in the domain:
 
 ```text
 -netdev user,id=pnet0,net=10.0.2.0/24,host=10.0.2.2[,dns=10.0.2.3|,restrict=on][,hostfwd=…]
--device virtio-net-pci,netdev=pnet0,mac=52:54:00:…
+-device virtio-net-pci,netdev=pnet0,mac=52:54:00:…,bus=pcie.0,addr=0x14
 ```
 
 Consequences that are part of the contract:
