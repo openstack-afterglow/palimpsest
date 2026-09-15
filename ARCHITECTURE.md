@@ -617,13 +617,17 @@ Draft PR #1 follow-up `Test` run `35025114784` proved the format gate remediatio
 
 Workflow lookup remediation run `35025567423` reached the strict privileged probe and exposed an older candidate/production argv split: both paths emitted the same normalized tar, but the candidate probe used the packer's default compression while production explicitly used zstd level 3, so their SquashFS digests differed. The fixed deterministic argument sequence now has one `oci_packer` owner and is consumed by both paths; the production argv contract ID and production bytes are unchanged, while candidate evidence is regenerated in production format. Root metadata, OCI translation, mount semantics, evidence comparison, and the independent native KVM requirement remain unchanged.
 
+Alignment commit `315222840c0cfb9161c4e20a469bcf3d3ff1c92a` then passed the x86_64 `OCI filesystem proof (privileged Linux)` job in `Test` run `35026142507`; Development package run `35026137691` also passed verification and SHA-specific prerelease publication. This is live proof for the shared zstd candidate/production argv. The completed Test run separately failed portable shards for the three test-boundary defects reviewed below and failed the independent required native KVM gate because `PALIMPSEST_KVM_ENABLED` was empty and the native job was skipped; no KVM success is inferred.
+
+Portable shard remediation for the same run reviewed three distinct test-boundary defects and changed no production behavior. First, CLI stderr contracts failed on hosts without `/var/log/palimpsest`: the host journal warning is production behavior, so the pytest session now pins `PALIMPSEST_LOG_HOME` to a private `0700` temporary directory in `tests/conftest.py`, matching what per-test overrides already did, while the journal failure tests keep asserting the warning. Second, the macOS shards raised `NotImplementedError: dir_fd unavailable on this platform` inside the test harness, not in `state.py`: `mkfifoat` is optional on macOS, so the regular-to-FIFO race harness creates the node by absolute path while the reader keeps its pinned directory descriptor and the rejection it proves is unchanged. Third, the parametrized project-callback case expected `RuntimeCapabilityError` from `inspect`, but `runtime_dispatch.inspect_run` is a state-only allowlisted projection that `platforms.capability_profile` permits for `(oci-root, kvm)`; the stale expectation was replaced with a dedicated test asserting the projected dispatch key, lifecycle status, degraded-ledger `StateError`s, and the absence of cloud, Lima, and legacy-heuristic probes.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "3884e7964ce0b52e8f73ba5309c16526a23b63bfbe6f9838d3c6c8a3a347dd0e",
-  "reviewed_at": "2026-09-15T21:30:48Z",
-  "summary": "Reviewed strict OCI filesystem proof alignment: candidate and production packers now share the existing deterministic zstd argv contract; production bytes and contract ID are unchanged, historical default-compression receipts remain non-authoritative, and native KVM requirements are untouched."
+  "source_sha256": "138605dea79487cc004f1ce14600c4bf0515b90961e72ccd72d87dd3e695ed35",
+  "reviewed_at": "2026-09-15T22:02:01Z",
+  "summary": "Reviewed portable shard remediation: pytest session pins PALIMPSEST_LOG_HOME to a private temporary journal with the platform-default root pinned by test, the FIFO race harness avoids optional mkfifoat, and state-only OCI inspect now asserts no backend/capability probes or ledger mutation; production runtime, ledger, and native gate behavior are unchanged."
 }
 ```
 <!-- architecture-review:end -->

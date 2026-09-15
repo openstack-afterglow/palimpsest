@@ -33,6 +33,16 @@ def test_journal_records_ordered_safe_lifecycle(tmp_path, monkeypatch):
     )
 
 
+def test_default_root_is_linux_only_and_override_is_honored(tmp_path, monkeypatch):
+    monkeypatch.delenv("PALIMPSEST_LOG_HOME", raising=False)
+    monkeypatch.setattr(host_journal.sys, "platform", "linux")
+    assert host_journal._root() == (Path("/var/log/palimpsest"), False)
+    monkeypatch.setattr(host_journal.sys, "platform", "darwin")
+    assert host_journal._root() == (None, False)
+    monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(tmp_path))
+    assert host_journal._root() == (tmp_path, False)
+
+
 def test_failure_warns_once_per_invocation_and_recovers(tmp_path, monkeypatch, capsys):
     missing = tmp_path / "missing"
     monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(missing))

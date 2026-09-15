@@ -1198,7 +1198,7 @@ def test_down_project_dangling_run_symlink_fails_in_dispatcher_before_backend_or
     assert project_state.read_bytes() == before
 
 
-@pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove"])
+@pytest.mark.parametrize("operation", ["start", "stop", "remove"])
 def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_backend_use(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1222,9 +1222,7 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
         effects.append(effect)
         pytest.fail(f"backend side effect reached: {effect}")
 
-    target_name = {"inspect": "inspect_run", "start": "start", "stop": "stop", "remove": "rm", "logs": "logs"}[
-        operation
-    ]
+    target_name = {"start": "start", "stop": "stop", "remove": "rm"}[operation]
     monkeypatch.setattr(
         project_adapter.runtime_dispatch.cloud_runtime,
         target_name,
@@ -1242,8 +1240,6 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
     )
 
     def invoke() -> object:
-        if operation == "inspect":
-            return callbacks.inspect(run_name)
         if operation == "start":
             service = project.services["api"]
             return callbacks.start(
@@ -1256,12 +1252,9 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
             )
         if operation == "stop":
             return callbacks.stop(run_name)
-        if operation == "remove":
-            return callbacks.remove(run_name)
-        return list(callbacks.logs(run_name, False))
+        return callbacks.remove(run_name)
 
     expected_error = {
-        "inspect": RuntimeCapabilityError,
         "start": RuntimeCapabilityError,
         "stop": OCIRunRemovalError,
         "remove": StateError,
@@ -1279,6 +1272,69 @@ def test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_back
     rpaths.owner.unlink()
     with pytest.raises(StateError, match="cannot securely read run ledger"):
         invoke()
+    assert effects == []
+
+
+def test_project_inspect_callback_projects_oci_ledger_without_backend_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", runtime_kind="oci-root")
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"backend side effect reached: {effect}")
+
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.cloud_runtime,
+        "inspect_run",
+        lambda *_args, **_kwargs: forbidden("cloud"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.lima,
+        "inspect_run",
+        lambda *_args, **_kwargs: forbidden("lima"),
+    )
+    monkeypatch.setattr(
+        project_adapter.lima,
+        "is_lima_run",
+        lambda *_args: forbidden("legacy-heuristic"),
+    )
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda *_args, **_kwargs: forbidden("capability-probe"),
+    )
+
+    record = callbacks.inspect(run_name)
+
+    assert isinstance(record, InspectRecord)
+    assert record.record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+    assert record.record.name == run_name
+    assert record.lifecycle.status == "stopped"
+    assert effects == []
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+
+    rpaths.state.write_text('{"schema_version":"corrupt"}\n', encoding="utf-8")
+    with pytest.raises(StateError, match="invalid run state schema"):
+        callbacks.inspect(run_name)
+    assert effects == []
+
+    rpaths.owner.unlink()
+    with pytest.raises(StateError, match="cannot securely read run ledger"):
+        callbacks.inspect(run_name)
     assert effects == []
 
 

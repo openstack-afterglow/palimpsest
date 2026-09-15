@@ -1902,6 +1902,7 @@ def test_dispatch_reader_rejects_regular_to_fifo_swap_without_blocking_or_leakin
     untouched = untouched_path.read_bytes()
     setup_source = f"""
 target = {filename!r}
+run_directory = {str(rpaths.root)!r}
 original_open = state._open_readonly_no_follow
 swapped = False
 
@@ -1909,8 +1910,11 @@ def racing_open(path, *, directory_fd=None, directory=False, nonblocking=False):
     global swapped
     if path == target and directory_fd is not None and not directory and not swapped:
         swapped = True
-        os.unlink(path, dir_fd=directory_fd)
-        os.mkfifo(path, mode=0o600, dir_fd=directory_fd)
+        # Path-based swap: mkfifoat is not available on every supported platform,
+        # and the pinned directory itself is never replaced by this race.
+        node = os.path.join(run_directory, target)
+        os.unlink(node)
+        os.mkfifo(node, mode=0o600)
     return original_open(
         path,
         directory_fd=directory_fd,

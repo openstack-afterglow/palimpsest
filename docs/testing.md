@@ -140,6 +140,18 @@ a skipped or cancelled shard cannot satisfy them. Lint, manifest checks and
 package construction run once. The release workflow still performs its broad
 unit, build and native proof checks.
 
+The pytest session sets `PALIMPSEST_LOG_HOME` to a private `0700` temporary directory through `tests/conftest.py`. Portable CLI tests therefore never write `/var/log/palimpsest` or acquire Linux-only warning output merely because the host-global journal directory is absent. Journal failure tests explicitly replace this override with missing, malformed, or unsafe paths and still require the production warning; the fixture does not suppress or weaken that behavior.
+
+Portable test harnesses may only use directory-relative (`dir_fd`) syscalls that
+every supported interpreter exposes. `os.open`, `os.stat`, `os.unlink`,
+`os.rename` and `os.replace` are available on Linux and macOS; `os.mkfifo` with
+`dir_fd` is not, because `mkfifoat` is absent from some macOS builds and raises
+`NotImplementedError: dir_fd unavailable on this platform`. Race harnesses that
+create a non-regular node mid-read use the absolute node path; the production
+reader still holds its pinned directory descriptor, so the swap it must reject is
+unchanged. This restriction applies to test scaffolding only: production code in
+`state.py` keeps its `dir_fd`-pinned open/stat/rename sequences.
+
 ## Native and product gates
 
 Special lanes are explicit: `native-live`, `guest-kvm`, `guest-binary`,

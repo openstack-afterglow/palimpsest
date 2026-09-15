@@ -693,6 +693,36 @@ Production argv·contract ID·artifact bytes는 바뀌지 않고 candidate evide
 production format으로 맞춘다. 이 run의 native KVM skip/required-gate 실패는 별도
 외부 gate로 유지한다.
 
+Alignment commit `315222840c0cfb9161c4e20a469bcf3d3ff1c92a`의 draft PR
+`Test` run [`35026142507`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35026142507)에서
+`OCI filesystem proof (privileged Linux)` job이 통과했다. Shared zstd argv로 candidate와
+production artifact를 비교한 현재 x86_64 strict proof다. Development package run
+[`35026137691`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35026137691)도
+package verification과 SHA-specific prerelease publication을 모두 통과했다. 같은 Test
+run의 native KVM job은 variable 부재로 skipped이고 required gate는 실패했으므로 PR은
+draft/blocked 상태를 유지하며 KVM 성공을 추론하지 않는다.
+
+같은 run `35026142507`의 portable shard 실패는 세 가지 테스트 경계 결함이었고
+production 동작은 바꾸지 않았다. (1) host journal 경고가 없는 host 전용 경로
+`/var/log/palimpsest` 부재로 CLI stderr 계약이 깨졌다. `tests/conftest.py`의
+session fixture가 `PALIMPSEST_LOG_HOME`을 private `0700` 임시 경로로 고정한다.
+`tests/unit/test_host_journal.py`는 여전히 missing/malformed/unsafe 경로로
+production 경고를 요구한다. (2) macOS shard의
+`NotImplementedError: dir_fd unavailable on this platform`은 `state.py`가 아니라
+`tests/unit/test_runtime_dispatch.py` race harness의 `os.mkfifo(..., dir_fd=...)`
+호출이었다. macOS build에 `mkfifoat`이 없을 수 있어 harness는 절대 경로로 FIFO를
+만든다. reader의 pinned directory descriptor와 거부 계약은 그대로다.
+(3) `test_project_callbacks_fail_closed_on_partial_or_oci_run_ledgers_before_backend_use`의
+`inspect` 기대값은 stale이었다. `runtime_dispatch.inspect_run`은 state-only
+projection이고 `(oci-root, kvm)`에서 허용된다. 해당 parameter를 지우는 대신
+`test_project_inspect_callback_projects_oci_ledger_without_backend_probes`가
+dispatch key·lifecycle·손상 ledger의 `StateError`·backend 미접근을 검사한다.
+로컬 `uv run python scripts/test_lanes.py run portable` 최종 실행은 6,044개 node 중
+5,827건 통과·217건 skip·7건 warning이었다. 이는 Linux/macOS CI shard 실행을 대신하지 않는다.
+`PALIMPSEST_KVM_ENABLED` variable이 비어 native KVM job은 skip되고 `Required native
+KVM proof` gate는 실패했다. 이 run은 runner availability를 입증하지 않으며, 변경은 gate를 우회하거나 완화하지 않는다.
+
+
 
 
 안전한 로컬 focused 명령:

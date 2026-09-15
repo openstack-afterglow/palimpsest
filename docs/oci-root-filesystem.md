@@ -91,3 +91,5 @@ These receipts predate the production-argv alignment discovered by draft PR run 
 - packer executable SHA-256: `4bc5c66a81a1d86a5743e1c1ced12b6362e1b56c088d8241ef9ed5a3b8659317`.
 
 The GitHub job repeats the proof on the required x86_64 Linux runner and uploads its candidate evidence JSON. That required job, rather than the development receipt alone, is the merge authority.
+
+Production-argv alignment commit `315222840c0cfb9161c4e20a469bcf3d3ff1c92a` passed the `OCI filesystem proof (privileged Linux)` job in draft PR `Test` run [`35026142507`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35026142507). This is the current x86_64 strict proof for the shared zstd argument contract. The repository variable was unset, so the independent native KVM job was skipped and its required gate failed; the run does not establish runner availability, and filesystem proof success does not substitute for that gate.
