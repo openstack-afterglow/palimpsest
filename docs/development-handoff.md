@@ -645,6 +645,13 @@ sdist SHA-256은
 이는 workflow의 설정 Python version과 일치하는 local 증거지만 GitHub Actions
 run 또는 SHA-specific prerelease publication은 아니다.
 
+User-authorized push 뒤 exact commit
+`7bd8ecc64d61a1a8465a0a73aa560ccb96dda598`의 GitHub Development package
+run [`35022949640`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35022949640)이
+통과했다. `Verify development package` job과 `Publish SHA-specific prerelease`
+job이 모두 success였으므로 이 commit의 Python 3.12 remote package gate와
+SHA-specific prerelease publication이 완료됐다.
+
 안전한 로컬 focused 명령:
 
 ```sh
