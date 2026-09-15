@@ -12,6 +12,7 @@ from .errors import (
     LifecycleError,
     PalimpsestError,
     StateError,
+    UnsupportedPlatformError,
 )
 from .hub import HubClient
 from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
@@ -33,6 +34,7 @@ __all__ = [
     "RunSpec",
     "StackRef",
     "StateError",
+    "UnsupportedPlatformError",
     "digest_file",
     "normalize_digest",
     "require_digest",

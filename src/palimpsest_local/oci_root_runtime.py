@@ -1,0 +1,2530 @@
+"""Private libvirt definition and launch boundary for committed OCI-root runs.
+
+This module supports explicit private lifecycle launches. Public runtime
+dispatch remains disabled until the privileged lifecycle handshake is ready.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+import threading
+import uuid
+import xml.etree.ElementTree as ET
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
+from dataclasses import dataclass
+from typing import Any
+
+from . import kvm
+from .errors import ArtifactValidationError, PalimpsestError, StableFailureError, StateError
+from .oci_control_protocol_v2 import (
+    OCI_CONTROL_CHANNEL_NAME,
+    HostOCIControlV2Session,
+    OCIControlV2Binding,
+)
+from .oci_exec_control import MonitorExecControl
+from .oci_layout import canonical_json
+from .oci_lifecycle_transport import (
+    DEFAULT_HANDOFF_TIMEOUT_SECONDS,
+    OCI_ROOT_HANDOFF_SCHEMA,
+    OCILifecycleFailureCategory,
+    OCILifecycleHandoffReceipt,
+    OCILifecycleStreamCallbackCleanupError,
+    OCILifecycleTransportError,
+    complete_initial_lifecycle_handoff,
+)
+from .oci_monitor import MonitorBinding
+from .oci_monitor_control import MonitorStopControl
+from .oci_monitor_ipc import MonitorPreActivationBinding, _PreactivationJournalLease
+from .oci_network import validated_qemu_arguments
+from .oci_root_kvm import (
+    ResolvedOCIRootDomainPlan,
+    VerifiedHostBootArtifacts,
+    resolve_committed_oci_root_domain_plan,
+)
+from .oci_runtime_io import runtime_io_guard
+from .oci_store import OCIStore
+from .platforms import DomainProfile
+from .project_volumes import CommandRunner, _default_runner
+from .runtime_types import ProcessExit
+from .state import RunLedgerSnapshot, StatePaths, locked_existing_run
+
+OCI_ROOT_LAUNCH_FAILURE_SCHEMA = "palimpsest.oci-root-launch-failure.v1"
+OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
+_MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+_QEMU_NAMESPACE = "{" + kvm.QEMU_DOMAIN_NAMESPACE + "}"
+_EVENT_DRIVER_LOCK = threading.Lock()
+_EVENT_RUN_LOCK = threading.Lock()
+_EVENT_DRIVER_LIBVIRT: Any | None = None
+_EVENT_DRIVER_PID: int | None = None
+_EVENT_DRIVER_POISONED = False
+_EVENT_DRIVER_TOKEN = object()
+_EVENT_STREAM_QUARANTINE: list[tuple[Any, Any]] = []
+_EVENT_STARTUP_QUARANTINE: list[tuple[Any, Any]] = []
+_EVENT_WAIT_MAX_MILLISECONDS = 10
+
+
+def _poison_event_driver_after_fork() -> None:
+    global _EVENT_DRIVER_LOCK, _EVENT_RUN_LOCK, _EVENT_DRIVER_PID, _EVENT_DRIVER_POISONED
+    _EVENT_DRIVER_LOCK = threading.Lock()
+    _EVENT_RUN_LOCK = threading.Lock()
+    _EVENT_DRIVER_PID = os.getpid()
+    _EVENT_DRIVER_POISONED = True
+
+
+_REGISTER_AT_FORK = getattr(os, "register_at_fork", None)
+if callable(_REGISTER_AT_FORK):
+    _REGISTER_AT_FORK(after_in_child=_poison_event_driver_after_fork)
+
+
+@dataclass(frozen=True, slots=True)
+class DefinedOCIRootDomain:
+    """Path-free receipt for one durable, inactive domain definition."""
+
+    run_id: str
+    run_name: str
+    plan_digest: str
+    domain_uuid: str
+    libvirt_uri: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedOCIRootHandoff:
+    """Private result for one domain boot observed through TERMINAL."""
+
+    run_id: str
+    run_name: str
+    plan_digest: str
+    domain_uuid: str
+    domain_id: int
+    libvirt_uri: str
+    terminal: ProcessExit
+    lifecycle: OCILifecycleHandoffReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class _OCIRootEventConnection:
+    connection: Any
+    libvirt: Any
+    pid: int
+    token: object
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.connection, name)
+
+
+def _libvirt_event_surface(libvirt: Any) -> tuple[int, int, int, int]:
+    operations = (
+        "virEventRegisterDefaultImpl",
+        "virEventRunDefaultImpl",
+        "virEventAddTimeout",
+        "virEventUpdateTimeout",
+        "virEventRemoveTimeout",
+    )
+    try:
+        if any(not callable(getattr(libvirt, operation, None)) for operation in operations):
+            raise StateError("required libvirt default event support is unavailable")
+        events = tuple(
+            getattr(libvirt, name)
+            for name in (
+                "VIR_STREAM_EVENT_READABLE",
+                "VIR_STREAM_EVENT_WRITABLE",
+                "VIR_STREAM_EVENT_ERROR",
+                "VIR_STREAM_EVENT_HANGUP",
+            )
+        )
+    except StateError:
+        raise
+    except Exception:
+        raise StateError("required libvirt default event support is unavailable") from None
+    if (
+        any(type(event) is not int or event <= 0 for event in events)
+        or len(set(events)) != len(events)
+        or any(left & right for index, left in enumerate(events) for right in events[index + 1 :])
+    ):
+        raise StateError("required libvirt default event support is unavailable")
+    return events
+
+
+def connect_oci_root_libvirt(uri: str) -> _OCIRootEventConnection:
+    """Open the explicit private OCI connection after one default-event setup."""
+
+    global _EVENT_DRIVER_LIBVIRT, _EVENT_DRIVER_PID
+    libvirt = kvm._libvirt()
+    pid = os.getpid()
+    if not callable(_REGISTER_AT_FORK):
+        raise StateError("libvirt default event fork guard is unavailable")
+    _libvirt_event_surface(libvirt)
+    if _EVENT_DRIVER_PID is not None and _EVENT_DRIVER_PID != pid:
+        raise StateError("libvirt default event implementation identity changed")
+    with _EVENT_DRIVER_LOCK:
+        if _EVENT_DRIVER_POISONED:
+            raise StateError("libvirt default event implementation is poisoned")
+        if _EVENT_DRIVER_LIBVIRT is None:
+            try:
+                registered = libvirt.virEventRegisterDefaultImpl()
+            except Exception:
+                raise StateError("libvirt default event initialization failed") from None
+            if type(registered) is not int or registered != 0:
+                raise StateError("libvirt default event initialization failed")
+            _EVENT_DRIVER_LIBVIRT = libvirt
+            _EVENT_DRIVER_PID = pid
+        elif _EVENT_DRIVER_LIBVIRT is not libvirt or _EVENT_DRIVER_PID != pid:
+            raise StateError("libvirt default event implementation identity changed")
+        connection = kvm.connect(uri)
+        if kvm._libvirt() is not libvirt:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            raise StateError("libvirt default event implementation identity changed")
+    return _OCIRootEventConnection(connection, libvirt, pid, _EVENT_DRIVER_TOKEN)
+
+
+def _poison_event_driver() -> None:
+    global _EVENT_DRIVER_POISONED
+    with _EVENT_DRIVER_LOCK:
+        _EVENT_DRIVER_POISONED = True
+
+
+def close_oci_root_libvirt(conn: _OCIRootEventConnection) -> None:
+    with _EVENT_DRIVER_LOCK:
+        if any(candidate is conn for _service, candidate in _EVENT_STARTUP_QUARANTINE):
+            raise StateError("OCI-root quarantined startup connection cannot be closed")
+        conn.close()
+
+
+class OCIStartupEventServiceError(StateError):
+    """The exact startup event authority is unhealthy or cleanup is ambiguous."""
+
+
+class OCIStartupEventService:
+    """Service server keepalives on one startup connection until lifecycle owns events."""
+
+    def __init__(self, conn: _OCIRootEventConnection):
+        with _EVENT_DRIVER_LOCK:
+            if (
+                type(conn) is not _OCIRootEventConnection
+                or conn.token is not _EVENT_DRIVER_TOKEN
+                or conn.pid != os.getpid()
+                or conn.pid != _EVENT_DRIVER_PID
+                or conn.libvirt is not _EVENT_DRIVER_LIBVIRT
+                or _EVENT_DRIVER_POISONED
+            ):
+                raise OCIStartupEventServiceError("OCI-root startup event connection identity is invalid")
+        self._conn = conn
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._failed = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="palimpsest-oci-startup-events", daemon=True)
+        self._timer_id: int | None = None
+        self._worker_ident: int | None = None
+        self._closed = False
+        self._started = False
+
+    @staticmethod
+    def _timer_event(_timer: Any, _opaque: Any) -> None:
+        return
+
+    def _fail(self) -> None:
+        _poison_event_driver()
+        self._failed.set()
+        self._ready.set()
+
+    def _identity_valid(self) -> bool:
+        with _EVENT_DRIVER_LOCK:
+            return (
+                not _EVENT_DRIVER_POISONED
+                and self._conn.pid == os.getpid() == _EVENT_DRIVER_PID
+                and self._conn.token is _EVENT_DRIVER_TOKEN
+                and self._conn.libvirt is _EVENT_DRIVER_LIBVIRT
+            )
+
+    def _run(self) -> None:
+        try:
+            self._worker_ident = threading.get_ident()
+            while not self._stop.is_set():
+                if not self._identity_valid():
+                    raise RuntimeError
+                if not _EVENT_RUN_LOCK.acquire(timeout=0.1):
+                    raise RuntimeError
+                try:
+                    result = self._conn.libvirt.virEventRunDefaultImpl()
+                finally:
+                    _EVENT_RUN_LOCK.release()
+                alive = self._conn.connection.isAlive()
+                if type(result) is not int or result != 0 or type(alive) is not int or alive != 1:
+                    raise RuntimeError
+                self._ready.set()
+        except BaseException:
+            self._fail()
+
+    def start(self) -> None:
+        if self._started or self._closed:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self._started = True
+        try:
+            timer = self._conn.libvirt.virEventAddTimeout(_EVENT_WAIT_MAX_MILLISECONDS, self._timer_event, self)
+        except Exception:
+            timer = -1
+        if type(timer) is not int or timer < 0:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self._timer_id = timer
+        try:
+            self._thread.start()
+        except Exception:
+            self._fail()
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed") from None
+        if not self._ready.wait(timeout=1) or self._failed.is_set():
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        if (
+            type(self._worker_ident) is not int
+            or self._worker_ident == threading.get_ident()
+            or self._thread.ident != self._worker_ident
+        ):
+            self._fail()
+            self.stop()
+            raise OCIStartupEventServiceError("OCI-root startup event service failed")
+        self.check()
+
+    def check(self) -> None:
+        valid = self._identity_valid()
+        if self._failed.is_set() or not valid or (not self._closed and not self._thread.is_alive()):
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup event service is unhealthy")
+        try:
+            alive = self._conn.connection.isAlive()
+        except Exception:
+            alive = -1
+        if type(alive) is not int or alive != 1:
+            self._fail()
+            raise OCIStartupEventServiceError("OCI-root startup libvirt connection is not alive")
+
+    def stop(self) -> None:
+        if self._closed:
+            self.check()
+            return
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=1)
+        if self._thread.is_alive():
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        acquired = _EVENT_RUN_LOCK.acquire(timeout=1)
+        if acquired:
+            _EVENT_RUN_LOCK.release()
+        else:
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        cleanup_failed = False
+        if self._timer_id is not None:
+            try:
+                removed = self._conn.libvirt.virEventRemoveTimeout(self._timer_id)
+                cleanup_failed = cleanup_failed or type(removed) is not int or removed != 0
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    disabled = self._conn.libvirt.virEventUpdateTimeout(self._timer_id, -1)
+                    cleanup_failed = cleanup_failed or type(disabled) is not int or disabled != 0
+                except Exception:
+                    cleanup_failed = True
+        self._closed = True
+        if cleanup_failed or self._failed.is_set():
+            self._quarantine()
+            raise OCIStartupEventServiceError("OCI-root startup event service shutdown failed")
+        self.check()
+
+    def _quarantine(self) -> None:
+        _poison_event_driver()
+        with _EVENT_DRIVER_LOCK:
+            if not any(service is self for service, _conn in _EVENT_STARTUP_QUARANTINE):
+                _EVENT_STARTUP_QUARANTINE.append((self, self._conn))
+
+
+class _LibvirtLifecycleEventPump:
+    def __init__(self, libvirt: Any, stream: Any):
+        readable, writable, error, hangup = _libvirt_event_surface(libvirt)
+        self._libvirt = libvirt
+        self._stream = stream
+        self._readable = readable
+        self._writable = writable
+        self._error = error
+        self._hangup = hangup
+        self._base_events = readable | error | hangup
+        self._all_events = self._base_events | writable
+        self._observed_events = 0
+        self._callback_invalid = False
+        self._closed = False
+        try:
+            added = stream.eventAddCallback(self._base_events, self._stream_event, self)
+        except Exception:
+            try:
+                stream.eventRemoveCallback()
+            except Exception:
+                pass
+            raise StateError("OCI-root lifecycle stream event callback registration failed") from None
+        if added is not None and (type(added) is not int or added != 0):
+            try:
+                stream.eventRemoveCallback()
+            except Exception:
+                pass
+            raise StateError("OCI-root lifecycle stream event callback registration failed")
+
+    def _stream_event(self, stream: Any, events: Any, opaque: Any) -> None:
+        if stream is not self._stream or opaque is not self or type(events) is not int or events & ~self._all_events:
+            self._callback_invalid = True
+            return
+        self._observed_events |= events
+
+    @staticmethod
+    def _timer_event(_timer: Any, _opaque: Any) -> None:
+        return
+
+    def _wait(self, seconds: float, *, writable: bool) -> None:
+        if self._closed or type(seconds) not in {int, float} or not math.isfinite(seconds) or seconds <= 0:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle event wait is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        mask = self._all_events if writable else self._base_events
+        update_attempted = False
+        timer_id: int | None = None
+        failure: BaseException | None = None
+        cleanup_failed = False
+        self._observed_events = 0
+        try:
+            if writable:
+                update_attempted = True
+                updated_result = self._stream.eventUpdateCallback(mask)
+                if type(updated_result) is not int or updated_result != 0:
+                    raise OCILifecycleTransportError(
+                        "OCI-root lifecycle stream event update failed", category=OCILifecycleFailureCategory.EVENT_PUMP
+                    )
+            milliseconds = max(1, min(_EVENT_WAIT_MAX_MILLISECONDS, math.ceil(seconds * 1000)))
+            timer_id = self._libvirt.virEventAddTimeout(milliseconds, self._timer_event, self)
+            if type(timer_id) is not int or timer_id < 0:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle event timer registration failed",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
+            if not _EVENT_RUN_LOCK.acquire(timeout=min(float(seconds), _EVENT_WAIT_MAX_MILLISECONDS / 1000)):
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle default event pump is already active",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
+            try:
+                result = self._libvirt.virEventRunDefaultImpl()
+            finally:
+                _EVENT_RUN_LOCK.release()
+            if type(result) is not int or result != 0:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle default event pump failed", category=OCILifecycleFailureCategory.EVENT_PUMP
+                )
+            if self._callback_invalid:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle stream event callback was invalid",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
+            if self._observed_events & self._error:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle stream reported an error", category=OCILifecycleFailureCategory.EVENT_PUMP
+                )
+        except BaseException as exc:
+            failure = exc
+        if timer_id is not None:
+            try:
+                removed = self._libvirt.virEventRemoveTimeout(timer_id)
+                if type(removed) is not int or removed != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    disabled = self._libvirt.virEventUpdateTimeout(timer_id, -1)
+                    if type(disabled) is not int or disabled != 0:
+                        cleanup_failed = True
+                except Exception:
+                    cleanup_failed = True
+        if update_attempted:
+            try:
+                restored = self._stream.eventUpdateCallback(self._base_events)
+                if type(restored) is not int or restored != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            global _EVENT_DRIVER_POISONED
+            with _EVENT_DRIVER_LOCK:
+                _EVENT_DRIVER_POISONED = True
+                if not any(pump is self for pump, _stream in _EVENT_STREAM_QUARANTINE):
+                    _EVENT_STREAM_QUARANTINE.append((self, self._stream))
+            raise OCILifecycleStreamCallbackCleanupError(
+                "OCI-root lifecycle event timer cleanup failed; event driver poisoned",
+                category=OCILifecycleFailureCategory.CLEANUP,
+            )
+        if failure is not None:
+            raise failure
+
+    def wait_readable(self, seconds: float) -> None:
+        self._wait(seconds, writable=False)
+
+    def wait_writable(self, seconds: float) -> None:
+        self._wait(seconds, writable=True)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            removed = self._stream.eventRemoveCallback()
+        except Exception:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream event callback cleanup failed", category=OCILifecycleFailureCategory.CLEANUP
+            ) from None
+        if type(removed) is not int or removed != 0:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream event callback cleanup failed", category=OCILifecycleFailureCategory.CLEANUP
+            )
+        self._closed = True
+
+
+def _single(parent: ET.Element, path: str, message: str) -> ET.Element:
+    found = parent.findall(path)
+    if len(found) != 1:
+        raise StateError(message)
+    return found[0]
+
+
+def _text(parent: ET.Element, path: str, message: str) -> str:
+    value = _single(parent, path, message).text
+    if not isinstance(value, str):
+        raise StateError(message)
+    return value
+
+
+def _source_dac_projection(source: ET.Element, *, domain_dac: bool, context: str) -> tuple[tuple[str, str], ...]:
+    children = list(source)
+    if (source.text or "").strip():
+        raise StateError(f"defined OCI-root {context} DAC policy is invalid")
+    if domain_dac:
+        if children:
+            raise StateError(f"defined OCI-root {context} cannot override domain DAC policy")
+        return ()
+    if (
+        len(children) != 1
+        or children[0].tag != "seclabel"
+        or children[0].attrib != {"model": "dac", "relabel": "no"}
+        or list(children[0])
+        or (children[0].text or "").strip()
+        or (children[0].tail or "").strip()
+    ):
+        raise StateError(f"defined OCI-root {context} DAC policy is invalid")
+    return tuple(sorted(children[0].attrib.items()))
+
+
+def _disk_projection(root: ET.Element) -> tuple[tuple[Any, ...], ...]:
+    projected: list[tuple[Any, ...]] = []
+    seen_targets: set[str] = set()
+    domain_dac = _dac_projection(root) is not None
+    for disk in root.findall("./devices/disk"):
+        source = _single(disk, "./source", "defined OCI-root disk source is invalid")
+        target = _single(disk, "./target", "defined OCI-root disk target is invalid")
+        driver = _single(disk, "./driver", "defined OCI-root disk driver is invalid")
+        serials = disk.findall("./serial")
+        readonly_count = len(disk.findall("./readonly"))
+        shareable_count = len(disk.findall("./shareable"))
+        backing_stores = disk.findall("./backingStore")
+        source_policy = _source_dac_projection(source, domain_dac=domain_dac, context="disk projection")
+        if any(
+            child.tag
+            not in {"address", "alias", "backingStore", "driver", "readonly", "serial", "shareable", "source", "target"}
+            for child in disk
+        ):
+            raise StateError("defined OCI-root disk contains an unapproved child")
+        if len(backing_stores) > 1 or any(
+            backing.attrib or list(backing) or (backing.text or "").strip() for backing in backing_stores
+        ):
+            raise StateError("defined OCI-root disk backing store is invalid")
+        target_name = target.get("dev")
+        if (
+            disk.attrib != {"type": "file", "device": "disk"}
+            or set(source.attrib) != {"file"}
+            or target.attrib.get("bus") != "virtio"
+            or set(target.attrib) != {"dev", "bus"}
+            or driver.get("name") != "qemu"
+            or driver.get("type") != "raw"
+            or not isinstance(target_name, str)
+            or target_name in seen_targets
+            or len(serials) != 1
+            or not isinstance(serials[0].text, str)
+            or readonly_count > 1
+            or shareable_count > 1
+            or list(target)
+            or list(driver)
+            or serials[0].attrib
+            or list(serials[0])
+            or len(disk.findall("./alias")) > 1
+            or len(disk.findall("./address")) > 1
+        ):
+            raise StateError("defined OCI-root disk projection is invalid")
+        seen_targets.add(target_name)
+        projected.append(
+            (
+                target_name,
+                source.get("file"),
+                serials[0].text,
+                tuple(sorted(driver.attrib.items())),
+                source_policy,
+                readonly_count == 1,
+                shareable_count == 1,
+            )
+        )
+    return tuple(sorted(projected))
+
+
+def _validate_file_console_serial_mirror(
+    serial: ET.Element, console_source: ET.Element | None, *, domain_dac: bool = False
+) -> None:
+    sources = serial.findall("./source")
+    targets = serial.findall("./target")
+    models = targets[0].findall("./model") if targets else []
+    if (
+        console_source is None
+        or serial.attrib != {"type": "file"}
+        or [child.tag for child in serial] != ["source", "target"]
+        or len(sources) != 1
+        or len(targets) != 1
+        or sources[0].attrib != console_source.attrib
+        or targets[0].attrib != {"port": "0", "type": "isa-serial"}
+        or [child.tag for child in targets[0]] != ["model"]
+        or len(models) != 1
+        or models[0].attrib != {"name": "isa-serial"}
+        or list(models[0])
+        or (serial.text or "").strip()
+        or (serial.tail or "").strip()
+        or (sources[0].text or "").strip()
+        or (sources[0].tail or "").strip()
+        or (targets[0].text or "").strip()
+        or (targets[0].tail or "").strip()
+        or (models[0].text or "").strip()
+        or (models[0].tail or "").strip()
+    ):
+        raise StateError("defined OCI-root generated file serial mirror is invalid")
+    if _source_dac_projection(
+        sources[0], domain_dac=domain_dac, context="generated file serial mirror"
+    ) != _source_dac_projection(console_source, domain_dac=domain_dac, context="console contract"):
+        raise StateError("defined OCI-root generated file serial mirror DAC policy is invalid")
+
+
+def _validate_devices_surface(
+    devices: ET.Element,
+    *,
+    file_console_source: ET.Element | None = None,
+    domain_dac: bool = False,
+) -> tuple[tuple[str, int], ...]:
+    """Reject host-resource devices; admit only bounded inert normalization.
+
+    Libvirt may synthesize a disabled audio backend, a reset-only watchdog,
+    bus controllers, a PTY serial peer, an exact file-console serial mirror,
+    legacy input devices, a panic notifier, or a virtio balloon in inactive
+    XML.  Only the file-console mirror has a host path, and that path plus its
+    complete shape must equal the authored console source.  Every authored
+    OCI-root device remains part of the exact projection below.
+    """
+
+    authored = {"channel", "console", "disk", "emulator", "interface"}
+    safe_generated = {"audio", "input", "memballoon", "panic", "serial", "watchdog"}
+    counts: dict[str, int] = {}
+    generated_counts: dict[str, int] = {}
+    safe_controller_ids: set[tuple[str, str]] = set()
+    for child in list(devices):
+        if not isinstance(child.tag, str) or "}" in child.tag:
+            raise StateError("defined OCI-root device class is invalid")
+        tag = child.tag
+        if tag in authored:
+            counts[tag] = counts.get(tag, 0) + 1
+            continue
+        if tag == "controller":
+            controller_type = child.get("type")
+            if controller_type == "virtio-serial":
+                counts[tag] = counts.get(tag, 0) + 1
+                continue
+            if (
+                controller_type not in {"pci", "sata", "usb"}
+                or set(child.attrib) - {"index", "model", "ports", "type"}
+                or any(grandchild.tag not in {"address", "alias", "driver", "model", "target"} for grandchild in child)
+                or child.find(".//source") is not None
+            ):
+                raise StateError("defined OCI-root generated controller is invalid")
+            identity = (controller_type, child.get("index", ""))
+            if identity in safe_controller_ids or len(safe_controller_ids) >= 32:
+                raise StateError("defined OCI-root generated controller set is invalid")
+            safe_controller_ids.add(identity)
+            continue
+        if tag not in safe_generated:
+            raise StateError(f"defined OCI-root device class is forbidden: {tag}")
+        generated_counts[tag] = generated_counts.get(tag, 0) + 1
+        limits = {"audio": 1, "input": 2, "memballoon": 1, "panic": 1, "serial": 1, "watchdog": 1}
+        if generated_counts[tag] > limits[tag] or (tag != "serial" and child.find(".//source") is not None):
+            raise StateError("defined OCI-root generated device set is invalid")
+        if tag == "audio":
+            if child.attrib != {"id": "1", "type": "none"} or child.text is not None or list(child):
+                raise StateError("defined OCI-root generated audio device is invalid")
+            counts[tag] = generated_counts[tag]
+        if tag == "watchdog":
+            if child.attrib != {"action": "reset", "model": "itco"} or child.text is not None or list(child):
+                raise StateError("defined OCI-root generated watchdog device is invalid")
+            counts[tag] = generated_counts[tag]
+        if tag == "input" and (
+            child.get("type") not in {"keyboard", "mouse", "tablet"}
+            or child.get("bus") not in {"ps2", "usb"}
+            or any(grandchild.tag not in {"address", "alias"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated input device is invalid")
+        if tag == "memballoon" and (
+            child.get("model") not in {"none", "virtio"}
+            or any(grandchild.tag not in {"address", "alias", "driver", "stats"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated balloon device is invalid")
+        if tag == "panic" and (
+            child.get("model") not in {"hyperv", "isa", "pseries", "s390"}
+            or any(grandchild.tag not in {"address", "alias"} for grandchild in child)
+        ):
+            raise StateError("defined OCI-root generated panic device is invalid")
+        if tag == "serial":
+            if child.get("type") == "file":
+                _validate_file_console_serial_mirror(child, file_console_source, domain_dac=domain_dac)
+                counts[tag] = generated_counts[tag]
+            else:
+                targets = child.findall("./target")
+                if (
+                    file_console_source is not None
+                    or child.attrib != {"type": "pty"}
+                    or len(targets) != 1
+                    or targets[0].get("port") != "0"
+                    or targets[0].get("type") not in {"isa-serial", "serial"}
+                    or any(grandchild.tag not in {"address", "alias", "target"} for grandchild in child)
+                    or child.find(".//source") is not None
+                ):
+                    raise StateError("defined OCI-root generated serial device is invalid")
+    required = {"channel": 1, "console": 1, "emulator": 1}
+    if any(counts.get(tag, 0) != count for tag, count in required.items()):
+        raise StateError("defined OCI-root authored device multiplicity is invalid")
+    if counts.get("disk", 0) < 3 or counts.get("controller", 0) != 1 or counts.get("interface", 0) > 1:
+        raise StateError("defined OCI-root authored device multiplicity is invalid")
+    return tuple(sorted(counts.items()))
+
+
+def _dac_projection(root: ET.Element) -> str | None:
+    labels = root.findall("./seclabel")
+    if not labels:
+        return None
+    if len(labels) != 1:
+        raise StateError("defined OCI-root DAC policy is invalid")
+    node = labels[0]
+    children = list(node)
+    if (
+        node.attrib != {"type": "static", "model": "dac", "relabel": "no"}
+        or len(children) != 1
+        or children[0].tag != "label"
+        or children[0].attrib
+        or list(children[0])
+        or (node.text or "").strip()
+        or (children[0].tail or "").strip()
+    ):
+        raise StateError("defined OCI-root DAC policy is invalid")
+    value = children[0].text
+    import re
+
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"\+[1-9][0-9]{0,9}:\+[1-9][0-9]{0,9}", value) is None
+        or any(int(item) >= 2**32 - 1 for item in value.split(":"))
+    ):
+        raise StateError("defined OCI-root DAC principal is invalid")
+    return value
+
+
+def _qemu_network_projection(root: ET.Element) -> tuple[str, ...]:
+    """Return the authored user-mode NIC arguments, or an empty tuple.
+
+    OCI-root authors its NIC as an explicit QEMU user-mode netdev, so the
+    defined domain carries one closed ``qemu:commandline`` element. Any other
+    namespaced element, attribute, child shape, or argument value is rejected.
+    """
+
+    elements = root.findall(f"{_QEMU_NAMESPACE}commandline")
+    if not elements:
+        return ()
+    if len(elements) != 1:
+        raise StateError("defined OCI-root QEMU command line is invalid")
+    element = elements[0]
+    if element.attrib or (element.text is not None and element.text.strip()):
+        raise StateError("defined OCI-root QEMU command line is invalid")
+    values: list[str] = []
+    for child in element:
+        if (
+            child.tag != f"{_QEMU_NAMESPACE}arg"
+            or set(child.attrib) != {"value"}
+            or list(child)
+            or (child.text is not None and child.text.strip())
+        ):
+            raise StateError("defined OCI-root QEMU argument is invalid")
+        values.append(child.get("value", ""))
+    try:
+        return validated_qemu_arguments(values)
+    except ArtifactValidationError as exc:
+        raise StateError("defined OCI-root QEMU network argument is invalid") from exc
+
+
+def _validate_top_level_surface(root: ET.Element) -> None:
+    authored = {"cpu", "devices", "features", "memory", "metadata", "name", "os", "vcpu"}
+    safe_defaults = {"clock", "currentMemory", "on_crash", "on_poweroff", "on_reboot", "pm", "uuid"}
+    counts: dict[str, int] = {}
+    _dac_projection(root)
+    _qemu_network_projection(root)
+    for child in list(root):
+        if not isinstance(child.tag, str):
+            raise StateError("defined OCI-root top-level extension is forbidden")
+        if child.tag == f"{_QEMU_NAMESPACE}commandline":
+            continue
+        if "}" in child.tag:
+            raise StateError("defined OCI-root top-level extension is forbidden")
+        if child.tag == "seclabel":
+            continue
+        if child.tag in authored:
+            counts[child.tag] = counts.get(child.tag, 0) + 1
+            continue
+        if child.tag not in safe_defaults:
+            raise StateError(f"defined OCI-root top-level element is forbidden: {child.tag}")
+        counts[child.tag] = counts.get(child.tag, 0) + 1
+        if counts[child.tag] > 1:
+            raise StateError("defined OCI-root generated top-level defaults are invalid")
+        if child.tag == "uuid":
+            try:
+                value = str(uuid.UUID(child.text or ""))
+            except ValueError:
+                raise StateError("defined OCI-root generated UUID element is invalid") from None
+            if value != child.text or child.attrib or list(child):
+                raise StateError("defined OCI-root generated UUID element is invalid")
+        elif child.tag == "clock":
+            if child.attrib != {"offset": "utc"} or any(grandchild.tag != "timer" for grandchild in child):
+                raise StateError("defined OCI-root generated clock is invalid")
+        elif child.tag == "currentMemory":
+            # libvirt may materialize this redundant field in inactive XML.  Its
+            # value is checked against memory after authored multiplicity has
+            # been established below.
+            pass
+        elif child.tag in {"on_crash", "on_poweroff", "on_reboot"}:
+            expected = {"on_crash": "destroy", "on_poweroff": "destroy", "on_reboot": "restart"}[child.tag]
+            if child.text != expected or child.attrib or list(child):
+                raise StateError("defined OCI-root generated lifecycle default is invalid")
+        elif child.tag == "pm":
+            expected_pm = {"suspend-to-disk": "no", "suspend-to-mem": "no"}
+            found_pm: dict[str, str | None] = {}
+            for setting in child:
+                if setting.tag not in expected_pm or set(setting.attrib) != {"enabled"} or list(setting):
+                    raise StateError("defined OCI-root generated power-management default is invalid")
+                found_pm[setting.tag] = setting.get("enabled")
+            if child.attrib or found_pm != expected_pm:
+                raise StateError("defined OCI-root generated power-management default is invalid")
+    if any(counts.get(tag, 0) != 1 for tag in authored):
+        raise StateError("defined OCI-root authored top-level multiplicity is invalid")
+    _memory_projection(root)
+
+
+def _memory_projection(root: ET.Element) -> tuple[str, int]:
+    memory = _single(root, "./memory", "defined OCI-root memory contract is invalid")
+    if (
+        set(memory.attrib) != {"unit"}
+        or memory.get("unit") not in {"KiB", "MiB"}
+        or re.fullmatch(r"[1-9][0-9]*", memory.text or "") is None
+        or list(memory)
+    ):
+        raise StateError("defined OCI-root memory contract is invalid")
+    current = root.findall("./currentMemory")
+    if current and (
+        len(current) != 1 or current[0].attrib != memory.attrib or current[0].text != memory.text or list(current[0])
+    ):
+        raise StateError("defined OCI-root generated current memory is invalid")
+    multiplier = 1 if memory.get("unit") == "KiB" else 1024
+    return ("KiB", int(memory.text or "0") * multiplier)
+
+
+def _cpu_projection(root: ET.Element) -> tuple[tuple[tuple[str, str], ...], tuple[Any, ...]]:
+    cpu = _single(root, "./cpu", "defined OCI-root CPU contract is invalid")
+    authored = {"mode": "host-passthrough"}
+    libvirt_defaulted = {"check": "none", "migratable": "on", "mode": "host-passthrough"}
+    if cpu.attrib not in (authored, libvirt_defaulted) or cpu.text is not None or list(cpu):
+        raise StateError("defined OCI-root CPU contract is invalid")
+    return (tuple(sorted(cpu.attrib.items())), ())
+
+
+def _domain_projection(xml: str) -> dict[str, Any]:
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, TypeError, ValueError):
+        raise StateError("defined OCI-root domain XML is invalid") from None
+    if root.tag != "domain" or root.attrib != {"type": "kvm"}:
+        raise StateError("defined OCI-root domain root is invalid")
+    _validate_top_level_surface(root)
+    domain_dac = _dac_projection(root) is not None
+    metadata = _single(root, "./metadata", "defined OCI-root metadata contract is invalid")
+    if (
+        metadata.attrib
+        or (metadata.text is not None and metadata.text.strip())
+        or (metadata.tail is not None and metadata.tail.strip())
+        or any(child.tail is not None and child.tail.strip() for child in metadata)
+    ):
+        raise StateError("defined OCI-root metadata contract is invalid")
+    marker_tag = f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run"
+    lifecycle_tag = f"{{{kvm.DOMAIN_MARKER_NAMESPACE}}}lifecycle"
+    metadata_tags = [child.tag for child in metadata]
+    if (
+        any(not isinstance(tag, str) or tag not in {lifecycle_tag, marker_tag} for tag in metadata_tags)
+        or metadata_tags.count(marker_tag) != 1
+        or metadata_tags.count(lifecycle_tag) > 1
+    ):
+        raise StateError("defined OCI-root metadata contract is invalid")
+    marker = _single(
+        root,
+        f"./metadata/{marker_tag}",
+        "defined OCI-root ownership marker is invalid",
+    )
+    if set(marker.attrib) != {"contract", "id", "schema", "version"} or marker.text is not None or list(marker):
+        raise StateError("defined OCI-root ownership marker is invalid")
+    lifecycle_nodes = metadata.findall(f"./{lifecycle_tag}")
+    lifecycle_projection = {
+        "channel": kvm.OCI_CONTROL_CHANNEL_NAME,
+        "protocol": kvm.OCI_CONTROL_PROTOCOL_V2,
+    }
+    # libvirt retains only the ownership child when two application metadata
+    # children share this namespace.  Absence is normalized to the fixed
+    # lifecycle contract; the run contract digest and exact channel projection
+    # below still bind the per-run source path and guest target.
+    if lifecycle_nodes:
+        lifecycle = lifecycle_nodes[0]
+        if lifecycle.attrib != lifecycle_projection or lifecycle.text is not None or list(lifecycle):
+            raise StateError("defined OCI-root lifecycle contract is invalid")
+    channels = root.findall("./devices/channel")
+    controllers = [
+        (controller.get("type"), controller.get("index"))
+        for controller in root.findall("./devices/controller")
+        if controller.get("type") == "virtio-serial"
+    ]
+    interfaces = root.findall("./devices/interface")
+    network_projection: list[tuple[str | None, str | None, str | None]] = []
+    for interface in interfaces:
+        source = _single(interface, "./source", "defined OCI-root network source is invalid")
+        model = _single(interface, "./model", "defined OCI-root network model is invalid")
+        macs = interface.findall("./mac")
+        if (
+            any(child.tag not in {"address", "alias", "mac", "model", "source"} for child in interface)
+            or interface.attrib != {"type": "network"}
+            or set(source.attrib) != {"network"}
+            or set(model.attrib) != {"type"}
+            or list(source)
+            or list(model)
+            or len(macs) > 1
+            or len(interface.findall("./alias")) > 1
+            or len(interface.findall("./address")) > 1
+            or (macs and (set(macs[0].attrib) != {"address"} or _MAC_RE.fullmatch(macs[0].get("address", "")) is None))
+        ):
+            raise StateError("defined OCI-root network projection is invalid")
+        network_projection.append((interface.get("type"), source.get("network"), model.get("type")))
+    channel_projection: list[tuple[str | None, ...]] = []
+    for channel in channels:
+        source = _single(channel, "./source", "defined OCI-root lifecycle channel source is invalid")
+        target = _single(channel, "./target", "defined OCI-root lifecycle channel is invalid")
+        if (
+            any(child.tag not in {"address", "alias", "source", "target"} for child in channel)
+            or channel.attrib != {"type": "unix"}
+            or set(source.attrib) != {"mode", "path"}
+            or set(target.attrib) != {"type", "name"}
+            or list(source)
+            or list(target)
+            or len(channel.findall("./alias")) > 1
+            or len(channel.findall("./address")) > 1
+        ):
+            raise StateError("defined OCI-root lifecycle channel source is invalid")
+        channel_projection.append(
+            (
+                channel.get("type"),
+                source.get("mode"),
+                source.get("path"),
+                target.get("type"),
+                target.get("name"),
+            )
+        )
+    os_type = _single(root, "./os/type", "defined OCI-root machine contract is invalid")
+    os_element = _single(root, "./os", "defined OCI-root direct-boot contract is invalid")
+    expected_os_children = {"cmdline", "initrd", "kernel", "type"}
+    boot_elements = os_element.findall("./boot")
+    if (
+        os_element.attrib
+        or any(child.tag not in expected_os_children | {"boot"} for child in os_element)
+        or any(len(os_element.findall(f"./{tag}")) != 1 for tag in expected_os_children)
+        or len(boot_elements) > 1
+        or (
+            boot_elements
+            and (
+                boot_elements[0].attrib != {"dev": "hd"} or boot_elements[0].text is not None or list(boot_elements[0])
+            )
+        )
+    ):
+        raise StateError("defined OCI-root direct-boot contract is invalid")
+    memory = _memory_projection(root)
+    cpu = _cpu_projection(root)
+    features = _single(root, "./features", "defined OCI-root feature contract is invalid")
+    consoles = root.findall("./devices/console")
+    if len(consoles) != 1:
+        raise StateError("defined OCI-root console contract is invalid")
+    console = consoles[0]
+    console_targets = console.findall("./target")
+    console_sources = console.findall("./source")
+    console_source_policy = None
+    if console_sources:
+        console_source_policy = _source_dac_projection(
+            console_sources[0], domain_dac=domain_dac, context="console contract"
+        )
+    if (
+        len(console_targets) != 1
+        or len(console_sources) > 1
+        or any(child.tag not in {"address", "alias", "source", "target"} for child in console)
+        or list(console_targets[0])
+        or len(console.findall("./alias")) > 1
+        or len(console.findall("./address")) > 1
+        or console_targets[0].attrib != {"port": "0", "type": "serial"}
+        or (console.text or "").strip()
+        or (console_targets[0].text or "").strip()
+        or any((child.tail or "").strip() for child in console)
+        or (not console_sources and console.attrib != {"type": "pty"})
+        or (
+            console_sources
+            and (
+                console.attrib != {"type": "file"}
+                or set(console_sources[0].attrib) != {"append", "path"}
+                or console_sources[0].get("append") != "on"
+                or not isinstance(console_sources[0].get("path"), str)
+                or not console_sources[0].get("path", "").startswith("/")
+            )
+        )
+    ):
+        raise StateError("defined OCI-root console contract is invalid")
+    emulator = _single(root, "./devices/emulator", "defined OCI-root emulator is invalid")
+    if emulator.attrib or list(emulator):
+        raise StateError("defined OCI-root emulator is invalid")
+    console_projection: tuple[Any, ...] = (
+        tuple(sorted(console.attrib.items())),
+        None if not console_sources else tuple(sorted(console_sources[0].attrib.items())),
+        tuple(sorted(console_targets[0].attrib.items())),
+    )
+    if console_source_policy:
+        console_projection += (console_source_policy,)
+    return {
+        "channels": tuple(channel_projection),
+        **({"dac_label": _dac_projection(root)} if root.find("./seclabel") is not None else {}),
+        "controllers": tuple(controllers),
+        "disks": _disk_projection(root),
+        "device_counts": _validate_devices_surface(
+            _single(root, "./devices", "defined OCI-root devices are invalid"),
+            file_console_source=console_sources[0] if console_sources else None,
+            domain_dac=domain_dac,
+        ),
+        "domain_type": root.get("type"),
+        "emulator": emulator.text,
+        "features": tuple((child.tag, tuple(sorted(child.attrib.items())), child.text) for child in list(features)),
+        "generated_boot": "hd",
+        "initramfs": _text(root, "./os/initrd", "defined OCI-root initramfs is invalid"),
+        "interfaces": tuple(network_projection),
+        "kernel": _text(root, "./os/kernel", "defined OCI-root kernel is invalid"),
+        "kernel_cmdline": _text(root, "./os/cmdline", "defined OCI-root kernel command line is invalid"),
+        "lifecycle": lifecycle_projection,
+        "machine": (os_type.get("arch"), os_type.get("machine"), os_type.text),
+        "marker": dict(marker.attrib),
+        "current_memory": memory,
+        "memory": memory,
+        "name": _text(root, "./name", "defined OCI-root domain name is invalid"),
+        "qemu_network": _qemu_network_projection(root),
+        "cpu": cpu,
+        "console": console_projection,
+        "vcpus": _text(root, "./vcpu", "defined OCI-root vCPU contract is invalid"),
+    }
+
+
+def _projection_digest(projection: Mapping[str, Any]) -> str:
+    return f"sha256:{hashlib.sha256(canonical_json(dict(projection))).hexdigest()}"
+
+
+def _validate_machine_alias(
+    conn: Any,
+    profile: DomainProfile,
+    authored_machine: tuple[str | None, str | None, str | None],
+    actual_machine: tuple[str | None, str | None, str | None],
+) -> None:
+    if authored_machine == actual_machine:
+        return
+    authored_arch, authored_name, authored_type = authored_machine
+    actual_arch, actual_name, actual_type = actual_machine
+    if (
+        authored_arch != profile.arch
+        or actual_arch != authored_arch
+        or authored_name != profile.machine
+        or authored_type != "hvm"
+        or actual_type != authored_type
+        or profile.domain_type != "kvm"
+        or not isinstance(actual_name, str)
+        or not actual_name
+    ):
+        raise StateError("defined OCI-root machine contract is invalid")
+    try:
+        inspect_capabilities = conn.getDomainCapabilities
+        if not callable(inspect_capabilities):
+            raise TypeError
+        capabilities = inspect_capabilities(
+            str(profile.emulator),
+            profile.arch,
+            profile.machine,
+            profile.domain_type,
+            0,
+        )
+        root = ET.fromstring(capabilities)
+    except Exception as exc:
+        raise StateError("libvirt machine alias capabilities cannot be inspected") from exc
+    if root.tag != "domainCapabilities" or root.attrib or (root.text is not None and root.text.strip()):
+        raise StateError("libvirt machine alias capabilities are invalid")
+    expected_scalars = {
+        "arch": authored_arch,
+        "domain": profile.domain_type,
+        "machine": actual_name,
+        "path": str(profile.emulator),
+    }
+    for tag, expected in expected_scalars.items():
+        scalar = _single(root, f"./{tag}", "libvirt machine alias domain capabilities are ambiguous")
+        if scalar.attrib or scalar.text != expected or list(scalar):
+            raise StateError("defined OCI-root machine alias is not an exact libvirt domain capability")
+
+
+def _validated_post_define_projection(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    actual_xml: str,
+) -> str:
+    authored = _domain_projection(resolved.xml)
+    actual = _domain_projection(actual_xml)
+    authored_machine = authored.get("machine")
+    actual_machine = actual.get("machine")
+    if not isinstance(authored_machine, tuple) or not isinstance(actual_machine, tuple):
+        raise StateError("defined OCI-root machine projection is invalid")
+    _validate_machine_alias(conn, resolved.profile, authored_machine, actual_machine)
+    authored["machine"] = actual_machine
+    actual_cpu = actual.get("cpu")
+    libvirt_cpu = (("check", "none"), ("migratable", "on"), ("mode", "host-passthrough"))
+    if actual_cpu == (libvirt_cpu, ()):
+        authored["cpu"] = actual_cpu
+    authored_device_counts = dict(authored.get("device_counts", ()))
+    actual_device_counts = dict(actual.get("device_counts", ()))
+    for generated_device in ("audio", "watchdog"):
+        if generated_device not in authored_device_counts and actual_device_counts.get(generated_device) == 1:
+            authored_device_counts[generated_device] = 1
+    authored_console = authored.get("console")
+    # The projection parser already proved the exact mirror and DAC policy;
+    # domain-wide no-relabel omits the legacy fourth, per-source label item.
+    if (
+        isinstance(authored_console, tuple)
+        and (len(authored_console) == 4 or len(authored_console) == 3 and "dac_label" in authored)
+        and authored_console[0] == (("type", "file"),)
+        and "serial" not in authored_device_counts
+        and actual_device_counts.get("serial") == 1
+    ):
+        authored_device_counts["serial"] = 1
+    authored["device_counts"] = tuple(sorted(authored_device_counts.items()))
+    if actual != authored:
+        raise StateError("defined OCI-root domain does not match the committed contract")
+    return _projection_digest(actual)
+
+
+def _domain_uuid(domain: Any) -> str:
+    try:
+        value = domain.UUIDString()
+        parsed = str(uuid.UUID(value))
+    except Exception as exc:
+        raise StateError("defined OCI-root domain UUID is invalid") from exc
+    if parsed != value:
+        raise StateError("defined OCI-root domain UUID is not canonical")
+    return value
+
+
+def _domain_id(domain: Any) -> int:
+    try:
+        value = domain.ID()
+    except Exception as exc:
+        raise StateError("OCI-root domain boot instance ID cannot be inspected") from exc
+    if type(value) is not int or value < -1:
+        raise StateError("OCI-root domain boot instance ID is invalid")
+    return value
+
+
+def _validate_defined_domain(
+    domain: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str,
+    *,
+    conn: Any | None = None,
+    expected_projection_digest: str | None = None,
+) -> str:
+    if (conn is None) == (expected_projection_digest is None):
+        raise StateError("defined OCI-root projection validation authority is invalid")
+    if _domain_uuid(domain) != expected_uuid:
+        raise StateError("defined OCI-root domain UUID changed after definition")
+    try:
+        actual_xml = domain.XMLDesc()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain cannot be inspected") from exc
+    if conn is not None:
+        projection_digest = _validated_post_define_projection(conn, resolved, actual_xml)
+    else:
+        projection_digest = _projection_digest(_domain_projection(actual_xml))
+        if projection_digest != expected_projection_digest:
+            raise StateError("defined OCI-root domain changed after definition")
+    actual_root = ET.fromstring(actual_xml)
+    xml_uuids = actual_root.findall("./uuid")
+    if xml_uuids and xml_uuids[0].text != expected_uuid:
+        raise StateError("defined OCI-root XML UUID does not match the libvirt domain UUID")
+    try:
+        active = domain.isActive()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain activity cannot be inspected") from exc
+    if active != 0:
+        raise StateError("defined OCI-root domain became active before start authorization")
+    return projection_digest
+
+
+def _lookup(conn: Any, name: str) -> Any | None:
+    libvirt = kvm._libvirt()
+    try:
+        domain = conn.lookupByName(name)
+    except libvirt.libvirtError as exc:
+        code = exc.get_error_code() if hasattr(exc, "get_error_code") else None
+        if code == libvirt.VIR_ERR_NO_DOMAIN:
+            return None
+        raise StateError(f"cannot determine whether OCI-root domain name is available: {name}") from exc
+    except Exception as exc:
+        raise StateError(f"cannot determine whether OCI-root domain name is available: {name}") from exc
+    if domain is None:
+        raise StateError(f"libvirt returned an ambiguous domain lookup result: {name}")
+    return domain
+
+
+def _has_exact_owner(domain: Any, resolved: ResolvedOCIRootDomainPlan) -> bool:
+    try:
+        root = ET.fromstring(domain.XMLDesc())
+        marker = _single(
+            root,
+            f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run",
+            "defined OCI-root ownership marker is invalid",
+        )
+    except Exception:
+        return False
+    return marker.attrib == {
+        "contract": resolved.plan.digest,
+        "id": resolved.plan.run_id,
+        "schema": "1",
+        "version": kvm.DOMAIN_MARKER_VERSION,
+    }
+
+
+def _cleanup_exact_new_domain(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str | None,
+) -> None:
+    domain = _lookup(conn, resolved.plan.run_name)
+    if domain is None:
+        return
+    if expected_uuid is None:
+        raise StateError("partially defined OCI-root domain has no captured UUID")
+    if _domain_uuid(domain) != expected_uuid or not _has_exact_owner(domain, resolved):
+        raise StateError("defined OCI-root domain identity changed before cleanup")
+    try:
+        active = domain.isActive()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain activity is ambiguous during cleanup") from exc
+    if active != 0:
+        raise StateError("defined OCI-root domain is unexpectedly active during cleanup")
+    try:
+        domain.undefine()
+    except Exception as exc:
+        raise StateError("defined OCI-root domain cleanup failed") from exc
+    if _lookup(conn, resolved.plan.run_name) is not None:
+        raise StateError("defined OCI-root domain remains after cleanup")
+
+
+def _connection_uri(conn: Any, profile: DomainProfile) -> str:
+    try:
+        uri = conn.getURI()
+    except Exception as exc:
+        raise StateError("OCI-root libvirt connection URI cannot be inspected") from exc
+    if not isinstance(uri, str) or uri != profile.uri:
+        raise StateError("OCI-root libvirt connection URI does not match the qualified profile")
+    return uri
+
+
+def _record_cleanup_required(
+    mutation: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str | None,
+    libvirt_uri: str,
+) -> None:
+    data = mutation.mutable_state()
+    data["error"] = "OCI-root domain definition failed and cleanup is required"
+    data["oci_root_definition"] = {
+        "domain_uuid": domain_uuid,
+        "libvirt_uri": libvirt_uri,
+        "phase": "cleanup-required",
+        "plan_digest": resolved.plan.digest,
+        "schema": OCI_ROOT_DEFINITION_SCHEMA,
+    }
+    mutation.write_state("failed", data)
+
+
+def define_committed_oci_root_domain(
+    roots: StatePaths,
+    name: str,
+    store: OCIStore,
+    boot_artifacts: VerifiedHostBootArtifacts,
+    profile: DomainProfile,
+    *,
+    conn: Any,
+    runner: CommandRunner = _default_runner,
+    health_check: Callable[[], None] | None = None,
+) -> DefinedOCIRootDomain:
+    """Define, validate, and durably record one inactive OCI-root domain.
+
+    This is intentionally not registered with runtime dispatch and never calls
+    ``create``.  Every path-bearing authority is reconstructed while the pinned
+    run lock is held, immediately before ``defineXML``.
+    """
+
+    if conn is None:
+        raise StateError("OCI-root domain definition requires an explicit libvirt connection")
+    with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
+        libvirt_uri = _connection_uri(conn, profile)
+        resolved = resolve_committed_oci_root_domain_plan(
+            roots,
+            mutation.snapshot,
+            store,
+            boot_artifacts,
+            profile,
+            runner=runner,
+        )
+        if resolved.spec.dac_label is not None:
+            from .oci_acl import parse_qemu_dac_baselabel
+
+            uid, gid = parse_qemu_dac_baselabel(conn.getCapabilities())
+            if resolved.spec.dac_label != f"+{uid}:+{gid}":
+                raise StateError("OCI-root export DAC principal changed before definition")
+        runtime_io = io_guards.enter_context(
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
+        )
+        if _lookup(conn, name) is not None:
+            raise StateError(f"libvirt domain name is already reserved: {name}")
+        attempted = False
+        domain_uuid: str | None = None
+        try:
+            if health_check is not None:
+                health_check()
+            mutation.verify_binding()
+            runtime_io.verify(require_socket_absent=True)
+            attempted = True
+            domain = conn.defineXML(resolved.xml)
+            if domain is None:
+                raise StateError("OCI-root domain definition failed")
+            domain_uuid = _domain_uuid(domain)
+            current = _lookup(conn, name)
+            if current is None:
+                raise StateError("defined OCI-root domain is missing")
+            projection_digest = _validate_defined_domain(current, resolved, domain_uuid, conn=conn)
+            if health_check is not None:
+                health_check()
+            mutation.verify_binding()
+            runtime_io.verify(require_socket_absent=True)
+            data = mutation.mutable_state()
+            data["oci_root_definition"] = {
+                "domain_uuid": domain_uuid,
+                "libvirt_uri": libvirt_uri,
+                "phase": "defined",
+                "plan_digest": resolved.plan.digest,
+                "projection_digest": projection_digest,
+                "schema": OCI_ROOT_DEFINITION_SCHEMA,
+            }
+            result = mutation.write_state("defined", data)
+            if result.get("status") != "defined":
+                raise StateError("OCI-root domain definition was not durably recorded")
+        except BaseException:
+            if attempted:
+                try:
+                    _cleanup_exact_new_domain(conn, resolved, domain_uuid)
+                except Exception as cleanup_exc:
+                    try:
+                        _record_cleanup_required(mutation, resolved, domain_uuid, libvirt_uri)
+                    except Exception as ledger_exc:
+                        raise StateError(
+                            "OCI-root domain cleanup failed and cleanup-required state could not be recorded"
+                        ) from ledger_exc
+                    raise StateError("OCI-root domain cleanup failed; cleanup is required") from cleanup_exc
+            raise
+        return DefinedOCIRootDomain(
+            resolved.plan.run_id,
+            resolved.plan.run_name,
+            resolved.plan.digest,
+            domain_uuid,
+            libvirt_uri,
+        )
+
+
+def _definition_ledger(state: Mapping[str, Any], profile: DomainProfile) -> tuple[str, str, str]:
+    value = state.get("oci_root_definition")
+    if not isinstance(value, Mapping) or set(value) != {
+        "domain_uuid",
+        "libvirt_uri",
+        "phase",
+        "plan_digest",
+        "projection_digest",
+        "schema",
+    }:
+        raise StateError("OCI-root durable definition ledger is invalid")
+    if value.get("schema") != OCI_ROOT_DEFINITION_SCHEMA or value.get("phase") != "defined":
+        raise StateError("OCI-root durable definition ledger is invalid")
+    domain_uuid = value.get("domain_uuid")
+    plan_digest = value.get("plan_digest")
+    projection_digest = value.get("projection_digest")
+    if (
+        not isinstance(domain_uuid, str)
+        or not isinstance(plan_digest, str)
+        or not isinstance(projection_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", projection_digest) is None
+    ):
+        raise StateError("OCI-root durable definition ledger is invalid")
+    try:
+        if str(uuid.UUID(domain_uuid)) != domain_uuid:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise StateError("OCI-root durable definition ledger is invalid") from None
+    if value.get("libvirt_uri") != profile.uri:
+        raise StateError("OCI-root durable definition URI is invalid")
+    return domain_uuid, plan_digest, projection_digest
+
+
+def _lookup_uuid(conn: Any, domain_uuid: str) -> Any | None:
+    libvirt = kvm._libvirt()
+    try:
+        domain = conn.lookupByUUIDString(domain_uuid)
+    except libvirt.libvirtError as exc:
+        code = exc.get_error_code() if hasattr(exc, "get_error_code") else None
+        if code == libvirt.VIR_ERR_NO_DOMAIN:
+            return None
+        raise StateError("cannot determine whether the OCI-root domain UUID exists") from exc
+    except Exception as exc:
+        raise StateError("cannot determine whether the OCI-root domain UUID exists") from exc
+    if domain is None:
+        raise StateError("libvirt returned an ambiguous domain UUID lookup result")
+    return domain
+
+
+def _exact_domain(conn: Any, resolved: ResolvedOCIRootDomainPlan, expected_uuid: str) -> Any:
+    by_name = _lookup(conn, resolved.plan.run_name)
+    by_uuid = _lookup_uuid(conn, expected_uuid)
+    if by_name is None or by_uuid is None:
+        raise StateError("defined OCI-root domain identity is missing")
+    if _domain_uuid(by_name) != expected_uuid or _domain_uuid(by_uuid) != expected_uuid:
+        raise StateError("defined OCI-root domain name and UUID do not agree")
+    if not _has_exact_owner(by_name, resolved) or not _has_exact_owner(by_uuid, resolved):
+        raise StateError("defined OCI-root domain ownership is invalid")
+    return by_name
+
+
+def _validate_monitor_boot_attempt(boot_attempt_id: str) -> None:
+    try:
+        if type(boot_attempt_id) is not str or str(uuid.UUID(boot_attempt_id)) != boot_attempt_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise StateError("OCI-root monitor boot attempt ID is not canonical") from None
+
+
+def _resolved_monitor_binding(
+    snapshot: RunLedgerSnapshot,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    projection_digest: str,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+) -> MonitorPreActivationBinding:
+    return MonitorPreActivationBinding(
+        record=snapshot.record,
+        owner_uid=os.geteuid(),
+        plan_digest=resolved.plan.digest,
+        expected_definition_projection_digest=projection_digest,
+        stage1_artifact_digest=str(resolved.plan.stage1_transport["artifact_digest"]),
+        domain_uuid=domain_uuid,
+        boot_attempt_id=boot_attempt_id,
+        libvirt_uri=libvirt_uri,
+    )
+
+
+def prepare_oci_root_monitor_binding(
+    roots: StatePaths,
+    name: str,
+    store: OCIStore,
+    boot_artifacts: VerifiedHostBootArtifacts,
+    profile: DomainProfile,
+    *,
+    conn: Any,
+    boot_attempt_id: str,
+    runner: CommandRunner = _default_runner,
+) -> MonitorPreActivationBinding:
+    """Bind a verified inactive definition to one chosen future boot attempt.
+
+    This is a snapshot of the durable post-definition contract, including
+    libvirt's accepted XML normalization. It grants no monitor ownership.
+    """
+
+    _validate_monitor_boot_attempt(boot_attempt_id)
+    with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
+        libvirt_uri = _connection_uri(conn, profile)
+        domain_uuid, definition_digest, projection_digest = _definition_ledger(mutation.snapshot.state, profile)
+        resolved = resolve_committed_oci_root_domain_plan(
+            roots, mutation.snapshot, store, boot_artifacts, profile, runner=runner, expected_status="defined"
+        )
+        runtime_io = io_guards.enter_context(
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
+        )
+        if definition_digest != resolved.plan.digest:
+            raise StateError("OCI-root durable definition plan binding is invalid")
+        domain = _exact_domain(conn, resolved, domain_uuid)
+        _validate_defined_domain(domain, resolved, domain_uuid, expected_projection_digest=projection_digest)
+        binding = _resolved_monitor_binding(
+            mutation.snapshot, resolved, domain_uuid, projection_digest, libvirt_uri, boot_attempt_id
+        )
+        mutation.verify_binding()
+        runtime_io.verify(require_socket_absent=True)
+        return binding
+
+
+def _validate_active_domain(
+    domain: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str,
+    expected_domain_id: int,
+    expected_projection_digest: str,
+) -> None:
+    if _domain_uuid(domain) != expected_uuid:
+        raise StateError("active OCI-root domain UUID changed")
+    try:
+        inactive_flag = getattr(kvm._libvirt(), "VIR_DOMAIN_XML_INACTIVE", None)
+        if type(inactive_flag) is not int:
+            raise StateError("libvirt inactive XML inspection support is unavailable")
+        actual_xml = domain.XMLDesc(inactive_flag)
+    except Exception as exc:
+        raise StateError("active OCI-root domain cannot be inspected") from exc
+    if _projection_digest(_domain_projection(actual_xml)) != expected_projection_digest:
+        raise StateError("active OCI-root persistent domain changed after definition")
+    try:
+        active = domain.isActive()
+    except Exception as exc:
+        raise StateError("active OCI-root domain activity cannot be inspected") from exc
+    if active != 1:
+        raise StateError("OCI-root domain did not become active")
+    if _domain_id(domain) != expected_domain_id:
+        raise StateError("active OCI-root domain boot instance changed")
+
+
+def _handoff_ledger(
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    domain_id: int | None,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+    phase: str,
+    lifecycle: OCILifecycleHandoffReceipt | None = None,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "domain_uuid": domain_uuid,
+        "boot_attempt_id": boot_attempt_id,
+        "libvirt_uri": libvirt_uri,
+        "phase": phase,
+        "plan_digest": resolved.plan.digest,
+        "schema": OCI_ROOT_HANDOFF_SCHEMA,
+    }
+    if phase == "activating":
+        if domain_id is not None or lifecycle is not None:
+            raise StateError("OCI-root activation ledger inputs are invalid")
+    elif type(domain_id) is int and domain_id > 0:
+        value["domain_id"] = domain_id
+    else:
+        raise StateError("OCI-root handoff domain ID is invalid")
+    if lifecycle is not None:
+        value["lifecycle"] = lifecycle.to_dict()
+    return value
+
+
+def _plain_wire_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _plain_wire_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_wire_value(item) for item in value]
+    return value
+
+
+def _post_ready_launch_failure_receipt(
+    failure: BaseException,
+    ready_lifecycle: OCILifecycleHandoffReceipt | None,
+) -> dict[str, str] | None:
+    if ready_lifecycle is None:
+        return None
+    if isinstance(failure, OCILifecycleTransportError):
+        source, category = "lifecycle-transport", failure.category.value
+    elif isinstance(failure, StableFailureError):
+        source, category = failure.failure_source, failure.failure_category
+
+    elif isinstance(failure, OCIStartupEventServiceError):
+        source, category = "startup-events", "service-failed"
+    elif isinstance(failure, StateError):
+        source, category = "runtime-state", "state-error"
+    else:
+        source, category = "internal", "internal-error"
+    return {
+        "category": category,
+        "schema": OCI_ROOT_LAUNCH_FAILURE_SCHEMA,
+        "source": source,
+        "stage": "post-ready-worker",
+    }
+
+
+def _require_expected_handoff(
+    state: Mapping[str, Any],
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    domain_id: int | None,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+    phase: str,
+    lifecycle: OCILifecycleHandoffReceipt | None = None,
+) -> None:
+    expected_status = {"activating": "starting", "starting": "starting", "ready": "running"}.get(phase)
+    if expected_status is None:
+        raise StateError("OCI-root expected handoff phase is invalid")
+    expected = _handoff_ledger(
+        resolved,
+        domain_uuid,
+        domain_id,
+        libvirt_uri,
+        boot_attempt_id,
+        phase,
+        lifecycle,
+    )
+    current = _plain_wire_value(state.get("oci_root_handoff"))
+    if state.get("status") != expected_status or current != expected:
+        raise StateError(f"OCI-root {phase} handoff ledger changed")
+
+
+class _LaunchControlAmbiguity(StateError):
+    """The captured boot instance can no longer be proven safe to mutate."""
+
+
+def _handle_launch_failure(
+    roots: StatePaths,
+    name: str,
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    domain_id: int | None,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+    ledger_phase: str,
+    ready_lifecycle: OCILifecycleHandoffReceipt | None,
+    expected_projection_digest: str,
+    *,
+    launch_failure: BaseException,
+    monitor_lease: _PreactivationJournalLease | None = None,
+    authority_guard: Callable[[], None] | None = None,
+) -> str:
+    with locked_existing_run(roots, name) as mutation:
+        ledger_domain_id = None if ledger_phase == "activating" else domain_id
+        _require_expected_handoff(
+            mutation.snapshot.state,
+            resolved,
+            domain_uuid,
+            ledger_domain_id,
+            libvirt_uri,
+            boot_attempt_id,
+            ledger_phase,
+            ready_lifecycle,
+        )
+        cleanup_phase = "failed"
+        try:
+            _cleanup_exact_launch_domain(
+                conn,
+                resolved,
+                domain_uuid,
+                domain_id,
+                expected_projection_digest,
+                before_mutation=(
+                    None
+                    if monitor_lease is None
+                    else lambda: _verify_monitor_lease_directory(
+                        mutation,
+                        monitor_lease,
+                        allowed_phases=frozenset({"activating", "active", "ready"}),
+                        authority_guard=authority_guard,
+                    )
+                ),
+            )
+        except _LaunchControlAmbiguity:
+            cleanup_phase = "cleanup-not-attempted"
+        except Exception:
+            cleanup_phase = "cleanup-required"
+        data = mutation.mutable_state()
+        messages = {
+            "cleanup-not-attempted": "OCI-root launch failed; control ambiguity prevented cleanup",
+            "cleanup-required": "OCI-root launch failed and cleanup is required",
+            "failed": "OCI-root launch failed",
+        }
+        data["error"] = messages[cleanup_phase]
+        failure_receipt = _post_ready_launch_failure_receipt(launch_failure, ready_lifecycle)
+        if failure_receipt is not None:
+            data["oci_root_launch_failure"] = failure_receipt
+        handoff = data.get("oci_root_handoff")
+        if not isinstance(handoff, dict):
+            raise StateError("OCI-root launch ledger changed before failure publication")
+        handoff["phase"] = cleanup_phase
+        mutation.write_state("failed", data)
+        return cleanup_phase
+
+
+def _record_launch_cleanup_required(
+    roots: StatePaths,
+    name: str,
+    resolved: ResolvedOCIRootDomainPlan,
+    domain_uuid: str,
+    domain_id: int | None,
+    libvirt_uri: str,
+    boot_attempt_id: str,
+    ledger_phase: str,
+    ready_lifecycle: OCILifecycleHandoffReceipt | None,
+    *,
+    launch_failure: BaseException,
+    journal_authority_lost: bool = False,
+    accepted_stop_failure: bool = False,
+) -> None:
+    with locked_existing_run(roots, name) as mutation:
+        ledger_domain_id = None if ledger_phase == "activating" else domain_id
+        _require_expected_handoff(
+            mutation.snapshot.state,
+            resolved,
+            domain_uuid,
+            ledger_domain_id,
+            libvirt_uri,
+            boot_attempt_id,
+            ledger_phase,
+            ready_lifecycle,
+        )
+        data = mutation.mutable_state()
+        data["error"] = (
+            "OCI-root monitor journal authority lost; cleanup is required"
+            if journal_authority_lost
+            else "OCI-root admitted guest STOP did not complete; cleanup is required"
+            if accepted_stop_failure
+            else "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
+        )
+        failure_receipt = _post_ready_launch_failure_receipt(launch_failure, ready_lifecycle)
+        if failure_receipt is not None:
+            data["oci_root_launch_failure"] = failure_receipt
+        handoff = data.get("oci_root_handoff")
+        if not isinstance(handoff, dict):
+            raise StateError("OCI-root launch ledger changed before failure publication")
+        handoff["phase"] = "cleanup-required"
+        mutation.write_state("failed", data)
+
+
+def _exact_launch_instance(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str,
+    expected_domain_id: int,
+    expected_projection_digest: str,
+    *,
+    active: bool,
+) -> Any:
+    try:
+        domain = _exact_domain(conn, resolved, expected_uuid)
+        inactive_flag = getattr(kvm._libvirt(), "VIR_DOMAIN_XML_INACTIVE", None)
+        if type(inactive_flag) is not int:
+            raise StateError("libvirt inactive XML inspection support is unavailable")
+        actual_xml = domain.XMLDesc(inactive_flag)
+        if _projection_digest(_domain_projection(actual_xml)) != expected_projection_digest:
+            raise StateError("OCI-root persistent domain XML changed")
+        actual_root = ET.fromstring(actual_xml)
+        xml_uuids = actual_root.findall("./uuid")
+        if xml_uuids and xml_uuids[0].text != expected_uuid:
+            raise StateError("OCI-root persistent XML UUID changed")
+        actual_active = domain.isActive()
+        actual_domain_id = _domain_id(domain)
+    except Exception as exc:
+        raise _LaunchControlAmbiguity("OCI-root boot instance identity is ambiguous") from exc
+    expected_active = 1 if active else 0
+    expected_id = expected_domain_id if active else -1
+    if actual_active != expected_active or actual_domain_id != expected_id:
+        raise _LaunchControlAmbiguity("OCI-root boot instance changed before cleanup")
+    return domain
+
+
+def _cleanup_exact_launch_domain(
+    conn: Any,
+    resolved: ResolvedOCIRootDomainPlan,
+    expected_uuid: str,
+    expected_domain_id: int | None,
+    expected_projection_digest: str,
+    *,
+    before_mutation: Callable[[], None] | None = None,
+) -> None:
+    try:
+        domain = _exact_domain(conn, resolved, expected_uuid)
+        active = domain.isActive()
+    except Exception as exc:
+        raise _LaunchControlAmbiguity("OCI-root domain activity is ambiguous during launch cleanup") from exc
+    if active not in {0, 1}:
+        raise _LaunchControlAmbiguity("OCI-root domain activity is ambiguous during launch cleanup")
+    if active == 1:
+        if expected_domain_id is None:
+            raise _LaunchControlAmbiguity("OCI-root active boot instance ID was not captured")
+        domain = _exact_launch_instance(
+            conn,
+            resolved,
+            expected_uuid,
+            expected_domain_id,
+            expected_projection_digest,
+            active=True,
+        )
+        if before_mutation is not None:
+            before_mutation()
+        try:
+            domain.destroy()
+        except Exception as exc:
+            raise StateError("OCI-root active domain cleanup failed") from exc
+    domain = _exact_launch_instance(
+        conn,
+        resolved,
+        expected_uuid,
+        0 if expected_domain_id is None else expected_domain_id,
+        expected_projection_digest,
+        active=False,
+    )
+    if before_mutation is not None:
+        before_mutation()
+    try:
+        domain.undefine()
+    except Exception as exc:
+        raise StateError("OCI-root domain definition cleanup failed") from exc
+    if _lookup(conn, resolved.plan.run_name) is not None or _lookup_uuid(conn, expected_uuid) is not None:
+        raise StateError("OCI-root domain remains after launch cleanup")
+
+
+def _close_unowned_stream(stream: Any) -> None:
+    """Abort a stream and invoke an optional binding-specific free extension."""
+
+    for operation in ("abort", "free"):
+        try:
+            candidate = getattr(stream, operation, None)
+            if callable(candidate):
+                candidate()
+        except Exception:
+            pass
+
+
+def _valid_lifecycle_stream_surface(stream: Any) -> bool:
+    try:
+        required = tuple(
+            getattr(stream, operation, None)
+            for operation in ("send", "recv", "abort", "eventAddCallback", "eventUpdateCallback", "eventRemoveCallback")
+        )
+        optional_free = getattr(stream, "free", None)
+    except Exception:
+        return False
+    return all(callable(operation) for operation in required) and (optional_free is None or callable(optional_free))
+
+
+def _verify_monitor_lease_directory(
+    mutation: Any,
+    lease: _PreactivationJournalLease,
+    binding: MonitorPreActivationBinding | None = None,
+    *,
+    activating: bool = False,
+    allowed_phases: frozenset[str] = frozenset({"committed", "activating", "active", "ready"}),
+    authority_guard: Callable[[], None] | None = None,
+) -> None:
+    """Bind held journal authority to the pinned run's actual private directory."""
+
+    if authority_guard is not None:
+        authority_guard()
+    mutation.verify_binding()
+    try:
+        directory_fd = os.open("monitor-private", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=mutation._run_fd)
+    except OSError:
+        raise StateError("OCI-root monitor journal directory is unavailable") from None
+    try:
+        if binding is None:
+            lease.validate_directory_binding(directory_fd)
+        else:
+            lease.validate_launch_binding(binding, directory_fd=directory_fd, activating=activating)
+        if lease.snapshot.phase not in allowed_phases:
+            raise StateError("OCI-root monitor journal phase does not authorize launch")
+        opened = os.fstat(directory_fd)
+        current = os.stat("monitor-private", dir_fd=mutation._run_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise StateError("OCI-root monitor journal directory changed")
+        mutation.verify_binding()
+        if authority_guard is not None:
+            authority_guard()
+    except (OSError, PalimpsestError):
+        raise StateError("OCI-root monitor journal authority is invalid") from None
+    finally:
+        os.close(directory_fd)
+
+
+def launch_defined_oci_root_domain(
+    roots: StatePaths,
+    name: str,
+    store: OCIStore,
+    boot_artifacts: VerifiedHostBootArtifacts,
+    profile: DomainProfile,
+    *,
+    conn: Any,
+    runner: CommandRunner = _default_runner,
+    timeout_seconds: float = DEFAULT_HANDOFF_TIMEOUT_SECONDS,
+    terminal_timeout_seconds: float | None = None,
+    monitor_binding: MonitorPreActivationBinding | None = None,
+    monitor_lease: _PreactivationJournalLease | None = None,
+    authority_guard: Callable[[], None] | None = None,
+    stop_control: MonitorStopControl | None = None,
+    exec_control: MonitorExecControl | None = None,
+) -> CompletedOCIRootHandoff:
+    """Privately launch an exact defined domain and synchronously observe exit.
+
+    This function remains disconnected from public runtime dispatch.  It does
+    not implement public detached operation, reconnect, exec, or log delivery.
+    A bound monitor can request one authenticated guest STOP through its worker.
+    """
+
+    if monitor_lease is not None and (type(monitor_lease) is not _PreactivationJournalLease or monitor_binding is None):
+        raise StateError("OCI-root monitor launch requires an exact bound journal lease")
+    if authority_guard is not None and (not callable(authority_guard) or monitor_lease is None):
+        raise StateError("OCI-root launch authority guard requires a bound monitor lease")
+    if stop_control is not None and (
+        type(stop_control) is not MonitorStopControl or monitor_lease is None or authority_guard is None
+    ):
+        raise StateError("OCI-root STOP control requires an exact guarded monitor lease")
+    if exec_control is not None and (type(exec_control) is not MonitorExecControl or stop_control is None):
+        raise StateError("OCI-root EXEC control requires an exact guarded monitor lease")
+
+    def verify_monitor_lease(mutation: Any, lease: _PreactivationJournalLease, *args: Any, **kwargs: Any) -> None:
+        _verify_monitor_lease_directory(mutation, lease, *args, authority_guard=authority_guard, **kwargs)
+        if resolved is not None:
+            with runtime_io_guard(mutation, plan_digest=resolved.plan.digest):
+                pass
+
+    if monitor_binding is not None:
+        if type(monitor_binding) is not MonitorPreActivationBinding:
+            raise StateError("OCI-root monitor launch binding type is invalid")
+        _validate_monitor_boot_attempt(monitor_binding.boot_attempt_id)
+        try:
+            MonitorPreActivationBinding.__post_init__(monitor_binding)
+        except PalimpsestError:
+            raise StateError("OCI-root monitor launch binding is invalid") from None
+    try:
+        event_libvirt = conn.libvirt
+        event_pid = conn.pid
+        event_token = conn.token
+    except Exception:
+        raise StateError("OCI-root launch requires an explicit event-ready libvirt connection") from None
+    if (
+        event_token is not _EVENT_DRIVER_TOKEN
+        or event_libvirt is not _EVENT_DRIVER_LIBVIRT
+        or event_pid != os.getpid()
+        or event_pid != _EVENT_DRIVER_PID
+    ):
+        raise StateError("OCI-root launch requires an explicit event-ready libvirt connection")
+    with _EVENT_DRIVER_LOCK:
+        if _EVENT_DRIVER_POISONED:
+            raise StateError("libvirt default event implementation is poisoned")
+    startup_events = OCIStartupEventService(conn) if monitor_binding is not None else None
+    startup_events_stopped = startup_events is None
+
+    def startup_check() -> None:
+        if startup_events is not None:
+            startup_events.check()
+
+    started_intent = False
+    journal_activation_attempted = False
+    terminal_durable = False
+    resolved: ResolvedOCIRootDomainPlan | None = None
+    domain_uuid: str | None = None
+    domain_id: int | None = None
+    libvirt_uri = profile.uri
+    boot_attempt_id: str | None = None
+    ledger_phase = "activating"
+    stream: Any | None = None
+    stream_handed_off = False
+    ready_lifecycle: OCILifecycleHandoffReceipt | None = None
+    definition_projection_digest: str | None = None
+    try:
+        if startup_events is not None:
+            startup_events.start()
+        with locked_existing_run(roots, name) as mutation, ExitStack() as io_guards:
+            libvirt_uri = _connection_uri(conn, profile)
+            domain_uuid, definition_digest, definition_projection_digest = _definition_ledger(
+                mutation.snapshot.state, profile
+            )
+            resolved = resolve_committed_oci_root_domain_plan(
+                roots,
+                mutation.snapshot,
+                store,
+                boot_artifacts,
+                profile,
+                runner=runner,
+                expected_status="defined",
+            )
+            startup_check()
+            runtime_io = io_guards.enter_context(
+                runtime_io_guard(mutation, plan_digest=resolved.plan.digest, require_socket_absent=True)
+            )
+            if definition_digest != resolved.plan.digest:
+                raise StateError("OCI-root durable definition plan binding is invalid")
+            domain = _exact_domain(conn, resolved, domain_uuid)
+            _validate_defined_domain(
+                domain,
+                resolved,
+                domain_uuid,
+                expected_projection_digest=definition_projection_digest,
+            )
+            startup_check()
+            if monitor_binding is not None and monitor_binding != _resolved_monitor_binding(
+                mutation.snapshot,
+                resolved,
+                domain_uuid,
+                definition_projection_digest,
+                libvirt_uri,
+                monitor_binding.boot_attempt_id,
+            ):
+                raise StateError("OCI-root monitor launch binding does not match the defined run")
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease, monitor_binding)
+            libvirt = event_libvirt
+            flags = getattr(libvirt, "VIR_STREAM_NONBLOCK", None)
+            inactive_flag = getattr(libvirt, "VIR_DOMAIN_XML_INACTIVE", None)
+            if type(flags) is not int or type(inactive_flag) is not int:
+                raise StateError("required libvirt stream or inactive XML support is unavailable")
+            if not callable(getattr(conn, "newStream", None)) or any(
+                not callable(getattr(domain, operation, None))
+                for operation in ("create", "destroy", "ID", "openChannel", "undefine")
+            ):
+                raise StateError("required libvirt OCI-root lifecycle operations are unavailable")
+            lifecycle_contract = resolved.plan.to_dict().get("lifecycle_control")
+            if (
+                not isinstance(lifecycle_contract, Mapping)
+                or lifecycle_contract.get("channel_name") != OCI_CONTROL_CHANNEL_NAME
+            ):
+                raise StateError("OCI-root durable lifecycle channel contract is invalid")
+            channel_name = str(lifecycle_contract["channel_name"])
+            binding = OCIControlV2Binding(
+                resolved.plan.run_id,
+                resolved.plan.domain_core_digest,
+                str(resolved.plan.stage1_transport["artifact_digest"]),
+            )
+            lifecycle_session = (
+                HostOCIControlV2Session(binding)
+                if monitor_binding is None
+                else HostOCIControlV2Session(binding, boot_attempt_factory=lambda: monitor_binding.boot_attempt_id)
+            )
+            boot_attempt_id = lifecycle_session.boot_attempt_id
+            try:
+                stream = conn.newStream(flags)
+            except Exception:
+                raise StateError("OCI-root lifecycle stream allocation failed") from None
+            if stream is None or not _valid_lifecycle_stream_surface(stream):
+                raise StateError("OCI-root lifecycle stream surface is invalid")
+            mutation.verify_binding()
+            if monitor_binding is not None:
+                current_uri = _connection_uri(conn, profile)
+                current_uuid, current_digest, current_projection = _definition_ledger(mutation.snapshot.state, profile)
+                current_resolved = resolve_committed_oci_root_domain_plan(
+                    roots,
+                    mutation.snapshot,
+                    store,
+                    boot_artifacts,
+                    profile,
+                    runner=runner,
+                    expected_status="defined",
+                )
+                if current_digest != current_resolved.plan.digest or monitor_binding != _resolved_monitor_binding(
+                    mutation.snapshot,
+                    current_resolved,
+                    current_uuid,
+                    current_projection,
+                    current_uri,
+                    lifecycle_session.boot_attempt_id,
+                ):
+                    raise StateError("OCI-root monitor launch binding changed before activation")
+                domain = _exact_domain(conn, current_resolved, current_uuid)
+                _validate_defined_domain(
+                    domain, current_resolved, current_uuid, expected_projection_digest=current_projection
+                )
+                mutation.verify_binding()
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease)
+                journal_activation_attempted = True
+                monitor_lease.mark_activating()
+            data = mutation.mutable_state()
+            data.pop("oci_root_launch_failure", None)
+            data["oci_root_handoff"] = _handoff_ledger(
+                resolved,
+                domain_uuid,
+                None,
+                libvirt_uri,
+                boot_attempt_id,
+                "activating",
+            )
+            result = mutation.write_state("starting", data)
+            if result.get("status") != "starting":
+                raise StateError("OCI-root activation intent was not durably recorded")
+            started_intent = True
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease, monitor_binding, activating=True)
+            runtime_io.verify(require_socket_absent=True)
+            startup_check()
+            try:
+                domain.create()
+            except Exception:
+                raise StateError("OCI-root domain activation failed") from None
+            captured_domain_id = _domain_id(domain)
+            if captured_domain_id <= 0:
+                raise StateError("OCI-root domain activation did not yield an active boot instance")
+            domain_id = captured_domain_id
+            domain = _exact_domain(conn, resolved, domain_uuid)
+            _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
+            runtime_io.verify()
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"activating"}))
+                monitor_lease.promote_active(
+                    MonitorBinding(
+                        monitor_binding.record,
+                        monitor_binding.owner_uid,
+                        monitor_binding.plan_digest,
+                        monitor_binding.expected_definition_projection_digest,
+                        monitor_binding.stage1_artifact_digest,
+                        domain_uuid,
+                        domain_id,
+                        boot_attempt_id,
+                        libvirt_uri,
+                    )
+                )
+            data = mutation.mutable_state()
+            data.pop("oci_root_launch_failure", None)
+            data["oci_root_handoff"] = _handoff_ledger(
+                resolved,
+                domain_uuid,
+                domain_id,
+                libvirt_uri,
+                boot_attempt_id,
+                "starting",
+            )
+            result = mutation.write_state("starting", data)
+            if result.get("status") != "starting":
+                raise StateError("OCI-root starting intent was not durably recorded")
+            ledger_phase = "starting"
+
+        startup_check()
+
+        try:
+            if monitor_lease is not None:
+                with locked_existing_run(roots, name) as mutation:
+                    verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
+            domain = _exact_domain(conn, resolved, domain_uuid)
+            _validate_active_domain(domain, resolved, domain_uuid, domain_id, definition_projection_digest)
+            if monitor_lease is not None:
+                with locked_existing_run(roots, name) as mutation:
+                    verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
+            with locked_existing_run(roots, name) as mutation:
+                with runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io:
+                    runtime_io.verify()
+                    try:
+                        opened = domain.openChannel(channel_name, stream, 0)
+                    except Exception:
+                        raise StateError("OCI-root lifecycle channel open failed") from None
+            if opened != 0:
+                raise StateError("OCI-root lifecycle channel open result is invalid")
+        except BaseException:
+            _close_unowned_stream(stream)
+            stream = None
+            raise
+
+        startup_check()
+        if startup_events is not None:
+            startup_events.stop()
+            startup_events_stopped = True
+        event_pump = _LibvirtLifecycleEventPump(libvirt, stream)
+
+        def publish_ready(lifecycle: OCILifecycleHandoffReceipt) -> None:
+            nonlocal ledger_phase, ready_lifecycle
+            with (
+                locked_existing_run(roots, name) as mutation,
+                runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io,
+            ):
+                if monitor_lease is not None:
+                    verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
+                current_uuid, current_digest, current_projection_digest = _definition_ledger(
+                    mutation.snapshot.state, profile
+                )
+                if (
+                    current_uuid != domain_uuid
+                    or current_digest != resolved.plan.digest
+                    or current_projection_digest != definition_projection_digest
+                ):
+                    raise StateError("OCI-root durable definition changed before READY")
+                if (
+                    not isinstance(lifecycle, OCILifecycleHandoffReceipt)
+                    or lifecycle.phase != "ready"
+                    or lifecycle.terminal is not None
+                    or lifecycle.boot_attempt_id != boot_attempt_id
+                ):
+                    raise StateError("OCI-root READY boot attempt is stale")
+                _require_expected_handoff(
+                    mutation.snapshot.state,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    libvirt_uri,
+                    boot_attempt_id,
+                    "starting",
+                )
+                active_domain = _exact_domain(conn, resolved, domain_uuid)
+                _validate_active_domain(
+                    active_domain,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    definition_projection_digest,
+                )
+                if monitor_lease is not None:
+                    verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"active"}))
+                runtime_io.verify()
+                data = mutation.mutable_state()
+                data.pop("error", None)
+                data.pop("oci_root_launch_failure", None)
+                data["oci_root_handoff"] = _handoff_ledger(
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    libvirt_uri,
+                    boot_attempt_id,
+                    "ready",
+                    lifecycle,
+                )
+                result = mutation.write_state("running", data)
+                if result.get("status") != "running":
+                    raise StateError("OCI-root READY was not durably recorded")
+                ready_lifecycle = lifecycle
+                ledger_phase = "ready"
+                if monitor_lease is not None:
+                    monitor_lease.mark_ready()
+                if stop_control is not None:
+                    stop_control.mark_ready()
+                if exec_control is not None:
+                    exec_control.mark_ready()
+
+        def before_stop_send() -> None:
+            # This callback runs only on the lifecycle worker, immediately
+            # before every write attempt (including partial/EAGAIN retries).
+            with locked_existing_run(roots, name) as mutation:
+                if monitor_lease is None or ready_lifecycle is None:
+                    raise StateError("OCI-root STOP requires a durable monitor READY")
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+                if _connection_uri(conn, profile) != libvirt_uri:
+                    raise StateError("OCI-root connection URI changed before STOP")
+                current = _definition_ledger(mutation.snapshot.state, profile)
+                if current != (domain_uuid, resolved.plan.digest, definition_projection_digest):
+                    raise StateError("OCI-root durable definition changed before STOP")
+                _require_expected_handoff(
+                    mutation.snapshot.state,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    libvirt_uri,
+                    boot_attempt_id,
+                    "ready",
+                    ready_lifecycle,
+                )
+                _exact_launch_instance(
+                    conn,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    definition_projection_digest,
+                    active=True,
+                )
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+
+        stream_handed_off = True
+        handoff_failure: BaseException | None = None
+        lifecycle: OCILifecycleHandoffReceipt | None = None
+        try:
+            lifecycle = complete_initial_lifecycle_handoff(
+                stream,
+                binding,
+                on_ready=publish_ready,
+                timeout_seconds=timeout_seconds,
+                terminal_timeout_seconds=terminal_timeout_seconds,
+                session=lifecycle_session,
+                wait=event_pump.wait_readable,
+                wait_writable=event_pump.wait_writable,
+                before_stream_close=event_pump.close,
+                **({"exec_control": exec_control} if exec_control is not None else {}),
+                **(
+                    {"stop_control": stop_control, "before_stop_send": before_stop_send}
+                    if stop_control is not None
+                    else {}
+                ),
+            )
+        except BaseException as exc:
+            handoff_failure = exc
+        if not isinstance(handoff_failure, OCILifecycleStreamCallbackCleanupError):
+            try:
+                event_pump.close()
+            except BaseException:
+                handoff_failure = OCILifecycleStreamCallbackCleanupError(
+                    "OCI-root lifecycle stream event cleanup failed; stream retained",
+                    category=OCILifecycleFailureCategory.CLEANUP,
+                )
+        if isinstance(handoff_failure, OCILifecycleStreamCallbackCleanupError):
+            with _EVENT_DRIVER_LOCK:
+                _EVENT_STREAM_QUARANTINE.append((event_pump, stream))
+        stream = None
+        if handoff_failure is not None:
+            raise handoff_failure
+        terminal = lifecycle.terminal if isinstance(lifecycle, OCILifecycleHandoffReceipt) else None
+        if terminal is None or lifecycle.phase != "terminal" or lifecycle.boot_attempt_id != boot_attempt_id:
+            raise StateError("OCI-root lifecycle terminal result is missing")
+
+        with (
+            locked_existing_run(roots, name) as mutation,
+            runtime_io_guard(mutation, plan_digest=resolved.plan.digest) as runtime_io,
+        ):
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+            runtime_io.verify()
+            current_uuid, current_digest, current_projection_digest = _definition_ledger(
+                mutation.snapshot.state, profile
+            )
+            if (
+                current_uuid != domain_uuid
+                or current_digest != resolved.plan.digest
+                or current_projection_digest != definition_projection_digest
+            ):
+                raise StateError("OCI-root durable definition changed before TERMINAL")
+            if ready_lifecycle is None:
+                raise StateError("OCI-root durable READY receipt is missing")
+            _require_expected_handoff(
+                mutation.snapshot.state,
+                resolved,
+                domain_uuid,
+                domain_id,
+                libvirt_uri,
+                boot_attempt_id,
+                "ready",
+                ready_lifecycle,
+            )
+            if (
+                lifecycle.boot_generation != ready_lifecycle.boot_generation
+                or lifecycle.key_id != ready_lifecycle.key_id
+            ):
+                raise StateError("OCI-root TERMINAL lifecycle identity changed")
+            domain = _exact_domain(conn, resolved, domain_uuid)
+            try:
+                active = domain.isActive()
+            except Exception as exc:
+                raise StateError("OCI-root domain activity is ambiguous at TERMINAL") from exc
+            if active not in {0, 1}:
+                raise StateError("OCI-root domain activity is ambiguous at TERMINAL")
+            if active == 1:
+                domain = _exact_launch_instance(
+                    conn,
+                    resolved,
+                    domain_uuid,
+                    domain_id,
+                    definition_projection_digest,
+                    active=True,
+                )
+                if monitor_lease is not None:
+                    verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+                runtime_io.verify()
+                try:
+                    domain.destroy()
+                except Exception:
+                    raise StateError("OCI-root domain could not be stopped after TERMINAL") from None
+            _exact_launch_instance(
+                conn,
+                resolved,
+                domain_uuid,
+                domain_id,
+                definition_projection_digest,
+                active=False,
+            )
+            if monitor_lease is not None:
+                verify_monitor_lease(mutation, monitor_lease, allowed_phases=frozenset({"ready"}))
+            runtime_io.verify()
+            data = mutation.mutable_state()
+            data.pop("error", None)
+            data.pop("oci_root_launch_failure", None)
+            data["oci_root_handoff"] = _handoff_ledger(
+                resolved,
+                domain_uuid,
+                domain_id,
+                libvirt_uri,
+                boot_attempt_id,
+                "terminal",
+                lifecycle,
+            )
+            result = mutation.write_state("exited", data)
+            if result.get("status") != "exited":
+                raise StateError("OCI-root TERMINAL was not durably recorded")
+            terminal_durable = True
+            if monitor_lease is not None:
+                monitor_lease.mark_terminal()
+            if stop_control is not None:
+                stop_control.mark_terminal()
+        return CompletedOCIRootHandoff(
+            resolved.plan.run_id,
+            resolved.plan.run_name,
+            resolved.plan.digest,
+            domain_uuid,
+            domain_id,
+            libvirt_uri,
+            terminal,
+            lifecycle,
+        )
+    except BaseException as launch_failure:
+        effective_failure = launch_failure
+        if startup_events is not None and not startup_events_stopped:
+            try:
+                startup_events.stop()
+                startup_events_stopped = True
+            except BaseException as stop_failure:
+                effective_failure = stop_failure
+        if stop_control is not None:
+            stop_control.mark_control_lost()
+        if stream is not None and not stream_handed_off:
+            _close_unowned_stream(stream)
+        if terminal_durable:
+            if monitor_lease is not None:
+                try:
+                    monitor_lease.mark_control_lost()
+                except BaseException:
+                    pass
+            raise
+        if (
+            started_intent
+            and resolved is not None
+            and domain_uuid is not None
+            and boot_attempt_id is not None
+            and definition_projection_digest is not None
+        ):
+            try:
+                journal_authority_valid = True
+                if monitor_lease is not None:
+                    try:
+                        with locked_existing_run(roots, name) as mutation:
+                            verify_monitor_lease(
+                                mutation, monitor_lease, allowed_phases=frozenset({"activating", "active", "ready"})
+                            )
+                    except BaseException:
+                        journal_authority_valid = False
+                if (
+                    not journal_authority_valid
+                    or isinstance(effective_failure, OCIStartupEventServiceError)
+                    or isinstance(effective_failure, OCILifecycleStreamCallbackCleanupError)
+                    or (stop_control is not None and stop_control.accepted)
+                ):
+                    _record_launch_cleanup_required(
+                        roots,
+                        name,
+                        resolved,
+                        domain_uuid,
+                        domain_id,
+                        libvirt_uri,
+                        boot_attempt_id,
+                        ledger_phase,
+                        ready_lifecycle,
+                        launch_failure=launch_failure,
+                        journal_authority_lost=not journal_authority_valid,
+                        accepted_stop_failure=(
+                            stop_control is not None
+                            and stop_control.accepted
+                            and not isinstance(launch_failure, OCILifecycleStreamCallbackCleanupError)
+                        ),
+                    )
+                    cleanup_phase = "cleanup-required"
+                else:
+                    cleanup_phase = _handle_launch_failure(
+                        roots,
+                        name,
+                        conn,
+                        resolved,
+                        domain_uuid,
+                        domain_id,
+                        libvirt_uri,
+                        boot_attempt_id,
+                        ledger_phase,
+                        ready_lifecycle,
+                        definition_projection_digest,
+                        launch_failure=launch_failure,
+                        monitor_lease=monitor_lease,
+                        authority_guard=authority_guard,
+                    )
+            except Exception:
+                raise StateError("OCI-root launch state changed; cleanup was not attempted") from None
+            finally:
+                if monitor_lease is not None and journal_activation_attempted:
+                    try:
+                        monitor_lease.mark_control_lost()
+                    except BaseException:
+                        pass
+            if cleanup_phase == "cleanup-not-attempted":
+                raise StateError("OCI-root launch control is ambiguous; cleanup was not attempted") from None
+            if cleanup_phase == "cleanup-required":
+                raise StateError("OCI-root launch cleanup failed; cleanup is required") from None
+            raise StateError("OCI-root launch failed") from None
+        if monitor_lease is not None and journal_activation_attempted:
+            try:
+                monitor_lease.mark_control_lost()
+            except BaseException:
+                pass
+        raise
+
+
+__all__ = [
+    "OCI_ROOT_DEFINITION_SCHEMA",
+    "OCI_ROOT_LAUNCH_FAILURE_SCHEMA",
+    "CompletedOCIRootHandoff",
+    "DefinedOCIRootDomain",
+    "connect_oci_root_libvirt",
+    "close_oci_root_libvirt",
+    "define_committed_oci_root_domain",
+    "launch_defined_oci_root_domain",
+    "prepare_oci_root_monitor_binding",
+]

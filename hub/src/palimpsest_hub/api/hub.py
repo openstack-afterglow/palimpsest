@@ -52,7 +52,9 @@ from palimpsest_hub.services.hub_bundle import (
 from palimpsest_hub.services.hub_store import (
     DISK_FORMAT_MEDIA_TYPES,
     IMAGE_FORMAT_SPECS,
+    KIND_BUILDKIT_CACHE,
     KIND_CLOUD_IMAGE,
+    MEDIA_TYPE_BUILDKIT_CACHE,
     MEDIA_TYPE_LAYER_SQUASHFS,
     HubDigestMismatch,
     HubStoreError,
@@ -86,6 +88,11 @@ _MAX_REFS = 32
 _MAX_BUNDLE_UPLOAD_BYTES = 64 * 1024 * 1024 * 1024  # 64 GiB
 _EXPORT_TOKEN_TTL_SECONDS = 60
 _EXPORT_TOKEN_PREFIX = "afterglow:export-dl-token:"
+_SUPPORTED_UPLOAD_MEDIA_TYPES = {
+    MEDIA_TYPE_LAYER_SQUASHFS,
+    MEDIA_TYPE_BUILDKIT_CACHE,
+    *DISK_FORMAT_MEDIA_TYPES.values(),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +131,9 @@ class HubLayerMeta(BaseModel):
     chain_id: str | None = None
     is_published: bool = False
     base_image_digest: str | None = None
+    media_type: str | None = None
     disk_format: str | None = None  # qcow2 | raw
-    arch: str = "x86_64"
+    arch: str | None = None
     os_variant: str | None = None
 
     @field_validator("disk_format")
@@ -135,10 +143,17 @@ class HubLayerMeta(BaseModel):
             raise ValueError(f"disk_format 은 {sorted(DISK_FORMAT_MEDIA_TYPES)} 중 하나여야 합니다")
         return value
 
+    @field_validator("media_type")
+    @classmethod
+    def _check_media_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in _SUPPORTED_UPLOAD_MEDIA_TYPES:
+            raise ValueError("지원하지 않는 media_type 입니다")
+        return value
+
     @field_validator("arch")
     @classmethod
-    def _check_arch(cls, value: str) -> str:
-        if value not in {"x86_64", "aarch64"}:
+    def _check_arch(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"x86_64", "aarch64"}:
             raise ValueError("arch 는 x86_64 또는 aarch64 여야 합니다")
         return value
 
@@ -154,17 +169,39 @@ class HubLayerMeta(BaseModel):
         if self.kind == KIND_CLOUD_IMAGE:
             if not self.disk_format:
                 raise ValueError("cloud-image 는 disk_format(qcow2|raw)이 필요합니다")
+            if self.arch is None:
+                raise ValueError("cloud-image 는 arch(x86_64|aarch64)가 필요합니다")
             if self.parent_digest or self.chain_id:
                 raise ValueError("cloud-image 는 부모 레이어를 가질 수 없습니다 — 스택의 출발점입니다")
             if self.base_image_digest:
                 raise ValueError("cloud-image 자신이 베이스입니다 — base_image_digest 를 가질 수 없습니다")
+            expected_media_type = DISK_FORMAT_MEDIA_TYPES[self.disk_format]
+            if self.media_type is not None and self.media_type != expected_media_type:
+                raise ValueError("cloud-image media_type 이 disk_format 과 일치하지 않습니다")
+        elif self.kind == KIND_BUILDKIT_CACHE:
+            if self.disk_format:
+                raise ValueError("disk_format 은 kind='cloud-image' 에서만 사용합니다")
+            if self.chain_id is None:
+                raise ValueError("buildkit-cache 는 build key를 chain_id 로 선언해야 합니다")
+            if self.parent_digest or self.base_image_digest:
+                raise ValueError("buildkit-cache 는 runtime parent/base 체인을 가질 수 없습니다")
+            if self.media_type is not None and self.media_type != MEDIA_TYPE_BUILDKIT_CACHE:
+                raise ValueError("buildkit-cache 는 BuildKit cache media_type 을 사용해야 합니다")
+            if self.arch is not None:
+                raise ValueError("buildkit-cache 는 runtime architecture를 가질 수 없습니다")
         elif self.disk_format:
             raise ValueError("disk_format 은 kind='cloud-image' 에서만 사용합니다")
+        elif self.media_type is not None and self.media_type != MEDIA_TYPE_LAYER_SQUASHFS:
+            raise ValueError("일반 레이어는 SquashFS media_type 을 사용해야 합니다")
         return self
 
     def resolved_media_type(self) -> str:
+        if self.media_type is not None:
+            return self.media_type
         if self.kind == KIND_CLOUD_IMAGE and self.disk_format:
             return DISK_FORMAT_MEDIA_TYPES[self.disk_format]
+        if self.kind == KIND_BUILDKIT_CACHE:
+            return MEDIA_TYPE_BUILDKIT_CACHE
         return MEDIA_TYPE_LAYER_SQUASHFS
 
     @field_validator("name")
@@ -258,6 +295,7 @@ class HubLayerResponse(BaseModel):
     config_digest: str
     chain_id: str | None = None
     parent_digest: str | None = None
+    base_image_digest: str | None = None
     name: str
     kind: str
     ubuntu_base: str | None = None
@@ -276,6 +314,7 @@ class HubUploadStartResponse(BaseModel):
     blob_digest: str | None = None
     already_present: bool = False
     registered: bool = False
+    registration: HubLayerResponse | None = None
 
 
 class HubUploadStatusResponse(BaseModel):
@@ -390,6 +429,9 @@ async def _grant_layer_access(session, digest: str, token_info: dict) -> None:
 
 
 def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
+    config = dict(row.config_json or {})
+    raw_base_image_digest = config.get("base_image_digest")
+    base_image_digest = normalize_digest(raw_base_image_digest) if isinstance(raw_base_image_digest, str) else None
     return {
         "blob_digest": row.blob_digest,
         "blob_md5": row.blob_md5,
@@ -401,11 +443,12 @@ def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
         "config_digest": row.config_digest,
         "chain_id": row.chain_id,
         "parent_digest": row.parent_digest,
+        "base_image_digest": base_image_digest,
         "name": row.name,
         "kind": row.kind,
         "ubuntu_base": row.ubuntu_base,
         "python_version": row.python_version,
-        "config_json": row.config_json,
+        "config_json": config,
         "project_id": row.project_id,
         "is_published": row.is_published,
         "created_by": row.created_by,
@@ -413,11 +456,47 @@ def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
     }
 
 
+def _registration_conflicts(row: PalimpsestHubLayer, meta: HubLayerMeta) -> list[str]:
+    """Return descriptor fields that cannot be silently aliased to existing bytes."""
+    config = dict(row.config_json or {})
+    raw_base = config.get("base_image_digest")
+    actual_base = normalize_digest(raw_base) if isinstance(raw_base, str) else None
+    expected = {
+        "name": meta.name,
+        "kind": meta.kind,
+        "media_type": meta.resolved_media_type(),
+        "disk_format": meta.disk_format,
+        "arch": meta.arch,
+        "os_variant": meta.os_variant,
+        "chain_id": meta.chain_id,
+        "parent_digest": meta.parent_digest,
+        "base_image_digest": meta.base_image_digest,
+        "ubuntu_base": meta.ubuntu_base,
+        "python_version": meta.python_version,
+    }
+    actual = {
+        "name": row.name,
+        "kind": row.kind,
+        "media_type": row.media_type,
+        "disk_format": row.disk_format,
+        "arch": row.arch,
+        "os_variant": row.os_variant,
+        "chain_id": row.chain_id,
+        "parent_digest": row.parent_digest,
+        "base_image_digest": actual_base,
+        "ubuntu_base": row.ubuntu_base,
+        "python_version": row.python_version,
+    }
+    return sorted(field for field, value in expected.items() if actual[field] != value)
+
+
 def _hub_blob_filename(row: PalimpsestHubLayer) -> str:
     stem = row.name if row.name and _NAME_RE.fullmatch(row.name) else row.blob_digest[len("sha256:") :][:12]
     if row.kind == KIND_CLOUD_IMAGE and row.disk_format in IMAGE_FORMAT_SPECS:
         ext = IMAGE_FORMAT_SPECS[row.disk_format].extension
         return f"{stem}.{ext}"
+    if row.kind == KIND_BUILDKIT_CACHE:
+        return f"{stem}.tar"
     return f"{stem}.sqsh"
 
 
@@ -835,6 +914,7 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(ge
                 "blob_digest": req.digest,
                 "already_present": True,
                 "registered": True,
+                "registration": _layer_dict(existing),
             }
 
     session_id = uuid.uuid4().hex
@@ -998,7 +1078,9 @@ async def finalize_upload(
                     size_bytes=finalized.size_bytes,
                     media_type=meta.resolved_media_type(),
                     disk_format=meta.disk_format,
-                    arch=meta.arch if meta.kind == KIND_CLOUD_IMAGE else None,
+                    # Generic/legacy SquashFS descriptors remain architecture-neutral.
+                    # Cloud images and runtime packs send an explicit architecture.
+                    arch=meta.arch,
                     os_variant=meta.os_variant,
                     config_digest=compute_config_digest(config),
                     chain_id=meta.chain_id,
@@ -1014,6 +1096,19 @@ async def finalize_upload(
                 )
             )
         else:
+            conflicts = _registration_conflicts(existing, meta)
+            if conflicts:
+                upload = await session.get(PalimpsestHubUpload, session_id)
+                if upload is not None:
+                    await session.delete(upload)
+                await session.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"blob {finalized.blob_digest} is already registered with incompatible descriptor fields: "
+                        + ", ".join(conflicts)
+                    ),
+                )
             await _grant_layer_access(session, finalized.blob_digest, token_info)
             if meta.is_published:
                 existing.is_published = True

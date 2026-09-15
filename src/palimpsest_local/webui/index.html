@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Palimpsest Local Manager</title>
+  <!-- Authenticated asset bootstrap -->
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-brand">
+        <h1>Palimpsest Local Manager</h1>
+        <span class="version-tag">v0.1.0</span>
+      </div>
+      <div id="summary-banner" class="summary-banner">
+        <div class="stat-pill"><span class="label">Host:</span> <span id="host-info">Loading...</span></div>
+        <div class="stat-pill"><span class="label">Backends:</span> <span id="backends-info">Loading...</span></div>
+        <div class="stat-pill"><span class="label">Storage:</span> <span id="storage-info">Loading...</span></div>
+      </div>
+    </header>
+
+    <div id="global-error" class="alert alert-danger hidden" role="alert"></div>
+
+    <nav class="nav-tabs" role="tablist" aria-label="Dashboard views">
+      <button class="tab-button active" role="tab" id="tab-vms" aria-selected="true" aria-controls="panel-vms" data-tab="vms">Virtual Machines</button>
+      <button class="tab-button" role="tab" id="tab-artifacts" aria-selected="false" aria-controls="panel-artifacts" data-tab="artifacts">Artifacts</button>
+      <button class="tab-button" role="tab" id="tab-builds" aria-selected="false" aria-controls="panel-builds" data-tab="builds">Builds</button>
+      <button class="tab-button" role="tab" id="tab-storage" aria-selected="false" aria-controls="panel-storage" data-tab="storage">Storage</button>
+    </nav>
+
+    <main class="tab-content">
+      <!-- VMs Tab -->
+      <section id="panel-vms" class="tab-panel active" role="tabpanel" aria-labelledby="tab-vms">
+        <div class="panel-header">
+          <h2>Virtual Machines</h2>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-vms">Refresh</button>
+        </div>
+        <div id="vms-warnings" class="warnings-container"></div>
+        <div class="table-responsive">
+          <table class="data-table" id="table-vms">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Backend</th>
+                <th>Status</th>
+                <th>Base Digest</th>
+                <th>Layers</th>
+                <th>Spec</th>
+                <th>SSH Endpoint</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="vms-tbody">
+              <tr><td colspan="9" class="loading-cell">Loading virtual machines...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Artifacts Tab -->
+      <section id="panel-artifacts" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-artifacts">
+        <div class="panel-header">
+          <h2>Artifact Store</h2>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-artifacts">Refresh</button>
+        </div>
+
+        <details class="card form-card">
+          <summary class="form-card-title">Import Cloud Image...</summary>
+          <form id="form-import" class="inline-form">
+            <div class="form-group">
+              <label for="import-path">File Path:</label>
+              <input type="text" id="import-path" required placeholder="/path/to/image.qcow2">
+            </div>
+            <div class="form-group">
+              <label for="import-format">Disk Format:</label>
+              <select id="import-format" required>
+                <option value="qcow2">qcow2</option>
+                <option value="raw">raw</option>
+                <option value="vmdk">vmdk</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="import-arch">Arch:</label>
+              <select id="import-arch" required>
+                <option value="x86_64">x86_64</option>
+                <option value="aarch64">aarch64</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="import-variant">OS Variant:</label>
+              <input type="text" id="import-variant" placeholder="ubuntu-24.04">
+            </div>
+            <button type="submit" class="btn btn-primary">Import Image</button>
+          </form>
+          <div id="import-feedback" class="feedback-msg hidden"></div>
+        </details>
+
+        <div id="artifacts-feedback" class="feedback-msg hidden"></div>
+
+        <div class="section-title">
+          <h3>Cloud Images</h3>
+        </div>
+        <div class="table-responsive">
+          <table class="data-table" id="table-images">
+            <thead>
+              <tr>
+                <th>Digest</th>
+                <th>Name / Tags</th>
+                <th>Arch</th>
+                <th>Format</th>
+                <th>Size</th>
+                <th>References</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="images-tbody">
+              <tr><td colspan="8" class="loading-cell">Loading images...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title">
+          <h3>Layers</h3>
+        </div>
+        <div class="table-responsive">
+          <table class="data-table" id="table-layers">
+            <thead>
+              <tr>
+                <th>Digest</th>
+                <th>Media Type / Parent</th>
+                <th>Size</th>
+                <th>References</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="layers-tbody">
+              <tr><td colspan="6" class="loading-cell">Loading layers...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Builds Tab -->
+      <section id="panel-builds" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-builds">
+        <div class="panel-header">
+          <h2>Build History</h2>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-builds">Refresh</button>
+        </div>
+        <div class="table-responsive">
+          <table class="data-table" id="table-builds">
+            <thead>
+              <tr>
+                <th>Build ID</th>
+                <th>Engine</th>
+                <th>Status</th>
+                <th>Tags</th>
+                <th>Duration</th>
+                <th>Started</th>
+                <th>Base Digest</th>
+                <th>Cache</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody id="builds-tbody">
+              <tr><td colspan="9" class="loading-cell">Loading builds...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Storage Tab -->
+      <section id="panel-storage" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-storage">
+        <div class="panel-header">
+          <h2>Storage Configuration</h2>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-storage">Refresh</button>
+        </div>
+
+        <div class="notice-box">
+          <strong>Notice:</strong> Lima VM disks live in Lima's state directory (<code>~/.lima</code>) and are not relocated by Palimpsest storage moves.
+        </div>
+
+        <div class="grid-2col">
+          <div class="card">
+            <h3>State Root Info</h3>
+            <dl class="info-list">
+              <dt>Current Root:</dt>
+              <dd id="storage-root-path">Loading...</dd>
+              <dt>Config Source:</dt>
+              <dd id="storage-root-source">Loading...</dd>
+              <dt>Total Usage:</dt>
+              <dd id="storage-total-bytes">Loading...</dd>
+              <dt>Available Disk Space:</dt>
+              <dd id="storage-free-bytes">Loading...</dd>
+            </dl>
+          </div>
+
+          <div class="card">
+            <h3>Directory Breakdown</h3>
+            <ul id="storage-breakdown" class="breakdown-list">
+              <li>Loading breakdown...</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="grid-2col margin-top">
+          <div class="card">
+            <h3>Move State Root</h3>
+            <form id="form-move-storage">
+              <div class="form-group">
+                <label for="move-dest">New Destination Path:</label>
+                <input type="text" id="move-dest" required placeholder="/new/path/to/palimpsest">
+              </div>
+              <div class="form-group checkbox-group">
+                <label>
+                  <input type="checkbox" id="move-keep-source">
+                  Keep source directory (do not remove old files)
+                </label>
+              </div>
+              <button type="submit" class="btn btn-primary">Move Storage Root</button>
+            </form>
+            <div id="move-feedback" class="feedback-msg hidden"></div>
+          </div>
+
+          <div class="card">
+            <h3>Point-To (Set) State Root</h3>
+            <form id="form-set-storage">
+              <div class="form-group">
+                <label for="set-dest">Existing Storage Path:</label>
+                <input type="text" id="set-dest" required placeholder="/path/to/existing/palimpsest">
+              </div>
+              <button type="submit" class="btn btn-secondary">Set Storage Root</button>
+            </form>
+            <div id="set-feedback" class="feedback-msg hidden"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Console Log Drawer -->
+    <div id="log-drawer" class="drawer hidden" role="dialog" aria-labelledby="drawer-title" aria-modal="true">
+      <div class="drawer-header">
+        <h3 id="drawer-title">Console Logs</h3>
+        <div class="drawer-controls">
+          <label for="log-tail-select">Tail lines:</label>
+          <select id="log-tail-select">
+            <option value="100">100</option>
+            <option value="400" selected>400</option>
+            <option value="1000">1000</option>
+          </select>
+          <button class="btn btn-secondary btn-sm" id="btn-refresh-log">Refresh</button>
+          <button class="btn-close" id="btn-close-drawer" aria-label="Close logs">&times;</button>
+        </div>
+      </div>
+      <div class="drawer-body">
+        <pre id="log-content" class="log-viewer">Select a VM or Build to view logs.</pre>
+      </div>
+    </div>
+    <div id="drawer-overlay" class="drawer-overlay hidden"></div>
+  </div>
+
+  <script>
+    (function() {
+      const urlParams = new URLSearchParams(window.location.search);
+      let token = urlParams.get('token');
+      if (token) {
+        sessionStorage.setItem('palimpsest_token', token);
+        const cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+        window.history.replaceState({}, document.title, cleanUrl);
+      } else {
+        token = sessionStorage.getItem('palimpsest_token');
+      }
+
+      if (!token) {
+        document.addEventListener('DOMContentLoaded', function() {
+          const err = document.getElementById('global-error');
+          if (err) {
+            err.textContent = 'Authentication token missing. Please open the dashboard via the CLI link.';
+            err.classList.remove('hidden');
+          }
+        });
+        return;
+      }
+
+      const headers = { 'Authorization': 'Bearer ' + token };
+
+      fetch('/app.css', { headers: headers })
+        .then(res => {
+          if (!res.ok) throw new Error('CSS fetch failed (' + res.status + ')');
+          return res.text();
+        })
+        .then(css => {
+          const style = document.createElement('style');
+          style.textContent = css;
+          document.head.appendChild(style);
+        })
+        .catch(err => console.error('Failed to load CSS:', err));
+
+      fetch('/app.js', { headers: headers })
+        .then(res => {
+          if (!res.ok) throw new Error('JS fetch failed (' + res.status + ')');
+          return res.text();
+        })
+        .then(jsText => {
+          const script = document.createElement('script');
+          script.textContent = jsText;
+          document.body.appendChild(script);
+        })
+        .catch(err => {
+          console.error('Failed to load JS:', err);
+          document.addEventListener('DOMContentLoaded', function() {
+            const errDiv = document.getElementById('global-error');
+            if (errDiv) {
+              errDiv.textContent = 'Failed to load application scripts: ' + err.message;
+              errDiv.classList.remove('hidden');
+            }
+          });
+        });
+    })();
+  </script>
+</body>
+</html>

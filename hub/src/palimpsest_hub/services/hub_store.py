@@ -38,6 +38,7 @@ _logger = logging.getLogger(__name__)
 # squashfs 레이어 blob 의 mediaType. OCI image manifest 의 layers[] 에 실린다.
 MEDIA_TYPE_LAYER_SQUASHFS = "application/vnd.afterglow.palimpsest.layer.squashfs.v1"
 MEDIA_TYPE_LAYER_CONFIG = "application/vnd.afterglow.palimpsest.layer.config.v1+json"
+MEDIA_TYPE_BUILDKIT_CACHE = "application/vnd.afterglow.palimpsest.buildkit.cache.v1.tar"
 MEDIA_TYPE_IMAGE_RAW = "application/vnd.afterglow.palimpsest.image.raw.v1"
 MEDIA_TYPE_IMAGE_QCOW2 = "application/vnd.afterglow.palimpsest.image.qcow2.v1"
 MEDIA_TYPE_IMAGE_VMDK = "application/vnd.afterglow.palimpsest.image.vmdk.v1"
@@ -56,6 +57,7 @@ class ImageFormatSpec:
 
 
 # kind='cloud-image' 는 레이어와 같은 blob store·업로드 세션을 쓰되 parent/chain 이 없다.
+KIND_BUILDKIT_CACHE = "buildkit-cache"
 KIND_CLOUD_IMAGE = "cloud-image"
 IMAGE_FORMAT_SPECS = {
     "raw": ImageFormatSpec(MEDIA_TYPE_IMAGE_RAW, "raw", "raw"),

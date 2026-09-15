@@ -32,9 +32,11 @@ HUB_API_PREFIX = "/v1"
 
 MEDIA_TYPE_LAYER_SQUASHFS = "application/vnd.afterglow.palimpsest.layer.squashfs.v1"
 MEDIA_TYPE_LAYER_CONFIG = "application/vnd.afterglow.palimpsest.layer.config.v1+json"
+MEDIA_TYPE_BUILDKIT_CACHE = "application/vnd.afterglow.palimpsest.buildkit.cache.v1.tar"
 MEDIA_TYPE_IMAGE_QCOW2 = "application/vnd.afterglow.palimpsest.image.qcow2.v1"
 MEDIA_TYPE_IMAGE_RAW = "application/vnd.afterglow.palimpsest.image.raw.v1"
 
+KIND_BUILDKIT_CACHE = "buildkit-cache"
 KIND_CLOUD_IMAGE = "cloud-image"
 
 DISK_FORMAT_MEDIA_TYPES: dict[str, str] = {
@@ -46,6 +48,49 @@ _DOWNLOAD_CHUNK = 1024 * 1024
 _UPLOAD_CHUNK = 8 * 1024 * 1024
 _MAX_UPLOAD_CONFLICT_RETRIES = 3
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+
+
+def _expected_media_type(metadata: dict[str, Any]) -> str:
+    explicit = metadata.get("media_type")
+    if isinstance(explicit, str):
+        return explicit
+    if metadata.get("kind") == KIND_CLOUD_IMAGE:
+        disk_format = metadata.get("disk_format")
+        if disk_format not in DISK_FORMAT_MEDIA_TYPES:
+            raise HubError("cloud-image upload metadata requires a supported disk_format")
+        return DISK_FORMAT_MEDIA_TYPES[disk_format]
+    if metadata.get("kind") == KIND_BUILDKIT_CACHE:
+        return MEDIA_TYPE_BUILDKIT_CACHE
+    return MEDIA_TYPE_LAYER_SQUASHFS
+
+
+def _verify_existing_registration(digest: str, metadata: dict[str, Any], registration: dict[str, Any]) -> None:
+    """Refuse a zero-byte upload shortcut that would silently discard its descriptor."""
+    expected: dict[str, Any] = {
+        "blob_digest": digest,
+        "name": metadata.get("name"),
+        "kind": metadata.get("kind", "squashfs"),
+        "media_type": _expected_media_type(metadata),
+    }
+    for field in (
+        "disk_format",
+        "arch",
+        "os_variant",
+        "chain_id",
+        "parent_digest",
+        "base_image_digest",
+        "ubuntu_base",
+        "python_version",
+    ):
+        if field in metadata:
+            expected[field] = metadata[field]
+    conflicts = sorted(field for field, value in expected.items() if registration.get(field) != value)
+    if metadata.get("is_published") is True and registration.get("is_published") is not True:
+        conflicts.append("is_published")
+    if conflicts:
+        raise HubError(
+            f"blob {digest} is already registered with incompatible descriptor fields: " + ", ".join(conflicts)
+        )
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -213,13 +258,21 @@ class HubClient:
         *,
         name: str | None = None,
         kind: str | None = None,
+        chain_id: str | None = None,
         parent_digest: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200:
             raise HubError("limit must be between 1 and 200")
+        normalized_chain = normalize_digest(chain_id) if chain_id is not None else None
         normalized_parent = normalize_digest(parent_digest) if parent_digest is not None else None
-        query = {"name": name, "kind": kind, "parent_digest": normalized_parent, "limit": limit}
+        query = {
+            "name": name,
+            "kind": kind,
+            "chain_id": normalized_chain,
+            "parent_digest": normalized_parent,
+            "limit": limit,
+        }
         return self._json_request("GET", "/layers", query=query)
 
     def get_layer(self, digest: str) -> dict[str, Any]:
@@ -382,6 +435,10 @@ class HubClient:
                         f"blob {digest} exists in hub storage but is not registered as a layer; "
                         "resolve the orphaned blob before pushing again"
                     )
+                registration = started.get("registration")
+                if not isinstance(registration, dict):
+                    registration = self.get_layer(digest)
+                _verify_existing_registration(digest, metadata, registration)
                 if resume:
                     delete_transfer(digest)
                 return {"blob_digest": digest, "already_present": True, "registered": True}

@@ -1,0 +1,304 @@
+# Shortest safe path to public OCI run and Gate 2
+
+The user prioritized public foreground `run`, Docker-like `run -d`, and the
+local build-to-run Gate 2 over further isolated infrastructure slices. This
+document records the execution order and the deliberately limited public surface.
+
+**2026-09-07 checkpoint:** the user-approved protected-root v2 Gate 2 is now
+complete at `36cf897`, including actual public detached run, root-proof/exec,
+PID 1 access denial and normal cleanup. Separate public exec also passed on
+that SHA. The unchanged guest ELF passed 43-boot v20 KVM qualification at
+`ef3ffc9`. [Evidence and prior failed attempts](oci-root-build-run-acceptance.md)
+remain distinguished; historical pending statements below are superseded by
+this checkpoint. Full-root privileges, shared data volumes and public retained
+root/recovery UX are not implied by this result.
+
+**2026-09-08 continuation:** explicit public retained-root reuse is separately
+qualified at `cb48781`; saved-root inventory is qualified at `f4305f3`.
+Standalone root deletion and shared data volumes remain follow-ups. These
+do not replace the historical Gate 2 evidence.
+
+Read-only saved-root discovery is qualified at `f4305f3` via
+`oci root-volumes` and `oci root-volume UUID`. These are metadata observations,
+not disk-integrity checks or reuse/deletion authorization. The
+[inventory and deletion boundary](oci-retained-root-inventory.md) keeps
+standalone deletion behind a separate durable-intent/recovery implementation.
+
+The current user-requested check is [real Docker Hub image compatibility](oci-docker-hub-compatibility.md):
+digest-preserving acquisition into local OCI archives followed by public VM
+execution of unchanged image defaults. Direct registry-reference `run` is not
+yet implemented; external acquisition is not a Docker workload fallback.
+At `f606e32`, unchanged hello-world passed its foreground VM lifecycle;
+Redis failed in pre-VM packing and non-root NGINX failed process validation
+(`ArgsEscaped`). The separate tests expose real compatibility gaps rather
+than qualifying arbitrary Docker Hub images or detached service execution.
+
+## First public local OCI lifecycle (five-stage integration)
+
+The CLI now connects explicit host admission, typed local intake, completed-run
+removal, the native launch adapter and foreground/detached dispatch. Linux
+x86_64 KVM with `qemu:///system` is the only initial target. Public OCI operations
+are `run`, `run -d`, `ps`, `stop`, `rm`, bounded noninteractive guest `exec`,
+and read-only `oci root-proof` for the exact current running boot;
+`start`, `logs`, TTY/stdin and network attachment remain unsupported. Gate 2
+remains a separate acceptance contract; see the additional-exec
+qualification and remaining host/probe constraints below.
+
+Public exec CLI qualification passed at
+`e2bdbf155941fa22370b747cca7a0867705531f5` on pieroot-server (19.47 s); the
+existing public lifecycle regression passed both tests at that SHA (37.88 s).
+Gate 2 was separately executed and failed its Docker-socket prerequisite before
+VM launch. The image-baked PID 1 probe also returned permission denied in the
+separate public exec proof. These are recorded failures/constraints, not skips
+or Gate 2 success.
+
+Subsequent user decision: Docker may coexist on the KVM host. Gate 2 no longer
+rejects a host merely for having Docker sockets; its CLI fallback audit remains.
+The user subsequently approved replacing the original PID 1 root probe's
+direct-access criterion while retaining supervisor protection. See
+[the protected root identity contract](oci-root-proof.md). Historical failures
+below are preserved and are not revised-gate success.
+
+Host configuration requires absolute `PALIMPSEST_OCI_KERNEL`,
+`PALIMPSEST_OCI_KERNEL_CONFIG`, `PALIMPSEST_OCI_PACKER` paths and canonical
+`PALIMPSEST_OCI_KERNEL_DIGEST` / `PALIMPSEST_OCI_KERNEL_CONFIG_DIGEST` SHA-256 pins.
+Use the qualified kernel/config pair, required built-in drivers, KVM/libvirt,
+ACL tools, qemu-img, mkfs.ext4 and a supported mksquashfs (4.6+). The Python
+environment must import libvirt without `PYTHONPATH`. Digest pins identify the
+operator-qualified pair; they do not prove how a kernel was compiled.
+
+Create a new short, dedicated runtime parent whose existing ancestors already
+permit search (simple ACLs only); never change the user's home permissions:
+
+```sh
+palimpsest oci init-runtime /tmp/my-oci-runtime
+export PALIMPSEST_STATE_HOME=/tmp/my-oci-runtime/state
+palimpsest run app.oci.tar --name app -d
+palimpsest exec app -- /bin/sh -c 'printf "hello from the guest\\n"'
+palimpsest stop app
+palimpsest rm app
+```
+
+To retain and later reuse one VM-exclusive writable upper root:
+
+```sh
+palimpsest run app.oci.tar --name first -d --root-retention retain
+palimpsest stop first
+palimpsest rm first  # capture: retained root<TAB><canonical UUID>
+palimpsest run app.oci.tar --name second -d --root-retention retain --root-volume UUID
+```
+
+An explicitly retained removal reports `retained root<TAB><canonical UUID>`
+only after verified cleanup completes. A later run may request that exclusive
+OverlayFS upper root with the same lower image graph and size using `--root-retention retain
+--root-volume UUID`; private checks reject conflicting, attached or mismatched
+roots. This is not a shared writable data volume. Generic OCI `inspect` remains
+closed. The separate native public reuse proof passed at
+`cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2`; see the bounded qualification below.
+
+Set the five host variables before `run`. Existing parent paths are not adopted
+or chmodded. Local layouts require `--runtime-kind oci-root`; `.oci.tar`/`.oci`
+files select OCI automatically. `--manifest sha256:…` selects an explicit root
+descriptor. Cloud-image layout directories keep their prior meaning. OCI
+network defaults to none; explicit `--network none` is equivalent. Other OCI
+network values and process overrides are not supported in this first surface.
+
+Foreground returns the actual workload exit and combined VM-console output
+(boot plus workload, not separated guest stdout/stderr). INT/TERM requests
+authenticated STOP. Startup signals are queued outside lock/receipt mutations;
+before activation they preserve an inactive exact run, and after READY they
+request a bounded completed STOP. SIGKILL/crash is not an automatic cleanup
+promise. `-d` returns the name only after READY; an already exited workload is
+not reported as a live detached service. Closing a reader alone only detaches.
+
+Normal `rm` verifies terminal completion, inactive exact domain and stale
+monitor ownership before revoking access and releasing leases/root resources.
+The default root is VM-exclusive and deleted with normal removal. Explicit
+retention and reuse preserve that exclusivity; shared-root UX remains deferred. Failed
+pre-activation grants or ambiguous/stale terminal socket state are preserved
+and may require recovery beyond normal `rm`; never manufacture terminal proof
+or delete a guessed VM to make a failure appear clean.
+
+`tests/kvm/test_oci_public_cli_live.py` is a separate opt-in public-command proof
+(`PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1`). It compiles a tiny syscall-only test image,
+materializes actual OCI layers, checks guest OverlayFS `/` and an image-only
+marker, finite exit, detached survival, STOP, foreground SIGINT and normal rm.
+It does not replace the Palimpsest-build/additional-exec Gate 2. Run this exact
+file during public adapter edits, not the entire native/portable suite.
+
+Qualified on pieroot-server at `88a8e95b77dd0b6b6983af7ed1f00d2da10e0f6a`:
+the public proof file passed both tests in 39.50 s, including three real VM
+launches and public removal. Foreground exited 23; service STOP and foreground
+SIGINT exited 42 after the guest observed PID 1's SIGTERM. No domain or monitor
+remained. Eight selected host/request/adapter/CLI/lane modules passed 637 tests
+in 30.07 s. These selected results are not a full suite or Gate 2 result.
+The first attempt failed before VM creation because host tool discovery omitted
+`/usr/sbin`; a fixed standard system search path and regression test corrected
+it. Failed evidence `/tmp/p-pub-87cfaadb` remains; the successful owned fixture
+was removed only after all three normal public `rm` operations completed.
+
+## Connected prerequisites
+
+Local OCI intake now selects a unique root descriptor within the same secure
+snapshot when no pin is supplied. `palimpsest oci materialize IMAGE.oci.tar`
+uses this path; `--manifest sha256:…` is still supported and is required for
+multiple root entries. A single image index delegates its internal platform
+selection to the existing verified image resolver. Discovery does not skip
+descriptor hashes, size limits, or archive safety checks.
+
+The run-owned lower provider connects sealed copies to domain planning,
+fresh-monitor descriptors and exact read-only ACL grant/revocation. Logical
+occurrence order and durable lease sets stay intact; repeated content is
+copied once per run. This removes shared export registry/GC from the initial
+launch dependency. It does not by itself provide the public adapter.
+The private v10 launch envelope includes at most 24 additional distinct lower
+file descriptors. Its existing 1 MiB encoded size cap is an admission limit:
+oversized combinations of long/escaped paths are rejected before spawn.
+
+The fresh coordinator now accepts pinned launch authority from a caller that
+already imports libvirt or uses threads. Only its clean child invokes the
+existing monitor spawn protocol; its return means launch accepted, not READY.
+An explicit null terminal timeout permits a service lifetime while the default
+45-second terminal timeout and bounded boot/STOP deadlines remain unchanged.
+
+The monitor client now pins the exact run and monitor directory and separates
+READY, STOP acceptance, durable TERMINAL and worker completion. A finite
+stop-and-wait returns the validated guest exit result, not a fabricated success.
+The noninteractive process session follows bounded, receipt-pinned VM-console
+bytes and drains them before returning that result. This console combines boot
+diagnostics and workload output; it does not provide separate guest stdout and
+stderr, stdin, TTY or remote exec. INT/TERM enqueue lifecycle STOP outside run
+locks; closing a reader only detaches it. The public adapter now uses this path.
+
+The first public lifecycle connects host/runtime-root setup, request/adapter
+wiring and normal stop/remove orchestration. Further recovery must cover pre-spawn grant
+failure and stale terminal sockets without fabricating terminal evidence.
+
+## Milestone 1: a complete public lifecycle
+
+Initial scope: a local OCI archive/layout, Linux x86_64 KVM, an explicitly
+qualified host kernel, and the packaged first-party initramfs. Registry intake
+and other backends can follow without changing the OCI root semantics.
+
+Connect these existing components in one vertical path:
+
+1. Resolve a unique supported manifest from local input and pin its bytes,
+   platform and digest. Reuse `LocalArchiveSource`/`LocalLayoutSource` and
+   `materialize_image_hard`; reject ambiguous input instead of guessing. Add a
+   typed OCI request rather than forcing it into the cloud-image `RunSpec`.
+2. Prepare a runtime root whose ancestors already permit the selected QEMU
+   principal to traverse them, with explicit setup/preflight. Never silently
+   chmod the user's home directory. State/runs/root-volumes ACLs do not solve
+   access to ancestors outside that namespace. Gate 2's temporary XDG root
+   must also meet this condition through supported product setup.
+3. Publish sealed BOOT and per-run lower exports before domain projection.
+   Copy verified distinct lower images into owned inodes; keep ordered logical
+   occurrences, hashes and OCIStore lease sets. No CAS hardlinks or CAS chmod.
+   Revoke and reclaim exports only after exact inactive-domain/terminal cleanup.
+   Shared physical exports can later implement the same logical contract.
+4. Connect resource preparation, plan commit, definition and existing access
+   grants. Retain the clean monitor spawn boundary: setup imports libvirt,
+   whereas `spawn_monitor_exec` requires a clean single-threaded process.
+   Use a typed fresh coordinator and revalidated pinned authority, not a
+   test-only monkeypatch or relaxed spawn check.
+5. Add `-d` to the OCI public path. Detached return requires authenticated
+   READY and a monitor that survives launcher exit. Default foreground mode
+   forwards workload output and exit status; interruption requests authenticated
+   STOP. Do not return success merely because a STOP request was accepted.
+6. Wire exact `stop` and `rm`: terminal/domain cleanup, BOOT/lower/stage1/root
+   and runtime ACL revocation, shared traversal departure, root/lease release,
+   then pinned run-tree removal. Ambiguous ownership remains fail-closed with
+   actionable recovery information. Preserve VM-exclusive root generations
+   and the existing retained-root API.
+
+Enable only operations that have passed this vertical qualification. Existing
+`resolve_run_request`, `ResolvedRunRequest`, `_adapter_for`, CLI parsing and
+platform capability profiles all need deliberate OCI-specific integration;
+removing one rejection is not a complete implementation.
+
+Acceptance is public CLI execution without fixture ACL brokers, source-path
+remapping or ownership-normalization adapters: OCI contents become the actual
+guest `/`; foreground returns the workload result; `-d` survives caller exit;
+a separate CLI can stop/remove only its exact VM; source archives remain.
+Exercise failure and interruption cleanup as well as successful shutdown.
+
+## Milestone 2: additional guest exec and Gate 2
+
+Authenticated `EXEC`, `EXEC_OUTPUT` and `EXEC_EXIT` now use the original boot
+authority. `exec-00000001` remains the main workload; additional commands use
+separate monotonic leaf generations. One command can run at a time, with literal
+argv, separate stdout/stderr, real exit status, 30-second execution and 64-KiB
+combined output limits. Timeout/output-limit/STOP kill and clean the additional
+leaf without inventing success. Image credentials/environment/cwd and existing
+isolation apply; no stdin/TTY, overrides or parallel exec are provided.
+
+The real engine proof passed at `02af2879bd79f19cdbfb02cd687d965e78283d55`
+on pieroot-server (1 test, 22.02 s), including post-timeout/output-limit recovery
+and STOP during exec. Public CLI proof is separately opt-in. See
+[the additional-exec contract](oci-additional-exec.md) for delivery, abandoned
+result and qualification details. This does not itself pass Gate 2.
+
+Docker sockets on the current test host are now permitted by user decision.
+The old baked `/proc/1/root` probe conflicts with the existing non-dumpable
+PID 1 supervisor boundary. The approved v2 criterion compares the application's
+actual root with minimal authenticated PID 1 root identity and retains direct
+PID 1 access denial as a negative check. Do not stop unrelated Docker services,
+hide sockets or weaken PID 1 protection to pass the gate.
+
+Then require `tests/e2e/test_local_oci_build_run.py` with the versioned v2 probe:
+
+```text
+Palimpsest build → immutable OCI archive + receipt
+→ transfer to qualified KVM host (Docker may coexist)
+→ public run -d → root-proof → separate public exec of the image probe → root-proof
+→ verify image marker, app/PID 1 root identity match and protected PID 1 access
+→ stop → rm → no domain/run state, source archive preserved
+```
+
+The probe must execute inside the guest. A host-generated response, the initial
+workload's output, or the existing boot-only fixture is not Gate 2 acceptance.
+Only after this proof should the opt-in gate be enabled as a required product
+qualification on an appropriately configured runner.
+
+## Deferred optimization, not abandoned requirements
+
+Shared lower-export membership/refcounts/GC, multiple VM data-volume sharing,
+retained-root deletion UX, TTY and parallel exec, remote Docker Hub intake,
+Compose and non-x86_64 backends need not block the first two milestones.
+The user's eventual multi-VM volume requirement remains. VM root disks stay
+exclusive and explicitly reusable after retention; a future shared data volume
+is a different lifecycle from the VM root.
+
+Every development change uses the [test lanes](testing.md) and its relevant
+native/product proof. Complete portable shards and broad release regression
+remain integration checks, not a reason to rerun all 4,000+ tests per small edit.
+
+## Public retained-root qualification
+
+At `cb48781b2f4646e8ca219bbe9692cbbe6c16e1c2`, local focused core checks passed
+542 and separate lane checks passed 63; native collection skipped its one
+explicit opt-in proof. The same pushed SHA passed the combined 605 selected
+checks on the server in 94.18 s, without skips. The initial local regression
+attempt had 419 passes and two sandbox socket-bind failures; the same selection
+passed all 421 with normal permissions. These overlapping runs are not a full
+suite total. Independent code/test review, lint, formatting and lane checks
+passed before push.
+
+The separate `tests/kvm/test_oci_retained_root_cli_live.py` proof then passed
+in 32.76 s on that exact SHA. It reuses the previously accepted Palimpsest-built
+archive: public exec writes a unique file in the first guest's `/`, normal
+stop/rm retains the root, and a second public run explicitly reuses the returned
+UUID with the same source graph and size. The new run/boot/domain identities,
+persisted file, authenticated root proof and direct PID 1 access denial are
+checked. Both test VMs/run trees are removed; one detached retained 4 GiB root
+and its test runtime (about 71 MiB allocated) intentionally remain reusable.
+The original image, previous failed-run evidence and private cleanup archive
+remain unchanged. No host-side root write substitutes for guest persistence.
+
+Enable only `PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1`, provide the existing
+`PALIMPSEST_OCI_EXEC_LIVE_IMAGE` acceptance archive and five host BOOT variables,
+then select this test file through pytest. This is normal shutdown and
+reuse qualification, not a fresh image build, full Gate 2, crash/power-loss
+recovery, standalone root export or concurrent multi-VM root sharing. Root
+deletion UX and shared data-volume semantics remain follow-ups; the subsequent
+metadata-only inventory is described separately above.

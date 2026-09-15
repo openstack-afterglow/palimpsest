@@ -1,0 +1,208 @@
+"""Qualified actual-PID1/virtio-blk proof for the packaged guest stage-1."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from palimpsest_local._oci_stage1_kvm_proof import (
+    ASSEMBLY_NEGATIVE_CONTROL_NAMES,
+    ASSEMBLY_REJECTION_MARKER,
+    EVIDENCE_ENV,
+    EVIDENCE_FILE_NAMES,
+    FILESYSTEM_NEGATIVE_CONTROL_NAMES,
+    FILESYSTEM_REJECTION_MARKER,
+    NEGATIVE_CONTROL_NAMES,
+    PREPARATION_FAILURE_MARKER,
+    REJECTION_MARKER,
+    ROOT_TRANSITION_MARKER,
+    ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES,
+    ROOT_TRANSITION_REJECTION_MARKER,
+    SUCCESS_MARKER,
+    TERMINAL_ROOT_QUIESCED_MARKER,
+    WORKLOAD_ISOLATION_MARKER,
+    WORKLOAD_NEGATIVE_CONTROL_NAMES,
+    WORKLOAD_NEGATIVE_REJECTION_MARKERS,
+    WORKLOAD_STARTED_MARKER,
+    _logical_line_count,
+    run_oci_stage1_kvm_proof,
+)
+
+pytestmark = [pytest.mark.kvm, pytest.mark.stage1_kvm]
+
+
+def test_packaged_stage1_supervises_isolated_workloads_and_rejects_all_43_boot_control_matrices() -> None:
+    if os.environ.get("PALIMPSEST_REQUIRE_STAGE1_KVM") != "1":
+        pytest.skip("set PALIMPSEST_REQUIRE_STAGE1_KVM=1 on the qualified native Linux/KVM runner")
+
+    result = run_oci_stage1_kvm_proof()
+
+    receipt = result.receipt.to_dict()
+    assert receipt["executed_boots"] == 43
+    assert receipt["qemu_invocations"] == 44
+    assert receipt["qualification"] == {
+        "accelerator": "kvm",
+        "architecture": "x86_64",
+        "cpu": "host",
+        "kvm_api_version": 12,
+        "live_pid1": True,
+    }
+    assert receipt["root_assembly"] is True
+    assert receipt["root_is_slash"] is True
+    assert receipt["pivot_root"] is False
+    assert receipt["switch_root"] is True
+    assert receipt["root_transition"] == {
+        "contract": "palimpsest.stage1-root-transition.v1",
+        "method": "move-mount-chroot",
+        "pid1_root_matches_slash": True,
+        "pivot_root": False,
+        "pseudo_filesystems": ["dev", "sys", "proc"],
+        "root_filesystem": "overlay",
+        "switch_root": True,
+        "workload_started": False,
+    }
+    assert receipt["workload_started"] is True
+    assert receipt["supervisor"] == {
+        "account_resolution": "image-root-passwd-group",
+        "argv0": "shell-free-path-search-after-chdir",
+        "agent_cgroup": "/palimpsest.agent",
+        "contract": "palimpsest.guest-pid1-supervisor.v10",
+        "cgroup": "/palimpsest.agent/exec-00000001",
+        "cgroup_security": "private-readonly-view-plus-pid1-owned-leaf-cleanup-authority",
+        "cgroup_write_escape_denied": ["root", "agent-parent", "exec-session-leaf"],
+        "cleanup": "stop-signal-grace-leaf-cgroup.kill-wait4-echild-leaf-empty-rmdir-parent-empty-rmdir",
+        "cooperative_status": 43,
+        "credential_timing": "child-isolate-drop-verify-parent-attach-key-bootstrap-ack-release",
+        "forced_status": 137,
+        "forwarded_signal": 15,
+        "lifecycle_broker": "palimpsest.guest-lifecycle-broker.v3",
+        "lifecycle_stop": "host-issued-after-ready-and-proof-signal-sync",
+        "isolation_contract": "palimpsest.workload-lifecycle-authority-isolation.v3",
+        "leaf_populated_after_cleanup": False,
+        "leaf_populated_before_release": True,
+        "leaf_removed": True,
+        "main_status": 42,
+        "max_active_sessions_qualified": 1,
+        "omitted_primary_group": True,
+        "parallel_exec_sessions_proven": False,
+        "parent_cgroup_procs_empty": True,
+        "parent_populated_after_cleanup": False,
+        "parent_recursively_populated": True,
+        "parent_removed": True,
+        "pid1_credentials": {"gid": 0, "supplementary_groups": [], "uid": 0},
+        "pid1_outside_agent": True,
+        "privileged_broker_after_fork": True,
+        "process_group": True,
+        "reaped_children": 3,
+        "session_id": 1,
+        "session_id_allocation": "guest-internal-monotonic-u32",
+        "terminal_root_quiesce": {
+            "contract": "palimpsest.terminal-root-quiesce.v1",
+            "filesystem": "overlay",
+            "identity": "nofollow-slash-directory-proc-self-root-stable-before-after",
+            "ordering": "workload-and-cgroup-cleanup-then-syncfs-and-close-then-terminal",
+            "sync": "syncfs",
+        },
+        "terminal_state": "root-quiesce-then-parent-marker-then-fail-closed-wait",
+        "terminal_wire_order": "cleanup-certainty-then-root-quiesce-then-terminal-frame-then-console-marker",
+        "supplementary_groups": "empty-restricted-subset",
+        "workload_credentials": {"gid": 65534, "supplementary_groups": [], "uid": 65534},
+        "uid0_capabilityless_proven": True,
+    }
+    assert receipt["terminal_root_quiesce"] == {
+        "close_verified": True,
+        "contract": "palimpsest.terminal-root-quiesce.v1",
+        "filesystem": "overlay",
+        "marker": TERMINAL_ROOT_QUIESCED_MARKER.decode("ascii"),
+        "marker_count": 1,
+        "proc_self_root_matches_slash": True,
+        "root_reopened_nofollow_directory": True,
+        "stable_before_after": True,
+        "syncfs": True,
+        "terminal_after_quiesce": True,
+    }
+    assert receipt["lifecycle"]["single_connection_proven"] is True
+    assert receipt["lifecycle"]["reconnect_proven"] is True
+    assert receipt["lifecycle"]["negative_input_proven"] is True
+    assert [frame["kind"] for frame in receipt["lifecycle"]["boots"][0]["frames"]] == [
+        "HELLO",
+        "BOOTSTRAP",
+        "KEY_ACK",
+        "READY",
+        "STOP",
+        "TERMINAL",
+    ]
+    assert (
+        receipt["lifecycle"]["boots"][0]["frames"][1]["boot_generation"]
+        != receipt["lifecycle"]["boots"][1]["frames"][1]["boot_generation"]
+    )
+    assert set(receipt["workload_negative_controls"]) == set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+    assert receipt["pre_mount_devices"] is True
+    assert receipt["filesystem_verified"] is True
+    assert receipt["root_filesystem_verified"] is True
+    assert receipt["root_content_verified"] is False
+    assert receipt["lower_filesystem_verified"] is True
+    assert receipt["lower_content_verified"] is True
+    assert receipt["mount_attempted"] is True
+    assert receipt["root_filesystem_mounted"] is True
+    assert receipt["lower_filesystems_mounted"] is True
+    assert receipt["overlay_assembled"] is True
+    assert _logical_line_count(result.console, SUCCESS_MARKER) == 1
+    assert _logical_line_count(result.console, ROOT_TRANSITION_MARKER) == 1
+    assert _logical_line_count(result.console, WORKLOAD_ISOLATION_MARKER) == 1
+    assert _logical_line_count(result.console, WORKLOAD_STARTED_MARKER) == 1
+    assert _logical_line_count(result.console, REJECTION_MARKER) == 0
+    assert _logical_line_count(result.console, ASSEMBLY_REJECTION_MARKER) == 0
+    assert _logical_line_count(result.console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+    assert _logical_line_count(result.retained_console, SUCCESS_MARKER) == 1
+    assert _logical_line_count(result.retained_console, ROOT_TRANSITION_MARKER) == 1
+    assert _logical_line_count(result.retained_console, WORKLOAD_ISOLATION_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, WORKLOAD_ISOLATION_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, WORKLOAD_STARTED_MARKER) == 1
+    assert _logical_line_count(result.uid0_isolation_console, SUCCESS_MARKER) == 1
+    assert _logical_line_count(result.retained_console, WORKLOAD_STARTED_MARKER) == 1
+    assert set(result.negative_consoles) == set(NEGATIVE_CONTROL_NAMES)
+    for console in result.negative_consoles.values():
+        assert _logical_line_count(console, REJECTION_MARKER) == 1
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+    assert set(result.filesystem_negative_consoles) == set(FILESYSTEM_NEGATIVE_CONTROL_NAMES)
+    for console in result.filesystem_negative_consoles.values():
+        assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, REJECTION_MARKER) == 0
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+    assert set(result.assembly_negative_consoles) == set(ASSEMBLY_NEGATIVE_CONTROL_NAMES)
+    for console in result.assembly_negative_consoles.values():
+        assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+    assert set(result.root_transition_negative_consoles) == set(ROOT_TRANSITION_NEGATIVE_CONTROL_NAMES)
+    for console in result.root_transition_negative_consoles.values():
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 1
+        assert _logical_line_count(console, REJECTION_MARKER) == 0
+        assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+    assert set(result.workload_negative_consoles) == set(WORKLOAD_NEGATIVE_CONTROL_NAMES)
+    for name, console in result.workload_negative_consoles.items():
+        assert _logical_line_count(console, ROOT_TRANSITION_MARKER) == 1
+        assert _logical_line_count(console, WORKLOAD_NEGATIVE_REJECTION_MARKERS[name]) == 1
+        assert _logical_line_count(console, WORKLOAD_STARTED_MARKER) == 0
+        assert _logical_line_count(console, SUCCESS_MARKER) == 0
+        assert _logical_line_count(console, REJECTION_MARKER) == 0
+        assert _logical_line_count(console, FILESYSTEM_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, ASSEMBLY_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, ROOT_TRANSITION_REJECTION_MARKER) == 0
+        assert _logical_line_count(console, PREPARATION_FAILURE_MARKER) == 0
+
+    evidence_value = os.environ.get(EVIDENCE_ENV)
+    if evidence_value is not None:
+        evidence = Path(evidence_value)
+        assert {path.name for path in evidence.iterdir()} == set(EVIDENCE_FILE_NAMES)
+        assert all(path.stat().st_mode & 0o777 == 0o400 for path in evidence.iterdir())

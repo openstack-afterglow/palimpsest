@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import cloudinit, kvm, state
+from . import cloud_runtime, cloudinit, kvm, platforms, state
 from .digest import InvalidDigestError, digest_file, require_digest, require_file_digest
 from .errors import ArtifactValidationError, BuildError, StateError
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
@@ -469,13 +469,11 @@ def build_layer(
         require_file_digest(spec.base.local_path, spec.base.digest)
     except Exception as exc:
         raise ArtifactValidationError(f"base image digest mismatch: {exc}") from exc
-    if spec.base.arch == "aarch64":
+    backend = platforms.select_backend(spec.base.arch)
+    if backend == "lima-vz":
         from . import lima
 
-        if lima.available():
-            return lima.build_layer(spec, roots=roots)
-    if spec.base.arch != "x86_64":
-        raise ArtifactValidationError(f"unsupported base architecture: {spec.base.arch}")
+        return lima.build_layer(spec, roots=roots)
     for layer in spec.parent_layers:
         try:
             require_file_digest(layer.local_path, layer.digest)
@@ -510,8 +508,6 @@ def build_layer(
         network=spec.network,
     )
 
-    from . import runtime
-
     builder_state: dict[str, Any] | None = None
     builder_cleaned = False
 
@@ -522,7 +518,7 @@ def build_layer(
                 shutil.copyfile(rpaths.console, console_log)
         except Exception:
             pass
-        runtime.rm(builder_name, roots=roots, volumes=True, conn=conn, kvm_uri=kvm_uri)
+        cloud_runtime.rm(builder_name, roots=roots, volumes=True, conn=conn, kvm_uri=kvm_uri)
 
     try:
         layer_disks = [
@@ -546,7 +542,7 @@ def build_layer(
             activation_script=kvm.build_layer_activation_script(layer_disks),
             job=serial_job,
         )
-        builder_state = runtime.start_serial_builder(
+        builder_state = cloud_runtime.start_serial_builder(
             builder_run_spec,
             user_data=user_data,
             roots=roots,
@@ -558,7 +554,7 @@ def build_layer(
         tmp_host_out = build_dir / "output.squashfs"
         serial_socket = state.run_paths(roots, builder_name).root / "builder.sock"
         if output_receiver is None:
-            output_digest = runtime.receive_serial_builder_output(serial_socket, tmp_host_out)
+            output_digest = cloud_runtime.receive_serial_builder_output(serial_socket, tmp_host_out)
         else:
             output_digest = output_receiver(serial_socket, tmp_host_out)
         cleanup_builder()

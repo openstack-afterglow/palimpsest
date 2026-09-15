@@ -24,6 +24,27 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run python -m pytest tests/unit -v
+      - name: Pin the offline x86_64 guest toolchain
+        run: docker pull --platform linux/amd64 docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
+      - name: Reproduce and execute the packaged guest stage-1 ELF
+        run: uv run python -m pytest -m guest_stage1_binary tests/integration/test_oci_guest_stage1_binary.py -vv
+      - name: Reproduce the native-KVM workload proof ELF
+        run: |
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-a.x86_64"
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-b.x86_64"
+          cmp tests/kvm/assets/workload-proof.x86_64 "$RUNNER_TEMP/workload-proof-a.x86_64"
+          cmp "$RUNNER_TEMP/workload-proof-a.x86_64" "$RUNNER_TEMP/workload-proof-b.x86_64"
+      - name: Verify KVM filesystem and workload fixture bindings
+        run: uv run python tests/kvm/assets/check_filesystem_fixtures.py
+      - run: docker buildx create --name palimpsest-e2e --driver docker-container --driver-opt network=none --use --bootstrap
+      - name: Verify local OCI product build
+        env:
+          PALIMPSEST_BUILDKIT_E2E: "1"
+          PALIMPSEST_BUILDKIT_BUILDER: palimpsest-e2e
+        run: uv run python -m pytest tests/integration/test_buildkit_named_oci_context.py -vv
+      - name: Remove test builder
+        if: always()
+        run: docker buildx rm palimpsest-e2e || true
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz
@@ -44,9 +65,21 @@ jobs:
         with:
           python-version: "3.12"
       - run: test -c /dev/kvm
-      - run: virsh -c qemu:///system net-info default
-      - run: uv sync --frozen --extra dev --extra kvm
-      - run: uv run python -m pytest -m kvm tests/kvm -vv
+      - run: uv sync --frozen --extra dev
+      - name: Create private stage-1 evidence directory
+        run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
+      - name: Require retained root, root transition, PID 1 supervision, and rejection matrices
+        timeout-minutes: 45
+        env:
+          PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
+          PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence
+        run: uv run python -m pytest -m stage1_kvm tests/kvm -vv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-stage1-native-kvm-proof
+          path: ${{ runner.temp }}/stage1-kvm-evidence
+          if-no-files-found: error
 
   publish:
     name: Publish signed release
