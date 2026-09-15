@@ -28,18 +28,22 @@ files_modified:
 
 - branch: `codex/oci-root-phase1`
 - native re-verification checkout: detached
-  `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`, clean and equal to the pushed
-  branch origin. The observability diagnostics implementation is commit
-  `2bb3a2d`. GitHub development package workflow `34922770716` passed and
-  published `package-2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`. The final
-  evidence document commit follows this point-in-time checkout and cannot
-  self-reference its own SHA.
-- final evidence staged architecture marker:
-  `eb3bd17e84fd6d8cbabdc862c4f888d4e56ae5d3bfd04e33d0329ed324bb2f4f`
-  (381 files), covering the exact SHA2 checks and native evidence while excluding
-  the unrelated MySQL hunk.
+  `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`, clean before verification and
+  equal to the then-pushed branch origin. This commit contains the bounded
+  initial monitor-client lock wait used by the successful PyTorch CPU proof.
+  GitHub development package workflow `34932288668` passed and published its
+  SHA-specific prerelease.
+- qualification evidence commit:
+  `633dbbed0bc15b84cf2377af6dbd77e08f4f8cc5`; GitHub development package
+  workflow `34933012902` passed and published its SHA-specific prerelease. This
+  handoff refresh follows that evidence commit and cannot self-reference its
+  own final SHA.
+- current architecture marker:
+  `d36359bb80b036f7ffe4359447f79ab394fe7477c0d7c126790fdb452f7276a2`
+  (381 files), covering the monitor startup boundary and exact native PyTorch
+  CPU evidence while excluding the unrelated MySQL hunk.
 - server `pieroot-server` checkout: `/home/pieroot/code/palimpsest` is detached
-  at `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`, with zero porcelain lines before
+  at `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`, with zero porcelain lines after
   native verification. The native venv remains
   `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python 3.12.3, libvirt 10.0.0).
 - `2bb3a2d` Linux verification: 187 passed in state, monitor-client, lifecycle,
