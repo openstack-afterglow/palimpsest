@@ -283,3 +283,110 @@ def test_default_route_requires_exactly_one_committed_gateway() -> None:
     assert 'read_bounded_file("/proc/net/route"' in route
     assert "return defaults == 1;" in route
     assert "gateway_value != net->gateway" in route
+
+
+ROUTE_PREFIX = r"""
+#include <stdio.h>
+#include <string.h>
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long u64;
+typedef signed long i64;
+typedef unsigned long usize;
+#define ROUTE_TABLE_MAX 8192
+#define GUEST_NAMESERVER_MAX 3
+#define IFNAMSIZ 16
+struct span { const char *p; usize n; };
+struct guest_network {
+    int enabled;
+    char interface[IFNAMSIZ];
+    u32 address;
+    u32 netmask;
+    u32 gateway;
+    u8 mac[6];
+    char nameservers[GUEST_NAMESERVER_MAX][16];
+    u32 nameserver_count;
+};
+static const char *fixture;
+static usize slen(const char *s) { usize n = 0; while (s[n]) n++; return n; }
+static int bytes_equal(const char *a, const char *b, usize n) { return memcmp(a, b, n) == 0; }
+static i64 read_bounded_file(const char *path, u8 *out, usize cap, int nofollow, void *st) {
+    usize n = slen(fixture);
+    (void)path; (void)nofollow; (void)st;
+    if (n > cap) return -1;
+    memcpy(out, fixture, n);
+    return (i64)n;
+}
+"""
+
+# The kernel pads /proc/net/route lines with spaces and prints uppercase hex.
+HEADER = (
+    "Iface\\tDestination\\tGateway \\tFlags\\tRefCnt\\tUse\\tMetric\\tMask\\t\\tMTU\\tWindow\\tIRTT              \\n"
+)
+DEFAULT_ROUTE = "eth0\\t00000000\\t0202000A\\t0003\\t0\\t0\\t0\\t00000000\\t0\\t0\\t0                              \\n"
+SUBNET_ROUTE = "eth0\\t0002000A\\t00000000\\t0001\\t0\\t0\\t0\\t00FFFFFF\\t0\\t0\\t0                              \\n"
+FOREIGN_ROUTE = "eth1\\t00000000\\t0202000A\\t0003\\t0\\t0\\t0\\t00000000\\t0\\t0\\t0                              \\n"
+WRONG_GATEWAY = "eth0\\t00000000\\t0102000A\\t0003\\t0\\t0\\t0\\t00000000\\t0\\t0\\t0                              \\n"
+
+ROUTE_CASES = (
+    ("kernel-format", HEADER + DEFAULT_ROUTE + SUBNET_ROUTE, 1),
+    ("reversed-order", HEADER + SUBNET_ROUTE + DEFAULT_ROUTE, 1),
+    (
+        "unpadded",
+        "Iface\\tDestination\\n" + "eth0\\t00000000\\t0202000A\\t0003\\t0\\t0\\t0\\t00000000\\t0\\t0\\t0\\n",
+        1,
+    ),
+    ("no-default", HEADER + SUBNET_ROUTE, 0),
+    ("foreign-interface", HEADER + FOREIGN_ROUTE, 0),
+    ("wrong-gateway", HEADER + WRONG_GATEWAY, 0),
+    ("duplicate-default", HEADER + DEFAULT_ROUTE + DEFAULT_ROUTE, 0),
+    ("header-only", HEADER, 0),
+)
+
+ROUTE_SUFFIX = (
+    """
+int main(int argc, char **argv) {
+    struct guest_network net;
+    static const char *fixtures[] = {"""
+    + ",".join(f'\n        "{text}"' for _name, text, _expected in ROUTE_CASES)
+    + """
+    };
+    static const int expected[] = {"""
+    + ", ".join(str(value) for _name, _text, value in ROUTE_CASES)
+    + """};
+    int index;
+    if (argc != 2) return 90;
+    index = atoi(argv[1]);
+    memset(&net, 0, sizeof(net));
+    memcpy(net.interface, "eth0", 5);
+    net.enabled = 1;
+    net.gateway = 0x0202000a;
+    fixture = fixtures[index];
+    return verify_default_route(&net) == expected[index] ? 0 : 1;
+}
+"""
+)
+
+
+@pytest.fixture(scope="module")
+def route_harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    source = (ROOT / "guest/stage1/init.c").read_text(encoding="utf-8")
+    functions = "\n".join(
+        _function(source, name)
+        for name in ("static int parse_hex_u32", "static int route_field", "static int verify_default_route")
+    )
+    directory = tmp_path_factory.mktemp("guest-route")
+    harness_source = directory / "route.c"
+    binary = directory / "route"
+    harness_source.write_text(ROUTE_PREFIX + "#include <stdlib.h>\n" + functions + ROUTE_SUFFIX, encoding="utf-8")
+    subprocess.run(
+        ["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(binary), str(harness_source)],
+        check=True,
+        timeout=60,
+    )
+    return binary
+
+
+@pytest.mark.parametrize("index", range(len(ROUTE_CASES)), ids=[name for name, _text, _value in ROUTE_CASES])
+def test_default_route_verification_reads_the_real_kernel_table(route_harness: Path, index: int) -> None:
+    subprocess.run([str(route_harness), str(index)], check=True, timeout=10)

@@ -4449,13 +4449,20 @@ rejected:
     return 0;
 }
 
+/* The kernel prints /proc/net/route fields in uppercase hexadecimal, so this
+ * parser accepts both cases. Digest validation elsewhere stays lowercase. */
 static int parse_hex_u32(const char *p, usize n, u32 *out) {
     u32 value = 0;
     usize index;
     if (!n || n > 8) return 0;
     for (index = 0; index < n; index++) {
-        if (!is_hex(p[index])) return 0;
-        value = (value << 4) | (u32)hex_value(p[index]);
+        char c = p[index];
+        u32 digit;
+        if (c >= '0' && c <= '9') digit = (u32)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (u32)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') digit = (u32)(c - 'A' + 10);
+        else return 0;
+        value = (value << 4) | digit;
     }
     *out = value;
     return 1;
