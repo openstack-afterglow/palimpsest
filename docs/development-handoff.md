@@ -171,6 +171,14 @@ files_modified:
   unexpected state, and requires `NET_NO_EGRESS_OK` to be the exact sole
   output. Its native rerun passed in 40.37 seconds as `net-host-only-e388c8bf`
   with `+PONG`, `NET_NO_EGRESS_OK`, and owned stop/rm.
+- that first fail-closed probe still used a `getent hosts localhost` control,
+  which only proves the binary runs because it resolves through `/etc/hosts`.
+  Exact `ed4d7d18d205f8d00d2ec188ac1ef3d9c30cef55` drops it, rejects any present
+  nameserver in the guest resolver file, and rests the egress proof on the two
+  TCP negatives made with a probe that must first reach an in-guest listener.
+  Its native rerun passed in 38.66 seconds as `net-host-only-f1dfd72f` with
+  `+PONG`, `NET_NO_EGRESS_OK`, and owned stop/rm. The NAT and wildcard nodes
+  were not re-run at that SHA; their qualification stands at `9ada8ca`.
 - three earlier networking attempts failed first: libvirt aborted domain start
   because the unaddressed NIC claimed PCI slot 0x1 ahead of its own root port;
   PID 1 then rejected the workload at link-state (carrier not yet reported) and

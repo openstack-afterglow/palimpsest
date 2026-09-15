@@ -222,6 +222,10 @@ egress. The probe now refuses unless the tools exist, proves the TCP probe
 against a reachable in-guest listener, rejects a present nameserver, fails
 distinctly on any unexpected state, and requires `NET_NO_EGRESS_OK` as the
 exact sole output. Its first fail-closed rerun passed in 40.37 seconds as
-`net-host-only-e388c8bf`; the `/etc/hosts`-only resolver control was then
-dropped because it proved only that the binary runs, and the current form was
-re-run natively as recorded above.
+`net-host-only-e388c8bf` at `e5bc4f74ac144b03d45fbc9ebf50a0a7c439bc0c`, which
+still used the `/etc/hosts`-only resolver control. That control was dropped
+because it proved only that the binary runs, and the current form — including
+the present-nameserver rejection — was re-run natively at exact
+`ed4d7d18d205f8d00d2ec188ac1ef3d9c30cef55`: `net-host-only-f1dfd72f` passed in
+38.66 seconds with a real `+PONG` through the published port,
+`NET_NO_EGRESS_OK`, and owned stop/remove.
