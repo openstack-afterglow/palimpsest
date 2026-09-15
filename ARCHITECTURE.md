@@ -30,6 +30,8 @@ GPU 점검 승인이 아니며 기존 staged PCI 구현과 미승인 증거 변�
 
 정확한 Linux checkout `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`에서 timeout/CLI/guest-C/dispatch 선별 및 새 진단 검사 선별353건(187건 47.78초 + 166건 9.13초)이 통과했다. 이어진 TensorFlow 실기는 125.65초 뒤 `framework-exec-command`에서 실패했지만, 새로 구현된 진단이 `timeout-source=run-lock-timeout`과 함께 Linux kernel lock 보유자 `run-lock-holder-pid=1727406`을 성공적으로 포착했다. 해당 PID는 detached monitor child worker(`oci_monitor_ipc --private-child-v2`)였으며, run ledger는 durable READY 수신 후 worker failure인 `oci_root_launch_failure={"stage": "post-ready-worker", "source": "lifecycle-transport", "category": "timeout"}`를 기록했다. 관측된 lock 보유자 PID와 사후 failure receipt는 독립된 사실이며, transport timeout이 lock 대기에 선행했다거나 실패 처리 중에 lock을 잡았다는 인과 순서를 뜻하지 않는다. 소스상 exec은 run lock 아래에서 `before_stop_send`를 호출하고 그 직후 `_send_all` 또는 `_recv_frame`이 transport `TIMEOUT`을 일으킬 수 있어, lock 경합이 worker 실패에 앞섰거나 공통 원인을 공유할 가능성이 열려 있다. 두 사건의 인과 순서와 정확한 transport 만료 지점은 미확정이다. 새 domain은 남지 않았다. PyTorch 실기는 297.04초 뒤 `public-run-command`에서 coordinator timeout(`[parent-response:timeout]`)으로 실패했고 새 `ml-pytorch-484e1dda`(UUID `74cc9561-61cc-45d1-a070-a4262b6c73a9`)를 inactive·persistent·autostart disable로 보존했다. 최종 full inventory는 기존19개와 새1개 domain 모두 inactive, active 0, 원본 archive 16개 전체 digest 불변이다. 어느 retained domain도 stop·undefine·adopt하지 않는다.
 
+PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-command`의 `[parent-response:timeout]`에서 멈춘 관측에 따라, 현재 source는 OCI monitor child의 bounded spawn handshake를 15초에서 허용 상한30초로, 이를 감싸는 parent coordinator response 대기를30초에서60초로 늘린다. 두 기한은 [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 모든 OCI-root launch에 고정 적용되고, coordinator의 hard maximum120초·불확실 결과 보존·no-kill·endpoint/journal 재인증·guest READY75초·guest exec 기한은 바꾸지 않는다. 이 변경은 GPU attach가 아니며, proof의 성공 조건은 여전히 hostdev/NIC/filesystem 없이 `torch`가 exact 2×2 결과 `[19,22,43,50]`, sum134, device `cpu`, `torch.cuda.is_available()==False`를 guest에서 출력하는 것이다. 관련 local coordinator/run-adapter/ML contract 선별119건은 통과했지만 native CPU 연산 성공은 별도 exact-SHA 실기로만 판정한다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -423,9 +425,13 @@ ML proof의 private setup evidence에는 고정 framework/phase/status enum과
 실패는 기존 불확실 결과 안내에 고정 코드만 덧붙이며 raw exception·자식
 stderr·경로·argv를 노출하지 않는다. 관찰할 수 없는 내부 prepare/commit
 단계를 추정하지 않고 unknown exception은 고정 child-failed 범주로 제한한다.
-Request v1·spawn/handshake 시간 제한·실패 자원 보존·정리 권한·guest 정책은
-그대로다. 과거 PyTorch의 상세 오류는 이미 폐기된 출력에서 복원할 수 없으며,
-이 변경은 다음 실행의 진단을 위한 것이지 timeout 원인 확정이나 수정이 아니다.
+Request v1·실패 자원 보존·정리 권한·guest 정책은 그대로다. 현재 runtime은
+large-image materialization 직후의 bounded startup 여유를 위해 monitor child
+spawn handshake를15초에서30초로, parent coordinator response를30초에서60초로
+늘린다. 이는 재시도나 kill 권한을 추가하지 않으며 coordinator hard maximum
+120초, endpoint/journal 재인증과 불확실 결과 보존을 유지한다. 과거 PyTorch의
+상세 오류는 이미 폐기된 출력에서 복원할 수 없고, 새 기한 자체도 CPU 연산이나
+timeout 원인 수정을 증명하지 않는다.
 
 후속 monitor-client 오류는 `timeout-source`에 client-deadline·ipc-timeout·
 run-lock-timeout 세 고정 enum만 허용한다. 기존 보존 안내를 유지하고 raw
@@ -578,9 +584,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b684901a20c216bd204f4a0b813cfae34cc1b5e6658c959ad4f51dec8725ec76",
-  "reviewed_at": "2026-09-14T16:18:33Z",
-  "summary": "Reviewed typed post-READY worker failure receipts and Linux kernel flock-holder PID diagnostics; lock timing, retry, monitor import boundaries, journal, cleanup authority, and native ML qualification remain unchanged."
+  "source_sha256": "6e832708e460ae96fba7b2bc32f8371fe5448109a237cba014d7bdc3251fe135",
+  "reviewed_at": "2026-09-15T04:34:48Z",
+  "summary": "Reviewed bounded OCI monitor startup expansion from child/parent 15/30 seconds to 30/60 seconds for the existing GPU-free PyTorch CPU proof; retry, process termination, cleanup authority, endpoint authentication, guest readiness, exec, and GPU contracts remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

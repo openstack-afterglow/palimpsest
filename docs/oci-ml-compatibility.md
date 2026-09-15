@@ -313,6 +313,15 @@ execution deadline (150 s) stays inside the harness's 180-second outer command
 bound; the identity, PID 1 and lifecycle commands keep the default 30-second
 deadline.
 
+The production OCI-root launch window now gives the clean monitor child up to
+30 seconds for its bounded spawn handshake and gives the parent coordinator up
+to 60 seconds to receive and authenticate that result. This replaces the prior
+15/30-second pair that the large PyTorch image repeatedly reached before guest
+READY. It adds no retry, process termination, cleanup authority, device, or GPU
+path; ambiguous outcomes still retain exact evidence. A native exact-SHA rerun,
+not the local timeout-contract tests, determines whether the PyTorch CPU proof
+can now reach the framework command.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

@@ -45,6 +45,9 @@ from .oci_stage1_access import grant_oci_stage1_access
 from .oci_store import OCIStore
 from .state import init_resolved_roots, locked_existing_run, reserve_new_run
 
+_MONITOR_SPAWN_TIMEOUT_SECONDS = 30
+_MONITOR_COORDINATOR_TIMEOUT_SECONDS = 60
+
 
 @dataclass(frozen=True, slots=True)
 class OCILaunchResult:
@@ -194,7 +197,10 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                 terminal_timeout_seconds=None,
             ) as authority:
                 endpoint = spawn_monitor_coordinator(
-                    MonitorExecIdentity(binding, str(uuid.uuid4())), authority, timeout=15
+                    MonitorExecIdentity(binding, str(uuid.uuid4())),
+                    authority,
+                    timeout=_MONITOR_SPAWN_TIMEOUT_SECONDS,
+                    coordinator_timeout=_MONITOR_COORDINATOR_TIMEOUT_SECONDS,
                 )
     finally:
         try:

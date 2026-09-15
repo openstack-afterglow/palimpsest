@@ -186,8 +186,9 @@ def case(tmp_path, monkeypatch):
 
     monkeypatch.setattr(adapter, "prepare_monitor_launch_authority", authority)
 
-    def spawn(identity, authority, *, timeout):
-        assert identity.binding == value.binding and authority is value.authority and timeout == 15
+    def spawn(identity, authority, *, timeout, coordinator_timeout):
+        assert identity.binding == value.binding and authority is value.authority
+        assert timeout == 30 and coordinator_timeout == 60
         value.calls.append("spawn")
         return value.endpoint
 

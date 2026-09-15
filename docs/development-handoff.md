@@ -62,6 +62,12 @@ files_modified:
   disabled). Final full inventory is 20 inactive domains, active 0, and all 16
   exact archive SHA-256 values unchanged. No retained domain was stopped,
   undefined, or adopted.
+- current CPU-only PyTorch follow-up extends only the bounded monitor startup
+  pair from child/parent 15/30 seconds to 30/60 seconds. The proof remains
+  GPU-free and requires guest output with the exact matrix result, sum 134,
+  device `cpu`, and `torch.cuda.is_available()==False`; local coordinator,
+  run-adapter, and ML contract selections passed 119 checks. Native success is
+  not claimed until an exact-SHA server run reaches and validates that output.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
@@ -418,13 +424,13 @@ PCI 노드도 함께 통과했다.
 6. **그 이후 GPU 개발:** inventory와 운영자 승인이 확보된 뒤에만 allocation
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
-7. **ML 재검증:** 새 exact SHA와 보존 baseline에서 TensorFlow와 PyTorch를
-   순차 실행한다. `9239dbd` 결과가 보여 준 실제 경계는 coordinator spawn
-   handshake와 host run lock이므로 guest 실행 기한 변경만으로 통과를
-   기대하지 않는다. 먼저 post-READY worker 실패 사유 보존과 run lock 보유자
-   식별을 설계하고, framework matrix/root/PID1/cleanup이 실제 통과하기 전에는
-   ML 또는 GPU 성공으로 표시하지 않는다. 보존된 `ml-pytorch-69afe41a`는
-   진단 자료이며 stop·undefine·adopt 대상이 아니다.
+7. **ML 재검증:** 먼저 새 exact SHA와 보존 baseline에서 PyTorch CPU-only case를
+   한 번 실행한다. 성공 조건은 hostdev/NIC/filesystem 없는 domain 안에서 exact
+   matrix·sum·`cpu`·CUDA unavailable 출력, root/PID1 검증과 proof-owned cleanup이
+   모두 통과하는 것이다. GPU helper·attach·rebind는 실행하지 않는다. 이 proof가
+   성공하면 별도 TensorFlow post-READY lifecycle transport timeout 진단을 계속한다.
+   실패하면 새 typed phase와 inventory를 보존하고 기존 inactive domain은
+   stop·undefine·adopt하지 않는다.
 
 ### 이후 backlog — 현재 승인 아님
 
