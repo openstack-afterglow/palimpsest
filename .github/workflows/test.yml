@@ -78,12 +78,12 @@ jobs:
         env:
           PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-evidence
           PALIMPSEST_REQUIRE_OCI_FS: "1"
-        run: sudo --preserve-env=PATH,PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS uv run python -m pytest -m oci_fs tests/oci_fs -vv
+        run: sudo --preserve-env=PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS "$(command -v uv)" run python -m pytest -m oci_fs tests/oci_fs -vv
       - name: Rebuild selected SquashFS in a separate process
         env:
           PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-replay
           PALIMPSEST_REQUIRE_OCI_FS: "1"
-        run: sudo --preserve-env=PATH,PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS uv run python -m pytest -m oci_fs -k layer_filesystem_semantics tests/oci_fs -vv
+        run: sudo --preserve-env=PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS "$(command -v uv)" run python -m pytest -m oci_fs -k layer_filesystem_semantics tests/oci_fs -vv
       - name: Require cross-process deterministic evidence
         run: |
           cmp "$RUNNER_TEMP/oci-fs-evidence/squashfs.json" "$RUNNER_TEMP/oci-fs-replay/squashfs.json"

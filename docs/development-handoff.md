@@ -670,6 +670,17 @@ KVM job은 `vars.PALIMPSEST_KVM_ENABLED`가 `true`이고 `[self-hosted, linux, x
 kvm]` runner에서 실제 proof가 success일 때만 gate를 통과한다. 현재 variable은
 비어 있고 job result는 skipped였으므로 이는 코드 수정으로 우회할 대상이 아니다.
 
+Formatting remediation commit `eff7d6b728c59f039e76ae10fda625a4c8ff72b3`의 후속
+`Test` run [`35025114784`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35025114784)에서
+`Lint, manifests, and package`는 통과했다. 별도 `OCI filesystem proof
+(privileged Linux)` job은 probe 실행 전 `sudo: uv: command not found`로 실패했다.
+setup-uv가 제공한 executable을 caller shell에서 절대 경로로 해석해 `sudo`에
+전달하도록 두 privileged invocation을 수정한다. proof marker·test selection·root 및
+CAP_SYS_ADMIN requirement·두 process evidence 비교·artifact retention은 바꾸지 않는다.
+같은 run의 native KVM skip/required-gate 실패도 이 workflow lookup 수정으로 우회하지
+않는다.
+
+
 안전한 로컬 focused 명령:
 
 ```sh

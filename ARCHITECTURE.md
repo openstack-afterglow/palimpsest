@@ -613,13 +613,15 @@ Architecture freshness guard는 package runtime과 분리된 standard-library/Gi
 
 Draft PR #1의 첫 full CI는 repository-wide `ruff format --check .`에서 기존11개 Python 파일의 format drift를 발견했다. Pin된 Ruff formatter로 그11개를 정규화하자 `test_oci_dev_cover_live_contract.py`의 한 함수가 Python 동작이 아니라 두 source substring의 기존 줄 배치를 고정하고 있어 실패할 것이 독립 review에서 확인됐다. 해당 source-text 함수는 삭제하고 실제 initramfs 생성 behavior test와 opt-in native proof는 유지했다. 이는 production/runtime, protocol, schema, authority 또는 architecture를 바꾸지 않는다. 전체336개 파일 format check·Ruff lint, `core-cli qualification` 1,384건 통과·7건 skip, `oci-guest` 629건 통과·114건 skip이 뒤따랐다. 별도 `Required native KVM proof` 실패는 repository variable과 self-hosted KVM job이 비활성인 외부 gate이며 이 변경은 그 gate를 skip하거나 완화하지 않는다.
 
+Draft PR #1 follow-up `Test` run `35025114784` proved the format gate remediation but exposed a separate privileged workflow defect before the OCI filesystem probe started: `sudo` replaced the caller `PATH`, so bare `uv` was unavailable and no evidence file could be produced. Both root invocations now resolve the setup-uv executable in the unprivileged shell and pass that absolute path to `sudo`, while preserving only the two proof environment variables. Test selection, root/CAP_SYS_ADMIN requirements, evidence comparison, artifact retention, and the independent native KVM gate are unchanged.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5c3e8576031bb8b2f963e005b4a600aa6e594b787b784ff69348faac5a9c1668",
-  "reviewed_at": "2026-09-15T21:16:44Z",
-  "summary": "Reviewed draft PR CI remediation: repository-pinned Ruff normalized eleven files and a brittle source-layout test was removed while behavioral coverage and the native proof remain; runtime and architecture contracts are unchanged, and the required self-hosted KVM gate remains externally blocked."
+  "source_sha256": "66be24d0608f5391abed743843e3036dfc5dce382e293d5e7cf2a1c2e3879450",
+  "reviewed_at": "2026-09-15T21:24:21Z",
+  "summary": "Reviewed privileged OCI filesystem workflow remediation: setup-uv is resolved before sudo while strict root, capability, evidence, artifact, and independent native KVM gates remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

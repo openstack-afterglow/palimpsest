@@ -56,6 +56,8 @@ The receipt compares the exact merged path set, type, ownership, permission bits
 
 The `OCI filesystem proof (privileged Linux)` workflow job is the stable required status for this gate. Repository branch protection must require that exact job name. It installs `squashfs-tools` and `erofs-utils`, sets `PALIMPSEST_REQUIRE_OCI_FS=1`, and therefore fails rather than skips when Linux, root, `CAP_SYS_ADMIN`, mount namespace support, mountinfo, a required tool, or a required packer feature is absent. It then starts a second pytest process, rebuilds the selected SquashFS artifacts, and byte-compares the complete evidence JSON before retaining both receipts. Ordinary developer runs skip the two privileged cases with an explicit reason.
 
+The workflow resolves the setup-uv executable to an absolute path before crossing the `sudo` boundary; it does not depend on `sudo` preserving the caller's `PATH`. Only the evidence-directory and strict-proof environment variables cross that boundary. This invocation detail does not relax the root, capability, tool, mount, or evidence requirements.
+
 The probe creates a private mount namespace, marks `/` recursively private, uses an owner-only temporary directory, copies the preflight-hashed packer into that directory and executes only that pinned copy, applies subprocess timeouts and a fixed locale, validates output magic and deterministic digests, checks effective mount flags, and requires successful reverse-order unmount before publishing evidence. Translation is bounded to 10,000 members, a 512 MiB input/total regular payload, a 256 MiB individual file, and 64 KiB PAX metadata per member; production-scale streaming is still an activation prerequisite for the later registry converter.
 
 Run the local pure gate:
