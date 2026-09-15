@@ -24,6 +24,7 @@ from typing import Any
 
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_changeset import ChangesetMember, EntryKind, normalize_changeset
+from .oci_packer import SQUASHFS_PACKER_FIXED_ARGUMENTS
 from .oci_tar_emitter import emit_normalized_overlay_tar
 
 _PACK_TIMEOUT_SECONDS = 120
@@ -573,13 +574,7 @@ def build_layer_filesystem(
                 resolved_packer,
                 "-",
                 str(out_path),
-                "-tar",
-                "-noappend",
-                "-xattrs",
-                "-mkfs-time",
-                "0",
-                "-processors",
-                "1",
+                *SQUASHFS_PACKER_FIXED_ARGUMENTS,
                 *_squashfs_root_arguments(translated_tar),
             ]
             _run_checked(command, input_bytes=translated_tar, failure_label="mksquashfs")
@@ -937,13 +932,7 @@ def probe_oci_filesystem_candidate(
                     "<verified-packer>",
                     "-",
                     "<output>",
-                    "-tar",
-                    "-noappend",
-                    "-xattrs",
-                    "-mkfs-time",
-                    "0",
-                    "-processors",
-                    "1",
+                    *SQUASHFS_PACKER_FIXED_ARGUMENTS,
                     *_squashfs_root_arguments(translate_oci_tar_to_overlay_tar(payload)),
                 )
             else:

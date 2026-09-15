@@ -894,6 +894,20 @@ def test_build_layer_filesystem_atomically_publishes_from_private_staging(tmp_pa
     output = tmp_path / "layer.squashfs"
 
     def fake_pack(command, **_kwargs):
+        assert command[3:15] == [
+            "-tar",
+            "-noappend",
+            "-xattrs",
+            "-comp",
+            "zstd",
+            "-Xcompression-level",
+            "3",
+            "-mkfs-time",
+            "0",
+            "-processors",
+            "1",
+            "-no-progress",
+        ]
         Path(command[2]).write_bytes(b"hsqs\0")
         return MagicMock(returncode=0, stdout=b"", stderr=b"")
 

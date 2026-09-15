@@ -615,13 +615,15 @@ Draft PR #1의 첫 full CI는 repository-wide `ruff format --check .`에서 기�
 
 Draft PR #1 follow-up `Test` run `35025114784` proved the format gate remediation but exposed a separate privileged workflow defect before the OCI filesystem probe started: `sudo` replaced the caller `PATH`, so bare `uv` was unavailable and no evidence file could be produced. Both root invocations now resolve the setup-uv executable in the unprivileged shell and pass that absolute path to `sudo`, while preserving only the two proof environment variables. Test selection, root/CAP_SYS_ADMIN requirements, evidence comparison, artifact retention, and the independent native KVM gate are unchanged.
 
+Workflow lookup remediation run `35025567423` reached the strict privileged probe and exposed an older candidate/production argv split: both paths emitted the same normalized tar, but the candidate probe used the packer's default compression while production explicitly used zstd level 3, so their SquashFS digests differed. The fixed deterministic argument sequence now has one `oci_packer` owner and is consumed by both paths; the production argv contract ID and production bytes are unchanged, while candidate evidence is regenerated in production format. Root metadata, OCI translation, mount semantics, evidence comparison, and the independent native KVM requirement remain unchanged.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "66be24d0608f5391abed743843e3036dfc5dce382e293d5e7cf2a1c2e3879450",
-  "reviewed_at": "2026-09-15T21:24:21Z",
-  "summary": "Reviewed privileged OCI filesystem workflow remediation: setup-uv is resolved before sudo while strict root, capability, evidence, artifact, and independent native KVM gates remain unchanged."
+  "source_sha256": "3884e7964ce0b52e8f73ba5309c16526a23b63bfbe6f9838d3c6c8a3a347dd0e",
+  "reviewed_at": "2026-09-15T21:30:48Z",
+  "summary": "Reviewed strict OCI filesystem proof alignment: candidate and production packers now share the existing deterministic zstd argv contract; production bytes and contract ID are unchanged, historical default-compression receipts remain non-authoritative, and native KVM requirements are untouched."
 }
 ```
 <!-- architecture-review:end -->

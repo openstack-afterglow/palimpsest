@@ -680,6 +680,20 @@ CAP_SYS_ADMIN requirement·두 process evidence 비교·artifact retention은 �
 같은 run의 native KVM skip/required-gate 실패도 이 workflow lookup 수정으로 우회하지
 않는다.
 
+Workflow lookup fix commit `8a22cf601baaac5c4596397c4ff38003827bf320`의
+`Test` run [`35025567423`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35025567423)은
+strict privileged probe까지 도달했다. Candidate probe와 production packer가 동일한
+normalized tar digest를 만들었지만 base SquashFS digest는 각각
+`ae84880f28360df6acc0564675bcbeb968530a891ad7b26c93f21f6c75f3ede9`와
+`7b86d6738665683625a33cfd002d126ce67318d4927bd1315936f287d78753dd`로
+달랐다. 원인은 candidate가 packer 기본 compression을 사용하고 production은 zstd
+level3를 명시한 기존 argv 분기다. Deterministic fixed argument sequence를
+`oci_packer` 한 곳에서 소유하고 candidate/prod 두 경로가 공유하도록 수정한다.
+Production argv·contract ID·artifact bytes는 바뀌지 않고 candidate evidence만
+production format으로 맞춘다. 이 run의 native KVM skip/required-gate 실패는 별도
+외부 gate로 유지한다.
+
+
 
 안전한 로컬 focused 명령:
 

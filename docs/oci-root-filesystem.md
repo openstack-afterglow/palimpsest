@@ -18,7 +18,8 @@ SquashFS 4.6.1 passed the two-layer fixture through its real `mksquashfs -tar` p
 The exact SquashFS command contract is:
 
 ```text
-mksquashfs - <output> -tar -noappend -xattrs -mkfs-time 0 -processors 1 \
+mksquashfs - <output> -tar -noappend -xattrs -comp zstd \
+  -Xcompression-level 3 -mkfs-time 0 -processors 1 -no-progress \
   -root-mode <mode> -root-uid <uid> -root-gid <gid> -root-time <mtime> \
   [-p "/ x <root-xattr>=0s<base64-value>" ...]
 ```
@@ -78,6 +79,8 @@ uv run python -m pytest -m oci_fs tests/oci_fs -vv
 ## Retained development evidence
 
 The two checked-in matching development receipts came from separate Ubuntu 24.04 privileged container processes in a Docker Desktop Linux VM on 2026-08-30:
+
+These receipts predate the production-argv alignment discovered by draft PR run `35025567423`: the semantics probe relied on the packer's default compression, while the production packer explicitly selected zstd level 3. They remain historical filesystem-semantics evidence, not current production-image digest or merge authority. The required GitHub job must regenerate zstd evidence with the shared argument contract.
 
 - kernel: `7.0.12-linuxkit`, architecture `aarch64`;
 - `squashfs-tools 4.6.1`: pass;

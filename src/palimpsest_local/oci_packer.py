@@ -37,6 +37,21 @@ SQUASHFS_PACK_POLICY_ID = "palimpsest.oci-squashfs-pack.v1"
 SQUASHFS_PACKER_ARGV_CONTRACT_ID = "palimpsest.oci-squashfs-mksquashfs-argv.v2"
 SQUASHFS_STRUCTURAL_VERIFIER_ID = "palimpsest.squashfs-superblock.v3"
 SQUASHFS_TOOLCHAIN_ID = "palimpsest.oci-squashfs-toolchain.v1"
+SQUASHFS_PACKER_FIXED_ARGUMENTS = (
+    "-tar",
+    "-noappend",
+    "-xattrs",
+    "-comp",
+    "zstd",
+    "-Xcompression-level",
+    "3",
+    "-mkfs-time",
+    "0",
+    "-processors",
+    "1",
+    "-no-progress",
+)
+
 
 _PACKER_RESOURCE_FAILURE_STAGES = frozenset(
     {
@@ -939,18 +954,7 @@ def pack_staged_squashfs(
             arguments = [
                 "-",
                 "layer.squashfs",
-                "-tar",
-                "-noappend",
-                "-xattrs",
-                "-comp",
-                "zstd",
-                "-Xcompression-level",
-                "3",
-                "-mkfs-time",
-                "0",
-                "-processors",
-                "1",
-                "-no-progress",
+                *SQUASHFS_PACKER_FIXED_ARGUMENTS,
                 *_root_arguments(staged, policy),
             ]
             return_code, _diagnostic_tail = _run_pinned(
