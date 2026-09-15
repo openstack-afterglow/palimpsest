@@ -186,7 +186,8 @@ def _pinned_pair(run_fd, receipt, *, writable=False):
 def _tail(run_fd, receipt, descriptors, modes, *, stamps=None):
     for digest, name in _filenames(receipt).items():
         fd, target = descriptors[digest], _target(receipt, digest)
-        _verify_payload(fd, target)
+        if stamps is None:
+            _verify_payload(fd, target)
         for info in (os.fstat(fd), os.stat(name, dir_fd=run_fd, follow_symlinks=False)):
             _metadata(info, target, modes=(modes[digest],))
             if stamps is not None and _immutable_stamp(info) != stamps[digest]:

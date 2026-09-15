@@ -322,6 +322,30 @@ path; ambiguous outcomes still retain exact evidence. A native exact-SHA rerun,
 not the local timeout-contract tests, determines whether the PyTorch CPU proof
 can now reach the framework command.
 
+At exact checkout `32ac1c3054c842ff268b9933a6ee42ab5817f6c3`, 119 focused
+Linux checks passed, but the first PyTorch rerun still failed at
+`public-run-command` after 326.87 seconds with `[parent-response:timeout]` and
+empty stdout. It retained inactive domain `ml-pytorch-aeed93b0` (UUID
+`a1ed4f44-4dd5-48ac-b948-86425eb2e710`, persistent, autostart disabled). The
+monitor journal reached `committed` revision 3 with `active_binding=null` and
+writer PID 1980445. After the parent timeout that live worker had accumulated
+`rchar=183498278198` in `/proc/1980445/io`. Source tracing found that every
+monitor-lease authority guard performed full digest validation of the 3.7 GB
+lower payload, so merely widening the bounded 15/30-second pair to 30/60 did
+not reach guest READY. An earlier command-shaping attempt was rejected by the
+remote shell before pytest collection and is not a native case result.
+
+The follow-up implementation retains full payload and ACL validation when an
+authority is reconstructed in each process and immediately before the launch
+worker connects to libvirt. It records the resulting immutable stamps. Later
+checks on that same authority validate the held descriptor and visible path
+identity, ownership, mode, link count, size, mtime, ctime, receipts, and ACL
+state against those stamps without rereading every lower payload byte. A
+metadata-only check without prior full validation is rejected. This removes
+avoidable repeated I/O without adding retries, cleanup authority, process
+termination, devices, or GPU access. CPU tensor success still requires a fresh
+exact-SHA native proof.
+
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
 

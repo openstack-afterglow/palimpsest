@@ -255,7 +255,7 @@ def _child_main(channel_fd):
             ipc.MonitorPreActivationBinding.from_dict(request.authority["binding"]), request.generation
         )
         directory_fd = os.dup(request.authority["entries"]["monitor"]["fd"])
-        authority.validate(directory_fd=directory_fd, binding=identity.binding)
+        authority.validate(directory_fd=directory_fd, binding=identity.binding, metadata_only=True)
         failure_stage = "monitor-spawn"
         handle = ipc.spawn_monitor_exec(
             directory_fd, identity, timeout=request.timeout_ms / 1000, launch_authority=authority

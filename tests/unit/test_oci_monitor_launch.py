@@ -84,6 +84,34 @@ def test_authority_pins_complete_explicit_roots_and_readonly_boot(inputs):
             os.fstat(fd)
 
 
+def test_metadata_only_validation_requires_a_prior_full_validation():
+    authority = launch.MonitorLaunchAuthority({})
+    with pytest.raises(StateError):
+        authority.validate(metadata_only=True)
+
+
+def test_revalidation_reuses_content_stamps_and_checks_metadata(inputs, monkeypatch):
+    from palimpsest_local import oci_boot_access, oci_lower_access, oci_stage1_access
+
+    with launch.prepare_monitor_launch_authority(*inputs) as authority:
+        calls = []
+
+        def metadata_only(label):
+            def verify(*_args, **kwargs):
+                assert kwargs["metadata_only"] is True
+                calls.append(label)
+                return kwargs["expected_stamp"]
+
+            return verify
+
+        monkeypatch.setattr(oci_lower_access, "verify_lower_launch", metadata_only("lower"))
+        monkeypatch.setattr(oci_boot_access, "verify_boot_launch", metadata_only("boot"))
+        monkeypatch.setattr(oci_stage1_access, "verify_stage1_launch", metadata_only("stage1"))
+        authority.validate(metadata_only=True)
+
+    assert calls == ["lower", "boot", "stage1", "stage1", "boot", "lower"]
+
+
 def test_child_reconstructs_only_explicit_duplicated_descriptors(inputs):
     with launch.prepare_monitor_launch_authority(*inputs) as authority:
         frame = authority.to_dict()

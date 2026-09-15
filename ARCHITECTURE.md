@@ -32,6 +32,8 @@ GPU 점검 승인이 아니며 기존 staged PCI 구현과 미승인 증거 변�
 
 PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-command`의 `[parent-response:timeout]`에서 멈춘 관측에 따라, 현재 source는 OCI monitor child의 bounded spawn handshake를 15초에서 허용 상한30초로, 이를 감싸는 parent coordinator response 대기를30초에서60초로 늘린다. 두 기한은 [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 모든 OCI-root launch에 고정 적용되고, coordinator의 hard maximum120초·불확실 결과 보존·no-kill·endpoint/journal 재인증·guest READY75초·guest exec 기한은 바꾸지 않는다. 이 변경은 GPU attach가 아니며, proof의 성공 조건은 여전히 hostdev/NIC/filesystem 없이 `torch`가 exact 2×2 결과 `[19,22,43,50]`, sum134, device `cpu`, `torch.cuda.is_available()==False`를 guest에서 출력하는 것이다. 관련 local coordinator/run-adapter/ML contract 선별119건은 통과했지만 native CPU 연산 성공은 별도 exact-SHA 실기로만 판정한다.
 
+`32ac1c3` exact checkout의 Linux 선별119건은 통과했지만 첫 PyTorch 재실기는 326.87초 뒤 다시 `public-run-command`의 `[parent-response:timeout]`에서 실패했다. 새 `ml-pytorch-aeed93b0`(UUID `a1ed4f44-4dd5-48ac-b948-86425eb2e710`)은 inactive·persistent·autostart disable로 보존됐고, monitor journal은 `committed` revision3과 `active_binding=null`, worker PID1980445를 남겼다. 부모 만료 뒤 살아 있던 worker의 `/proc/1980445/io`는 `rchar=183498278198`을 기록했다. Source 추적 결과 `MonitorLaunchAuthority.validate()`의 각 monitor-lease guard가 3.7GB lower payload 전체를 다시 digest했으며, 단순 30/60초 확대만으로는 이 반복 검증을 수용할 수 없었다. 현재 source는 각 process의 authority reconstruction과 worker launch 직전에 full payload/ACL 검증을 수행하고 그 결과의 immutable stamp를 보존한다. 그 뒤 같은 authority의 checkpoint는 held FD와 visible path의 device·inode·owner·mode·link count·size·mtime·ctime 및 기존 receipt/ACL 경계를 stamp와 재검증하되 payload를 다시 읽지 않는다. 선행 full validation 없는 metadata-only 요청은 거부한다. 이는 GPU 경로를 추가하지 않으며, CPU tensor proof는 다음 exact-SHA native 실기 전까지 미통과다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -425,13 +427,17 @@ ML proof의 private setup evidence에는 고정 framework/phase/status enum과
 실패는 기존 불확실 결과 안내에 고정 코드만 덧붙이며 raw exception·자식
 stderr·경로·argv를 노출하지 않는다. 관찰할 수 없는 내부 prepare/commit
 단계를 추정하지 않고 unknown exception은 고정 child-failed 범주로 제한한다.
-Request v1·실패 자원 보존·정리 권한·guest 정책은 그대로다. 현재 runtime은
-large-image materialization 직후의 bounded startup 여유를 위해 monitor child
-spawn handshake를15초에서30초로, parent coordinator response를30초에서60초로
-늘린다. 이는 재시도나 kill 권한을 추가하지 않으며 coordinator hard maximum
-120초, endpoint/journal 재인증과 불확실 결과 보존을 유지한다. 과거 PyTorch의
-상세 오류는 이미 폐기된 출력에서 복원할 수 없고, 새 기한 자체도 CPU 연산이나
-timeout 원인 수정을 증명하지 않는다.
+Request v1·실패 자원 보존·정리 권한·guest 정책은 그대로다. Runtime은 monitor
+child spawn handshake30초와 parent coordinator response60초의 bounded window를
+유지한다. `32ac1c3` PyTorch 실기가 이 window에서도 실패하고 monitor worker의
+누적 read가183,498,278,198 bytes였던 뒤, launch authority는 각 process의
+reconstruction과 worker launch 직전에 lower payload와 ACL을 full 검증해
+immutable stamp를 만든다. 같은 authority의 이후 guard는 held FD와 visible
+path의 device/inode/uid/gid/nlink/mode/size/mtime/ctime 및 기존 receipt·ACL
+경계를 stamp와 대조하고 lower payload를 반복 digest하지 않는다. 선행 full
+validation 없는 metadata-only 요청은 거부한다. Retry·kill·coordinator hard
+maximum120초·endpoint/journal 재인증·불확실 결과 보존은 바꾸지 않으며, 이
+최적화 자체는 CPU 연산 성공이나 과거 timeout의 단일 원인을 증명하지 않는다.
 
 후속 monitor-client 오류는 `timeout-source`에 client-deadline·ipc-timeout·
 run-lock-timeout 세 고정 enum만 허용한다. 기존 보존 안내를 유지하고 raw
@@ -584,9 +590,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6e832708e460ae96fba7b2bc32f8371fe5448109a237cba014d7bdc3251fe135",
-  "reviewed_at": "2026-09-15T04:34:48Z",
-  "summary": "Reviewed bounded OCI monitor startup expansion from child/parent 15/30 seconds to 30/60 seconds for the existing GPU-free PyTorch CPU proof; retry, process termination, cleanup authority, endpoint authentication, guest readiness, exec, and GPU contracts remain unchanged."
+  "source_sha256": "bac7a2d4f9e6c71741020de9d03b126cbf0e1694cff514e07ecf72fc77835f2f",
+  "reviewed_at": "2026-09-15T04:56:21Z",
+  "summary": "Reviewed per-process full launch-authority validation with immutable metadata-stamp revalidation for later guards; repeated multi-gigabyte lower rehashes are removed while descriptor/path identity, ctime, ACL, receipt, no-retry, no-kill, cleanup, and GPU boundaries remain enforced."
 }
 ```
 <!-- architecture-review:end -->

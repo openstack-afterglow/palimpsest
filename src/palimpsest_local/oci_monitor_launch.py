@@ -207,6 +207,7 @@ class MonitorLaunchAuthority:
     def __init__(self, frame: dict[str, Any]) -> None:
         self._frame = copy.deepcopy(frame)
         self._closed = False
+        self._validation_stamps: tuple[object, object, object] | None = None
 
     @classmethod
     def from_dict(cls, value: object, *, excluded_fds: tuple[int, ...] = ()) -> MonitorLaunchAuthority:
@@ -322,12 +323,19 @@ class MonitorLaunchAuthority:
         return tuple(entry["fd"] for entry in self._frame["entries"].values())
 
     def to_dict(self) -> dict[str, Any]:
-        self.validate()
+        self.validate(metadata_only=True)
         return copy.deepcopy(self._frame)
 
-    def validate(self, directory_fd: int | None = None, binding: MonitorPreActivationBinding | None = None) -> None:
-        if self._closed:
+    def validate(
+        self,
+        directory_fd: int | None = None,
+        binding: MonitorPreActivationBinding | None = None,
+        *,
+        metadata_only: bool = False,
+    ) -> None:
+        if self._closed or type(metadata_only) is not bool or (metadata_only and self._validation_stamps is None):
             raise _invalid()
+        expected_stamps = self._validation_stamps if metadata_only else None
         try:
             selected = MonitorPreActivationBinding.from_dict(self._frame["binding"])
             if binding is not None:
@@ -352,6 +360,8 @@ class MonitorLaunchAuthority:
                 self._frame["lower_access"],
                 self._frame["entries"],
                 binding=selected,
+                metadata_only=metadata_only,
+                expected_stamp=None if expected_stamps is None else expected_stamps[0],
             )
             boot_stamp = verify_boot_launch(
                 boot_roots,
@@ -359,17 +369,22 @@ class MonitorLaunchAuthority:
                 self._frame["boot_access"],
                 self._frame["entries"],
                 binding=selected,
+                metadata_only=metadata_only,
+                expected_stamp=None if expected_stamps is None else expected_stamps[1],
             )
             from .oci_stage1_access import verify_stage1_launch
 
             stage1_stamp = verify_stage1_launch(
                 StatePaths(
-                    _path(self._frame["entries"]["config"]["path"]), _path(self._frame["entries"]["state"]["path"])
+                    _path(self._frame["entries"]["config"]["path"]),
+                    _path(self._frame["entries"]["state"]["path"]),
                 ),
                 stage1_access,
                 self._frame["entries"]["run"]["fd"],
                 self._frame["entries"].get("stage1_transport", {}).get("fd"),
                 binding=selected,
+                metadata_only=metadata_only,
+                expected_stamp=None if expected_stamps is None else expected_stamps[2],
             )
             from .oci_root_access import verify_root_launch_member
 
@@ -512,11 +527,13 @@ class MonitorLaunchAuthority:
                 metadata_only=True,
                 expected_stamp=lower_stamp,
             )
+            if not metadata_only:
+                self._validation_stamps = (lower_stamp, boot_stamp, stage1_stamp)
         except (OSError, KeyError, TypeError, ValueError, PalimpsestError):
             raise _invalid() from None
 
     def _rebuild(self) -> tuple[StatePaths, OCIStore, VerifiedHostBootArtifacts, DomainProfile]:
-        self.validate()
+        self.validate(metadata_only=True)
         entries = self._frame["entries"]
         roots = StatePaths(Path(entries["config"]["path"]), Path(entries["state"]["path"]))
         boot = verify_host_boot_artifacts(
@@ -530,7 +547,7 @@ class MonitorLaunchAuthority:
         store = OCIStore(roots)
         if store.identity != self._frame["store_identity"]:
             raise _invalid()
-        self.validate()
+        self.validate(metadata_only=True)
         return roots, store, boot, _profile(self._frame["profile"])
 
     def run(
@@ -559,7 +576,7 @@ class MonitorLaunchAuthority:
             self.validate(directory_fd, binding)
             roots, store, boot, profile = self._rebuild()
             connection = connect_oci_root_libvirt(binding.libvirt_uri)
-            self.validate(directory_fd, binding)
+            self.validate(directory_fd, binding, metadata_only=True)
             return launch_defined_oci_root_domain(
                 roots,
                 binding.record.name,
@@ -571,7 +588,7 @@ class MonitorLaunchAuthority:
                 monitor_lease=lease,
                 timeout_seconds=self._frame["timeout_seconds"],
                 terminal_timeout_seconds=self._frame["terminal_timeout_seconds"],
-                authority_guard=lambda: self.validate(directory_fd, binding),
+                authority_guard=lambda: self.validate(directory_fd, binding, metadata_only=True),
                 **({"stop_control": stop_control} if stop_control is not None else {}),
                 **({"exec_control": exec_control} if exec_control is not None else {}),
             )
@@ -594,7 +611,7 @@ class MonitorLaunchAuthority:
                 pass
 
     def __enter__(self) -> MonitorLaunchAuthority:
-        self.validate()
+        self.validate(metadata_only=True)
         return self
 
     def __exit__(self, *_args: object) -> None:

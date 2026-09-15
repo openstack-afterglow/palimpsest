@@ -88,6 +88,28 @@ def test_distinct_copies_preserve_cas_and_ordered_occurrences(case):
     assert "/blobs/" not in json.dumps(receipt.to_dict())
 
 
+def test_stamped_tail_skips_payload_rehash_but_rejects_metadata_change(case, monkeypatch):
+    receipt = publish(case)
+    path = next(iter(load(case).values()))
+    run_fd = os.open(case.run_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with exports._pinned_pair(run_fd, receipt) as descriptors:
+            modes = dict.fromkeys(descriptors, 0o400)
+            stamps = {digest: exports._immutable_stamp(os.fstat(fd)) for digest, fd in descriptors.items()}
+            monkeypatch.setattr(
+                exports,
+                "_verify_payload",
+                lambda *_args: pytest.fail("stamped metadata revalidation rehashed lower payload"),
+            )
+            exports._tail(run_fd, receipt, descriptors, modes, stamps=stamps)
+            path.chmod(0o600)
+            path.chmod(0o400)
+            with pytest.raises(StateError):
+                exports._tail(run_fd, receipt, descriptors, modes, stamps=stamps)
+    finally:
+        os.close(run_fd)
+
+
 def test_completed_replay_is_readonly(case, monkeypatch):
     receipt = publish(case)
     before = case.state.read_bytes()

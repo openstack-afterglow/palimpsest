@@ -62,12 +62,19 @@ files_modified:
   disabled). Final full inventory is 20 inactive domains, active 0, and all 16
   exact archive SHA-256 values unchanged. No retained domain was stopped,
   undefined, or adopted.
-- current CPU-only PyTorch follow-up extends only the bounded monitor startup
-  pair from child/parent 15/30 seconds to 30/60 seconds. The proof remains
-  GPU-free and requires guest output with the exact matrix result, sum 134,
-  device `cpu`, and `torch.cuda.is_available()==False`; local coordinator,
-  run-adapter, and ML contract selections passed 119 checks. Native success is
-  not claimed until an exact-SHA server run reaches and validates that output.
+- `32ac1c3` raised the bounded monitor child/parent startup pair from 15/30 to
+  30/60 seconds. Its 119 focused Linux checks passed, but the PyTorch native
+  case still failed after 326.87 seconds at `public-run-command` with
+  `[parent-response:timeout]`, retaining inactive `ml-pytorch-aeed93b0` (UUID
+  `a1ed4f44-4dd5-48ac-b948-86425eb2e710`). The committed monitor writer PID
+  1980445 remained live and showed `rchar=183498278198`; source tracing found
+  repeated full 3.7 GB lower-payload validation at monitor-lease checkpoints.
+- current follow-up keeps full payload/ACL checks at per-process authority
+  reconstruction and immediately before worker launch, then reuses immutable
+  stamps for later metadata/receipt/ACL guards. Metadata-only validation cannot
+  run before a full validation. Focused monitor/runtime selections passed
+  242 checks with 6 skips; broader launch-access/store selections passed 564.
+  This is not yet native CPU tensor success and adds no GPU path.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane

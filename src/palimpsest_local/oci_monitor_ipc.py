@@ -1993,7 +1993,7 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
             authority = MonitorLaunchAuthority.from_dict(
                 value["launch_authority"], excluded_fds=(directory_fd, config_fd)
             )
-            authority.validate(directory_fd=directory_fd, binding=identity.binding)
+            authority.validate(directory_fd=directory_fd, binding=identity.binding, metadata_only=True)
         if parent.pid == os.getpid():
             raise MonitorIPCError(MonitorIPCErrorCategory.UNAUTHORIZED_PEER)
         writer = current_process_identity()
@@ -2034,7 +2034,7 @@ def _child_main(directory_fd: int, config_fd: int) -> int:
                     bound.validate()
                     if lease.snapshot.phase != "committed":
                         raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_JOURNAL)
-                    authority.validate(directory_fd=directory_fd, binding=identity.binding)
+                    authority.validate(directory_fd=directory_fd, binding=identity.binding, metadata_only=True)
                 except Exception:
                     # COMMIT alone grants no VM mutation authority. Parent
                     # death/lost fence leaves an inert discoverable journal.
@@ -2247,7 +2247,7 @@ def spawn_monitor_exec(
 
         if type(launch_authority) is not MonitorLaunchAuthority:
             raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
-        launch_authority.validate(directory_fd=directory_fd, binding=identity.binding)
+        launch_authority.validate(directory_fd=directory_fd, binding=identity.binding, metadata_only=True)
         authority_fds = launch_authority.pass_fds
         if directory_fd in authority_fds:
             raise MonitorIPCError(MonitorIPCErrorCategory.INVALID_IDENTITY)
