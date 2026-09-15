@@ -619,6 +619,20 @@ standard-library/Git 도구다. 현재 source는 stamp timestamp에
 regression이 이 경계를 고정하며 package의 Python 3.12+ 지원 범위는 낮추지
 않는다.
 
+Exact checkout `137fd784ebf3ac329cf3c4e9586fd941925e3126`의 격리된
+local development-package gate에서 system Python 3.9 architecture check,
+generated CLI reference와 lane manifest check, Ruff lint가 통과했다.
+`core-cli qualification`은 1,384건 통과·7건 skip(28.09초)이었고 wheel/sdist
+build, source asset 검증, 격리 wheel install, `uv tool` install과 CLI
+version/help smoke test도 통과했다. Wheel SHA-256은
+`487c4e4cebbc828d8233d8926a4dbe15ebde79b4bf646264678327a43048baed`,
+sdist SHA-256은
+`20a8b34275b245548bb576ccea807b7e217fd6d9e6230bc19b20cc21c8166d7d`다.
+추가 whole-tree `ruff format --check .`은 이 변경 밖 기존11개 파일의 format
+drift를 보고했고, guard source/test는 포함하지 않았다. 이 local gate는 Python
+3.13 package build 증거이며 GitHub의 Python 3.12 workflow 실행이나 publication은
+아니다.
+
 안전한 로컬 focused 명령:
 
 ```sh
