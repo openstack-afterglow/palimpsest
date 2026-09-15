@@ -16,6 +16,7 @@ All notable changes to Palimpsest Local are documented here.
 - Added persistent single-writer block volumes: raw ext4 `virtio-blk` on KVM and receipt-bound Lima standalone disks, with preserve-by-default `down` and exact-owner `down --volumes` deletion.
 - Added Lima static TCP project forwarding and guest-journal logs while Linux libvirt project ports fail closed until a verified `passt` path is available.
 - Added dynamic Zsh, Bash, and Fish completion generated from the live `argparse` command tree.
+- Added OCI-root publication reporting to the top-level `ps` `PORTS` column and typed `inspect` JSON, derived from the committed domain plan without backend calls or state writes.
 
 ### Fixed
 

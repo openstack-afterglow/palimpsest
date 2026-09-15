@@ -1164,6 +1164,7 @@ ALLOWED_RUNTIME_STATUSES = {
         }
     ),
 }
+_INSPECT_LIFECYCLE_STATUSES = frozenset().union(*ALLOWED_RUNTIME_STATUSES.values())
 
 _SUMMARY_DETAIL_KEYS = frozenset(
     {
@@ -1351,7 +1352,7 @@ class InspectLifecycle:
     updated_at: str | None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.status, str) or self.status not in ALLOWED_RUNTIME_STATUSES[RuntimeKind.CLOUD_IMAGE]:
+        if not isinstance(self.status, str) or self.status not in _INSPECT_LIFECYCLE_STATUSES:
             raise ValueError("inspect lifecycle has an invalid status")
         if type(self.lifecycle_revision) is not int or not 0 <= self.lifecycle_revision <= _MAX_LIFECYCLE_REVISION:
             raise ValueError("inspect lifecycle has an invalid revision")
@@ -1474,13 +1475,35 @@ class CloudImageInspectDetail:
 
 
 @dataclass(frozen=True, slots=True)
+class OCIRootInspectDetail:
+    """Public OCI-root detail derived from a committed domain plan."""
+
+    memory_mib: int | None
+    vcpus: int | None
+    network: str | None
+    ports: tuple[InspectPort, ...]
+    guest_ip: str | None
+
+    def __post_init__(self) -> None:
+        for value, minimum, maximum in ((self.memory_mib, 256, 1_048_576), (self.vcpus, 1, 256)):
+            if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+                raise ValueError("OCI-root inspect detail has an invalid numeric field")
+        if self.network is not None and self.network not in {"nat", "host-only", "none"}:
+            raise ValueError("OCI-root inspect detail has an invalid network")
+        if not isinstance(self.ports, tuple) or not all(isinstance(item, InspectPort) for item in self.ports):
+            raise TypeError("OCI-root inspect detail requires immutable ports")
+        if self.guest_ip is not None and not _valid_ip(self.guest_ip):
+            raise ValueError("OCI-root inspect detail has an invalid guest IP")
+
+
+@dataclass(frozen=True, slots=True)
 class InspectRecord:
     """Versioned, deeply immutable public projection of one pinned run ledger."""
 
     schema_version: int
     record: ExistingRunRecord
     lifecycle: InspectLifecycle
-    detail: CloudImageInspectDetail
+    detail: CloudImageInspectDetail | OCIRootInspectDetail
     warnings: tuple[InspectWarningCategory, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1488,12 +1511,17 @@ class InspectRecord:
             raise ValueError("inspect record has an unsupported response schema version")
         if not isinstance(self.record, ExistingRunRecord):
             raise TypeError("inspect record requires an ExistingRunRecord")
-        if self.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE:
-            raise ValueError("inspect record requires a cloud-image run")
-        if not isinstance(self.lifecycle, InspectLifecycle):
-            raise TypeError("inspect record requires an InspectLifecycle")
-        if not isinstance(self.detail, CloudImageInspectDetail):
-            raise TypeError("inspect record requires a cloud-image detail")
+        runtime_kind = self.record.dispatch_key.runtime_kind
+        if runtime_kind is RuntimeKind.CLOUD_IMAGE:
+            if not isinstance(self.detail, CloudImageInspectDetail):
+                raise TypeError("cloud-image inspect requires a cloud-image detail")
+        elif runtime_kind is RuntimeKind.OCI_ROOT:
+            if not isinstance(self.detail, OCIRootInspectDetail):
+                raise TypeError("OCI-root inspect requires an OCI-root detail")
+        else:  # pragma: no cover - DispatchKey is a closed enum contract
+            raise ValueError("inspect record has an unsupported runtime kind")
+        if self.lifecycle.status not in ALLOWED_RUNTIME_STATUSES[runtime_kind]:
+            raise ValueError("inspect lifecycle status does not match the runtime kind")
         if not isinstance(self.warnings, tuple) or not all(
             isinstance(item, InspectWarningCategory) for item in self.warnings
         ):
@@ -1632,6 +1660,7 @@ __all__ = (
     "CapabilityProfile",
     "CapabilityRequirement",
     "CloudImageInspectDetail",
+    "OCIRootInspectDetail",
     "CloudInitSnapshot",
     "CloudInitWriteFileSnapshot",
     "CommitResult",

@@ -8,6 +8,7 @@ import inspect
 import json
 import uuid
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -21,6 +22,10 @@ from palimpsest_local.runtime_types import (
     CommitResult,
     DispatchKey,
     ExistingRunRecord,
+    InspectLifecycle,
+    InspectPort,
+    InspectRecord,
+    OCIRootInspectDetail,
     ProcessCapabilities,
     ProcessExit,
     ProcessExitCategory,
@@ -28,8 +33,10 @@ from palimpsest_local.runtime_types import (
     ProcessSignal,
     ProcessStatusEvent,
     ProcessStream,
+    RunAggregationResult,
     RunAttachmentMode,
     RunResult,
+    RunSummary,
     RuntimeBackend,
     RuntimeKind,
     RuntimePreflightError,
@@ -92,6 +99,30 @@ def _fake_run_result(name: str, backend: RuntimeBackend, guest_ip: str | None = 
         dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
     )
     return RunResult(record, "running", True, RunAttachmentMode.DETACHED, guest_ip)
+
+
+def _oci_inspect_record() -> InspectRecord:
+    record = ExistingRunRecord(
+        name="demo-vm",
+        run_id="862ffb44-6795-4618-b2d8-c0750439fac3",
+        state_schema_version=2,
+        dispatch_key=DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+    return InspectRecord(
+        schema_version=1,
+        record=record,
+        lifecycle=InspectLifecycle("running", 4, "2026-09-16T00:00:00Z", "2026-09-16T00:01:00Z"),
+        detail=OCIRootInspectDetail(
+            memory_mib=4096,
+            vcpus=4,
+            network="nat",
+            ports=(
+                InspectPort("127.0.0.1", 18080, 8080, "tcp"),
+                InspectPort("0.0.0.0", 18443, 8443, "udp"),
+            ),
+            guest_ip="10.0.2.15",
+        ),
+    )
 
 
 def _snapshot_cli_state(root: Path) -> dict[str, tuple[int, int, bytes | None]]:
@@ -1458,9 +1489,77 @@ def test_cli_inspect_json_does_not_serialize_internal_ledger_fields(
     assert "ssh_config_file" not in rendered
 
 
+def test_cli_inspect_serializes_oci_root_published_ports(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_run_ledger(backend="kvm", runtime_kind="oci-root")
+    inspected = _oci_inspect_record()
+    monkeypatch.setattr(runtime_dispatch, "inspect_run", lambda *_args, **_kwargs: inspected)
+
+    assert cli.main(["inspect", "demo-vm"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["identity"] == {"runtime_kind": "oci-root", "backend": "kvm"}
+    assert payload["detail"] == {
+        "type": "oci-root",
+        "memory_mib": 4096,
+        "vcpus": 4,
+        "network": "nat",
+        "ports": [
+            {"host_ip": "127.0.0.1", "host_port": 18080, "guest_port": 8080, "protocol": "tcp"},
+            {"host_ip": "0.0.0.0", "host_port": 18443, "guest_port": 8443, "protocol": "udp"},
+        ],
+        "guest_ip": "10.0.2.15",
+    }
+
+
+def test_cli_ps_prints_each_published_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state.init_roots()
+    inspected = _oci_inspect_record()
+    details = MappingProxyType(
+        {
+            "base_digest": "",
+            "base_arch": "",
+            "layers": (),
+            "memory_mib": 4096,
+            "vcpus": 4,
+            "network": "nat",
+            "ports": tuple(
+                MappingProxyType(
+                    {
+                        "host_ip": port.host_ip,
+                        "host_port": port.host_port,
+                        "guest_port": port.guest_port,
+                        "protocol": port.protocol,
+                    }
+                )
+                for port in inspected.detail.ports
+            ),
+            "volumes": (),
+            "ssh": MappingProxyType({"host": None, "port": 22}),
+            "guest_ip": "10.0.2.15",
+            "created_at": "2026-09-16T00:00:00Z",
+            "updated_at": "2026-09-16T00:01:00Z",
+        }
+    )
+    aggregation = RunAggregationResult((RunSummary(inspected.record, "running", details, stale=True),), ())
+    monkeypatch.setattr(runtime_dispatch, "ps", lambda **_kwargs: aggregation)
+
+    assert cli.main(["ps"]) == 0
+
+    output = capsys.readouterr().out
+    assert "PORTS" in output
+    assert "127.0.0.1:18080->8080/tcp" in output
+    assert "0.0.0.0:18443->8443/udp" in output
+
+
 @pytest.mark.parametrize(
     ("operation", "target_name", "argv", "_expected_kwargs"),
-    [item for item in _CLI_EXISTING_RUN_OPERATIONS if item[0] not in {"stop", "rm"}],
+    [item for item in _CLI_EXISTING_RUN_OPERATIONS if item[0] not in {"stop", "rm", "inspect"}],
 )
 def test_cli_oci_root_existing_operations_fail_typed_before_backend_subprocess_or_file_side_effects(
     monkeypatch: pytest.MonkeyPatch,

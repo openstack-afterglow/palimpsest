@@ -152,7 +152,7 @@ def capability_profile(
             identifiers = ("host.kvm-device", "tool.qemu-img", "tool.qemu-system", "python.libvirt")
         elif operation is RuntimeOperation.RM:
             identifiers = ("python.libvirt",)
-        elif operation in {RuntimeOperation.STOP, RuntimeOperation.PS, RuntimeOperation.EXEC}:
+        elif operation in {RuntimeOperation.STOP, RuntimeOperation.INSPECT, RuntimeOperation.PS, RuntimeOperation.EXEC}:
             identifiers = ()
         else:
             raise RuntimeCapabilityError(operation, dispatch_key)

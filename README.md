@@ -215,8 +215,11 @@ previous no-NIC default, so use `--network none` to keep the old isolation.
 traffic only reaches published ports, host addresses default to `127.0.0.1`,
 and external exposure requires writing `0.0.0.0` explicitly. Palimpsest creates
 no libvirt network, bridge, firewall rule or DNS service: the NIC and every
-host listener belong to the VM's own QEMU process. `palimpsest oci network NAME`
-projects the committed mode, publications and external exposure. See the
+host listener belong to the VM's own QEMU process. `palimpsest ps` includes
+configured publications in its `PORTS` column, `palimpsest inspect NAME` emits
+them as typed JSON, and `palimpsest oci network NAME` performs the stronger
+OCI-specific committed-plan verification and external-exposure classification.
+Configured publications on a stopped run are not live-listener claims. See the
 [network contract](docs/oci-network.md) for limits, including no IPv6, no
 privileged host ports and no VM-to-VM network.
 

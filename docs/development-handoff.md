@@ -559,10 +559,13 @@ PCI 노드도 함께 통과했다.
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
 7. **Networking next step:** `nat`, `host-only` and explicit publication are
    natively qualified at exact `9ada8ca` for the three pinned images only.
-   Remaining work, in order: report the `--publish` endpoints in `ps`/`inspect`
-   rather than only in `oci network`; decide whether IPv6 publication and
-   VM-to-VM networking become separate contracts; and re-run the three nodes
-   whenever the guest ELF, QEMU or libvirt changes. Resolve capacity by using
+   Top-level `ps` now reports configured publications in a `PORTS` column and
+   `inspect` supports OCI-root with typed network/port/guest-address fields,
+   projected from one committed-plan ledger snapshot without backend calls or
+   writes. These are configured endpoints, not listener-liveness claims.
+   Remaining work, in order: decide whether IPv6 publication and VM-to-VM
+   networking become separate contracts; and re-run the three nodes whenever
+   the guest ELF, QEMU or libvirt changes. Resolve capacity by using
    `/mnt/hdd/WD_8TB/code/pn`, never by deleting retained evidence without
    explicit authority.
 8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback

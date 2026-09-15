@@ -31,6 +31,7 @@ import palimpsest_local.oci_root_prepare as oci_root_prepare_module
 import palimpsest_local.oci_root_runtime as oci_root_runtime_module
 import palimpsest_local.oci_store as oci_store_module
 import palimpsest_local.platforms as platforms
+import palimpsest_local.runtime_dispatch as runtime_dispatch_module
 import palimpsest_local.state as state_module
 from palimpsest_local.artifact_store import ArtifactStore, ArtifactStoreError
 from palimpsest_local.errors import ArtifactValidationError, StateError
@@ -54,6 +55,7 @@ from palimpsest_local.oci_guest_stage1 import parse_guest_kernel_cmdline, verify
 from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.oci_lifecycle_transport import OCILifecycleHandoffReceipt
 from palimpsest_local.oci_materializer import OCIImageMaterializationReceipt
+from palimpsest_local.oci_network import OCINetworkConfig
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
@@ -2162,7 +2164,13 @@ def _evented_connection(
     return oci_root_runtime_module.connect_oci_root_libvirt("qemu:///system")
 
 
-def _committed_oci_domain(tmp_path: Path, name: str, *, user_override: OCIUserSpec | None = None):
+def _committed_oci_domain(
+    tmp_path: Path,
+    name: str,
+    *,
+    user_override: OCIUserSpec | None = None,
+    network: OCINetworkConfig | None = None,
+):
     roots, store = _short_oci_store()
     tools = _RootVolumeTools()
     kernel = tmp_path / "vmlinuz"
@@ -2182,7 +2190,15 @@ def _committed_oci_domain(tmp_path: Path, name: str, *, user_override: OCIUserSp
             user_override=user_override,
             runner=tools,
         )
-    preview = build_oci_root_domain_plan(roots, prepared, store, boot, profile, runner=tools)
+    preview = build_oci_root_domain_plan(
+        roots,
+        prepared,
+        store,
+        boot,
+        profile,
+        network=network or OCINetworkConfig("none"),
+        runner=tools,
+    )
     plan = commit_oci_root_domain_plan(roots, preview, store, runner=tools)
     return roots, store, tools, boot, profile, prepared, plan
 
@@ -2203,6 +2219,36 @@ def test_user_override_is_bound_through_preparation_domain_and_stage1(tmp_path: 
     assert OCIStage1Plan.from_domain_plan(plan).process == plan.process
     ledger = read_run_ledger_snapshot(roots, "redis-user").state["oci_root"]
     assert OCIRootPreparationTransaction.from_dict(ledger) == prepared.transaction
+
+
+def test_ps_and_inspect_report_ports_from_the_committed_oci_domain_plan(tmp_path: Path) -> None:
+    network = OCINetworkConfig.resolve("nat", ["127.0.0.1:18080:8080", "0.0.0.0:18443:8443/udp"])
+    roots, _store_value, _tools, _boot, _profile, _prepared, plan = _committed_oci_domain(
+        tmp_path,
+        "network-report",
+        network=network,
+    )
+    state_before = (roots.runs / "network-report" / "state.json").read_bytes()
+
+    inspected = runtime_dispatch_module.inspect_run("network-report", roots=roots)
+    summaries = runtime_dispatch_module.ps(roots=roots).summaries
+
+    assert inspected.detail.network == "nat"
+    assert inspected.detail.guest_ip == "10.0.2.15"
+    assert inspected.detail.memory_mib == plan.memory_mib
+    assert inspected.detail.vcpus == plan.vcpus
+    assert [(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in inspected.detail.ports] == [
+        ("127.0.0.1", 18080, 8080, "tcp"),
+        ("0.0.0.0", 18443, 8443, "udp"),
+    ]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.details["network"] == "nat"
+    assert summary.details["guest_ip"] == "10.0.2.15"
+    assert tuple(dict(port) for port in summary.details["ports"]) == tuple(
+        port.to_dict() for port in network.published_ports
+    )
+    assert (roots.runs / "network-report" / "state.json").read_bytes() == state_before
 
 
 def test_oci_root_prepare_commits_path_free_ready_ledger_and_recovers(tmp_path: Path) -> None:

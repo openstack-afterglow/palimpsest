@@ -102,6 +102,7 @@ from .runtime_types import (
     LogStreamError,
     LogTerminalCategory,
     LogTerminalEvent,
+    OCIRootInspectDetail,
     ProcessOutputEvent,
     ProcessSession,
     ProcessSignal,
@@ -128,7 +129,51 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
     """Manually serialize the stable public inspect schema without reflective fields."""
 
     detail = inspected.detail
-    if not isinstance(detail, CloudImageInspectDetail):  # pragma: no cover - closed typed contract
+    ports = [
+        {
+            "host_ip": port.host_ip,
+            "host_port": port.host_port,
+            "guest_port": port.guest_port,
+            "protocol": port.protocol,
+        }
+        for port in detail.ports
+    ]
+    if isinstance(detail, CloudImageInspectDetail):
+        detail_payload: dict[str, object] = {
+            "type": "cloud-image",
+            "base": {
+                "digest": detail.base.digest,
+                "arch": detail.base.arch,
+                "disk_format": detail.base.disk_format,
+            },
+            "layers": [{"digest": layer.digest, "target_dev": layer.target_dev} for layer in detail.layers],
+            "memory_mib": detail.memory_mib,
+            "vcpus": detail.vcpus,
+            "network": detail.network,
+            "ports": ports,
+            "volumes": [
+                {
+                    "name": volume.name,
+                    "mount_path": volume.mount_path,
+                    "filesystem": volume.filesystem,
+                    "read_only": volume.read_only,
+                    "target_dev": volume.target_dev,
+                }
+                for volume in detail.volumes
+            ],
+            "ssh": {"host": detail.ssh.host, "port": detail.ssh.port},
+            "guest_ip": detail.guest_ip,
+        }
+    elif isinstance(detail, OCIRootInspectDetail):
+        detail_payload = {
+            "type": "oci-root",
+            "memory_mib": detail.memory_mib,
+            "vcpus": detail.vcpus,
+            "network": detail.network,
+            "ports": ports,
+            "guest_ip": detail.guest_ip,
+        }
+    else:  # pragma: no cover - InspectRecord enforces the closed detail union
         raise PalimpsestError("unsupported runtime inspect detail")
     return {
         "schema_version": inspected.schema_version,
@@ -148,39 +193,7 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
             "created_at": inspected.lifecycle.created_at,
             "updated_at": inspected.lifecycle.updated_at,
         },
-        "detail": {
-            "type": "cloud-image",
-            "base": {
-                "digest": detail.base.digest,
-                "arch": detail.base.arch,
-                "disk_format": detail.base.disk_format,
-            },
-            "layers": [{"digest": layer.digest, "target_dev": layer.target_dev} for layer in detail.layers],
-            "memory_mib": detail.memory_mib,
-            "vcpus": detail.vcpus,
-            "network": detail.network,
-            "ports": [
-                {
-                    "host_ip": port.host_ip,
-                    "host_port": port.host_port,
-                    "guest_port": port.guest_port,
-                    "protocol": port.protocol,
-                }
-                for port in detail.ports
-            ],
-            "volumes": [
-                {
-                    "name": volume.name,
-                    "mount_path": volume.mount_path,
-                    "filesystem": volume.filesystem,
-                    "read_only": volume.read_only,
-                    "target_dev": volume.target_dev,
-                }
-                for volume in detail.volumes
-            ],
-            "ssh": {"host": detail.ssh.host, "port": detail.ssh.port},
-            "guest_ip": detail.guest_ip,
-        },
+        "detail": detail_payload,
         "warnings": [warning.value for warning in inspected.warnings],
     }
 
@@ -2237,7 +2250,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         for error in aggregation.errors:
             identity = error.name or error.entry_token or "unknown-entry"
             print(f"warning: {identity}: {error.message}", file=sys.stderr)
-        print(f"{'NAME':<20} {'STATUS':<12} {'BASE':<12} {'LAYERS':<8} {'IP':<16} {'CREATED':<24}")
+        print(f"{'NAME':<20} {'STATUS':<12} {'BASE':<12} {'LAYERS':<8} {'IP':<16} {'CREATED':<24} PORTS")
         for summary in aggregation.summaries:
             if summary.status == "removed":
                 continue
@@ -2250,9 +2263,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
             ssh_host = ssh.get("host") if isinstance(ssh, Mapping) else None
             guest_ip = details.get("guest_ip") or ssh_host or "-"
             created_at = details.get("created_at") or "-"
+            raw_ports = details.get("ports")
+            published_ports = "-"
+            if isinstance(raw_ports, tuple) and raw_ports:
+                published_ports = ",".join(
+                    f"{port['host_ip']}:{port['host_port']}->{port['guest_port']}/{port['protocol']}"
+                    for port in raw_ports
+                    if isinstance(port, Mapping)
+                )
             print(
                 f"{summary.name:<20} {summary.status:<12} {base_hex:<12} "
-                f"{layers_count:<8} {guest_ip:<16} {created_at:<24}"
+                f"{layers_count:<8} {guest_ip:<16} {created_at:<24} {published_ports}"
             )
 
     elif op == "inspect":

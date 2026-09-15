@@ -17,6 +17,7 @@ from typing import Any
 
 from . import cloud_runtime, lima, log_stream, platforms, state
 from .errors import StateError
+from .oci_network import OCI_NETWORK_GUEST_ADDRESS
 from .oci_run_request import LocalOCIRunRequest
 from .refs import RunSpec, VolumeAttachment
 from .runtime_types import (
@@ -40,6 +41,7 @@ from .runtime_types import (
     LifecycleWarningCategory,
     LogMode,
     LogStream,
+    OCIRootInspectDetail,
     PreflightReport,
     PreflightReportPurpose,
     ProcessSession,
@@ -1186,9 +1188,40 @@ def _project_mapping_items(
     return tuple(projected)
 
 
+def _committed_oci_domain_plan(snapshot: state.RunLedgerSnapshot) -> Any | None:
+    """Parse a committed OCI plan from one snapshot without filesystem reads."""
+
+    if snapshot.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT:
+        return None
+    value = snapshot.state.get("oci_root_domain")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"digest", "plan"}:
+        raise StateError("OCI-root domain plan ledger is invalid")
+    from .oci_root_kvm import OCIRootDomainPlan
+
+    plan = OCIRootDomainPlan.from_dict(value["plan"])
+    if value["digest"] != plan.digest or plan.run_id != snapshot.record.run_id or plan.run_name != snapshot.record.name:
+        raise StateError("OCI-root domain plan ledger binding is invalid")
+    return plan
+
+
+def _inspect_ports(raw_ports: Any) -> tuple[InspectPort, ...]:
+    return tuple(
+        InspectPort(item["host_ip"], item["host_port"], item["guest_port"], item["protocol"])
+        for item in _project_mapping_items(
+            raw_ports,
+            fields={"host_ip": str, "host_port": int, "guest_port": int, "protocol": str},
+            required=frozenset({"host_ip", "host_port", "guest_port", "protocol"}),
+        )
+    )
+
+
 def _project_summary(snapshot: state.RunLedgerSnapshot, *, stale: bool) -> RunSummary:
     """Build a deeply immutable public projection without host paths or raw ledger data."""
+
     raw = snapshot.state
+    plan = _committed_oci_domain_plan(snapshot)
     base = raw.get("base")
     if base is not None and not isinstance(base, Mapping):
         raise StateError("run ledger contains an invalid public base")
@@ -1217,18 +1250,22 @@ def _project_summary(snapshot: state.RunLedgerSnapshot, *, stale: bool) -> RunSu
     )
     ports = _project_mapping_items(
         raw.get("ports", ()),
-        fields={
-            "host_ip": str,
-            "host_port": int,
-            "guest_port": int,
-            "protocol": str,
-        },
+        fields={"host_ip": str, "host_port": int, "guest_port": int, "protocol": str},
         required=frozenset({"host_ip", "host_port", "guest_port", "protocol"}),
     )
 
     guest_ip = _optional_string(raw, "guest_ip")
+    memory_mib = _optional_integer(raw, "memory_mib")
+    vcpus = _optional_integer(raw, "vcpus")
+    network = _optional_string(raw, "network")
+    if plan is not None:
+        memory_mib = plan.memory_mib
+        vcpus = plan.vcpus
+        network = plan.network.mode
+        ports = tuple(MappingProxyType(port.to_dict()) for port in plan.network.published_ports)
+        guest_ip = OCI_NETWORK_GUEST_ADDRESS if plan.network.enabled else None
+
     raw_ssh = raw.get("ssh")
-    ssh: MappingProxyType[str, Any]
     if raw_ssh is not None:
         if not isinstance(raw_ssh, Mapping):
             raise StateError("run ledger contains an invalid public SSH endpoint")
@@ -1246,9 +1283,9 @@ def _project_summary(snapshot: state.RunLedgerSnapshot, *, stale: bool) -> RunSu
             "base_digest": "" if base_digest is None else base_digest,
             "base_arch": "" if base_arch is None else base_arch,
             "layers": layers,
-            "memory_mib": _optional_integer(raw, "memory_mib"),
-            "vcpus": _optional_integer(raw, "vcpus"),
-            "network": _optional_string(raw, "network"),
+            "memory_mib": memory_mib,
+            "vcpus": vcpus,
+            "network": network,
             "ports": ports,
             "volumes": volumes,
             "ssh": ssh,
@@ -1267,6 +1304,33 @@ def _project_inspect(snapshot: state.RunLedgerSnapshot) -> InspectRecord:
     """Build typed inspect data from exact public fields of one snapshot."""
 
     raw = snapshot.state
+    status = raw.get("status")
+    if not isinstance(status, str):
+        raise StateError("run ledger contains an invalid status")
+    revision = _optional_integer(raw, "lifecycle_revision")
+    lifecycle = InspectLifecycle(
+        status=status,
+        lifecycle_revision=0 if revision is None else revision,
+        created_at=_optional_string(raw, "created_at"),
+        updated_at=_optional_string(raw, "updated_at"),
+    )
+
+    if snapshot.record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
+        plan = _committed_oci_domain_plan(snapshot)
+        detail = OCIRootInspectDetail(None, None, None, (), None)
+        if plan is not None:
+            guest_address = OCI_NETWORK_GUEST_ADDRESS if plan.network.enabled else None
+            detail = OCIRootInspectDetail(
+                memory_mib=plan.memory_mib,
+                vcpus=plan.vcpus,
+                network=plan.network.mode,
+                ports=tuple(
+                    InspectPort(port.host_ip, port.host_port, port.guest_port, port.protocol)
+                    for port in plan.network.published_ports
+                ),
+                guest_ip=guest_address,
+            )
+        return InspectRecord(schema_version=1, record=snapshot.record, lifecycle=lifecycle, detail=detail)
     base = raw.get("base")
     if base is not None and not isinstance(base, Mapping):
         raise StateError("run ledger contains an invalid public base")
@@ -1289,14 +1353,7 @@ def _project_inspect(snapshot: state.RunLedgerSnapshot) -> InspectRecord:
             required=frozenset({"digest"}),
         )
     )
-    ports = tuple(
-        InspectPort(item["host_ip"], item["host_port"], item["guest_port"], item["protocol"])
-        for item in _project_mapping_items(
-            raw.get("ports", ()),
-            fields={"host_ip": str, "host_port": int, "guest_port": int, "protocol": str},
-            required=frozenset({"host_ip", "host_port", "guest_port", "protocol"}),
-        )
-    )
+    ports = _inspect_ports(raw.get("ports", ()))
     volumes = tuple(
         InspectVolume(
             name=item["name"],
@@ -1331,19 +1388,10 @@ def _project_inspect(snapshot: state.RunLedgerSnapshot) -> InspectRecord:
     if ssh_host is None:
         ssh_host = guest_ip
 
-    status = raw.get("status")
-    if not isinstance(status, str):
-        raise StateError("run ledger contains an invalid status")
-    revision = _optional_integer(raw, "lifecycle_revision")
     return InspectRecord(
         schema_version=1,
         record=snapshot.record,
-        lifecycle=InspectLifecycle(
-            status=status,
-            lifecycle_revision=0 if revision is None else revision,
-            created_at=_optional_string(raw, "created_at"),
-            updated_at=_optional_string(raw, "updated_at"),
-        ),
+        lifecycle=lifecycle,
         detail=CloudImageInspectDetail(
             base=InspectBase(base_digest, base_arch, base_format),
             layers=layers,

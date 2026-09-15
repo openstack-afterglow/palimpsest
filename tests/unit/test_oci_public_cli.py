@@ -501,6 +501,7 @@ def test_oci_capability_matrix_opens_only_the_implemented_public_operations():
             RuntimeOperation.STOP,
             RuntimeOperation.RM,
             RuntimeOperation.PS,
+            RuntimeOperation.INSPECT,
             RuntimeOperation.EXEC,
         }:
             profile = platforms.capability_profile(key, operation, network=None)

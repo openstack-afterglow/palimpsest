@@ -2595,7 +2595,11 @@ def test_adapter_entry_guard_blocks_run_swap_during_secure_reread_before_real_si
 
 @pytest.mark.parametrize(
     ("operation", "_target_name", "dispatch", "kwargs"),
-    [item for item in _OPERATIONS if item[0] not in {RuntimeOperation.STOP, RuntimeOperation.RM}],
+    [
+        item
+        for item in _OPERATIONS
+        if item[0] not in {RuntimeOperation.STOP, RuntimeOperation.RM, RuntimeOperation.INSPECT}
+    ],
 )
 def test_oci_root_dispatch_returns_typed_capability_error_before_adapter_or_file_side_effects(
     tmp_path: Path,

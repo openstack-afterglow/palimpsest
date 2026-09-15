@@ -122,7 +122,7 @@ Parser limits are 256–1,048,576 MiB for `--memory` (default 4096) and 1–256 
 
 ## Runtime lifecycle and observation
 
-`ps`, `inspect NAME`, `logs NAME [--follow]`, `start NAME`, `stop NAME`, and `rm NAME` act on managed runs. `inspect` emits the stable runtime record. `shell` requests an interactive runtime session; `exec NAME -- COMMAND...` is non-interactive and requires a command. `--completion-record PATH` asks OCI exec to persist its bounded completion record. Direct PID 1 access is refused.
+`ps`, `inspect NAME`, `logs NAME [--follow]`, `start NAME`, `stop NAME`, and `rm NAME` act on managed runs. `ps` includes configured publications in its `PORTS` column as `HOST_IP:HOST_PORT->GUEST_PORT/PROTOCOL`; `inspect` emits the stable runtime record and, for OCI-root runs with a committed domain plan, typed `detail.network`, `detail.ports`, and `detail.guest_ip` fields. These are durable configured endpoints, not proof that a stopped or failed run still has a live listener. `shell` requests an interactive runtime session; `exec NAME -- COMMAND...` is non-interactive and requires a command. `--completion-record PATH` asks OCI exec to persist its bounded completion record. Direct PID 1 access is refused.
 
 ```sh
 palimpsest ps

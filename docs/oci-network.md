@@ -114,13 +114,28 @@ the only configured address.
 ## Observing exposure
 
 ```console
+palimpsest ps
+palimpsest inspect api
 palimpsest oci network api
 ```
 
-This read-only command projects the committed domain plan: mode, backend,
-subnet, guest address/gateway/netmask/MAC/resolver, every publication, and an
-explicit `exposure.external` classification with its endpoints. A missing or
-invalid plan is reported as a refusal, never as "no exposure".
+`ps` includes a `PORTS` column for every committed publication, formatted as
+`HOST_IP:HOST_PORT->GUEST_PORT/PROTOCOL`. `inspect` emits the same publications
+as typed `detail.ports` fields together with `detail.network` and the fixed
+guest address. Both commands read one durable ledger snapshot, perform no
+backend call or state write, and report no publications before a domain plan is
+committed.
+
+These are configured endpoints, not a liveness claim. A stopped or failed run
+retains its configured publications in durable inspection even though its QEMU
+process owns no active listeners. Check lifecycle status and probe the service
+when current reachability matters.
+
+`oci network` performs the stronger OCI-specific committed-plan and stage-1
+transport verification, then reports mode, backend, subnet, guest
+address/gateway/netmask/MAC/resolver, every publication, and an explicit
+`exposure.external` classification with its endpoints. A missing or invalid
+plan is reported as a refusal, never as "no exposure".
 
 ## Host prerequisites
 
