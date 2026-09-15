@@ -28,22 +28,23 @@ files_modified:
 
 - branch: `codex/oci-root-phase1`
 - native re-verification checkout: detached
-  `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`, clean before verification and
-  equal to the then-pushed branch origin. This commit contains the bounded
-  initial monitor-client lock wait used by the successful PyTorch CPU proof.
-  GitHub development package workflow `34932288668` passed and published its
-  SHA-specific prerelease.
-- qualification evidence commit:
-  `633dbbed0bc15b84cf2377af6dbd77e08f4f8cc5`; GitHub development package
-  workflow `34933012902` passed and published its SHA-specific prerelease. This
-  handoff refresh follows that evidence commit and cannot self-reference its
-  own final SHA.
+  `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`, clean before and after
+  verification and equal to the then-pushed branch origin. This commit adds the
+  PyTorch loopback HTTP inference-service proof on top of the qualified initial
+  monitor-client lock wait.
+- service implementation commit:
+  `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`; GitHub development package
+  workflow `34944305626` passed and published its SHA-specific prerelease.
+- prior tensor qualification evidence commit:
+  `633dbbed0bc15b84cf2377af6dbd77e08f4f8cc5`; workflow `34933012902` passed.
+  This service-evidence refresh follows `fac2ec5` and cannot self-reference its
+  own final documentation SHA.
 - current architecture marker:
-  `d36359bb80b036f7ffe4359447f79ab394fe7477c0d7c126790fdb452f7276a2`
-  (381 files), covering the monitor startup boundary and exact native PyTorch
-  CPU evidence while excluding the unrelated MySQL hunk.
+  `713d2e8c36410fd66a93b05aeb469ab1cba25d21cf2e8c2c13ef0ff4b611910a`
+  (381 files), covering the service proof contract and exact native result while
+  excluding the unrelated MySQL hunk.
 - server `pieroot-server` checkout: `/home/pieroot/code/palimpsest` is detached
-  at `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`, with zero porcelain lines after
+  at `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`, with zero porcelain lines after
   native verification. The native venv remains
   `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python 3.12.3, libvirt 10.0.0).
 - `2bb3a2d` Linux verification: 187 passed in state, monitor-client, lifecycle,
@@ -110,41 +111,50 @@ files_modified:
   access was denied; proof-owned stop/rm and run/root-volume cleanup passed.
   The newly qualified domain is absent. Full postflight kept all 16 archive
   hashes unchanged with 48,021,008,384 bytes free under `/tmp`.
-- current follow-up adds a separate PyTorch HTTP inference-service proof using
-  the same pinned original archive. A public command override binds only guest
-  `127.0.0.1:18080`, builds a six-layer 256-wide TransformerEncoder, and serves
-  health plus fixed inference requests. Public exec must observe HTTP 200 and
-  two repeatable four-pass `[1,128,256]` CPU results with CUDA unavailable,
-  then repeat root/PID1 and proof-owned cleanup checks. This does not expose a
-  host/external endpoint or add networking/GPU authority; exact-SHA native
-  service success is not yet established.
-- the earlier failed `ml-pytorch-ed03b448` remained running, persistent, and
-  autostart-disabled in postflight. It was not stopped, undefined, or adopted;
-  it is separate from the successful proof-owned cleanup. GPU helper, attach,
-  rebind, and CUDA execution remain blocked/unperformed.
+- exact checkout `fac2ec594f7f03e1ec5745babbf8337ebc7568c3` passed the
+  focused Linux service contract 30/30 in 1.85 seconds and the pinned PyTorch
+  loopback HTTP inference-service node in 279.07 seconds. The first invocation
+  used a long caller path and failed before VM creation because its lifecycle
+  socket would be 108 bytes against the 97-byte test bound; it is not counted
+  as a native service result. The successful short-root run
+  `ml-pytorch-service-b336089f` served guest `127.0.0.1:18080`. Public exec
+  observed HTTP 200 health and two identical four-pass Transformer requests,
+  increasing request counters, finite `[1,128,256]` CPU output, CUDA false, and
+  repeatable output SHA-256
+  `73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`.
+  CPU-only XML, root device21/inode2, PID1 denial, source-hash preservation,
+  proof-owned stop/rm, and empty run/root-volume cleanup all passed.
+- postflight preserved the same 22-domain inventory and all 16 archive hashes;
+  the new service domain is absent. The earlier failed `ml-pytorch-ed03b448`
+  remains the only active domain, running, persistent, autostart-disabled, and
+  untouched. Evidence is retained at `/tmp/pms-a/m-434a58e7`. Its
+  11,239,440,912-byte tree leaves 36,758,560,768 bytes free under `/tmp`, below
+  the 40 GiB precondition for another ML proof.
+- this qualifies only a real guest-loopback service. `network none` provides no
+  host/external endpoint; the in-memory deterministic model does not prove
+  pretrained model quality. GPU helper, attach, rebind, CUDA execution, and
+  external forwarding remain blocked/unperformed.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
   manifest checks passed; Ruff check passed. Whole-repository format check
   still names 11 unrelated pre-existing files and was not used to widen scope.
-- current local observability working tree (based on `a14cc590`) adds the
-  typed post-READY launch-failure receipt and best-effort Linux run-lock holder
-  PID without native execution. Focused behavior checks passed 186 tests, the
-  related OCI runtime selections passed 429, and the repaired public monitor
-  import boundary plus both receipt categories passed 3. All affected portable
-  lanes then passed 5737 tests with 217 skips and 7 existing fork warnings in
-  149.84 seconds. Architecture guard regression passed 13; lane manifest,
-  Ruff, `git diff --check`, and working architecture guard passed. The current
-  working architecture marker is `b684901a20c216bd204f4a0b813cfae34cc1b5e6658c959ad4f51dec8725ec76`
-  for 381 files. Independent review approved the current source with no blocking
-  patch-introduced findings. This is portable test evidence only; it does not
-  identify the holder or cause in either historical native run.
+- the earlier local observability work based on `a14cc590` added the typed
+  post-READY launch-failure receipt and best-effort Linux run-lock holder PID.
+  Its focused behavior checks passed 186 tests, related OCI runtime selections
+  passed 429, and repaired public monitor import plus both receipt categories
+  passed 3. All affected portable lanes then passed 5737 tests with 217 skips
+  and 7 existing fork warnings in 149.84 seconds. This is historical portable
+  evidence only; the later exact Linux PyTorch results above supersede its
+  then-pending qualification status without changing those recorded outcomes.
 - current working tree still has other-author changes. The MySQL-related
   `ARCHITECTURE.md` hunk, `docs/docker-hub-service-matrix.md`, and
   `docs/oci-linux-process.md` remain unstaged and outside this session's
   publication scope.
-- 로컬 선별 검증은 PCI/lane 91건, define-failure 15건, architecture guard 13건,
-  lane manifest, working/staged architecture guard, `git diff --check`가 통과했다.
+- current service implementation verification passed 30 focused contracts and
+  the 887-test `host-runtime` lane locally, plus the same 30 focused contracts
+  and one exact native service node on Linux. Ruff check/format, lane manifest,
+  working/staged architecture guards, and GitHub package workflow passed.
 
 증거 용어는 엄격히 구분한다.
 
@@ -239,12 +249,14 @@ provenance를 유지하며 원본 default 결과를 소급 변경하지 않는�
 
 ## ML CPU와 GPU 현황
 
-핀된 입력은 TensorFlow 2.21 CPU와 PyTorch 2.8 CUDA 12.6 runtime image다.
-테스트는 original archive, Cmd-only override, network none, 8192 MiB/2 vCPU,
-single-thread 2x2 matrix multiplication, GPU 미노출, 실제 root/PID1/lifecycle을
-정의한다. 이것은 대화형 development image, CUDA, GPU 또는 외부 network
-qualification이 아니다. [ML compatibility](oci-ml-compatibility.md)가
-checkpoint 정본이다.
+The pinned inputs are TensorFlow 2.21 CPU and the PyTorch 2.8 CUDA 12.6 runtime
+image. Separate PyTorch nodes now prove the original single-thread 2x2 CPU
+tensor command and a deterministic six-layer Transformer HTTP service through
+guest loopback. Both use the original archive, Cmd-only override, network none,
+8192 MiB/2 vCPU, no GPU exposure, and actual root/PID1/lifecycle assertions.
+These results do not qualify an interactive development image, pretrained model
+quality, CUDA/GPU, or host/external networking. [ML compatibility](oci-ml-compatibility.md)
+is the checkpoint source of truth.
 
 native 재시도는 최소 40 GiB 실제 여유 공간, 8 GiB/2 vCPU, framework별
 순차 실행과 single-thread 설정을 요구한다. 짧은 public-init mode 0711
@@ -266,18 +278,19 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   `ipc-timeout`, `run-lock-timeout` 중 고정 enum으로 보존한다. deadline,
   retry, lock, guest, cleanup 정책은 바뀌지 않았다. 이 변경 뒤 새 native
   TensorFlow 재실행은 아직 없다.
-- PyTorch는 큰-image conversion 뒤 public run의 monitor handshake 경계에서
-  실패했고 CPU tensor/root/PID1 proof에 도달하지 않았다. 장시간 준비 중
-  동일 libvirt connection을 유지하는 startup event service와 coordinator의
-  fixed-enum observability가 후속 구현·검토됐지만, 이 변경들로 PyTorch native
-  성공이 새로 증명되지는 않았다. 실패 증거와 inactive resource를 임의로
-  삭제하거나 성공으로 재분류하지 않는다.
-- `021dd38` removed the repeated launch-authority payload hashes and crossed the
-  earlier coordinator response boundary. Its case then exposed the next typed
-  boundary: initial monitor-client run-lock acquisition expired after five
-  seconds while the worker still held that lock during pre-activation domain
-  resolution. The current source widens only that initial acquisition to 60
-  seconds; a fresh exact-SHA native run remains required.
+- Earlier PyTorch attempts failed around the large-image monitor handshake and
+  run-lock boundaries before a complete CPU/root/PID1 proof. Their retained
+  evidence and inactive domains remain historical facts and were not deleted or
+  reclassified.
+- `021dd38` removed repeated launch-authority payload hashes and exposed the
+  initial monitor-client five-second run-lock boundary. The following source
+  widened only that initial acquisition to 60 seconds.
+- exact `58e9cb8e7c024deaa6e58f86344d420ce9f42c66` then passed the complete
+  PyTorch CPU tensor/root/PID1/cleanup qualification in 289.62 seconds.
+- exact `fac2ec594f7f03e1ec5745babbf8337ebc7568c3` then passed the separate
+  guest-loopback HTTP Transformer service qualification in 279.07 seconds with
+  repeatable CPU output and no CUDA. This closes the PyTorch CPU/service proof;
+  it does not close TensorFlow post-READY transport, host networking, or GPU.
 - `9239dbd` native TensorFlow는 detached run이 116.6초에 이름과 exit 0을
   반환하고 guest console에 root 전환·workload 시작·READY commit을 남겼지만,
   이어진 공개 `exec`이 5.09초에 `timeout-source=run-lock-timeout` 하나만
@@ -328,13 +341,13 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   timeout receipt are separate facts and establish no causal sequence: exec
   calls `before_stop_send` under the run lock and stream I/O can subsequently
   raise transport `TIMEOUT`, so contention may precede worker failure instead.
-  Causal ordering and the exact transport timeout site remain unresolved. PyTorch
-  expired at coordinator spawn response (`[parent-response:timeout]`) after
-  297.04 seconds and retained `ml-pytorch-484e1dda` (UUID
-  `74cc9561-61cc-45d1-a070-a4262b6c73a9`), leaving 20 inactive domains.
-  The remaining diagnosis is evaluating the lifecycle stream transport timeout
-  under high-CPU/I-O conditions post-READY and the coordinator spawn 15-second
-  bound for multi-gigabyte PyTorch materialization.
+  Causal ordering and the exact transport timeout site remain unresolved for
+  TensorFlow. The historical PyTorch coordinator response failure after 297.04
+  seconds retained `ml-pytorch-484e1dda` (UUID
+  `74cc9561-61cc-45d1-a070-a4262b6c73a9`), but later exact-SHA tensor and
+  service runs passed after the bounded launch fixes. The remaining ML runtime
+  diagnosis is TensorFlow's post-READY lifecycle transport; it must not reuse
+  or rewrite the now-qualified PyTorch result.
 - 비교용 소용량 control lane은 실행 불가였다. 핀된 build artifact의
   `acceptance.json`이 아직 `palimpsest.oci-root-build-run-acceptance.v1`이고
   `tests/kvm/test_oci_exec_cli_live.py`는 v2를 요구하므로 입력 검증에서
@@ -484,14 +497,15 @@ PCI 노드도 함께 통과했다.
 6. **그 이후 GPU 개발:** inventory와 운영자 승인이 확보된 뒤에만 allocation
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
-7. **ML 다음 단계:** PyTorch CPU tensor case는 exact `58e9cb8`에서 통과했다.
-   이제 같은 pinned archive의 loopback HTTP inference-service node를 새 exact
-   SHA에서 한 번 실행한다. 성공 조건은 health와 동일 inference2건, 반복 가능한
-   four-pass Transformer output, CPU/CUDA false, CPU-only XML, root/PID1 및
-   proof-owned cleanup이다. 성공 후 별도 TensorFlow post-READY lifecycle
-   transport timeout 진단을 계속한다. 보존된 `ml-pytorch-ed03b448`과 기존
-   inactive domain은 stop·undefine·adopt하지 않고 GPU helper·attach·rebind도
-   실행하지 않는다.
+7. **ML next step:** PyTorch CPU tensor at exact `58e9cb8` and guest-loopback
+   HTTP inference service at exact `fac2ec5` both passed. Before another
+   large-image proof, resolve `/tmp` capacity back to the documented 40 GiB
+   minimum without deleting retained evidence absent explicit authority. Then
+   continue the separate TensorFlow post-READY lifecycle transport diagnosis.
+   Host/external service reachability is an independent network/forwarding
+   contract, not an extension of the loopback result. Preserve
+   `ml-pytorch-ed03b448` and all existing inactive domains; do not stop,
+   undefine, or adopt them, and do not run GPU helper, attach, or rebind.
 
 ### 이후 backlog — 현재 승인 아님
 

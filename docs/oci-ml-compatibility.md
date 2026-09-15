@@ -399,31 +399,49 @@ GPU helper.
 
 ### PyTorch loopback inference service
 
-The next opt-in proof reuses the same original pinned PyTorch archive and
-manifest without deriving or modifying the image. A public command override
-starts `/opt/conda/bin/python` as a persistent HTTP service bound only to guest
-`127.0.0.1:18080`. The service constructs a six-layer, 256-wide
+The service proof reuses the same original pinned PyTorch archive and manifest
+without deriving or modifying the image. A public command override starts
+`/opt/conda/bin/python` as a persistent HTTP service bound only to guest
+`127.0.0.1:18080`. The service constructs a deterministic six-layer, 256-wide
 `torch.nn.TransformerEncoder`, publishes `/healthz`, and accepts one fixed
 `/infer` request contract. Each request runs four sequential inference passes
 over a `[1,128,256]` tensor under `torch.inference_mode()`.
 
-The host waits for the service's bounded console readiness marker, then uses
-public `exec --timeout 300` to make one health request and two inference
-requests through guest loopback. Success requires HTTP 200, PyTorch version,
-model and shape identity, finite output, device `cpu`, CUDA unavailable,
-monotonic request counters, and the same 64-hex output SHA-256 for both
-identical requests. The proof also repeats the CPU-only domain XML,
-authenticated root/PID 1, source preservation, proof-owned stop/remove, and
-root-volume cleanup assertions from the tensor qualification.
+At exact checkout `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`, 30 focused
+Linux service-contract checks passed in 1.85 seconds and GitHub development
+package workflow `34944305626` passed. The first native invocation used a
+caller path whose lifecycle socket would have been 108 bytes, exceeded the
+97-byte test bound, and failed before VM creation; it is not a service result.
+The rerun with short runtime root `/tmp/pms-a` passed in 279.07 seconds. Public
+run returned `ml-pytorch-service-b336089f`; the bounded console readiness check
+completed, and public `exec --timeout 300` returned exactly
+`ML_SERVICE_OK pytorch 2.8.0+cu126 transformer-encoder-6x256 [1, 128, 256] 4
+cpu False 73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`.
+The passing probe observed HTTP 200 from health and from two identical inference
+requests, monotonically increasing request counters, finite CPU output, CUDA
+unavailable, and the same 64-hex tensor SHA-256 for both responses.
 
-This is a real long-running HTTP inference service and a materially larger CPU
-workload than the 2x2 tensor smoke test. It deliberately proves only guest-local
-service behavior: the domain still has `network none`, no interface, hostdev,
-or host filesystem, and the listener is not host- or externally reachable.
-External API reachability requires a separate network authority and forwarding
-contract. The service test adds no GPU, model download, secret, mount, retry,
-or derived image. Its implementation and portable contracts are not native
-success evidence until the exact published SHA passes on Linux KVM.
+The CPU-only domain assertion found no interface, hostdev, or host-filesystem
+device. Authenticated root identity was device 21/inode 2, direct access through
+`/proc/1/root` was denied, and proof-owned stop/remove returned `stopped` and
+`removed` for the service domain. Its run and root-volume directories were
+empty after cleanup, and the source archive hash was unchanged. Full postflight
+found the service domain absent and the same 22-domain inventory as preflight:
+the separately preserved `ml-pytorch-ed03b448` remained the only active domain,
+running, persistent, autostart-disabled, and untouched. All 16 archive hashes
+were unchanged. The retained evidence is
+`/tmp/pms-a/m-434a58e7`; retaining its 11,239,440,912-byte tree left
+36,758,560,768 bytes free under `/tmp`, below the proof's 40 GiB next-run
+precondition.
+
+This qualifies a real long-running guest-local HTTP inference service and a
+materially larger CPU workload than the 2x2 tensor smoke test. It deliberately
+does not qualify host or external reachability: the domain still has `network
+none`, and the listener is guest-loopback only. External API reachability needs
+a separate network authority and forwarding contract. The deterministic model
+is created in memory and proves framework/service execution, not pretrained
+model quality. The proof adds no GPU, model download, secret, mount, retry, or
+derived image; CUDA and the blocked GPU helper remain untested.
 
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
