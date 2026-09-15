@@ -14,6 +14,7 @@ from test_oci_store import _handoff_receipt
 
 from palimpsest_local import oci_monitor_client as client
 from palimpsest_local import oci_monitor_ipc as ipc
+from palimpsest_local import state as state_module
 from palimpsest_local.errors import StateError
 from palimpsest_local.runtime_types import ProcessExit, ProcessExitCategory
 from palimpsest_local.state import locked_existing_run
@@ -28,10 +29,20 @@ def test_timeout_source_surface_is_exact_and_constructor_rejects_untyped_values(
         "run-lock-timeout",
     }
     ordinary = client.MonitorClientError("ordinary")
-    assert ordinary.timeout_source is None and str(ordinary) == "ordinary"
+    assert ordinary.timeout_source is ordinary.run_lock_holder_pid is None
+    assert str(ordinary) == "ordinary"
     for invalid in ("ipc-timeout", True, 1):
         with pytest.raises(TypeError, match="timeout source is invalid"):
             client.MonitorClientError("invalid", timeout_source=invalid)
+    for invalid in ("42", True, 0, -1):
+        with pytest.raises(TypeError, match="holder PID is invalid"):
+            client.MonitorClientError(
+                "invalid",
+                timeout_source=client.MonitorClientTimeoutSource.RUN_LOCK_TIMEOUT,
+                run_lock_holder_pid=invalid,
+            )
+    with pytest.raises(TypeError, match="requires a run-lock timeout"):
+        client.MonitorClientError("invalid", run_lock_holder_pid=42)
 
 
 @pytest.fixture
@@ -303,12 +314,15 @@ def test_invalid_deadline_refused_before_io(case, transport, timeout):
     assert transport[0] == []
 
 
-def test_run_lock_contention_has_finite_deadline(case, transport):
+def test_run_lock_contention_has_finite_deadline_and_identifies_linux_holder(case, transport, monkeypatch):
+    monkeypatch.setattr(state_module, "_linux_flock_holder_pid", lambda _fd: 4242)
     with locked_existing_run(case.roots, case.binding.record.name):
         started = time.monotonic()
         with pytest.raises(client.MonitorClientError, match="timed out") as error:
             _open(case, timeout=0.1)
         assert error.value.timeout_source is client.MonitorClientTimeoutSource.RUN_LOCK_TIMEOUT
+        assert error.value.run_lock_holder_pid == 4242
+        assert "; run-lock-holder-pid=4242;" in str(error.value)
         assert str(error.value).endswith("; timeout-source=run-lock-timeout")
         assert time.monotonic() - started < 1
     assert transport[0] == []

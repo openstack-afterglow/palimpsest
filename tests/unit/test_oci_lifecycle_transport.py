@@ -18,6 +18,7 @@ from palimpsest_local.oci_control_protocol_v2 import (
 )
 from palimpsest_local.oci_exec_control import MonitorExecControl
 from palimpsest_local.oci_lifecycle_transport import (
+    OCILifecycleFailureCategory,
     OCILifecycleTransportError,
     complete_initial_lifecycle_handoff,
 )
@@ -317,7 +318,7 @@ def test_exec_deadline_does_not_fabricate_exit_when_guest_silent():
         mailbox.mark_ready()
         mailbox.submit(1, RUN_ID, ("/bin/probe",), 1)
 
-    with pytest.raises(OCILifecycleTransportError, match="timed out"):
+    with pytest.raises(OCILifecycleTransportError, match="timed out") as failure:
         complete_initial_lifecycle_handoff(
             stream,
             BINDING,
@@ -331,6 +332,7 @@ def test_exec_deadline_does_not_fabricate_exit_when_guest_silent():
             wait=lambda seconds: clock.__setitem__(0, clock[0] + 1),
             wait_writable=lambda seconds: clock.__setitem__(0, clock[0] + 1),
         )
+    assert failure.value.category is OCILifecycleFailureCategory.TIMEOUT
     assert mailbox.poll(1, RUN_ID)["terminal"] is None
     assert mailbox.status()["state"] == "control-lost"
 
@@ -435,7 +437,7 @@ def test_stop_authority_revocation_prevents_next_write(failure_at):
         nonlocal checks
         checks += 1
         if checks == failure_at:
-            raise OCILifecycleTransportError("authority revoked")
+            raise OCILifecycleTransportError("authority revoked", category=OCILifecycleFailureCategory.CONTROL_INVALID)
 
     with pytest.raises(OCILifecycleTransportError, match="authority revoked"):
         complete_initial_lifecycle_handoff(

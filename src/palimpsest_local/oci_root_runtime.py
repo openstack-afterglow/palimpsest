@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import kvm
-from .errors import PalimpsestError, StateError
+from .errors import PalimpsestError, StableFailureError, StateError
 from .oci_control_protocol_v2 import (
     OCI_CONTROL_CHANNEL_NAME,
     HostOCIControlV2Session,
@@ -30,6 +30,7 @@ from .oci_layout import canonical_json
 from .oci_lifecycle_transport import (
     DEFAULT_HANDOFF_TIMEOUT_SECONDS,
     OCI_ROOT_HANDOFF_SCHEMA,
+    OCILifecycleFailureCategory,
     OCILifecycleHandoffReceipt,
     OCILifecycleStreamCallbackCleanupError,
     OCILifecycleTransportError,
@@ -50,6 +51,7 @@ from .project_volumes import CommandRunner, _default_runner
 from .runtime_types import ProcessExit
 from .state import RunLedgerSnapshot, StatePaths, locked_existing_run
 
+OCI_ROOT_LAUNCH_FAILURE_SCHEMA = "palimpsest.oci-root-launch-failure.v1"
 OCI_ROOT_DEFINITION_SCHEMA = "palimpsest.oci-root-definition.v2"
 _MAC_RE = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 _EVENT_DRIVER_LOCK = threading.Lock()
@@ -386,7 +388,9 @@ class _LibvirtLifecycleEventPump:
 
     def _wait(self, seconds: float, *, writable: bool) -> None:
         if self._closed or type(seconds) not in {int, float} or not math.isfinite(seconds) or seconds <= 0:
-            raise OCILifecycleTransportError("OCI-root lifecycle event wait is invalid")
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle event wait is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
         mask = self._all_events if writable else self._base_events
         update_attempted = False
         timer_id: int | None = None
@@ -398,23 +402,38 @@ class _LibvirtLifecycleEventPump:
                 update_attempted = True
                 updated_result = self._stream.eventUpdateCallback(mask)
                 if type(updated_result) is not int or updated_result != 0:
-                    raise OCILifecycleTransportError("OCI-root lifecycle stream event update failed")
+                    raise OCILifecycleTransportError(
+                        "OCI-root lifecycle stream event update failed", category=OCILifecycleFailureCategory.EVENT_PUMP
+                    )
             milliseconds = max(1, min(_EVENT_WAIT_MAX_MILLISECONDS, math.ceil(seconds * 1000)))
             timer_id = self._libvirt.virEventAddTimeout(milliseconds, self._timer_event, self)
             if type(timer_id) is not int or timer_id < 0:
-                raise OCILifecycleTransportError("OCI-root lifecycle event timer registration failed")
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle event timer registration failed",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
             if not _EVENT_RUN_LOCK.acquire(timeout=min(float(seconds), _EVENT_WAIT_MAX_MILLISECONDS / 1000)):
-                raise OCILifecycleTransportError("OCI-root lifecycle default event pump is already active")
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle default event pump is already active",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
             try:
                 result = self._libvirt.virEventRunDefaultImpl()
             finally:
                 _EVENT_RUN_LOCK.release()
             if type(result) is not int or result != 0:
-                raise OCILifecycleTransportError("OCI-root lifecycle default event pump failed")
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle default event pump failed", category=OCILifecycleFailureCategory.EVENT_PUMP
+                )
             if self._callback_invalid:
-                raise OCILifecycleTransportError("OCI-root lifecycle stream event callback was invalid")
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle stream event callback was invalid",
+                    category=OCILifecycleFailureCategory.EVENT_PUMP,
+                )
             if self._observed_events & self._error:
-                raise OCILifecycleTransportError("OCI-root lifecycle stream reported an error")
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle stream reported an error", category=OCILifecycleFailureCategory.EVENT_PUMP
+                )
         except BaseException as exc:
             failure = exc
         if timer_id is not None:
@@ -445,7 +464,8 @@ class _LibvirtLifecycleEventPump:
                 if not any(pump is self for pump, _stream in _EVENT_STREAM_QUARANTINE):
                     _EVENT_STREAM_QUARANTINE.append((self, self._stream))
             raise OCILifecycleStreamCallbackCleanupError(
-                "OCI-root lifecycle event timer cleanup failed; event driver poisoned"
+                "OCI-root lifecycle event timer cleanup failed; event driver poisoned",
+                category=OCILifecycleFailureCategory.CLEANUP,
             )
         if failure is not None:
             raise failure
@@ -462,9 +482,13 @@ class _LibvirtLifecycleEventPump:
         try:
             removed = self._stream.eventRemoveCallback()
         except Exception:
-            raise OCILifecycleTransportError("OCI-root lifecycle stream event callback cleanup failed") from None
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream event callback cleanup failed", category=OCILifecycleFailureCategory.CLEANUP
+            ) from None
         if type(removed) is not int or removed != 0:
-            raise OCILifecycleTransportError("OCI-root lifecycle stream event callback cleanup failed")
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream event callback cleanup failed", category=OCILifecycleFailureCategory.CLEANUP
+            )
         self._closed = True
 
 
@@ -1518,6 +1542,31 @@ def _plain_wire_value(value: Any) -> Any:
     return value
 
 
+def _post_ready_launch_failure_receipt(
+    failure: BaseException,
+    ready_lifecycle: OCILifecycleHandoffReceipt | None,
+) -> dict[str, str] | None:
+    if ready_lifecycle is None:
+        return None
+    if isinstance(failure, OCILifecycleTransportError):
+        source, category = "lifecycle-transport", failure.category.value
+    elif isinstance(failure, StableFailureError):
+        source, category = failure.failure_source, failure.failure_category
+
+    elif isinstance(failure, OCIStartupEventServiceError):
+        source, category = "startup-events", "service-failed"
+    elif isinstance(failure, StateError):
+        source, category = "runtime-state", "state-error"
+    else:
+        source, category = "internal", "internal-error"
+    return {
+        "category": category,
+        "schema": OCI_ROOT_LAUNCH_FAILURE_SCHEMA,
+        "source": source,
+        "stage": "post-ready-worker",
+    }
+
+
 def _require_expected_handoff(
     state: Mapping[str, Any],
     resolved: ResolvedOCIRootDomainPlan,
@@ -1561,6 +1610,8 @@ def _handle_launch_failure(
     ledger_phase: str,
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
     expected_projection_digest: str,
+    *,
+    launch_failure: BaseException,
     monitor_lease: _PreactivationJournalLease | None = None,
     authority_guard: Callable[[], None] | None = None,
 ) -> str:
@@ -1606,6 +1657,9 @@ def _handle_launch_failure(
             "failed": "OCI-root launch failed",
         }
         data["error"] = messages[cleanup_phase]
+        failure_receipt = _post_ready_launch_failure_receipt(launch_failure, ready_lifecycle)
+        if failure_receipt is not None:
+            data["oci_root_launch_failure"] = failure_receipt
         handoff = data.get("oci_root_handoff")
         if not isinstance(handoff, dict):
             raise StateError("OCI-root launch ledger changed before failure publication")
@@ -1625,6 +1679,7 @@ def _record_launch_cleanup_required(
     ledger_phase: str,
     ready_lifecycle: OCILifecycleHandoffReceipt | None,
     *,
+    launch_failure: BaseException,
     journal_authority_lost: bool = False,
     accepted_stop_failure: bool = False,
 ) -> None:
@@ -1648,6 +1703,9 @@ def _record_launch_cleanup_required(
             if accepted_stop_failure
             else "OCI-root lifecycle stream callback cleanup failed; cleanup is required"
         )
+        failure_receipt = _post_ready_launch_failure_receipt(launch_failure, ready_lifecycle)
+        if failure_receipt is not None:
+            data["oci_root_launch_failure"] = failure_receipt
         handoff = data.get("oci_root_handoff")
         if not isinstance(handoff, dict):
             raise StateError("OCI-root launch ledger changed before failure publication")
@@ -1993,6 +2051,7 @@ def launch_defined_oci_root_domain(
                 journal_activation_attempted = True
                 monitor_lease.mark_activating()
             data = mutation.mutable_state()
+            data.pop("oci_root_launch_failure", None)
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
                 domain_uuid,
@@ -2036,6 +2095,7 @@ def launch_defined_oci_root_domain(
                     )
                 )
             data = mutation.mutable_state()
+            data.pop("oci_root_launch_failure", None)
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
                 domain_uuid,
@@ -2126,6 +2186,7 @@ def launch_defined_oci_root_domain(
                 runtime_io.verify()
                 data = mutation.mutable_state()
                 data.pop("error", None)
+                data.pop("oci_root_launch_failure", None)
                 data["oci_root_handoff"] = _handoff_ledger(
                     resolved,
                     domain_uuid,
@@ -2207,7 +2268,8 @@ def launch_defined_oci_root_domain(
                 event_pump.close()
             except BaseException:
                 handoff_failure = OCILifecycleStreamCallbackCleanupError(
-                    "OCI-root lifecycle stream event cleanup failed; stream retained"
+                    "OCI-root lifecycle stream event cleanup failed; stream retained",
+                    category=OCILifecycleFailureCategory.CLEANUP,
                 )
         if isinstance(handoff_failure, OCILifecycleStreamCallbackCleanupError):
             with _EVENT_DRIVER_LOCK:
@@ -2288,6 +2350,7 @@ def launch_defined_oci_root_domain(
             runtime_io.verify()
             data = mutation.mutable_state()
             data.pop("error", None)
+            data.pop("oci_root_launch_failure", None)
             data["oci_root_handoff"] = _handoff_ledger(
                 resolved,
                 domain_uuid,
@@ -2367,6 +2430,7 @@ def launch_defined_oci_root_domain(
                         boot_attempt_id,
                         ledger_phase,
                         ready_lifecycle,
+                        launch_failure=launch_failure,
                         journal_authority_lost=not journal_authority_valid,
                         accepted_stop_failure=(
                             stop_control is not None
@@ -2388,8 +2452,9 @@ def launch_defined_oci_root_domain(
                         ledger_phase,
                         ready_lifecycle,
                         definition_projection_digest,
-                        monitor_lease,
-                        authority_guard,
+                        launch_failure=launch_failure,
+                        monitor_lease=monitor_lease,
+                        authority_guard=authority_guard,
                     )
             except Exception:
                 raise StateError("OCI-root launch state changed; cleanup was not attempted") from None
@@ -2414,6 +2479,7 @@ def launch_defined_oci_root_domain(
 
 __all__ = [
     "OCI_ROOT_DEFINITION_SCHEMA",
+    "OCI_ROOT_LAUNCH_FAILURE_SCHEMA",
     "CompletedOCIRootHandoff",
     "DefinedOCIRootDomain",
     "connect_oci_root_libvirt",

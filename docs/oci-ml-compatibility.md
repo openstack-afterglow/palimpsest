@@ -216,10 +216,15 @@ The open diagnosis is that a post-READY worker failure collapses into one
 generic message, and that the fixed coordinator-spawn (15 s), launch-authority
 (60 s) and run-lock (5 s) bounds have not been evaluated against
 multi-hundred-megabyte and multi-gigabyte materialization on this host.
-Preserving a bounded fixed-enum reason for post-READY worker loss, and
-identifying the run-lock holder, remain separate reviewed changes. A larger
-public exec deadline changes only the guest execution bound and therefore
-cannot by itself remove either observed boundary.
+The next diagnostic implementation now preserves a bounded post-READY worker
+failure receipt in the run ledger and reports the Linux kernel's best-effort
+`flock` holder PID on a run-lock timeout. The receipt contains only fixed
+stage/source/category values; raw exception text, paths, argv, and guest output
+remain excluded. The PID is a point-in-time diagnostic, not durable process
+identity or proof of causality. Neither change alters the guest deadline,
+monitor handshake, run-lock duration, retry, resource preservation, or cleanup
+authority. A new exact-SHA native retry is still required to obtain these facts
+for the pinned TensorFlow failure; the historical runs cannot be reclassified.
 
 At exact checkout `06697bde83f4e0734955320577a59cc9c7e06f27`, the
 timeout implementation from `5e9473a` and its test-isolation follow-up were

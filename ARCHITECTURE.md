@@ -433,6 +433,24 @@ host session40초, 개별 monitor 교환 최대5초와 동일 payload 재시도�
 않는다. 과거 TensorFlow stderr에는 이 코드가 없어 소급 분류할 수 없으며,
 새 진단 코드의 테스트 통과가 실제 ML 연산 성공을 의미하지 않는다.
 
+post-READY worker failure 진단은 monitor journal schema를 바꾸지 않고 run ledger의
+`oci_root_launch_failure` v1 receipt로 보존한다. durable READY receipt가 실제로
+게시된 실행 실패에만 `stage=post-ready-worker`와 고정 `source`·`category`를
+기록하며, lifecycle transport 오류는 `OCILifecycleFailureCategory`, monitor
+오류는 기존 `MonitorIPCErrorCategory`만 사용한다. 일반 `StateError`와 알 수 없는
+예외는 각각 `state-error`·`internal-error`로 축약하고 raw exception, path, argv,
+guest output은 기록하지 않는다. 새 activation·READY·TERMINAL publication은 이전
+failure receipt를 제거하므로 성공 상태에 stale 실패가 남지 않는다.
+
+Linux run-lock timeout은 기한이 실제 만료된 뒤에만 `/proc/locks`의 kernel
+snapshot을 읽어 이미 연 lock file의 device/inode와 정확히 일치하는
+`FLOCK ADVISORY WRITE` owner PID를 best-effort로 찾는다. 양의 PID만
+`run-lock-holder-pid`로 monitor-client 오류에 추가하며 timeout source가
+`run-lock-timeout`인 경우에만 허용한다. `/proc` 부재·초과·malformed·race 또는
+non-Linux host에서는 기존 timeout만 반환한다. lock 획득/해제, 5초 제한, retry,
+journal, cleanup authority는 바꾸지 않으며 PID는 만료 시점의 진단이지 지속
+process identity나 원인 판정이 아니다.
+
 `aad3d492`의 timeout-origin client/exec 선별105건은 로컬과 정확한 Linux
 checkout 모두 다른 outcome 없이 통과했다. 로컬 architecture guard 회귀13건과
 GitHub 패키지도 통과했다. 이번 검증에서는 새 VM을 실행하지 않았으며,
@@ -558,9 +576,9 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "eb3bd17e84fd6d8cbabdc862c4f888d4e56ae5d3bfd04e33d0329ed324bb2f4f",
-  "reviewed_at": "2026-09-14T15:47:12Z",
-  "summary": "Reviewed exact 06697bd Linux timeout checks, the 43-boot packaged stage-1 KVM matrix, sequential TensorFlow and PyTorch native outcomes, retained-resource invariants, and the full 19-domain/16-archive zero-active postflight; no guest-admission or timeout-causality claim."
+  "source_sha256": "b684901a20c216bd204f4a0b813cfae34cc1b5e6658c959ad4f51dec8725ec76",
+  "reviewed_at": "2026-09-14T16:18:33Z",
+  "summary": "Reviewed typed post-READY worker failure receipts and Linux kernel flock-holder PID diagnostics; lock timing, retry, monitor import boundaries, journal, cleanup authority, and native ML qualification remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

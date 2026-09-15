@@ -3905,7 +3905,10 @@ def test_oci_root_admitted_stop_failure_preserves_exact_vm(
                 lease.mark_control_lost()
             before_stop_send()
             if failure == "callback-cleanup":
-                raise OCILifecycleStreamCallbackCleanupError("test callback cleanup failure")
+                raise OCILifecycleStreamCallbackCleanupError(
+                    "test callback cleanup failure",
+                    category=oci_root_runtime_module.OCILifecycleFailureCategory.CLEANUP,
+                )
             raise StateError("test STOP send or terminal timeout")
         finally:
             before_stream_close()
@@ -4578,6 +4581,54 @@ def test_oci_root_private_launch_failure_cleans_exact_domain_or_records_cleanup_
         assert domain.destroy_calls == domain.undefine_calls == 1
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_source", "expected_category"),
+    [
+        (
+            oci_root_runtime_module.OCILifecycleTransportError(
+                "SENSITIVE POST-READY DETAIL",
+                category=oci_root_runtime_module.OCILifecycleFailureCategory.STREAM_ENDED,
+            ),
+            "lifecycle-transport",
+            "stream-ended",
+        ),
+        (
+            monitor_ipc_module.MonitorIPCError(monitor_ipc_module.MonitorIPCErrorCategory.CONTROL_LOST),
+            "monitor-ipc",
+            "control-lost",
+        ),
+    ],
+)
+def test_oci_root_post_ready_failure_persists_only_typed_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected_source: str,
+    expected_category: str,
+) -> None:
+    name = "post-ready-failure"
+    roots, store, tools, boot, profile, _prepared, _plan = _committed_oci_domain(tmp_path, name)
+    conn = _evented_connection(_DefinitionConnection(), monkeypatch)
+    define_committed_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    def handoff_failure(_stream, _binding, *, on_ready, session, **_kwargs):
+        on_ready(_handoff_receipt("ready", boot_attempt_id=session.boot_attempt_id))
+        raise failure
+
+    monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", handoff_failure)
+    with pytest.raises(StateError, match="launch failed"):
+        launch_defined_oci_root_domain(roots, name, store, boot, profile, conn=conn, runner=tools)
+
+    snapshot = read_run_ledger_snapshot(roots, name).state
+    assert snapshot["oci_root_launch_failure"] == {
+        "category": expected_category,
+        "schema": "palimpsest.oci-root-launch-failure.v1",
+        "source": expected_source,
+        "stage": "post-ready-worker",
+    }
+    assert "SENSITIVE" not in repr(snapshot)
+
+
 def test_oci_root_private_launch_requires_libvirt_surface_before_starting_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4795,7 +4846,9 @@ def test_oci_root_launch_quarantines_stream_when_event_callback_removal_fails(
     def fail_handoff(_stream, _binding, *, before_stream_close, **_kwargs):
         with pytest.raises(oci_root_runtime_module.OCILifecycleTransportError, match="callback cleanup failed"):
             before_stream_close()
-        raise oci_root_runtime_module.OCILifecycleStreamCallbackCleanupError("stream retained")
+        raise oci_root_runtime_module.OCILifecycleStreamCallbackCleanupError(
+            "stream retained", category=oci_root_runtime_module.OCILifecycleFailureCategory.CLEANUP
+        )
 
     monkeypatch.setattr(oci_root_runtime_module, "complete_initial_lifecycle_handoff", fail_handoff)
     with pytest.raises(StateError, match="cleanup is required"):

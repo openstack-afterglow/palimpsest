@@ -29,7 +29,7 @@ from enum import StrEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
-from .errors import PalimpsestError
+from .errors import PalimpsestError, StableFailureError
 from .oci_exec_control import MonitorExecControl, MonitorExecControlError, validate_exec_request
 from .oci_exec_control import _identity as _exec_identity
 from .oci_monitor import (
@@ -123,14 +123,14 @@ class MonitorIPCErrorCategory(StrEnum):
     POISONED = "poisoned"
 
 
-class MonitorIPCError(PalimpsestError):
+class MonitorIPCError(StableFailureError):
     """Path-free, peer-input-free monitor IPC failure."""
 
     def __init__(self, category: MonitorIPCErrorCategory) -> None:
         if not isinstance(category, MonitorIPCErrorCategory):
             raise TypeError("monitor IPC error requires a stable category")
         self.category = category
-        super().__init__(category.value)
+        super().__init__(category.value, failure_source="monitor-ipc", failure_category=category.value)
 
 
 class MonitorIPCOperation(StrEnum):

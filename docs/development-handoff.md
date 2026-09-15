@@ -51,6 +51,18 @@ files_modified:
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
   manifest checks passed; Ruff check passed. Whole-repository format check
   still names 11 unrelated pre-existing files and was not used to widen scope.
+- current local observability working tree (based on `a14cc590`) adds the
+  typed post-READY launch-failure receipt and best-effort Linux run-lock holder
+  PID without native execution. Focused behavior checks passed 186 tests, the
+  related OCI runtime selections passed 429, and the repaired public monitor
+  import boundary plus both receipt categories passed 3. All affected portable
+  lanes then passed 5737 tests with 217 skips and 7 existing fork warnings in
+  149.84 seconds. Architecture guard regression passed 13; lane manifest,
+  Ruff, `git diff --check`, and working architecture guard passed. The current
+  working architecture marker is `b684901a20c216bd204f4a0b813cfae34cc1b5e6658c959ad4f51dec8725ec76`
+  for 381 files. Independent review approved the current source with no blocking
+  patch-introduced findings. This is portable test evidence only; it does not
+  identify the holder or cause in either historical native run.
 - current working tree still has other-author changes. The MySQL-related
   `ARCHITECTURE.md` hunk, `docs/docker-hub-service-matrix.md`, and
   `docs/oci-linux-process.md` remain unstaged and outside this session's
@@ -222,11 +234,15 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   before collection, ran zero tests and created no domain; it is excluded from
   the two native case results.
 - 관측된 두 경계는 guest 실행 기한이 아니라 coordinator spawn handshake와
-  host run lock이다. 승인된 공개 `exec --timeout` 계약 변경은 guest 실행
-  기한만 넓히므로 이 두 경계를 그 자체로 제거하지 못한다. 남은 진단은
-  post-READY worker 실패 사유가 일반 메시지로 소실되는 문제, run lock
-  보유자 식별, coordinator spawn 15초·launch authority 60초·run lock 5초
-  고정 한도의 대용량 materialization 적합성이다.
+  host run lock이다. 후속 local source는 durable READY 뒤 worker failure만
+  `oci_root_launch_failure` v1의 고정 stage/source/category로 보존하고, Linux
+  run-lock 만료 시 kernel `/proc/locks`에서 exact lock inode의 `flock` owner
+  PID를 best-effort로 `run-lock-holder-pid`에 추가한다. raw exception·path·argv·
+  guest output은 기록하지 않고 lock 5초·retry·cleanup authority도 바꾸지 않는다.
+  아직 새 exact-SHA native 실행 증거가 없으므로 과거 TensorFlow의 holder/cause는
+  확정되지 않았다. 남은 진단은 이 receipt를 사용한 순차 native 재검증과
+  coordinator spawn 15초·launch authority 60초 고정 한도의 대용량
+  materialization 적합성이다.
 - 비교용 소용량 control lane은 실행 불가였다. 핀된 build artifact의
   `acceptance.json`이 아직 `palimpsest.oci-root-build-run-acceptance.v1`이고
   `tests/kvm/test_oci_exec_cli_live.py`는 v2를 요구하므로 입력 검증에서

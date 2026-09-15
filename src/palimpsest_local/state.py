@@ -43,6 +43,69 @@ _STATUSES = {"creating", "defined", "starting", "running", "stopping", "stopped"
 _MAX_RUN_LEDGER_BYTES = 1024 * 1024
 _MAX_LIFECYCLE_REVISION = 2**63 - 1
 
+_PROC_LOCKS_MAX_BYTES = 1024 * 1024
+
+
+class RunLockTimeoutError(StateError):
+    """A bounded run-lock acquisition expired; holder identity is best effort."""
+
+    def __init__(self, holder_pid: int | None = None) -> None:
+        if holder_pid is not None and (type(holder_pid) is not int or holder_pid <= 0):
+            raise TypeError("run lock holder PID is invalid")
+        self.holder_pid = holder_pid
+        message = "run lock timed out"
+        if holder_pid is not None:
+            message += f"; holder-pid={holder_pid}"
+        super().__init__(message)
+
+
+def _parse_linux_flock_holder(content: bytes, lock_device: int, lock_inode: int) -> int | None:
+    if not isinstance(content, bytes) or type(lock_device) is not int or type(lock_inode) is not int:
+        return None
+    try:
+        text = content.decode("ascii")
+        expected_major, expected_minor = os.major(lock_device), os.minor(lock_device)
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) < 8 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+                continue
+            device = fields[5].split(":")
+            if len(device) != 3:
+                continue
+            major, minor, inode = int(device[0], 16), int(device[1], 16), int(device[2], 10)
+            holder_pid = int(fields[4], 10)
+            if (major, minor, inode) == (expected_major, expected_minor, lock_inode) and holder_pid > 0:
+                return holder_pid
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return None
+
+
+def _linux_flock_holder_pid(lock_fd: int) -> int | None:
+    if sys.platform != "linux":
+        return None
+    descriptor = -1
+    try:
+        lock = os.fstat(lock_fd)
+        descriptor = os.open("/proc/locks", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        chunks: list[bytes] = []
+        remaining = _PROC_LOCKS_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > _PROC_LOCKS_MAX_BYTES:
+            return None
+        return _parse_linux_flock_holder(content, lock.st_dev, lock.st_ino)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            _close_noerror(descriptor)
+
 
 @dataclass(frozen=True, slots=True)
 class RunLedgerSnapshot:
@@ -1340,7 +1403,7 @@ def _new_run_name_lock(roots: StatePaths, name: str, *, lock_timeout: float | No
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise StateError("run lock timed out")
+                        raise RunLockTimeoutError(_linux_flock_holder_pid(lock_fd))
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break

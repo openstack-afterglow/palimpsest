@@ -102,6 +102,26 @@ def test_run_state_and_locks() -> None:
         assert read_st["guest_ip"] == "192.168.122.10"
 
 
+def test_linux_flock_holder_parser_returns_only_exact_write_owner() -> None:
+    device = os.makedev(8, 2)
+    content = (
+        b"11: POSIX  ADVISORY  WRITE 1111 08:02:99 0 EOF\n"
+        b"12: FLOCK  ADVISORY  READ  2222 08:02:99 0 EOF\n"
+        b"13: FLOCK  ADVISORY  WRITE 4242 08:02:99 0 EOF\n"
+        b"13: -> FLOCK  ADVISORY  WRITE 5252 08:02:99 0 EOF\n"
+    )
+
+    assert state._parse_linux_flock_holder(content, device, 99) == 4242
+    assert state._parse_linux_flock_holder(content, device, 100) is None
+    assert state._parse_linux_flock_holder(b"not-ascii-\xff", device, 99) is None
+
+
+@pytest.mark.parametrize("holder_pid", [0, -1, True, "42"])
+def test_run_lock_timeout_rejects_invalid_holder_identity(holder_pid: object) -> None:
+    with pytest.raises(TypeError, match="holder PID is invalid"):
+        state.RunLockTimeoutError(holder_pid)  # type: ignore[arg-type]
+
+
 def test_new_run_reservation_writes_exact_v2_identity_and_rejects_smuggling(tmp_path: Path) -> None:
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
     with state.reserve_new_run(roots, "fresh", _cloud_key(RuntimeBackend.LIBVIRT_HVF)) as reservation:
