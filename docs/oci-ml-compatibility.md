@@ -257,6 +257,35 @@ values unchanged. Neither case reached a CPU tensor result, root-identity
 comparison, or PID 1 refusal; no retained domain was stopped, undefined, or
 adopted.
 
+At exact checkout `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`, the post-READY
+failure receipt and Linux flock-holder PID diagnostics were verified natively
+on `pieroot-server` (187 focused state/monitor/lifecycle/store checks passed in
+47.78 seconds, followed by 166 monitor IPC, PCI, lane, and guard checks in
+9.13 seconds). The pinned TensorFlow case failed after 125.65 seconds at
+`framework-exec-command`. Its saved stdout was empty, but stderr recorded
+`timeout-source=run-lock-timeout` and the exact kernel lock holder
+`run-lock-holder-pid=1727406`. Host process observation confirmed that PID
+1727406 was the detached monitor child worker (`palimpsest_local.oci_monitor_ipc
+--private-child-v2 3 5`). Concurrently, the run ledger recorded
+`status=failed`, `oci_root_handoff.phase=failed` despite receiving a durable
+`ready` lifecycle receipt, and the new typed failure receipt:
+`oci_root_launch_failure={"stage": "post-ready-worker", "source":
+"lifecycle-transport", "category": "timeout", "schema":
+"palimpsest.oci-root-launch-failure.v1"}`. This establishes that the detached
+worker experienced a lifecycle transport timeout after guest READY and held
+the run lock during failure handling, causing the public `exec` client's
+5-second lock acquisition to expire. The VM domain was cleanly cleaned up; no
+new domain remained, and the 19-domain zero-active baseline was preserved.
+The pinned PyTorch case failed after 297.04 seconds at `public-run-command` with
+`[parent-response:timeout]` and empty stdout, leaving its ledger at
+`status=defined` and retaining inactive domain `ml-pytorch-484e1dda` (UUID
+`74cc9561-61cc-45d1-a070-a4262b6c73a9`, shut off, persistent, autostart
+disabled). Postflight matched all 19 prior domain names, UUIDs, states, and
+autostart settings plus this one retained domain (20 inactive domains, zero
+active, all 16 archive SHA-256 values unchanged). Neither case reached CPU
+tensor proof, root-identity check, or PID 1 refusal; no retained domain was
+stopped, undefined, or adopted.
+
 One preceding SSH orchestration attempt exited pytest code 4 before collection
 because the remote working directory was not applied; zero tests ran and no
 domain was created. It is not counted as a native case result.

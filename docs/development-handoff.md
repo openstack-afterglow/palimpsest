@@ -28,10 +28,10 @@ files_modified:
 
 - branch: `codex/oci-root-phase1`
 - native re-verification checkout: detached
-  `06697bde83f4e0734955320577a59cc9c7e06f27`, clean and equal to the then-current
-  branch origin. The public timeout implementation is commit `5e9473a`; the
-  exact checkout adds test-only ambient-state isolation. GitHub development
-  package workflows `34855348288` and `34855721201` both passed. The final
+  `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`, clean and equal to the pushed
+  branch origin. The observability diagnostics implementation is commit
+  `2bb3a2d`. GitHub development package workflow `34922770716` passed and
+  published `package-2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`. The final
   evidence document commit follows this point-in-time checkout and cannot
   self-reference its own SHA.
 - final evidence staged architecture marker:
@@ -39,13 +39,25 @@ files_modified:
   (381 files), covering the exact SHA2 checks and native evidence while excluding
   the unrelated MySQL hunk.
 - server `pieroot-server` checkout: `/home/pieroot/code/palimpsest` is detached
-  at `06697bde83f4e0734955320577a59cc9c7e06f27`, with zero porcelain lines before
+  at `2bb3a2dd70ad1b7e71765eb44a6bf43e4b0ed5cf`, with zero porcelain lines before
   native verification. The native venv remains
   `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python 3.12.3, libvirt 10.0.0).
-- SHA2 Linux verification: 605 passed / 4 skipped in the timeout, CLI, guest-C,
-  dispatch, record-integration and architecture selections; 186 additional
-  monitor/ML/lane contract checks passed. The packaged stage-1 43-boot KVM
-  matrix passed its single pytest node in 122.35 seconds.
+- `2bb3a2d` Linux verification: 187 passed in state, monitor-client, lifecycle,
+  and store selections; 166 passed in monitor IPC, PCI, lane, and guard
+  selections with umask 022.
+- `2bb3a2d` native TensorFlow: failed after 125.65 seconds at
+  `framework-exec-command` with `timeout-source=run-lock-timeout` and
+  `run-lock-holder-pid=1727406` (the detached monitor child worker). Run ledger
+  recorded `oci_root_launch_failure={"stage": "post-ready-worker", "source":
+  "lifecycle-transport", "category": "timeout"}` despite receiving durable READY.
+  No new domain remained; exact 19-domain/zero-active baseline was preserved.
+- `2bb3a2d` native PyTorch: failed after 297.04 seconds at `public-run-command`
+  with `[parent-response:timeout]` and empty stdout, leaving its ledger at
+  `status=defined` and retaining inactive domain `ml-pytorch-484e1dda` (UUID
+  `74cc9561-61cc-45d1-a070-a4262b6c73a9`, shut off, persistent, autostart
+  disabled). Final full inventory is 20 inactive domains, active 0, and all 16
+  exact archive SHA-256 values unchanged. No retained domain was stopped,
+  undefined, or adopted.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
@@ -239,10 +251,18 @@ domain/archive/hardware baseline 수는 새로 승인된 inventory 범위에서 
   run-lock 만료 시 kernel `/proc/locks`에서 exact lock inode의 `flock` owner
   PID를 best-effort로 `run-lock-holder-pid`에 추가한다. raw exception·path·argv·
   guest output은 기록하지 않고 lock 5초·retry·cleanup authority도 바꾸지 않는다.
-  아직 새 exact-SHA native 실행 증거가 없으므로 과거 TensorFlow의 holder/cause는
-  확정되지 않았다. 남은 진단은 이 receipt를 사용한 순차 native 재검증과
-  coordinator spawn 15초·launch authority 60초 고정 한도의 대용량
-  materialization 적합성이다.
+  The `2bb3a2d` native rerun successfully captured both facts: TensorFlow's
+  lock holder was PID 1727406 (`palimpsest_local.oci_monitor_ipc --private-child-v2 3 5`),
+  and its ledger recorded `stage=post-ready-worker`, `source=lifecycle-transport`,
+  `category=timeout`. This establishes that the detached worker timed out in
+  lifecycle transport post-READY while holding the host run lock, causing the
+  subsequent `exec` client's 5-second lock acquisition to expire. PyTorch
+  expired at coordinator spawn response (`[parent-response:timeout]`) after
+  297.04 seconds and retained `ml-pytorch-484e1dda` (UUID
+  `74cc9561-61cc-45d1-a070-a4262b6c73a9`), leaving 20 inactive domains.
+  The remaining diagnosis is evaluating the lifecycle stream transport timeout
+  under high-CPU/I-O conditions post-READY and the coordinator spawn 15-second
+  bound for multi-gigabyte PyTorch materialization.
 - 비교용 소용량 control lane은 실행 불가였다. 핀된 build artifact의
   `acceptance.json`이 아직 `palimpsest.oci-root-build-run-acceptance.v1`이고
   `tests/kvm/test_oci_exec_cli_live.py`는 v2를 요구하므로 입력 검증에서
