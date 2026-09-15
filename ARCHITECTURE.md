@@ -38,6 +38,8 @@ PyTorch CPU-only proof가 guest에 진입하기 전에 세 차례 `public-run-co
 
 같은 보존 run이 durable READY에 도달한 뒤 exact state root에서 동일한 공개 `exec --timeout 150`을 실행했고 5.30초에 `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`를 반환했다. 이는 핀된 공식 image의 PyTorch import·정확한 행렬 연산·CPU device·CUDA unavailable을 guest 안에서 직접 확인한 증거다. 앞선 pytest 호출은 실패했으므로 root identity·PID1 거부·proof-owned stop/rm/cleanup까지 통과한 전체 qualification으로 승격하지 않는다.
 
+정확한 Linux checkout `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`에서 run-adapter/monitor-client 선별103건(49.67초)과 PyTorch native case 1건(289.62초)이 통과했다. 성공 run `ml-pytorch-451d9107`은 interface/hostdev/host-filesystem 없이 공개 `exec --timeout 150`에서 exact `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`를 반환했고, 인증 root identity device21/inode2, `/proc/1/root` 접근 거부, proof-owned stop/rm, run/root-volume 제거, source archive hash 불변까지 확인했다. Full postflight에서 새 domain은 없고 archive16개 hash는 모두 불변이며 `/tmp` 48,021,008,384 bytes가 남았다. 이전 실패에서 보존된 `ml-pytorch-ed03b448`은 running·persistent·autostart disable로 그대로 두었고 성공 cleanup 대상에 포함하거나 adopt하지 않았다. 따라서 PyTorch CPU-only qualification은 완료됐지만 CUDA/GPU helper·attach·rebind·TensorFlow post-READY 진단은 수행하지 않았다.
+
 Linux OCI layer의 경로 문법은 `/`만 계층 구분자로 사용하고 리터럴
 backslash는 파일명 문자로 보존한다. `a\\b`를 `a/b`로 치환하거나 같은
 entry로 합치지 않으며 hardlink·whiteout·normalized tar도 이 구분을
@@ -595,8 +597,8 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 {
   "schema_version": 1,
   "source_sha256": "d36359bb80b036f7ffe4359447f79ab394fe7477c0d7c126790fdb452f7276a2",
-  "reviewed_at": "2026-09-15T05:18:54Z",
-  "summary": "Reviewed the initial OCI monitor client run-lock boundary; only launch acquisition changes from 5 to 60 seconds."
+  "reviewed_at": "2026-09-15T05:29:50Z",
+  "summary": "Reviewed the bounded initial OCI monitor-client lock wait and exact Linux PyTorch CPU qualification: tensor output, CPU-only devices, root/PID1 boundaries, proof-owned cleanup, and archive preservation passed; GPU and TensorFlow boundaries remain unchanged."
 }
 ```
 <!-- architecture-review:end -->

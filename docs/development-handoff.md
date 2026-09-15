@@ -96,7 +96,20 @@ files_modified:
   run lock longer than the former generic five-second constructor deadline
   while resolving the committed large-image domain before activation. Later
   exec/stop client deadlines, IPC, READY, guest execution, retry, cleanup, and
-  GPU boundaries remain unchanged. A fresh full native case is still required.
+  GPU boundaries remain unchanged. The exact change was then tested natively.
+- exact checkout `58e9cb8e7c024deaa6e58f86344d420ce9f42c66` passed 103
+  focused Linux run-adapter/monitor-client checks in 49.67 seconds and the full
+  pinned PyTorch CPU-only case in 289.62 seconds. Run
+  `ml-pytorch-451d9107` had no interface, hostdev, or host-filesystem device;
+  public exec returned exact `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134
+  cpu False`; authenticated root identity was device 21/inode 2; PID 1 root
+  access was denied; proof-owned stop/rm and run/root-volume cleanup passed.
+  The newly qualified domain is absent. Full postflight kept all 16 archive
+  hashes unchanged with 48,021,008,384 bytes free under `/tmp`.
+- the earlier failed `ml-pytorch-ed03b448` remained running, persistent, and
+  autostart-disabled in postflight. It was not stopped, undefined, or adopted;
+  it is separate from the successful proof-owned cleanup. GPU helper, attach,
+  rebind, and CUDA execution remain blocked/unperformed.
 - local timeout implementation verification passed 551 focused tests, 31
   Docker guest-C tests, 34 guest-binary tests with no skip, and the changed
   lane at 5728 passed / 217 skipped / 7 warnings. CLI reference and lane
@@ -459,13 +472,12 @@ PCI 노드도 함께 통과했다.
 6. **그 이후 GPU 개발:** inventory와 운영자 승인이 확보된 뒤에만 allocation
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
-7. **ML 재검증:** 먼저 새 exact SHA와 보존 baseline에서 PyTorch CPU-only case를
-   한 번 실행한다. 성공 조건은 hostdev/NIC/filesystem 없는 domain 안에서 exact
-   matrix·sum·`cpu`·CUDA unavailable 출력, root/PID1 검증과 proof-owned cleanup이
-   모두 통과하는 것이다. GPU helper·attach·rebind는 실행하지 않는다. 이 proof가
-   성공하면 별도 TensorFlow post-READY lifecycle transport timeout 진단을 계속한다.
-   실패하면 새 typed phase와 inventory를 보존하고 기존 inactive domain은
-   stop·undefine·adopt하지 않는다.
+7. **ML 다음 단계:** PyTorch CPU-only case는 exact `58e9cb8`에서 matrix·sum·
+   `cpu`·CUDA unavailable, root/PID1, CPU-only XML과 proof-owned cleanup까지
+   통과했다. 다음 ML 작업은 별도 TensorFlow post-READY lifecycle transport
+   timeout 진단이다. 보존된 `ml-pytorch-ed03b448`과 기존 inactive domain은
+   stop·undefine·adopt하지 않는다. GPU helper·attach·rebind도 계속 실행하지
+   않는다.
 
 ### 이후 backlog — 현재 승인 아님
 

@@ -376,8 +376,26 @@ large-image launch, the worker can still hold the run lock while resolving and
 validating the committed domain before activation. The current follow-up gives
 only this initial client acquisition a 60-second bounded deadline; later public
 `exec`, `stop`, IPC, guest execution, READY, retry, and cleanup policies are
-unchanged. A fresh exact-SHA native run must determine whether that initial
-lock wait is sufficient and whether the tensor and cleanup assertions pass.
+unchanged. The next exact-SHA native run was used to decide whether that
+initial lock wait was sufficient and whether all qualification assertions pass.
+
+At exact checkout `58e9cb8e7c024deaa6e58f86344d420ce9f42c66`, 103
+focused Linux run-adapter and monitor-client checks passed in 49.67 seconds.
+The pinned PyTorch native case then passed in 289.62 seconds. Its public run
+returned `ml-pytorch-451d9107`; the CPU-only domain XML assertion found no
+interface, hostdev, or host-filesystem device. Public `exec --timeout 150`
+returned exactly `ML_OK pytorch 2.8.0+cu126 [19, 22, 43, 50] 134 cpu False`.
+The authenticated root identity was device 21/inode 2, direct access through
+`/proc/1/root` was denied, and the proof-owned stop and remove returned
+`stopped ml-pytorch-451d9107` and `removed ml-pytorch-451d9107`. Its run and
+root-volume directories were empty after cleanup. The source archive SHA-256
+was unchanged before and after. Full postflight found the newly qualified
+domain absent, all 16 archive hashes unchanged, and 48,021,008,384 bytes free
+under `/tmp`. The separately preserved failed run `ml-pytorch-ed03b448`
+remained running, persistent, autostart-disabled, and untouched; it is not part
+of the successful proof-owned cleanup. This completes the PyTorch CPU-only
+qualification. It does not test CUDA, attach a GPU, or authorize the blocked
+GPU helper.
 
 The anonymous TLS registry metadata selection used to acquire the proof inputs
 is fixed to Linux/amd64:
