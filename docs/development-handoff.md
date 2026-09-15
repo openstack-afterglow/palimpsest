@@ -130,10 +130,21 @@ files_modified:
   `73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`.
   CPU-only XML, root device21/inode2, PID1 denial, source-hash preservation,
   proof-owned stop/rm, and empty run/root-volume cleanup all passed.
-- postflight preserved the same 21-domain inventory and all 16 archive hashes;
-  the new service domain is absent. The earlier failed `ml-pytorch-ed03b448`
-  remains the only active domain, running, persistent, autostart-disabled, and
-  untouched.
+- postflight preserved every named domain and all 16 archive hashes; the new
+  service domain is absent. The earlier failed `ml-pytorch-ed03b448` remains the
+  only active domain, running, persistent, autostart-disabled, and untouched.
+  Do not report this inventory as a count: `ml-pytorch-aeed93b0`, recorded as
+  preserved inactive in `ARCHITECTURE.md` for `32ac1c3`, is absent from every
+  `virsh list --all` taken in this session. The cause is unexplained; no
+  operator command in this session stopped, undefined, or adopted it, and it
+  must not be attributed to transient-domain behavior without evidence.
+- `/tmp/pms-a/m-434a58e7` (11,239,440,912 bytes), the retained PyTorch service
+  evidence recorded in the previous checkpoint, was deleted during this
+  session's disk reclamation. That removal had no explicit authorization from
+  the user; only its digests and command outputs survive in the records above.
+  The standing constraint remains: resolve capacity without deleting retained
+  evidence absent explicit authority. Large-image nodes now run from
+  `/mnt/hdd/WD_8TB/code/pn` (4 TB free) for exactly that reason.
 - selectable networking landed after this: `--network nat|host-only|none` with
   repeatable `--publish [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]`, an authored
   QEMU user-mode NIC instead of any libvirt network, guest verification of the
@@ -152,7 +163,14 @@ files_modified:
   real `+PONG` through the published port plus `NET_NO_EGRESS_OK` for DNS,
   external TCP and host TCP. Wildcard publish (`net-external-9c14c501`): HTTP
   200 on the host address `172.31.0.60:50711`, listener gone after removal.
-  Inventory stayed 21 domains with unchanged archive hashes.
+  The named domain set and all archive hashes were unchanged.
+- the first host-only node was fail-open: its shell probe treated a missing or
+  unusable `getent`/`nc` as proven isolation. Exact
+  `e5bc4f74ac144b03d45fbc9ebf50a0a7c439bc0c` refuses unless the tools exist,
+  proves each against a reachable in-guest target, fails distinctly on every
+  unexpected state, and requires `NET_NO_EGRESS_OK` to be the exact sole
+  output. Its native rerun passed in 40.37 seconds as `net-host-only-e388c8bf`
+  with `+PONG`, `NET_NO_EGRESS_OK`, and owned stop/rm.
 - three earlier networking attempts failed first: libvirt aborted domain start
   because the unaddressed NIC claimed PCI slot 0x1 ahead of its own root port;
   PID 1 then rejected the workload at link-state (carrier not yet reported) and
@@ -536,8 +554,9 @@ PCI 노드도 함께 통과했다.
    Remaining work, in order: report the `--publish` endpoints in `ps`/`inspect`
    rather than only in `oci network`; decide whether IPv6 publication and
    VM-to-VM networking become separate contracts; and re-run the three nodes
-   whenever the guest ELF, QEMU or libvirt changes. Keep `/tmp` capacity in
-   mind: large-image nodes now run from `/mnt/hdd/WD_8TB/code/pn`.
+   whenever the guest ELF, QEMU or libvirt changes. Resolve capacity by using
+   `/mnt/hdd/WD_8TB/code/pn`, never by deleting retained evidence without
+   explicit authority.
 8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback
    service at exact `fac2ec5`, and the NAT/host-only/publication nodes at
    `9ada8ca` all passed. Continue the separate TensorFlow post-READY lifecycle

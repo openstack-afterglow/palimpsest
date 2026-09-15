@@ -198,7 +198,7 @@ Every node also verified the authored QEMU argument vector against the durable
 plan, the absence of any libvirt-owned interface, hostdev or host filesystem,
 the `oci network` exposure projection, authenticated root identity, PID 1
 access denial, `stopped`/`removed` for its own run, and unchanged source
-archives. The 21-domain libvirt inventory and all pinned archive hashes were
+archives. Every named libvirt domain and all pinned archive hashes were
 identical before and after; the separately preserved running
 `ml-pytorch-ed03b448` was untouched. This qualifies these three exact images,
 modes and publications on this host. It does not qualify IPv6, privileged host
@@ -210,3 +210,12 @@ aborted domain start because an unaddressed passthrough NIC claimed PCI slot
 link-state check because carrier was not yet reported; and it next rejected the
 default-route check because the kernel prints `/proc/net/route` in uppercase
 hexadecimal. Those runs are not networking qualification.
+
+The first host-only node was also fail-open: a missing or unusable guest
+`getent`/`nc` would have printed the isolation marker without testing
+egress. At exact `e5bc4f74ac144b03d45fbc9ebf50a0a7c439bc0c` the probe
+refuses unless the tools exist, proves the resolver and TCP probe against
+reachable in-guest targets, fails distinctly on any unexpected state, and
+requires `NET_NO_EGRESS_OK` as the exact sole output. That rerun passed in
+40.37 seconds as `net-host-only-e388c8bf` with a real `+PONG` through the
+published port and owned stop/remove.
