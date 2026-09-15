@@ -652,6 +652,24 @@ run [`35022949640`](https://github.com/openstack-afterglow/palimpsest/actions/ru
 job이 모두 success였으므로 이 commit의 Python 3.12 remote package gate와
 SHA-specific prerelease publication이 완료됐다.
 
+User-authorized draft PR [#1](https://github.com/openstack-afterglow/palimpsest/pull/1)은
+`dev`를 base로 열렸고, 생성 시점 범위는287 commits·393 files여서 merge-ready가
+아닌 분할·review 판단용이다. 첫 PR `Test` run
+[`35023860010`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35023860010)과
+Hub 재사용 run
+[`35023860237`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35023860237)은
+repository-wide Ruff format drift11개와 비활성 native KVM gate를 보고했다. Pin된
+Ruff로 해당11개 파일을 정규화했다. 독립 review는 dev-cover portable test의 한
+함수가 Python behavior가 아니라 두 source substring의 기존 줄 배치를 고정해
+formatter 뒤 실패할 것을 발견했다. 해당 source-text 함수는 삭제하고 실제
+initramfs 생성 behavior test와 opt-in native proof는 유지했다. 이후 전체336개
+파일 format check·Ruff lint, `core-cli qualification` 1,384건 통과·7건
+skip(30.61초), `oci-guest` 629건 통과·114건 skip(19.99초)을 확인했다. 이 변경은
+production/runtime 계약을 바꾸거나 native KVM requirement를 완화하지 않는다.
+KVM job은 `vars.PALIMPSEST_KVM_ENABLED`가 `true`이고 `[self-hosted, linux, x64,
+kvm]` runner에서 실제 proof가 success일 때만 gate를 통과한다. 현재 variable은
+비어 있고 job result는 skipped였으므로 이는 코드 수정으로 우회할 대상이 아니다.
+
 안전한 로컬 focused 명령:
 
 ```sh

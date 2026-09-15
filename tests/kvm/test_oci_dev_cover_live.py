@@ -36,30 +36,73 @@ _PREFIX = b"PALIMPSEST_DEV_COVER_V1 "
 
 
 def _build_probe_initramfs(init_payload: bytes) -> bytes:
-    return build_newc([
-        NewcEntry("dev", stat.S_IFDIR | 0o755, b""),
-        NewcEntry("init", stat.S_IFREG | 0o755, init_payload),
-        NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
-        NewcEntry("trusted", stat.S_IFDIR | 0o755, b""),
-    ])
+    return build_newc(
+        [
+            NewcEntry("dev", stat.S_IFDIR | 0o755, b""),
+            NewcEntry("init", stat.S_IFREG | 0o755, init_payload),
+            NewcEntry("proc", stat.S_IFDIR | 0o755, b""),
+            NewcEntry("trusted", stat.S_IFDIR | 0o755, b""),
+        ]
+    )
 
 
 def _compile(root: Path) -> Path:
     source = Path(__file__).with_name("assets") / "dev-cover-probe.c"
     command = [
-        "docker", "run", "--rm", "--pull=never", "--platform", "linux/amd64",
-        "--network", "none", "--read-only", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
-        "--pids-limit", "16", "--memory", "128m", "--cpus", "0.25",
-        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
-        "--mount", f"type=bind,src={Path(__file__).resolve().parents[2]},dst=/repo,readonly",
-        "--mount", f"type=bind,src={source},dst=/src/probe.c,readonly",
-        "--mount", f"type=bind,src={root},dst=/out",
-        "--entrypoint", "/usr/bin/timeout", _TOOLCHAIN, "--kill-after=3", "55",
-        "/usr/local/bin/gcc", "-std=c11", "-Os", "-nostdlib", "-static", "-fno-builtin",
-        "-fno-ident", "-fno-stack-protector", "-fno-unwind-tables", "-fno-pie", "-no-pie",
-        "-ffreestanding", "-mno-red-zone", "-Wall", "-Wextra", "-Werror",
-        "-Wl,--build-id=none,-z,noexecstack,-s,-e,probe_start", "-o", "/out/init", "/src/probe.c",
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--platform",
+        "linux/amd64",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "--pids-limit",
+        "16",
+        "--memory",
+        "128m",
+        "--cpus",
+        "0.25",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "--mount",
+        f"type=bind,src={Path(__file__).resolve().parents[2]},dst=/repo,readonly",
+        "--mount",
+        f"type=bind,src={source},dst=/src/probe.c,readonly",
+        "--mount",
+        f"type=bind,src={root},dst=/out",
+        "--entrypoint",
+        "/usr/bin/timeout",
+        _TOOLCHAIN,
+        "--kill-after=3",
+        "55",
+        "/usr/local/bin/gcc",
+        "-std=c11",
+        "-Os",
+        "-nostdlib",
+        "-static",
+        "-fno-builtin",
+        "-fno-ident",
+        "-fno-stack-protector",
+        "-fno-unwind-tables",
+        "-fno-pie",
+        "-no-pie",
+        "-ffreestanding",
+        "-mno-red-zone",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wl,--build-id=none,-z,noexecstack,-s,-e,probe_start",
+        "-o",
+        "/out/init",
+        "/src/probe.c",
     ]
     completed = _bounded_command(command, environment=dict(os.environ), timeout=60)
     _save(root, "compile", completed)
@@ -77,8 +120,9 @@ def _boot(command: list[str], evidence: Path, name: str, terminal: bytes) -> tup
     boot_evidence = evidence / name
     boot_evidence.mkdir(mode=0o700)
     try:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+        )
         assert process.stdout is not None
         os.set_blocking(process.stdout.fileno(), False)
         selector.register(process.stdout, selectors.EVENT_READ)
@@ -90,7 +134,11 @@ def _boot(command: list[str], evidence: Path, name: str, terminal: bytes) -> tup
                     data.extend(chunk)
             assert len(data) <= 1024 * 1024
             lines = _completed_probe_lines(bytes(data))
-            if terminal in lines or any(line.startswith(_PREFIX + b"FAIL_") for line in lines) or process.poll() is not None:
+            if (
+                terminal in lines
+                or any(line.startswith(_PREFIX + b"FAIL_") for line in lines)
+                or process.poll() is not None
+            ):
                 break
         assert terminal in lines, f"evidence retained at {evidence}"
         assert not any(line.startswith(_PREFIX + b"FAIL_") for line in lines), f"evidence retained at {evidence}"
@@ -120,33 +168,63 @@ def test_populated_image_dev_is_covered_by_trusted_devtmpfs_then_private_child_t
     kernel_path = _secure_write(evidence, "kernel", kernel.payload, mode=0o400)
     initrd = _secure_write(evidence, "initramfs.cpio", archive, mode=0o400)
     qemu_path = _secure_write(evidence, "qemu-system-x86_64", qemu.payload, mode=0o500)
-    probe_sha256 = hashlib.sha256(
-        (Path(__file__).with_name("assets") / "dev-cover-probe.c").read_bytes()
-    ).hexdigest()
+    probe_sha256 = hashlib.sha256((Path(__file__).with_name("assets") / "dev-cover-probe.c").read_bytes()).hexdigest()
     receipt = {
         "schema": "palimpsest.guest-dev-cover-proof.v1",
         "kernel_sha256": hashlib.sha256(kernel.payload).hexdigest(),
         "kernel_config_sha256": hashlib.sha256(config.payload).hexdigest(),
         "qemu_sha256": hashlib.sha256(qemu.payload).hexdigest(),
-        "qemu_version": version.decode(), "probe_source_sha256": probe_sha256,
-        "planned_boots": 2, "executed_boots": 0, "result": "prepared",
-        "memory_mib": 128, "vcpus": 1, "network": "none",
+        "qemu_version": version.decode(),
+        "probe_source_sha256": probe_sha256,
+        "planned_boots": 2,
+        "executed_boots": 0,
+        "result": "prepared",
+        "memory_mib": 128,
+        "vcpus": 1,
+        "network": "none",
     }
     receipt_path = evidence / "receipt.json"
     receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
-    base = [os.fspath(qemu_path), "-nodefaults", "-no-reboot", "-display", "none",
-            "-machine", "q35,accel=kvm", "-cpu", "host", "-m", "128", "-smp", "1",
-            "-kernel", os.fspath(kernel_path), "-initrd", os.fspath(initrd),
-            "-serial", "stdio", "-net", "none"]
-    success = _boot(base + ["-append", "console=ttyS0,115200n8 rdinit=/init panic=-1"],
-                    evidence, "success-console.bin", _PREFIX + b"PASS")
+    base = [
+        os.fspath(qemu_path),
+        "-nodefaults",
+        "-no-reboot",
+        "-display",
+        "none",
+        "-machine",
+        "q35,accel=kvm",
+        "-cpu",
+        "host",
+        "-m",
+        "128",
+        "-smp",
+        "1",
+        "-kernel",
+        os.fspath(kernel_path),
+        "-initrd",
+        os.fspath(initrd),
+        "-serial",
+        "stdio",
+        "-net",
+        "none",
+    ]
+    success = _boot(
+        base + ["-append", "console=ttyS0,115200n8 rdinit=/init panic=-1"],
+        evidence,
+        "success-console.bin",
+        _PREFIX + b"PASS",
+    )
     receipt.update(executed_boots=1, result="success-boot-complete")
     receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
     assert success.count(_PREFIX + b"TRUSTED_DEVTMPFS") == 1
     assert success.count(_PREFIX + b"CHILD_TMPFS_6_PLUS_2") == 1
     assert success.count(_PREFIX + b"PARENT_DEVTMPFS_UNCHANGED") == 1
-    rejected = _boot(base + ["-append", "console=ttyS0,115200n8 rdinit=/init panic=-1 palimpsest.dev_cover_fail=1"],
-                     evidence, "rejected-console.bin", _PREFIX + b"REJECT")
+    rejected = _boot(
+        base + ["-append", "console=ttyS0,115200n8 rdinit=/init panic=-1 palimpsest.dev_cover_fail=1"],
+        evidence,
+        "rejected-console.bin",
+        _PREFIX + b"REJECT",
+    )
     receipt.update(executed_boots=2, result="boots-complete-unqualified")
     receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
     assert _PREFIX + b"TRUSTED_DEVTMPFS" not in rejected

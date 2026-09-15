@@ -33,16 +33,17 @@ def harness(tmp_path_factory: pytest.TempPathFactory) -> Path:
     assert "main_workload_stop_deadline ? main_workload_stop_deadline" in function
     assert "now + 1000" in function
     template = (ROOT / "tests/c/main_output_terminate_harness.c").read_text(encoding="utf-8")
-    generated = template.replace("/* RECORD_REAPED_FUNCTION */", record).replace(
-        "/* TERMINATE_FUNCTION */", function
-    )
+    generated = template.replace("/* RECORD_REAPED_FUNCTION */", record).replace("/* TERMINATE_FUNCTION */", function)
     directory = tmp_path_factory.mktemp("main-output-terminate")
     source = directory / "harness.c"
     binary = directory / "harness"
     source.write_text(generated, encoding="utf-8")
     result = subprocess.run(
         ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", str(source), "-o", str(binary)],
-        capture_output=True, text=True, timeout=20, check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     return binary

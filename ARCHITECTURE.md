@@ -611,13 +611,15 @@ escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcar
 
 Architecture freshness guard는 package runtime과 분리된 standard-library/Git 도구로, pre-commit과 초기 CI에서 system `python3`로 실행된다. Stamp timestamp는 Python 3.11 전용 `datetime.UTC` alias 대신 `datetime.timezone.utc`를 사용해 Python 3.9에서도 동일한 UTC `Z` JSON 계약을 생성한다. Digest, marker schema, atomic write, staged/working 범위와 package의 Python 3.12+ 지원 계약은 바뀌지 않는다.
 
+Draft PR #1의 첫 full CI는 repository-wide `ruff format --check .`에서 기존11개 Python 파일의 format drift를 발견했다. Pin된 Ruff formatter로 그11개를 정규화하자 `test_oci_dev_cover_live_contract.py`의 한 함수가 Python 동작이 아니라 두 source substring의 기존 줄 배치를 고정하고 있어 실패할 것이 독립 review에서 확인됐다. 해당 source-text 함수는 삭제하고 실제 initramfs 생성 behavior test와 opt-in native proof는 유지했다. 이는 production/runtime, protocol, schema, authority 또는 architecture를 바꾸지 않는다. 전체336개 파일 format check·Ruff lint, `core-cli qualification` 1,384건 통과·7건 skip, `oci-guest` 629건 통과·114건 skip이 뒤따랐다. 별도 `Required native KVM proof` 실패는 repository variable과 self-hosted KVM job이 비활성인 외부 gate이며 이 변경은 그 gate를 skip하거나 완화하지 않는다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a771390c6f6608ea1b2f9dce1f4ca4299551b27c9917f78dd54d85c660421214",
-  "reviewed_at": "2026-09-15T18:49:18Z",
-  "summary": "Reviewed standalone architecture guard portability: timezone.utc preserves UTC Z timestamps when system Python lacks datetime.UTC; digest, schema, atomicity, staged/working boundaries, and package Python support remain unchanged."
+  "source_sha256": "5c3e8576031bb8b2f963e005b4a600aa6e594b787b784ff69348faac5a9c1668",
+  "reviewed_at": "2026-09-15T21:16:44Z",
+  "summary": "Reviewed draft PR CI remediation: repository-pinned Ruff normalized eleven files and a brittle source-layout test was removed while behavioral coverage and the native proof remain; runtime and architecture contracts are unchanged, and the required self-hosted KVM gate remains externally blocked."
 }
 ```
 <!-- architecture-review:end -->

@@ -112,8 +112,6 @@ def test_previous_conflated_deadline_reproduces_native_failure(tmp_path: Path) -
         timeout=20,
     )
     assert compiled.returncode == 0, compiled.stderr
-    reproduced = subprocess.run(
-        [str(binary), "slice-empty"], capture_output=True, text=True, check=False, timeout=10
-    )
+    reproduced = subprocess.run([str(binary), "slice-empty"], capture_output=True, text=True, check=False, timeout=10)
     assert reproduced.returncode != 0
     assert "slice-empty failed" in reproduced.stderr

@@ -131,13 +131,20 @@ def test_pinned_reader_rejects_runs_ancestor_permission_drift(tmp_path: Path) ->
 
 def _runtime_access_receipt(run: Path) -> tuple[RuntimeAccessReceipt, MonitorPreActivationBinding]:
     record = ExistingRunRecord(
-        "demo", "f6f546e2-e734-4920-9eff-1762b348a249", 2,
+        "demo",
+        "f6f546e2-e734-4920-9eff-1762b348a249",
+        2,
         DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
     )
     binding = MonitorPreActivationBinding(
-        record, os.geteuid(), "sha256:" + "a" * 64, "sha256:" + "b" * 64,
-        "sha256:" + "c" * 64, "de305d54-75b4-431b-adb2-eb6b9e546014",
-        "aca88126-d991-4de8-b66b-90dc07904dff", "qemu:///system",
+        record,
+        os.geteuid(),
+        "sha256:" + "a" * 64,
+        "sha256:" + "b" * 64,
+        "sha256:" + "c" * 64,
+        "de305d54-75b4-431b-adb2-eb6b9e546014",
+        "aca88126-d991-4de8-b66b-90dc07904dff",
+        "qemu:///system",
     )
     info = run.stat()
     qemu_uid = 12345 if os.geteuid() != 12345 else 12346
@@ -145,30 +152,59 @@ def _runtime_access_receipt(run: Path) -> tuple[RuntimeAccessReceipt, MonitorPre
     directory_baseline = baseline_acl(directory=True)
     file_baseline = baseline_acl(directory=False)
     run_target = RuntimeAccessTarget(
-        info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_nlink, True,
-        directory_baseline, traversal_acl(directory_baseline, qemu_uid),
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        True,
+        directory_baseline,
+        traversal_acl(directory_baseline, qemu_uid),
     )
     directory_target = RuntimeAccessTarget(
-        info.st_dev, info.st_ino + 1, info.st_uid, info.st_gid, 2, True,
-        directory_baseline, grant_acl(directory_baseline, qemu_uid),
+        info.st_dev,
+        info.st_ino + 1,
+        info.st_uid,
+        info.st_gid,
+        2,
+        True,
+        directory_baseline,
+        grant_acl(directory_baseline, qemu_uid),
     )
     console_target = RuntimeAccessTarget(
-        info.st_dev, info.st_ino + 2, info.st_uid, info.st_gid, 1, False,
-        file_baseline, grant_acl(file_baseline, qemu_uid),
+        info.st_dev,
+        info.st_ino + 2,
+        info.st_uid,
+        info.st_gid,
+        1,
+        False,
+        file_baseline,
+        grant_acl(file_baseline, qemu_uid),
     )
     runtime_io = RuntimeIOReceipt(
-        "palimpsest.oci-runtime-io.v1", record.run_id, record.name, binding.plan_digest,
-        directory_target.device, directory_target.inode, console_target.device, console_target.inode,
+        "palimpsest.oci-runtime-io.v1",
+        record.run_id,
+        record.name,
+        binding.plan_digest,
+        directory_target.device,
+        directory_target.inode,
+        console_target.device,
+        console_target.inode,
     )
     return RuntimeAccessReceipt(
-        str(uuid.uuid4()), "granted", binding, runtime_io, qemu_uid, qemu_gid,
-        run_target, directory_target, console_target,
+        str(uuid.uuid4()),
+        "granted",
+        binding,
+        runtime_io,
+        qemu_uid,
+        qemu_gid,
+        run_target,
+        directory_target,
+        console_target,
     ), binding
 
 
-@pytest.mark.parametrize(
-    "mutation", ["valid", "missing", "malformed", "phase", "boot", "target", "acl"]
-)
+@pytest.mark.parametrize("mutation", ["valid", "missing", "malformed", "phase", "boot", "target", "acl"])
 def test_pinned_reader_requires_exact_authorized_0710_receipt_and_acl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
@@ -195,7 +231,8 @@ def test_pinned_reader_requires_exact_authorized_0710_receipt_and_acl(
     snapshot = SimpleNamespace(record=binding.record, state=_freeze(state))
     current_acl = receipt.run.baseline if mutation == "acl" else receipt.run.granted
     monkeypatch.setattr(
-        proof_module, "LinuxFdACLBackend",
+        proof_module,
+        "LinuxFdACLBackend",
         lambda: SimpleNamespace(read_acl=lambda fd: current_acl),
     )
     monkeypatch.setattr(proof_module, "read_run_ledger_snapshot", lambda roots, name: snapshot)
@@ -224,8 +261,11 @@ def _tree_fingerprint(root: Path) -> tuple[tuple[object, ...], ...]:
         info = path.lstat()
         values.append(
             (
-                str(path.relative_to(root.parent)), info.st_dev, info.st_ino,
-                stat.S_IMODE(info.st_mode), info.st_mtime_ns,
+                str(path.relative_to(root.parent)),
+                info.st_dev,
+                info.st_ino,
+                stat.S_IMODE(info.st_mode),
+                info.st_mtime_ns,
                 path.read_bytes() if path.is_file() else None,
             )
         )
@@ -243,8 +283,15 @@ def proof_case(monkeypatch: pytest.MonkeyPatch):
     key = bytes(range(32))
     wire_binding = OCIControlV2Binding(run_id, core, stage1)
     ready_message = OCIControlV2Message(
-        "READY", wire_binding, attempt, "1" * 64, 1, 2, {"root_identity": IDENTITY},
-        boot_generation=generation, reply_to=2,
+        "READY",
+        wire_binding,
+        attempt,
+        "1" * 64,
+        1,
+        2,
+        {"root_identity": IDENTITY},
+        boot_generation=generation,
+        reply_to=2,
     )
     ready_envelope = sign_message(ready_message, key)
     projection = dict(
@@ -254,26 +301,43 @@ def proof_case(monkeypatch: pytest.MonkeyPatch):
     )
     record = SimpleNamespace(name="demo", run_id=run_id)
     binding = SimpleNamespace(
-        record=record, boot_attempt_id=attempt, domain_uuid=str(uuid.uuid4()), libvirt_uri="qemu:///system",
-        plan_digest=plan_digest, stage1_artifact_digest=stage1,
-        expected_definition_projection_digest="sha256:" + "d" * 64, digest="sha256:" + "e" * 64,
+        record=record,
+        boot_attempt_id=attempt,
+        domain_uuid=str(uuid.uuid4()),
+        libvirt_uri="qemu:///system",
+        plan_digest=plan_digest,
+        stage1_artifact_digest=stage1,
+        expected_definition_projection_digest="sha256:" + "d" * 64,
+        digest="sha256:" + "e" * 64,
     )
     active_binding = SimpleNamespace(domain_id=7, boot_attempt_id=attempt)
     journal = SimpleNamespace(
-        phase="ready", identity=SimpleNamespace(binding=binding, generation=str(uuid.uuid4())),
-        active_binding=active_binding, revision=9,
+        phase="ready",
+        identity=SimpleNamespace(binding=binding, generation=str(uuid.uuid4())),
+        active_binding=active_binding,
+        revision=9,
     )
     lifecycle = {
-        "phase": "ready", "boot_attempt_id": attempt, "boot_generation": generation,
-        "key_id": ready_envelope.key_id, "terminal": None, "transcript": [projection],
+        "phase": "ready",
+        "boot_attempt_id": attempt,
+        "boot_generation": generation,
+        "key_id": ready_envelope.key_id,
+        "terminal": None,
+        "transcript": [projection],
     }
     handoff = {
-        "schema": "palimpsest.oci-root-handoff.v1", "boot_attempt_id": attempt,
-        "domain_uuid": binding.domain_uuid, "domain_id": 7, "plan_digest": plan_digest,
-        "libvirt_uri": "qemu:///system", "phase": "ready", "lifecycle": lifecycle,
+        "schema": "palimpsest.oci-root-handoff.v1",
+        "boot_attempt_id": attempt,
+        "domain_uuid": binding.domain_uuid,
+        "domain_id": 7,
+        "plan_digest": plan_digest,
+        "libvirt_uri": "qemu:///system",
+        "phase": "ready",
+        "lifecycle": lifecycle,
     }
     raw_state = {
-        "status": "running", "oci_root_domain": {"digest": plan_digest, "plan": {}},
+        "status": "running",
+        "oci_root_domain": {"digest": plan_digest, "plan": {}},
         "oci_root_handoff": handoff,
     }
     snapshots = [SimpleNamespace(record=record, state=_freeze(raw_state))]
@@ -299,16 +363,31 @@ def proof_case(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(proof_module, "_PinnedRunRead", Pinned)
     monkeypatch.setattr(proof_module, "load_oci_root_domain_plan", lambda roots, name: plan)
     monkeypatch.setattr(
-        proof_module, "read_run_ledger_snapshot", lambda roots, name: snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
+        proof_module,
+        "read_run_ledger_snapshot",
+        lambda roots, name: snapshots.pop(0) if len(snapshots) > 1 else snapshots[0],
     )
     monkeypatch.setattr(
-        proof_module, "_read_run_journal", lambda mutation, binding=None: journals.pop(0) if len(journals) > 1 else journals[0]
+        proof_module,
+        "_read_run_journal",
+        lambda mutation, binding=None: journals.pop(0) if len(journals) > 1 else journals[0],
     )
-    monkeypatch.setattr(proof_module, "_active_domain", lambda conn, selected, domain_id: domain_calls.append(domain_id))
+    monkeypatch.setattr(
+        proof_module, "_active_domain", lambda conn, selected, domain_id: domain_calls.append(domain_id)
+    )
     return SimpleNamespace(
-        roots=SimpleNamespace(), snapshot=snapshots[0], raw_state=raw_state, handoff=handoff,
-        lifecycle=lifecycle, projection=projection, binding=binding, journal=journal, plan=plan,
-        snapshots=snapshots, journals=journals, domain_calls=domain_calls,
+        roots=SimpleNamespace(),
+        snapshot=snapshots[0],
+        raw_state=raw_state,
+        handoff=handoff,
+        lifecycle=lifecycle,
+        projection=projection,
+        binding=binding,
+        journal=journal,
+        plan=plan,
+        snapshots=snapshots,
+        journals=journals,
+        domain_calls=domain_calls,
     )
 
 
@@ -364,9 +443,7 @@ def test_root_proof_rejects_missing_conflicting_tampered_or_stale_ready(proof_ca
         changed = "sha256:" + "f" * 64
         proof_case.projection["stage1_artifact_digest"] = changed
         proof_case.binding.stage1_artifact_digest = changed
-        proof_case.projection["body_digest"] = proof_module._digest(
-            _ready_body(proof_case.projection, IDENTITY)
-        )
+        proof_case.projection["body_digest"] = proof_module._digest(_ready_body(proof_case.projection, IDENTITY))
         proof_case.projection["projection_digest"] = proof_module._digest(
             {key: value for key, value in proof_case.projection.items() if key != "projection_digest"}
         )
@@ -385,7 +462,8 @@ def test_root_proof_rejects_journal_ledger_and_domain_observation_races(
         root_proof(proof_case.roots, "demo", conn=object())
     proof_case.journals[:] = [proof_case.journal]
     monkeypatch.setattr(
-        proof_module, "_active_domain",
+        proof_module,
+        "_active_domain",
         lambda conn, binding, domain_id: (_ for _ in ()).throw(StateError("domain replaced")),
     )
     with pytest.raises(StateError, match="domain replaced"):
@@ -395,6 +473,9 @@ def test_root_proof_rejects_journal_ledger_and_domain_observation_races(
 def test_root_proof_rejects_ledger_snapshot_race(proof_case) -> None:
     changed = deepcopy(proof_case.raw_state)
     changed["status"] = "exited"
-    proof_case.snapshots[:] = [proof_case.snapshot, SimpleNamespace(record=proof_case.binding.record, state=_freeze(changed))]
+    proof_case.snapshots[:] = [
+        proof_case.snapshot,
+        SimpleNamespace(record=proof_case.binding.record, state=_freeze(changed)),
+    ]
     with pytest.raises(StateError, match="plan changed"):
         root_proof(proof_case.roots, "demo", conn=object())

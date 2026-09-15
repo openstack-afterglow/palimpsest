@@ -171,14 +171,14 @@ def test_production_loopback_abi_matches_linux_uapi(tmp_path: Path) -> None:
     check.write_text(
         "#define _DEFAULT_SOURCE\n#include <stddef.h>\n#include <sys/socket.h>\n#include <sys/ioctl.h>\n"
         "#include <net/if.h>\n#include <linux/sockios.h>\n#include <sys/syscall.h>\n"
-        "_Static_assert(SYS_socket==41,\"socket\");\n"
-        "_Static_assert(AF_INET==2 && SOCK_DGRAM==2,\"socket ABI\");\n"
-        "_Static_assert(IFNAMSIZ==16 && sizeof(struct ifreq)==40,\"ifreq size\");\n"
-        "_Static_assert(offsetof(struct ifreq,ifr_ifindex)==16,\"ifindex offset\");\n"
-        "_Static_assert(offsetof(struct ifreq,ifr_flags)==16,\"flags offset\");\n"
+        '_Static_assert(SYS_socket==41,"socket");\n'
+        '_Static_assert(AF_INET==2 && SOCK_DGRAM==2,"socket ABI");\n'
+        '_Static_assert(IFNAMSIZ==16 && sizeof(struct ifreq)==40,"ifreq size");\n'
+        '_Static_assert(offsetof(struct ifreq,ifr_ifindex)==16,"ifindex offset");\n'
+        '_Static_assert(offsetof(struct ifreq,ifr_flags)==16,"flags offset");\n'
         "_Static_assert(SIOCGIFNAME==0x8910 && SIOCGIFFLAGS==0x8913 && "
-        "SIOCSIFFLAGS==0x8914 && SIOCGIFINDEX==0x8933,\"ioctls\");\n"
-        "_Static_assert(IFF_UP==1 && IFF_LOOPBACK==8 && IFF_RUNNING==64,\"flags\");\n"
+        'SIOCSIFFLAGS==0x8914 && SIOCGIFINDEX==0x8933,"ioctls");\n'
+        '_Static_assert(IFF_UP==1 && IFF_LOOPBACK==8 && IFF_RUNNING==64,"flags");\n'
         "int main(void){return 0;}\n",
         encoding="ascii",
     )

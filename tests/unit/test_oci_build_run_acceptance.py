@@ -72,8 +72,13 @@ def case(tmp_path, monkeypatch):
                 "run": {"name": value.run_name, "run_id": "run"},
                 "boot": {"attempt_id": "attempt", "generation": "generation"},
                 "domain": {"id": 7, "uuid": "domain"},
-                "root_identity": {"schema": "palimpsest.oci-root-identity.v1", "pid": 1,
-                                  "filesystem": "overlayfs", "device": device, "inode": 11},
+                "root_identity": {
+                    "schema": "palimpsest.oci-root-identity.v1",
+                    "pid": 1,
+                    "filesystem": "overlayfs",
+                    "device": device,
+                    "inode": 11,
+                },
             }
             return subprocess.CompletedProcess(arguments, 0, json.dumps(proof), "")
         elif arguments[0] == "exec" and arguments[-1] == "/usr/local/bin/palimpsest-e2e-probe":

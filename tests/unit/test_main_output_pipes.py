@@ -228,13 +228,16 @@ def test_child_install_and_parent_close_actual_fault_matrix(tmp_path):
 
 def test_eof_and_full_cleanup_close_faults_actual(tmp_path):
     source = SOURCE.read_text()
-    extracted = "\n\n".join((
-        _function(source, "static int close_main_output_fd"),
-        _function(source, "static int close_main_output(void)"),
-        _function(source, "static main_output_count read_main_output_nonblocking"),
-    ))
+    extracted = "\n\n".join(
+        (
+            _function(source, "static int close_main_output_fd"),
+            _function(source, "static int close_main_output(void)"),
+            _function(source, "static main_output_count read_main_output_nonblocking"),
+        )
+    )
     harness = tmp_path / "main_output_close_harness.c"
-    harness.write_text(textwrap.dedent(r'''
+    harness.write_text(
+        textwrap.dedent(r"""
         #include <stdint.h>
         #include <stdlib.h>
         typedef unsigned int u32; typedef unsigned long usize; typedef signed long i64;
@@ -257,7 +260,10 @@ def test_eof_and_full_cleanup_close_faults_actual(tmp_path):
           reads++;
           return 0;
         }
-    ''') + "\n" + extracted + textwrap.dedent(r'''
+    """)
+        + "\n"
+        + extracted
+        + textwrap.dedent(r"""
         int main(int argc,char **argv) { unsigned char byte; int result; scenario=argc>1?atoi(argv[1]):0;
           if (scenario<=2) {
             result=(int)read_main_output_nonblocking(&main_output,(unsigned int)(scenario==2),&byte,1);
@@ -274,9 +280,12 @@ def test_eof_and_full_cleanup_close_faults_actual(tmp_path):
           if (close_attempt[10]!=1 || close_attempt[11]!=1 || close_attempt[12]!=1 || close_attempt[13]!=1) return 21;
           return 0;
         }
-    '''))
+    """)
+    )
     binary = tmp_path / "harness"
-    built = subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)], capture_output=True)
+    built = subprocess.run(
+        ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)], capture_output=True
+    )
     assert built.returncode == 0, built.stderr.decode()
     for scenario in range(4):
         ran = subprocess.run([str(binary), str(scenario)], capture_output=True)

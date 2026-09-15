@@ -121,13 +121,9 @@ class _PinnedRunRead:
         if (
             any(not stat.S_ISDIR(item.st_mode) for item in (runs_open, runs_visible, run_open, run_visible))
             or any(
-                (item.st_uid, stat.S_IMODE(item.st_mode)) != self._runs_metadata
-                for item in (runs_open, runs_visible)
+                (item.st_uid, stat.S_IMODE(item.st_mode)) != self._runs_metadata for item in (runs_open, runs_visible)
             )
-            or any(
-                (item.st_uid, stat.S_IMODE(item.st_mode)) != self._run_metadata
-                for item in (run_open, run_visible)
-            )
+            or any((item.st_uid, stat.S_IMODE(item.st_mode)) != self._run_metadata for item in (run_open, run_visible))
             or any((item.st_dev, item.st_ino) != self._runs_identity for item in (runs_open, runs_visible))
             or any((item.st_dev, item.st_ino) != self._run_identity for item in (run_open, run_visible))
             or read_run_ledger_snapshot(self.roots, self.record.name) != self.snapshot
@@ -144,8 +140,14 @@ class _PinnedRunRead:
             receipt = RuntimeAccessReceipt.from_dict(self.snapshot.state["oci_runtime_access"])
             receipt_binding = receipt.binding
             binding_fields = (
-                "record", "owner_uid", "plan_digest", "expected_definition_projection_digest",
-                "stage1_artifact_digest", "domain_uuid", "boot_attempt_id", "libvirt_uri",
+                "record",
+                "owner_uid",
+                "plan_digest",
+                "expected_definition_projection_digest",
+                "stage1_artifact_digest",
+                "domain_uuid",
+                "boot_attempt_id",
+                "libvirt_uri",
             )
             if receipt.phase != "granted" or any(
                 getattr(receipt_binding, field) != getattr(binding, field) for field in binding_fields
@@ -183,7 +185,10 @@ def root_proof(roots: StatePaths, name: str, *, conn: Any | None = None) -> Mapp
     try:
         snapshot = read_run_ledger_snapshot(roots, name)
         plan = load_oci_root_domain_plan(roots, name)
-        if read_run_ledger_snapshot(roots, name) != snapshot or plan.digest != snapshot.state["oci_root_domain"]["digest"]:
+        if (
+            read_run_ledger_snapshot(roots, name) != snapshot
+            or plan.digest != snapshot.state["oci_root_domain"]["digest"]
+        ):
             raise StateError("OCI-root proof domain plan changed")
         mutation = _PinnedRunRead(roots, snapshot)
         try:
@@ -217,16 +222,35 @@ def root_proof(roots: StatePaths, name: str, *, conn: Any | None = None) -> Mapp
             ):
                 raise StateError("OCI-root proof READY receipt is missing")
             transcript = lifecycle.get("transcript")
-            candidates = [item for item in transcript if isinstance(item, Mapping) and item.get("kind") == "READY"] \
-                if isinstance(transcript, tuple) else []
+            candidates = (
+                [item for item in transcript if isinstance(item, Mapping) and item.get("kind") == "READY"]
+                if isinstance(transcript, tuple)
+                else []
+            )
             if len(candidates) != 1:
                 raise StateError("OCI-root proof has missing or conflicting READY evidence")
             ready = candidates[0]
             required = {
-                "authentication_verified", "body_digest", "boot_attempt_id", "boot_generation", "carrier",
-                "direction", "domain_core_digest", "envelope_digest", "epoch", "host_nonce", "key_id", "kind",
-                "projection_digest", "reply_to", "request_id", "root_identity", "run_id", "size_bytes",
-                "stage1_artifact_digest", "wire_sequence",
+                "authentication_verified",
+                "body_digest",
+                "boot_attempt_id",
+                "boot_generation",
+                "carrier",
+                "direction",
+                "domain_core_digest",
+                "envelope_digest",
+                "epoch",
+                "host_nonce",
+                "key_id",
+                "kind",
+                "projection_digest",
+                "reply_to",
+                "request_id",
+                "root_identity",
+                "run_id",
+                "size_bytes",
+                "stage1_artifact_digest",
+                "wire_sequence",
             }
             if (
                 set(ready) != required

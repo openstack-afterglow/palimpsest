@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
             f'test "$(cat /proc/self/root/palimpsest-e2e-root-marker)" = {marker!r}\n'
             "slash_identity=$(stat -c '%d:%i' /)\n"
             "self_identity=$(stat -Lc '%d:%i' /proc/self/root)\n"
-            "test \"$slash_identity\" = \"$self_identity\"\n"
+            'test "$slash_identity" = "$self_identity"\n'
             f"printf 'PALIMPSEST_OCI_ROOT_OK:{marker}:%s\\n' \"$slash_identity\"\n",
             encoding="utf-8",
         )

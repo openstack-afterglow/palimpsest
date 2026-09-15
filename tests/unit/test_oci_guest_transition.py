@@ -246,9 +246,7 @@ def test_real_c_transition_target_accepts_only_approved_modes(transition_harness
 
 
 @pytest.mark.parametrize("kind", ["dev-populated", "dev-populated-ready", "dev-populated-no-entry-open"])
-def test_real_c_dev_transition_accepts_populated_directory_without_mutating_entries(
-    transition_harness, kind
-):
+def test_real_c_dev_transition_accepts_populated_directory_without_mutating_entries(transition_harness, kind):
     result = transition_harness(kind, target="dev", fixture_mode="0755")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
@@ -259,9 +257,7 @@ def test_real_c_dev_transition_accepts_populated_directory_without_mutating_entr
     ("target", "mode"),
     [("proc", "0555"), ("proc", "0755"), ("sys", "0555"), ("sys", "0755"), ("dev", "0755")],
 )
-def test_real_c_transition_target_readiness_accepts_unchanged_approved_mode(
-    transition_harness, target, mode
-):
+def test_real_c_transition_target_readiness_accepts_unchanged_approved_mode(transition_harness, target, mode):
     result = transition_harness("ready", target=target, fixture_mode=mode)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
@@ -296,9 +292,7 @@ def test_real_c_generic_safe_dir_still_rejects_0555(transition_harness):
 
 @pytest.mark.parametrize("target", ["proc", "sys", "dev"])
 @pytest.mark.parametrize("kind", ["ready-wrong-fs", "ready-replaced"])
-def test_real_c_transition_target_readiness_rejects_identity_controls(
-    transition_harness, target, kind
-):
+def test_real_c_transition_target_readiness_rejects_identity_controls(transition_harness, target, kind):
     result = transition_harness(kind, target=target, fixture_mode="0755")
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b""
