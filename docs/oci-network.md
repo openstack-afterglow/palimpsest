@@ -168,3 +168,45 @@ Each node additionally re-checks the authored QEMU vector, the absence of any
 libvirt-owned network device, `oci network` exposure output, authenticated
 root identity, PID 1 access denial, owned `stop`/`rm`, and unchanged source
 archives.
+
+## Native results
+
+At exact checkout `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8` on `pieroot-server`
+(libvirt 10.0.0, QEMU 8.2.2), the changed stage-1 ELF passed the 43-boot /
+44-QEMU matrix in 122.23 seconds and all three networking nodes passed in
+513.02 seconds.
+
+- **NAT with a published loopback port** (`net-nat-service-31d0ee9e`): the host
+  received HTTP 200 from `/healthz` (`pytorch 2.8.0+cu126`, device `cpu`, CUDA
+  false) and from two identical `/infer` requests through the forwarded port,
+  with request counters 1 and 2, shape `[1,128,256]`, finite output, and the
+  same SHA-256
+  `73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`. The guest
+  then completed a real outbound API call: `NET_EGRESS_OK verified 1 200 26` —
+  one address resolved through the virtual network's DNS, a
+  certificate-verified TLS session, HTTP 200 from `https://api.github.com/meta`,
+  and 26 published API ranges parsed.
+- **host-only with a published loopback port** (`net-host-only-60435d58`): the
+  host completed a real Redis exchange (`+PONG`) through the forwarded port
+  while the guest proved `NET_NO_EGRESS_OK`: DNS resolution, an external TCP
+  connect, and a host-directed TCP connect all failed.
+- **NAT with an explicit wildcard publication** (`net-external-9c14c501`): the
+  service answered HTTP 200 on the host's own LAN address `172.31.0.60:50711`,
+  and that listener refused connections after the proof-owned removal.
+
+Every node also verified the authored QEMU argument vector against the durable
+plan, the absence of any libvirt-owned interface, hostdev or host filesystem,
+the `oci network` exposure projection, authenticated root identity, PID 1
+access denial, `stopped`/`removed` for its own run, and unchanged source
+archives. The 21-domain libvirt inventory and all pinned archive hashes were
+identical before and after; the separately preserved running
+`ml-pytorch-ed03b448` was untouched. This qualifies these three exact images,
+modes and publications on this host. It does not qualify IPv6, privileged host
+ports, VM-to-VM networking, or any other image.
+
+Three earlier native attempts failed and produced the fixes above: libvirt
+aborted domain start because an unaddressed passthrough NIC claimed PCI slot
+`0x1` ahead of libvirt's own root port; PID 1 then rejected the workload at the
+link-state check because carrier was not yet reported; and it next rejected the
+default-route check because the kernel prints `/proc/net/route` in uppercase
+hexadecimal. Those runs are not networking qualification.

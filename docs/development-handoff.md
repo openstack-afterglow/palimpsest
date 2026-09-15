@@ -28,25 +28,31 @@ files_modified:
 
 - branch: `codex/oci-root-phase1`
 - native re-verification checkout: detached
-  `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`, clean before and after
-  verification and equal to the then-pushed branch origin. This commit adds the
-  PyTorch loopback HTTP inference-service proof on top of the qualified initial
-  monitor-client lock wait.
-- service implementation commit:
-  `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`; GitHub development package
-  workflow `34944305626` passed and published its SHA-specific prerelease.
-- prior tensor qualification evidence commit:
-  `633dbbed0bc15b84cf2377af6dbd77e08f4f8cc5`; workflow `34933012902` passed.
-  This service-evidence refresh follows `fac2ec5` and cannot self-reference its
-  own final documentation SHA.
+  `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8`, clean before and after
+  verification and equal to the then-pushed branch origin. This commit carries
+  selectable OCI-root networking plus the three fixes its native attempts
+  forced (NIC PCI address pin, per-check NIC failure stages, link-state
+  contract, uppercase route hex).
+- networking implementation commits: `7303483a83f8d902855c42c18a90b9252c051beb`
+  (feature), `4a00781d895c246c88584a6aadde4efd653abc12` (PCI address pin),
+  `1009daaada90258a1e5abd5445491554703f649b` (per-check stages),
+  `0bac3269b263f533dd8e35bcca2b4fe3bee6f8c0` (link-state contract),
+  `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8` (route hex parsing). The GitHub
+  development package workflow `34956921701` passed for `7303483`.
+- prior PyTorch service evidence commit:
+  `67bf7c484a29dd009c381d20de38e1147c42486e`; workflow `34945624331` passed.
+  This networking-evidence refresh follows `9ada8ca` and cannot self-reference
+  its own final documentation SHA.
 - current architecture marker:
-  `713d2e8c36410fd66a93b05aeb469ab1cba25d21cf2e8c2c13ef0ff4b611910a`
-  (381 files), covering the service proof contract and exact native result while
+  `33081946a4a23a165c3930f467354049b6f2900b6bc8e4f6fc9f10b336111e3e`
+  (387 files), covering selectable networking and the guest NIC contract while
   excluding the unrelated MySQL hunk.
 - server `pieroot-server` checkout: `/home/pieroot/code/palimpsest` is detached
-  at `fac2ec594f7f03e1ec5745babbf8337ebc7568c3`, with zero porcelain lines after
-  native verification. The native venv remains
-  `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python 3.12.3, libvirt 10.0.0).
+  at `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8` with zero porcelain lines. The
+  native venv remains `/tmp/palimpsest-30y-venv.B5P9EO/bin/python` (Python
+  3.12.3, libvirt 10.0.0, QEMU 8.2.2). The packaged ELF must be `chmod 0644`
+  after checkout because the server umask is 002 and the asset test requires
+  exactly 0644.
 - `2bb3a2d` Linux verification: 187 passed in state, monitor-client, lifecycle,
   and store selections; 166 passed in monitor IPC, PCI, lane, and guard
   selections with umask 022.
@@ -124,12 +130,40 @@ files_modified:
   `73cf2a3cfaf2e95a0962b15c4eb8d259760ad5bf3a370562ec2c9296a38dc464`.
   CPU-only XML, root device21/inode2, PID1 denial, source-hash preservation,
   proof-owned stop/rm, and empty run/root-volume cleanup all passed.
-- postflight preserved the same 22-domain inventory and all 16 archive hashes;
+- postflight preserved the same 21-domain inventory and all 16 archive hashes;
   the new service domain is absent. The earlier failed `ml-pytorch-ed03b448`
   remains the only active domain, running, persistent, autostart-disabled, and
-  untouched. Evidence is retained at `/tmp/pms-a/m-434a58e7`. Its
-  11,239,440,912-byte tree leaves 36,758,560,768 bytes free under `/tmp`, below
-  the 40 GiB precondition for another ML proof.
+  untouched.
+- selectable networking landed after this: `--network nat|host-only|none` with
+  repeatable `--publish [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]`, an authored
+  QEMU user-mode NIC instead of any libvirt network, guest verification of the
+  committed MAC/address/netmask/route/interface set, resolver writing for `nat`
+  only, and read-only `oci network NAME`. Omitting `--network` now means `nat`;
+  this is an explicit breaking change and every existing native proof was
+  pinned to `--network none`. Contract and limits are in
+  [network contract](oci-network.md).
+- exact checkout `9ada8ca2aba2c40aa932a35d04a8379930bcc7e8` passed the 43-boot /
+  44-QEMU stage-1 matrix in 122.23 seconds and all three networking nodes in
+  513.02 seconds. NAT + published loopback (`net-nat-service-31d0ee9e`): host
+  HTTP 200 health plus two identical `/infer` responses with counters 1/2,
+  `[1,128,256]`, CUDA false and repeatable SHA-256 `73cf2a3c…dc464`, and guest
+  `NET_EGRESS_OK verified 1 200 26` (DNS + certificate-verified TLS + HTTP 200
+  from `https://api.github.com/meta`). host-only (`net-host-only-60435d58`):
+  real `+PONG` through the published port plus `NET_NO_EGRESS_OK` for DNS,
+  external TCP and host TCP. Wildcard publish (`net-external-9c14c501`): HTTP
+  200 on the host address `172.31.0.60:50711`, listener gone after removal.
+  Inventory stayed 21 domains with unchanged archive hashes.
+- three earlier networking attempts failed first: libvirt aborted domain start
+  because the unaddressed NIC claimed PCI slot 0x1 ahead of its own root port;
+  PID 1 then rejected the workload at link-state (carrier not yet reported) and
+  at the default-route check (`/proc/net/route` prints uppercase hex). Fixes are
+  in `4a00781`, `1009daa`, `0bac326`, `9ada8ca`. Receipts for the failed runs
+  are under `/tmp/pnet-failure-receipts`; their bulky runtime trees were removed
+  during disk reclamation, which is recorded here rather than presented as
+  preserved disks.
+- networking proofs run from `/mnt/hdd/WD_8TB/code/pn` because `/tmp` has under
+  40 GiB free; that path keeps the lifecycle socket within 97 bytes and its
+  ancestors already permit QEMU traversal.
 - this qualifies only a real guest-loopback service. `network none` provides no
   host/external endpoint; the in-memory deterministic model does not prove
   pretrained model quality. GPU helper, attach, rebind, CUDA execution, and
@@ -497,15 +531,21 @@ PCI 노드도 함께 통과했다.
 6. **그 이후 GPU 개발:** inventory와 운영자 승인이 확보된 뒤에만 allocation
    contract를 설계한다. attach/rebind부터 시작하지 않는다. Nova topology에는
    먼저 portable boot disk와 CPU-only actual-`/` proof가 필요하다.
-7. **ML next step:** PyTorch CPU tensor at exact `58e9cb8` and guest-loopback
-   HTTP inference service at exact `fac2ec5` both passed. Before another
-   large-image proof, resolve `/tmp` capacity back to the documented 40 GiB
-   minimum without deleting retained evidence absent explicit authority. Then
-   continue the separate TensorFlow post-READY lifecycle transport diagnosis.
-   Host/external service reachability is an independent network/forwarding
-   contract, not an extension of the loopback result. Preserve
-   `ml-pytorch-ed03b448` and all existing inactive domains; do not stop,
-   undefine, or adopt them, and do not run GPU helper, attach, or rebind.
+7. **Networking next step:** `nat`, `host-only` and explicit publication are
+   natively qualified at exact `9ada8ca` for the three pinned images only.
+   Remaining work, in order: report the `--publish` endpoints in `ps`/`inspect`
+   rather than only in `oci network`; decide whether IPv6 publication and
+   VM-to-VM networking become separate contracts; and re-run the three nodes
+   whenever the guest ELF, QEMU or libvirt changes. Keep `/tmp` capacity in
+   mind: large-image nodes now run from `/mnt/hdd/WD_8TB/code/pn`.
+8. **ML next step:** PyTorch CPU tensor at exact `58e9cb8`, guest-loopback
+   service at exact `fac2ec5`, and the NAT/host-only/publication nodes at
+   `9ada8ca` all passed. Continue the separate TensorFlow post-READY lifecycle
+   transport diagnosis. Preserve `ml-pytorch-ed03b448` and all existing
+   inactive domains; do not stop, undefine, or adopt them, and do not run the
+   GPU helper, attach, or rebind. Do not delete any retained failure tree
+   without explicit authorization; the earlier networking reclamation is
+   recorded in the snapshot above.
 
 ### 이후 backlog — 현재 승인 아님
 
