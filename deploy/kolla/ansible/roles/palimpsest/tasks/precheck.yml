@@ -1,0 +1,44 @@
+---
+- name: Precheck | Verify enable_palimpsest is set
+  ansible.builtin.assert:
+    that:
+      - enable_palimpsest is defined
+    fail_msg: "enable_palimpsest must be set in globals.yml"
+  run_once: true
+  tags: precheck
+
+- name: Precheck | Verify stock Kolla Valkey dependency
+  ansible.builtin.assert:
+    that:
+      - enable_valkey | default(false) | bool
+      - groups.get('valkey', []) | length > 0
+      - valkey_master_password is defined and valkey_master_password | length > 0
+    fail_msg: "Deploy stock Kolla Valkey before enabling palimpsest; no plugin Redis fallback exists"
+  run_once: true
+  tags: precheck
+  when: enable_palimpsest | default(false) | bool
+
+- name: Precheck | Check required Palimpsest secrets
+  ansible.builtin.assert:
+    that:
+      - palimpsest_database_password is defined and palimpsest_database_password | length > 0
+      - palimpsest_keystone_password is defined and palimpsest_keystone_password | length > 0
+      - palimpsest_redis_db_index == 9
+    fail_msg: "Palimpsest DB/Keystone secrets must be set, and palimpsest_redis_db_index must equal 9"
+  tags: precheck
+  when: enable_palimpsest | bool
+
+- name: Precheck | Validate Palimpsest public route hostname
+  ansible.builtin.assert:
+    that:
+      - palimpsest_public_haproxy_fqdn is match('^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$')
+      - (palimpsest_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ palimpsest_public_haproxy_fqdn)
+    fail_msg: "palimpsest_public_endpoint_url must be the HTTPS origin for palimpsest_public_haproxy_fqdn"
+  run_once: true
+  tags: precheck
+  when:
+    - enable_palimpsest | bool
+    - palimpsest_public_haproxy_enabled | bool
+
+- name: Include Palimpsest image precheck tasks
+  ansible.builtin.include_tasks: image_precheck.yml

@@ -1,0 +1,97 @@
+---
+- name: Source Build | Ensure Palimpsest source checkout directory exists
+  become: true
+  ansible.builtin.file:
+    path: "{{ palimpsest_source_dir }}"
+    state: directory
+    mode: "0755"
+  when: inventory_hostname in groups['palimpsest']
+
+- name: Source Build | Check if existing Git repository exists
+  become: true
+  ansible.builtin.stat:
+    path: "{{ palimpsest_source_dir }}/.git"
+  register: palimpsest_git_dir_stat
+  when: inventory_hostname in groups['palimpsest']
+
+- name: Source Build | Check git status of existing checkout
+  become: true
+  ansible.builtin.command:
+    cmd: "git status --porcelain"
+    chdir: "{{ palimpsest_source_dir }}"
+  register: palimpsest_existing_git_status
+  changed_when: false
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - palimpsest_git_dir_stat.stat.exists
+
+- name: Source Build | Fail if existing Palimpsest checkout is dirty
+  ansible.builtin.assert:
+    that:
+      - palimpsest_existing_git_status.stdout | trim | length == 0
+    fail_msg: "Existing Palimpsest source checkout at {{ palimpsest_source_dir }} is dirty (uncommitted changes present)"
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - palimpsest_git_dir_stat.stat.exists
+
+- name: Source Build | Check HEAD SHA of existing checkout
+  become: true
+  ansible.builtin.command:
+    cmd: "git rev-parse HEAD"
+    chdir: "{{ palimpsest_source_dir }}"
+  register: palimpsest_existing_head_sha
+  changed_when: false
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - palimpsest_git_dir_stat.stat.exists
+
+- name: Source Build | Fail if existing Palimpsest checkout HEAD does not match palimpsest_source_version
+  ansible.builtin.assert:
+    that:
+      - palimpsest_existing_head_sha.stdout | trim == palimpsest_source_version
+    fail_msg: "Existing Palimpsest checkout HEAD ({{ palimpsest_existing_head_sha.stdout | default('') }}) does not match required version ({{ palimpsest_source_version }})"
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - palimpsest_git_dir_stat.stat.exists
+
+- name: Source Build | Checkout Palimpsest source repository when absent
+  become: true
+  ansible.builtin.git:
+    repo: "{{ palimpsest_source_repo }}"
+    dest: "{{ palimpsest_source_dir }}"
+    version: "{{ palimpsest_source_version }}"
+    force: false
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - not palimpsest_git_dir_stat.stat.exists
+
+- name: Source Build | Verify checked out HEAD SHA
+  become: true
+  ansible.builtin.command:
+    cmd: "git rev-parse HEAD"
+    chdir: "{{ palimpsest_source_dir }}"
+  register: palimpsest_head_sha
+  changed_when: false
+  when: inventory_hostname in groups['palimpsest']
+
+- name: Source Build | Fail if checked out HEAD does not match palimpsest_source_version
+  ansible.builtin.assert:
+    that:
+      - palimpsest_head_sha.stdout | trim == palimpsest_source_version
+    fail_msg: "Palimpsest source checkout HEAD ({{ palimpsest_head_sha.stdout | default('') }}) does not match expected version ({{ palimpsest_source_version }})"
+  when: inventory_hostname in groups['palimpsest']
+
+- name: Source Build | Build local Palimpsest images
+  become: true
+  community.docker.docker_image:
+    name: "afterglow-local/{{ item }}:{{ palimpsest_source_version | truncate(12, True, '') }}"
+    build:
+      path: "{{ palimpsest_source_dir }}/hub"
+      dockerfile: "Dockerfile"
+      target: "{{ item }}"
+    source: build
+    force_source: false
+  loop:
+    - palimpsest-hub-api
+    - palimpsest-hub-worker
+  when: inventory_hostname in groups['palimpsest']

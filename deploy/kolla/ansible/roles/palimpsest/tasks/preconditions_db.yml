@@ -1,0 +1,31 @@
+---
+- name: DB | Create Palimpsest database
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_db
+    module_args:
+      login_host: "{{ palimpsest_database_address }}"
+      login_port: "{{ palimpsest_database_port }}"
+      login_user: "{{ palimpsest_database_admin_user }}"
+      login_password: "{{ palimpsest_database_admin_password }}"
+      name: "{{ palimpsest_database_name }}"
+  run_once: true
+  delegate_to: "{{ groups['palimpsest'][0] }}"
+
+- name: DB | Create Palimpsest database user
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: mysql_user
+    module_args:
+      login_host: "{{ palimpsest_database_address }}"
+      login_port: "{{ palimpsest_database_port }}"
+      login_user: "{{ palimpsest_database_admin_user }}"
+      login_password: "{{ palimpsest_database_admin_password }}"
+      name: "{{ palimpsest_database_user }}"
+      password: "{{ palimpsest_database_password }}"
+      host: "%"
+      priv: "{{ palimpsest_database_name }}.*:ALL"
+      state: present
+  run_once: true
+  delegate_to: "{{ groups['palimpsest'][0] }}"
+  no_log: true

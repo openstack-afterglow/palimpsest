@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "palimpsest-kolla"
+dynamic = ["version"]
+description = "Palimpsest Kolla-Ansible roles and packaging"
+requires-python = ">=3.11"
+dependencies = [
+    "kolla-ansible>=21,<22",
+]
+
+[tool.hatch.version]
+path = "../../hub/src/palimpsest_hub/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/palimpsest_kolla"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"ansible/roles/palimpsest" = "share/kolla-ansible/ansible/roles/palimpsest"
