@@ -36,8 +36,9 @@ from typing import Any
 
 from . import state
 from .digest import digest_file, require_digest, require_file_digest
-from .errors import ArtifactValidationError, BuildError, HubError
+from .errors import ArtifactValidationError, BuildError, DigestMismatchError, HubError
 from .hub import KIND_BUILDKIT_CACHE, MEDIA_TYPE_BUILDKIT_CACHE
+from .oci_image import verify_blob_chunks
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .registry import RegistryError, validate_cache_spec
 from .state import TagRecord, validate_tag, write_tag_record
@@ -87,7 +88,7 @@ def _oci_blob_path(layout: Path, digest: str) -> Path:
 def _verify_oci_blob(layout: Path, descriptor: dict[str, Any], seen: set[str]) -> tuple[str, Path]:
     raw_digest = descriptor.get("digest")
     raw_size = descriptor.get("size")
-    if not isinstance(raw_digest, str) or not isinstance(raw_size, int) or raw_size < 0:
+    if not isinstance(raw_digest, str) or type(raw_size) is not int or not 0 <= raw_size <= 2**63 - 1:
         raise ArtifactValidationError("OCI descriptor must contain a digest and nonnegative size")
     digest = require_digest(raw_digest)
     blob = _oci_blob_path(layout, digest)
@@ -96,7 +97,14 @@ def _verify_oci_blob(layout: Path, descriptor: dict[str, Any], seen: set[str]) -
     if blob.stat().st_size != raw_size:
         raise ArtifactValidationError(f"OCI descriptor size mismatch for {digest}")
     if digest not in seen:
-        require_file_digest(blob, digest)
+        try:
+            with blob.open("rb") as artifact:
+                chunks = iter(lambda: artifact.read(_READ_CHUNK), b"")
+                verify_blob_chunks(expected_digest=digest, expected_size=raw_size, chunks=chunks)
+        except ArtifactValidationError as exc:
+            raise DigestMismatchError(f"digest mismatch for OCI blob {digest}") from exc
+        except OSError as exc:
+            raise ArtifactValidationError(f"cannot read referenced OCI blob {digest}") from exc
         seen.add(digest)
         if len(seen) > _MAX_OCI_DESCRIPTORS:
             raise ArtifactValidationError("OCI layout references too many descriptors")

@@ -2,37 +2,72 @@
 
 `palimpsest-local` is a Python 3.12+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
 
-It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
+It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under a managed state root. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
 
 ## Status
 
 - **macOS Apple Silicon:** default runtime using Lima/VZ (`lima-vz`), with experimental QEMU/libvirt Hypervisor.framework support (`libvirt-hvf`).
-- **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Standalone release `0.1.0` requires clean-host KVM integration proof.
+- **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Public `v0.1.0` publication remains blocked by the physical-host KVM release gate.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
 - **Version:** `0.1.0.dev0`.
 
 ## Install
 
-### Development checkout
+### Download an exact-SHA development package
+
+Successful pushes to `main`, `dev`, and `codex/oci-root-phase1` publish a
+GitHub prerelease tagged `package-<full-commit-SHA>`. Download all three assets
+for the exact commit, verify them, and then install the wheel:
+
+```sh
+SHA="FULL_40_CHARACTER_COMMIT_SHA"
+BASE="https://github.com/openstack-afterglow/palimpsest/releases/download/package-${SHA}"
+DOWNLOAD_DIR="$(mktemp -d)"
+cd "$DOWNLOAD_DIR"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0-py3-none-any.whl"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0.tar.gz"
+curl -fLO "${BASE}/SHA256SUMS"
+sha256sum -c SHA256SUMS && \
+  uv tool install --no-index ./palimpsest_local-0.1.0.dev0-py3-none-any.whl
+```
+
+The workflow refuses an existing tag instead of replacing its assets. If
+publication fails after tag creation, the tag is preserved and an automatic
+rerun refuses it; recovery is an explicit maintainer operation. These
+packages are development snapshots, are never marked Latest, and are not
+stable, PyPI-published, or Gate 2-qualified. The URLs exist only after that
+commit's workflow succeeds; see the
+[GitHub releases list](https://github.com/openstack-afterglow/palimpsest/releases).
+
+### Build and install locally
+
+From a trusted checkout with Python 3.12+ and
+[uv](https://docs.astral.sh/uv/):
+
+```sh
+uv run python scripts/build_package.py --out-dir dist/package-0.1.0.dev0
+uv tool install --no-index \
+  dist/package-0.1.0.dev0/palimpsest_local-0.1.0.dev0-py3-none-any.whl
+palimpsest --help
+```
+
+The build produces a wheel and source distribution, checks the packaged guest
+ELF and an isolated offline installation, and writes `SHA256SUMS`. Choose a new
+output directory on each run. This checkout is version `0.1.0.dev0`; do not
+assume a public PyPI package exists.
+
+For development:
 
 ```sh
 uv sync --extra dev
 uv run palimpsest --help
 ```
 
-### Package installation
-
-```sh
-pip install .
-# or
-uv pip install .
-```
-
-To use the Linux KVM runtime, install the optional extra:
-
-```sh
-pip install '.[kvm]'
-```
+On Linux, select a private `XDG_STATE_HOME` for user-owned artifact workflows or
+use the explicit administrator-managed account and storage provisioner. Package
+installation never creates accounts, changes privileged groups, or writes
+sudoers policy. KVM also needs the optional `kvm` dependency and host tools.
+See the [short install guide](install.md) and [detailed guide](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
@@ -44,15 +79,16 @@ Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, b
 
 - **API Worker:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`)
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`)
-- **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` or `python -m palimpsest_hub.migrate`
+- **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
+- **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies non-empty source tables into an empty initialized destination; it is not bootstrap.
 
 ### Client Hub Configuration
 
-Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and Keystone token (`PALIMPSEST_TOKEN` or environment) to call native `/v1` Hub endpoints over `X-Auth-Token`.
+Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and a Keystone token from `PALIMPSEST_TOKEN` to call native `/v1` Hub endpoints over `X-Auth-Token`. Keep the token in a secret manager or process environment; do not paste a token into documentation, shell history, or state files.
 
 ```sh
 export PALIMPSEST_URL="http://hub.example:8020"
-export PALIMPSEST_TOKEN="gAAAAAB..."
+# Set PALIMPSEST_TOKEN from your secret-management mechanism.
 
 palimpsest image ls --arch aarch64
 palimpsest --url http://another-hub.example:8020 image ls
@@ -84,6 +120,8 @@ palimpsest image load -i ./api.tar
 Profiles are stored without secrets in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Selection order for an unqualified reference is: a registry written in the reference, `--registry`, `PALIMPSEST_REGISTRY`, then the configured default. Palimpsest reuses the existing Docker credential store from `DOCKER_CONFIG` or `~/.docker`; use `login --password-stdin` for non-interactive authentication. `palimpsest docker ...` provides a generic Docker passthrough for commands without a first-class wrapper while blocking Docker-global `--config` overrides before the subcommand and password-bearing login arguments.
 
 See [Docker/OCI registry profiles](docs/registries.md) for cache settings, private CAs/mirrors, Docker-compatible command coverage, and offline restrictions.
+See also the source-based [Docker Hub intake analysis](docs/docker-hub-intake-analysis.md)
+for the current local-archive boundary and unqualified gaps.
 
 ## Artifact workflow
 
@@ -105,7 +143,10 @@ palimpsest bundle pull sha256:<leaf-layer-digest> --include-base --output ./bund
 palimpsest bundle verify ./bundle
 ```
 
-Local artifacts live below `${XDG_STATE_HOME:-~/.local/state}/palimpsest/`:
+Local artifacts live below the selected state root. The unconfigured Linux
+default is `/var/lib/palimpsest`; an explicit `XDG_STATE_HOME` selects
+`${XDG_STATE_HOME}/palimpsest`, and other platforms default to
+`~/.local/state/palimpsest`:
 
 ```text
 store/       content-addressed blobs and metadata
@@ -120,6 +161,69 @@ transfers/   Hub transfer progress
 ```
 
 ## Dockerfile cache and runtime-block workflow
+
+For a local standard OCI archive/layout, the experimental OCI-root converter
+can verify and materialize its layers without Docker:
+
+```sh
+# Anonymous TLS acquisition requires Skopeo 1.13+ and an explicit registry.
+palimpsest oci pull quay.io/example/application:v1 --output ./image.oci.tar
+palimpsest oci materialize ./image.oci.tar --output ./materialization.json
+# If the local index lists multiple roots, choose one explicitly:
+palimpsest oci materialize ./image-layout --manifest 'sha256:<root-digest>'
+```
+
+This requires the qualified SquashFS packer (`/usr/bin/mksquashfs` by default)
+and currently supports `linux/amd64`. It produces verified layer artifacts,
+not a running VM by itself. Public local OCI-root `run/-d` and the protected-root
+Gate 2 have separate qualified proofs on Linux/x86_64 KVM; see the
+[public-runtime roadmap](docs/oci-public-runtime-roadmap.md). Docker Hub
+references are not accepted directly by OCI-root `run`; `oci pull` first
+terminates acquisition at the verified local archive boundary, while the Docker
+`pull` wrapper does not bridge into that runtime. See the
+[anonymous registry intake contract](docs/registry-intake.md) and
+[Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
+digest-preserving local-archive workflow and its real-image verification scope.
+
+OCI-root runs accept an explicit `--user USER[:GROUP]` (name or canonical
+numeric ID), for example `palimpsest run ./redis.oci.tar --name redis-demo
+--user redis -d`. This changes only the launch identity, not the source image,
+entrypoint or arguments. Without the option, the image's configured user is
+unchanged. PID 1 protections and the capabilityless workload policy remain
+enabled; this is not privileged mode or general Docker compatibility. See
+[explicit OCI run users](docs/oci-run-user.md) for the contract and limits.
+
+OCI-root `exec` accepts `--timeout SECONDS` (integer 1–600, default 30) to set
+the guest execution deadline for that one command; the option is rejected for
+cloud-image runs. Retry, locking, privilege, cleanup and the 64 KiB output
+limit are unchanged, and a longer deadline does not change host monitor or run
+lock bounds.
+
+OCI-root runs select one virtual network with `--network nat|host-only|none`
+and publish guest ports with the repeatable
+`--publish [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]` (`-p`):
+
+```sh
+palimpsest run ./service.oci.tar --name api -d \
+  --network nat --publish 127.0.0.1:18080:8080
+```
+
+Omitting `--network` now means `nat`: the guest gets a private `10.0.2.15/24`
+address with outbound NAT and DNS. This is an explicit breaking change from the
+previous no-NIC default, so use `--network none` to keep the old isolation.
+`host-only` keeps the private address but blocks every outbound path. Inbound
+traffic only reaches published ports, host addresses default to `127.0.0.1`,
+and external exposure requires writing `0.0.0.0` explicitly. Palimpsest creates
+no libvirt network, bridge, firewall rule or DNS service: the NIC and every
+host listener belong to the VM's own QEMU process. `palimpsest ps` includes
+configured publications in its `PORTS` column, `palimpsest inspect NAME` emits
+them as typed JSON, and `palimpsest oci network NAME` performs the stronger
+OCI-specific committed-plan verification and external-exposure classification.
+Configured publications on a stopped run are not live-listener claims. See the
+[network contract](docs/oci-network.md) for limits, including no IPv6, no
+privileged host ports and no VM-to-VM network. IPv6 host publication and a
+shared VM network are separately gated future contracts; neither is implied by
+the current per-VM network modes.
 
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
 
@@ -304,8 +408,10 @@ palimpsest image  inspect|history|rm|save|load # Docker/OCI image
 palimpsest image  ls|pull|verify|import|push # Hub boot image
 palimpsest layer  ls|pull|pack|push
 palimpsest bundle pull|verify
+palimpsest oci materialize
 palimpsest build
 palimpsest run
+palimpsest start
 palimpsest compose config|up|down|ps|logs|exec|stop|port
 palimpsest ps|inspect|logs|shell|exec|stop|rm|commit
 palimpsest ui                                # web management dashboard
@@ -313,7 +419,8 @@ palimpsest store show|ls|rm|move|set         # storage state & artifact manageme
 palimpsest completion zsh|bash|fish          # shell completion generator
 ```
 
-Use `palimpsest <command> --help` for exact arguments.
+Use `palimpsest <command> --help` for exact arguments. The checked generated
+[CLI reference](docs/cli/README.md) records the complete command tree.
 
 ## Shell completion
 
@@ -361,15 +468,44 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 ## Development
 
+### Resume ongoing development
+
+Start with the [development handoff](docs/development-handoff.md) for the
+2026-09-14 checkpoint: completed work, image-specific verification, unresolved
+ML failures, the local PCI preflight, pending approvals, and ordered next tasks.
+Read [AGENTS.md](AGENTS.md) for contributor rules and [ARCHITECTURE.md](ARCHITECTURE.md)
+for the current source contracts before changing code. [agent.md](agent.md) is
+a short agent entrypoint to the same documents, not a separate policy.
+
+At this checkpoint, PCI inventory is implemented and locally tested, but actual
+GPU passthrough/CUDA is **not** qualified. The PCI changes remain uncommitted;
+GitHub publication and a private read-only server helper both await explicit
+approval after their execution requests were blocked. Saving this handoff does
+not approve either action. Recheck the current Git state before resuming; do not
+treat this dated checkpoint as fresh server inventory or an instruction to
+commit every existing change.
+
 ```sh
 uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
-uv run python -m pytest tests/unit tests/integration -q
+uv run python scripts/test_lanes.py list --check
+uv run python scripts/test_lanes.py plan --changed HEAD
+uv run python scripts/test_lanes.py run --changed HEAD --dry-run
 uv build
 ```
 
+Use the suggested functional lanes during development, rather than rerunning
+every test after each edit. For example, `run oci-monitor` exercises monitor
+contracts, and `run portable --shard 1/6` runs one deterministic sixth of the
+portable test cases. `run full` remains an explicit broad regression command;
+native KVM, privileged filesystem, BuildKit and Gate 2 proofs are separate
+opt-in lanes, not substitutes for portable tests. See the
+[test workflow](docs/testing.md) for selection rules and release checks.
+
 ## Project references
+
+- [Living architecture](ARCHITECTURE.md) — current source map, runtime boundaries, and update procedure
 
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
 - [Installation details](docs/install.md)

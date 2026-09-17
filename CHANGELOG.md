@@ -16,6 +16,7 @@ All notable changes to Palimpsest Local are documented here.
 - Added persistent single-writer block volumes: raw ext4 `virtio-blk` on KVM and receipt-bound Lima standalone disks, with preserve-by-default `down` and exact-owner `down --volumes` deletion.
 - Added Lima static TCP project forwarding and guest-journal logs while Linux libvirt project ports fail closed until a verified `passt` path is available.
 - Added dynamic Zsh, Bash, and Fish completion generated from the live `argparse` command tree.
+- Added OCI-root publication reporting to the top-level `ps` `PORTS` column and typed `inspect` JSON, derived from the committed domain plan without backend calls or state writes.
 
 ### Fixed
 
@@ -24,6 +25,7 @@ All notable changes to Palimpsest Local are documented here.
 - Split OCI image publication (`build --push`) from Hub runtime-block publication (`build --runtime-push`) and kept legacy Hub boot-image commands distinct from Docker image commands.
 - Hardened registry/cache inputs against inline credentials, kept cache specifications out of receipts, and made strict-offline builds reject every registry-facing option before solving.
 - Moved KVM readiness after typed provisioning and added a fresh per-boot readiness service so project restarts cannot reuse an old console sentinel.
+- Made architecture review stamping compatible with the documented system-Python entry point when `datetime.UTC` is unavailable.
 
 ### Documentation
 

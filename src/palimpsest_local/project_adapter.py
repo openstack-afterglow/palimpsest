@@ -10,15 +10,16 @@ import socket
 import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import kvm, lima, platforms, runtime, state
+from . import kvm, lima, runtime_dispatch, state
 from .digest import digest_file, require_file_digest
 from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
 from .project_runtime import (
     DownTarget,
+    ExternalRunStatus,
     ManagedVolume,
     PreparedService,
     ProjectCallbacks,
@@ -40,17 +41,34 @@ from .project_volumes import (
     verify_lima_volume,
 )
 from .refs import PortForward, RunSpec, StackRef, VolumeAttachment
+from .runtime_types import ExpectedRunIdentity, PreflightReport, ResolvedRunRequest, RunVolumeIntent
 
 _MIB = 1024 * 1024
 
 
 @dataclass(frozen=True)
 class ResolvedProjectService:
-    stack: StackRef
-    backend: str
-    network: str
-    environment: tuple[tuple[str, str], ...] = field(repr=False)
-    cloud_init: object | None = field(repr=False)
+    request: ResolvedRunRequest = field(repr=False)
+
+    @property
+    def stack(self) -> StackRef:
+        return self.request.spec.stack
+
+    @property
+    def backend(self) -> str:
+        return self.request.dispatch_key.backend.value
+
+    @property
+    def network(self) -> str:
+        return self.request.spec.network
+
+    @property
+    def environment(self) -> tuple[tuple[str, str], ...]:
+        return self.request.spec.environment
+
+    @property
+    def cloud_init(self) -> object | None:
+        return self.request.spec.cloud_init
 
 
 @dataclass(frozen=True)
@@ -62,10 +80,6 @@ class _ResolvedExecutionInputs:
 
 
 StackResolver = Callable[[ServiceSpec], StackRef]
-
-
-def _backend_for_stack(stack: StackRef) -> str:
-    return platforms.select_backend(stack.base.arch)
 
 
 def _network_for_service(project: Project, service: ServiceSpec, backend: str) -> str:
@@ -108,21 +122,15 @@ def _port_is_available(port: PublishedPort, replacing_run: str | None) -> bool:
 
 
 def _inspect_run(name: str, roots: state.StatePaths) -> object | None:
-    rpaths = state.run_paths(roots, name)
-    root_present = rpaths.root.exists() or rpaths.root.is_symlink()
-    owner_present = rpaths.owner.exists() or rpaths.owner.is_symlink()
-    if not root_present and not owner_present:
+    if not state.run_entry_present_or_ambiguous(roots, name):
         if lima.available():
             foreign_status = lima.inspect_instance_status(name)
             if foreign_status is not None:
-                return {"status": foreign_status}
+                return ExternalRunStatus(foreign_status)
         return None
     # Any partial or malformed local ledger is an ownership ambiguity, never
     # evidence that the run name is free.
-    record = state.read_run_state(rpaths)
-    if record.get("backend") == "lima-vz":
-        return lima.inspect_run(name, roots=roots)
-    return runtime.inspect_run(name, roots=roots)
+    return runtime_dispatch.inspect_run(name, roots=roots)
 
 
 def _volume_use_counts(project: Project) -> Counter[str]:
@@ -231,7 +239,7 @@ def _validate_kvm_volume_references(path: Path, allowed_run_ids: Mapping[str, st
                 continue
             name = root.findtext("name")
             expected_run_id = allowed_run_ids.get(name) if isinstance(name, str) else None
-            actual_run_id = runtime._get_domain_run_id(domain)
+            actual_run_id = kvm.get_domain_run_id(domain)
             if expected_run_id is None or actual_run_id != expected_run_id:
                 raise StateError(
                     f"KVM volume {path.name!r} is referenced by foreign or unexpected libvirt domain {name!r}"
@@ -298,6 +306,7 @@ def build_project_callbacks(
     execution_inputs: dict[str, _ResolvedExecutionInputs] = {}
     attachment_cache: dict[tuple[str, str], VolumeAttachment] = {}
     preexisting_volume_keys: set[tuple[str, str]] = set()
+    preflighted_requests: dict[str, tuple[ResolvedRunRequest, PreflightReport]] = {}
     prepare_complete = False
 
     def resolved_inputs(_project: Project, service: ServiceSpec) -> _ResolvedExecutionInputs:
@@ -354,17 +363,49 @@ def build_project_callbacks(
     def desired_digest(_project: Project, service: ServiceSpec) -> str:
         return resolved_inputs(_project, service).digest
 
-    def resolve(_project: Project, service: ServiceSpec, _run_name: str) -> ResolvedProjectService:
+    def resolve(_project: Project, service: ServiceSpec, run_name: str) -> ResolvedProjectService:
         inputs = resolved_inputs(_project, service)
-        backend = _backend_for_stack(inputs.stack)
-        network = _network_for_service(project, service, backend)
-        return ResolvedProjectService(
+        ports = tuple(
+            PortForward(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in service.ports
+        )
+        provisional_spec = RunSpec(
+            name=run_name,
             stack=inputs.stack,
-            backend=backend,
-            network=network,
+            memory_mib=service.memory_mib,
+            vcpus=service.vcpus,
+            ports=ports,
             environment=inputs.environment,
             cloud_init=inputs.cloud_init,
         )
+        provisional = runtime_dispatch.resolve_run_request(provisional_spec)
+        network = _network_for_service(project, service, provisional.dispatch_key.backend.value)
+        logical_spec = RunSpec(
+            name=run_name,
+            stack=inputs.stack,
+            memory_mib=service.memory_mib,
+            vcpus=service.vcpus,
+            network=network,
+            ports=ports,
+            environment=inputs.environment,
+            cloud_init=inputs.cloud_init,
+        )
+        request = runtime_dispatch.resolve_run_request(
+            logical_spec,
+            requested_backend=provisional.dispatch_key.backend.value,
+            require_volume_binding=bool(service.volumes),
+            volume_intents=tuple(
+                RunVolumeIntent(
+                    project.volumes[mount.source].name,
+                    mount.target,
+                    "ext4",
+                    mount.read_only,
+                )
+                for mount in service.volumes
+            ),
+        )
+        if request.dispatch_key != provisional.dispatch_key:
+            raise StateError("project runtime backend changed while the request was resolved")
+        return ResolvedProjectService(request)
 
     def _allowed_lima_instance(item: PreparedService) -> str | None:
         if item.plan.action == "start":
@@ -608,6 +649,7 @@ def build_project_callbacks(
         nonlocal prepare_complete
         attachment_cache.clear()
         preexisting_volume_keys.clear()
+        preflighted_requests.clear()
         prepare_complete = False
         ledger = read_project_state(project, roots)
         ledger_volumes = {} if ledger is None else ledger.volumes
@@ -707,6 +749,24 @@ def build_project_callbacks(
                             format=False,
                         )
 
+        # Preserve existing project error precedence: backend/tool probing is
+        # the final preflight step, after every pure reservation, spec, path,
+        # network, domain, and volume validation, and immediately before the
+        # caller enters volume preparation. Reports stay bound to logical
+        # intent while physical volume attachment paths are prepared later.
+        completed_preflights: dict[str, tuple[ResolvedRunRequest, PreflightReport]] = {}
+        for item in prepared:
+            if item.plan.action not in {"create", "recreate"} or item.plan.preserve_config:
+                continue
+            resolved = item.resolved
+            if not isinstance(resolved, ResolvedProjectService):
+                raise LifecycleError("project resolver returned an invalid service payload")
+            completed_preflights[item.plan.service] = (
+                resolved.request,
+                runtime_dispatch.preflight_run_request(resolved.request),
+            )
+        preflighted_requests.update(completed_preflights)
+
     def prepare(prepared: tuple[PreparedService, ...]) -> tuple[ManagedVolume, ...]:
         nonlocal prepare_complete
         completed: dict[str, ManagedVolume] = {}
@@ -794,32 +854,46 @@ def build_project_callbacks(
             result.append(cached)
         return tuple(result)
 
-    def start_service(item: PreparedService) -> object:
+    def start_service(
+        item: PreparedService,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
         if item.plan.action == "start":
-            rpaths = state.run_paths(roots, item.plan.run_name)
-            if lima.is_lima_run(rpaths):
-                return lima.start(item.plan.run_name, roots=roots)
-            return runtime.start(item.plan.run_name, roots=roots)
+            if expected_identity is None:
+                return runtime_dispatch.start(item.plan.run_name, roots=roots)
+            return runtime_dispatch.start(
+                item.plan.run_name,
+                roots=roots,
+                expected_identity=expected_identity,
+            )
         resolved = item.resolved
         if not isinstance(resolved, ResolvedProjectService):
             raise LifecycleError("project resolver returned an invalid service payload")
-        ports = tuple(
-            PortForward(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in item.service.ports
-        )
-        spec = RunSpec(
-            name=item.plan.run_name,
-            stack=resolved.stack,
-            memory_mib=item.service.memory_mib,
-            vcpus=item.service.vcpus,
-            network=resolved.network,
-            ports=ports,
-            volumes=attachments(item, resolved),
-            environment=resolved.environment,
-            cloud_init=resolved.cloud_init,
-        )
+        logical_preflight = preflighted_requests.get(item.plan.service)
+        if logical_preflight is None or logical_preflight[0] is not resolved.request:
+            raise StateError("project run request was not preflighted before volume preparation")
+        logical_request, preflight = logical_preflight
+        if item.service.volumes:
+            spec = replace(logical_request.spec, volumes=attachments(item, resolved))
+            binding_receipt = runtime_dispatch._issue_volume_binding_receipt(
+                logical_request,
+                spec,
+                dispatch_key=logical_request.dispatch_key,
+                _authority=runtime_dispatch._PROJECT_VOLUME_BINDING_AUTHORITY,
+            )
+            request = runtime_dispatch.bind_run_request_volumes(
+                logical_request,
+                spec,
+                dispatch_key=logical_request.dispatch_key,
+                receipt=binding_receipt,
+            )
+        else:
+            spec = logical_request.spec
+            request = logical_request
         if resolved.backend == "lima-vz":
             try:
-                return lima.run(spec, roots=roots)
+                return runtime_dispatch.run(request, preflight=preflight, roots=roots)
             except Exception as exc:
                 if spec.volumes and not any(volume.format for volume in spec.volumes):
                     detail = str(exc).strip() or type(exc).__name__
@@ -829,21 +903,32 @@ def build_project_callbacks(
                         "contents before explicitly deleting any named volume."
                     ) from exc
                 raise
-        return runtime.run(spec, roots=roots)
+        return runtime_dispatch.run(request, preflight=preflight, roots=roots)
 
-    def stop_service(name: str) -> object:
-        rpaths = state.run_paths(roots, name)
-        if lima.is_lima_run(rpaths):
-            return lima.stop(name, roots=roots)
-        return runtime.stop(name, roots=roots)
+    def stop_service(
+        name: str,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if expected_identity is None:
+            return runtime_dispatch.stop(name, roots=roots)
+        return runtime_dispatch.stop(name, roots=roots, expected_identity=expected_identity)
 
-    def remove_service(name: str) -> object:
-        rpaths = state.run_paths(roots, name)
-        if not rpaths.root.exists() and not rpaths.owner.exists():
+    def remove_service(
+        name: str,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if not state.run_entry_present_or_ambiguous(roots, name):
             return {"name": name, "status": "removed"}
-        if lima.is_lima_run(rpaths):
-            return lima.rm(name, roots=roots, volumes=True)
-        return runtime.rm(name, roots=roots, volumes=True)
+        if expected_identity is None:
+            return runtime_dispatch.rm(name, roots=roots, volumes=True)
+        return runtime_dispatch.rm(
+            name,
+            roots=roots,
+            volumes=True,
+            expected_identity=expected_identity,
+        )
 
     def preflight_down(
         targets: tuple[DownTarget, ...],
@@ -896,11 +981,20 @@ def build_project_callbacks(
             )
         raise StateError(f"managed volume {volume_name!r} has unsupported backend {backend!r}")
 
-    def service_logs(name: str, follow: bool):
-        rpaths = state.run_paths(roots, name)
-        if lima.is_lima_run(rpaths):
-            return lima.logs(name, roots=roots, follow=follow)
-        return runtime.logs(name, roots=roots, follow=follow)
+    def service_logs(
+        name: str,
+        follow: bool,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ):
+        if expected_identity is None:
+            return runtime_dispatch.logs(name, roots=roots, follow=follow)
+        return runtime_dispatch.logs(
+            name,
+            roots=roots,
+            follow=follow,
+            expected_identity=expected_identity,
+        )
 
     return ProjectCallbacks(
         inspect=lambda name: _inspect_run(name, roots),

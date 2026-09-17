@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import http.client
-from http.server import ThreadingHTTPServer
 import json
-from pathlib import Path
 import socket
 import threading
+import uuid
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from palimpsest_local import inventory, state, ui
+from palimpsest_local import state, ui
+from palimpsest_local.runtime_types import (
+    CapabilityCheck,
+    ExistingRunRecord,
+    RuntimeBackend,
+    _issue_lifecycle_adapter_outcome,
+)
 from palimpsest_local.state import init_roots
 
 
@@ -19,6 +27,49 @@ def _setup_roots(tmp_path: Path) -> state.StatePaths:
     config_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
     return init_roots({"XDG_CONFIG_HOME": str(config_dir), "XDG_STATE_HOME": str(state_dir)})
+
+
+def _write_ui_run_ledger(
+    roots: state.StatePaths,
+    *,
+    backend: str,
+    runtime_kind: str = "cloud-image",
+) -> state.RunPaths:
+    rpaths = state.run_paths(roots, "ui-vm")
+    rpaths.root.mkdir(parents=True, exist_ok=True)
+    run_id = str(uuid.uuid4())
+    state.atomic_write_json(
+        rpaths.owner,
+        {"schema_version": 1, "run_id": run_id, "name": "ui-vm"},
+    )
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            "schema_version": 2,
+            "runtime_kind": runtime_kind,
+            "backend": backend,
+            "name": "ui-vm",
+            "run_id": run_id,
+            "status": "stopped",
+        },
+    )
+    return rpaths
+
+
+_UI_LIFECYCLE_REQUESTS = (
+    ("start", "start", "POST", "/api/v1/vms/ui-vm/start", {}),
+    ("stop", "stop", "POST", "/api/v1/vms/ui-vm/stop", {}),
+    ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm?volumes=true", {"volumes": True}),
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ui.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 @pytest.fixture
@@ -118,6 +169,51 @@ def test_auth_semantics(server_env: dict[str, Any]):
     assert status == 200
 
 
+def test_ui_vm_inventory_uses_safe_aggregation_projection(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm")
+    record = state.read_run_state(rpaths)
+    state.atomic_write_json(
+        rpaths.state,
+        {
+            **record,
+            "base": {
+                "digest": "sha256:" + "a" * 64,
+                "arch": "x86_64",
+                "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+            },
+            "layers": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "target_dev": "vdb",
+                    "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        ui.inventory.runtime_dispatch.cloud_runtime,
+        "reconcile_run",
+        lambda *_a, **_k: {"state": {"guest_ip": "SENSITIVE_VALUE"}},
+    )
+
+    status, _headers, payload = _request(
+        server_env["port"],
+        "GET",
+        "/api/v1/vms",
+        headers={"Authorization": f"Bearer {server_env['token']}"},
+    )
+
+    assert status == 200
+    assert [vm["name"] for vm in payload["vms"]] == ["ui-vm"]
+    assert payload["vms"][0]["base_digest"] == "sha256:" + "a" * 64
+    assert "SENSITIVE_VALUE" not in repr(payload)
+    assert "local_path" not in repr(payload)
+
+
 def test_csrf_origin_semantics(server_env: dict[str, Any]):
     port = server_env["port"]
     token = server_env["token"]
@@ -127,20 +223,203 @@ def test_csrf_origin_semantics(server_env: dict[str, Any]):
 
     # 1. POST with forbidden Origin -> 403
     bad_headers = headers | {"Origin": "http://evil.local"}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=bad_headers, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=bad_headers, body={"destination": "/tmp/test"}
+    )
     assert status == 403
     assert json_data == {"error": "Forbidden: invalid Origin"}
 
     # 2. POST with forbidden Sec-Fetch-Site -> 403
     bad_headers2 = headers | {"Sec-Fetch-Site": "cross-site"}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=bad_headers2, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=bad_headers2, body={"destination": "/tmp/test"}
+    )
     assert status == 403
     assert json_data == {"error": "Forbidden: Sec-Fetch-Site must be same-origin"}
 
     # 3. POST with matching Origin -> 200 / 400 (not 403)
     good_headers = headers | {"Origin": origin}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=good_headers, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=good_headers, body={"destination": "/tmp/test"}
+    )
     assert status in (200, 400, 409)
+
+
+@pytest.mark.parametrize(
+    ("backend", "adapter_name", "expected_backend"),
+    [
+        ("kvm", "cloud_runtime", RuntimeBackend.KVM),
+        ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
+        ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+    ],
+)
+@pytest.mark.parametrize(("operation", "target_name", "method", "path", "expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    adapter_name: str,
+    expected_backend: RuntimeBackend,
+    operation: str,
+    target_name: str,
+    method: str,
+    path: str,
+    expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    _write_ui_run_ledger(roots, backend=backend)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def selected(name: str, **kwargs: object) -> object:
+        calls.append((name, kwargs))
+        if operation == "logs":
+            return iter(("one\n", "two\n", "three\n"))
+        expected = kwargs["_expected_record"]
+        assert isinstance(expected, ExistingRunRecord)
+        expected_snapshot = kwargs["_expected_snapshot"]
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+        with state.locked_existing_run(roots, name, expected=expected, expected_snapshot=expected_snapshot) as mutation:
+            terminal = "running" if operation == "start" else "removed" if operation == "rm" else "stopped"
+            initial = mutation.initial_snapshot
+            written = (
+                mutation.mutable_state()
+                if initial.state["status"] == terminal and operation != "rm"
+                else mutation.write_state(terminal, mutation.mutable_state())
+            )
+            outcome = _issue_lifecycle_adapter_outcome(
+                mutation.record,
+                initial.state["status"],
+                state.lifecycle_revision(initial),
+                terminal,
+                state.lifecycle_revision(written),
+            )
+            if operation == "rm":
+                mutation.delete_run_tree()
+            return outcome
+
+    selected_adapter = getattr(ui.runtime_dispatch, adapter_name)
+    other_adapter = ui.runtime_dispatch.lima if adapter_name == "cloud_runtime" else ui.runtime_dispatch.cloud_runtime
+    monkeypatch.setattr(selected_adapter, target_name, selected)
+    monkeypatch.setattr(
+        other_adapter,
+        target_name,
+        lambda *_args, **_kwargs: pytest.fail("UI dispatcher selected the wrong runtime adapter"),
+    )
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, response_headers, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 200
+    assert "application/json" in response_headers["Content-Type"]
+    if operation == "logs":
+        assert payload == {"log": "two\nthree\n"}
+    else:
+        assert payload == {
+            "name": "ui-vm",
+            "run_id": payload["run_id"],
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "operation": operation,
+            "previous_status": "stopped",
+            "status": "running" if operation == "start" else "removed" if operation == "rm" else "stopped",
+            "lifecycle_revision": 0 if operation == "stop" else 1,
+            "warning_category": None,
+            "fallback_used": False,
+        }
+    assert len(calls) == 1
+    called_name, kwargs = calls[0]
+    assert called_name == "ui-vm"
+    expected_record = kwargs.pop("_expected_record")
+    expected_snapshot = kwargs.pop("_expected_snapshot", None)
+    assert isinstance(expected_record, ExistingRunRecord)
+    assert expected_record.dispatch_key.backend is expected_backend
+    if operation in {"start", "stop", "rm"}:
+        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+    assert kwargs == {"roots": roots, **expected_kwargs}
+
+
+@pytest.mark.parametrize(("operation", "target_name", "method", "path", "_expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_oci_vm_lifecycle_fails_closed_with_typed_409_before_backend_side_effects(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    target_name: str,
+    method: str,
+    path: str,
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm", runtime_kind="oci-root")
+    before = (
+        rpaths.owner.read_bytes(),
+        rpaths.state.read_bytes(),
+        tuple(sorted(path.name for path in rpaths.root.iterdir())),
+    )
+    effects: list[str] = []
+
+    def forbidden(effect: str) -> None:
+        effects.append(effect)
+        pytest.fail(f"UI backend side effect reached: {effect}")
+
+    monkeypatch.setattr(
+        ui.runtime_dispatch.cloud_runtime,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("cloud"),
+    )
+    monkeypatch.setattr(
+        ui.runtime_dispatch.lima,
+        target_name,
+        lambda *_args, **_kwargs: forbidden("lima"),
+    )
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 409
+    expected_error = {
+        "start": "runtime operation 'start' is unavailable for oci-root/kvm",
+        "stop": "OCI run removal could not be verified; preserve the run evidence",
+        "rm": "OCI-root rm --volumes is unavailable; root retention follows the owned run policy",
+    }[operation]
+    assert payload == {"error": expected_error}
+    assert effects == []
+    assert before == (
+        rpaths.owner.read_bytes(),
+        rpaths.state.read_bytes(),
+        tuple(sorted(path.name for path in rpaths.root.iterdir())),
+    )
+
+
+@pytest.mark.parametrize(("_operation", "_target_name", "method", "path", "_expected_kwargs"), _UI_LIFECYCLE_REQUESTS)
+def test_ui_corrupt_vm_ledger_fails_closed_as_409_without_value_reflection(
+    server_env: dict[str, Any],
+    _operation: str,
+    _target_name: str,
+    method: str,
+    path: str,
+    _expected_kwargs: dict[str, object],
+) -> None:
+    roots: state.StatePaths = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm")
+    rpaths.state.write_text('{"schema_version":"sensitive-corrupt-value"}\n', encoding="utf-8")
+    before = rpaths.state.read_bytes()
+    headers = {
+        "Authorization": f"Bearer {server_env['token']}",
+        "Origin": server_env["origin"],
+    }
+
+    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+
+    assert status == 409
+    assert payload == {"error": "invalid run state schema"}
+    assert "sensitive-corrupt-value" not in json.dumps(payload)
+    assert rpaths.state.read_bytes() == before
 
 
 def test_static_asset_routes(server_env: dict[str, Any]):
@@ -177,6 +456,7 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     assert status == 200
     assert "text/css" in resp_headers.get("Content-Type", "")
 
+
 def test_get_routes_and_not_found(server_env: dict[str, Any]):
     roots: state.StatePaths = server_env["roots"]
     port = server_env["port"]
@@ -186,7 +466,10 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
     # Synthesize VM run ledger
     run_dir = roots.runs / "demo-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-vm"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -199,6 +482,8 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
         },
     )
     (run_dir / "console.log").write_text("vm console line 1\nvm console line 2\n", encoding="utf-8")
+    run_dir.chmod(0o700)
+    (run_dir / "console.log").chmod(0o600)
 
     # Synthesize build record
     b_id = "b-000000000999"
@@ -314,7 +599,10 @@ def test_referenced_artifact_deletion_409(server_env: dict[str, Any]):
     # Synthesize VM run ledger referencing base_digest
     run_dir = roots.runs / "active-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "active-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "active-vm"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -331,6 +619,8 @@ def test_referenced_artifact_deletion_409(server_env: dict[str, Any]):
     status, _, json_data = _request(port, "DELETE", f"/api/v1/store/artifacts/{base_digest}", headers=headers)
     assert status == 409
     assert "still used by: active-vm" in json_data["error"]
+
+
 def test_malformed_and_traversal_build_id_400(server_env: dict[str, Any]):
     port = server_env["port"]
     token = server_env["token"]
@@ -374,8 +664,8 @@ def test_truncated_body_400(server_env: dict[str, Any]):
         f"Origin: {origin}\r\n"
         f"Content-Type: application/json\r\n"
         f"Content-Length: 100\r\n\r\n"
-        f"{{\"short\": 1}}"
-    ).encode("utf-8")
+        f'{{"short": 1}}'
+    ).encode()
 
     sock.sendall(req)
     sock.shutdown(socket.SHUT_WR)
@@ -390,10 +680,10 @@ def test_truncated_body_400(server_env: dict[str, Any]):
 
     resp_text = resp_bytes.decode("utf-8", errors="replace")
     assert "400 Bad Request" in resp_text or "Truncated request body" in resp_text
+
+
 @pytest.mark.parametrize("keep_source", [False, True])
-def test_storage_move_and_set_http_success_and_switch(
-    server_env: dict[str, Any], tmp_path: Path, keep_source: bool
-):
+def test_storage_move_and_set_http_success_and_switch(server_env: dict[str, Any], tmp_path: Path, keep_source: bool):
     port = server_env["port"]
     token = server_env["token"]
     origin = server_env["origin"]
@@ -441,9 +731,7 @@ def test_storage_move_and_set_http_success_and_switch(
     assert move_res["new_root"] == str(dest_move)
 
     # 3. Next GET /api/v1/storage reports destination
-    status, _, storage_res = _request(
-        port, "GET", "/api/v1/storage", headers={"Authorization": f"Bearer {token}"}
-    )
+    status, _, storage_res = _request(port, "GET", "/api/v1/storage", headers={"Authorization": f"Bearer {token}"})
     assert status == 200
     assert storage_res["state_root"] == str(dest_move)
 
@@ -482,7 +770,18 @@ def test_storage_move_and_set_http_success_and_switch(
     assert storage_after_set["state_root"] == str(dest_set)
 
     # Ensure empty set destination gets normal state directory structure/modes
-    for sub in ("store", "runs", "locks", "transfers", "tags", "builds", "build-cache", "runtime-packs", "projects", "volumes"):
+    for sub in (
+        "store",
+        "runs",
+        "locks",
+        "transfers",
+        "tags",
+        "builds",
+        "build-cache",
+        "runtime-packs",
+        "projects",
+        "volumes",
+    ):
         subdir = dest_set / sub
         assert subdir.is_dir()
         assert (subdir.stat().st_mode & 0o777) == 0o700

@@ -1,0 +1,381 @@
+{
+  "artifacts": {
+    "lower0": {
+      "base64_file": "lower0.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "36942af180f317ae47e3bcaebd9f595b9e72e86455505ebaece9ccec230a256a",
+      "raw_size_bytes": 4096,
+      "source_entries": [
+        {
+          "mode": 420,
+          "path": ".__palimpsest_overlay_order_probe_v1",
+          "sha256": "630e9a93e9e4da54eefdd9229c4973c2cabfdb201d95f96862c8e890128a7d06",
+          "size_bytes": 11,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "layer.txt",
+          "sha256": "57ef70f3f9a4b158e7b33720d362d6a7f9023f7d35352c26758ea84841f321e0",
+          "size_bytes": 22,
+          "type": "file"
+        }
+      ],
+      "source_root": "inputs/lower0"
+    },
+    "lower1": {
+      "base64_file": "lower1.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "fb67ee3a5bc74b92ab3e35bb8a1a753dad33af6b4f5cf5c2a6544c1e2d482807",
+      "raw_size_bytes": 8192,
+      "source_entries": [
+        {
+          "mode": 420,
+          "path": ".__palimpsest_oci_root_workload_proof_v1",
+          "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db",
+          "size_bytes": 38,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": ".__palimpsest_overlay_order_probe_v1",
+          "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+          "size_bytes": 10,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": ".__palimpsest_workload_proof_v1",
+          "sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+          "size_bytes": 14328,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "etc",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "etc/group",
+          "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467",
+          "size_bytes": 30,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "etc/passwd",
+          "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e",
+          "size_bytes": 97,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "layer.txt",
+          "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
+          "size_bytes": 21,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "proof",
+          "type": "directory"
+        },
+        {
+          "mode": 493,
+          "path": "proof/workdir",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "proof/workdir/.__palimpsest_workdir_v1",
+          "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d",
+          "size_bytes": 22,
+          "type": "file"
+        }
+      ],
+      "source_root": "inputs/lower1"
+    },
+    "root": {
+      "base64_file": "root-ext4.raw.gz.b64",
+      "compression": "gzip",
+      "compressed_sha256": "29f0a7f99f27546bed35e4e681a45ffe847e0a7b3316136f50ea73404162168d",
+      "filesystem_label": "pali-root-e3f97d",
+      "filesystem_uuid": "1fd7a60e-fdb2-4877-91d3-148bbca3884f",
+      "raw_sha256": "ef607002f63f445491b659898009ff1322affe8a8ff6ef980b6b30af34ca6cf7",
+      "raw_size_bytes": 16777216
+    },
+    "transition_dev": {
+      "base64_file": "transition-dev.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "b7a84a74ea60cbd8ecccd93012dd824af2dade1abaf541f13742fbd95f55c7fb",
+      "raw_size_bytes": 8192,
+      "source_entries": [
+        {
+          "mode": 420,
+          "path": ".__palimpsest_oci_root_workload_proof_v1",
+          "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db",
+          "size_bytes": 38,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": ".__palimpsest_overlay_order_probe_v1",
+          "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+          "size_bytes": 10,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": ".__palimpsest_workload_proof_v1",
+          "sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+          "size_bytes": 14328,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "dev",
+          "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
+          "size_bytes": 16,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "etc",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "etc/group",
+          "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467",
+          "size_bytes": 30,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "etc/passwd",
+          "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e",
+          "size_bytes": 97,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "layer.txt",
+          "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
+          "size_bytes": 21,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "proof",
+          "type": "directory"
+        },
+        {
+          "mode": 493,
+          "path": "proof/workdir",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "proof/workdir/.__palimpsest_workdir_v1",
+          "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d",
+          "size_bytes": 22,
+          "type": "file"
+        }
+      ],
+      "source_root": "inputs/transition-dev"
+    },
+    "transition_proc": {
+      "base64_file": "transition-proc.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "151da8fdd737817a5c69500a6dda790f2a93c0eec8deb07459ecfcb43be59f1e",
+      "raw_size_bytes": 8192,
+      "source_entries": [
+        {
+          "mode": 420,
+          "path": ".__palimpsest_oci_root_workload_proof_v1",
+          "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db",
+          "size_bytes": 38,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": ".__palimpsest_overlay_order_probe_v1",
+          "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+          "size_bytes": 10,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": ".__palimpsest_workload_proof_v1",
+          "sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+          "size_bytes": 14328,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "etc",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "etc/group",
+          "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467",
+          "size_bytes": 30,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "etc/passwd",
+          "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e",
+          "size_bytes": 97,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "layer.txt",
+          "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
+          "size_bytes": 21,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "proc",
+          "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
+          "size_bytes": 16,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "proof",
+          "type": "directory"
+        },
+        {
+          "mode": 493,
+          "path": "proof/workdir",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "proof/workdir/.__palimpsest_workdir_v1",
+          "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d",
+          "size_bytes": 22,
+          "type": "file"
+        }
+      ],
+      "source_root": "inputs/transition-proc"
+    },
+    "transition_sys": {
+      "base64_file": "transition-sys.squashfs.b64",
+      "compression_id": 6,
+      "raw_sha256": "2a0d035b43f8ddd083a58c329908376645e98f0058d27c38df3c444718add0cb",
+      "raw_size_bytes": 8192,
+      "source_entries": [
+        {
+          "mode": 420,
+          "path": ".__palimpsest_oci_root_workload_proof_v1",
+          "sha256": "9e304af4297f1e082e005d57523b8a9f2dbf26a21a08b40cf8b55ae4c44946db",
+          "size_bytes": 38,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": ".__palimpsest_overlay_order_probe_v1",
+          "sha256": "f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+          "size_bytes": 10,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": ".__palimpsest_workload_proof_v1",
+          "sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+          "size_bytes": 14328,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "etc",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "etc/group",
+          "sha256": "e671e31c735281799d794d8e79f314cb5a588af3666c16d5859fb96e28953467",
+          "size_bytes": 30,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "etc/passwd",
+          "sha256": "1096f64e7295a34ffd5a4809ac0e293d390a97800ae9ef49fb720c4cd082d82e",
+          "size_bytes": 97,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "layer.txt",
+          "sha256": "7f07e426caacc38f539d445eb3f8bd9d98de0fb2f2bd14fed98092b98c253741",
+          "size_bytes": 21,
+          "type": "file"
+        },
+        {
+          "mode": 493,
+          "path": "proof",
+          "type": "directory"
+        },
+        {
+          "mode": 493,
+          "path": "proof/workdir",
+          "type": "directory"
+        },
+        {
+          "mode": 420,
+          "path": "proof/workdir/.__palimpsest_workdir_v1",
+          "sha256": "ad335f6e86c61d9393a716897b2f2f382c17058d77bce6f4a41f890f6e59574d",
+          "size_bytes": 22,
+          "type": "file"
+        },
+        {
+          "mode": 420,
+          "path": "sys",
+          "sha256": "afddb47761294cc7bf40abd87d5fae26ae749d04dc2d7c6d0dd75329bb5b6109",
+          "size_bytes": 16,
+          "type": "file"
+        }
+      ],
+      "source_root": "inputs/transition-sys"
+    }
+  },
+  "assembly_probe": {
+    "digest": "sha256:f6f8a6d4cc482c9589ab87159165dab15c4802ace3f3759325144f2734fa761a",
+    "path": "/.__palimpsest_overlay_order_probe_v1",
+    "size_bytes": 10,
+    "top_ordinal": 1
+  },
+  "policy": "palimpsest.kvm-actual-filesystem-fixtures.v11",
+  "provenance": {
+    "lower_builder": {
+      "argv_policy": "mksquashfs source output -comp zstd -Xcompression-level 3 -b 131072 -noappend -no-exports -no-xattrs -reproducible -all-time 0 -mkfs-time 0 -all-root -processors 1 -no-progress",
+      "compression": "zstd",
+      "compression_id": 6,
+      "executable_sha256": "0e2bc38611d42bd385112d4f72e5030a7b79df59d34079c9b00dec7109237c30",
+      "version": "mksquashfs 4.7.5"
+    },
+    "root_builder": {
+      "container_image": "ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
+      "lazy_initialization": false,
+      "version": "mke2fs 1.47.0"
+    },
+    "workload_proof": {
+      "build_script": "scripts/build_oci_guest_workload_proof.sh",
+      "build_script_sha256": "4f88223bc5cf8b853254a229187f55d6c3cbf6c31992ee0008c8f797bf43e25d",
+      "elf_mode": 493,
+      "elf_sha256": "269f606e97be4c1a8d36e4e50eaa170951db3a18fd4163e929f77f93cd99ba9c",
+      "elf_size_bytes": 14328,
+      "source": "guest/workload-proof/proof.c",
+      "source_sha256": "7f2da9a6bca521721f70e468da2aa408410c48e7d7a56b2fe67e0c4bc88f88e8",
+      "toolchain": "docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1"
+    }
+  },
+  "schema": "palimpsest.kvm-filesystem-fixtures.v11"
+}

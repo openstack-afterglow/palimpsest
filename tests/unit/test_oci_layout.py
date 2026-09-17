@@ -71,8 +71,28 @@ def test_content_store_operations(tmp_path: Path):
     assert store.exists(sample_digest)
 
     # Delete
-    store.delete(sample_digest)
+    store.delete(sample_digest, retention_guard=lambda: None)
     assert not store.exists(sample_digest)
+
+
+def test_content_store_delete_requires_retention_guard(tmp_path: Path) -> None:
+    store = ContentStore(tmp_path)
+    digest = store.write_stream([b"guarded"]).name
+
+    with pytest.raises(ArtifactValidationError, match="durable-reference guard"):
+        store.delete(f"sha256:{digest}")
+
+
+def test_content_store_reuses_valid_digest_inode(tmp_path: Path) -> None:
+    store = ContentStore(tmp_path)
+    payload = b"stable inode"
+    digest = config_digest(payload)
+    first = store.write_stream([payload], expected_digest=digest)
+    identity = (first.stat().st_dev, first.stat().st_ino)
+
+    second = store.write_stream([payload], expected_digest=digest)
+
+    assert (second.stat().st_dev, second.stat().st_ino) == identity
 
 
 def test_content_store_replaces_poisoned_existing_digest_target(tmp_path: Path):

@@ -306,11 +306,11 @@ def test_build_layer_promotes_verified_output_and_cleans_builder(tmp_path: Path,
     spec = _build_spec(tmp_path)
     removed: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.rm",
+        "palimpsest_local.cloud_runtime.rm",
         lambda name, *, volumes, **_kwargs: removed.append((name, volumes)),
     )
 
@@ -328,6 +328,9 @@ def test_build_layer_rejects_conflicting_tag(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
     roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
     spec = _build_spec(tmp_path, tag="conflict")
+    conflicting_blob = roots.store / "blobs" / "sha256" / ("f" * 64)
+    conflicting_blob.parent.mkdir(parents=True, exist_ok=True)
+    conflicting_blob.write_bytes(b"stub")
     state.write_tag_record(
         roots,
         state.TagRecord(
@@ -343,10 +346,10 @@ def test_build_layer_rejects_conflicting_tag(tmp_path: Path, monkeypatch: pytest
         ),
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     with pytest.raises(BuildError, match="conflicting with built digest"):
         build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
@@ -365,10 +368,10 @@ def test_network_none_build_uses_serial_builder_without_an_interface(tmp_path: P
     )
     started: list[tuple[object, str]] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, *, user_data, **_kwargs: started.append((run_spec, user_data)) or {"status": "running"},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
 
@@ -383,11 +386,11 @@ def test_build_layer_records_serial_run_failure_and_cleans_builder(tmp_path: Pat
     spec = _build_spec(tmp_path, command="false")
     removed: list[str] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: {"status": "running", "name": run_spec.name},
     )
     monkeypatch.setattr(
-        "palimpsest_local.runtime.rm",
+        "palimpsest_local.cloud_runtime.rm",
         lambda name, **_kwargs: removed.append(name),
     )
 
@@ -408,6 +411,7 @@ def test_build_layer_selects_lima_vz(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "lima-vz")
     called: list[object] = []
     import palimpsest_local.lima as lima
+
     monkeypatch.setattr(lima, "build_layer", lambda s, roots=None: called.append(s) or {"status": "success"})
 
     result = build_layer(spec, roots=roots)
@@ -432,10 +436,10 @@ def test_build_layer_uses_serial_builder_for_kvm_on_linux_aarch64(tmp_path: Path
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
     started: list[object] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime.start_serial_builder",
+        "palimpsest_local.cloud_runtime.start_serial_builder",
         lambda run_spec, **_kwargs: started.append(run_spec) or {"status": "running", "name": run_spec.name},
     )
-    monkeypatch.setattr("palimpsest_local.runtime.rm", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
 
     record = build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
     assert record["status"] == "success"
@@ -445,8 +449,10 @@ def test_build_layer_uses_serial_builder_for_kvm_on_linux_aarch64(tmp_path: Path
 def test_build_layer_propagates_platform_selector_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
     spec = _build_spec(tmp_path)
+
     def selector_boom(arch: str):
         raise ArtifactValidationError("no local runtime can boot a x86_64 image on Darwin/aarch64")
+
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", selector_boom)
 
     with pytest.raises(ArtifactValidationError, match="no local runtime can boot a x86_64 image on Darwin/aarch64"):

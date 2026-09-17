@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 import subprocess
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +15,9 @@ from typing import Any
 
 from .cloudinit import BUILD_CHANNEL_NAME
 from .digest import normalize_digest
+from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
+from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
+from .oci_network import OCINetworkConfig
 from .platforms import DomainProfile
 
 _logger = logging.getLogger(__name__)
@@ -20,9 +25,13 @@ _DOMAIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _NETWORK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _DISK_LETTERS = "bcdefghijklmnopqrstuvwxyz"
 MAX_LAYER_DISKS = len(_DISK_LETTERS)
+MAX_OCI_ROOT_LAYER_DISKS = MAX_LAYER_DISKS - 1
+LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES = 107
 DOMAIN_MARKER_VERSION = "0.1.0"
 DOMAIN_MARKER_NAMESPACE = "https://afterglow.dev/palimpsest-local/domain/v1"
+QEMU_DOMAIN_NAMESPACE = "http://libvirt.org/schemas/domain/qemu/1.0"
 ET.register_namespace("palimpsest", DOMAIN_MARKER_NAMESPACE)
+ET.register_namespace("qemu", QEMU_DOMAIN_NAMESPACE)
 
 
 class KvmError(RuntimeError):
@@ -33,9 +42,30 @@ class KvmUnavailable(KvmError):
     """The optional libvirt runtime is unavailable."""
 
 
+def _validate_oci_lifecycle_socket_path(path: Path | None) -> None:
+    if not isinstance(path, Path) or not path.is_absolute() or path.name != "lifecycle.sock":
+        raise KvmError("OCI-root lifecycle socket path is invalid")
+    try:
+        encoded = os.fsencode(path)
+    except (TypeError, UnicodeError, ValueError):
+        raise KvmError("OCI-root lifecycle socket path is invalid") from None
+    if b"\0" in encoded:
+        raise KvmError("OCI-root lifecycle socket path is invalid")
+    if len(encoded) > LIBVIRT_UNIX_SOCKET_PATH_MAX_BYTES:
+        raise KvmError("OCI-root lifecycle socket path exceeds the Linux AF_UNIX pathname limit")
+
+
 @dataclass(frozen=True)
 class LayerDisk:
     blob_digest: str
+    host_path: Path
+    target_dev: str
+    serial: str
+
+
+@dataclass(frozen=True)
+class Stage1TransportDisk:
+    artifact_digest: str
     host_path: Path
     target_dev: str
     serial: str
@@ -68,6 +98,30 @@ class DomainSpec:
     control_socket: Path | None = None
     ssh_host_port: int | None = None
     nvram: Path | None = None
+
+
+@dataclass(frozen=True)
+class OCIRootDomainSpec:
+    """Local-only libvirt inputs for a direct-kernel OCI-root guest."""
+
+    name: str
+    memory_mib: int
+    vcpus: int
+    kernel: Path
+    initramfs: Path
+    kernel_cmdline: str
+    root_disk: Path
+    root_serial: str
+    layers: tuple[LayerDisk, ...]
+    stage1_transport: Stage1TransportDisk
+    network: OCINetworkConfig | None = None
+    console_log: Path | None = None
+    run_id: str | None = None
+    boot_contract_digest: str | None = None
+    lifecycle_socket: Path | None = None
+    lifecycle_channel_name: str = OCI_CONTROL_CHANNEL_NAME
+    lifecycle_protocol: str = OCI_CONTROL_PROTOCOL_V2
+    dac_label: str | None = None
 
 
 def _valid_name(name: str) -> bool:
@@ -113,16 +167,22 @@ def _disk(
     readonly: bool,
     device: str = "disk",
     bus: str = "virtio",
+    shareable: bool = False,
+    dac_no_relabel: bool = False,
 ) -> ET.Element:
     disk = ET.SubElement(devices, "disk", {"type": "file", "device": device})
     driver = {"name": "qemu", "type": disk_format}
     if target == "vda":
         driver["discard"] = "unmap"
     ET.SubElement(disk, "driver", driver)
-    ET.SubElement(disk, "source", {"file": str(path)})
+    source = ET.SubElement(disk, "source", {"file": str(path)})
+    if dac_no_relabel:
+        ET.SubElement(source, "seclabel", {"model": "dac", "relabel": "no"})
     ET.SubElement(disk, "target", {"dev": target, "bus": bus})
     if readonly:
         ET.SubElement(disk, "readonly")
+    if shareable:
+        ET.SubElement(disk, "shareable")
     return disk
 
 
@@ -221,6 +281,187 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
     return ET.tostring(domain, encoding="unicode")
 
 
+def build_oci_root_domain_xml(spec: OCIRootDomainSpec, profile: DomainProfile) -> str:
+    """Build the fail-closed direct-kernel domain shape used by OCI-root.
+
+    This deliberately does not share the cloud-image builder: OCI-root has a
+    raw writable root, no firmware boot disk, and no NoCloud seed device.
+    """
+
+    if profile.backend != "kvm" or profile.domain_type != "kvm" or profile.arch != "x86_64":
+        raise KvmError("OCI-root direct boot currently requires x86_64 KVM")
+    if profile.firmware is not None or profile.autoselect_firmware:
+        raise KvmError("OCI-root direct boot does not accept a firmware profile")
+    if not _valid_name(spec.name):
+        raise KvmError("domain name must match ^[a-z0-9][a-z0-9-]{0,62}$")
+    if not 256 <= spec.memory_mib <= 1_048_576:
+        raise KvmError("memory_mib is outside the supported range")
+    if not 1 <= spec.vcpus <= 256:
+        raise KvmError("vcpus is outside the supported range")
+    if not spec.layers or len(spec.layers) > MAX_OCI_ROOT_LAYER_DISKS:
+        raise KvmError("OCI-root layer count is outside the supported range")
+    for label, path in (
+        ("kernel", spec.kernel),
+        ("initramfs", spec.initramfs),
+        ("root disk", spec.root_disk),
+    ):
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise KvmError(f"OCI-root {label} path must be absolute")
+    if spec.console_log is not None and not spec.console_log.is_absolute():
+        raise KvmError("OCI-root console path must be absolute")
+    if not isinstance(spec.kernel_cmdline, str) or not spec.kernel_cmdline or len(spec.kernel_cmdline) > 4096:
+        raise KvmError("OCI-root kernel command line is invalid")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in spec.kernel_cmdline):
+        raise KvmError("OCI-root kernel command line contains control characters")
+    if re.fullmatch(r"[0-9a-f]{20}", spec.root_serial or "") is None:
+        raise KvmError("OCI-root root disk serial is invalid")
+    if spec.network is not None and not isinstance(spec.network, OCINetworkConfig):
+        raise KvmError("OCI-root network configuration must be typed")
+    try:
+        run_id = str(uuid.UUID(spec.run_id or ""))
+    except (AttributeError, TypeError, ValueError):
+        raise KvmError("OCI-root run ID is invalid") from None
+    if run_id != spec.run_id:
+        raise KvmError("OCI-root run ID is not canonical")
+    try:
+        contract_digest = normalize_digest(spec.boot_contract_digest or "")
+    except Exception:
+        raise KvmError("OCI-root boot contract digest is invalid") from None
+    if contract_digest != spec.boot_contract_digest:
+        raise KvmError("OCI-root boot contract digest is not canonical")
+    if spec.lifecycle_channel_name != OCI_CONTROL_CHANNEL_NAME or spec.lifecycle_protocol != OCI_CONTROL_PROTOCOL_V2:
+        raise KvmError("OCI-root lifecycle channel contract is invalid")
+    _validate_oci_lifecycle_socket_path(spec.lifecycle_socket)
+
+    seen_serials = {spec.root_serial}
+    for index, layer in enumerate(spec.layers):
+        try:
+            layer_digest = normalize_digest(layer.blob_digest)
+        except Exception:
+            raise KvmError("OCI-root layer digest is invalid") from None
+        if (
+            layer.target_dev != f"vd{_DISK_LETTERS[index + 1]}"
+            or not layer.host_path.is_absolute()
+            or layer.host_path == spec.root_disk
+            or layer_digest != layer.blob_digest
+            or re.fullmatch(r"[0-9a-f]{20}", layer.serial or "") is None
+            or layer.serial in seen_serials
+        ):
+            raise KvmError("OCI-root layer disk order or identity is invalid")
+        seen_serials.add(layer.serial)
+    transport = spec.stage1_transport
+    try:
+        transport_digest = normalize_digest(transport.artifact_digest)
+    except Exception:
+        raise KvmError("OCI-root stage-1 transport digest is invalid") from None
+    if (
+        transport_digest != transport.artifact_digest
+        or not transport.host_path.is_absolute()
+        or transport.host_path == spec.root_disk
+        or transport.host_path in {layer.host_path for layer in spec.layers}
+        or transport.target_dev != "vdb"
+        or re.fullmatch(r"[0-9a-f]{20}", transport.serial or "") is None
+        or transport.serial in seen_serials
+    ):
+        raise KvmError("OCI-root stage-1 transport identity is invalid")
+
+    domain = ET.Element("domain", {"type": "kvm"})
+    if spec.dac_label is not None:
+        if (
+            not isinstance(spec.dac_label, str)
+            or re.fullmatch(r"\+[1-9][0-9]{0,9}:\+[1-9][0-9]{0,9}", spec.dac_label) is None
+        ):
+            raise KvmError("OCI-root fixed DAC principal is invalid")
+        if any(int(value) >= 2**32 - 1 for value in spec.dac_label.split(":")):
+            raise KvmError("OCI-root fixed DAC principal is invalid")
+        label = ET.SubElement(domain, "seclabel", {"type": "static", "model": "dac", "relabel": "no"})
+        ET.SubElement(label, "label").text = spec.dac_label
+    ET.SubElement(domain, "name").text = spec.name
+    ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(spec.memory_mib)
+    ET.SubElement(domain, "vcpu").text = str(spec.vcpus)
+    os_element = ET.SubElement(domain, "os")
+    ET.SubElement(os_element, "type", {"arch": profile.arch, "machine": profile.machine}).text = "hvm"
+    ET.SubElement(os_element, "kernel").text = str(spec.kernel)
+    ET.SubElement(os_element, "initrd").text = str(spec.initramfs)
+    ET.SubElement(os_element, "cmdline").text = spec.kernel_cmdline
+    features = ET.SubElement(domain, "features")
+    ET.SubElement(features, "acpi")
+    ET.SubElement(features, "apic")
+    ET.SubElement(domain, "cpu", {"mode": "host-passthrough"})
+    metadata = ET.SubElement(domain, "metadata")
+    ET.SubElement(
+        metadata,
+        "{https://afterglow.dev/palimpsest-local/domain/v1}run",
+        {
+            "id": run_id,
+            "schema": "1",
+            "version": DOMAIN_MARKER_VERSION,
+            "contract": contract_digest,
+        },
+    )
+    ET.SubElement(
+        metadata,
+        "{https://afterglow.dev/palimpsest-local/domain/v1}lifecycle",
+        {"channel": spec.lifecycle_channel_name, "protocol": spec.lifecycle_protocol},
+    )
+    devices = ET.SubElement(domain, "devices")
+    ET.SubElement(devices, "emulator").text = str(profile.emulator)
+    # libvirt forbids per-source label overrides when domain relabeling is off.
+    source_dac_override = spec.dac_label is None
+    root = _disk(devices, spec.root_disk, "vda", "raw", readonly=False, dac_no_relabel=source_dac_override)
+    ET.SubElement(root, "serial").text = spec.root_serial
+    transport_disk = _disk(
+        devices,
+        transport.host_path,
+        transport.target_dev,
+        "raw",
+        readonly=True,
+        dac_no_relabel=source_dac_override,
+    )
+    ET.SubElement(transport_disk, "serial").text = transport.serial
+    for layer in spec.layers:
+        disk = _disk(
+            devices,
+            layer.host_path,
+            layer.target_dev,
+            "raw",
+            readonly=True,
+            shareable=True,
+            dac_no_relabel=source_dac_override,
+        )
+        ET.SubElement(disk, "serial").text = layer.serial
+    ET.SubElement(devices, "controller", {"type": "virtio-serial", "index": "0"})
+    lifecycle_channel = ET.SubElement(devices, "channel", {"type": "unix"})
+    ET.SubElement(
+        lifecycle_channel,
+        "source",
+        {"mode": "bind", "path": str(spec.lifecycle_socket)},
+    )
+    ET.SubElement(
+        lifecycle_channel,
+        "target",
+        {"type": "virtio", "name": spec.lifecycle_channel_name},
+    )
+    network_arguments = () if spec.network is None else spec.network.qemu_arguments(run_id)
+    if spec.console_log is None:
+        console = ET.SubElement(devices, "console", {"type": "pty"})
+    else:
+        console = ET.SubElement(devices, "console", {"type": "file"})
+        console_source = ET.SubElement(console, "source", {"path": str(spec.console_log), "append": "on"})
+        if source_dac_override:
+            ET.SubElement(console_source, "seclabel", {"model": "dac", "relabel": "no"})
+    ET.SubElement(console, "target", {"type": "serial", "port": "0"})
+    if network_arguments:
+        # The NIC is authored as an explicit QEMU user-mode netdev: libvirt
+        # never creates, adopts, or mutates a host network, bridge, firewall
+        # rule, or DHCP service for an OCI-root run. Every host listener
+        # belongs to this QEMU process and disappears with it.
+        commandline = ET.SubElement(domain, f"{{{QEMU_DOMAIN_NAMESPACE}}}commandline")
+        for value in network_arguments:
+            ET.SubElement(commandline, f"{{{QEMU_DOMAIN_NAMESPACE}}}arg", {"value": value})
+    return ET.tostring(domain, encoding="unicode")
+
+
 def build_seed_iso_command(seed_iso: Path, user_data: Path, meta_data: Path) -> list[str]:
     for label, path in (("seed_iso", seed_iso), ("user_data", user_data), ("meta_data", meta_data)):
         if not path.is_absolute():
@@ -284,7 +525,17 @@ def build_hdiutil_seed_command(seed_iso: Path, seed_dir: Path) -> list[str]:
     for label, path in (("seed_iso", seed_iso), ("seed_dir", seed_dir)):
         if not path.is_absolute():
             raise KvmError(f"{label} must be an absolute path: {path!s}")
-    return ["hdiutil", "makehybrid", "-iso", "-joliet", "-default-volume-name", "CIDATA", "-o", str(seed_iso), str(seed_dir)]
+    return [
+        "hdiutil",
+        "makehybrid",
+        "-iso",
+        "-joliet",
+        "-default-volume-name",
+        "CIDATA",
+        "-o",
+        str(seed_iso),
+        str(seed_dir),
+    ]
 
 
 def run_hdiutil_seed_iso(seed_iso: Path, seed_dir: Path) -> None:
@@ -302,6 +553,49 @@ def _libvirt() -> Any:
     except ImportError as exc:
         raise KvmUnavailable("libvirt-python is not installed; install palimpsest-local[kvm]") from exc
     return libvirt
+
+
+def _validated_domain_marker_run_id(element: ET.Element) -> str | None:
+    if (
+        element.tag != f"{{{DOMAIN_MARKER_NAMESPACE}}}run"
+        or element.get("schema") != "1"
+        or element.get("version") != DOMAIN_MARKER_VERSION
+    ):
+        return None
+    run_id = element.get("id")
+    if not isinstance(run_id, str):
+        return None
+    try:
+        parsed = uuid.UUID(run_id)
+    except ValueError:
+        return None
+    return run_id if str(parsed) == run_id else None
+
+
+def get_domain_run_id(domain: Any) -> str | None:
+    """Extract the Palimpsest run ID from a libvirt domain."""
+    try:
+        libvirt = _libvirt()
+        metadata_xml = domain.metadata(
+            libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+            DOMAIN_MARKER_NAMESPACE,
+        )
+        if metadata_xml:
+            root = ET.fromstring(metadata_xml)
+            run_id = _validated_domain_marker_run_id(root)
+            if run_id is not None:
+                return run_id
+    except Exception:
+        pass
+
+    try:
+        root = ET.fromstring(domain.XMLDesc())
+        element = root.find(f"./metadata/{{{DOMAIN_MARKER_NAMESPACE}}}run")
+        if element is not None:
+            return _validated_domain_marker_run_id(element)
+    except Exception:
+        pass
+    return None
 
 
 def connect(uri: str):

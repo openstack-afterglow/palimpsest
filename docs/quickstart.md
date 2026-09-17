@@ -6,12 +6,26 @@ This guide covers common workflows using the `palimpsest` CLI tool for working w
 
 ## Prerequisites & Environment Setup
 
-Set your Hub URL and Bearer token via environment variables:
+Set the Hub URL and a project-scoped Keystone token through your secret-management mechanism. The token is sent in `X-Auth-Token`; never copy a real token into this guide, shell history, or local state.
 
 ```bash
-export PALIMPSEST_URL="https://hub.afterglow.dev"
-export PALIMPSEST_TOKEN="ag_token_example_12345"
+export PALIMPSEST_URL="https://hub.example.invalid"
+# Set PALIMPSEST_TOKEN from your secret-management mechanism.
 ```
+
+### Standalone Hub bootstrap and data migration
+
+Bootstrap and data migration are separate operations. From the Hub package directory, initialize an empty destination schema first, then (when moving existing rows) copy the three supported tables from a different source database:
+
+```bash
+cd hub
+uv run palimpsest-hub-bootstrap
+uv run palimpsest-hub-migrate-data \
+  --source-url "$SOURCE_DATABASE_URL" \
+  --destination-url "$DESTINATION_DATABASE_URL"
+```
+
+The migration refuses an identical source/destination URL and a non-empty destination table. Run it only after reviewing the source and destination; it does not replace the bootstrap step or move blob files. Start the API and export worker separately with `uv run palimpsest-hub` and `uv run palimpsest-hub-worker`.
 
 These variables authenticate Palimpsest Hub's native `/v1` artifact and cache API. Hub is separate from any Docker/OCI `/v2` registry configured below.
 
@@ -56,6 +70,18 @@ palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
 ---
 
 ## 1. Artifact Management (`image`, `layer`, `bundle`)
+
+For a qualified Linux KVM host and an existing local OCI archive, an explicit
+launch user is available without changing the image:
+
+```sh
+palimpsest run ./redis.oci.tar --name redis-demo --user redis -d
+```
+
+`--user USER[:GROUP]` applies only to OCI-root runs. Omit it to keep the image
+user. It grants no capabilities, does not repair file ownership and does not
+enable direct registry-reference intake. Read the
+[identity contract and compatibility limits](oci-run-user.md) before use.
 
 ### Managing Boot Images (`image`)
 
@@ -239,10 +265,10 @@ See [Declarative multi-VM projects](projects.md) for all supported keys, `.env`/
 # List all active and stopped local runs
 palimpsest ps
 
-# View machine-readable JSON inspect ledger with safety warnings
+# View an allowlisted, machine-readable durable-state snapshot
 palimpsest inspect web-dev
 
-# Stream live serial console logs
+# Stream retained console-file bytes (state-only on every cloud backend)
 palimpsest logs web-dev --follow
 
 # Open an interactive SSH shell into the guest as user 'ubuntu'
@@ -395,7 +421,7 @@ palimpsest rm web-dev --volumes
 
 ## KVM Runtime Requirements Notice
 
-> **Important:** On Linux, commands that create or manage virtual machines (`run`, `compose`, Palimpsestfile guest `build`, `commit`, `shell`, `exec`, `stop`, `rm`, `ps`, `inspect`, `logs`) require `/dev/kvm` access and `palimpsest-local[kvm]`. On Apple Silicon, supported `run`/`compose` operations use Lima/VZ instead. Dockerfile/Buildx builds do not use libvirt; runtime packing additionally requires `mksquashfs`.
+> **Important:** On Linux, operations that create, enter, or mutate a live KVM guest (`run`, `start`, `stop`, `rm`, `shell`, `exec`, `compose`, Palimpsestfile guest `build`, and `commit`) require the relevant KVM tools, `/dev/kvm` access, and `palimpsest-local[kvm]`. `ps` and `inspect` read only the durable run ledger, while `logs` reads only the retained owner-only console file; none requires `/dev/kvm`, libvirt, Lima, or an in-guest journal. On Apple Silicon, supported `run`/`compose` operations use Lima/VZ instead. Dockerfile/Buildx builds do not use libvirt; runtime packing additionally requires `mksquashfs`.
 >
 > On hosts without KVM or when `libvirt-python` is absent:
 > - Palimpsestfile guest builds and `palimpsest commit` raise operational errors indicating KVM runtime is unavailable; Dockerfile/Buildx builds remain available.

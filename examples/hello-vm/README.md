@@ -120,16 +120,16 @@ uv run palimpsest exec hello-vm -- uname -m
 # List all active VMs and backend assignments
 uv run palimpsest ps
 
-# View state ledger, SSH endpoint, and attached layers
+# View the allowlisted durable-state snapshot, SSH endpoint, and attached layers
 uv run palimpsest inspect hello-vm
 
 # Read the retained Palimpsest console/provisioning log for this run
 uv run palimpsest logs hello-vm
 ```
 
-On macOS, `ps`, `inspect`, and `logs` report the persisted run ledger and the
-retained Palimpsest console log, not the live Lima guest journal. For the
-in-guest journal use Lima directly:
+On every host, `ps` and `inspect` report persisted state rather than querying the
+live backend. On macOS, `logs` reads the retained Palimpsest console log, not the
+live Lima guest journal. For the in-guest journal use Lima directly:
 
 ```bash
 limactl shell hello-vm journalctl -b --no-pager

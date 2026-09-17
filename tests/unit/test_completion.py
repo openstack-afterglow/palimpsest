@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
 from palimpsest_local import cli, completion
 
 
@@ -17,9 +18,7 @@ def test_root_completion_candidates():
     parser = cli.build_parser()
     candidates = completion.resolve_candidates(parser, [""])
 
-    top_actions = next(
-        action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction)
-    )
+    top_actions = next(action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction))
     expected_subcommands = set(top_actions.choices.keys())
     expected_root_options = {"-h", "--help", "--url", "--version"}
 
@@ -59,6 +58,9 @@ def test_nested_completion_candidates():
     assert "--quiet" in compose_config_candidates
     assert "--services" in compose_config_candidates
 
+    assert "materialize" in completion.resolve_candidates(parser, ["oci", ""])
+    assert "--manifest" in completion.resolve_candidates(parser, ["oci", "materialize", "--"])
+
 
 def test_option_and_choices_completion():
     parser = cli.build_parser()
@@ -96,7 +98,7 @@ def test_prefix_filtering():
     assert set(i_candidates) == {"image", "images", "inspect"}
 
     st_candidates = completion.resolve_candidates(parser, ["st"])
-    assert set(st_candidates) == {"stop", "store"}
+    assert set(st_candidates) == {"start", "stop", "store"}
 
 
 def test_aliases_and_short_long_flags():
@@ -142,7 +144,7 @@ def test_generated_registration_scripts():
     zsh_script = completion.generate_completion_script("zsh")
     assert "#compdef palimpsest" in zsh_script
     assert "compdef _palimpsest palimpsest" in zsh_script
-    assert '${words[@]:1:$((CURRENT-1))}' in zsh_script
+    assert "${words[@]:1:$((CURRENT-1))}" in zsh_script
     assert "emulate -L zsh" in zsh_script
     assert 'compstate[insert]=""' in zsh_script
     assert "return 0" in zsh_script
@@ -277,6 +279,7 @@ def test_executable_fish_completion():
         )
         assert "auto" in proc.stdout
 
+
 def test_cli_main_complete_interception_and_completion_cmd(capsys: pytest.CaptureFixture[str]):
     # Hidden __complete interception
     ret = cli.main(["__complete", "--", "run", "--backend", "a"])
@@ -303,13 +306,12 @@ def test_cli_main_complete_interception_and_completion_cmd(capsys: pytest.Captur
 
 def test_exact_top_level_command_set():
     parser = cli.build_parser()
-    top_actions = next(
-        action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction)
-    )
+    top_actions = next(action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction))
     expected = {
         "image",
         "layer",
         "bundle",
+        "oci",
         "build",
         "registry",
         "login",
@@ -330,6 +332,7 @@ def test_exact_top_level_command_set():
         "logs",
         "shell",
         "exec",
+        "start",
         "stop",
         "rm",
         "commit",

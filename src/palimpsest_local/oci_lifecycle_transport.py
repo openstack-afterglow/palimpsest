@@ -1,0 +1,603 @@
+"""Private libvirt transport for the production-inert OCI-root handoff.
+
+The public runtime dispatcher deliberately does not import this module.  It is
+the narrow synchronous bridge between a previously qualified v2 lifecycle
+state machine and one exact libvirt virtio-serial channel.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
+
+from .errors import StateError
+from .oci_control_protocol_v2 import (
+    HostOCIControlV2Session,
+    OCIControlProtocolV2Error,
+    OCIControlV2Binding,
+    OCIControlV2Envelope,
+    OCIControlV2FrameDecoder,
+    encode_frame,
+)
+from .oci_exec_control import MonitorExecControl
+from .oci_monitor_control import MonitorStopControl
+from .runtime_types import ProcessExit, ProcessExitCategory
+
+OCI_ROOT_HANDOFF_SCHEMA = "palimpsest.oci-root-handoff.v1"
+DEFAULT_HANDOFF_TIMEOUT_SECONDS = 30.0
+_READ_SIZE = 64 * 1024
+
+
+class OCILifecycleFailureCategory(StrEnum):
+    TIMEOUT = "timeout"
+    STREAM_SEND = "stream-send"
+    STREAM_RECEIVE = "stream-receive"
+    STREAM_ENDED = "stream-ended"
+    FRAME_INVALID = "frame-invalid"
+    PROTOCOL_REJECTED = "protocol-rejected"
+    CONTROL_INVALID = "control-invalid"
+    EVENT_PUMP = "event-pump"
+    CLEANUP = "cleanup"
+    RECEIPT_INVALID = "receipt-invalid"
+    INTERNAL = "internal"
+
+
+class OCILifecycleTransportError(StateError):
+    """Stable categorized failure at the libvirt stream or lifecycle boundary."""
+
+    def __init__(self, message: str, *, category: OCILifecycleFailureCategory) -> None:
+        if type(category) is not OCILifecycleFailureCategory:
+            raise TypeError("OCI lifecycle transport failure category is invalid")
+        self.category = category
+        super().__init__(message)
+
+
+class OCILifecycleStreamCallbackCleanupError(OCILifecycleTransportError):
+    """The stream callback may still be registered, so the stream must remain open."""
+
+
+@dataclass(frozen=True, slots=True)
+class OCILifecycleHandoffReceipt:
+    """Secret-free projection of one authenticated boot lifecycle."""
+
+    boot_attempt_id: str
+    boot_generation: str
+    key_id: str
+    phase: str
+    transcript: tuple[Mapping[str, Any], ...]
+    terminal: ProcessExit | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            if str(uuid.UUID(self.boot_attempt_id)) != self.boot_attempt_id:
+                raise ValueError
+            if str(uuid.UUID(self.boot_generation)) != self.boot_generation:
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("OCI-root lifecycle receipt boot identity is invalid") from None
+        if not isinstance(self.key_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", self.key_id) is None:
+            raise ValueError("OCI-root lifecycle receipt key ID is invalid")
+        if self.phase == "ready" and self.terminal is None:
+            pass
+        elif self.phase == "terminal" and isinstance(self.terminal, ProcessExit):
+            pass
+        else:
+            raise ValueError("OCI-root lifecycle receipt phase is invalid")
+        if not isinstance(self.transcript, tuple) or any(not isinstance(item, Mapping) for item in self.transcript):
+            raise ValueError("OCI-root lifecycle receipt transcript is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        terminal = None
+        if self.terminal is not None:
+            terminal = {
+                "category": self.terminal.category.value,
+                "exit_code": self.terminal.exit_code,
+                "returncode": self.terminal.returncode,
+                "signal_number": self.terminal.signal_number,
+            }
+        return {
+            "boot_attempt_id": self.boot_attempt_id,
+            "boot_generation": self.boot_generation,
+            "key_id": self.key_id,
+            "phase": self.phase,
+            "schema": OCI_ROOT_HANDOFF_SCHEMA,
+            "terminal": terminal,
+            "transcript": [dict(item) for item in self.transcript],
+        }
+
+
+def _terminal_result(envelope: OCIControlV2Envelope) -> ProcessExit:
+    terminal = envelope.body.payload["terminal"]
+    exit_code = terminal["exit_code"]
+    signal_number = terminal["signal"]
+    if exit_code is not None:
+        return ProcessExit(exit_code, exit_code, None, ProcessExitCategory.EXITED)
+    return ProcessExit(-signal_number, None, signal_number, ProcessExitCategory.SIGNALED)
+
+
+def _remaining(deadline: float | None, monotonic: Callable[[], float]) -> float:
+    if deadline is None:
+        return 0.01
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise OCILifecycleTransportError(
+            "OCI-root lifecycle handoff timed out", category=OCILifecycleFailureCategory.TIMEOUT
+        )
+    return remaining
+
+
+def _pause(deadline: float | None, monotonic: Callable[[], float], wait: Callable[[float], None]) -> None:
+    wait(min(0.01, _remaining(deadline, monotonic)))
+
+
+def _send_all(
+    stream: Any,
+    payload: bytes,
+    *,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+    wait_writable: Callable[[float], None],
+    before_send: Callable[[], None] | None = None,
+) -> None:
+    offset = 0
+    while offset < len(payload):
+        _remaining(deadline, monotonic)
+        if before_send is not None:
+            before_send()
+            _remaining(deadline, monotonic)
+        try:
+            sent = stream.send(payload[offset:])
+        except Exception:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream send failed", category=OCILifecycleFailureCategory.STREAM_SEND
+            ) from None
+        if sent == -2:
+            _pause(deadline, monotonic, wait_writable)
+            continue
+        if type(sent) is not int or sent <= 0 or sent > len(payload) - offset:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream send result is invalid", category=OCILifecycleFailureCategory.STREAM_SEND
+            )
+        offset += sent
+
+
+def _receive_one(
+    stream: Any,
+    decoder: OCIControlV2FrameDecoder,
+    pending: list[OCIControlV2Envelope],
+    *,
+    deadline: float | None,
+    monotonic: Callable[[], float],
+    wait: Callable[[float], None],
+    control_poll: Callable[[bool], None] | None = None,
+) -> OCIControlV2Envelope:
+    while not pending:
+        if control_poll is not None:
+            control_poll(False)
+        _remaining(deadline, monotonic)
+        try:
+            chunk = stream.recv(_READ_SIZE)
+        except Exception:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream receive failed", category=OCILifecycleFailureCategory.STREAM_RECEIVE
+            ) from None
+        if chunk == -2:
+            if control_poll is not None:
+                # A consumed four-byte header has zero buffered_bytes but
+                # still awaits a payload. finish() also checks that state.
+                try:
+                    decoder.finish()
+                except OCIControlProtocolV2Error:
+                    frame_boundary = False
+                else:
+                    frame_boundary = True
+                control_poll(frame_boundary)
+            _pause(deadline, monotonic, wait)
+            continue
+        if chunk in {b"", 0}:
+            try:
+                decoder.finish()
+            except OCIControlProtocolV2Error:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle stream ended with a truncated frame",
+                    category=OCILifecycleFailureCategory.STREAM_ENDED,
+                ) from None
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream ended before terminal status",
+                category=OCILifecycleFailureCategory.STREAM_ENDED,
+            )
+        if not isinstance(chunk, bytes):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream receive result is invalid",
+                category=OCILifecycleFailureCategory.STREAM_RECEIVE,
+            )
+        try:
+            pending.extend(decoder.feed(chunk))
+        except OCIControlProtocolV2Error:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle frame is invalid", category=OCILifecycleFailureCategory.FRAME_INVALID
+            ) from None
+    return pending.pop(0)
+
+
+def _receipt(
+    session: HostOCIControlV2Session,
+    phase: str,
+    transcript: list[Mapping[str, Any]],
+    terminal: ProcessExit | None,
+    observed_tags: set[str],
+) -> OCILifecycleHandoffReceipt:
+    if session.boot_generation is None or session.key_id is None:
+        raise OCILifecycleTransportError(
+            "OCI-root lifecycle session identity is incomplete", category=OCILifecycleFailureCategory.RECEIPT_INVALID
+        )
+    receipt = OCILifecycleHandoffReceipt(
+        session.boot_attempt_id,
+        session.boot_generation,
+        session.key_id,
+        phase,
+        tuple(transcript),
+        terminal,
+    )
+    serialized = json.dumps(receipt.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+    try:
+        session.assert_receipt_safe(serialized, observed_tags)
+    except OCIControlProtocolV2Error:
+        raise OCILifecycleTransportError(
+            "OCI-root lifecycle receipt is not safe to persist", category=OCILifecycleFailureCategory.RECEIPT_INVALID
+        ) from None
+    return receipt
+
+
+def complete_initial_lifecycle_handoff(
+    stream: Any,
+    binding: OCIControlV2Binding,
+    *,
+    on_ready: Callable[[OCILifecycleHandoffReceipt], None],
+    timeout_seconds: float = DEFAULT_HANDOFF_TIMEOUT_SECONDS,
+    terminal_timeout_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    wait: Callable[[float], None] = time.sleep,
+    wait_writable: Callable[[float], None] | None = None,
+    before_stream_close: Callable[[], None] | None = None,
+    session: HostOCIControlV2Session | None = None,
+    stop_control: MonitorStopControl | None = None,
+    before_stop_send: Callable[[], None] | None = None,
+    exec_control: MonitorExecControl | None = None,
+) -> OCILifecycleHandoffReceipt:
+    """Drive HELLO/BOOTSTRAP/KEY_ACK/READY through authenticated TERMINAL.
+
+    ``stream`` must already be the exact domain channel opened with libvirt's
+    nonblocking flag.  It is always aborted on return.  Some Python libvirt
+    bindings do not expose ``virStreamFree`` as a public ``free`` method; when
+    absent, the binding owns final release when the wrapper is collected.  A
+    callable ``free`` extension is invoked after ``abort`` exactly once.
+    """
+
+    result: OCILifecycleHandoffReceipt | None = None
+    failure: BaseException | None = None
+    abort_operation: Callable[[], Any] | None = None
+    free_operation: Callable[[], Any] | None = None
+    try:
+        try:
+            abort_candidate = getattr(stream, "abort", None)
+        except Exception:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream surface is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            ) from None
+        abort_operation = abort_candidate if callable(abort_candidate) else None
+        try:
+            free_candidate = getattr(stream, "free", None)
+        except Exception:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream surface is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            ) from None
+        free_operation = free_candidate if callable(free_candidate) else None
+        if (
+            any(not callable(getattr(stream, operation, None)) for operation in ("send", "recv"))
+            or not callable(abort_candidate)
+            or (free_candidate is not None and not callable(free_candidate))
+        ):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream surface is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if type(timeout_seconds) not in {int, float} or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle timeout is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if terminal_timeout_seconds is not None and (
+            type(terminal_timeout_seconds) not in {int, float}
+            or not math.isfinite(terminal_timeout_seconds)
+            or terminal_timeout_seconds <= 0
+        ):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle terminal timeout is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if not callable(on_ready):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle ready callback is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if stop_control is not None and (
+            type(stop_control) is not MonitorStopControl or not callable(before_stop_send)
+        ):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle STOP control is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if exec_control is not None and (
+            type(exec_control) is not MonitorExecControl or stop_control is None or not callable(before_stop_send)
+        ):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle EXEC control is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if not callable(monotonic) or not callable(wait):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle timing callback is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if wait_writable is None:
+            wait_writable = wait
+        if not callable(wait_writable):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle timing callback is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        if before_stream_close is not None and not callable(before_stream_close):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle stream cleanup callback is invalid",
+                category=OCILifecycleFailureCategory.CONTROL_INVALID,
+            )
+        ready_deadline = monotonic() + float(timeout_seconds)
+        if not math.isfinite(ready_deadline):
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle clock result is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+            )
+        decoder = OCIControlV2FrameDecoder()
+        pending: list[OCIControlV2Envelope] = []
+        transcript: list[Mapping[str, Any]] = []
+        observed_tags: set[str] = set()
+        session = HostOCIControlV2Session(binding) if session is None else session
+        if session.binding != binding or session.state != "new":
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle session is invalid", category=OCILifecycleFailureCategory.INTERNAL
+            )
+        hello = session.hello()
+        encoded = encode_frame(hello)
+        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait_writable=wait_writable)
+        transcript.append(session.transcript_projection(hello, encoded))
+
+        bootstrap = _receive_one(stream, decoder, pending, deadline=ready_deadline, monotonic=monotonic, wait=wait)
+        try:
+            session.accept(bootstrap)
+        except OCIControlProtocolV2Error:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle BOOTSTRAP was rejected", category=OCILifecycleFailureCategory.PROTOCOL_REJECTED
+            ) from None
+        if bootstrap.tag is not None:
+            observed_tags.add(bootstrap.tag)
+        bootstrap_encoded = encode_frame(bootstrap)
+        transcript.append(session.transcript_projection(bootstrap, bootstrap_encoded))
+
+        key_ack = session.key_ack()
+        encoded = encode_frame(key_ack)
+        _send_all(stream, encoded, deadline=ready_deadline, monotonic=monotonic, wait_writable=wait_writable)
+        observed_tags.add(key_ack.tag or "")
+        transcript.append(session.transcript_projection(key_ack, encoded))
+
+        ready = _receive_one(stream, decoder, pending, deadline=ready_deadline, monotonic=monotonic, wait=wait)
+        try:
+            session.accept(ready)
+        except OCIControlProtocolV2Error:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle READY was rejected", category=OCILifecycleFailureCategory.PROTOCOL_REJECTED
+            ) from None
+        if session.state != "ready":
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle did not become ready", category=OCILifecycleFailureCategory.PROTOCOL_REJECTED
+            )
+        if ready.tag is not None:
+            observed_tags.add(ready.tag)
+        ready_encoded = encode_frame(ready)
+        transcript.append(session.transcript_projection(ready, ready_encoded))
+        on_ready(_receipt(session, "ready", transcript, None, observed_tags))
+
+        terminal_deadline = None
+        if terminal_timeout_seconds is not None:
+            terminal_deadline = monotonic() + float(terminal_timeout_seconds)
+            if not math.isfinite(terminal_deadline):
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle clock result is invalid", category=OCILifecycleFailureCategory.CONTROL_INVALID
+                )
+
+        exec_job = None
+        exec_deadline = None
+
+        def poll_stop(can_send: bool) -> None:
+            nonlocal exec_job, exec_deadline
+            if exec_deadline is not None:
+                _remaining(exec_deadline, monotonic)
+            if stop_control is None:
+                return
+            stop_deadline = stop_control.deadline
+            if stop_deadline is not None:
+                _remaining(stop_deadline, monotonic)
+            if not can_send:
+                return
+            if not stop_control.take_stop():
+                if exec_control is not None and not stop_control.accepted and exec_job is None and not pending:
+                    job = exec_control.take_exec()
+                    if job is not None:
+                        exec_job = job
+                        # Guest enforces its execution deadline; the host allows
+                        # bounded drain/cleanup time but never guesses an exit.
+                        exec_deadline = monotonic() + job.timeout_ms / 1000 + 15
+                        request = session.exec(job.argv, timeout_ms=job.timeout_ms)
+                        _send_all(
+                            stream,
+                            encode_frame(request),
+                            deadline=min(exec_deadline, monotonic() + 5),
+                            monotonic=monotonic,
+                            wait_writable=wait_writable,
+                            before_send=before_stop_send,
+                        )
+                return
+            if exec_control is not None:
+                exec_control.close_to_exec("stopping")
+            stop_deadline = stop_control.deadline
+            if stop_deadline is None:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle STOP deadline is missing", category=OCILifecycleFailureCategory.CONTROL_INVALID
+                )
+            _remaining(stop_deadline, monotonic)
+            stop = session.stop()
+            encoded_stop = encode_frame(stop)
+            deadlines = [value for value in (terminal_deadline, stop_deadline) if value is not None]
+            _send_all(
+                stream,
+                encoded_stop,
+                deadline=min(deadlines) if deadlines else None,
+                monotonic=monotonic,
+                wait_writable=wait_writable,
+                before_send=before_stop_send,
+            )
+            observed_tags.add(stop.tag or "")
+            transcript.append(session.transcript_projection(stop, encoded_stop))
+
+        after_exec_output = False
+        while True:
+            # Continuous output must not starve an accepted STOP. A decoded
+            # complete frame is a safe send boundary even without EAGAIN.
+            try:
+                decoder.finish()
+            except OCIControlProtocolV2Error:
+                can_send = False
+            else:
+                can_send = after_exec_output
+            poll_stop(can_send)
+            terminal_envelope = _receive_one(
+                stream,
+                decoder,
+                pending,
+                deadline=terminal_deadline,
+                monotonic=monotonic,
+                wait=wait,
+                control_poll=poll_stop,
+            )
+            try:
+                session.accept(terminal_envelope)
+            except OCIControlProtocolV2Error:
+                raise OCILifecycleTransportError(
+                    "OCI-root lifecycle TERMINAL or exec response was rejected",
+                    category=OCILifecycleFailureCategory.PROTOCOL_REJECTED,
+                ) from None
+            kind = terminal_envelope.body.kind
+            if kind not in {"EXEC_OUTPUT", "EXEC_EXIT"}:
+                break
+            if exec_control is None or exec_job is None:
+                raise OCILifecycleTransportError(
+                    "OCI-root guest exec result has no owned request",
+                    category=OCILifecycleFailureCategory.CONTROL_INVALID,
+                )
+            payload = terminal_envelope.body.payload
+            if kind == "EXEC_OUTPUT":
+                exec_control.append_output(
+                    exec_job, payload["stream"], payload["offset"], bytes.fromhex(payload["data_hex"])
+                )
+            else:
+                exec_control.complete(
+                    exec_job,
+                    None if payload["terminal"] is None else dict(payload["terminal"]),
+                    payload["stdout_bytes"],
+                    payload["stderr_bytes"],
+                    payload["reason"],
+                )
+                exec_job = None
+                exec_deadline = None
+            after_exec_output = kind == "EXEC_OUTPUT"
+            # Command content/output stays in the bounded volatile mailbox.
+            # It is not part of the durable boot lifecycle transcript.
+        if session.state != "terminal" or terminal_envelope.body.kind != "TERMINAL":
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle terminal status is invalid", category=OCILifecycleFailureCategory.PROTOCOL_REJECTED
+            )
+        if stop_control is not None:
+            stop_control.mark_observed_terminal()
+        if exec_control is not None:
+            exec_control.close_to_exec("terminal")
+        if pending:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle TERMINAL had trailing frame data",
+                category=OCILifecycleFailureCategory.FRAME_INVALID,
+            )
+        try:
+            decoder.finish()
+        except OCIControlProtocolV2Error:
+            raise OCILifecycleTransportError(
+                "OCI-root lifecycle TERMINAL had trailing frame data",
+                category=OCILifecycleFailureCategory.FRAME_INVALID,
+            ) from None
+        if terminal_envelope.tag is not None:
+            observed_tags.add(terminal_envelope.tag)
+        terminal_encoded = encode_frame(terminal_envelope)
+        transcript.append(session.transcript_projection(terminal_envelope, terminal_encoded))
+        result = _receipt(
+            session,
+            "terminal",
+            transcript,
+            _terminal_result(terminal_envelope),
+            observed_tags,
+        )
+    except BaseException as exc:
+        failure = exc
+        if stop_control is not None and type(stop_control) is MonitorStopControl:
+            stop_control.mark_control_lost()
+        if exec_control is not None and type(exec_control) is MonitorExecControl:
+            exec_control.close_to_exec("control-lost")
+    if isinstance(failure, OCILifecycleStreamCallbackCleanupError):
+        raise failure
+    if before_stream_close is not None:
+        try:
+            before_stream_close()
+        except Exception:
+            if stop_control is not None and type(stop_control) is MonitorStopControl:
+                stop_control.mark_control_lost()
+            raise OCILifecycleStreamCallbackCleanupError(
+                "OCI-root lifecycle stream event cleanup failed; stream retained",
+                category=OCILifecycleFailureCategory.CLEANUP,
+            ) from None
+    close_failed = False
+    for operation in (abort_operation, free_operation):
+        if operation is None:
+            continue
+        try:
+            operation()
+        except Exception:
+            close_failed = True
+    if failure is not None:
+        raise failure
+    if close_failed:
+        if stop_control is not None and type(stop_control) is MonitorStopControl:
+            stop_control.mark_control_lost()
+        raise OCILifecycleTransportError(
+            "OCI-root lifecycle stream cleanup failed", category=OCILifecycleFailureCategory.CLEANUP
+        )
+    if result is None:
+        raise OCILifecycleTransportError(
+            "OCI-root lifecycle handoff did not complete", category=OCILifecycleFailureCategory.INTERNAL
+        )
+    return result
+
+
+__all__ = [
+    "DEFAULT_HANDOFF_TIMEOUT_SECONDS",
+    "OCI_ROOT_HANDOFF_SCHEMA",
+    "OCILifecycleFailureCategory",
+    "OCILifecycleHandoffReceipt",
+    "OCILifecycleStreamCallbackCleanupError",
+    "OCILifecycleTransportError",
+    "complete_initial_lifecycle_handoff",
+]

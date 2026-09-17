@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
+
 import pytest
 
 from palimpsest_local import inventory, state
 from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.runtime_types import CapabilityCheck
 from palimpsest_local.state import TagRecord, init_roots, write_tag_record
+
+
+@pytest.fixture(autouse=True)
+def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
 
 
 def _setup_roots(tmp_path: Path) -> state.StatePaths:
@@ -37,7 +49,9 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Synthesize run ledgers
     run1 = roots.runs / "demo-kvm"
     run1.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run1 / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-kvm"})
+    state.atomic_write_json(
+        run1 / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-kvm"}
+    )
     state.atomic_write_json(
         run1 / "state.json",
         {
@@ -47,8 +61,28 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "status": "running",
             "memory_mib": 2048,
             "vcpus": 2,
-            "base": {"digest": "sha256:" + "a" * 64, "arch": "x86_64"},
-            "layers": [{"digest": "sha256:" + "b" * 64, "target_dev": "vdb"}],
+            "base": {
+                "digest": "sha256:" + "a" * 64,
+                "arch": "x86_64",
+                "local_path": "/private/SENSITIVE_VALUE/base.qcow2",
+            },
+            "layers": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "target_dev": "vdb",
+                    "local_path": "/private/SENSITIVE_VALUE/layer.squashfs",
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "data",
+                    "mount_path": "/srv/Data",
+                    "filesystem": "ext4",
+                    "read_only": False,
+                    "target_dev": "vdc",
+                    "host_path": "/private/SENSITIVE_VALUE/data.raw",
+                }
+            ],
             "ssh": {"host": "127.0.0.1", "port": 2222},
             "created_at": "2026-08-24T00:00:00Z",
             "updated_at": "2026-08-24T00:01:00Z",
@@ -57,7 +91,10 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     run2 = roots.runs / "demo-lima"
     run2.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run2 / "owner.json", {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "demo-lima"})
+    state.atomic_write_json(
+        run2 / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "demo-lima"},
+    )
     state.atomic_write_json(
         run2 / "state.json",
         {
@@ -78,7 +115,15 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "schema_version": 1,
             "project": "myproj",
             "config_digest": "sha256:" + "c" * 64,
-            "services": [{"service": "web", "run_name": "demo-kvm", "config_digest": "sha256:" + "d" * 64, "run_id": "11111111-1111-1111-1111-111111111111", "backend": "kvm"}],
+            "services": [
+                {
+                    "service": "web",
+                    "run_name": "demo-kvm",
+                    "config_digest": "sha256:" + "d" * 64,
+                    "run_id": "11111111-1111-1111-1111-111111111111",
+                    "backend": "kvm",
+                }
+            ],
             "order": ["web"],
             "volumes": [],
             "created_at": "2026-08-24T00:00:00Z",
@@ -86,40 +131,23 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         },
     )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        return [
-            {
-                "name": "demo-kvm",
-                "owner": {"run_id": "11111111-1111-1111-1111-111111111111"},
-                "state": {
-                    "name": "demo-kvm",
-                    "run_id": "11111111-1111-1111-1111-111111111111",
-                    "backend": "kvm",
-                    "status": "running",
-                    "memory_mib": 2048,
-                    "vcpus": 2,
-                    "base": {"digest": "sha256:" + "a" * 64, "arch": "x86_64"},
-                    "layers": [{"digest": "sha256:" + "b" * 64, "target_dev": "vdb"}],
-                    "ssh": {"host": "127.0.0.1", "port": 2222},
-                    "created_at": "2026-08-24T00:00:00Z",
-                    "updated_at": "2026-08-24T00:01:00Z",
-                },
-            }
-        ], []
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
-    monkeypatch.setattr(inventory, "inspect_instance_status", lambda name: "stopped")
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", lambda *_a, **_k: {})
+    monkeypatch.setattr(inventory.runtime_dispatch.lima, "reconcile_run", lambda *_a, **_k: {})
 
     vms_res = inventory.list_vms(roots)
     vms = vms_res["vms"]
     assert len(vms) == 2
 
     kvm_vm = next(v for v in vms if v["name"] == "demo-kvm")
+    assert kvm_vm["runtime_kind"] == "cloud-image"
     assert kvm_vm["backend"] == "kvm"
     assert kvm_vm["project"] == "myproj"
     assert kvm_vm["base_digest"] == "sha256:" + "a" * 64
     assert kvm_vm["layer_count"] == 1
     assert kvm_vm["ssh"] == {"host": "127.0.0.1", "port": 2222}
+    assert "SENSITIVE_VALUE" not in repr(vms_res)
+    assert "local_path" not in repr(vms_res)
+    assert "host_path" not in repr(vms_res)
 
     vm_detail = inventory.get_vm(roots, "demo-kvm")
     assert vm_detail["name"] == "demo-kvm"
@@ -132,38 +160,57 @@ def test_list_vms_stale_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     roots = _setup_roots(tmp_path)
     run_dir = roots.runs / "stale-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "33333333-3333-3333-3333-333333333333", "name": "stale-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "33333333-3333-3333-3333-333333333333", "name": "stale-vm"},
+    )
     state.atomic_write_json(run_dir / "state.json", {"name": "stale-vm", "backend": "kvm", "status": "running"})
 
-    def mock_preflight(backend: str, host=None):
-        if backend == "kvm":
-            raise ArtifactValidationError("/dev/kvm is not accessible")
-
-    monkeypatch.setattr(inventory, "preflight", mock_preflight)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.cloud_runtime,
+        "reconcile_run",
+        lambda *_a, **_k: (_ for _ in ()).throw(ArtifactValidationError("/dev/kvm is not accessible")),
+    )
 
     res = inventory.list_vms(roots)
     assert len(res["vms"]) == 1
     vm = res["vms"][0]
     assert vm["stale"] is True
-    assert any("unavailable on this host" in w for w in res["warnings"])
+    assert any("runtime reconciliation failed" in w for w in res["warnings"])
+
+
+def test_list_vms_uses_non_reflective_token_for_invalid_entry_name(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    invalid = roots.runs / "BAD SENSITIVE_VALUE"
+    invalid.mkdir()
+    (invalid / "owner.json").write_text("SENSITIVE_VALUE", encoding="utf-8")
+
+    result = inventory.list_vms(roots)
+
+    assert result["vms"] == []
+    assert len(result["warnings"]) == 1
+    assert result["warnings"][0].startswith("entry-")
+    assert "invalid run entry" in result["warnings"][0]
+    assert "SENSITIVE_VALUE" not in repr(result)
 
 
 def test_list_artifacts(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     store = ContentStore(roots.store)
 
-    img_digest = "sha256:" + "1" * 64
-    layer_digest = "sha256:" + "2" * 64
-    unknown_digest = "sha256:" + "3" * 64
+    img_digest = f"sha256:{store.write_stream([b'image artifact']).name}"
+    layer_digest = f"sha256:{store.write_stream([b'layer artifact']).name}"
+    unknown_digest = f"sha256:{store.write_stream([b'unknown artifact']).name}"
 
     # Write store blobs & metadata
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
     (roots.store / "metadata").mkdir(parents=True, exist_ok=True)
-    for d in (img_digest, layer_digest, unknown_digest):
-        (roots.store / "blobs" / "sha256" / d.split(":", 1)[1]).write_bytes(b"dummy artifact bytes")
 
-    store.write_metadata(img_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "ubuntu.img"})
-    store.write_metadata(layer_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS, "base_image_digest": img_digest})
+    store.write_metadata(
+        img_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "ubuntu.img"}
+    )
+    store.write_metadata(
+        layer_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS, "base_image_digest": img_digest}
+    )
     store.write_metadata(unknown_digest, {"kind": "other"})
 
     # Write tag record
@@ -185,7 +232,10 @@ def test_list_artifacts(tmp_path: Path):
     # Write run ledger referencing img_digest and layer_digest
     run_dir = roots.runs / "art-run"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "44444444-4444-4444-4444-444444444444", "name": "art-run"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "44444444-4444-4444-4444-444444444444", "name": "art-run"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -213,13 +263,12 @@ def test_remove_artifact_refusal_and_success(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     store = ContentStore(roots.store)
 
-    ref_digest = "sha256:" + "4" * 64
-    free_digest = "sha256:" + "5" * 64
+    ref_digest = store.write_stream([b"referenced blob"]).name
+    free_digest = store.write_stream([b"free blob"]).name
+    ref_digest = f"sha256:{ref_digest}"
+    free_digest = f"sha256:{free_digest}"
 
-    (roots.store / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
     (roots.store / "metadata").mkdir(parents=True, exist_ok=True)
-    for d in (ref_digest, free_digest):
-        (roots.store / "blobs" / "sha256" / d.split(":", 1)[1]).write_bytes(b"blob bytes")
 
     store.write_metadata(ref_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64"})
     store.write_metadata(free_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS})
@@ -257,6 +306,310 @@ def test_remove_artifact_refusal_and_success(tmp_path: Path):
     assert rem_res["removed_tags"] == ["free-tag"]
     assert not store.exists(free_digest)
     assert not (roots.tags / "free-tag.json").exists()
+
+
+def test_remove_artifact_rejects_malformed_run_layer_shape(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'guarded layer']).name}"
+    run_dir = roots.runs / "malformed-run"
+    run_dir.mkdir()
+    state.atomic_write_json(run_dir / "state.json", {"layers": {"digest": digest}})
+
+    with pytest.raises(StateError, match="run ledger is invalid"):
+        inventory.remove_artifact(roots, digest)
+
+    assert store.exists(digest)
+
+
+def test_remove_artifact_accepts_symlinked_state_root(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'symlinked state root']).name}"
+    store.write_metadata(digest, {"kind": "other"})
+    alias = tmp_path / "state-alias"
+    try:
+        alias.symlink_to(roots.state, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = inventory.remove_artifact(state.StatePaths(config=roots.config, state=alias), digest)
+
+    assert result["digest"] == digest
+    assert not store.exists(digest)
+    assert not store.metadata_path(digest).exists()
+
+
+def test_remove_artifact_rejects_tag_payload_path_traversal(tmp_path: Path) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'tag traversal target']).name}"
+    victim = roots.state.parent / "victim.json"
+    victim.write_text("preserve me", encoding="utf-8")
+    state.atomic_write_json(
+        roots.tags / "alias.json",
+        {
+            "schema_version": 1,
+            "tag": "../../victim",
+            "digest": digest,
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "size_bytes": 20,
+            "parent_digest": None,
+            "base_image_digest": None,
+            "source": "test",
+            "created_at": "2026-08-31T00:00:00Z",
+        },
+    )
+
+    with pytest.raises(StateError, match="tag record is invalid"):
+        inventory.remove_artifact(roots, digest)
+
+    assert victim.read_text(encoding="utf-8") == "preserve me"
+    assert store.exists(digest)
+
+
+@pytest.mark.parametrize("component", ["tags", "metadata"])
+def test_remove_artifact_rejects_symlinked_index_directory(tmp_path: Path, component: str) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'external index target']).name}"
+    external = tmp_path / f"external-{component}"
+    external.mkdir(mode=0o700)
+    if component == "tags":
+        roots.tags.rmdir()
+        attacked = roots.tags
+        external_entry = external / "outside.json"
+    else:
+        store.write_metadata(digest, {"kind": "other"})
+        metadata = roots.store / "metadata"
+        for entry in metadata.iterdir():
+            entry.unlink()
+        metadata.rmdir()
+        attacked = metadata
+        external_entry = external / f"{digest.split(':', 1)[1]}.json"
+    external_entry.write_text("preserve me", encoding="utf-8")
+    try:
+        attacked.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(StateError, match="state directory authority"):
+        inventory.remove_artifact(roots, digest)
+
+    assert external_entry.read_text(encoding="utf-8") == "preserve me"
+    assert store.exists(digest)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "in-place"])
+def test_remove_artifact_rejects_mutated_tag_snapshot(tmp_path: Path, monkeypatch, mutation: str) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'original tag target']).name}"
+    replacement_digest = f"sha256:{store.write_stream([b'replacement tag target']).name}"
+    write_tag_record(
+        roots,
+        TagRecord(
+            schema_version=1,
+            tag="race-tag",
+            digest=digest,
+            media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+            size_bytes=19,
+            parent_digest=None,
+            base_image_digest=None,
+            source="test",
+            created_at="2026-08-31T00:00:00Z",
+        ),
+    )
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    failures: list[str] = []
+    real_delete = inventory.ArtifactStore.delete_blob
+
+    def paused_delete(self, *args, **kwargs):
+        delete_entered.set()
+        assert allow_delete.wait(2)
+        return real_delete(self, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.ArtifactStore, "delete_blob", paused_delete)
+
+    def remove() -> None:
+        try:
+            inventory.remove_artifact(roots, digest)
+        except StateError as exc:
+            failures.append(str(exc))
+
+    remove_thread = threading.Thread(target=remove)
+    remove_thread.start()
+    assert delete_entered.wait(2)
+    replacement = {
+        "schema_version": 1,
+        "tag": "race-tag",
+        "digest": replacement_digest,
+        "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+        "size_bytes": 23,
+        "parent_digest": None,
+        "base_image_digest": None,
+        "source": "test",
+        "created_at": "2026-08-31T00:00:01Z",
+    }
+    if mutation == "replace":
+        state.atomic_write_json(roots.tags / "race-tag.json", replacement)
+    else:
+        (roots.tags / "race-tag.json").write_text(
+            json.dumps(replacement, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    allow_delete.set()
+    remove_thread.join(2)
+
+    assert not remove_thread.is_alive()
+    assert failures == ["tag record changed before removal"]
+    assert store.exists(digest)
+    assert state.read_tag_record(roots, "race-tag").digest == replacement_digest
+
+
+@pytest.mark.parametrize("replacement_target", ["other", "same"])
+def test_remove_artifact_reconciles_tag_replacement_during_finalize(
+    tmp_path: Path, monkeypatch, replacement_target: str
+) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'multi-tag target']).name}"
+    other_digest = f"sha256:{store.write_stream([b'late replacement']).name}"
+    replacement_digest = other_digest if replacement_target == "other" else digest
+    for tag in ("a-tag", "b-tag"):
+        write_tag_record(
+            roots,
+            TagRecord(
+                schema_version=1,
+                tag=tag,
+                digest=digest,
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                size_bytes=16,
+                parent_digest=None,
+                base_image_digest=None,
+                source="test",
+                created_at="2026-08-31T00:00:00Z",
+            ),
+        )
+    real_unlink = inventory._unlink_index_entry
+
+    def replace_later_tag(filename: str, *, directory_fd: int) -> None:
+        real_unlink(filename, directory_fd=directory_fd)
+        if filename == "a-tag.json":
+            state.atomic_write_json(
+                roots.tags / "b-tag.json",
+                {
+                    "schema_version": 1,
+                    "tag": "b-tag",
+                    "digest": replacement_digest,
+                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                    "size_bytes": 16,
+                    "parent_digest": None,
+                    "base_image_digest": None,
+                    "source": "test",
+                    "created_at": "2026-08-31T00:00:01Z",
+                },
+            )
+
+    monkeypatch.setattr(inventory, "_unlink_index_entry", replace_later_tag)
+
+    result = inventory.remove_artifact(roots, digest)
+
+    assert not store.exists(digest)
+    if replacement_target == "other":
+        assert result["removed_tags"] == ["a-tag"]
+        assert state.read_tag_record(roots, "b-tag").digest == other_digest
+    else:
+        assert result["removed_tags"] == ["a-tag", "b-tag"]
+        assert not state.tag_path(roots, "b-tag").exists()
+
+
+def test_remove_artifact_serializes_late_run_reference_commit(tmp_path: Path, monkeypatch) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'reference race']).name}"
+    store.write_metadata(digest, {"kind": "other"})
+    rpaths = state.run_paths(roots, "late-run")
+    rpaths.root.mkdir()
+    entered_delete = threading.Event()
+    allow_delete = threading.Event()
+    writer_started = threading.Event()
+    outcomes: list[str] = []
+    real_delete = inventory.ArtifactStore.delete_blob
+
+    def paused_delete(self, *args, **kwargs):
+        entered_delete.set()
+        assert allow_delete.wait(2)
+        return real_delete(self, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.ArtifactStore, "delete_blob", paused_delete)
+
+    def remove() -> None:
+        inventory.remove_artifact(roots, digest)
+
+    def write_reference() -> None:
+        writer_started.set()
+        try:
+            state.write_run_state(rpaths, status="running", data={"base_digest": digest})
+        except StateError as exc:
+            outcomes.append(str(exc))
+
+    remove_thread = threading.Thread(target=remove)
+    writer_thread = threading.Thread(target=write_reference)
+    remove_thread.start()
+    assert entered_delete.wait(2)
+    writer_thread.start()
+    assert writer_started.wait(2)
+    allow_delete.set()
+    remove_thread.join(2)
+    writer_thread.join(2)
+
+    assert not remove_thread.is_alive() and not writer_thread.is_alive()
+    assert outcomes == ["run ledger references a missing artifact"]
+    assert not rpaths.state.exists() and not store.exists(digest)
+
+
+def test_remove_cleanup_is_serialized_with_same_digest_republish(tmp_path: Path, monkeypatch) -> None:
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    payload = b"same digest republish"
+    digest = f"sha256:{store.write_stream([payload]).name}"
+    store.write_metadata(digest, {"kind": "old"})
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    publish_started = threading.Event()
+    real_fsync_index_directory = inventory._fsync_index_directory
+
+    def paused_fsync(directory_fd: int) -> None:
+        if not cleanup_entered.is_set():
+            cleanup_entered.set()
+            assert allow_cleanup.wait(2)
+        real_fsync_index_directory(directory_fd)
+
+    monkeypatch.setattr(inventory, "_fsync_index_directory", paused_fsync)
+
+    def remove() -> None:
+        inventory.remove_artifact(roots, digest)
+
+    def republish() -> None:
+        publish_started.set()
+        store.write_stream([payload], expected_digest=digest)
+        store.write_metadata(digest, {"kind": "new"})
+
+    remove_thread = threading.Thread(target=remove)
+    publish_thread = threading.Thread(target=republish)
+    remove_thread.start()
+    assert cleanup_entered.wait(2)
+    publish_thread.start()
+    assert publish_started.wait(2)
+    allow_cleanup.set()
+    remove_thread.join(2)
+    publish_thread.join(2)
+
+    assert not remove_thread.is_alive() and not publish_thread.is_alive()
+    assert store.verify_blob(digest) == len(payload)
+    assert store.read_metadata(digest)["kind"] == "new"
 
 
 def test_list_builds_and_get_build_and_log(tmp_path: Path):
@@ -322,6 +675,8 @@ def test_list_builds_and_get_build_and_log(tmp_path: Path):
 
     log_tail = inventory.build_log(roots, b1_id, tail=2)
     assert log_tail == "line 3\nline 4\n"
+
+
 def test_import_cloud_image(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     img_file = tmp_path / "test.qcow2"
@@ -374,7 +729,9 @@ def test_move_state_root_preconditions_and_success(tmp_path: Path):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     dest_dir = tmp_path / "target_state"
-    with pytest.raises(StateError, match="relocating the state root requires no runs and no projects; remove them first: active-vm"):
+    with pytest.raises(
+        StateError, match="relocating the state root requires no runs and no projects; remove them first: active-vm"
+    ):
         inventory.move_state_root(roots, dest_dir)
 
     # Remove run and proceed
@@ -384,7 +741,11 @@ def test_move_state_root_preconditions_and_success(tmp_path: Path):
     assert res["new_root"] == str(dest_dir.resolve())
     assert dest_dir.is_dir()
     assert not roots.state.exists()
-def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+
+
+def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     roots = _setup_roots(tmp_path)
     dest_dir = tmp_path / "target_state_fail"
 
@@ -402,6 +763,7 @@ def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest
 
     assert not incoming.exists()
     assert roots.state.exists()
+
 
 def test_set_and_move_state_root_rejected_when_env_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
@@ -427,6 +789,7 @@ def test_set_and_move_state_root_rejected_when_env_active(tmp_path: Path, monkey
     # Verify move target was not created and source state exists
     assert not dest_move.exists()
     assert roots.state.exists()
+
 
 def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
@@ -467,144 +830,77 @@ def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch:
         },
     )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
-    orig_resolve = inventory.platforms.resolve_domain_profile
+    captured_backends: list[str] = []
 
-    def mock_resolve(backend: str, arch: str):
-        if backend == "libvirt-hvf":
-            return inventory.platforms.DomainProfile(
-                backend=inventory.platforms.BACKEND_HVF,
-                domain_type="hvf",
-                arch="aarch64",
-                machine="virt",
-                emulator=Path("/usr/bin/qemu-system-aarch64"),
-                uri="qemu:///session",
-                firmware=inventory.platforms.Firmware(
-                    loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
-                    nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
-                ),
-                autoselect_firmware=False,
-                network_mode="user-hostfwd",
-                seed_tool="hdiutil",
-                seed_bus="scsi",
-            )
-        return orig_resolve(backend, arch)
+    def mock_reconcile_run(name, *, _expected_record, **_kwargs):
+        captured_backends.append(_expected_record.dispatch_key.backend.value)
+        return {"state": state.read_run_state(state.run_paths(roots, name)), "warnings": []}
 
-    monkeypatch.setattr(inventory.platforms, "resolve_domain_profile", mock_resolve)
-
-    captured_profiles = []
-
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        captured_profiles.append(profile)
-        if profile is not None and profile.backend == "kvm":
-            return [
-                {
-                    "name": "kvm-vm",
-                    "owner": {"run_id": "11111111-1111-1111-1111-111111111111"},
-                    "state": {
-                        "name": "kvm-vm",
-                        "run_id": "11111111-1111-1111-1111-111111111111",
-                        "backend": "kvm",
-                        "status": "stopped",
-                        "base": {"arch": "x86_64"},
-                    },
-                }
-            ], []
-        elif profile is not None and profile.backend == "libvirt-hvf":
-            return [
-                {
-                    "name": "hvf-vm",
-                    "owner": {"run_id": "22222222-2222-2222-2222-222222222222"},
-                    "state": {
-                        "name": "hvf-vm",
-                        "run_id": "22222222-2222-2222-2222-222222222222",
-                        "backend": "libvirt-hvf",
-                        "status": "running",
-                        "base": {"arch": "aarch64"},
-                    },
-                }
-            ], []
-        return [], []
-
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
     res = inventory.list_vms(roots)
     vms = {v["name"]: v for v in res["vms"]}
 
-    assert len(captured_profiles) == 2
-    kvm_prof = next(p for p in captured_profiles if p.backend == "kvm")
-    hvf_prof = next(p for p in captured_profiles if p.backend == "libvirt-hvf")
-
-    assert kvm_prof.uri == "qemu:///system"
-    assert hvf_prof.uri == "qemu:///session"
-
-    assert vms["kvm-vm"]["status"] == "stopped"
+    assert captured_backends == ["libvirt-hvf", "kvm"]
+    assert vms["kvm-vm"]["status"] == "running"
     assert vms["hvf-vm"]["status"] == "running"
     assert vms["kvm-vm"]["stale"] is False
     assert vms["hvf-vm"]["stale"] is False
+
+
 def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
 
     # KVM ledger with no base arch
     kvm_dir = roots.runs / "legacy-kvm"
     kvm_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(kvm_dir / "owner.json", {"schema_version": 1, "run_id": "1111", "name": "legacy-kvm"})
-    state.atomic_write_json(kvm_dir / "state.json", {"name": "legacy-kvm", "run_id": "1111", "backend": "kvm", "status": "running"})
+    state.atomic_write_json(
+        kvm_dir / "owner.json",
+        {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "legacy-kvm"},
+    )
+    state.atomic_write_json(
+        kvm_dir / "state.json",
+        {
+            "name": "legacy-kvm",
+            "run_id": "11111111-1111-1111-1111-111111111111",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
 
     # HVF ledger with no base arch
     hvf_dir = roots.runs / "legacy-hvf"
     hvf_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(hvf_dir / "owner.json", {"schema_version": 1, "run_id": "2222", "name": "legacy-hvf"})
-    state.atomic_write_json(hvf_dir / "state.json", {"name": "legacy-hvf", "run_id": "2222", "backend": "libvirt-hvf", "status": "running"})
+    state.atomic_write_json(
+        hvf_dir / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "legacy-hvf"},
+    )
+    state.atomic_write_json(
+        hvf_dir / "state.json",
+        {
+            "name": "legacy-hvf",
+            "run_id": "22222222-2222-2222-2222-222222222222",
+            "backend": "libvirt-hvf",
+            "status": "running",
+        },
+    )
 
-    monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
+    captured_backends: list[str] = []
 
-    orig_resolve = inventory.platforms.resolve_domain_profile
-
-    def mock_resolve(backend: str, arch: str):
+    def mock_reconcile_run(name, *, _expected_record, **_kwargs):
+        backend = _expected_record.dispatch_key.backend.value
+        captured_backends.append(backend)
         if backend == "libvirt-hvf":
-            return inventory.platforms.DomainProfile(
-                backend=inventory.platforms.BACKEND_HVF,
-                domain_type="hvf",
-                arch=arch,
-                machine="virt",
-                emulator=Path("/usr/bin/qemu-system-aarch64"),
-                uri="qemu:///session",
-                firmware=inventory.platforms.Firmware(
-                    loader=Path("/usr/share/qemu/edk2-aarch64-code.fd"),
-                    nvram_template=Path("/usr/share/qemu/edk2-arm-vars.fd"),
-                ),
-                autoselect_firmware=False,
-                network_mode="user-hostfwd",
-                seed_tool="hdiutil",
-                seed_bus="scsi",
-            )
-        return orig_resolve(backend, arch)
+            raise RuntimeError("sensitive backend failure")
+        return {"state": state.read_run_state(state.run_paths(roots, name)), "warnings": []}
 
-    monkeypatch.setattr(inventory.platforms, "resolve_domain_profile", mock_resolve)
-
-    captured_profiles = []
-
-    def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
-        captured_profiles.append(profile)
-        if profile is not None and profile.backend == "libvirt-hvf":
-            raise RuntimeError("conn error")
-        return [], []
-
-    monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch.cloud_runtime, "reconcile_run", mock_reconcile_run)
 
     res = inventory.list_vms(roots)
 
-    assert len(captured_profiles) == 2
-    kvm_prof = next(p for p in captured_profiles if p.backend == "kvm")
-    hvf_prof = next(p for p in captured_profiles if p.backend == "libvirt-hvf")
-
-    expected_kvm_arch = inventory.platforms.detect_host().machine
-    assert kvm_prof.arch == expected_kvm_arch
-    assert hvf_prof.arch == "aarch64"
-
-    assert any("reconcile failed for backend 'libvirt-hvf': conn error" in w for w in res["warnings"])
+    assert captured_backends == ["libvirt-hvf", "kvm"]
+    assert any("runtime reconciliation failed" in w for w in res["warnings"])
+    assert all("sensitive" not in warning for warning in res["warnings"])
     vms = {v["name"]: v for v in res["vms"]}
     assert vms["legacy-hvf"]["stale"] is True
-    assert vms["legacy-kvm"]["stale"] is True
-    assert any("omitted during reconciliation for backend 'kvm'" in w for w in res["warnings"])
+    assert vms["legacy-kvm"]["stale"] is False

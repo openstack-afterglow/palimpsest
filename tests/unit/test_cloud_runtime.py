@@ -1,11 +1,14 @@
-"""Unit tests for palimpsest_local.runtime lifecycle, state ledgers, and KVM controls."""
+"""Unit tests for the cloud VM lifecycle, state ledgers, and KVM controls."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import os
+import shutil
 import socket
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -15,17 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import palimpsest_local.cloud_runtime as runtime
 import palimpsest_local.kvm as kvm
 import palimpsest_local.platforms as platforms
-import palimpsest_local.runtime as runtime
 import palimpsest_local.state as state
-from palimpsest_local.errors import (
-    ArtifactValidationError,
-    LifecycleError,
-    StateError,
-)
-from palimpsest_local.refs import ImageRef, LayerRef, RunSpec, StackRef
-from palimpsest_local.runtime import (
+from palimpsest_local.cloud_runtime import (
     commit,
     create_and_validate_overlay,
     exec_command,
@@ -41,6 +38,13 @@ from palimpsest_local.runtime import (
     start_serial_builder,
     stop,
 )
+from palimpsest_local.errors import (
+    ArtifactValidationError,
+    LifecycleError,
+    StateError,
+)
+from palimpsest_local.refs import ImageRef, LayerRef, PortForward, RunSpec, StackRef
+from palimpsest_local.runtime_types import ExecRequest
 
 
 class FakeDomain:
@@ -106,8 +110,41 @@ class FakeLibvirtConn:
         raise KeyError(f"Domain not found: {name}")
 
 
+def _legacy_cloud_lifecycle(
+    roots: state.StatePaths,
+    name: str,
+    status: str,
+) -> tuple[state.RunPaths, state.OwnerRecord, FakeLibvirtConn, FakeDomain]:
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rpaths.ssh.mkdir(mode=0o700)
+    rpaths.console.write_text("old boot\n", encoding="utf-8")
+    rpaths.console.chmod(0o600)
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status=status,
+        data={"backend": "kvm", "network": "none", "guest_ip": None, "layers": [], "volumes": []},
+    )
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner.run_id}" '
+        f'schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain(name, f"<domain><name>{name}</name><metadata>{marker}</metadata></domain>")
+    conn = FakeLibvirtConn()
+    conn.domains[name] = domain
+    return rpaths, owner, conn, domain
+
+
 def _sha256_file(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+def _stub_store_blob(roots: state.StatePaths, digest: str) -> None:
+    target = roots.store / "blobs" / "sha256" / digest.split(":", 1)[1]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"stub")
+    target.chmod(0o444)
 
 
 def _serve_serial_frame(path: Path, header: dict[str, object], body: bytes = b"") -> threading.Thread:
@@ -189,13 +226,14 @@ def test_start_serial_builder_writes_ledger_and_serial_channel(tmp_path: Path, m
     )
     conn = FakeLibvirtConn()
     monkeypatch.setattr(
-        "palimpsest_local.runtime.create_and_validate_overlay", lambda _base, output: output.write_bytes(b"overlay")
+        "palimpsest_local.cloud_runtime.create_and_validate_overlay",
+        lambda _base, output: output.write_bytes(b"overlay"),
     )
     monkeypatch.setattr("palimpsest_local.kvm.run_seed_iso", lambda seed, _user, _meta: seed.touch())
 
     readiness: list[bool] = []
     monkeypatch.setattr(
-        "palimpsest_local.runtime._wait_for_readiness",
+        "palimpsest_local.cloud_runtime._wait_for_readiness",
         lambda *_args, require_ip, **_kwargs: readiness.append(require_ip) or None,
     )
     result = start_serial_builder(spec, user_data="#cloud-config\n", roots=roots, conn=conn)
@@ -203,7 +241,15 @@ def test_start_serial_builder_writes_ledger_and_serial_channel(tmp_path: Path, m
     assert result["status"] == "running"
     assert readiness == [False]
     rpaths = state.run_paths(roots, spec.name)
-    assert state.read_run_state(rpaths)["status"] == "running"
+    owner = state.read_owner_record(rpaths)
+    assert state.read_run_state(rpaths) == result
+    assert {key: result[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": spec.name,
+        "run_id": owner.run_id,
+    }
     xml = conn.domains[spec.name].xml_content
     assert 'name="org.qemu.guest_agent.0"' not in xml
     assert 'source mode="bind"' in xml
@@ -250,7 +296,7 @@ def test_overlay_creation_and_validation():
                     return MagicMock(stdout=json.dumps(info), stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             create_and_validate_overlay(base_ref, overlay_file)
             assert overlay_file.exists()
 
@@ -322,13 +368,13 @@ def test_run_status_transitions_and_completion():
                 return MagicMock(stdout="", stderr="", returncode=0)
             elif argv[0] == "cloud-localds":
                 Path(argv[1]).touch()
-                rpaths.console.write_text("PALIMPSEST_READY=1\n")
+                Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
                 return MagicMock(stdout="", stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
         rpaths = state.run_paths(roots, "test-run")
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             res = run(spec, roots=roots, conn=conn)
 
             assert res["status"] == "running"
@@ -341,6 +387,11 @@ def test_run_status_transitions_and_completion():
 
             r_owner = state.read_owner_record(rpaths)
             assert r_owner.name == "test-run"
+            assert res["name"] == spec.name
+            assert res["run_id"] == r_owner.run_id
+            assert res["backend"] == "kvm"
+            assert res["schema_version"] == 2
+            assert res["runtime_kind"] == "cloud-image"
 
             # Check ps output
             ps_runs = ps(roots=roots, conn=conn)
@@ -361,7 +412,7 @@ def test_run_status_transitions_and_completion():
                 rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
                 return "192.168.122.100"
 
-            with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=restarted_wait):
+            with patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=restarted_wait):
                 restarted_res = start("test-run", roots=roots, conn=conn)
             assert restarted_res["status"] == "running"
             assert restarted_res["guest_ip"] == "192.168.122.100"
@@ -435,16 +486,307 @@ def test_start_rollback_on_failure():
             raise LifecycleError("readiness failed")
 
         with (
-            patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run),
-            patch("palimpsest_local.runtime._wait_for_readiness", side_effect=failing_wait),
+            patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run),
+            patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=failing_wait),
         ):
             with pytest.raises(LifecycleError, match="readiness failed"):
                 run(spec, roots=roots, conn=conn)
 
             rpaths = state.run_paths(roots, "rollback-run")
             st = state.read_run_state(rpaths)
-            assert st["status"] == "failed"
+            owner = state.read_owner_record(rpaths)
+            assert {
+                key: st[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+            } == {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": "kvm",
+                "name": spec.name,
+                "run_id": owner.run_id,
+                "status": "failed",
+            }
             assert "rollback-run" not in conn.domains or conn.domains["rollback-run"].undefined
+
+
+def test_legacy_cloud_start_promotes_once_after_backend_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, owner, conn, domain = _legacy_cloud_lifecycle(roots, "legacy-start", "stopped")
+    before = rpaths.state.read_bytes()
+    monkeypatch.setattr(runtime, "_wait_for_readiness", lambda *_a, **_k: None)
+
+    result = start("legacy-start", roots=roots, conn=conn)
+
+    assert domain.isActive() is True
+    assert rpaths.state.read_bytes() != before
+    assert {key: result[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": "legacy-start",
+        "run_id": owner.run_id,
+        "status": "running",
+    }
+
+
+def test_legacy_cloud_start_backend_failure_preserves_exact_state_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(roots, "legacy-start-failure", "stopped")
+    before = rpaths.state.read_bytes()
+    monkeypatch.setattr(
+        runtime, "_wait_for_readiness", lambda *_a, **_k: (_ for _ in ()).throw(LifecycleError("boot failed"))
+    )
+
+    with pytest.raises(LifecycleError, match="boot failed"):
+        start("legacy-start-failure", roots=roots, conn=conn)
+
+    assert rpaths.state.read_bytes() == before
+
+
+def test_legacy_cloud_stop_success_promotes_but_failure_preserves_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    success_paths, success_owner, success_conn, success_domain = _legacy_cloud_lifecycle(
+        roots, "legacy-stop", "running"
+    )
+    success_domain._active = True
+
+    stopped = stop("legacy-stop", roots=roots, conn=success_conn, timeout_seconds=0)
+
+    assert stopped["schema_version"] == 2
+    assert stopped["run_id"] == success_owner.run_id
+    assert stopped["status"] == "stopped"
+
+    failure_paths, _owner, failure_conn, failure_domain = _legacy_cloud_lifecycle(
+        roots, "legacy-stop-failure", "running"
+    )
+    failure_domain._active = True
+    failure_domain.shutdown = lambda: None  # type: ignore[method-assign]
+    failure_domain.destroy = lambda: (_ for _ in ()).throw(LifecycleError("destroy failed"))  # type: ignore[method-assign]
+    before = failure_paths.state.read_bytes()
+
+    with pytest.raises(LifecycleError, match="destroy failed"):
+        stop("legacy-stop-failure", roots=roots, conn=failure_conn, timeout_seconds=0)
+
+    assert failure_paths.state.read_bytes() == before
+
+
+@pytest.mark.parametrize("domain_present", [True, False])
+def test_legacy_cloud_stop_live_success_promotes_only_at_terminal_write(
+    tmp_path: Path,
+    domain_present: bool,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    suffix = "present" if domain_present else "missing"
+    rpaths, _owner, conn, domain = _legacy_cloud_lifecycle(roots, f"legacy-stop-noop-{suffix}", "running")
+    domain._active = False
+    if not domain_present:
+        conn.domains.clear()
+    stopped = stop(rpaths.name, roots=roots, conn=conn)
+
+    assert stopped["status"] == "stopped"
+    assert stopped["schema_version"] == 2
+    assert stopped["lifecycle_revision"] == 1
+    assert state.read_run_state(rpaths) == stopped
+
+
+@pytest.mark.parametrize("source_status", ["creating", "failed"])
+def test_cloud_stop_preserves_legacy_source_compatibility(
+    tmp_path: Path,
+    source_status: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, _domain = _legacy_cloud_lifecycle(
+        roots,
+        f"legacy-stop-{source_status}",
+        source_status,
+    )
+
+    stopped = stop(rpaths.name, roots=roots, conn=conn, timeout_seconds=0)
+
+    assert stopped["status"] == "stopped"
+    assert stopped["schema_version"] == 2
+    assert stopped["lifecycle_revision"] == 1
+
+
+def test_legacy_cloud_plain_rm_promotes_removed_and_volumes_rm_rejects_replacement(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    plain_paths, plain_owner, plain_conn, _plain_domain = _legacy_cloud_lifecycle(roots, "legacy-rm", "stopped")
+    plain_conn.domains.clear()
+
+    removed = rm("legacy-rm", roots=roots, conn=plain_conn)
+
+    assert removed["schema_version"] == 2
+    assert removed["run_id"] == plain_owner.run_id
+    assert removed["status"] == "removed"
+    assert plain_paths.root.exists()
+
+    swap_paths, _owner, swap_conn, swap_domain = _legacy_cloud_lifecycle(roots, "legacy-rm-swap", "stopped")
+    displaced = roots.runs / "legacy-rm-swap-original"
+    original_state = swap_paths.state.read_bytes()
+
+    def swap_on_undefine() -> int:
+        os.rename(swap_paths.root, displaced)
+        swap_paths.root.mkdir()
+        (swap_paths.root / "marker").write_bytes(b"replacement")
+        swap_domain.undefined = True
+        return 0
+
+    swap_domain.undefine = swap_on_undefine  # type: ignore[method-assign]
+
+    with pytest.raises(StateError, match="changed during lifecycle"):
+        rm("legacy-rm-swap", roots=roots, conn=swap_conn, volumes=True)
+
+    assert (swap_paths.root / "marker").read_bytes() == b"replacement"
+    assert (displaced / "state.json").read_bytes() == original_state
+
+
+def test_legacy_cloud_plain_rm_cleans_owned_domain_without_rewriting_removed_state(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths, _owner, conn, domain = _legacy_cloud_lifecycle(roots, "legacy-rm-noop", "removed")
+    domain._active = True
+    before = rpaths.state.read_bytes()
+
+    removed = rm("legacy-rm-noop", roots=roots, conn=conn)
+
+    assert removed["status"] == "removed"
+    assert removed.get("schema_version") is None
+    assert domain.destroyed is True
+    assert domain.undefined is True
+    assert rpaths.state.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("backend", "arch"),
+    [(platforms.BACKEND_KVM, "x86_64"), (platforms.BACKEND_HVF, "aarch64")],
+)
+def test_new_cloud_backend_failure_holds_exact_v2_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    arch: str,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / f"base-{backend}.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name=f"failed-{arch.replace('_', '-')}",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", arch, None, base), ()),
+    )
+    profile = (
+        platforms.resolve_domain_profile(platforms.BACKEND_KVM, arch)
+        if backend == platforms.BACKEND_KVM
+        else _hvf_test_profile(tmp_path)
+    )
+    overlay_calls = 0
+
+    def fail_overlay(_base: ImageRef, _output: Path) -> None:
+        nonlocal overlay_calls
+        overlay_calls += 1
+        rpaths = state.run_paths(roots, spec.name)
+        assert _output.parent != rpaths.root
+        assert _output.parent.parent == roots.state
+        owner = state.read_owner_record(rpaths)
+        creating = state.read_run_state(rpaths)
+        assert {
+            key: creating[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+        } == {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": backend,
+            "name": spec.name,
+            "run_id": owner.run_id,
+            "status": "creating",
+        }
+        raise LifecycleError("backend exploded")
+
+    monkeypatch.setattr(runtime, "create_and_validate_overlay", fail_overlay)
+
+    with pytest.raises(LifecycleError, match="backend exploded"):
+        run(spec, roots=roots, conn=FakeLibvirtConn(), profile=profile)
+
+    rpaths = state.run_paths(roots, spec.name)
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert {key: failed[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": backend,
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "failed",
+    }
+    with pytest.raises(StateError, match="already exists"):
+        run(spec, roots=roots, conn=FakeLibvirtConn(), profile=profile)
+    assert overlay_calls == 1
+    assert list(roots.state.glob(".run-create-*")) == []
+
+
+def test_serial_builder_failure_holds_exact_v2_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / "serial-base.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name="failed-serial",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", "x86_64", None, base), ()),
+        network="none",
+    )
+
+    def fail_overlay(_base: ImageRef, _output: Path) -> None:
+        rpaths = state.run_paths(roots, spec.name)
+        assert _output.parent != rpaths.root
+        assert _output.parent.parent == roots.state
+        owner = state.read_owner_record(rpaths)
+        creating = state.read_run_state(rpaths)
+        assert {
+            key: creating[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")
+        } == {
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": spec.name,
+            "run_id": owner.run_id,
+            "status": "creating",
+        }
+        raise LifecycleError("serial backend exploded")
+
+    monkeypatch.setattr(runtime, "create_and_validate_overlay", fail_overlay)
+
+    with pytest.raises(LifecycleError, match="serial backend exploded"):
+        start_serial_builder(spec, user_data="#cloud-config\n", roots=roots, conn=FakeLibvirtConn())
+
+    rpaths = state.run_paths(roots, spec.name)
+    owner = state.read_owner_record(rpaths)
+    failed = state.read_run_state(rpaths)
+    assert {key: failed[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": "kvm",
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "failed",
+    }
+    assert list(roots.state.glob(".run-create-*")) == []
+
+
+def test_cloud_pre_reservation_failure_creates_no_run_entry(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = tmp_path / "base.qcow2"
+    base.write_bytes(b"base")
+    spec = RunSpec(
+        name="invalid-before-reserve",
+        stack=StackRef(ImageRef(_sha256_file(base), "qcow2", "x86_64", None, base), ()),
+        ports=(PortForward("127.0.0.1", 18080, 80),),
+    )
+
+    with pytest.raises(ArtifactValidationError, match="port forwarding is unavailable"):
+        run(spec, roots=roots, conn=FakeLibvirtConn())
+
+    assert not (roots.runs / spec.name).exists()
 
 
 def test_foreign_marker_refusal():
@@ -530,7 +872,64 @@ def test_missing_domain_reconciliation():
         runs, warnings = reconcile(roots=roots, conn=conn)
         assert any("domain missing from libvirt" in w for w in warnings)
         st = state.read_run_state(rpaths)
-        assert st["status"] == "stopped"
+        assert st["status"] == "running"
+        assert runs[0]["status"] == "stopped"
+
+
+def test_bulk_reconcile_persists_v2_drift_through_locked_single_run_path(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "v2-bulk-reconcile")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+        },
+    )
+
+    runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
+
+    assert warnings == ["run 'v2-bulk-reconcile': domain missing from libvirt"]
+    assert runs[0]["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "stopped"
+
+
+def test_bulk_reconcile_preserves_observed_result_when_v2_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "v2-bulk-write-failure")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": rpaths.name,
+            "run_id": owner.run_id,
+        },
+    )
+    monkeypatch.setattr(
+        state.ExistingRunMutation,
+        "write_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
+
+    assert warnings == ["run 'v2-bulk-write-failure': domain missing from libvirt"]
+    assert runs[0]["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "running"
 
 
 def test_lima_run_reconciliation_skips_libvirt_state_changes():
@@ -571,7 +970,6 @@ def test_network_omission():
         spec = RunSpec(name="no-net-run", stack=stack, network="none")
 
         conn = FakeLibvirtConn()
-        rpaths = state.run_paths(roots, "no-net-run")
 
         def fake_subprocess_run(argv, *args, **kwargs):
             if argv[0] == "qemu-img":
@@ -600,11 +998,11 @@ def test_network_omission():
                 return MagicMock(stdout="", stderr="", returncode=0)
             elif argv[0] == "cloud-localds":
                 Path(argv[1]).touch()
-                rpaths.console.write_text("PALIMPSEST_READY=1\n")
+                Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
                 return MagicMock(stdout="", stderr="", returncode=0)
             return MagicMock(stdout="", stderr="", returncode=0)
 
-        with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+        with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
             res = run(spec, roots=roots, conn=conn)
             assert res["status"] == "running"
             assert res["guest_ip"] is None
@@ -649,6 +1047,64 @@ def test_logs_and_commands():
         assert any("palimpsest-exec" in arg or "ls" in arg for arg in ex_cmd)
 
 
+def test_cloud_process_adapters_spawn_sessions_and_never_return_host_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "process-run")
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.70"})
+    rpaths.identity.write_bytes(b"identity-a")
+    rpaths.known_hosts.write_bytes(b"known-host-a")
+
+    class Session:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    sessions = [Session(), Session()]
+    calls: list[tuple[list[str], bool, bool, Path, Path]] = []
+
+    def fake_spawn(argv, *, tty, stdin):
+        identity_index = argv.index("-i") + 1
+        known_hosts_arg = next(item for item in argv if item.startswith("UserKnownHostsFile="))
+        identity = Path(argv[identity_index])
+        known_hosts = Path(known_hosts_arg.split("=", 1)[1])
+        assert identity.read_bytes() == b"identity-a"
+        assert known_hosts.read_bytes() == b"known-host-a"
+        calls.append((argv, tty, stdin, identity, known_hosts))
+        return sessions[len(calls) - 1]
+
+    monkeypatch.setattr(runtime, "spawn_process_session", fake_spawn)
+
+    exec_session = runtime.exec_session("process-run", ExecRequest(("printf", "%s", "literal")), roots=roots)
+    shell_session = runtime.shell_session("process-run", roots=roots)
+    assert calls[0][1:3] == (False, False)
+    assert any("palimpsest-exec" in item for item in calls[0][0])
+    assert calls[1][1:3] == (True, True)
+    assert calls[1][0][0] == "ssh"
+    staged_paths = [path for call in calls for path in call[3:]]
+    assert all(path.is_file() for path in staged_paths)
+
+    shutil.rmtree(rpaths.root)
+    rpaths.root.mkdir(mode=0o700)
+    state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.99"})
+    rpaths.identity.write_bytes(b"identity-b")
+    rpaths.known_hosts.write_bytes(b"known-host-b")
+    assert [path.read_bytes() for path in calls[0][3:]] == [b"identity-a", b"known-host-a"]
+
+    exec_session.close()
+    assert all(not path.exists() for path in calls[0][3:])
+    assert all(path.exists() for path in calls[1][3:])
+    shell_session.close()
+    assert all(not path.exists() for path in calls[1][3:])
+
+
 def parse_runner_cmd(cmd: list[str]) -> list[str]:
     if not cmd or cmd[0] == "scp":
         return cmd
@@ -687,6 +1143,8 @@ def test_commit_success(tmp_path: Path):
 
     base_digest = "sha256:" + "a" * 64
     layer_digest = "sha256:" + "b" * 64
+    _stub_store_blob(roots, base_digest)
+    _stub_store_blob(roots, layer_digest)
     owner_rec = state.write_owner_record(rpaths)
     state.write_run_state(
         rpaths,
@@ -732,6 +1190,110 @@ def test_commit_success(tmp_path: Path):
     assert tag_rec.source == "commit"
 
 
+def test_typed_commit_binding_rejects_run_replacement_before_capture_or_publish(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "bound-run")
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    rpaths.ssh.mkdir(parents=True, mode=0o700)
+    rpaths.identity.write_text("original key")
+    rpaths.known_hosts.write_text("original host")
+    rpaths.identity.chmod(0o600)
+    rpaths.known_hosts.chmod(0o600)
+    original = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, "sha256:" + "a" * 64)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={"guest_ip": "192.168.122.50", "base_digest": "sha256:" + "a" * 64, "layers": []},
+    )
+    expected = state.read_run_dispatch_record(roots, "bound-run")
+    conn = FakeLibvirtConn()
+    conn.defineXML(
+        f'<domain><name>bound-run</name><metadata><palimpsest:run xmlns:palimpsest="https://afterglow.dev/palimpsest-local/domain/v1" id="{original.run_id}" schema="1" version="0.1.0"/></metadata></domain>'
+    )
+    replacement_id = "862ffb44-6795-4618-b2d8-c0750439fac3"
+    swapped = False
+    staged_credentials: list[tuple[Path, Path]] = []
+    scp_destination: Path | None = None
+
+    def replacing_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal scp_destination, swapped
+        identity = Path(cmd[cmd.index("-i") + 1])
+        known_hosts_argument = next(item for item in cmd if item.startswith("UserKnownHostsFile="))
+        known_hosts = Path(known_hosts_argument.split("=", 1)[1])
+        assert identity.read_text() == "original key"
+        assert known_hosts.read_text() == "original host"
+        assert rpaths.root not in identity.parents
+        assert rpaths.root not in known_hosts.parents
+        staged_credentials.append((identity, known_hosts))
+        if cmd[0] == "scp":
+            scp_destination = Path(cmd[-1])
+            assert rpaths.root not in scp_destination.parents
+            assert stat_module.S_IMODE(scp_destination.parent.stat().st_mode) == 0o700
+            swapped = True
+            rpaths.root.rename(roots.runs / "bound-run-original")
+            rpaths.root.mkdir(mode=0o700)
+            rpaths.ssh.mkdir(mode=0o700)
+            rpaths.identity.write_text("replacement key")
+            rpaths.known_hosts.write_text("replacement host")
+            rpaths.identity.chmod(0o600)
+            rpaths.known_hosts.chmod(0o600)
+            rpaths.owner.write_text(
+                json.dumps({"schema_version": 1, "run_id": replacement_id, "name": "bound-run"}) + "\n",
+                encoding="utf-8",
+            )
+            rpaths.state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "runtime_kind": "cloud-image",
+                        "backend": "kvm",
+                        "name": "bound-run",
+                        "run_id": replacement_id,
+                        "status": "stopped",
+                        "replacement_marker": "untouched",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rpaths.owner.chmod(0o600)
+            rpaths.state.chmod(0o600)
+            scp_destination.write_bytes(b"hsqs" + b"\x00" * 100)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        argv = parse_runner_cmd(cmd)
+        cmd_name = get_cmd_name(argv)
+        if cmd_name == "fuser":
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        if cmd_name == "findmnt":
+            return subprocess.CompletedProcess(cmd, 0, "ext4\n", "")
+        if cmd_name == "stat":
+            return subprocess.CompletedProcess(cmd, 0, "2049\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with pytest.raises(StateError, match="changed"):
+        commit(
+            "bound-run",
+            "must-not-publish",
+            roots=roots,
+            conn=conn,
+            runner=replacing_runner,
+            _expected_record=expected,
+        )
+
+    replacement = json.loads(rpaths.state.read_text(encoding="utf-8"))
+    assert replacement["run_id"] == replacement_id
+    assert replacement["status"] == "stopped"
+    assert replacement["replacement_marker"] == "untouched"
+    assert swapped is True
+    assert staged_credentials
+    assert rpaths.identity.read_text() == "replacement key"
+    assert rpaths.known_hosts.read_text() == "replacement host"
+    assert not (rpaths.root / "commit-must-not-publish.squashfs").exists()
+    assert scp_destination is not None and not scp_destination.exists()
+    assert not state.tag_path(roots, "must-not-publish").exists()
+
+
 def test_commit_refuses_non_running_or_unowned_state(tmp_path: Path):
     env = {
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
@@ -762,6 +1324,7 @@ def test_commit_refuses_busy_merged_tree(tmp_path: Path):
     rpaths.identity.write_text("key")
     rpaths.known_hosts.write_text("host")
     owner_rec = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, "sha256:" + "a" * 64)
     state.write_run_state(
         rpaths, status="running", data={"guest_ip": "192.168.122.50", "base_digest": "sha256:" + "a" * 64}
     )
@@ -796,6 +1359,7 @@ def test_commit_tag_conflict(tmp_path: Path):
     rpaths.known_hosts.write_text("host")
     base_digest = "sha256:" + "a" * 64
     owner_rec = state.write_owner_record(rpaths)
+    _stub_store_blob(roots, base_digest)
     state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.50", "base_digest": base_digest})
 
     conn = FakeLibvirtConn()
@@ -815,6 +1379,7 @@ def test_commit_tag_conflict(tmp_path: Path):
         source="commit",
         created_at=state.utc_now_iso(),
     )
+    _stub_store_blob(roots, existing_rec.digest)
     state.write_tag_record(roots, existing_rec)
 
     def fake_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -852,7 +1417,6 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
     spec = RunSpec(name="ledger-fields-run", stack=stack, memory_mib=2048, vcpus=4)
 
     conn = FakeLibvirtConn()
-    rpaths = state.run_paths(roots, "ledger-fields-run")
 
     def fake_subprocess_run(argv, *args, **kwargs):
         if argv[0] == "qemu-img":
@@ -876,11 +1440,11 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
             return MagicMock(stdout="", stderr="", returncode=0)
         elif argv[0] == "cloud-localds":
             Path(argv[1]).touch()
-            rpaths.console.write_text("PALIMPSEST_READY=1\n")
+            Path(argv[1]).with_name("console.log").write_text("PALIMPSEST_READY=1\n")
             return MagicMock(stdout="", stderr="", returncode=0)
         return MagicMock(stdout="", stderr="", returncode=0)
 
-    with patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run):
+    with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
         res = run(spec, roots=roots, conn=conn)
 
     assert res["backend"] == platforms.BACKEND_KVM
@@ -963,13 +1527,21 @@ def test_run_user_hostfwd_allocates_port_and_writes_known_hosts_without_ip_disco
         return None
 
     with (
-        patch("palimpsest_local.runtime.subprocess.run", side_effect=fake_subprocess_run),
-        patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait),
+        patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run),
+        patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=fake_wait),
     ):
         res = run(spec, roots=roots, conn=conn, profile=hvf_profile)
 
     assert readiness == [False]
-    assert res["backend"] == platforms.BACKEND_HVF
+    owner = state.read_owner_record(rpaths)
+    assert {key: res[key] for key in ("schema_version", "runtime_kind", "backend", "name", "run_id", "status")} == {
+        "schema_version": 2,
+        "runtime_kind": "cloud-image",
+        "backend": platforms.BACKEND_HVF,
+        "name": spec.name,
+        "run_id": owner.run_id,
+        "status": "running",
+    }
     assert res["guest_ip"] is None
     assert res["ssh"]["host"] == "127.0.0.1"
     assert 1 <= res["ssh"]["port"] <= 65535
@@ -1009,12 +1581,12 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
 
     conn = FakeLibvirtConn()
     dom_xml = (
-        f'<domain><name>hvf-restart</name><metadata>'
+        f"<domain><name>hvf-restart</name><metadata>"
         f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner_rec.run_id}" '
         f'schema="1" version="0.1.0"/></metadata>'
         f'<qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">'
         f'<qemu:arg value="-netdev"/><qemu:arg value="user,id=palimpsest0,hostfwd=tcp:127.0.0.1:55123-:22"/>'
-        f'</qemu:commandline></domain>'
+        f"</qemu:commandline></domain>"
     )
     conn.defineXML(dom_xml)
     rpaths.known_hosts.write_text("[127.0.0.1]:55123 ssh-ed25519 AAAAFakeHostKey host\n", encoding="utf-8")
@@ -1026,7 +1598,7 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
         rpaths_in.console.write_text("PALIMPSEST_READY=1\n", encoding="utf-8")
         return None
 
-    with patch("palimpsest_local.runtime._wait_for_readiness", side_effect=fake_wait):
+    with patch("palimpsest_local.cloud_runtime._wait_for_readiness", side_effect=fake_wait):
         res = start("hvf-restart", roots=roots, conn=conn, profile=hvf_profile)
 
     new_port = res["ssh"]["port"]
@@ -1043,6 +1615,7 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
     known_hosts_text = rpaths.known_hosts.read_text(encoding="utf-8")
     assert f"[127.0.0.1]:{new_port}" in known_hosts_text
     assert "55123" not in known_hosts_text
+
 
 def test_shell_and_exec_commands_use_recorded_ssh_port(tmp_path: Path):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
@@ -1094,7 +1667,8 @@ def test_reconcile_treats_libvirt_hvf_backend_as_libvirt_backed(tmp_path: Path):
     runs, warnings = reconcile(roots=roots, conn=FakeLibvirtConn())
 
     assert any("domain missing from libvirt" in w for w in warnings)
-    assert state.read_run_state(rpaths)["status"] == "stopped"
+    assert state.read_run_state(rpaths)["status"] == "running"
+    assert runs[0]["status"] == "stopped"
 
 
 def test_ps_reports_backend_field_and_defaults_legacy_ledgers_to_kvm(tmp_path: Path):
@@ -1129,7 +1703,9 @@ def test_resolve_new_run_profile_preserves_legacy_conn_and_kvm_uri_callers():
 
 def test_resolve_new_run_profile_bare_call_uses_host_auto_selection_and_preflight(monkeypatch: pytest.MonkeyPatch):
     calls: list[str] = []
-    monkeypatch.setattr(platforms, "select_backend", lambda arch, **_kwargs: calls.append("select") or platforms.BACKEND_KVM)
+    monkeypatch.setattr(
+        platforms, "select_backend", lambda arch, **_kwargs: calls.append("select") or platforms.BACKEND_KVM
+    )
     monkeypatch.setattr(platforms, "preflight", lambda backend, **_kwargs: calls.append("preflight"))
     profile, uri = runtime._resolve_new_run_profile("x86_64", kvm_uri=None, profile=None, conn=None)
     assert calls == ["select", "preflight"]
@@ -1157,6 +1733,7 @@ def test_resolve_ledger_profile_defaults_missing_backend_to_kvm():
     profile2 = runtime._resolve_ledger_profile({"backend": platforms.BACKEND_KVM, "base": {"arch": "aarch64"}})
     assert profile2.arch == "aarch64"
     assert profile2.machine == "virt"
+
 
 def test_reconcile_scoped_by_profile_ignores_other_backend(tmp_path: Path):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
@@ -1250,3 +1827,129 @@ def test_reconcile_profile_scoped_connect_failure(tmp_path: Path, monkeypatch: p
     runs, warnings = reconcile(roots=roots)
     assert len(runs) == 1
     assert runs[0]["name"] == "test-run"
+
+
+def test_single_run_reconcile_uses_exact_backend_uri_without_profile_or_firmware_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    for name, backend in (("kvm-exact", "kvm"), ("hvf-exact", "libvirt-hvf")):
+        rpaths = state.run_paths(roots, name)
+        rpaths.root.mkdir()
+        owner = state.write_owner_record(rpaths)
+        state.atomic_write_json(
+            rpaths.state,
+            {
+                "schema_version": 2,
+                "runtime_kind": "cloud-image",
+                "backend": backend,
+                "name": name,
+                "run_id": owner.run_id,
+                "status": "stopped",
+            },
+        )
+
+    uris: list[str] = []
+    monkeypatch.setattr(
+        platforms,
+        "resolve_domain_profile",
+        lambda *_a, **_k: pytest.fail("single-run reconciliation performed create-time profile discovery"),
+    )
+    monkeypatch.setattr(kvm, "connect", lambda uri: uris.append(uri) or FakeLibvirtConn())
+
+    for name in ("kvm-exact", "hvf-exact"):
+        expected = state.read_run_dispatch_record(roots, name)
+        result = runtime.reconcile_run(name, roots=roots, _expected_record=expected)
+        assert result["state"]["status"] == "stopped"
+
+    assert uris == ["qemu:///system", "qemu:///session"]
+
+
+def test_single_run_connection_failure_creates_no_additional_lock_or_mutates_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    roots.runs.mkdir(parents=True)
+    rpaths = state.run_paths(roots, "offline-run")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="stopped", data={"backend": "kvm"})
+    expected = state.read_run_dispatch_record(roots, "offline-run")
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes())
+    locks_before = sorted(path.name for path in roots.locks.iterdir())
+    monkeypatch.setattr(kvm, "connect", lambda _uri: (_ for _ in ()).throw(kvm.KvmError("offline")))
+
+    with pytest.raises(LifecycleError, match="offline"):
+        runtime.reconcile_run("offline-run", roots=roots, _expected_record=expected)
+
+    assert locks_before == ["artifact-references-v1.lock"]
+    assert sorted(path.name for path in roots.locks.iterdir()) == locks_before
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+
+    result = runtime.inspect_run("offline-run", roots=roots)
+    assert result["owner"]["run_id"] == owner.run_id
+    assert result["state"]["status"] == "stopped"
+    assert sorted(path.name for path in roots.locks.iterdir()) == locks_before
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes()) == before
+
+
+def test_single_run_reconcile_updates_only_the_bound_target_and_preserves_sibling_bytes(tmp_path: Path) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    target = state.run_paths(roots, "target-run")
+    target.root.mkdir()
+    target_owner = state.write_owner_record(target)
+    state.write_run_state(target, status="defined", data={"backend": "kvm"})
+    sibling = state.run_paths(roots, "sibling-run")
+    sibling.root.mkdir()
+    state.write_owner_record(sibling)
+    state.write_run_state(sibling, status="running", data={"backend": "libvirt-hvf"})
+    sibling_before = (sibling.owner.read_bytes(), sibling.state.read_bytes(), sibling.state.stat().st_mtime_ns)
+
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{target_owner.run_id}" '
+        f'schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain("target-run", f"<domain><metadata>{marker}</metadata></domain>")
+    domain._active = True
+    conn = FakeLibvirtConn()
+    conn.domains["target-run"] = domain
+    expected = state.read_run_dispatch_record(roots, "target-run")
+    target_before = target.state.read_bytes()
+
+    result = runtime.reconcile_run("target-run", roots=roots, conn=conn, _expected_record=expected)
+
+    assert result["state"]["status"] == "running"
+    assert target.state.read_bytes() == target_before
+    assert (sibling.owner.read_bytes(), sibling.state.read_bytes(), sibling.state.stat().st_mtime_ns) == sibling_before
+
+
+def test_single_run_reconcile_does_not_swallow_state_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    rpaths = state.run_paths(roots, "write-failure")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="running",
+        data={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "name": "write-failure",
+            "run_id": owner.run_id,
+        },
+    )
+    expected = state.read_run_dispatch_record(roots, "write-failure")
+    monkeypatch.setattr(
+        state.ExistingRunMutation,
+        "write_state",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        runtime.reconcile_run("write-failure", roots=roots, conn=FakeLibvirtConn(), _expected_record=expected)

@@ -153,7 +153,11 @@ Use `cloud_init: {file: cloud-init.yml}` for a project-contained file containing
 
 Do not edit a Palimpsest-owned libvirt domain or Lima instance directly. Immutable owner UUIDs, disk formatting flags, volume references, and destructive operations are checked fail-closed, but full reconciliation of every externally edited CPU, memory, and network field is a later compatibility phase. Long-running `compose exec` and `compose logs --follow` hold the project lifecycle lock so a concurrent recreate cannot redirect the operation to a replacement VM.
 
-Project state and block-volume receipts live below `${XDG_STATE_HOME:-~/.local/state}/palimpsest/projects/` and `volumes/`. Rollback removes only VMs created by the failed `up`; persistent named volumes remain recoverable by default.
+Project state and block-volume receipts live below the selected state root's
+`projects/` and `volumes/` directories. The unconfigured Linux state root is
+`/var/lib/palimpsest`; explicit environment or config roots retain precedence.
+Rollback removes only VMs created by the failed `up`; persistent named volumes
+remain recoverable by default.
 
 ## Command coverage and current differences
 

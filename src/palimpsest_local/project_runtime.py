@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from . import state
 from .digest import InvalidDigestError, require_digest
@@ -33,6 +33,17 @@ from .project import (
     deterministic_service_name,
     project_config_digest,
     service_start_order,
+)
+from .runtime_types import (
+    DispatchKey,
+    ExpectedRunIdentity,
+    InspectRecord,
+    LifecycleResult,
+    LogEvent,
+    LogStream,
+    RunResult,
+    RuntimeBackend,
+    RuntimeKind,
 )
 
 PROJECT_STATE_SCHEMA_VERSION = 2
@@ -171,6 +182,57 @@ class RuntimeIdentity:
     backend: str
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalRunStatus:
+    """A non-owned Lima name collision; never confused with an owned inspect record."""
+
+    status: str
+
+    def __post_init__(self) -> None:
+        if self.status not in _KNOWN_RUNTIME_STATUSES:
+            raise ValueError("external runtime has an invalid status")
+
+
+class StartServiceCallback(Protocol):
+    def __call__(
+        self,
+        item: PreparedService,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object: ...
+
+
+class ExistingRunMutationCallback(Protocol):
+    def __call__(
+        self,
+        name: str,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object: ...
+
+
+class ExistingRunLogsCallback(Protocol):
+    def __call__(
+        self,
+        name: str,
+        follow: bool,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> LogStream: ...
+
+
+def _expected_mutation_identity(managed: ManagedService) -> ExpectedRunIdentity:
+    try:
+        backend = RuntimeBackend(managed.backend)
+    except (TypeError, ValueError):
+        raise ProjectLifecycleError("managed run has an invalid backend identity") from None
+    return ExpectedRunIdentity(
+        managed.run_name,
+        managed.run_id,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
+    )
+
+
 def _noop_preflight(_services: tuple[PreparedService, ...]) -> None:
     return None
 
@@ -206,9 +268,12 @@ class ProjectCallbacks:
     are intentionally preserved if a later service operation fails.
 
     ``start`` handles both a new VM and a stopped VM; ``plan.action`` tells the
-    adapter which case applies.  For ``recreate`` the orchestrator calls ``stop``
-    and ``remove`` before ``start``.  ``remove`` should release the per-run writable
-    overlay/tombstone, but project named volumes are managed only by
+    adapter which case applies. Existing-run start/stop/remove calls carry the
+    immutable project-owned identity so adapters can reject name reuse immediately
+    before backend entry. New creation and best-effort rollback remain unbound when
+    no durable identity is available. For ``recreate`` the orchestrator calls
+    ``stop`` and ``remove`` before ``start``. ``remove`` should release the per-run
+    writable overlay/tombstone, but project named volumes are managed only by
     ``remove_volume``.
 
     ``desired_digest`` can extend the structural service digest with a one-way
@@ -219,15 +284,15 @@ class ProjectCallbacks:
 
     inspect: Callable[[str], object | None]
     resolve: Callable[[Project, ServiceSpec, str], object]
-    start: Callable[[PreparedService], object]
-    stop: Callable[[str], object]
-    remove: Callable[[str], object]
+    start: StartServiceCallback
+    stop: ExistingRunMutationCallback
+    remove: ExistingRunMutationCallback
     preflight: Callable[[tuple[PreparedService, ...]], None] = _noop_preflight
     prepare: Callable[[tuple[PreparedService, ...]], Sequence[ManagedVolume]] = _noop_prepare
     preflight_down: Callable[[tuple[DownTarget, ...], tuple[ManagedVolume, ...]], None] = _noop_down_preflight
     port_available: Callable[[PublishedPort, str | None], bool] = _port_available
     remove_volume: Callable[[str, str, str, int], object] = _remove_volume
-    logs: Callable[[str, bool], Iterable[str]] | None = None
+    logs: ExistingRunLogsCallback | None = None
     desired_digest: Callable[[Project, ServiceSpec], str] | None = None
 
 
@@ -318,7 +383,13 @@ def runtime_status(value: object | None) -> str | None:
 
     if value is None:
         return None
-    if isinstance(value, str):
+    if isinstance(value, InspectRecord):
+        status = value.lifecycle.status
+    elif isinstance(value, ExternalRunStatus):
+        status = value.status
+    elif isinstance(value, (RunResult, LifecycleResult)):
+        status = value.status if isinstance(value, RunResult) else value.current_status
+    elif isinstance(value, str):
         status = value
     elif isinstance(value, Mapping):
         candidate = value.get("status")
@@ -339,6 +410,18 @@ def runtime_identity(value: object | None) -> RuntimeIdentity | None:
 
     if value is None:
         return None
+    if isinstance(value, InspectRecord):
+        return RuntimeIdentity(
+            run_id=value.record.run_id,
+            backend=value.record.dispatch_key.backend.value,
+        )
+    if isinstance(value, ExternalRunStatus):
+        raise ProjectLifecycleError("external runtime status has no owned runtime identity")
+    if isinstance(value, (RunResult, LifecycleResult)):
+        return RuntimeIdentity(
+            run_id=value.record.run_id,
+            backend=value.record.dispatch_key.backend.value,
+        )
     if not isinstance(value, Mapping):
         raise ProjectLifecycleError("runtime identity requires a mapping inspection result")
     nested_state = value.get("state")
@@ -812,6 +895,7 @@ def up_project(
         mutable_volumes = dict(ledger.volumes)
         current = ledger
         created: list[PreparedService] = []
+        created_identities: dict[str, ExpectedRunIdentity] = {}
         prepared_by_service = {item.plan.service: item for item in prepared}
         try:
             current_input_prepared = tuple(item for item in prepared if not item.plan.preserve_config)
@@ -850,6 +934,7 @@ def up_project(
                     continue
                 item = prepared_by_service[plan.service]
                 prior_managed = mutable_services.get(plan.service)
+                expected_identity = _expected_mutation_identity(prior_managed) if prior_managed is not None else None
                 if prior_managed is not None and plan.previous_status is not None:
                     before_mutation = callbacks.inspect(plan.run_name)
                     if before_mutation is None:
@@ -859,11 +944,14 @@ def up_project(
                     _assert_managed_identity(prior_managed, before_mutation)
                 if plan.action == "recreate":
                     if plan.previous_status not in {None, "removed"}:
-                        callbacks.stop(plan.run_name)
-                    callbacks.remove(plan.run_name)
+                        callbacks.stop(plan.run_name, expected_identity=expected_identity)
+                    callbacks.remove(plan.run_name, expected_identity=expected_identity)
                 if plan.action in {"create", "recreate"}:
                     created.append(item)
-                callbacks.start(item)
+                if plan.action == "start":
+                    callbacks.start(item, expected_identity=expected_identity)
+                else:
+                    callbacks.start(item)
                 started = callbacks.inspect(plan.run_name)
                 if runtime_status(started) != "running":
                     raise ProjectLifecycleError(
@@ -887,6 +975,8 @@ def up_project(
                     identity.run_id,
                     identity.backend,
                 )
+                if plan.action in {"create", "recreate"}:
+                    created_identities[plan.service] = _expected_mutation_identity(mutable_services[plan.service])
                 if plan.service not in mutable_order:
                     mutable_order.append(plan.service)
                 referenced_volumes = (
@@ -925,27 +1015,44 @@ def up_project(
         except Exception as exc:
             rollback_errors: list[str] = []
             for item in reversed(created):
+                expected_identity = created_identities.get(item.plan.service)
+                cleanup_failed = False
                 try:
-                    callbacks.stop(item.plan.run_name)
+                    if expected_identity is None:
+                        callbacks.stop(item.plan.run_name)
+                    else:
+                        callbacks.stop(item.plan.run_name, expected_identity=expected_identity)
                 except Exception as rollback_exc:  # cleanup continues best-effort
+                    cleanup_failed = True
                     rollback_errors.append(f"stop {item.plan.run_name}: {rollback_exc}")
                 try:
-                    callbacks.remove(item.plan.run_name)
+                    if expected_identity is None:
+                        callbacks.remove(item.plan.run_name)
+                    else:
+                        callbacks.remove(item.plan.run_name, expected_identity=expected_identity)
                 except Exception as rollback_exc:  # cleanup continues best-effort
+                    cleanup_failed = True
                     rollback_errors.append(f"remove {item.plan.run_name}: {rollback_exc}")
-                mutable_services.pop(item.plan.service, None)
-                if item.plan.service in mutable_order:
-                    mutable_order.remove(item.plan.service)
-            current = _replace_state(
-                current,
-                services=mutable_services,
-                order=mutable_order,
-                volumes=mutable_volumes,
+                if not cleanup_failed:
+                    mutable_services.pop(item.plan.service, None)
+                    if item.plan.service in mutable_order:
+                        mutable_order.remove(item.plan.service)
+            rollback_changed = (
+                dict(current.services) != mutable_services
+                or current.order != tuple(mutable_order)
+                or dict(current.volumes) != mutable_volumes
             )
-            try:
-                _write_project_state(ppaths, current)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"write project ledger: {rollback_exc}")
+            if rollback_changed:
+                current = _replace_state(
+                    current,
+                    services=mutable_services,
+                    order=mutable_order,
+                    volumes=mutable_volumes,
+                )
+                try:
+                    _write_project_state(ppaths, current)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"write project ledger: {rollback_exc}")
             detail = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ""
             raise ProjectLifecycleError(f"project up failed: {exc}{detail}") from exc
 
@@ -984,17 +1091,18 @@ def down_project(
         removed_services: list[str] = []
         for target in targets:
             managed = mutable_services[target.service]
+            expected_identity = _expected_mutation_identity(managed)
             before_mutation = callbacks.inspect(target.run_name)
             if before_mutation is not None:
                 _assert_managed_identity(managed, before_mutation)
             if target.status not in {None, "removed"}:
-                callbacks.stop(target.run_name)
+                callbacks.stop(target.run_name, expected_identity=expected_identity)
             before_remove = callbacks.inspect(target.run_name)
             if before_remove is not None:
                 _assert_managed_identity(managed, before_remove)
             # Removal also clears an owned stopped/removed/missing run ledger or
             # tombstone.  The adapter must verify ownership before doing so.
-            callbacks.remove(target.run_name)
+            callbacks.remove(target.run_name, expected_identity=expected_identity)
             mutable_services.pop(target.service, None)
             mutable_order.remove(target.service)
             removed_services.append(target.service)
@@ -1091,7 +1199,7 @@ def project_service_operation(
     project: Project,
     service: str,
     inspect: Callable[[str], object | None],
-    operation: Callable[[str], object],
+    operation: ExistingRunMutationCallback,
     *,
     roots: state.StatePaths | None = None,
 ) -> object:
@@ -1110,7 +1218,10 @@ def project_service_operation(
         if inspected is None:
             raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
         _assert_managed_identity(managed, inspected)
-        return operation(managed.run_name)
+        return operation(
+            managed.run_name,
+            expected_identity=_expected_mutation_identity(managed),
+        )
 
 
 def stop_project_services(
@@ -1139,7 +1250,10 @@ def stop_project_services(
             if inspected is None:
                 raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
             _assert_managed_identity(managed, inspected)
-            callbacks.stop(managed.run_name)
+            callbacks.stop(
+                managed.run_name,
+                expected_identity=_expected_mutation_identity(managed),
+            )
             after = callbacks.inspect(managed.run_name)
             if after is None:
                 raise ProjectLifecycleError(f"managed run {managed.run_name!r} disappeared while stopping")
@@ -1157,26 +1271,40 @@ def project_logs(
     *,
     roots: state.StatePaths | None = None,
     follow: bool = False,
-) -> Iterable[tuple[str, str]]:
-    """Yield ``(service, line)`` pairs without exposing backend run-name details."""
+) -> Iterable[tuple[str, LogEvent]]:
+    """Yield typed events after releasing the project ownership lock."""
 
     if callbacks.logs is None:
         raise ProjectLifecycleError("the selected runtime does not provide a logs callback")
     roots = roots or state.init_roots()
     ppaths = state.project_paths(roots, project.name)
-    with state.file_lock(ppaths.lock):
-        ledger = read_project_state(project, roots)
-        if ledger is None:
-            raise ProjectLifecycleError(f"project {project.name!r} has not been started")
-        selected = list(ledger.order) if services is None else list(dict.fromkeys(services))
-        unknown = sorted(set(selected) - set(ledger.services))
-        if unknown:
-            raise ProjectLifecycleError(f"service(s) are not managed by this project: {', '.join(unknown)}")
-        for service_name in selected:
-            managed = ledger.services[service_name]
-            inspected = callbacks.inspect(managed.run_name)
-            if inspected is None:
-                raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
-            _assert_managed_identity(managed, inspected)
-            for line in callbacks.logs(managed.run_name, follow):
-                yield service_name, line
+    opened: list[tuple[str, LogStream]] = []
+    try:
+        with state.file_lock(ppaths.lock):
+            ledger = read_project_state(project, roots)
+            if ledger is None:
+                raise ProjectLifecycleError(f"project {project.name!r} has not been started")
+            selected = list(ledger.order) if services is None else list(dict.fromkeys(services))
+            unknown = sorted(set(selected) - set(ledger.services))
+            if unknown:
+                raise ProjectLifecycleError(f"service(s) are not managed by this project: {', '.join(unknown)}")
+            for service_name in selected:
+                managed = ledger.services[service_name]
+                inspected = callbacks.inspect(managed.run_name)
+                if inspected is None:
+                    raise ProjectLifecycleError(f"managed run {managed.run_name!r} is missing")
+                _assert_managed_identity(managed, inspected)
+                stream = callbacks.logs(
+                    managed.run_name,
+                    follow,
+                    expected_identity=_expected_mutation_identity(managed),
+                )
+                if not isinstance(stream, LogStream):
+                    raise ProjectLifecycleError("runtime logs callback returned an invalid stream")
+                opened.append((service_name, stream))
+        for service_name, stream in opened:
+            for event in stream.events():
+                yield service_name, event
+    finally:
+        for _, stream in opened:
+            stream.close()

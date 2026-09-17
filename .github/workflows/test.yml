@@ -10,28 +10,146 @@ permissions:
   contents: read
 
 jobs:
-  pure:
-    name: Pure contracts (Python 3.12)
+  checks:
+    name: Lint, manifests, and package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check architecture freshness
+        run: python3 scripts/check_architecture.py
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
+      - run: uv run python tests/fixtures/oci-root/generate_fixtures.py --check
+      - name: Check generated CLI reference
+        run: uv run python scripts/generate_cli_reference.py --check
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run python scripts/test_lanes.py list --check
+      - name: Build and smoke-test package artifacts
+        run: uv run python scripts/build_package.py --out-dir "$RUNNER_TEMP/palimpsest-dist"
+
+  portable-linux:
+    name: Portable Linux (${{ matrix.shard }}/6)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: uv sync --frozen --extra dev
-      - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run python -m pytest tests/unit -v
-      - run: uv build
-      - run: python -m zipfile -t dist/*.whl
-      - run: tar -tzf dist/*.tar.gz
+      - run: uv run python scripts/test_lanes.py run portable --shard ${{ matrix.shard }}/6
+
+  pure:
+    name: Pure contracts (Python 3.12)
+    if: always()
+    needs: [checks, portable-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every portable shard and package check
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          PORTABLE_RESULT: ${{ needs.portable-linux.result }}
+        run: test "$CHECKS_RESULT" = success && test "$PORTABLE_RESULT" = success
+
+  oci-fs-proof:
+    name: OCI filesystem proof (privileged Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes erofs-utils squashfs-tools
+      - run: uv sync --frozen --extra dev
+      - run: mkdir -m 0700 "$RUNNER_TEMP/oci-fs-evidence"
+      - run: mkdir -m 0700 "$RUNNER_TEMP/oci-fs-replay"
+      - name: Prove selected SquashFS and retain EROFS comparison failure
+        env:
+          PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-evidence
+          PALIMPSEST_REQUIRE_OCI_FS: "1"
+        run: sudo --preserve-env=PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS "$(command -v uv)" run python -m pytest -m oci_fs tests/oci_fs -vv
+      - name: Rebuild selected SquashFS in a separate process
+        env:
+          PALIMPSEST_OCI_FS_EVIDENCE_DIR: ${{ runner.temp }}/oci-fs-replay
+          PALIMPSEST_REQUIRE_OCI_FS: "1"
+        run: sudo --preserve-env=PALIMPSEST_OCI_FS_EVIDENCE_DIR,PALIMPSEST_REQUIRE_OCI_FS "$(command -v uv)" run python -m pytest -m oci_fs -k layer_filesystem_semantics tests/oci_fs -vv
+      - name: Require cross-process deterministic evidence
+        run: |
+          cmp "$RUNNER_TEMP/oci-fs-evidence/squashfs.json" "$RUNNER_TEMP/oci-fs-replay/squashfs.json"
+          cp "$RUNNER_TEMP/oci-fs-replay/squashfs.json" "$RUNNER_TEMP/oci-fs-evidence/squashfs-replay.json"
+      - name: Require both retained candidate results
+        run: test -s "$RUNNER_TEMP/oci-fs-evidence/squashfs.json" && test -s "$RUNNER_TEMP/oci-fs-evidence/squashfs-replay.json" && test -s "$RUNNER_TEMP/oci-fs-evidence/erofs.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oci-filesystem-proof
+          path: ${{ runner.temp }}/oci-fs-evidence
+          if-no-files-found: error
+
+  local-oci-build:
+    name: Local OCI image product build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - name: Create isolated network-none BuildKit builder
+        run: docker buildx create --name palimpsest-e2e --driver docker-container --driver-opt network=none --use --bootstrap
+      - name: Prove direct interoperability and Palimpsest product build
+        env:
+          PALIMPSEST_BUILDKIT_E2E: "1"
+          PALIMPSEST_BUILDKIT_BUILDER: palimpsest-e2e
+        run: uv run python -m pytest tests/integration/test_buildkit_named_oci_context.py -vv
+      - name: Remove test builder
+        if: always()
+        run: docker buildx rm palimpsest-e2e || true
+
+  guest-stage1-binary:
+    name: Guest stage-1 binary (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - name: Pin the offline x86_64 build toolchain
+        run: docker pull --platform linux/amd64 docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
+      - name: Execute and reproduce the packaged stage-1 ELF
+        run: uv run python -m pytest -m guest_stage1_binary tests/integration/test_oci_guest_stage1_binary.py -vv
+      - name: Reproduce the native-KVM workload proof ELF
+        run: |
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-a.x86_64"
+          scripts/build_oci_guest_workload_proof.sh "$RUNNER_TEMP/workload-proof-b.x86_64"
+          cmp tests/kvm/assets/workload-proof.x86_64 "$RUNNER_TEMP/workload-proof-a.x86_64"
+          cmp "$RUNNER_TEMP/workload-proof-a.x86_64" "$RUNNER_TEMP/workload-proof-b.x86_64"
+      - name: Verify KVM filesystem and workload fixture bindings
+        run: uv run python tests/kvm/assets/check_filesystem_fixtures.py
 
 
-  unit-macos:
-    name: Unit tests (macOS 15)
+  portable-macos:
+    name: Portable macOS (${{ matrix.shard }}/4)
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -40,7 +158,18 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --extra dev
       - run: uv run python -c "import palimpsest_local; import palimpsest_local.cli"
-      - run: uv run python -m pytest tests/unit -v
+      - run: uv run python scripts/test_lanes.py run portable --shard ${{ matrix.shard }}/4
+
+  unit-macos:
+    name: Unit tests (macOS 15)
+    if: always()
+    needs: [portable-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every macOS portable shard
+        env:
+          PORTABLE_RESULT: ${{ needs.portable-macos.result }}
+        run: test "$PORTABLE_RESULT" = success
   hub:
     name: Hub tests, lint, and build
     runs-on: ubuntu-latest
@@ -63,7 +192,7 @@ jobs:
       - run: tar -tzf dist/*.tar.gz
 
   kvm:
-    name: KVM end to end
+    name: Native KVM stage-1 proof
     if: vars.PALIMPSEST_KVM_ENABLED == 'true'
     runs-on: [self-hosted, linux, x64, kvm]
     steps:
@@ -73,6 +202,32 @@ jobs:
         with:
           python-version: "3.12"
       - run: test -c /dev/kvm
-      - run: virsh -c qemu:///system net-info default
-      - run: uv sync --frozen --extra dev --extra kvm
-      - run: uv run python -m pytest -m kvm tests/kvm -vv
+      - run: uv sync --frozen --extra dev
+      - name: Create private stage-1 evidence directory
+        run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
+      - name: Prove retained root, root transition, PID 1 supervision, and rejection matrices
+        timeout-minutes: 45
+        env:
+          PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
+          PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence
+        run: uv run python -m pytest -m stage1_kvm tests/kvm -vv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage1-native-kvm-proof
+          path: ${{ runner.temp }}/stage1-kvm-evidence
+          if-no-files-found: error
+
+  kvm-required:
+    name: Required native KVM proof
+    if: always()
+    needs: [kvm]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse skipped or failed KVM qualification
+        env:
+          PALIMPSEST_KVM_ENABLED: ${{ vars.PALIMPSEST_KVM_ENABLED }}
+          PALIMPSEST_KVM_RESULT: ${{ needs.kvm.result }}
+        run: |
+          test "$PALIMPSEST_KVM_ENABLED" = "true"
+          test "$PALIMPSEST_KVM_RESULT" = "success"

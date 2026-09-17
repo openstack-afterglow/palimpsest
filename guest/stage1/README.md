@@ -1,0 +1,324 @@
+# Palimpsest guest stage-1 consumer
+
+`init.c` is a freestanding Linux x86_64 PID 1. It uses raw syscalls and embeds
+its own SHA-256 and canonical JSON validation; it has no libc, dynamic loader,
+or system-header dependency. It authenticates the stage-1 transport, then
+opens and authenticates the complete root/lower block-device set by role,
+serial, read-only state, exact size and stable identity. It verifies the root
+ext4 identity and geometry, then every
+lower's SquashFS v4 structure and whole-device image digest. Live PID 1 mounts
+the authenticated block FDs at deterministic staging paths, assembles
+OverlayFS, moves devtmpfs, sysfs, and proc into that tree, then moves the
+OverlayFS mount onto `/` and enters it with `chroot(2)`. This is an
+initramfs-safe switch-root choreography, not a `pivot_root(2)` call. It then
+decodes the authenticated process contract, forks the admitted image process
+into its own process group, confirms `execve(2)` through a close-on-exec error
+pipe, forwards an allow-listed signal set through `signalfd`, and reaps all
+children with `wait4(2)`.
+
+The executable subset accepts canonical numeric or image account names. PID 1
+reads only bounded, root-owned, not group/other-writable, no-follow regular
+`/etc/passwd` and `/etc/group` files; named matches must be unique. An omitted
+group uses the matching passwd primary GID, while a numeric UID absent from
+passwd uses Docker's GID 0 fallback. Explicit numeric groups bypass group-file
+lookup. Supplementary groups intentionally remain empty: this is a restricted
+security subset, not Docker's image group-membership expansion. The child gets
+the authenticated image environment plus the fixed container default `PATH`
+when absent. After credential drop and `chdir`, PID 1 performs shell-free
+`execve` candidate search; argv containing `/` is direct, and an empty PATH
+element explicitly means the workload cwd.
+
+New OCI-root volumes are formatted with a closed ext4 feature allow-list and
+fixed geometry rather than host `mke2fs.conf` defaults, then verified before
+publication. Retained legacy volumes may omit `metadata_csum`; when it is
+present, checksum type 1 (CRC32C) and the primary-superblock checksum are exact.
+
+The reproducible build is:
+
+```sh
+scripts/build_oci_guest_init.sh
+```
+
+`init.c` includes `main_output_pump.h` and routes the main workload's stdout
+and stderr through two distinct workload-UID:GID-owned `0600` FIFOs. Child
+write ends remain blocking; only PID 1's read ends are nonblocking. Each stream
+has a fixed 4 KiB pump buffer. Observed chunks and PID 1 diagnostics enter one
+16 KiB console queue, and an actual console flush performs at most one
+nonblocking 1 KiB write per tick. Queue admission is atomic for workload data;
+diagnostic overflow and permanent I/O errors are sticky failures. Per-stream
+order and observed enqueue order are preserved, but independent stdout and
+stderr have no reconstructed real-time total order.
+
+The child-private mode-0755 `/dev` contains the same six root-owned character
+devices plus exactly three root-owned links: `stdout -> /proc/self/fd/1`,
+`stderr -> /proc/self/fd/2`, and `fd -> /proc/self/fd`. There is no `/dev/stdin`
+alias. The workload child creates the links without replacing an existing
+entry and checks their no-follow type, owner, mode, link count, and exact
+bounded target before dropping credentials. The complete nine-entry directory
+and all device identities are checked again after temporary cgroup staging is
+removed. The privileged parent never follows these aliases; reopening resolves
+the workload child's own descriptors, including application-created pipe FDs.
+The existing `/proc/1/fd` and `fdinfo` read-only empty masks and child FD closure
+policy remain unchanged. The self-FD alias does not grant another process's FD
+authority. Native probes check the entry descriptor inventory before opening
+their own files; main and additional exec must inherit only FD 0, 1, and 2.
+These are setup-time checks
+inside the child's private mount namespace, not an immutability guarantee
+against a UID 0 workload after launch.
+
+Before credentials, capabilities, no-new-privileges, and seccomp are committed,
+each workload child idempotently validates and enables only the kernel-created
+IPv4 interface named `lo` in the guest's shared no-NIC network namespace. The
+raw `ifreq` ioctl sequence requires a positive index, an index-to-name `lo`
+round trip, an exact initial flag word of `IFF_LOOPBACK` or
+`IFF_UP|IFF_LOOPBACK|IFF_RUNNING`, and that the same index reaches the latter
+exact word. Every socket is close-on-exec and is closed before isolation
+continues. The guest does not create an interface or namespace and does not add
+an address, route, DNS configuration, host port, or host-network attachment.
+The qualified built-in IPv4 kernel behavior assigns `127.0.0.1/8` when the
+loopback device is brought up.
+
+PID 1 acquires and revalidates a distinct nonblocking console OFD through the
+fixed `/proc/self/fd/1` magic link before root transition. After acquisition,
+diagnostics use only the queue and pinned sink: there is no blocking fallback.
+Ordinary diagnostics retire after the last terminal marker; authenticated
+reconnect boundaries are control messages, not discardable diagnostics.
+Pre-acquisition bootstrap
+failures and non-PID fixture mode retain their direct-write exception.
+
+Cleanup uses one shared budget: up to five seconds for graceful supervision,
+then cgroup kill and at most one additional second for output drain. Natural
+exit also gives descendant writers a bounded drain opportunity. Success
+requires pump EOF, empty buffers, an empty healthy queue and completed process
+cleanup. The terminal sequence is root quiescence, terminal diagnostic
+enqueue, bounded drain and held-sink revalidation, then authenticated TERMINAL
+publication. The main pipes are closed, but PID 1 retains the same nonblocking
+console sink for authenticated reconnect `BOUNDARY_ACK` delivery. Terminal
+control service polls pending console output and gives each pending boundary
+a separate five-second delivery budget; it does not extend workload cleanup.
+Control delivery failure wipes lifecycle secrets, closes the sink and waits
+fail-closed without changing the completed workload's terminal cause.
+Deadline expiry or permanent output failure disables normal TERMINAL. These
+userspace deadlines do not claim a hard kernel deadline for tasks stuck in an
+uninterruptible kernel state.
+
+The stage-1 source identity uses the versioned source-bundle framing over
+the named `init.c` and `main_output_pump.h` inputs. The separate native stage-1,
+UID 0/101 stdout-stderr and existing-image public lifecycle proofs passed at
+`9736132`; see the [native checkpoint](../../docs/oci-linux-process.md#main-output-native-checkpoint-9736132-2026-09-10).
+Component/portable checks are distinct evidence. Source and focused real-C
+tests define the two standard-output aliases and the self-FD alias separately from native
+qualification; they do not by themselves qualify original NGINX, a new
+application build or full Gate 2.
+
+The build runs offline and read-only as the invoking UID/GID with fixed locale,
+timezone, home and `SOURCE_DATE_EPOCH`. Its compiler is the linux/amd64 manifest
+of GCC 14.3.0 Bookworm, pinned as:
+
+```text
+docker.io/library/gcc@sha256:a689e29bc3adf4663ef9a141d23081252764d1319c63f591a027bd6fd676f4c1
+```
+
+The linker output is sealed by `scripts/seal_static_elf.py`: the seal rejects
+dynamic, interpreter, writable-executable, malformed and executable-stack
+segments, truncates to the complete program-header/load extent, and removes
+the section-header table. Normal package and initramfs construction reads the
+already packaged `assets/oci-stage1-init.x86_64`; Docker and a compiler are not
+runtime dependencies. Exact source, recipe, seal, toolchain and ELF digests are
+bound by the initramfs manifest.
+
+## Fixture ABI
+
+The same ELF supports `--fixture-v1 ROOT` and `--fixture-v2 ROOT` only when it is not PID 1. A
+non-PID1 invocation without that exact fixture ABI exits with usage status and
+cannot enter the live mount path. `ROOT` contains regular files:
+
+```text
+proc/cmdline
+sys/class/block/vdX/serial
+sys/class/block/vdX/ro
+sys/class/block/vdX/driver
+sys/class/block/vdX/dev
+dev/vdX
+```
+
+Fixture v2 additionally requires `root.raw` and ordered `lower-<ordinal>.raw`
+regular files. It applies the live filesystem parsers and whole-lower digest,
+but intentionally does not pretend regular files exercise block ioctls.
+
+`driver`, `ro` and `dev` contain `virtio_blk\n`, `1\n` and `0:0\n` in the
+portable fixture. The transport and filesystem files must be single-link
+regular files with no group/world write bits; lowers must have no write bits.
+Exit codes are `0` verified, `64` fixture usage,
+`65` cmdline, `66` discovery, `67` envelope/artifact, and `68` semantic plan
+rejection, `69` filesystem rejection, live-only `70` mount/assembly rejection,
+and live-only `71` root-transition rejection. A partial transition is reported
+as indeterminate rather than rolled back. Live PID 1 never exits: both success
+and failure wait fail-closed.
+
+Before moving any pseudo-filesystem, a rejected initial `proc`, `sys`, or
+`dev` target preparation emits an additional fixed diagnostic:
+`root transition target rejected; target=proc; check=mode` (for example).
+Target names are compile-time literals; checks are a closed set covering
+mkdir, open, stat/type, owner, exact mode, directory read/encoding/emptiness,
+and filesystem identity. No image values, paths, errno, run IDs or secrets
+are emitted. The original exit-71 rejection and indeterminate-state wait
+remain unchanged; later readiness/move/chroot failures remain generic.
+The marker is diagnostic console output, not authenticated READY/root proof,
+and does not imply rollback or authorize workload execution. Success emits
+no new marker. Following the user's narrow compatibility approvals, the
+root-owned empty `proc` and `sys` targets accept either exact `0755` or `0555`.
+`dev` and generic directory checks remain exact `0755`. Following the separate
+populated-device-directory approval, only the `dev` transition target may be
+nonempty. Its contents are never opened, copied or admitted as workload devices:
+the verified initramfs devtmpfs is moved over it before root transition completes,
+and each workload receives its own verified six-device/three-alias tmpfs. `proc`,
+`sys` and generic emptiness requirements remain unchanged. No permissions are
+normalized and no source image is changed. The ordered nofollow/type/owner/
+mode/emptiness checks retain the initial device/inode/mode/UID/GID snapshot;
+immediately before each mount move, both retained and reopened target FDs
+must still match that snapshot. Even a `0755` to `0555` change (or the reverse)
+between preparation and readiness is rejected. Production readiness requires
+OverlayFS; a restricted tmpfs C harness exercises the shared checker without
+claiming to qualify real mount operations. PID 1 protection, workload
+credentials/capabilities and authenticated root evidence remain unchanged.
+
+The root-volume generation is bounded consistently in Python and C to 4096
+canonical decimal digits.
+
+## Native KVM qualification
+
+`tests/kvm/test_oci_guest_stage1_live.py` is the only release-qualified live
+consumer proof. It direct-boots this exact packaged initramfs on native Linux
+x86_64 with KVM API 12 and QEMU `-accel kvm -cpu host`. The selected kernel
+configuration must provide cgroup support, initrd, devtmpfs, proc/sysfs, PCI, serial
+console, virtio block, ext4, SquashFS xattr plus gzip/zstd codecs, and
+OverlayFS requirements as built-ins (`=y`). A successful boot
+attaches an actual ext4 writable root and two actual SquashFS read-only lowers
+in deliberately permuted QEMU order. A successful boot must emit the
+root-transition and workload-started markers, then a PID-1-authored terminal
+marker binding main status 42, cooperative status 43, forced status 137, three
+reaps, forwarded signal 15, and root PID 1 credentials with no supplementary groups. It
+remains alive in the terminal fail-closed wait. Before
+the root-transition marker, PID 1 proves `/` is the same authenticated OverlayFS
+inode previously mounted at staging, `/proc/self/root` matches `/`, the moved
+pseudo-filesystems retain their pre-transition identities, probes still pass
+at `/`, and every device passes a final recheck. Thirteen
+separate negative boots cover writable transport, root/lower absence, wrong
+serial, read-only-mode mismatch, capacity mismatch, duplicate serial, and an
+extra disk. Six separate same-topology filesystem negatives cover root magic,
+label and geometry plus lower magic, structure and whole-image digest. Each
+must emit only its exact rejection marker and remain in the PID 1 fail-closed wait.
+Root controls carry a recalculated valid superblock checksum. Lower magic and
+structure controls carry their mutated image digest through a distinct
+plan/transport/cmdline, while only the digest control intentionally keeps the
+original digest.
+
+The v19 receipt retains owner-only positive and per-control consoles plus a
+canonical receipt binding each exact path-free topology. Missing
+KVM prerequisites fail when `PALIMPSEST_REQUIRE_STAGE1_KVM=1`; they are not
+converted into skips. TCG can be useful for development but is never accepted
+as qualified evidence. This boundary proves transport, block identity,
+filesystem structure/content policy, OverlayFS assembly, and an actual `/`
+through `palimpsest.stage1-root-transition.v1` method `move-mount-chroot`, then
+the `palimpsest.guest-pid1-supervisor.v10` execution checkpoint, the
+`palimpsest.workload-lifecycle-authority-isolation.v3` boundary, and the
+`palimpsest.guest-lifecycle-broker.v3` exchange.
+Literal `pivot_root` remains false, the initial initramfs root is covered rather
+than claimed unmounted or reclaimed, mutable root content is not authenticated,
+and production VM launch remains disabled. Stage-1 plan/protocol v15 admits
+the bounded image-root account and shell-free PATH process subset.
+
+Before release, PID 1 verifies that the workload child has closed the
+lifecycle descriptor, entered a private mount namespace, installed an exact
+private safe `/dev`, made or masked sysfs/cgroup control paths read-only,
+emptied every capability set, locked securebits, enabled `no_new_privs`, and
+installed the narrow authority seccomp filter. The exact isolation marker is
+emitted only after this child-ready handshake and cgroup attachment, before
+`WORKLOAD_STARTED` and lifecycle READY. The UID 0 native positive boot proves
+that numeric root receives no capabilities or lifecycle authority while normal
+argv/env/cwd/root/stdout, safe-device I/O, ordinary fork, stop, and cleanup
+remain usable. No PID or user namespace is claimed; this does not make the
+workload availability-safe against all same-PID-namespace denial of service.
+
+The positive highest lower contains the separately reproducible proof workload
+and its OCI-root sentinel. That workload validates argv, environment, cwd,
+credentials, parent PID, process group, its own `/proc/self/root` and exact
+`/palimpsest.agent/exec-00000001` cgroup membership, and PID 1's
+four UID/GID values and empty supplementary-group list through bounded
+`/proc/1/status` parsing. It creates cooperative and stubborn descendants and
+then exits 42 naturally. PID 1 sends the configured stop signal after main
+exit; one descendant exits 43 and the other is killed through cgroup v2 with
+status 137. Five additional launch controls independently bind a missing
+executable, non-executable target, missing cwd, absent named user, and absent
+named group to exact child setup stage/errno rejection markers.
+
+After root transition, PID 1 mounts and verifies cgroup v2, creates and pins
+the empty `/palimpsest.agent` parent and monotonic session leaf
+`exec-00000001` plus both nodes' `cgroup.procs`, `cgroup.kill`, and
+`cgroup.events`, and forks a child held behind a release gate. Existing names
+are rejected rather than adopted. The child first closes the lifecycle fd,
+installs and verifies its isolation boundary, and reports readiness. Only then
+does root PID 1 move it into the dedicated cgroup, generate the per-boot
+lifecycle key, complete authenticated BOOTSTRAP/KEY_ACK, and send the release byte;
+the child may subsequently change cwd and exec. Cleanup uses
+only the pinned leaf `cgroup.kill`; it requires `wait4` to `ECHILD`, an empty
+leaf and successful leaf removal, then an empty direct-process-free parent and
+successful parent removal before the terminal marker. Session IDs are
+guest-internal monotonic u32 values, but this qualification permits at most one
+active session and does not prove parallel exec. Future detached stop, runtime
+exec, and agent lifecycle still need the production broker and dispatch path.
+The cgroup provides workload containment and deterministic cleanup; it is not
+a complete hostile-root availability sandbox. Every admitted resolved identity,
+including UID 0, executes without capabilities behind the same boundary.
+
+Additional exec stdout and stderr remain separate anonymous pipes and retain
+their existing bounded lifecycle transport. Before an exec child is forked,
+PID 1 verifies two distinct root-owned FIFO inodes with mode `0600`, each
+shared by its pipe's two endpoints, changes only those two inodes to the already
+resolved workload UID/GID, and verifies their identity, type and mode again.
+Isolation, child-error and release pipes remain root-owned. Failure at any
+ownership or identity check closes all newly created endpoints and refuses the
+exec before fork; the main workload console and its termination policy are not
+changed by this boundary.
+
+The native proof opens the uniquely named lifecycle virtio port and runs the
+bounded v2 HELLO/BOOTSTRAP/KEY_ACK/READY/STOP/TERMINAL exchange for both the
+base and distinct UID 0 plans. It also qualifies signed console BOUNDARY_ACK,
+retained-root reconnect/SNAPSHOT/same-ID retry and deduplication, plus the
+malformed, stale, replayed, and conflicting input matrix. TERMINAL is sent only
+after cgroup cleanup certainty, an identity-stable no-follow reopen of OverlayFS
+`/`, successful `syncfs`, and successful descriptor close, and before the console
+terminal marker. Receipt v19 records `reconnect_proven=true` and
+`negative_input_proven=true`; production
+runtime dispatch and host-daemon recovery remain future boundaries.
+
+PID 1 remains fail-closed without a valid initial HELLO. Before the first
+frame byte it waits for the host-owned activation timeout rather than imposing
+a competing guest deadline, so a delayed libvirt channel attachment cannot
+race a fixed guest timer. Once any byte arrives, the existing five-second
+partial-frame deadline applies; malformed or binding-invalid HELLO input is
+still rejected immediately and no workload starts before authentication.
+The release-qualified native proof deliberately delays its first positive
+HELLO until more than five seconds after the root-transition marker to exercise
+this startup ordering.
+Four fixed console markers distinguish channel readiness, accepted initial
+HELLO, transmitted BOOTSTRAP, and accepted authenticated KEY_ACK. Each is
+emitted only after its boundary commits, contains no run-specific value or
+secret, and precedes workload release in positive native evidence.
+
+Proof v7 uses two real zstd SquashFS images built from the committed
+`tests/kvm/assets/inputs` trees. Both contain the same reserved root-level
+sentinel with different bytes; an optional authenticated plan probe (empty for
+normal production plans) verifies that the highest ordinal is visible through
+the merged tree. The positive path boots the same ext4 backing twice and binds
+seed, boot-one/post=boot-two/pre, and boot-two/post digests. This is a
+synchronized retained-root reassembly checkpoint after `syncfs` on the mounted
+ext4 filesystem. QEMU is terminated after the marker, so it is neither a
+graceful guest-shutdown nor a crash-recovery claim. Three additional boots
+isolate missing, wrong-sized, and wrong-digest post-overlay probe rejection.
+Three v3-fixture-backed transition controls independently replace the highest
+lower with a real zstd SquashFS containing a regular `dev`, `sys`, or `proc`.
+Each reaches valid assembly and rejects the regular-file target before any
+mount move. Those controls retain their original fixtures; they do not alone
+qualify the newly admitted root-owned empty `proc` mode `0555`.

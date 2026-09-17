@@ -1,0 +1,386 @@
+"""Canonical, shell-free OCI image process configuration."""
+
+from __future__ import annotations
+
+import posixpath
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from .errors import ArtifactValidationError
+
+MAX_PROCESS_ARGUMENTS = 4096
+MAX_PROCESS_ENVIRONMENT = 4096
+MAX_PROCESS_BYTES = 256 * 1024
+MAX_ACCOUNT_DATABASE_BYTES = 64 * 1024
+MAX_USER_OVERRIDE_LENGTH = 65
+OCI_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+_SIGNALS = {
+    "SIGHUP": 1,
+    "SIGINT": 2,
+    "SIGQUIT": 3,
+    "SIGABRT": 6,
+    "SIGKILL": 9,
+    "SIGUSR1": 10,
+    "SIGUSR2": 12,
+    "SIGPIPE": 13,
+    "SIGALRM": 14,
+    "SIGTERM": 15,
+    "SIGCHLD": 17,
+    "SIGCONT": 18,
+    "SIGSTOP": 19,
+    "SIGTSTP": 20,
+    "SIGTTIN": 21,
+    "SIGTTOU": 22,
+}
+
+
+def _plain_string(value: Any, field_name: str, *, allow_empty: bool = True) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value) or "\0" in value:
+        raise ArtifactValidationError(f"{field_name} is invalid")
+    if len(value.encode("utf-8")) > 32 * 1024:
+        raise ArtifactValidationError(f"{field_name} is too large")
+    return value
+
+
+def _account(value: Any, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ArtifactValidationError(f"{field_name} is invalid")
+    if value.isdecimal():
+        number = int(value)
+        if number > 2**32 - 2 or str(number) != value:
+            raise ArtifactValidationError(f"{field_name} is not canonical")
+    elif _ACCOUNT_RE.fullmatch(value) is None:
+        raise ArtifactValidationError(f"{field_name} is invalid")
+    return value
+
+
+def _stop_signal(value: Any) -> int:
+    if value is None or value == "":
+        return 15
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str):
+        rendered = value.upper()
+        if rendered.isdecimal():
+            number = int(rendered)
+            if str(number) != rendered:
+                raise ArtifactValidationError("image process stop signal is not canonical")
+        else:
+            rendered = rendered if rendered.startswith("SIG") else f"SIG{rendered}"
+            number = _SIGNALS.get(rendered, 0)
+    else:
+        number = 0
+    if not 1 <= number <= 64:
+        raise ArtifactValidationError("image process stop signal is unsupported")
+    return number
+
+
+@dataclass(frozen=True, slots=True)
+class OCIUserSpec:
+    user: str
+    group: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "user", _account(self.user, "image process user"))
+        if self.group is not None:
+            object.__setattr__(self, "group", _account(self.group, "image process group"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"group": self.group, "user": self.user}
+
+    @classmethod
+    def from_value(cls, value: Any) -> OCIUserSpec:
+        if value is None or value == "":
+            return cls("0", "0")
+        if not isinstance(value, str) or value.count(":") > 1:
+            raise ArtifactValidationError("image process user is invalid")
+        user, separator, group = value.partition(":")
+        if not user or (separator and not group):
+            raise ArtifactValidationError("image process user is invalid")
+        return cls(user, group if separator else None)
+
+    @classmethod
+    def from_override_value(cls, value: Any) -> OCIUserSpec:
+        """Parse an explicit CLI user override without image-config defaults."""
+        if not isinstance(value, str) or not value or len(value) > MAX_USER_OVERRIDE_LENGTH:
+            raise ArtifactValidationError("OCI run user override is invalid")
+        return cls.from_value(value)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> OCIUserSpec:
+        if not isinstance(value, Mapping) or set(value) != {"group", "user"}:
+            raise ArtifactValidationError("image process user fields are invalid")
+        user = cls(value["user"], value["group"])
+        if user.to_dict() != dict(value):
+            raise ArtifactValidationError("image process user is not canonical")
+        return user
+
+
+@dataclass(frozen=True, slots=True)
+class OCIProcessSpec:
+    argv: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    cwd: str
+    user: OCIUserSpec
+    stop_signal: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.argv, tuple) or len(self.argv) > MAX_PROCESS_ARGUMENTS:
+            raise ArtifactValidationError("image process argv is invalid")
+        argv = tuple(_plain_string(value, f"image process argv[{index}]") for index, value in enumerate(self.argv))
+        if not isinstance(self.environment, tuple) or len(self.environment) > MAX_PROCESS_ENVIRONMENT:
+            raise ArtifactValidationError("image process environment is invalid")
+        environment: list[tuple[str, str]] = []
+        names: set[str] = set()
+        for index, item in enumerate(self.environment):
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ArtifactValidationError("image process environment entry is invalid")
+            name, raw_value = item
+            if not isinstance(name, str) or _ENV_NAME_RE.fullmatch(name) is None or name in names:
+                raise ArtifactValidationError("image process environment name is invalid or duplicated")
+            names.add(name)
+            environment.append((name, _plain_string(raw_value, f"image process environment[{index}].value")))
+        if "PATH" not in names:
+            if len(environment) >= MAX_PROCESS_ENVIRONMENT:
+                raise ArtifactValidationError("image process environment leaves no room for default PATH")
+            environment.append(("PATH", OCI_DEFAULT_PATH))
+        cwd = _plain_string(self.cwd, "image process cwd", allow_empty=False)
+        if not cwd.startswith("/") or posixpath.normpath(cwd) != cwd or "//" in cwd:
+            raise ArtifactValidationError("image process cwd must be a canonical absolute path")
+        if not isinstance(self.user, OCIUserSpec):
+            raise ArtifactValidationError("image process user is invalid")
+        signal_number = _stop_signal(self.stop_signal)
+        total = sum(len(value.encode("utf-8")) + 1 for value in argv)
+        total += sum(len(name.encode()) + len(value.encode("utf-8")) + 2 for name, value in environment)
+        total += len(cwd.encode("utf-8")) + len(str(self.user.to_dict()).encode())
+        if total > MAX_PROCESS_BYTES:
+            raise ArtifactValidationError("image process contract is too large")
+        object.__setattr__(self, "argv", argv)
+        object.__setattr__(self, "environment", tuple(environment))
+        object.__setattr__(self, "cwd", cwd)
+        object.__setattr__(self, "stop_signal", signal_number)
+
+    @property
+    def bootable(self) -> bool:
+        return bool(self.argv and self.argv[0])
+
+    def require_bootable(self) -> None:
+        if not self.bootable:
+            raise ArtifactValidationError("OCI image has no Entrypoint or Cmd to execute")
+
+    def with_user(self, user: OCIUserSpec) -> OCIProcessSpec:
+        """Return an effective process differing only in its user identity."""
+        if not isinstance(user, OCIUserSpec):
+            raise ArtifactValidationError("OCI process user override is invalid")
+        return OCIProcessSpec(self.argv, self.environment, self.cwd, user, self.stop_signal)
+
+    def with_command(self, entrypoint: tuple[str, ...], command: tuple[str, ...]) -> OCIProcessSpec:
+        if not isinstance(entrypoint, tuple) or not isinstance(command, tuple) or not command:
+            raise ArtifactValidationError("OCI process command override is invalid")
+        return OCIProcessSpec((*entrypoint, *command), self.environment, self.cwd, self.user, self.stop_signal)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "environment": [{"name": name, "value": value} for name, value in self.environment],
+            "stop_signal": self.stop_signal,
+            "user": self.user.to_dict(),
+        }
+
+    @classmethod
+    def empty(cls) -> OCIProcessSpec:
+        return cls((), (), "/", OCIUserSpec("0", "0"), 15)
+
+    @classmethod
+    def from_config(cls, value: Any) -> OCIProcessSpec:
+        if value is None:
+            return cls.empty()
+        if not isinstance(value, Mapping):
+            raise ArtifactValidationError("image config.config must be an object or null")
+        args_escaped = value.get("ArgsEscaped")
+        if args_escaped is not None and type(args_escaped) is not bool:
+            raise ArtifactValidationError("image process ArgsEscaped must be a boolean or null")
+
+        def string_array(field_name: str) -> tuple[str, ...]:
+            raw = value.get(field_name)
+            if raw is None:
+                return ()
+            if not isinstance(raw, list):
+                raise ArtifactValidationError(f"image process {field_name} must be an array or null")
+            return tuple(_plain_string(item, f"image process {field_name}[{index}]") for index, item in enumerate(raw))
+
+        entrypoint = string_array("Entrypoint")
+        command = string_array("Cmd")
+        raw_environment = value.get("Env")
+        environment: list[tuple[str, str]] = []
+        if raw_environment is not None:
+            if not isinstance(raw_environment, list):
+                raise ArtifactValidationError("image process Env must be an array or null")
+            for item in raw_environment:
+                rendered = _plain_string(item, "image process Env entry")
+                name, separator, env_value = rendered.partition("=")
+                if not separator:
+                    raise ArtifactValidationError("image process Env entry must contain '='")
+                environment.append((name, env_value))
+        raw_cwd = value.get("WorkingDir")
+        if raw_cwd is None or raw_cwd == "":
+            raw_cwd = "/"
+        cwd = posixpath.normpath(_plain_string(raw_cwd, "image process WorkingDir", allow_empty=False))
+        return cls(
+            argv=(*entrypoint, *command),
+            environment=tuple(environment),
+            cwd=cwd,
+            user=OCIUserSpec.from_value(value.get("User")),
+            stop_signal=_stop_signal(value.get("StopSignal")),
+        )
+
+    @classmethod
+    def from_dict(cls, value: Any) -> OCIProcessSpec:
+        if not isinstance(value, Mapping) or set(value) != {"argv", "cwd", "environment", "stop_signal", "user"}:
+            raise ArtifactValidationError("image process fields are invalid")
+        raw_environment = value.get("environment")
+        if not isinstance(value.get("argv"), list) or not isinstance(raw_environment, list):
+            raise ArtifactValidationError("image process arrays are invalid")
+        environment: list[tuple[str, str]] = []
+        for item in raw_environment:
+            if not isinstance(item, Mapping) or set(item) != {"name", "value"}:
+                raise ArtifactValidationError("image process environment fields are invalid")
+            environment.append((item["name"], item["value"]))
+        process = cls(
+            tuple(value["argv"]),
+            tuple(environment),
+            value["cwd"],
+            OCIUserSpec.from_dict(value["user"]),
+            value["stop_signal"],
+        )
+        if process.to_dict() != dict(value):
+            raise ArtifactValidationError("image process contract is not canonical")
+        return process
+
+
+def image_process_vectors(value: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Strictly recover the Docker Entrypoint/Cmd boundary from verified config JSON."""
+    if not isinstance(value, Mapping):
+        raise ArtifactValidationError("image config.config must be an object")
+    vectors = []
+    for field_name in ("Entrypoint", "Cmd"):
+        raw = value.get(field_name)
+        if raw is None:
+            vectors.append(())
+            continue
+        if not isinstance(raw, list):
+            raise ArtifactValidationError(f"image process {field_name} must be an array or null")
+        vectors.append(
+            tuple(_plain_string(item, f"image process {field_name}[{index}]") for index, item in enumerate(raw))
+        )
+    return vectors[0], vectors[1]
+
+
+def _account_number(value: str, field_name: str) -> int:
+    try:
+        canonical = _account(value, field_name)
+    except ArtifactValidationError:
+        raise
+    if not canonical.isdecimal():
+        raise ArtifactValidationError(f"{field_name} is not numeric")
+    return int(canonical)
+
+
+def _account_lines(payload: bytes, field_name: str) -> tuple[str, ...]:
+    if not isinstance(payload, bytes) or len(payload) > MAX_ACCOUNT_DATABASE_BYTES or b"\0" in payload:
+        raise ArtifactValidationError(f"image-root {field_name} database is invalid")
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        raise ArtifactValidationError(f"image-root {field_name} database is not ASCII") from None
+    if text and not text.endswith("\n"):
+        raise ArtifactValidationError(f"image-root {field_name} database is unterminated")
+    lines = () if not text else tuple(text[:-1].split("\n"))
+    return tuple(line for line in lines if line and not line.startswith("#"))
+
+
+def resolve_oci_user(
+    user: OCIUserSpec,
+    *,
+    passwd: bytes | None,
+    group: bytes | None,
+) -> tuple[int, int]:
+    """Resolve Docker-compatible image User semantics without NSS.
+
+    Only the image-root ``/etc/passwd`` and ``/etc/group`` byte contracts are
+    consulted.  Numeric users remain valid without passwd; when their group is
+    omitted, an exact passwd UID match supplies the primary group and no match
+    falls back to GID 0, matching Docker's numeric-user behavior.
+    """
+
+    if not isinstance(user, OCIUserSpec):
+        raise ArtifactValidationError("image process user is invalid")
+    passwd_records: list[tuple[str, int, int]] = []
+    needs_passwd = not user.user.isdecimal() or user.group is None
+    if needs_passwd and passwd is not None:
+        for line in _account_lines(passwd, "passwd"):
+            fields = line.split(":")
+            if len(fields) != 7 or _ACCOUNT_RE.fullmatch(fields[0]) is None:
+                raise ArtifactValidationError("image-root passwd entry is invalid")
+            uid = _account_number(fields[2], "image-root passwd UID")
+            gid = _account_number(fields[3], "image-root passwd GID")
+            passwd_records.append((fields[0], uid, gid))
+
+    if user.user.isdecimal():
+        uid = int(user.user)
+        passwd_matches = [record for record in passwd_records if record[1] == uid]
+    else:
+        passwd_matches = [record for record in passwd_records if record[0] == user.user]
+        if not passwd_matches:
+            raise ArtifactValidationError("image process user is absent from image-root passwd")
+        uid = passwd_matches[0][1]
+    if len(passwd_matches) > 1:
+        raise ArtifactValidationError("image process user is ambiguous in image-root passwd")
+
+    if user.group is None:
+        return uid, passwd_matches[0][2] if passwd_matches else 0
+    if user.group.isdecimal():
+        return uid, int(user.group)
+    if group is None:
+        raise ArtifactValidationError("image process group is absent from image-root group")
+    matches: list[int] = []
+    for line in _account_lines(group, "group"):
+        fields = line.split(":")
+        if len(fields) != 4 or _ACCOUNT_RE.fullmatch(fields[0]) is None:
+            raise ArtifactValidationError("image-root group entry is invalid")
+        gid = _account_number(fields[2], "image-root group GID")
+        if fields[0] == user.group:
+            matches.append(gid)
+    if len(matches) != 1:
+        reason = "absent from" if not matches else "ambiguous in"
+        raise ArtifactValidationError(f"image process group is {reason} image-root group")
+    return uid, matches[0]
+
+
+def oci_path_candidates(process: OCIProcessSpec) -> tuple[str, ...]:
+    """Return shell-free execve candidates for the image process argv[0]."""
+
+    process.require_bootable()
+    command = process.argv[0]
+    if "/" in command:
+        return (command,)
+    path = next((value for name, value in process.environment if name == "PATH"), OCI_DEFAULT_PATH)
+    return tuple(f"{directory}/{command}" if directory else command for directory in path.split(":"))
+
+
+__all__ = [
+    "MAX_ACCOUNT_DATABASE_BYTES",
+    "MAX_PROCESS_ARGUMENTS",
+    "MAX_PROCESS_BYTES",
+    "MAX_PROCESS_ENVIRONMENT",
+    "OCI_DEFAULT_PATH",
+    "OCIProcessSpec",
+    "OCIUserSpec",
+    "oci_path_candidates",
+    "resolve_oci_user",
+]

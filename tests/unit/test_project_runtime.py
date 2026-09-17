@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
@@ -33,8 +36,47 @@ from palimpsest_local.project_runtime import (
     stop_project_services,
     up_project,
 )
+from palimpsest_local.runtime_types import (
+    DispatchKey,
+    ExistingRunRecord,
+    ExpectedRunIdentity,
+    LogCursor,
+    LogDataEvent,
+    LogEvent,
+    LogMode,
+    LogSourceStream,
+    LogTerminalCategory,
+    LogTerminalEvent,
+    LogTerminalOutcome,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 _IMAGE = "sha256:" + "a" * 64
+
+
+class _FakeLogStream:
+    def __init__(self, record: ExistingRunRecord) -> None:
+        self.record = record
+        self.mode = LogMode.SNAPSHOT
+        self.closed = False
+
+    def events(self) -> Iterator[LogEvent]:
+        generation = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        yield LogDataEvent(LogCursor(self.record, generation, 1), LogSourceStream.VM_CONSOLE, 1, now, b"first\n")
+        yield LogDataEvent(LogCursor(self.record, generation, 2), LogSourceStream.VM_CONSOLE, 2, now, b"second\n")
+        yield LogTerminalEvent(
+            LogCursor(self.record, generation, 3),
+            now,
+            LogTerminalOutcome(LogTerminalCategory.SNAPSHOT_COMPLETE),
+        )
+
+    def cancel(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _service(
@@ -131,8 +173,16 @@ class FakeRuntime:
             raise ProjectPrepareError("prepare rejected", tuple(volumes.values()))
         return tuple(volumes[name] for name in sorted(volumes))
 
-    def start(self, prepared: object) -> None:
+    def start(
+        self,
+        prepared: object,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> None:
         name = prepared.plan.run_name
+        if expected_identity is not None:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("start", prepared.plan.service, prepared.plan.action))
         if prepared.plan.action in {"create", "recreate"} or name not in self.run_ids:
             self.generation += 1
@@ -143,12 +193,18 @@ class FakeRuntime:
             raise RuntimeError("start failed")
         self.statuses[name] = "running"
 
-    def stop(self, name: str) -> None:
+    def stop(self, name: str, *, expected_identity: ExpectedRunIdentity | None = None) -> None:
+        if expected_identity is not None:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("stop", name))
         if name in self.statuses:
             self.statuses[name] = "stopped"
 
-    def remove(self, name: str) -> None:
+    def remove(self, name: str, *, expected_identity: ExpectedRunIdentity | None = None) -> None:
+        if expected_identity is not None and name in self.run_ids:
+            assert expected_identity.name == name
+            assert expected_identity.run_id == self.run_ids[name]
         self.events.append(("remove", name))
         self.statuses.pop(name, None)
         self.run_ids.pop(name, None)
@@ -161,10 +217,25 @@ class FakeRuntime:
     def remove_volume(self, project: str, volume: str, backend: str, size_bytes: int) -> None:
         self.events.append(("remove-volume", project, volume, backend, size_bytes))
 
-    def logs(self, run_name: str, follow: bool):
+    def logs(
+        self,
+        run_name: str,
+        follow: bool,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ):
+        if expected_identity is not None:
+            assert expected_identity.name == run_name
+            assert expected_identity.run_id == self.run_ids[run_name]
         self.events.append(("logs", run_name, follow))
-        yield "first\n"
-        yield "second\n"
+        return _FakeLogStream(
+            ExistingRunRecord(
+                run_name,
+                self.run_ids[run_name],
+                2,
+                DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend(self.backends[run_name])),
+            )
+        )
 
     def callbacks(self) -> ProjectCallbacks:
         return ProjectCallbacks(
@@ -370,6 +441,41 @@ def test_rollback_touches_only_services_created_by_this_invocation(tmp_path: Pat
     assert runtime.statuses == {"demo-db-1": "running"}
 
 
+def test_rollback_keeps_successful_created_identity_when_name_is_reused(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    runtime = FakeRuntime()
+    roots = _roots(tmp_path)
+    runtime.fail_start = "worker"
+    callbacks = runtime.callbacks()
+    original_start = callbacks.start
+    replacement_run_id = str(uuid.uuid4())
+
+    def racing_start(
+        prepared: object,
+        *,
+        expected_identity: ExpectedRunIdentity | None = None,
+    ) -> object:
+        if prepared.plan.service == "worker":
+            runtime.run_ids["demo-api-1"] = replacement_run_id
+        return original_start(prepared, expected_identity=expected_identity)
+
+    callbacks = replace(callbacks, start=racing_start)
+
+    with pytest.raises(ProjectLifecycleError, match="start failed"):
+        up_project(project, callbacks, roots=roots, services=["worker"])
+
+    api_cleanup_events = [
+        event for event in runtime.events if event[0] in {"stop", "remove"} and event[1] == "demo-api-1"
+    ]
+    assert api_cleanup_events == []
+    assert runtime.run_ids["demo-api-1"] == replacement_run_id
+    assert runtime.statuses["demo-api-1"] == "running"
+    ledger = read_project_state(project, roots)
+    assert ledger is not None
+    assert set(ledger.services) == {"api"}
+    assert ledger.services["api"].run_id != replacement_run_id
+
+
 def test_down_is_reverse_order_and_preserves_named_volumes_by_default(tmp_path: Path) -> None:
     project = _project(tmp_path)
     runtime = FakeRuntime()
@@ -427,10 +533,52 @@ def test_ps_log_and_exec_mapping_helpers(tmp_path: Path) -> None:
     ]
     assert project_log_targets(project, ["api"], roots=roots, inspect=runtime.inspect) == (("api", "demo-api-1"),)
     assert managed_run_name(project, "api", roots=roots, inspect=runtime.inspect) == "demo-api-1"
-    assert list(project_logs(project, runtime.callbacks(), ["api"], roots=roots)) == [
-        ("api", "first\n"),
-        ("api", "second\n"),
+    log_events = list(project_logs(project, runtime.callbacks(), ["api"], roots=roots))
+    assert [event.data for service, event in log_events if isinstance(event, LogDataEvent) and service == "api"] == [
+        b"first\n",
+        b"second\n",
     ]
+    assert isinstance(log_events[-1][1], LogTerminalEvent)
+
+
+def test_project_logs_releases_project_lock_before_events_and_always_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    runtime = FakeRuntime()
+    roots = _roots(tmp_path)
+    up_project(project, runtime.callbacks(), roots=roots, services=["api"])
+    run_name = "demo-api-1"
+    record = ExistingRunRecord(
+        run_name,
+        runtime.run_ids[run_name],
+        2,
+        DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+    )
+    held = False
+
+    @contextmanager
+    def tracking_lock(_path: Path):
+        nonlocal held
+        assert not held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    class LockCheckingStream(_FakeLogStream):
+        def events(self) -> Iterator[LogEvent]:
+            assert not held
+            yield from super().events()
+
+    stream = LockCheckingStream(record)
+    callbacks = replace(runtime.callbacks(), logs=lambda *_args, **_kwargs: stream)
+    monkeypatch.setattr(state, "file_lock", tracking_lock)
+
+    assert list(project_logs(project, callbacks, ["api"], roots=roots))
+    assert stream.closed
 
 
 def test_foreign_run_collision_and_corrupt_schema_fail_closed(tmp_path: Path) -> None:
@@ -557,14 +705,22 @@ def test_locked_project_service_operation_and_stop_revalidate_identity(tmp_path:
     roots = _roots(tmp_path)
     up_project(project, runtime.callbacks(), roots=roots, services=["api"])
 
+    received_identity: list[ExpectedRunIdentity | None] = []
+
+    def execute(run_name: str, *, expected_identity: ExpectedRunIdentity | None = None):
+        received_identity.append(expected_identity)
+        return "executed", run_name
+
     observed = project_service_operation(
         project,
         "api",
         runtime.inspect,
-        lambda run_name: ("executed", run_name),
+        execute,
         roots=roots,
     )
     assert observed == ("executed", "demo-api-1")
+    assert len(received_identity) == 1
+    assert isinstance(received_identity[0], ExpectedRunIdentity)
 
     stopped = stop_project_services(project, runtime.callbacks(), ["db", "api"], roots=roots)
     assert stopped == ("api", "db")
@@ -596,8 +752,10 @@ def test_successful_up_refreshes_dependency_order_before_down(tmp_path: Path) ->
     down_project(changed, runtime.callbacks(), roots=roots)
     assert [event[1] for event in runtime.events if event[0] == "remove"] == ["demo-a-1", "demo-b-1"]
 
+
 def test_valid_backend_accepts_known_backends_and_rejects_unknown() -> None:
     from palimpsest_local.project_runtime import _KNOWN_BACKENDS, _valid_backend
+
     assert _KNOWN_BACKENDS == {"kvm", "lima-vz", "libvirt-hvf"}
     assert _valid_backend("kvm", "backend") == "kvm"
     assert _valid_backend("lima-vz", "backend") == "lima-vz"

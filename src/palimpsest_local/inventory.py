@@ -7,28 +7,73 @@ import datetime
 import os
 import re
 import shutil
+import stat as stat_module
+from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from . import runtime_dispatch
+from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import digest_file, require_digest
 from .errors import ArtifactValidationError, StateError
 from .hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
-from .lima import inspect_instance_status
 from .oci_layout import ContentStore
-from . import platforms
-from .platforms import preflight
-from .runtime import reconcile
+from .oci_store import OCIStore, OCIStoreError
 from .state import (
     StatePaths,
+    artifact_reference_guard,
     fsync_directory,
     init_roots,
+    pinned_owner_directory,
     read_json,
     read_tag_record,
+    read_tag_record_snapshot_at,
     state_root_source,
     write_state_root,
 )
 
 BUILD_ID_RE = re.compile(r"^(?:b|bk)-[0-9a-f]{12}$")
+
+
+def _fsync_index_directory(directory_fd: int) -> None:
+    os.fsync(directory_fd)
+
+
+def _unlink_index_entry(filename: str, *, directory_fd: int) -> None:
+    os.unlink(filename, dir_fd=directory_fd)
+
+
+def _run_artifact_digests(record: Any) -> frozenset[str]:
+    """Strictly project artifact references from one run ledger."""
+    if not isinstance(record, dict):
+        raise StateError("run ledger must be an object")
+    found: set[str] = set()
+    if "base" in record:
+        base = record["base"]
+        if not isinstance(base, dict):
+            raise StateError("run ledger base reference is invalid")
+        if "digest" in base:
+            if not isinstance(base["digest"], str):
+                raise StateError("run ledger base digest is invalid")
+            found.add(require_digest(base["digest"]))
+    if "base_digest" in record and record["base_digest"] is not None:
+        if not isinstance(record["base_digest"], str):
+            raise StateError("run ledger base digest is invalid")
+        found.add(require_digest(record["base_digest"]))
+    if "layers" in record:
+        layers = record["layers"]
+        if not isinstance(layers, list):
+            raise StateError("run ledger layers must be a list")
+        for layer in layers:
+            if isinstance(layer, str):
+                found.add(require_digest(layer))
+            elif isinstance(layer, dict) and isinstance(layer.get("digest"), str):
+                found.add(require_digest(layer["digest"]))
+            else:
+                raise StateError("run ledger layer reference is invalid")
+    return frozenset(found)
+
 
 def _dir_size(path: Path) -> int:
     if not path.exists():
@@ -67,6 +112,7 @@ def storage_report(roots: StatePaths) -> dict[str, Any]:
             "tags": _dir_size(roots.tags),
             "transfers": _dir_size(roots.transfers),
             "volumes": _dir_size(roots.volumes),
+            "oci_root_volumes": _dir_size(roots.oci_root_volumes),
             "build_cache": _dir_size(roots.build_cache),
         },
         "total_state_bytes": _dir_size(roots.state),
@@ -102,147 +148,55 @@ def _build_project_index(roots: StatePaths) -> dict[str, str]:
     return proj_index
 
 
+def _json_projection(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_projection(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_projection(item) for item in value]
+    return value
+
+
 def list_vms(roots: StatePaths) -> dict[str, Any]:
     proj_index = _build_project_index(roots)
-    warnings: list[str] = []
+    aggregation = runtime_dispatch.reconcile(roots=roots)
+    warnings = [
+        f"{error.entry_token}: {error.message}" if error.name is None else f"run '{error.name}': {error.message}"
+        for error in aggregation.errors
+    ]
     vms: list[dict[str, Any]] = []
+    for summary in aggregation.summaries:
+        name = summary.name
+        details = summary.details
+        layers = _json_projection(details["layers"])
+        ports = _json_projection(details["ports"])
+        volumes = _json_projection(details["volumes"])
+        ssh_info = _json_projection(details["ssh"])
+        guest_ip = details["guest_ip"] or ssh_info.get("host")
 
-    if not roots.runs.exists():
-        return {"vms": [], "warnings": []}
-
-    runs_by_backend: dict[str, list[tuple[str, Any, dict[str, Any]]]] = {}
-    for run_dir in sorted(roots.runs.iterdir()):
-        if not run_dir.is_dir():
-            continue
-        name = run_dir.name
-        try:
-            owner_data = read_json(run_dir / "owner.json") if (run_dir / "owner.json").is_file() else {}
-            st_data = read_json(run_dir / "state.json") if (run_dir / "state.json").is_file() else {}
-        except Exception as exc:
-            warnings.append(f"run '{name}': invalid ledger ({exc})")
-            continue
-        backend = st_data.get("backend", "kvm")
-        runs_by_backend.setdefault(backend, []).append((name, owner_data, st_data))
-
-    preflight_status: dict[str, tuple[bool, str]] = {}
-    for backend in runs_by_backend:
-        try:
-            preflight(backend)
-            preflight_status[backend] = (True, "")
-        except Exception as exc:
-            preflight_status[backend] = (False, str(exc))
-
-    reconciled_map: dict[str, dict[str, Any]] = {}
-    successfully_reconciled: set[str] = set()
-
-    for backend in (platforms.BACKEND_KVM, platforms.BACKEND_HVF):
-        if backend in runs_by_backend and preflight_status.get(backend, (False, ""))[0]:
-            resolved_profile = None
-            for _name, _owner, st_data in runs_by_backend[backend]:
-                base_info = st_data.get("base") if isinstance(st_data.get("base"), dict) else {}
-                arch = st_data.get("base_arch") or base_info.get("arch") or ""
-                if arch:
-                    try:
-                        resolved_profile = platforms.resolve_domain_profile(backend, arch)
-                        break
-                    except Exception:
-                        pass
-            if resolved_profile is None:
-                if backend == platforms.BACKEND_KVM:
-                    fallback_arch = platforms.detect_host().machine
-                else:
-                    fallback_arch = "aarch64"
-                resolved_profile = platforms.resolve_domain_profile(backend, fallback_arch)
-
-            try:
-                reconciled_runs, rec_warnings = reconcile(roots=roots, profile=resolved_profile)
-                warnings.extend(rec_warnings)
-                returned_names = set()
-                for r in reconciled_runs:
-                    r_name = r["name"]
-                    reconciled_map[r_name] = r["state"]
-                    successfully_reconciled.add(r_name)
-                    returned_names.add(r_name)
-
-                for r_name, _, _ in runs_by_backend[backend]:
-                    if r_name not in returned_names:
-                        warnings.append(f"run '{r_name}': omitted during reconciliation for backend '{backend}'")
-            except Exception as exc:
-                warnings.append(f"reconcile failed for backend '{backend}': {exc}")
-
-    if preflight_status.get("lima-vz", (False, ""))[0] and "lima-vz" in runs_by_backend:
-        for name, _, st_data in runs_by_backend["lima-vz"]:
-            try:
-                live_st = inspect_instance_status(name)
-                if live_st is not None:
-                    st_data["status"] = live_st
-                    successfully_reconciled.add(name)
-                else:
-                    warnings.append(f"run '{name}': Lima status inspection returned None")
-            except Exception as exc:
-                warnings.append(f"run '{name}': Lima status inspection failed ({exc})")
-
-    for backend, runs_list in runs_by_backend.items():
-        is_ok, err_msg = preflight_status.get(backend, (False, "preflight not run"))
-        for name, owner_data, st_data in runs_list:
-            if not is_ok:
-                stale = True
-                warnings.append(f"backend '{backend}' for run '{name}' is unavailable on this host ({err_msg})")
-            else:
-                if name in reconciled_map:
-                    st_data = reconciled_map[name]
-                stale = name not in successfully_reconciled
-            run_id = owner_data.get("run_id") if isinstance(owner_data, dict) else ""
-            if not run_id and isinstance(st_data, dict):
-                run_id = st_data.get("run_id", "")
-
-            status = st_data.get("status", "unknown")
-            base_info = st_data.get("base") if isinstance(st_data.get("base"), dict) else {}
-            base_digest = st_data.get("base_digest") or base_info.get("digest") or ""
-            base_arch = st_data.get("base_arch") or base_info.get("arch") or ""
-
-            layers_raw = st_data.get("layers", [])
-            layers = [
-                {"digest": l.get("digest", ""), "target_dev": l.get("target_dev", "")}
-                for l in layers_raw
-                if isinstance(l, dict) and "digest" in l
-            ]
-            layer_count = len(layers)
-
-            memory_mib = st_data.get("memory_mib")
-            vcpus = st_data.get("vcpus")
-            network = st_data.get("network")
-            ports = st_data.get("ports")
-            volumes = st_data.get("volumes")
-            ssh_info = st_data.get("ssh")
-            if not isinstance(ssh_info, dict):
-                ssh_info = {"host": st_data.get("guest_ip"), "port": 22}
-            guest_ip = st_data.get("guest_ip") or ssh_info.get("host")
-            project_name = proj_index.get(name)
-            created_at = st_data.get("created_at")
-            updated_at = st_data.get("updated_at")
-
-            vms.append({
+        vms.append(
+            {
                 "name": name,
-                "run_id": run_id,
-                "backend": backend,
-                "status": status,
-                "stale": stale,
-                "base_digest": base_digest,
-                "base_arch": base_arch,
+                "run_id": summary.run_id,
+                "runtime_kind": summary.runtime_kind.value,
+                "backend": summary.backend.value,
+                "status": summary.status,
+                "stale": summary.stale,
+                "base_digest": details["base_digest"],
+                "base_arch": details["base_arch"],
                 "layers": layers,
-                "layer_count": layer_count,
-                "memory_mib": memory_mib,
-                "vcpus": vcpus,
-                "network": network,
+                "layer_count": len(layers),
+                "memory_mib": details["memory_mib"],
+                "vcpus": details["vcpus"],
+                "network": details["network"],
                 "ports": ports,
                 "volumes": volumes,
                 "ssh": ssh_info,
                 "guest_ip": guest_ip,
-                "project": project_name,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            })
+                "project": proj_index.get(name),
+                "created_at": details["created_at"],
+                "updated_at": details["updated_at"],
+            }
+        )
 
     vms.sort(key=lambda x: x["name"])
 
@@ -485,7 +439,13 @@ def build_log(roots: StatePaths, build_id: str, *, tail: int = 400) -> str:
 
 
 def remove_artifact(roots: StatePaths, digest: str, *, force: bool = False) -> dict[str, Any]:
+    canonical_roots = StatePaths(config=roots.config.resolve(), state=roots.state.resolve())
     norm_digest = require_digest(digest)
+    with artifact_reference_guard(canonical_roots):
+        return _remove_artifact_locked(canonical_roots, norm_digest, force=force)
+
+
+def _remove_artifact_locked(roots: StatePaths, norm_digest: str, *, force: bool) -> dict[str, Any]:
     proj_index = _build_project_index(roots)
     referencing_runs: set[str] = set()
     referencing_projects: set[str] = set()
@@ -500,45 +460,123 @@ def remove_artifact(roots: StatePaths, digest: str, *, force: bool = False) -> d
                 continue
             try:
                 st = read_json(state_file)
-                base_d = st.get("base", {}).get("digest") or st.get("base_digest")
-                if base_d == norm_digest:
+                if norm_digest in _run_artifact_digests(st):
                     referencing_runs.add(name)
                     if name in proj_index:
                         referencing_projects.add(proj_index[name])
-                for layer in st.get("layers", []):
-                    layer_d = layer.get("digest") if isinstance(layer, dict) else str(layer)
-                    if layer_d == norm_digest:
-                        referencing_runs.add(name)
-                        if name in proj_index:
-                            referencing_projects.add(proj_index[name])
             except Exception:
-                pass
+                raise StateError("cannot prove artifact is unreferenced because a run ledger is invalid") from None
 
     names = sorted(referencing_runs | referencing_projects)
     if names:
         raise StateError(f"{norm_digest} is still used by: " + ", ".join(names))
 
-    removed_tags: list[str] = []
-    if roots.tags.exists():
-        for tag_file in roots.tags.glob("*.json"):
+    removed_tags: list[tuple[str, str, tuple[int, int, int, int, int]]] = []
+    with pinned_owner_directory(roots.tags) as tags_fd, ExitStack() as index_authorities:
+        assert tags_fd is not None
+        for tag_filename in sorted(name for name in os.listdir(tags_fd) if name.endswith(".json")):
             try:
-                tag_rec = read_tag_record(roots, tag_file.stem)
+                tag_name = tag_filename.removesuffix(".json")
+                tag_rec, tag_identity = read_tag_record_snapshot_at(tags_fd, tag_name)
                 if tag_rec.digest == norm_digest:
-                    removed_tags.append(tag_rec.tag)
+                    removed_tags.append((tag_rec.tag, tag_filename, tag_identity))
             except Exception:
-                pass
+                raise StateError("cannot prove artifact is unreferenced because a tag record is invalid") from None
 
-    store = ContentStore(roots.store)
-    freed_bytes = store.size(norm_digest) if store.exists(norm_digest) else 0
+        physical = ArtifactStore(roots.store)
+        derived = OCIStore(roots)
+        metadata_fd: int | None = None
+        metadata_present = False
+        metadata_identity: tuple[int, int] | None = None
+        metadata_filename = f"{norm_digest.split(':', 1)[1]}.json"
+        deleted_tags: list[str] = []
 
-    store.blob_path(norm_digest).unlink(missing_ok=True)
-    store.metadata_path(norm_digest).unlink(missing_ok=True)
-    for tag in removed_tags:
-        (roots.tags / f"{tag}.json").unlink(missing_ok=True)
+        def verify_tag_entry(tag_filename: str, tag_identity: tuple[int, int, int, int, int]) -> None:
+            current = os.stat(tag_filename, dir_fd=tags_fd, follow_symlinks=False)
+            current_identity = (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            )
+            if (
+                not stat_module.S_ISREG(current.st_mode)
+                or current.st_uid != os.geteuid()
+                or current_identity != tag_identity
+            ):
+                raise StateError("tag record changed before removal")
+
+        def verify_tag_entries() -> None:
+            for _, tag_filename, tag_identity in removed_tags:
+                verify_tag_entry(tag_filename, tag_identity)
+
+        def guard_retention_and_indexes() -> None:
+            nonlocal metadata_fd, metadata_identity, metadata_present
+            derived.assert_artifact_unleased(norm_digest)
+            verify_tag_entries()
+            metadata_fd = index_authorities.enter_context(
+                pinned_owner_directory(roots.store / "metadata", missing_ok=True)
+            )
+            if metadata_fd is None:
+                return
+            try:
+                entry = os.stat(metadata_filename, dir_fd=metadata_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not stat_module.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid():
+                raise StateError("artifact metadata entry is unsafe")
+            metadata_present = True
+            metadata_identity = (entry.st_dev, entry.st_ino)
+
+        def finalize_indexes() -> None:
+            if metadata_present:
+                assert metadata_fd is not None
+                current = os.stat(metadata_filename, dir_fd=metadata_fd, follow_symlinks=False)
+                if (
+                    not stat_module.S_ISREG(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or (current.st_dev, current.st_ino) != metadata_identity
+                ):
+                    raise StateError("artifact metadata entry changed before removal")
+                os.unlink(metadata_filename, dir_fd=metadata_fd)
+                _fsync_index_directory(metadata_fd)
+            for tag, tag_filename, tag_identity in removed_tags:
+                try:
+                    verify_tag_entry(tag_filename, tag_identity)
+                except (OSError, StateError):
+                    try:
+                        current_record, current_identity = read_tag_record_snapshot_at(tags_fd, tag)
+                    except StateError:
+                        try:
+                            os.stat(tag_filename, dir_fd=tags_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        raise
+                    if current_record.digest != norm_digest:
+                        continue
+                    verify_tag_entry(tag_filename, current_identity)
+                _unlink_index_entry(tag_filename, directory_fd=tags_fd)
+                deleted_tags.append(tag)
+            if deleted_tags:
+                _fsync_index_directory(tags_fd)
+
+        try:
+            freed_bytes = physical.delete_blob(
+                norm_digest,
+                retention_guard=guard_retention_and_indexes,
+                finalize=finalize_indexes,
+            )
+        except OCIStoreError as exc:
+            if exc.code == "oci-store-in-use":
+                raise StateError(f"{norm_digest} is retained by a durable OCI lease") from None
+            raise StateError("cannot prove artifact is unleased because OCI retention metadata is invalid") from None
+        except ArtifactStoreError:
+            raise StateError("artifact physical deletion failed descriptor verification") from None
 
     return {
         "digest": norm_digest,
-        "removed_tags": sorted(removed_tags),
+        "removed_tags": sorted(deleted_tags),
         "freed_bytes": freed_bytes,
     }
 
@@ -624,7 +662,9 @@ def move_state_root(roots: StatePaths, destination: Path, *, keep_source: bool =
 
     names = sorted(set(runs) | set(projects))
     if names:
-        raise StateError("relocating the state root requires no runs and no projects; remove them first: " + ", ".join(names))
+        raise StateError(
+            "relocating the state root requires no runs and no projects; remove them first: " + ", ".join(names)
+        )
 
     incoming = dest.parent / f"{dest.name}.incoming-{os.getpid()}"
     if incoming.exists():

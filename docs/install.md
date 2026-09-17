@@ -1,330 +1,235 @@
-# Installing Palimpsest Local
+# Detailed installation guide
 
-`palimpsest-local` is a standalone Python 3.12+ library and CLI (`palimpsest`) for managing verified local OCI artifacts, building SquashFS layers in disposable KVM guests, and orchestrating layered QEMU/libvirt virtual machines for Afterglow Palimpsest.
+Palimpsest Local is a Python 3.12+ CLI. Its base distribution has no required
+Python dependencies. The checkout version is `0.1.0.dev0`; public `v0.1.0`
+publication remains blocked pending the documented physical Linux KVM release
+gate. Build and install a local artifact, or select an exact-SHA GitHub
+development package, rather than assuming PyPI availability.
 
----
+Anonymous TLS OCI registry acquisition through `palimpsest oci pull` additionally
+requires Skopeo 1.13 or newer on `PATH`; it is an external executable rather
+than a Python package dependency. See the [anonymous registry intake
+contract](registry-intake.md) before relying on its authentication,
+TLS, platform, storage, and output-path limits. Other local archive operations
+do not require Skopeo.
 
-## System & Host Requirements
+## Download an exact-SHA development package
 
-Running local virtual machines is supported across Linux x86_64, Linux aarch64, and macOS Apple Silicon.
+Successful workflow runs for `main`, `dev`, and `codex/oci-root-phase1`
+publish a prerelease tagged `package-<full-commit-SHA>`. Choose the full SHA you
+reviewed instead of resolving a moving branch name or the Latest release:
 
-### 1. Hardware & Operating System
-- **Linux x86_64:** Production host with `/dev/kvm` hardware acceleration, `qemu-system-x86_64`, `libvirtd`, and `qemu:///system`.
-- **Linux aarch64:** Production host with `/dev/kvm` hardware acceleration, `qemu-system-aarch64`, `virt` machine, EFI firmware (e.g., `qemu-efi-aarch64` / `AAVMF`), `libvirtd`, and `qemu:///system`.
-- **macOS arm64 (Default):** Apple Silicon host using Lima 2.1+ and the VZ backend (`lima-vz`).
-- **macOS arm64 (Experimental):** Apple Silicon host using QEMU/libvirt with Hypervisor.framework acceleration (`libvirt-hvf`). Requires `brew install libvirt qemu`. SLIRP user-mode networking (`hostfwd`) is used because libvirt network drivers are unsupported on macOS; `--network` must be `none` or `default`.
-- **Python:** Python `>= 3.12`.
-
-### 2. Host System Packages & Hardware Verification
-
-#### Linux (x86_64 & aarch64)
-- **QEMU / libvirt:** `qemu-system-x86_64` (x86_64) or `qemu-system-aarch64` (aarch64), `libvirtd` (or `virtqemud`), `libvirt-clients`. User must have `/dev/kvm` access and permission to connect to `qemu:///system` with the `default` network.
-- **Disk Utilities:** `qemu-img` (qcow2 overlays), `mkfs.ext4` (project volumes), `cloud-localds` (NoCloud seed ISOs), `mksquashfs` and `unsquashfs` (`squashfs-tools` 4.5+ with `zstd`).
-- **SSH Client:** OpenSSH `ssh` and `scp` binaries.
-
-**Linux aarch64 Hardware Verification:**
-```bash
-# Import an arm64 cloud image and run a domain using the default network
-DIGEST=$(palimpsest image import ./ubuntu-24.04-server-cloudimg-arm64.img --disk-format qcow2 --arch aarch64 --os-variant ubuntu-24.04)
-palimpsest run "$DIGEST" --name arm-probe --network default
-palimpsest exec arm-probe -- uname -m   # Verify stdout prints: aarch64
-virsh dumpxml arm-probe                # Verify XML contains machine='virt' and EFI firmware
+```sh
+SHA="FULL_40_CHARACTER_COMMIT_SHA"
+BASE="https://github.com/openstack-afterglow/palimpsest/releases/download/package-${SHA}"
+DOWNLOAD_DIR="$(mktemp -d)"
+cd "$DOWNLOAD_DIR"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0-py3-none-any.whl"
+curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0.tar.gz"
+curl -fLO "${BASE}/SHA256SUMS"
+sha256sum -c SHA256SUMS && \
+  uv tool install --no-index ./palimpsest_local-0.1.0.dev0-py3-none-any.whl && \
+  palimpsest --version
 ```
 
-#### macOS (arm64)
-- **Lima (Default backend):** Lima 2.1 or newer for persistent `limactl disk` volumes, `additionalDisks`, and static TCP port forwarding.
-  ```bash
-  brew install lima
-  limactl --version
-  ```
-- **libvirt-hvf (Experimental backend):** Homebrew `libvirt` and `qemu` for Hypervisor.framework acceleration:
-  ```bash
-  brew install libvirt qemu
-  brew services start libvirt
-  ```
+The URLs exist only after that commit's workflow succeeds. The publisher
+refuses an existing tag and never overwrites assets. This prerelease is not
+Latest, stable, PyPI-published, signed, or native KVM/Gate 2-qualified. Review
+the [GitHub releases list](https://github.com/openstack-afterglow/palimpsest/releases)
+and commit before use. On macOS, use `shasum -a 256 -c SHA256SUMS` if GNU
+`sha256sum` is unavailable.
 
-**macOS libvirt-hvf Hardware Verification:**
-```bash
-# Start libvirt service, import image, and run with --backend libvirt-hvf
-brew services start libvirt
-DIGEST=$(palimpsest image import ./ubuntu-24.04-server-cloudimg-arm64.img --disk-format qcow2 --arch aarch64 --os-variant ubuntu-24.04)
-palimpsest run "$DIGEST" --name hvf-probe --backend libvirt-hvf --network none
-virsh -c qemu:///session dumpxml hvf-probe  # Verify domain type='hvf' and -netdev user,hostfwd=...
-palimpsest exec hvf-probe -- uname -m      # Verify guest execution succeeds over local port
-```
-### 3. BuildKit Requirements for Dockerfile Builds
+If release publication fails after the tag is created, the workflow preserves
+that tag and an automated rerun fails instead of deleting or replacing it.
+Maintainer inspection and explicit recovery are required.
 
-The Dockerfile frontend invokes `docker buildx build`; install Docker Engine/Desktop with the Buildx plugin and a running BuildKit-backed builder. The Docker CLI is also the execution backend for Palimpsest's Docker-compatible image commands and `palimpsest docker ...` passthrough. BuildKit cache records remain separate from the SquashFS runtime block attached to a VM.
+### Verified development-package checkpoint
 
-Palimpsest exports an OCI archive, so the currently selected builder must use an OCI-export-capable `docker-container`, `kubernetes`, or `remote` driver. The default `docker` driver does not support the OCI exporter. Before each build, Palimpsest runs the read-only `docker buildx inspect` command and fails with setup guidance when the selected driver is incompatible; it never creates, bootstraps, or changes the selected builder.
+The [development-package Actions run for
+`7c7ac540fb792b06e8bdd4900662f83477e8f566`](https://github.com/openstack-afterglow/palimpsest/actions/runs/34468685079)
+completed successfully and published the public
+[`package-7c7ac540fb792b06e8bdd4900662f83477e8f566`
+prerelease](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-7c7ac540fb792b06e8bdd4900662f83477e8f566).
+Its verified SHA-256 values are:
 
-To keep Docker Desktop's selected builder unchanged, create a separate builder and select it only for the Palimpsest process:
+- wheel: `305c5bd1b2e23516f4b332e1c4a677acee775715430ab02cc3c8405cff1f3f10`
+- sdist: `fca917387230b66a08065387e641ff35a81f3f47b3435968b802161a4824c378`
 
-```bash
-docker buildx create --name palimpsest --driver docker-container
-docker buildx inspect --builder palimpsest --bootstrap
-BUILDX_BUILDER=palimpsest palimpsest build . --frontend dockerfile -f Dockerfile --tag demo
-```
+On the Linux verification server, an isolated download into
+`/tmp/palimpsest-github-install.QkUfxsHw` passed checksum verification,
+`--no-index` wheel installation, CLI version/help, and the sealed stage-1 ELF
+validation. The installed wheel then cold-materialized the same fresh
+`hello-world` archive into a 4,096-byte SquashFS image with SHA-256
+`cbc3b5f5473509f8b760a5b673d5f5c78cb3303e1da8b38ea1a0768dc4d0e59c`.
+This checkpoint verifies public package delivery, isolated installation, and
+cold materialization only; it did not boot a native VM and is not Gate 2
+qualification.
 
-An existing `kubernetes` or `remote` builder can be supplied through `BUILDX_BUILDER` in the same way. See Docker's [OCI exporter](https://docs.docker.com/build/exporters/oci-docker/) and [build driver](https://docs.docker.com/build/builders/drivers/) documentation for the upstream capability matrix.
+## Build and verify distributions
 
-Registry profiles can describe BuildKit mirrors, private CA files, and transport policy. Generate a daemon configuration and apply it when explicitly creating the dedicated builder:
+From a trusted checkout with [uv](https://docs.astral.sh/uv/) available:
 
-```bash
-palimpsest registry buildkit-config --output ./buildkitd.toml
-
-docker buildx create \
-  --name palimpsest \
-  --driver docker-container \
-  --buildkitd-config ./buildkitd.toml
-docker buildx inspect --builder palimpsest --bootstrap
+```sh
+uv run python scripts/build_package.py --out-dir dist/package-0.1.0.dev0
 ```
 
-Generating `buildkitd.toml` does not modify an existing builder. Mirror, CA, `plain_http`, and TLS-skip settings take effect only after that file is supplied to a new or otherwise explicitly configured BuildKit daemon. The generated file contains no credentials and does not change Docker Engine/Desktop's pull/push trust store, insecure-registry list, or daemon mirror configuration.
+The output directory must not already exist; choose a new path for a rebuild.
+The command builds an sdist, builds the wheel from that sdist, validates every
+archive and checks the sealed `oci-stage1-init.x86_64` ELF byte-for-byte. It then
+creates a fresh environment, installs with `--no-deps --no-index`, invokes the
+runtime ELF validator under isolated Python, runs installed CLI help away from
+the checkout, and writes sorted `SHA256SUMS`. A commit-derived
+`SOURCE_DATE_EPOCH` stabilizes archive timestamps; it does not imply that
+different source trees produce identical packages.
 
-For an online build, configure `PALIMPSEST_URL` and `PALIMPSEST_TOKEN`. The resolver consults Hub before executing a cache miss and treats Hub authentication, transport, metadata, and digest errors as fatal.
+Use another uv executable when PATH is intentionally restricted:
 
-For strict `--offline` builds, provision all of the following locally before starting:
-
-- a dedicated, already-bootstrapped single-node local Buildx builder created with `--driver docker-container --driver-opt network=none`;
-- a digest-pinned OCI layout for each Dockerfile `FROM` alias;
-- the immutable qcow2/raw runtime base in the local content store;
-- any BuildKit cache intended for reuse;
-- a local build context.
-
-Create and bootstrap the offline builder while the required BuildKit image is still available, then select it only for the Palimpsest process:
-
-```bash
-docker buildx create --name palimpsest-offline \
-  --driver docker-container \
-  --driver-opt network=none
-docker buildx inspect --builder palimpsest-offline --bootstrap
-BUILDX_BUILDER=palimpsest-offline palimpsest build . \
-  --frontend dockerfile --offline --network none --tag demo
+```sh
+python3 scripts/build_package.py --out-dir /tmp/palimpsest-package \
+  --uv /absolute/path/to/uv
 ```
 
-Offline mode verifies that the builder has exactly one node, that its endpoint matches the current local Unix/named-pipe Docker context, and that its sole running BuildKit container's Docker network mode is `none`. It also enforces `--network none` for build steps, rejects remote or dynamic Dockerfile sources, verifies the transitive blobs of each pinned OCI layout, and does not load Palimpsest registry profiles, invoke registry authentication, or use Hub, a remote registry, or a remote cache exporter. Docker may still read its selected `DOCKER_CONFIG` to locate the local context and builder. It rejects `--registry`, `--pull`, `--push`, `--runtime-push`, and external `--cache-from`/`--cache-to` options. The command and verification contract are in [BuildKit Cache and Block Runtime Workflow](buildkit-block-workflow.md).
+This is a package smoke test, not publication, signing, or native KVM proof.
 
----
+## Developer or user-private installation
 
-## Installation
+Install the wheel into an isolated tool environment:
 
-### Base Package (Stdlib-only Core)
-The base distribution has zero required runtime Python dependencies. It provides the full CLI for artifact verification, bundle management, layer packing, and Hub interaction:
-
-```bash
-pip install .
-# or using uv:
-uv pip install .
+```sh
+uv tool install --no-index \
+  dist/package-0.1.0.dev0/palimpsest_local-0.1.0.dev0-py3-none-any.whl
+palimpsest --help
 ```
 
-### libvirt Runtime Extra (`[kvm]`)
-To enable VM execution on **Linux x86_64 and aarch64** using libvirt/KVM, install with the `kvm` optional dependency extra:
+On Linux, an unconfigured process selects `/var/lib/palimpsest`, which a normal
+user generally cannot create. For a user-private artifact-only setup, select an
+explicit private state parent before stateful commands:
 
-```bash
-pip install '.[kvm]'
-# or using uv:
-uv tool install 'palimpsest-local[kvm]'
+```sh
+export XDG_STATE_HOME="$HOME/.local/state"
+palimpsest store show
 ```
 
-The `[kvm]` extra installs `libvirt-python>=10.0.0`. `libvirt-python` is imported dynamically only during libvirt domain operations (`palimpsest_local.kvm`), allowing pure artifact workflows to function in environments without libvirt installed.
+That does not provision the dedicated system identity and is not a substitute
+for administrator review of KVM/libvirt access. For checkout development use
+`uv sync --extra dev`; installing the package does not alter shell startup files.
 
-**macOS Apple Silicon** VM execution uses Lima/VZ by default, which is included in the base package and needs no extra. The experimental `libvirt-hvf` backend does use libvirt, so it requires this extra plus Homebrew `libvirt`/`qemu`. See [System & Host Requirements](#system--host-requirements) for setup details and the [VM workflow guide](vm-workflow.md) for the end-to-end command reference.
+## Optional runtime prerequisites
 
-### Development Installation
-For running the test suite and linters:
+The package does not install hypervisors or modify host permissions.
 
-```bash
-uv sync --extra dev --extra kvm
+- Linux KVM/libvirt needs the `kvm` extra (`libvirt-python>=10.0.0`) and the
+  host's QEMU, libvirt, `qemu-img`, `cloud-localds`, SquashFS, OpenSSH, and
+  filesystem tools. `/dev/kvm`, firmware, network, and libvirt access must
+  already be configured. OCI-root qualification is currently Linux x86_64.
+- macOS Apple Silicon uses separately installed Lima/VZ by default. The
+  experimental libvirt/HVF backend additionally needs QEMU, libvirt, and the
+  `kvm` Python extra.
+- Dockerfile workflows need a separately managed Docker Buildx builder.
+
+Installing the optional Python dependency may require libvirt development
+headers and an approved package index. The base-wheel offline installation
+deliberately does not resolve it.
+
+In an environment where the host libraries and approved dependency source are
+already configured, install the wheel with its extra explicitly:
+
+```sh
+python3.12 -m venv .venv-kvm
+.venv-kvm/bin/python -m pip install \
+  'dist/package-0.1.0.dev0/palimpsest_local-0.1.0.dev0-py3-none-any.whl[kvm]'
+.venv-kvm/bin/palimpsest --help
 ```
 
-### Shell Completion Setup
-Palimpsest includes dynamic shell completion scripts for `zsh`, `bash`, and `fish`. Completion candidates follow the live CLI `argparse` tree dynamically and suppress unrelated filesystem suggestions.
+This can contact the configured index for `libvirt-python`; it is intentionally
+separate from the offline base-wheel smoke test.
 
-The `palimpsest` executable (or active virtual environment) must be active and on your `PATH`. Installing the package does not silently modify shell configuration files.
-The Zsh and Bash startup forms require `palimpsest` on `PATH` when the shell starts. For a project-local virtual environment, run the current-shell activation after `source .venv/bin/activate`.
+## 3. BuildKit Requirements for Dockerfile Builds
 
-#### Zsh (macOS / Linux Primary)
-```bash
-# Current shell session:
-autoload -Uz compinit && compinit
-eval "$(palimpsest completion zsh)"
+Dockerfile builds require an existing OCI-export-capable Buildx builder. The
+default `docker` driver cannot provide that exporter; select a separately
+managed `docker-container`, `kubernetes`, or `remote` builder. Palimpsest checks
+the selected builder but does not create or reconfigure it. Strict offline
+builds additionally require a previously bootstrapped, single-node local
+`docker-container` builder using `--driver-opt network=none` and locally
+available pinned inputs. See the [BuildKit cache and runtime-block
+workflow](buildkit-block-workflow.md) for creation commands, network checks,
+cache rules, and registry configuration.
 
-# Persistent setup: add both lines to ~/.zshrc
-autoload -Uz compinit && compinit
-eval "$(palimpsest completion zsh)"
+## Administrator-owned Linux installation
+
+For a single-operator service host, keep installed code separate from mutable
+assets. An administrator-owned virtual environment is one possible pattern:
+
+```sh
+cd /
+sudo python3.12 -I -m venv /opt/palimpsest
+sudo /opt/palimpsest/bin/python -I -m pip install --no-index --no-deps \
+  /trusted/path/palimpsest_local-0.1.0.dev0-py3-none-any.whl
 ```
 
-#### Bash & Fish Alternatives
-```bash
-# Bash - Current shell session:
-source <(palimpsest completion bash)
+Use an approved local environment installer if that Python lacks `venv` or
+pip. Verify the environment and wheel are administrator-owned and not writable
+by the service identity. Never run privileged commands from an editable user
+checkout, an untrusted current directory, or a download-to-`sudo` pipeline.
 
-# Bash - Persistent setup: add this guarded line to ~/.bashrc
-if command -v palimpsest >/dev/null 2>&1; then source <(palimpsest completion bash); fi
+Package installation creates no account or system directory. After reviewing
+the deployment identity, explicitly invoke the packaged provisioner:
 
-# Fish - Current shell session:
-palimpsest completion fish | source
-
-# Fish - Persistent setup:
-mkdir -p ~/.config/fish/completions
-palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
+```sh
+cd /
+sudo /opt/palimpsest/bin/python -I -m palimpsest_local.linux_install
 ```
 
-#### Expected Tab Completion Behavior
-- `palimpsest <Tab><Tab>` → lists top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `ui`, `store`, etc.)
-- `palimpsest image <Tab><Tab>` → lists `image` subcommands (`inspect`, `history`, `rm`, `save`, `load`, `ls`, `pull`, `verify`, `import`, `push`)
-- `palimpsest run --backend <Tab><Tab>` → lists valid choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
+It creates the no-login `palimpsest` user and primary group, then
+`/var/lib/palimpsest` and `/var/log/palimpsest`, owned by that identity with
+mode `0700`. Matching existing objects are accepted; conflicts and symlinks are
+rejected. It never recursively changes ownership, migrates or removes data,
+adds privileged group memberships, or writes sudoers policy. A failed account
+command can leave partial setup that requires administrator inspection. Group
+ownership is descriptive: mode `0700` does not grant shared writes.
 
----
+Run management commands under that identity with inherited root overrides
+removed, for example:
 
-## Package vs. KVM-Extra Boundary
-
-| Capability | Base Package (`palimpsest-local`) | KVM Extra (`palimpsest-local[kvm]`) |
-|---|---|---|
-| Python dependencies | None (stdlib only) | `libvirt-python>=10.0.0` |
-| Platform support | Linux, macOS, BSD | Linux x86_64 with `/dev/kvm` |
-| Commands available | Hub `image`/`layer`/`bundle`, registry profiles, Docker-compatible image commands, Dockerfile/Buildx `build` | `run`, `compose`, Palimpsestfile guest `build`, `commit`, `ps`, `inspect`, `logs`, `shell`, `exec`, `stop`, `rm` |
-| Primary use case | Hub interaction, CI artifact verification, Dockerfile builds | Local VM lifecycle, guest-delta building, and committing |
-
-Afterglow API containers depend on `palimpsest-local==0.1.0` without the `[kvm]` extra, keeping container images lightweight and free of C/libvirt system library overhead.
-
----
-
-## Environment Variables
-
-| Variable | Description | Default / Fallback |
-|---|---|---|
-| `PALIMPSEST_URL` | Base URL of Afterglow Hub API (e.g. `https://hub.afterglow.dev`) | `--url` CLI argument |
-| `PALIMPSEST_TOKEN` | Bearer token for Hub authentication | **Required for Hub requests** (No CLI flag exists, preventing token leaks in `ps` output) |
-| `PALIMPSEST_REGISTRY` | Registry profile used for unqualified image references | `default` in `registries.toml` |
-| `DOCKER_CONFIG` | Existing Docker configuration and credential-helper directory | `~/.docker` |
-| `XDG_CONFIG_HOME` | Configuration root directory | `~/.config` |
-| `XDG_STATE_HOME` | Local state and store root directory | `~/.local/state` |
-
----
-
-## XDG Paths & Permission Expectations
-
-All configuration, state, and cryptographic key directories are strictly owner-only.
-
-### Configuration
-- Path: `${XDG_CONFIG_HOME:-~/.config}/palimpsest/config.toml`
-- Permissions: Directory `0700`, File `0600`.
-
-```toml
-[hub]
-url = "https://hub.example.invalid"
+```sh
+sudo -H -u palimpsest env -u PALIMPSEST_STATE_HOME -u PALIMPSEST_LOG_HOME \
+  -u XDG_STATE_HOME -u XDG_CONFIG_HOME \
+  /opt/palimpsest/bin/python -I -m palimpsest_local.cli store show
 ```
 
-`--url` takes precedence over `PALIMPSEST_URL`, which takes precedence over this non-secret configuration value.
+Any KVM, libvirt, or Docker access is a separate host-policy decision; the
+installer does not grant it.
 
-### Registry profiles
+The command journal defaults to `/var/log/palimpsest` for this system setup. A
+user-private Linux process cannot write there and reports a fixed warning while
+continuing the requested command. To retain a private journal, pre-create a
+private directory with mode `0700` and select its absolute path explicitly:
 
-- Path: `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`
-- Permissions: Directory `0700`, File `0600`.
-- Contents: endpoints, namespaces, mirrors, absolute CA paths, transport flags, and optional external BuildKit cache definitions. Secrets and inline credentials are rejected.
-
-The built-in `docker` profile uses `docker.io` with namespace `library`. Configure and select an external registry without editing TOML manually:
-
-```bash
-palimpsest registry add corp registry.example.com \
-  --namespace platform \
-  --default
-palimpsest registry inspect corp
-
-palimpsest login --registry corp
+```sh
+install -d -m 0700 "$HOME/.local/state/palimpsest-log"
+export PALIMPSEST_LOG_HOME="$HOME/.local/state/palimpsest-log"
 ```
 
-Registry selection for unqualified image references is: an explicit registry in the reference, the command's `--registry`, `PALIMPSEST_REGISTRY`, then the configured default. Credentials stay in Docker's existing `DOCKER_CONFIG`/`~/.docker` credential store. Palimpsest never writes them to `registries.toml`; for automation, pipe a password to `palimpsest login --username USER --password-stdin`.
+## Upgrade and uninstall
 
-See [Docker/OCI Registry Profiles](registries.md) for the full command and BuildKit configuration contract.
+Build into a new directory and smoke-test the new wheel first. Stop workloads
+according to local operations policy, replace only the package in the same
+isolated Python environment, then run CLI and relevant runtime checks.
 
-### State & Store Layout
-Root directory: `${XDG_STATE_HOME:-~/.local/state}/palimpsest/` (Permissions: `0700`).
+For a uv tool installation, upgrade and uninstall the code explicitly:
 
-```text
-~/.local/state/palimpsest/
-├── store/                          # Content-addressed artifact store (dir: 0700)
-│   └── blobs/sha256/<hex>          # Verified immutable blob files (file: 0444)
-├── runs/                           # Local VM run ledgers (dir: 0700)
-│   └── <name>/                     # Per-run directory (dir: 0700)
-│       ├── owner.json              # Schema v1 ownership & UUID record (file: 0600)
-│       ├── state.json              # Atomic lifecycle state ledger (file: 0600)
-│       ├── overlay.qcow2           # Writable qcow2 overlay for vda (file: 0600)
-│       ├── seed.iso                # NoCloud seed ISO configuration disk (file: 0600)
-│       ├── console.log             # Domain serial console log (file: 0600)
-│       └── ssh/                    # Owner-only SSH directory (dir: 0700)
-│           ├── id_ed25519          # Client private key (file: 0600)
-│           ├── id_ed25519.pub      # Client public key (file: 0644)
-│           ├── host_id_ed25519     # Guest host private key (file: 0600)
-│           └── known_hosts         # Strict SSH host key pin (file: 0600)
-├── projects/                       # palimpsest.yml ownership/reconcile ledgers
-│   └── <project>/state.json        # service UUID/backend/config bindings (0600)
-├── volumes/                        # persistent project block storage
-│   └── <project>/                  # KVM raw ext4 images or Lima owner receipts
-├── locks/                          # Exclusive process lock files (dir: 0700)
-│   └── <name>.lock                 # Run lock file (file: 0600)
-├── transfers/                      # Resumable upload session checkpoints (dir: 0700)
-│   └── <digest_hex>.json           # Transfer metadata record (file: 0600)
-├── tags/                           # Local runtime-layer tag records (dir: 0700)
-│   └── <tag>.json                  # Immutable schema v1 tag record (file: 0600)
-├── build-cache/                    # BuildKit local-exporter cache (dir: 0700)
-│   └── <scope>/
-│       ├── current.json            # Atomic pointer to the committed generation
-│       └── generations/<build-id>/ # Complete locally exported cache generation
-└── builds/                         # Disposable build records (dir: 0700)
-    └── <build-id>/                 # Per-build log, metadata, cache archive, and ledger
-        └── record.json             # Legacy schema v1 or BuildKit schema v2 receipt (file: 0600)
+```sh
+uv tool install --force --no-index /path/to/new/palimpsest_local-*.whl
+uv tool uninstall palimpsest-local
 ```
 
----
+Upgrading or removing Python code does **not** remove or migrate
+`/var/lib/palimpsest`, `/var/log/palimpsest`, explicit XDG state, VM definitions,
+volumes, Docker data, or Lima-managed disks. Preserve and inspect those assets
+before changing the environment. The provisioner has no uninstall mode;
+account and directory removal is an explicit administrator operation outside
+package management.
 
-## Local Management GUI & Storage Administration
-
-### 1. Web Management Dashboard (`palimpsest ui`)
-Serve a local dashboard web UI on `127.0.0.1`:
-
-```bash
-# Start server on an ephemeral port and open browser
-palimpsest ui
-
-# Specify a custom port without opening browser
-palimpsest ui --port 8765 --no-browser
-```
-
-The web dashboard provides four tabs:
--+ **VMs:** View active/stopped VMs, hypervisor backend badges, layer breakdown, resource allocation, SSH endpoints, and live console logs.
--+ **Artifacts:** Inspect images and SquashFS layers, view size and reference counts, import cloud images, and delete unreferenced blobs.
--+ **Builds:** History of Palimpsestfile and BuildKit builds, build duration, execution phase timings, and build logs.
--+ **Storage:** Current state root path, storage source (`env`, `config`, or `default`), per-directory byte breakdown, free disk space, and relocation controls.
-
-### 2. CLI Storage Management (`palimpsest store`)
-Manage content-addressed artifacts and state root configuration:
-
-```bash
-# Show state root path, config source, and directory space utilization
-palimpsest store show --format json
-
-# List stored images and SquashFS layers
-palimpsest store ls --kind all
-
-# Remove an unreferenced artifact (fails closed if referenced by active VM runs or projects)
-palimpsest store rm sha256:<digest>
-
-# Relocate state root to a new directory (safeguard: requires no active runs or projects)
-palimpsest store move --to /mnt/fast-storage/palimpsest
-
-# Point config to an existing state root directory
-palimpsest store set --to /mnt/fast-storage/palimpsest
-```
-
-**Storage Relocation Safeguards & Lima Notice:**
--+ `store move` verifies that destination path is absolute and that `runs/` and `projects/` ledgers contain no active instances before copying.
--+ **Lima-managed disks non-relocation notice:** `limactl disk` volumes are managed by Lima (`~/.lima`) and are **not** relocated when moving the Palimpsest state root.
-
----
-
-## KVM Release Gate Notice
-
-> **Mandatory Release Gate:** Standalone release `v0.1.0` on PyPI and cutover of Afterglow dependencies remain **blocked** pending full integration proof on a physical Linux x86_64 KVM host (`pytest -m kvm`). The implementation is verified in pure unit and mock integration environments, but final publication requires end-to-end execution proof on hardware virtualization.
+See [Linux storage and logging](linux-storage-logging.md) for state and journal
+contracts and the [VM workflow guide](vm-workflow.md) for runtime prerequisites.

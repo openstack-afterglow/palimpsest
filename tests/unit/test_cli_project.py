@@ -8,8 +8,45 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import cli
+from palimpsest_local.runtime_types import (
+    CloudImageInspectDetail,
+    DispatchKey,
+    ExistingRunRecord,
+    ExpectedRunIdentity,
+    InspectBase,
+    InspectLifecycle,
+    InspectPort,
+    InspectRecord,
+    InspectSshEndpoint,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 _IMAGE = "sha256:" + "a" * 64
+
+
+def _typed_inspect(status: str, ports: tuple[InspectPort, ...] = ()) -> InspectRecord:
+    return InspectRecord(
+        schema_version=1,
+        record=ExistingRunRecord(
+            "demo-api-1",
+            "00000000-0000-0000-0000-000000000001",
+            2,
+            DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        ),
+        lifecycle=InspectLifecycle(status, 0, None, None),
+        detail=CloudImageInspectDetail(
+            InspectBase(None, None, None),
+            (),
+            None,
+            None,
+            None,
+            ports,
+            (),
+            InspectSshEndpoint(None, 22),
+            None,
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -200,28 +237,38 @@ def test_compose_exec_preserves_argv_and_never_uses_a_shell(
     monkeypatch.setattr(
         cli,
         "project_service_operation",
-        lambda _project, _service, _inspect, operation, **_kwargs: operation("demo-api-1"),
+        lambda _project, _service, _inspect, operation, **_kwargs: operation(
+            "demo-api-1",
+            expected_identity=ExpectedRunIdentity(
+                "demo-api-1",
+                "00000000-0000-0000-0000-000000000001",
+                DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
+            ),
+        ),
     )
-    monkeypatch.setattr(cli.lima, "is_lima_run", lambda _paths: False)
+    session = object()
+    calls: list[tuple[str, list[str], ExpectedRunIdentity | None]] = []
+
+    def fake_exec(name, command, *, roots, expected_identity):
+        del roots
+        calls.append((name, command, expected_identity))
+        return session
+
+    monkeypatch.setattr(cli.runtime_dispatch, "exec", fake_exec)
     monkeypatch.setattr(
         cli,
-        "exec_command",
-        lambda name, command, **_kwargs: ["ssh", name, "--", *command],
+        "_run_process_session",
+        lambda candidate, *, interactive: 17 if candidate is session and not interactive else pytest.fail(),
     )
-    calls: list[tuple[list[str], bool]] = []
-
-    def fake_run(argv, *, shell):
-        calls.append((argv, shell))
-        return SimpleNamespace(returncode=17)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
     result = cli.main(
         ["compose", "--project-directory", str(tmp_path), "exec", "api", "--", "printf", "%s", "hello world"]
     )
 
     assert result == 17
-    assert calls == [(["ssh", "demo-api-1", "--", "printf", "%s", "hello world"], False)]
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("demo-api-1", ["printf", "%s", "hello world"])
+    assert isinstance(calls[0][2], ExpectedRunIdentity)
 
 
 def test_compose_port_prints_owner_verified_applied_mapping_instead_of_current_yaml(
@@ -230,21 +277,7 @@ def test_compose_port_prints_owner_verified_applied_mapping_instead_of_current_y
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_project(tmp_path)
-    inspected = {
-        "owner": {"run_id": "00000000-0000-0000-0000-000000000001"},
-        "state": {
-            "status": "running",
-            "backend": "lima-vz",
-            "ports": [
-                {
-                    "host_ip": "127.0.0.1",
-                    "host_port": 19090,
-                    "guest_port": 8080,
-                    "protocol": "tcp",
-                }
-            ],
-        },
-    }
+    inspected = _typed_inspect("running", (InspectPort("127.0.0.1", 19090, 8080, "tcp"),))
     callbacks = SimpleNamespace(inspect=lambda _name: inspected)
     monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
 
@@ -275,7 +308,7 @@ def test_compose_port_rejects_malformed_applied_runtime_state(
     monkeypatch.setattr(cli, "managed_run_name", fake_managed_run_name)
 
     assert cli.main(["compose", "--project-directory", str(tmp_path), "port", "api", "8080"]) == 1
-    assert "malformed applied port state" in capsys.readouterr().err
+    assert "typed inspect record" in capsys.readouterr().err
 
 
 def test_compose_port_rejects_removed_runtime_instead_of_falling_back_to_yaml(
@@ -285,19 +318,7 @@ def test_compose_port_rejects_removed_runtime_instead_of_falling_back_to_yaml(
 ) -> None:
     _write_project(tmp_path)
     callbacks = SimpleNamespace(
-        inspect=lambda _name: {
-            "state": {
-                "status": "removed",
-                "ports": [
-                    {
-                        "host_ip": "127.0.0.1",
-                        "host_port": 18080,
-                        "guest_port": 8080,
-                        "protocol": "tcp",
-                    }
-                ],
-            }
-        }
+        inspect=lambda _name: _typed_inspect("removed", (InspectPort("127.0.0.1", 18080, 8080, "tcp"),))
     )
     monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
 
@@ -361,13 +382,19 @@ def test_compose_env_file_must_remain_inside_project(tmp_path: Path, capsys: pyt
     assert "must stay inside" in capsys.readouterr().err
 
 
-def test_runtime_bundle_fails_early_on_apple_silicon_without_trusted_architecture(
+def test_runtime_bundle_validation_has_no_host_lima_availability_heuristic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = tmp_path / "bundle"
     bundle.mkdir()
-    monkeypatch.setattr(cli.lima, "available", lambda: True)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "verify_layout_dir",
+        lambda path: calls.append(path) or SimpleNamespace(manifests=()),
+    )
 
-    with pytest.raises(cli.PalimpsestError, match="x86_64/KVM-only"):
+    with pytest.raises(cli.PalimpsestError, match="exactly one selectable manifest"):
         cli._resolve_runtime_stack(SimpleNamespace(), bundle, (), None)
+    assert calls == [bundle]
