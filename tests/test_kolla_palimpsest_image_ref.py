@@ -74,4 +74,3 @@ def test_accepts_source_build_commit_tag() -> None:
         "afterglow-local/palimpsest-hub-api:e83ce559e3e3",
         source_mode=True,
     )
-

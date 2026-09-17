@@ -16,7 +16,6 @@ KOLLA_DIR = REPO_ROOT / "deploy" / "kolla"
 ROLE_DIR = KOLLA_DIR / "ansible" / "roles" / "palimpsest"
 
 
-
 def _get_hub_version() -> str:
     init_py = REPO_ROOT / "hub" / "src" / "palimpsest_hub" / "__init__.py"
     for line in init_py.read_text(encoding="utf-8").splitlines():

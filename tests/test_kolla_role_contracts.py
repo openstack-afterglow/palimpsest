@@ -117,7 +117,9 @@ def test_haproxy_public_route_defaults_are_disabled_and_combine_into_services():
     assert defaults_yaml["palimpsest_haproxy_services"] == (
         "{{ palimpsest_services | combine(palimpsest_public_haproxy_services, recursive=True) }}"
     )
-    public_haproxy = defaults_yaml["palimpsest_public_haproxy_services"]["palimpsest-public"]["haproxy"]["palimpsest-public"]
+    public_haproxy = defaults_yaml["palimpsest_public_haproxy_services"]["palimpsest-public"]["haproxy"][
+        "palimpsest-public"
+    ]
     assert public_haproxy["external_fqdn"] == "{{ palimpsest_public_haproxy_fqdn }}"
 
 
@@ -129,6 +131,5 @@ def test_loadbalancer_task_wires_combined_haproxy_services_and_prunes_when_disab
 def test_precheck_validates_public_hostname_matches_endpoint_url():
     assert "palimpsest_public_haproxy_fqdn is match(" in precheck_text
     assert (
-        "(palimpsest_public_endpoint_url | regex_replace('/$', '')) == "
-        "('https://' ~ palimpsest_public_haproxy_fqdn)"
+        "(palimpsest_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ palimpsest_public_haproxy_fqdn)"
     ) in precheck_text
