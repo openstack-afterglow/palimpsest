@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.1.0"
+palimpsest_image_tag: "0.1.1"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
