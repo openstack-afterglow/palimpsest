@@ -23,7 +23,7 @@ jobs:
       - run: uv sync --frozen --extra dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run python -m pytest tests/unit -v
+      - run: uv run python -m pytest tests/unit tests/test_kolla_assets.py tests/test_kolla_palimpsest_image_ref.py tests/test_kolla_role_contracts.py -v
       - run: uv build
       - run: python -m zipfile -t dist/*.whl
       - run: tar -tzf dist/*.tar.gz

@@ -112,7 +112,7 @@ wheels = [
 
 [[package]]
 name = "palimpsest-local"
-version = "0.1.0.dev0"
+version = "0.1.4"
 source = { editable = "." }
 
 [package.optional-dependencies]

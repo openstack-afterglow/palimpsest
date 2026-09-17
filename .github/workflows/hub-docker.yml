@@ -63,16 +63,16 @@ jobs:
             type=sha,prefix=sha-
       - uses: docker/build-push-action@v5
         with:
-          context: hub
-          file: hub/Dockerfile
+          context: .
+          file: docker/hub/Dockerfile
           target: palimpsest-hub-api
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.api.outputs.tags }}
           labels: ${{ steps.api.outputs.labels }}
       - uses: docker/build-push-action@v5
         with:
-          context: hub
-          file: hub/Dockerfile
+          context: .
+          file: docker/hub/Dockerfile
           target: palimpsest-hub-worker
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.worker.outputs.tags }}

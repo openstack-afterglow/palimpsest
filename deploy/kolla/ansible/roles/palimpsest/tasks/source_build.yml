@@ -86,8 +86,8 @@
   community.docker.docker_image:
     name: "afterglow-local/{{ item }}:{{ palimpsest_source_version | truncate(12, True, '') }}"
     build:
-      path: "{{ palimpsest_source_dir }}/hub"
-      dockerfile: "Dockerfile"
+      path: "{{ palimpsest_source_dir }}"
+      dockerfile: "docker/hub/Dockerfile"
       target: "{{ item }}"
     source: build
     force_source: false

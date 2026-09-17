@@ -1,15 +1,14 @@
 # Palimpsest Local
-
 `palimpsest-local` is a Python 3.12+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
 
-It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
+It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The base package has no required Python runtime dependencies; Linux KVM support is an opt-in extra.
 
 ## Status
 
 - **macOS Apple Silicon:** default runtime using Lima/VZ (`lima-vz`), with experimental QEMU/libvirt Hypervisor.framework support (`libvirt-hvf`).
 - **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Standalone release `0.1.0` requires clean-host KVM integration proof.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Version:** `0.1.0.dev0`.
+- **Version:** `0.1.4`.
 
 ## Install
 
@@ -34,6 +33,8 @@ To use the Linux KVM runtime, install the optional extra:
 pip install '.[kvm]'
 ```
 
+The root wheel also ships the `palimpsest` Kolla-Ansible role at `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin Kolla-Ansible independently. The role defaults retain the existing published Hub image tag (`0.1.3`), while source builds use the checked-out commit SHA.
+
 ## Hub configuration & Standalone Service
 
 Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`).
@@ -45,6 +46,13 @@ Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, b
 - **API Worker:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`)
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`)
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` or `python -m palimpsest_hub.migrate`
+
+The canonical Hub container build uses the repository root as context and `docker/hub/Dockerfile` as its Dockerfile:
+
+```sh
+docker build --file docker/hub/Dockerfile --target palimpsest-hub-api .
+docker build --file docker/hub/Dockerfile --target palimpsest-hub-worker .
+```
 
 ### Client Hub Configuration
 

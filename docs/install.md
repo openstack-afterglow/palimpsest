@@ -110,7 +110,7 @@ Offline mode verifies that the builder has exactly one node, that its endpoint m
 ## Installation
 
 ### Base Package (Stdlib-only Core)
-The base distribution has zero required runtime Python dependencies. It provides the full CLI for artifact verification, bundle management, layer packing, and Hub interaction:
+The `palimpsest-local` distribution has zero required runtime Python dependencies. It provides the full CLI for artifact verification, bundle management, layer packing, and Hub interaction:
 
 ```bash
 pip install .
@@ -130,6 +130,9 @@ uv tool install 'palimpsest-local[kvm]'
 The `[kvm]` extra installs `libvirt-python>=10.0.0`. `libvirt-python` is imported dynamically only during libvirt domain operations (`palimpsest_local.kvm`), allowing pure artifact workflows to function in environments without libvirt installed.
 
 **macOS Apple Silicon** VM execution uses Lima/VZ by default, which is included in the base package and needs no extra. The experimental `libvirt-hvf` backend does use libvirt, so it requires this extra plus Homebrew `libvirt`/`qemu`. See [System & Host Requirements](#system--host-requirements) for setup details and the [VM workflow guide](vm-workflow.md) for the end-to-end command reference.
+
+### Kolla-Ansible Role Data
+The root wheel owns the role data at `share/kolla-ansible/ansible/roles/palimpsest`; there is no separate `palimpsest-kolla` distribution. It does not declare or install Kolla-Ansible, Ansible, Hub, or other server dependencies. The deployment environment must pin Kolla-Ansible independently. The role's image-tag default remains the existing published Hub image version; source builds are bound to the configured checkout commit SHA.
 
 ### Development Installation
 For running the test suite and linters:
@@ -178,16 +181,16 @@ palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
 
 ---
 
-## Package vs. KVM-Extra Boundary
+## Package Dependency Boundary
 
 | Capability | Base Package (`palimpsest-local`) | KVM Extra (`palimpsest-local[kvm]`) |
 |---|---|---|
-| Python dependencies | None (stdlib only) | `libvirt-python>=10.0.0` |
+| Python dependencies | None | `libvirt-python>=10.0.0` |
 | Platform support | Linux, macOS, BSD | Linux x86_64 with `/dev/kvm` |
 | Commands available | Hub `image`/`layer`/`bundle`, registry profiles, Docker-compatible image commands, Dockerfile/Buildx `build` | `run`, `compose`, Palimpsestfile guest `build`, `commit`, `ps`, `inspect`, `logs`, `shell`, `exec`, `stop`, `rm` |
-| Primary use case | Hub interaction, CI artifact verification, Dockerfile builds | Local VM lifecycle, guest-delta building, and committing |
+| Primary use case | Hub interaction, CI artifact verification, Dockerfile builds, and Kolla role data | Local VM lifecycle, guest-delta building, and committing |
 
-Afterglow API containers depend on `palimpsest-local==0.1.0` without the `[kvm]` extra, keeping container images lightweight and free of C/libvirt system library overhead.
+The root wheel's Kolla role data carries no Kolla/Ansible or Hub runtime dependency. Afterglow API containers depend on `palimpsest-local==0.1.4` without optional extras, keeping container images lightweight and free of C/libvirt and server runtime dependencies.
 
 ---
 

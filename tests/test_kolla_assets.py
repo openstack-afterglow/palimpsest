@@ -1,4 +1,4 @@
-"""Tests for Palimpsest Kolla-Ansible packaging and lifecycle assets."""
+"""Tests for root-wheel Kolla-Ansible role data and lifecycle assets."""
 
 from __future__ import annotations
 
@@ -11,8 +11,10 @@ import jinja2
 import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
+ROOT_PYPROJECT = REPO_ROOT / "pyproject.toml"
 KOLLA_DIR = REPO_ROOT / "deploy" / "kolla"
 ROLE_DIR = KOLLA_DIR / "ansible" / "roles" / "palimpsest"
+
 
 
 def _get_hub_version() -> str:
@@ -23,13 +25,15 @@ def _get_hub_version() -> str:
     raise RuntimeError("Could not determine hub_version from __init__.py")
 
 
+root_pyproject = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+root_version = root_pyproject["project"]["version"]
 hub_version = _get_hub_version()
 
 
-def test_kolla_required_assets_exist():
+def test_kolla_required_assets_exist_without_standalone_package():
     assert KOLLA_DIR.exists()
-    assert (KOLLA_DIR / "pyproject.toml").exists()
-    assert (KOLLA_DIR / "src" / "palimpsest_kolla" / "__init__.py").exists()
+    assert not (KOLLA_DIR / "pyproject.toml").exists()
+    assert not (KOLLA_DIR / "src").exists()
 
     required_role_files = [
         "defaults/main.yml",
@@ -61,11 +65,20 @@ def test_kolla_required_assets_exist():
         assert path.exists(), f"Missing required role asset: {relative_path}"
 
 
-def test_version_lockstep_and_metadata():
-    pyproject_data = tomllib.loads((KOLLA_DIR / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject_data["project"]["name"] == "palimpsest-kolla"
-    assert pyproject_data["project"]["requires-python"] == ">=3.11"
-    assert pyproject_data["tool"]["hatch"]["version"]["path"] == "../../hub/src/palimpsest_hub/__init__.py"
+def test_root_metadata_owns_kolla_shared_data_without_runtime_dependencies():
+    project = root_pyproject["project"]
+    assert project["name"] == "palimpsest-local"
+    assert project["dependencies"] == []
+    assert "service" not in project["optional-dependencies"]
+    assert all(
+        "kolla-ansible" not in requirement
+        for requirements in project["optional-dependencies"].values()
+        for requirement in requirements
+    )
+    assert "palimpsest-hub" not in project["dependencies"]
+    assert root_pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["shared-data"] == {
+        "deploy/kolla/ansible/roles/palimpsest": "share/kolla-ansible/ansible/roles/palimpsest"
+    }
 
     defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
     assert defaults_yaml["palimpsest_image_tag"] == hub_version
@@ -85,13 +98,13 @@ def test_jinja_templates_compile():
         assert env.parse(content) is not None
 
 
-def test_palimpsest_kolla_wheel_build_and_install(tmp_path: Path):
+def test_root_wheel_builds_and_installs_kolla_shared_data(tmp_path: Path):
     dist_dir = tmp_path / "dist"
     dist_dir.mkdir()
 
     res = subprocess.run(
         ["uv", "build", "--wheel", "--out-dir", str(dist_dir)],
-        cwd=KOLLA_DIR,
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
     )
@@ -100,13 +113,13 @@ def test_palimpsest_kolla_wheel_build_and_install(tmp_path: Path):
     wheels = list(dist_dir.glob("*.whl"))
     assert len(wheels) == 1
     wheel_path = wheels[0]
-    assert f"palimpsest_kolla-{hub_version}" in wheel_path.name
+    assert f"palimpsest_local-{root_version}" in wheel_path.name
 
     with zipfile.ZipFile(wheel_path, "r") as zf:
         namelist = zf.namelist()
-        data_prefix = f"palimpsest_kolla-{hub_version}.data/data/share/kolla-ansible/ansible/roles/palimpsest/"
-        role_files = [n for n in namelist if n.startswith(data_prefix)]
-        assert len(role_files) > 0, "No shared-data role files found in wheel"
+        data_prefix = f"palimpsest_local-{root_version}.data/data/share/kolla-ansible/ansible/roles/palimpsest/"
+        role_files = [name for name in namelist if name.startswith(data_prefix)]
+        assert role_files, "No shared-data role files found in wheel"
 
     venv_dir = tmp_path / "venv"
     res_venv = subprocess.run(["uv", "venv", str(venv_dir)], capture_output=True, text=True)
@@ -125,9 +138,8 @@ def test_palimpsest_kolla_wheel_build_and_install(tmp_path: Path):
     assert (installed_role / "tasks" / "main.yml").is_file()
     assert (installed_role / "templates" / "palimpsest.conf.j2").is_file()
 
-    # Clean uninstall check
     res_uninst = subprocess.run(
-        ["uv", "pip", "uninstall", "--python", str(venv_python), "palimpsest-kolla"],
+        ["uv", "pip", "uninstall", "--python", str(venv_python), "palimpsest-local"],
         capture_output=True,
         text=True,
     )
