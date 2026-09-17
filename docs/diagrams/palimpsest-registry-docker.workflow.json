@@ -1,0 +1,266 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Registry 프로필과 Docker 명령 워크플로우",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "session",
+        "label": "Registry session",
+        "focus": [
+          "registry_profile",
+          "registry_use",
+          "login",
+          "pull",
+          "inspect",
+          "tag",
+          "push",
+          "logout"
+        ],
+        "note": "비밀 없는 registry profile을 고르고 Docker credential store로 인증합니다."
+      },
+      {
+        "id": "local-images",
+        "label": "로컬 image 관리",
+        "focus": [
+          "pull",
+          "inspect",
+          "tag",
+          "archive"
+        ],
+        "note": "wrapper와 image alias는 동일한 Docker image store를 조작합니다."
+      }
+    ],
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "CLI·대화 표면"
+        },
+        "backend": {
+          "label": "Local 처리"
+        },
+        "database": {
+          "label": "State와 store"
+        },
+        "cloud": {
+          "label": "Hub·registry"
+        },
+        "security": {
+          "label": "정책과 증거"
+        },
+        "external": {
+          "label": "외부 도구"
+        },
+        "messagebus": {
+          "label": "로그와 스트림"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "profile",
+      "label": "Registry profile"
+    },
+    {
+      "id": "credential",
+      "label": "Credential store"
+    },
+    {
+      "id": "remote",
+      "label": "OCI registry"
+    },
+    {
+      "id": "local",
+      "label": "Docker image store"
+    }
+  ],
+  "phases": [
+    {
+      "id": "select",
+      "label": "Select + auth",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "consume",
+      "label": "Pull + inspect",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "publish",
+      "label": "Tag + publish",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "registry_profile",
+    "registry_use",
+    "login",
+    "pull",
+    "inspect",
+    "tag",
+    "push",
+    "logout"
+  ],
+  "nodes": [
+    {
+      "id": "registry_profile",
+      "lane": "profile",
+      "col": 0,
+      "type": "database",
+      "label": "registry add",
+      "sublabel": "ls/inspect/rm",
+      "width": 164
+    },
+    {
+      "id": "registry_use",
+      "lane": "profile",
+      "col": 1,
+      "type": "security",
+      "label": "registry use",
+      "sublabel": "default 선택",
+      "width": 164
+    },
+    {
+      "id": "buildkit_cfg",
+      "lane": "profile",
+      "col": 3,
+      "type": "external",
+      "label": "buildkit-config",
+      "sublabel": "builder 설정 파일",
+      "width": 164
+    },
+    {
+      "id": "login",
+      "lane": "credential",
+      "col": 1,
+      "type": "security",
+      "label": "login",
+      "sublabel": "Docker credential",
+      "width": 164
+    },
+    {
+      "id": "logout",
+      "lane": "credential",
+      "col": 5,
+      "type": "security",
+      "label": "logout",
+      "sublabel": "credential 제거",
+      "width": 164
+    },
+    {
+      "id": "pull",
+      "lane": "remote",
+      "col": 2,
+      "type": "cloud",
+      "label": "pull",
+      "sublabel": "registry → local",
+      "width": 164
+    },
+    {
+      "id": "push",
+      "lane": "remote",
+      "col": 5,
+      "type": "cloud",
+      "label": "push",
+      "sublabel": "local → registry",
+      "width": 164
+    },
+    {
+      "id": "inspect",
+      "lane": "local",
+      "col": 3,
+      "type": "backend",
+      "label": "image 조회",
+      "sublabel": "images/history",
+      "width": 164
+    },
+    {
+      "id": "tag",
+      "lane": "local",
+      "col": 4,
+      "type": "backend",
+      "label": "tag",
+      "sublabel": "대상 ref 지정",
+      "width": 164
+    },
+    {
+      "id": "archive",
+      "lane": "local",
+      "col": 5,
+      "type": "database",
+      "label": "save / load / rmi",
+      "sublabel": "로컬 정리",
+      "width": 164
+    }
+  ],
+  "edges": [
+    {
+      "from": "registry_profile",
+      "to": "registry_use"
+    },
+    {
+      "from": "registry_use",
+      "to": "login",
+      "variant": "security"
+    },
+    {
+      "from": "login",
+      "to": "pull"
+    },
+    {
+      "from": "pull",
+      "to": "inspect",
+      "variant": "emphasis"
+    },
+    {
+      "from": "inspect",
+      "to": "tag"
+    },
+    {
+      "from": "tag",
+      "to": "push"
+    },
+    {
+      "from": "push",
+      "to": "logout",
+      "label": "session 종료"
+    },
+    {
+      "from": "registry_use",
+      "to": "buildkit_cfg",
+      "label": "builder 연계",
+      "role": "branch"
+    },
+    {
+      "from": "tag",
+      "to": "archive",
+      "label": "로컬 보관",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "선택 우선순위",
+      "items": [
+        "reference의 registry가 --registry보다 우선합니다",
+        "--registry, PALIMPSEST_REGISTRY, default profile 순으로 고릅니다"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Secret 경계",
+      "items": [
+        "credential은 DOCKER_CONFIG 또는 ~/.docker에 남습니다",
+        "registries.toml에는 endpoint와 policy만 저장합니다"
+      ]
+    }
+  ]
+}

@@ -1009,12 +1009,12 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
 
     conn = FakeLibvirtConn()
     dom_xml = (
-        f'<domain><name>hvf-restart</name><metadata>'
+        f"<domain><name>hvf-restart</name><metadata>"
         f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner_rec.run_id}" '
         f'schema="1" version="0.1.0"/></metadata>'
         f'<qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">'
         f'<qemu:arg value="-netdev"/><qemu:arg value="user,id=palimpsest0,hostfwd=tcp:127.0.0.1:55123-:22"/>'
-        f'</qemu:commandline></domain>'
+        f"</qemu:commandline></domain>"
     )
     conn.defineXML(dom_xml)
     rpaths.known_hosts.write_text("[127.0.0.1]:55123 ssh-ed25519 AAAAFakeHostKey host\n", encoding="utf-8")
@@ -1043,6 +1043,7 @@ def test_start_user_hostfwd_reallocates_port_and_rewrites_ledger_and_known_hosts
     known_hosts_text = rpaths.known_hosts.read_text(encoding="utf-8")
     assert f"[127.0.0.1]:{new_port}" in known_hosts_text
     assert "55123" not in known_hosts_text
+
 
 def test_shell_and_exec_commands_use_recorded_ssh_port(tmp_path: Path):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
@@ -1129,7 +1130,9 @@ def test_resolve_new_run_profile_preserves_legacy_conn_and_kvm_uri_callers():
 
 def test_resolve_new_run_profile_bare_call_uses_host_auto_selection_and_preflight(monkeypatch: pytest.MonkeyPatch):
     calls: list[str] = []
-    monkeypatch.setattr(platforms, "select_backend", lambda arch, **_kwargs: calls.append("select") or platforms.BACKEND_KVM)
+    monkeypatch.setattr(
+        platforms, "select_backend", lambda arch, **_kwargs: calls.append("select") or platforms.BACKEND_KVM
+    )
     monkeypatch.setattr(platforms, "preflight", lambda backend, **_kwargs: calls.append("preflight"))
     profile, uri = runtime._resolve_new_run_profile("x86_64", kvm_uri=None, profile=None, conn=None)
     assert calls == ["select", "preflight"]
@@ -1157,6 +1160,7 @@ def test_resolve_ledger_profile_defaults_missing_backend_to_kvm():
     profile2 = runtime._resolve_ledger_profile({"backend": platforms.BACKEND_KVM, "base": {"arch": "aarch64"}})
     assert profile2.arch == "aarch64"
     assert profile2.machine == "virt"
+
 
 def test_reconcile_scoped_by_profile_ignores_other_backend(tmp_path: Path):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})

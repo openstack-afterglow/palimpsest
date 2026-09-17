@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+
 import pytest
 
 from palimpsest_local import inventory, state
@@ -37,7 +37,9 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Synthesize run ledgers
     run1 = roots.runs / "demo-kvm"
     run1.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run1 / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-kvm"})
+    state.atomic_write_json(
+        run1 / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-kvm"}
+    )
     state.atomic_write_json(
         run1 / "state.json",
         {
@@ -57,7 +59,10 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     run2 = roots.runs / "demo-lima"
     run2.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run2 / "owner.json", {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "demo-lima"})
+    state.atomic_write_json(
+        run2 / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "demo-lima"},
+    )
     state.atomic_write_json(
         run2 / "state.json",
         {
@@ -78,7 +83,15 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "schema_version": 1,
             "project": "myproj",
             "config_digest": "sha256:" + "c" * 64,
-            "services": [{"service": "web", "run_name": "demo-kvm", "config_digest": "sha256:" + "d" * 64, "run_id": "11111111-1111-1111-1111-111111111111", "backend": "kvm"}],
+            "services": [
+                {
+                    "service": "web",
+                    "run_name": "demo-kvm",
+                    "config_digest": "sha256:" + "d" * 64,
+                    "run_id": "11111111-1111-1111-1111-111111111111",
+                    "backend": "kvm",
+                }
+            ],
             "order": ["web"],
             "volumes": [],
             "created_at": "2026-08-24T00:00:00Z",
@@ -87,6 +100,7 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
 
     monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
+
     def mock_reconcile(*, roots=None, conn=None, kvm_uri=None, profile=None):
         return [
             {
@@ -107,6 +121,7 @@ def test_list_vms_and_get_vm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 },
             }
         ], []
+
     monkeypatch.setattr(inventory, "reconcile", mock_reconcile)
     monkeypatch.setattr(inventory, "inspect_instance_status", lambda name: "stopped")
 
@@ -132,7 +147,10 @@ def test_list_vms_stale_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     roots = _setup_roots(tmp_path)
     run_dir = roots.runs / "stale-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "33333333-3333-3333-3333-333333333333", "name": "stale-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "33333333-3333-3333-3333-333333333333", "name": "stale-vm"},
+    )
     state.atomic_write_json(run_dir / "state.json", {"name": "stale-vm", "backend": "kvm", "status": "running"})
 
     def mock_preflight(backend: str, host=None):
@@ -162,8 +180,12 @@ def test_list_artifacts(tmp_path: Path):
     for d in (img_digest, layer_digest, unknown_digest):
         (roots.store / "blobs" / "sha256" / d.split(":", 1)[1]).write_bytes(b"dummy artifact bytes")
 
-    store.write_metadata(img_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "ubuntu.img"})
-    store.write_metadata(layer_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS, "base_image_digest": img_digest})
+    store.write_metadata(
+        img_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "ubuntu.img"}
+    )
+    store.write_metadata(
+        layer_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS, "base_image_digest": img_digest}
+    )
     store.write_metadata(unknown_digest, {"kind": "other"})
 
     # Write tag record
@@ -185,7 +207,10 @@ def test_list_artifacts(tmp_path: Path):
     # Write run ledger referencing img_digest and layer_digest
     run_dir = roots.runs / "art-run"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "44444444-4444-4444-4444-444444444444", "name": "art-run"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "44444444-4444-4444-4444-444444444444", "name": "art-run"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -322,6 +347,8 @@ def test_list_builds_and_get_build_and_log(tmp_path: Path):
 
     log_tail = inventory.build_log(roots, b1_id, tail=2)
     assert log_tail == "line 3\nline 4\n"
+
+
 def test_import_cloud_image(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     img_file = tmp_path / "test.qcow2"
@@ -374,7 +401,9 @@ def test_move_state_root_preconditions_and_success(tmp_path: Path):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     dest_dir = tmp_path / "target_state"
-    with pytest.raises(StateError, match="relocating the state root requires no runs and no projects; remove them first: active-vm"):
+    with pytest.raises(
+        StateError, match="relocating the state root requires no runs and no projects; remove them first: active-vm"
+    ):
         inventory.move_state_root(roots, dest_dir)
 
     # Remove run and proceed
@@ -384,7 +413,11 @@ def test_move_state_root_preconditions_and_success(tmp_path: Path):
     assert res["new_root"] == str(dest_dir.resolve())
     assert dest_dir.is_dir()
     assert not roots.state.exists()
-def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+
+
+def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     roots = _setup_roots(tmp_path)
     dest_dir = tmp_path / "target_state_fail"
 
@@ -402,6 +435,7 @@ def test_move_state_root_failure_cleans_incoming_without_deleting_committed_dest
 
     assert not incoming.exists()
     assert roots.state.exists()
+
 
 def test_set_and_move_state_root_rejected_when_env_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
@@ -427,6 +461,7 @@ def test_set_and_move_state_root_rejected_when_env_active(tmp_path: Path, monkey
     # Verify move target was not created and source state exists
     assert not dest_move.exists()
     assert roots.state.exists()
+
 
 def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
@@ -542,6 +577,8 @@ def test_list_vms_reconciles_kvm_and_hvf_separately(tmp_path: Path, monkeypatch:
     assert vms["hvf-vm"]["status"] == "running"
     assert vms["kvm-vm"]["stale"] is False
     assert vms["hvf-vm"]["stale"] is False
+
+
 def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = _setup_roots(tmp_path)
 
@@ -549,13 +586,17 @@ def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkey
     kvm_dir = roots.runs / "legacy-kvm"
     kvm_dir.mkdir(parents=True, exist_ok=True)
     state.atomic_write_json(kvm_dir / "owner.json", {"schema_version": 1, "run_id": "1111", "name": "legacy-kvm"})
-    state.atomic_write_json(kvm_dir / "state.json", {"name": "legacy-kvm", "run_id": "1111", "backend": "kvm", "status": "running"})
+    state.atomic_write_json(
+        kvm_dir / "state.json", {"name": "legacy-kvm", "run_id": "1111", "backend": "kvm", "status": "running"}
+    )
 
     # HVF ledger with no base arch
     hvf_dir = roots.runs / "legacy-hvf"
     hvf_dir.mkdir(parents=True, exist_ok=True)
     state.atomic_write_json(hvf_dir / "owner.json", {"schema_version": 1, "run_id": "2222", "name": "legacy-hvf"})
-    state.atomic_write_json(hvf_dir / "state.json", {"name": "legacy-hvf", "run_id": "2222", "backend": "libvirt-hvf", "status": "running"})
+    state.atomic_write_json(
+        hvf_dir / "state.json", {"name": "legacy-hvf", "run_id": "2222", "backend": "libvirt-hvf", "status": "running"}
+    )
 
     monkeypatch.setattr(inventory, "preflight", lambda backend, host=None: None)
 

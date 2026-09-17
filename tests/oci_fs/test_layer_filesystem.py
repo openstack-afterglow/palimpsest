@@ -15,7 +15,6 @@ import pytest
 
 from palimpsest_local.errors import UnsupportedPlatformError
 from palimpsest_local.oci_convert import (
-    OCI_LAYER_FILESYSTEM,
     _verify_merged_tree,
     build_layer_filesystem,
     check_lowerdir_page_budget,
@@ -116,6 +115,7 @@ def test_tar_translation_whiteouts_and_xattrs():
         # Check opaque xattr on parent directory
         opq_info = out_tar.getmember("dir_opq")
         assert opq_info.pax_headers.get("SCHILY.xattr.trusted.overlay.opaque") == "y"
+
 
 def test_tar_translation_same_layer_whiteout_overridden_by_real_target():
     """Verify same-layer ordinary whiteout is omitted when a real target wins later in the layer."""
@@ -219,6 +219,7 @@ def test_tar_translation_leaf_fixture_structure():
         idx_target = names.index("forward_link_2.txt")
         idx_link = names.index("forward_link_1.txt")
         assert idx_target < idx_link, "forward_link_2.txt target must be emitted before forward_link_1.txt hardlink"
+
 
 @pytest.mark.oci_fs
 def test_layer_filesystem_semantics():
@@ -406,9 +407,10 @@ def test_verify_merged_tree_pure_unit_tests(tmp_path):
         except OSError:
             pass  # Filesystem may not support user xattrs in some test environments
 
+
 def test_build_layer_filesystem_cleanup_on_failure(tmp_path):
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
+    with tarfile.open(fileobj=buf, mode="w"):
         pass
     valid_tar = buf.getvalue()
 

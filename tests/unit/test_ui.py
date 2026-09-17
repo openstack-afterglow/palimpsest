@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import http.client
-from http.server import ThreadingHTTPServer
 import json
-from pathlib import Path
 import socket
 import threading
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from palimpsest_local import inventory, state, ui
+from palimpsest_local import state, ui
 from palimpsest_local.state import init_roots
 
 
@@ -127,19 +128,25 @@ def test_csrf_origin_semantics(server_env: dict[str, Any]):
 
     # 1. POST with forbidden Origin -> 403
     bad_headers = headers | {"Origin": "http://evil.local"}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=bad_headers, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=bad_headers, body={"destination": "/tmp/test"}
+    )
     assert status == 403
     assert json_data == {"error": "Forbidden: invalid Origin"}
 
     # 2. POST with forbidden Sec-Fetch-Site -> 403
     bad_headers2 = headers | {"Sec-Fetch-Site": "cross-site"}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=bad_headers2, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=bad_headers2, body={"destination": "/tmp/test"}
+    )
     assert status == 403
     assert json_data == {"error": "Forbidden: Sec-Fetch-Site must be same-origin"}
 
     # 3. POST with matching Origin -> 200 / 400 (not 403)
     good_headers = headers | {"Origin": origin}
-    status, _, json_data = _request(port, "POST", "/api/v1/storage/set", headers=good_headers, body={"destination": "/tmp/test"})
+    status, _, json_data = _request(
+        port, "POST", "/api/v1/storage/set", headers=good_headers, body={"destination": "/tmp/test"}
+    )
     assert status in (200, 400, 409)
 
 
@@ -177,6 +184,7 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     assert status == 200
     assert "text/css" in resp_headers.get("Content-Type", "")
 
+
 def test_get_routes_and_not_found(server_env: dict[str, Any]):
     roots: state.StatePaths = server_env["roots"]
     port = server_env["port"]
@@ -186,7 +194,10 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
     # Synthesize VM run ledger
     run_dir = roots.runs / "demo-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "11111111-1111-1111-1111-111111111111", "name": "demo-vm"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -314,7 +325,10 @@ def test_referenced_artifact_deletion_409(server_env: dict[str, Any]):
     # Synthesize VM run ledger referencing base_digest
     run_dir = roots.runs / "active-vm"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.atomic_write_json(run_dir / "owner.json", {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "active-vm"})
+    state.atomic_write_json(
+        run_dir / "owner.json",
+        {"schema_version": 1, "run_id": "22222222-2222-2222-2222-222222222222", "name": "active-vm"},
+    )
     state.atomic_write_json(
         run_dir / "state.json",
         {
@@ -331,6 +345,8 @@ def test_referenced_artifact_deletion_409(server_env: dict[str, Any]):
     status, _, json_data = _request(port, "DELETE", f"/api/v1/store/artifacts/{base_digest}", headers=headers)
     assert status == 409
     assert "still used by: active-vm" in json_data["error"]
+
+
 def test_malformed_and_traversal_build_id_400(server_env: dict[str, Any]):
     port = server_env["port"]
     token = server_env["token"]
@@ -374,8 +390,8 @@ def test_truncated_body_400(server_env: dict[str, Any]):
         f"Origin: {origin}\r\n"
         f"Content-Type: application/json\r\n"
         f"Content-Length: 100\r\n\r\n"
-        f"{{\"short\": 1}}"
-    ).encode("utf-8")
+        f'{{"short": 1}}'
+    ).encode()
 
     sock.sendall(req)
     sock.shutdown(socket.SHUT_WR)
@@ -390,10 +406,10 @@ def test_truncated_body_400(server_env: dict[str, Any]):
 
     resp_text = resp_bytes.decode("utf-8", errors="replace")
     assert "400 Bad Request" in resp_text or "Truncated request body" in resp_text
+
+
 @pytest.mark.parametrize("keep_source", [False, True])
-def test_storage_move_and_set_http_success_and_switch(
-    server_env: dict[str, Any], tmp_path: Path, keep_source: bool
-):
+def test_storage_move_and_set_http_success_and_switch(server_env: dict[str, Any], tmp_path: Path, keep_source: bool):
     port = server_env["port"]
     token = server_env["token"]
     origin = server_env["origin"]
@@ -441,9 +457,7 @@ def test_storage_move_and_set_http_success_and_switch(
     assert move_res["new_root"] == str(dest_move)
 
     # 3. Next GET /api/v1/storage reports destination
-    status, _, storage_res = _request(
-        port, "GET", "/api/v1/storage", headers={"Authorization": f"Bearer {token}"}
-    )
+    status, _, storage_res = _request(port, "GET", "/api/v1/storage", headers={"Authorization": f"Bearer {token}"})
     assert status == 200
     assert storage_res["state_root"] == str(dest_move)
 
@@ -482,7 +496,18 @@ def test_storage_move_and_set_http_success_and_switch(
     assert storage_after_set["state_root"] == str(dest_set)
 
     # Ensure empty set destination gets normal state directory structure/modes
-    for sub in ("store", "runs", "locks", "transfers", "tags", "builds", "build-cache", "runtime-packs", "projects", "volumes"):
+    for sub in (
+        "store",
+        "runs",
+        "locks",
+        "transfers",
+        "tags",
+        "builds",
+        "build-cache",
+        "runtime-packs",
+        "projects",
+        "volumes",
+    ):
         subdir = dest_set / sub
         assert subdir.is_dir()
         assert (subdir.stat().st_mode & 0o777) == 0o700

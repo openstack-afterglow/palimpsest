@@ -12,9 +12,7 @@ from palimpsest_local.runtime import run
 from palimpsest_local.state import init_roots
 
 
-def test_runtime_rejects_unsupported_host_image_before_run_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_runtime_rejects_unsupported_host_image_before_run_creation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     base = roots.store / "base.raw"
     base.parent.mkdir(parents=True, exist_ok=True)

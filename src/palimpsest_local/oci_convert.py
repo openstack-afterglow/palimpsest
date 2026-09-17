@@ -13,7 +13,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from .errors import ArtifactValidationError, PalimpsestError, UnsupportedPlatformError
+from .errors import ArtifactValidationError, UnsupportedPlatformError
 
 OCI_LAYER_FILESYSTEM: str | None = None
 
@@ -24,9 +24,7 @@ def get_oci_layer_filesystem() -> str:
     Raises UnsupportedPlatformError if no passing probe has established it.
     """
     if OCI_LAYER_FILESYSTEM is None:
-        raise UnsupportedPlatformError(
-            "OCI_LAYER_FILESYSTEM has not been established by a passing Linux probe."
-        )
+        raise UnsupportedPlatformError("OCI_LAYER_FILESYSTEM has not been established by a passing Linux probe.")
     return OCI_LAYER_FILESYSTEM
 
 
@@ -156,11 +154,7 @@ def translate_oci_tar_to_overlay_tar(in_tar_bytes: bytes) -> bytes:
                 # Synthesize missing parent directories for file-to-directory transitions
                 curr = parent_dir
                 while curr and curr != ".":
-                    if (
-                        curr not in table
-                        or table[curr].get("is_whiteout")
-                        or not table[curr]["member"].isdir()
-                    ):
+                    if curr not in table or table[curr].get("is_whiteout") or not table[curr]["member"].isdir():
                         synth_info = tarfile.TarInfo(name=curr)
                         synth_info.type = tarfile.DIRTYPE
                         synth_info.mode = 0o755 | stat.S_IFDIR
@@ -179,11 +173,7 @@ def translate_oci_tar_to_overlay_tar(in_tar_bytes: bytes) -> bytes:
     # Ensure opaque dirs have directory entries in table with opaque PAX header
     for opq_dir in opaque_dirs:
         if opq_dir and opq_dir != ".":
-            if (
-                opq_dir not in table
-                or table[opq_dir].get("is_whiteout")
-                or not table[opq_dir]["member"].isdir()
-            ):
+            if opq_dir not in table or table[opq_dir].get("is_whiteout") or not table[opq_dir]["member"].isdir():
                 dir_info = tarfile.TarInfo(name=opq_dir)
                 dir_info.type = tarfile.DIRTYPE
                 dir_info.mode = 0o755 | stat.S_IFDIR
@@ -268,9 +258,7 @@ def translate_oci_tar_to_overlay_tar(in_tar_bytes: bytes) -> bytes:
     return out_buf.getvalue()
 
 
-def build_layer_filesystem(
-    tar_bytes: bytes, target_fs: str = "squashfs", out_path: Path | None = None
-) -> Path:
+def build_layer_filesystem(tar_bytes: bytes, target_fs: str = "squashfs", out_path: Path | None = None) -> Path:
     """Build candidate lower filesystem image (SquashFS or EROFS) from OCI tar stream."""
     check_platform_support()
 
@@ -290,9 +278,7 @@ def build_layer_filesystem(
                 raise UnsupportedPlatformError("mksquashfs tool is not installed or not in PATH")
 
             cmd = [mksquashfs_bin, "-", str(out_path), "-tar", "-noappend", "-xattrs"]
-            proc = subprocess.run(
-                cmd, input=translated_tar, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-            )
+            proc = subprocess.run(cmd, input=translated_tar, capture_output=True, check=False)
             if proc.returncode != 0:
                 raise ArtifactValidationError(
                     f"mksquashfs failed with code {proc.returncode}: {proc.stderr.decode('utf-8', errors='replace')}"
@@ -307,10 +293,8 @@ def build_layer_filesystem(
             os.close(tmp_tar_fd)
             try:
                 Path(tmp_tar_path).write_bytes(translated_tar)
-                cmd = [mkerofs_bin, f"--tar=file", str(out_path), tmp_tar_path]
-                proc = subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-                )
+                cmd = [mkerofs_bin, "--tar=file", str(out_path), tmp_tar_path]
+                proc = subprocess.run(cmd, capture_output=True, check=False)
                 if proc.returncode != 0:
                     raise ArtifactValidationError(
                         f"mkfs.erofs failed with code {proc.returncode}: {proc.stderr.decode('utf-8', errors='replace')}"
@@ -330,9 +314,7 @@ def build_layer_filesystem(
     return out_path
 
 
-def probe_oci_filesystem_semantics(
-    base_tar: bytes, leaf_tar: bytes, expected_receipt: dict
-) -> str:
+def probe_oci_filesystem_semantics(base_tar: bytes, leaf_tar: bytes, expected_receipt: dict) -> str:
     """Linux privileged probe for 2-layer OCI changeset OverlayFS semantics.
 
     Probes SquashFS first, then EROFS. Records passing choice in global OCI_LAYER_FILESYSTEM.
@@ -444,9 +426,7 @@ def probe_oci_filesystem_semantics(
                     continue
 
                 # 2. Verify merged tree matches expected receipt
-                receipt_ok, diff_msg = _verify_merged_tree(
-                    overlay_mnt, expected_receipt.get("entries", {})
-                )
+                receipt_ok, diff_msg = _verify_merged_tree(overlay_mnt, expected_receipt.get("entries", {}))
                 if not receipt_ok:
                     probe_errors.append(f"{fs} receipt mismatch: {diff_msg}")
                     continue
@@ -624,9 +604,7 @@ def _verify_merged_tree(mnt: Path, expected_entries: dict) -> tuple[bool, str]:
                 except OSError as e:
                     return (False, f"{rel_path} xattr {attr_name} read error: {e}")
 
-                exp_val_bytes = (
-                    exp_val.encode("utf-8") if isinstance(exp_val, str) else bytes(exp_val)
-                )
+                exp_val_bytes = exp_val.encode("utf-8") if isinstance(exp_val, str) else bytes(exp_val)
                 if act_val_bytes != exp_val_bytes:
                     return (
                         False,

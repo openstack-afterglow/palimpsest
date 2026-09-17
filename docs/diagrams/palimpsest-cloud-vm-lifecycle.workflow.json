@@ -1,0 +1,263 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Cloud-image VM 실행·관찰·수명주기 워크플로우",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "run-observe",
+        "label": "실행과 관찰",
+        "focus": [
+          "run_vm",
+          "ps",
+          "inspect",
+          "logs",
+          "shell",
+          "exec"
+        ],
+        "note": "conventional cloud image를 실행하고 inventory와 guest channel로 관찰합니다."
+      },
+      {
+        "id": "lifecycle",
+        "label": "수명주기",
+        "focus": [
+          "stop",
+          "start",
+          "commit",
+          "rm"
+        ],
+        "note": "stop/start는 보존 VM을 재사용하고 commit은 상태를 새 image로 캡처합니다."
+      }
+    ],
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "CLI·대화 표면"
+        },
+        "backend": {
+          "label": "Local 처리"
+        },
+        "database": {
+          "label": "State와 store"
+        },
+        "cloud": {
+          "label": "Hub·registry"
+        },
+        "security": {
+          "label": "정책과 증거"
+        },
+        "external": {
+          "label": "외부 도구"
+        },
+        "messagebus": {
+          "label": "로그와 스트림"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "run",
+      "label": "실행과 inventory"
+    },
+    {
+      "id": "observe",
+      "label": "관찰과 산출물"
+    },
+    {
+      "id": "guest",
+      "label": "Guest 작업"
+    },
+    {
+      "id": "lifecycle",
+      "label": "수명주기"
+    }
+  ],
+  "phases": [
+    {
+      "id": "boot",
+      "label": "Boot + discover",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "operate",
+      "label": "Observe + operate",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "retain",
+      "label": "Retain + remove",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "run_vm",
+    "ps",
+    "inspect",
+    "logs",
+    "shell",
+    "exec",
+    "stop",
+    "rm"
+  ],
+  "nodes": [
+    {
+      "id": "run_vm",
+      "lane": "run",
+      "col": 0,
+      "type": "cloud",
+      "label": "run",
+      "sublabel": "cloud image + layer",
+      "width": 164
+    },
+    {
+      "id": "ps",
+      "lane": "run",
+      "col": 1,
+      "type": "database",
+      "label": "ps",
+      "sublabel": "managed VM 목록",
+      "width": 164
+    },
+    {
+      "id": "inspect",
+      "lane": "run",
+      "col": 2,
+      "type": "database",
+      "label": "inspect",
+      "sublabel": "상태와 경로",
+      "width": 164
+    },
+    {
+      "id": "start",
+      "lane": "run",
+      "col": 5,
+      "type": "cloud",
+      "label": "start",
+      "sublabel": "보존 VM 재기동",
+      "width": 164
+    },
+    {
+      "id": "logs",
+      "lane": "observe",
+      "col": 3,
+      "type": "messagebus",
+      "label": "logs",
+      "sublabel": "console 기록",
+      "width": 164
+    },
+    {
+      "id": "commit",
+      "lane": "observe",
+      "col": 5,
+      "type": "database",
+      "label": "commit",
+      "sublabel": "새 image 캡처",
+      "width": 164
+    },
+    {
+      "id": "shell",
+      "lane": "guest",
+      "col": 3,
+      "type": "frontend",
+      "label": "shell",
+      "sublabel": "대화형 세션",
+      "width": 164
+    },
+    {
+      "id": "exec",
+      "lane": "guest",
+      "col": 4,
+      "type": "backend",
+      "label": "exec",
+      "sublabel": "추가 프로세스",
+      "width": 164
+    },
+    {
+      "id": "stop",
+      "lane": "lifecycle",
+      "col": 4,
+      "type": "security",
+      "label": "stop",
+      "sublabel": "보존 정지",
+      "width": 164
+    },
+    {
+      "id": "rm",
+      "lane": "lifecycle",
+      "col": 5,
+      "type": "security",
+      "label": "rm",
+      "sublabel": "VM record 제거",
+      "width": 164
+    }
+  ],
+  "edges": [
+    {
+      "from": "run_vm",
+      "to": "ps"
+    },
+    {
+      "from": "ps",
+      "to": "inspect"
+    },
+    {
+      "from": "inspect",
+      "to": "logs"
+    },
+    {
+      "from": "logs",
+      "to": "shell",
+      "label": "진단 후 접속"
+    },
+    {
+      "from": "shell",
+      "to": "exec",
+      "label": "비대화식 작업"
+    },
+    {
+      "from": "exec",
+      "to": "stop"
+    },
+    {
+      "from": "stop",
+      "to": "rm"
+    },
+    {
+      "from": "stop",
+      "to": "start",
+      "label": "재사용",
+      "role": "branch"
+    },
+    {
+      "from": "stop",
+      "to": "commit",
+      "label": "상태 캡처",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Cloud-image 의미",
+      "items": [
+        "guest의 /는 원본 cloud image root이며 OCI pivot_root가 아닙니다",
+        "backend auto는 Linux KVM 또는 macOS Lima/VZ를 고릅니다"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "명령 경계",
+      "items": [
+        "ps/inspect/logs는 기록된 inventory와 console을 읽습니다",
+        "commit은 conventional runtime에만 적용됩니다"
+      ]
+    }
+  ]
+}

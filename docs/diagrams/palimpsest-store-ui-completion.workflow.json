@@ -1,0 +1,230 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Local store·UI·completion 관리 워크플로우",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "store-admin",
+        "label": "Store 관리",
+        "focus": [
+          "select_state",
+          "store_show",
+          "store_ls",
+          "store_set",
+          "store_move",
+          "store_rm"
+        ],
+        "note": "선택된 state root에서 artifact와 관리 record를 조회·변경·이동·삭제합니다."
+      },
+      {
+        "id": "human-tools",
+        "label": "UI와 shell",
+        "focus": [
+          "select_state",
+          "store_show",
+          "ui",
+          "completion"
+        ],
+        "note": "브라우저 UI와 shell completion은 CLI와 같은 inventory 및 command schema를 사용합니다."
+      }
+    ],
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "CLI·대화 표면"
+        },
+        "backend": {
+          "label": "Local 처리"
+        },
+        "database": {
+          "label": "State와 store"
+        },
+        "cloud": {
+          "label": "Hub·registry"
+        },
+        "security": {
+          "label": "정책과 증거"
+        },
+        "external": {
+          "label": "외부 도구"
+        },
+        "messagebus": {
+          "label": "로그와 스트림"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "config",
+      "label": "State 선택"
+    },
+    {
+      "id": "store",
+      "label": "Store 명령"
+    },
+    {
+      "id": "human",
+      "label": "사람 인터페이스"
+    }
+  ],
+  "phases": [
+    {
+      "id": "locate",
+      "label": "Locate",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "manage",
+      "label": "Manage",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "present",
+      "label": "Present",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "select_state",
+    "store_show",
+    "store_ls",
+    "store_set",
+    "store_move",
+    "store_rm"
+  ],
+  "nodes": [
+    {
+      "id": "select_state",
+      "lane": "config",
+      "col": 0,
+      "type": "database",
+      "label": "state root",
+      "sublabel": "env/config/기본값",
+      "width": 132
+    },
+    {
+      "id": "store_show",
+      "lane": "store",
+      "col": 1,
+      "type": "backend",
+      "label": "store show",
+      "sublabel": "활성 경계",
+      "width": 132
+    },
+    {
+      "id": "store_ls",
+      "lane": "store",
+      "col": 2,
+      "type": "database",
+      "label": "store ls",
+      "sublabel": "artifact 목록",
+      "width": 132
+    },
+    {
+      "id": "store_set",
+      "lane": "store",
+      "col": 3,
+      "type": "backend",
+      "label": "store set",
+      "sublabel": "경로 설정",
+      "width": 132
+    },
+    {
+      "id": "store_move",
+      "lane": "store",
+      "col": 4,
+      "type": "database",
+      "label": "store move",
+      "sublabel": "state 이전",
+      "width": 132
+    },
+    {
+      "id": "store_rm",
+      "lane": "store",
+      "col": 5,
+      "type": "security",
+      "label": "store rm",
+      "sublabel": "record 제거",
+      "width": 132
+    },
+    {
+      "id": "ui",
+      "lane": "human",
+      "col": 3,
+      "type": "frontend",
+      "label": "ui",
+      "sublabel": "loopback 대시보드",
+      "width": 132
+    },
+    {
+      "id": "completion",
+      "lane": "human",
+      "col": 5,
+      "type": "frontend",
+      "label": "completion",
+      "sublabel": "bash/zsh/fish",
+      "width": 132
+    }
+  ],
+  "edges": [
+    {
+      "from": "select_state",
+      "to": "store_show"
+    },
+    {
+      "from": "store_show",
+      "to": "store_ls"
+    },
+    {
+      "from": "store_ls",
+      "to": "store_set"
+    },
+    {
+      "from": "store_set",
+      "to": "store_move",
+      "variant": "emphasis"
+    },
+    {
+      "from": "store_move",
+      "to": "store_rm"
+    },
+    {
+      "from": "store_show",
+      "to": "ui",
+      "label": "같은 inventory",
+      "role": "branch"
+    },
+    {
+      "from": "ui",
+      "to": "completion",
+      "label": "같은 CLI schema",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "State precedence",
+      "items": [
+        "PALIMPSEST_STATE_HOME이 config와 platform 기본값보다 우선합니다",
+        "Linux 기본값은 /var/lib/palimpsest입니다"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Mutation safety",
+      "items": [
+        "store set은 설정만 바꾸고 bytes를 옮기지 않습니다",
+        "store rm은 참조·lease된 객체를 항상 거부합니다"
+      ]
+    }
+  ]
+}

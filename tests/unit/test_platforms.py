@@ -320,9 +320,7 @@ def test_preflight_kvm_requires_dev_kvm_access(monkeypatch: pytest.MonkeyPatch):
 
 def test_preflight_kvm_requires_tools_on_path(monkeypatch: pytest.MonkeyPatch):
     _patch_dev_kvm(monkeypatch, accessible=True)
-    monkeypatch.setattr(
-        platforms.shutil, "which", lambda name: None if name == "cloud-localds" else f"/usr/bin/{name}"
-    )
+    monkeypatch.setattr(platforms.shutil, "which", lambda name: None if name == "cloud-localds" else f"/usr/bin/{name}")
     host = platforms.HostPlatform(system="Linux", machine="x86_64")
     with pytest.raises(LifecycleError, match="cloud-localds"):
         platforms.preflight(platforms.BACKEND_KVM, host=host)
@@ -402,9 +400,7 @@ def test_preflight_hvf_requires_firmware(tmp_path: Path, monkeypatch: pytest.Mon
         platforms.preflight(platforms.BACKEND_HVF, host=host)
 
 
-def test_preflight_hvf_wraps_missing_libvirt_python_as_lifecycle_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_preflight_hvf_wraps_missing_libvirt_python_as_lifecycle_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     emulator = _fake_emulator(tmp_path)
     share_dir = emulator.resolve().parent.parent / "share" / "qemu"
     share_dir.mkdir(parents=True)

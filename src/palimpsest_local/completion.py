@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Sequence
+from collections.abc import Sequence
 
 SUPPORTED_SHELLS = ("zsh", "bash", "fish")
 
@@ -41,8 +41,7 @@ def resolve_candidates(parser: argparse.ArgumentParser, words: Sequence[str]) ->
     in_remainder = False
 
     pos_actions = [
-        a for a in curr_parser._actions
-        if not a.option_strings and not isinstance(a, argparse._SubParsersAction)
+        a for a in curr_parser._actions if not a.option_strings and not isinstance(a, argparse._SubParsersAction)
     ]
     pos_idx = 0
 
@@ -87,7 +86,8 @@ def resolve_candidates(parser: argparse.ArgumentParser, words: Sequence[str]) ->
         if subparser_action is not None and w in subparser_action.choices:
             curr_parser = subparser_action.choices[w]
             pos_actions = [
-                a for a in curr_parser._actions
+                a
+                for a in curr_parser._actions
                 if not a.option_strings and not isinstance(a, argparse._SubParsersAction)
             ]
             pos_idx = 0

@@ -463,9 +463,7 @@ def test_domain_xml_rejects_relative_nvram_for_pflash_firmware():
 
 def test_domain_xml_rejects_missing_ssh_host_port_for_user_hostfwd():
     disks = build_layer_disks(_ROOT, _DIGESTS)
-    spec = DomainSpec(
-        **{**_spec(disks).__dict__, "nvram": Path("/var/lib/palimpsest/domains/demo-nvram.fd")}
-    )
+    spec = DomainSpec(**{**_spec(disks).__dict__, "nvram": Path("/var/lib/palimpsest/domains/demo-nvram.fd")})
     with pytest.raises(KvmError, match="ssh host port"):
         build_domain_xml(spec, _HVF_PROFILE)
 

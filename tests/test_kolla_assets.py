@@ -7,15 +7,8 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-try:
-    import yaml
-except ImportError:
-    yaml = None
-
-try:
-    import jinja2
-except ImportError:
-    jinja2 = None
+import jinja2
+import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
 KOLLA_DIR = REPO_ROOT / "deploy" / "kolla"
@@ -74,26 +67,18 @@ def test_version_lockstep_and_metadata():
     assert pyproject_data["project"]["requires-python"] == ">=3.11"
     assert pyproject_data["tool"]["hatch"]["version"]["path"] == "../../hub/src/palimpsest_hub/__init__.py"
 
-    if yaml is not None:
-        defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
-        assert defaults_yaml["palimpsest_image_tag"] == hub_version
-    else:
-        defaults_text = (ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
-        assert f'palimpsest_image_tag: "{hub_version}"' in defaults_text or f"palimpsest_image_tag: '{hub_version}'" in defaults_text
+    defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
+    assert defaults_yaml["palimpsest_image_tag"] == hub_version
 
 
 def test_all_yaml_files_parse():
-    if yaml is None:
-        return
     for yml_file in ROLE_DIR.rglob("*.yml"):
         content = yml_file.read_text(encoding="utf-8")
         parsed = yaml.safe_load(content)
-        assert parsed is not None, f"YAML file parsed to None or empty: {yml_file}"
+        assert parsed is not None or yml_file.name == "main.yml", f"YAML file parsed to None or empty: {yml_file}"
 
 
 def test_jinja_templates_compile():
-    if jinja2 is None:
-        return
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
     for template_file in (ROLE_DIR / "templates").glob("*.j2"):
         content = template_file.read_text(encoding="utf-8")
@@ -139,3 +124,13 @@ def test_palimpsest_kolla_wheel_build_and_install(tmp_path: Path):
     assert (installed_role / "defaults" / "main.yml").is_file()
     assert (installed_role / "tasks" / "main.yml").is_file()
     assert (installed_role / "templates" / "palimpsest.conf.j2").is_file()
+
+    # Clean uninstall check
+    res_uninst = subprocess.run(
+        ["uv", "pip", "uninstall", "--python", str(venv_python), "palimpsest-kolla"],
+        capture_output=True,
+        text=True,
+    )
+    assert res_uninst.returncode == 0, f"uv pip uninstall failed: {res_uninst.stderr}"
+    remaining_files = list(installed_role.glob("**/*")) if installed_role.exists() else []
+    assert not [path for path in remaining_files if path.is_file()], "Uninstall left behind role files"

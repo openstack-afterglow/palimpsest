@@ -40,6 +40,7 @@ def _get_conn(conn: Any | None, kvm_uri: str) -> Any:
     except kvm.KvmError as exc:
         raise LifecycleError(str(exc)) from exc
 
+
 _LIBVIRT_BACKENDS = (platforms.BACKEND_KVM, platforms.BACKEND_HVF)
 
 

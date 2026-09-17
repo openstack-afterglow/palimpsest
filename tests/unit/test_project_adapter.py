@@ -39,7 +39,9 @@ def _project(tmp_path: Path, body: str, environment: dict[str, str] | None = Non
     return load_project(path, environment or {})
 
 
-def test_desired_digest_binds_resolved_environment_and_runtime_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_desired_digest_binds_resolved_environment_and_runtime_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
     image_digest = "sha256:" + "a" * 64
     project = _project(
@@ -292,7 +294,9 @@ def test_volume_deletion_uses_ledger_backend_binding(tmp_path: Path, monkeypatch
     assert calls == ["kvm"]
 
 
-def test_managed_default_network_rejects_non_nat_driver_before_backend_use(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_default_network_rejects_non_nat_driver_before_backend_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(project_adapter.platforms, "select_backend", lambda _arch: "kvm")
     project = _project(
         tmp_path,
@@ -653,6 +657,7 @@ def test_libvirt_hvf_backend_routes_like_kvm_for_ports_and_volumes(
 
     with pytest.raises(ArtifactValidationError, match="per-domain inbound forwarding"):
         callbacks.preflight((prepared,))
+
 
 def test_kvm_volume_reference_check_allows_only_exact_owned_teardown_domain(
     tmp_path: Path,
