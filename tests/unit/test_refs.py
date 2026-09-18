@@ -6,7 +6,15 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local.errors import ArtifactValidationError, DigestMismatchError
-from palimpsest_local.refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
+from palimpsest_local.refs import (
+    BuildSpec,
+    ImageRef,
+    LayerRef,
+    PortForward,
+    RunSpec,
+    StackRef,
+    VolumeAttachment,
+)
 
 
 def _artifact(tmp_path: Path, name: str, content: bytes = b"artifact") -> tuple[Path, str]:
@@ -46,3 +54,22 @@ def test_stack_and_run_contract_limits(tmp_path: Path):
         StackRef(base, (layer, layer))
     with pytest.raises(ArtifactValidationError, match="run names"):
         RunSpec("Bad Name", StackRef(base, ()))
+
+
+def test_project_runtime_resources_are_strict_and_collision_free(tmp_path: Path):
+    base_path, base_digest = _artifact(tmp_path, "base")
+    volume_path, _ = _artifact(tmp_path, "data.raw")
+    stack = StackRef(ImageRef(base_digest, "raw", "x86_64", None, base_path), ())
+    volume = VolumeAttachment("data", "/var/lib/data", host_path=volume_path)
+    port = PortForward("127.0.0.1", 8080, 80)
+
+    spec = RunSpec("demo", stack, ports=(port,), volumes=(volume,), environment=(("APP_ENV", "prod"),))
+    assert spec.ports == (port,)
+    assert spec.volumes == (volume,)
+
+    with pytest.raises(ArtifactValidationError, match="duplicate host port"):
+        RunSpec("demo", stack, ports=(port, port))
+    with pytest.raises(ArtifactValidationError, match="single NUL-free line"):
+        RunSpec("demo", stack, environment=(("BAD", "one\ntwo"),))
+    with pytest.raises(ArtifactValidationError, match="shadow"):
+        VolumeAttachment("bad", "/proc/data", host_path=volume_path)

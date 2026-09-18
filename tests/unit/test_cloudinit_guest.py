@@ -6,6 +6,7 @@ import base64
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,8 +52,81 @@ def test_user_data_structure():
     assert cloudinit.EXEC_HELPER_PATH in ud
     assert cloudinit.ACTIVATION_SCRIPT_PATH in ud
     assert cloudinit.ACTIVATION_UNIT_PATH in ud
+    assert cloudinit.READY_SCRIPT_PATH in ud
+    assert cloudinit.READY_UNIT_PATH in ud
     assert cloudinit.READY_SENTINEL in ud
     assert cloudinit.CONSOLE_DEVICE in ud
+
+
+def test_user_data_appends_guest_environment_without_shell_interpolation():
+    user_data = cloudinit.build_user_data(
+        client_public_key="ssh-ed25519 AAAAClient client@host",
+        host_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----\n",
+        host_public_key="ssh-ed25519 AAAAHost host@guest",
+        activation_script="set -euo pipefail\ntrue\n",
+        environment=(("APP_ENV", "production"), ("LITERAL", '$HOME and "quotes"')),
+    )
+
+    assert "  - path: /etc/environment" in user_data
+    assert "    append: true" in user_data
+    assert 'APP_ENV="production"' in user_data
+    assert 'LITERAL="' in user_data
+    assert "$HOME" in user_data
+
+
+def test_user_data_rejects_multiline_environment():
+    with pytest.raises(GuestError, match="single-line"):
+        cloudinit.build_user_data(
+            client_public_key="ssh-ed25519 AAAAClient client@host",
+            host_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----\n",
+            host_public_key="ssh-ed25519 AAAAHost host@guest",
+            activation_script="true\n",
+            environment=(("BAD", "line1\nline2"),),
+        )
+
+
+def test_typed_cloud_init_is_compiled_before_final_readiness():
+    custom = SimpleNamespace(
+        packages=("curl",),
+        write_files=(SimpleNamespace(path="/etc/demo.conf", content="mode=prod", permissions="0640"),),
+        runcmd=(("printf", "%s", "hello; not-a-shell"),),
+    )
+    user_data = cloudinit.build_user_data(
+        client_public_key="ssh-ed25519 AAAAClient client@host",
+        host_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----\n",
+        host_public_key="ssh-ed25519 AAAAHost host@guest",
+        activation_script="true\n",
+        cloud_init=custom,
+    )
+
+    assert '  - "curl"' in user_data
+    assert 'path: "/etc/demo.conf"' in user_data
+    assert "printf %s 'hello; not-a-shell'" in user_data
+    project_script = user_data[user_data.index(cloudinit.PROJECT_INIT_PATH) :]
+    assert project_script.index("hello; not-a-shell") < project_script.index(cloudinit.READY_SENTINEL)
+    activation_script = user_data[
+        user_data.index(cloudinit.ACTIVATION_SCRIPT_PATH) : user_data.index(cloudinit.ACTIVATION_UNIT_PATH)
+    ]
+    assert cloudinit.READY_SENTINEL not in activation_script
+    assert f"After={cloudinit.ACTIVATION_UNIT_NAME} cloud-final.service" in user_data
+    assert f"systemctl enable {cloudinit.READY_UNIT_NAME}" in user_data
+    assert f"systemctl enable --now {cloudinit.READY_UNIT_NAME}" not in user_data
+
+
+def test_typed_cloud_init_cannot_overwrite_runtime_paths():
+    custom = SimpleNamespace(
+        packages=(),
+        write_files=(SimpleNamespace(path=cloudinit.ACTIVATION_SCRIPT_PATH, content="bad", permissions="0755"),),
+        runcmd=(),
+    )
+    with pytest.raises(GuestError, match="reserved"):
+        cloudinit.build_user_data(
+            client_public_key="ssh-ed25519 AAAAClient client@host",
+            host_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----\n",
+            host_public_key="ssh-ed25519 AAAAHost host@guest",
+            activation_script="true\n",
+            cloud_init=custom,
+        )
 
 
 def test_serial_builder_seed_is_credential_free_and_transport_handles_short_writes():

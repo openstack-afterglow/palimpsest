@@ -14,7 +14,9 @@ string.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import re
+import shlex
+from pathlib import Path, PurePosixPath
 
 from .errors import LifecycleError as GuestError
 
@@ -23,12 +25,31 @@ EXEC_HELPER_PATH = "/usr/local/libexec/palimpsest-exec"
 ACTIVATION_SCRIPT_PATH = "/usr/local/libexec/palimpsest-activate"
 ACTIVATION_UNIT_PATH = "/etc/systemd/system/palimpsest-activate.service"
 ACTIVATION_UNIT_NAME = "palimpsest-activate.service"
+READY_SCRIPT_PATH = "/usr/local/libexec/palimpsest-ready"
+READY_UNIT_PATH = "/etc/systemd/system/palimpsest-ready.service"
+READY_UNIT_NAME = "palimpsest-ready.service"
 CONSOLE_DEVICE = "/dev/ttyS0"
 BUILD_CHANNEL_NAME = "org.afterglow.palimpsest.builder.v1"
 BUILD_JOB_PATH = "/etc/palimpsest/build-job.json"
 BUILD_WORKER_PATH = "/usr/local/libexec/palimpsest-builder"
 BUILD_UNIT_PATH = "/etc/systemd/system/palimpsest-builder.service"
 BUILD_UNIT_NAME = "palimpsest-builder.service"
+PROJECT_INIT_PATH = "/usr/local/libexec/palimpsest-project-init"
+_ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_GUEST_PATHS = (
+    "/dev",
+    "/proc",
+    "/sys",
+    "/etc/palimpsest",
+    "/opt/layers",
+    "/mnt/palimpsest",
+    EXEC_HELPER_PATH,
+    ACTIVATION_SCRIPT_PATH,
+    ACTIVATION_UNIT_PATH,
+    READY_SCRIPT_PATH,
+    READY_UNIT_PATH,
+    PROJECT_INIT_PATH,
+)
 
 _BUILD_WORKER_SOURCE = r'''#!/usr/bin/env python3
 """One-shot, seed-defined Palimpsest builder.
@@ -286,7 +307,7 @@ def build_meta_data(instance_id: str, *, hostname: str = "palimpsest") -> str:
     return f"instance-id: {instance_id}\nlocal-hostname: {hostname}\n"
 
 
-def build_activation_unit(activation_script: str) -> tuple[str, str]:
+def build_activation_unit(activation_script: str, *, emit_ready: bool = True) -> tuple[str, str]:
     """Return ``(helper_script_text, systemd_unit_text)`` for layer activation.
 
     Wraps ``activation_script`` (e.g. from
@@ -297,9 +318,9 @@ def build_activation_unit(activation_script: str) -> tuple[str, str]:
     if not activation_script.strip():
         raise GuestError("activation_script must be nonempty")
     body = activation_script if activation_script.endswith("\n") else activation_script + "\n"
-    helper_script = (
-        "#!/bin/bash\nset -euo pipefail\nexec >>" + CONSOLE_DEVICE + " 2>&1\n" + body + f"echo {READY_SENTINEL}\n"
-    )
+    helper_script = "#!/bin/bash\nset -euo pipefail\nexec >>" + CONSOLE_DEVICE + " 2>&1\n" + body
+    if emit_ready:
+        helper_script += f"echo {READY_SENTINEL}\n"
     unit_text = (
         "[Unit]\n"
         "Description=Palimpsest layer activation\n"
@@ -325,6 +346,8 @@ def build_user_data(
     host_private_key: Path | str,
     host_public_key: Path | str,
     activation_script: str,
+    environment: tuple[tuple[str, str], ...] = (),
+    cloud_init: object | None = None,
 ) -> str:
     """Render the full NoCloud ``user-data`` ``#cloud-config`` document for one run.
 
@@ -335,7 +358,47 @@ def build_user_data(
     client_key = read_public_key_line(client_public_key)
     host_public = read_public_key_line(host_public_key)
     host_private = read_key_material(host_private_key).rstrip("\n")
-    helper_script, unit_text = build_activation_unit(activation_script)
+    helper_script, unit_text = build_activation_unit(activation_script, emit_ready=False)
+    ready_script = f"#!/bin/bash\nset -euo pipefail\necho {READY_SENTINEL} >>{CONSOLE_DEVICE}\n"
+    ready_unit = (
+        "[Unit]\n"
+        "Description=Palimpsest boot readiness\n"
+        f"Requires={ACTIVATION_UNIT_NAME}\n"
+        f"After={ACTIVATION_UNIT_NAME} cloud-final.service\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={READY_SCRIPT_PATH}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+    environment_lines: list[str] = []
+    seen_environment: set[str] = set()
+    for name, value in environment:
+        if (
+            _ENVIRONMENT_NAME_RE.fullmatch(name) is None
+            or name in seen_environment
+            or any(character in value for character in ("\x00", "\n", "\r"))
+        ):
+            raise GuestError("environment entries must have unique names and single-line values")
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        environment_lines.append(f'{name}="{escaped}"')
+        seen_environment.add(name)
+
+    packages = tuple(getattr(cloud_init, "packages", ())) if cloud_init is not None else ()
+    write_files = tuple(getattr(cloud_init, "write_files", ())) if cloud_init is not None else ()
+    commands = tuple(getattr(cloud_init, "runcmd", ())) if cloud_init is not None else ()
+    if not all(isinstance(package, str) and package and "\x00" not in package for package in packages):
+        raise GuestError("cloud-init packages entries must be nonempty NUL-free strings")
+    project_script_lines = ["#!/bin/bash", "set -euo pipefail", f"exec >>{CONSOLE_DEVICE} 2>&1"]
+    for command in commands:
+        if not isinstance(command, tuple) or not command or not all(isinstance(argument, str) for argument in command):
+            raise GuestError("cloud-init runcmd entries must be nonempty argv tuples")
+        project_script_lines.append(shlex.join(command))
+    project_script_lines.append(f"echo {READY_SENTINEL}")
+    project_script = "\n".join(project_script_lines) + "\n"
 
     lines = [
         "#cloud-config",
@@ -370,12 +433,72 @@ def build_user_data(
         "    owner: root:root",
         "    content: |",
         _literal_block(unit_text.rstrip("\n"), 6),
-        "",
-        "runcmd:",
-        "  - systemctl daemon-reload",
-        f"  - systemctl enable --now {ACTIVATION_UNIT_NAME}",
-        "",
+        f"  - path: {READY_SCRIPT_PATH}",
+        "    permissions: '0755'",
+        "    owner: root:root",
+        "    content: |",
+        _literal_block(ready_script.rstrip("\n"), 6),
+        f"  - path: {READY_UNIT_PATH}",
+        "    permissions: '0644'",
+        "    owner: root:root",
+        "    content: |",
+        _literal_block(ready_unit.rstrip("\n"), 6),
+        f"  - path: {PROJECT_INIT_PATH}",
+        "    permissions: '0755'",
+        "    owner: root:root",
+        "    content: |",
+        _literal_block(project_script.rstrip("\n"), 6),
     ]
+    for item in write_files:
+        path = getattr(item, "path", None)
+        content = getattr(item, "content", None)
+        permissions = getattr(item, "permissions", None)
+        if not all(isinstance(value, str) for value in (path, content, permissions)):
+            raise GuestError("cloud-init write_files entries are invalid")
+        pure_path = PurePosixPath(path)
+        if not pure_path.is_absolute() or ".." in pure_path.parts:
+            raise GuestError("cloud-init write_files paths must be normalized absolute guest paths")
+        normalized_path = str(pure_path)
+        if any(
+            normalized_path == reserved or normalized_path.startswith(reserved + "/")
+            for reserved in _RESERVED_GUEST_PATHS
+        ):
+            raise GuestError(f"cloud-init write_files path is reserved by Palimpsest: {normalized_path}")
+        if re.fullmatch(r"0[0-7]{3}", permissions) is None:
+            raise GuestError("cloud-init write_files permissions must be a four-digit octal string")
+        lines.extend(
+            [
+                f"  - path: {json.dumps(normalized_path)}",
+                f"    permissions: {json.dumps(permissions)}",
+                "    owner: root:root",
+                "    content: |",
+                _literal_block(content, 6),
+            ]
+        )
+    if environment_lines:
+        lines.extend(
+            [
+                "  - path: /etc/environment",
+                "    permissions: '0644'",
+                "    owner: root:root",
+                "    append: true",
+                "    content: |",
+                _literal_block("\n".join(environment_lines), 6),
+            ]
+        )
+    if packages:
+        lines.extend(["", "packages:", *(f"  - {json.dumps(package)}" for package in packages)])
+    lines.extend(
+        [
+            "",
+            "runcmd:",
+            "  - systemctl daemon-reload",
+            f"  - systemctl enable --now {ACTIVATION_UNIT_NAME}",
+            f"  - systemctl enable {READY_UNIT_NAME}",
+            f"  - {PROJECT_INIT_PATH}",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 

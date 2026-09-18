@@ -1,0 +1,41 @@
+---
+- name: Bootstrap | Pull Palimpsest API image for bootstrap
+  become: true
+  community.docker.docker_image:
+    name: "{{ palimpsest_api_image_ref }}"
+    source: pull
+    force_source: "{{ palimpsest_image_tag == 'latest' }}"
+  run_once: true
+  delegate_to: "{{ groups['palimpsest'] | first }}"
+  when: not (palimpsest_source_mode | default(false) | bool)
+
+- name: Bootstrap | Run Palimpsest Hub bootstrap
+  become: true
+  community.docker.docker_container:
+    name: palimpsest_bootstrap
+    image: "{{ palimpsest_api_image_ref }}"
+    command: ["palimpsest-hub-bootstrap"]
+    state: started
+    detach: false
+    cleanup: true
+    network_mode: host
+    volumes:
+      - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+    env:
+      DATABASE_URL: "{{ palimpsest_database_url }}"
+      REDIS_URL: "{{ palimpsest_redis_url }}"
+      PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+      OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
+      OS_USERNAME: "{{ palimpsest_keystone_user }}"
+      OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+      OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
+      OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
+      OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
+      OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
+      OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
+      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+  no_log: true
+  register: palimpsest_bootstrap_result
+  run_once: true
+  delegate_to: "{{ groups['palimpsest'] | first }}"

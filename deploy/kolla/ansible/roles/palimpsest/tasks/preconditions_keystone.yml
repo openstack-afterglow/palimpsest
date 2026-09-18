@@ -1,0 +1,24 @@
+---
+- name: Keystone | Register Palimpsest service, project, and user
+  ansible.builtin.import_role:
+    name: service-ks-register
+  vars:
+    project_name: palimpsest
+    service_ks_register_auth: "{{ openstack_auth }}"
+    service_ks_register_services:
+      - name: palimpsest
+        type: palimpsest
+        description: "Palimpsest Hub layer repository service"
+        endpoints:
+          - interface: public
+            url: "{{ palimpsest_public_endpoint_url }}"
+          - interface: internal
+            url: "{{ palimpsest_internal_endpoint_url }}"
+          - interface: admin
+            url: "{{ palimpsest_admin_endpoint_url }}"
+    service_ks_register_users:
+      - project: "{{ palimpsest_service_project_name }}"
+        user: "{{ palimpsest_keystone_user }}"
+        password: "{{ palimpsest_keystone_password }}"
+        role: admin
+  no_log: true

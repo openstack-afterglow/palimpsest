@@ -12,11 +12,12 @@ from .errors import (
     LifecycleError,
     PalimpsestError,
     StateError,
+    UnsupportedPlatformError,
 )
 from .hub import HubClient
 from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.4"
 
 __all__ = [
     "ArtifactValidationError",
@@ -33,6 +34,7 @@ __all__ = [
     "RunSpec",
     "StackRef",
     "StateError",
+    "UnsupportedPlatformError",
     "digest_file",
     "normalize_digest",
     "require_digest",

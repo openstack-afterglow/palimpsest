@@ -33,3 +33,7 @@ class LifecycleError(PalimpsestError):
 
 class BuildError(PalimpsestError):
     """A Palimpsestfile or build capture violates the build contract."""
+
+
+class UnsupportedPlatformError(PalimpsestError):
+    """The host environment or system does not support the requested operation."""

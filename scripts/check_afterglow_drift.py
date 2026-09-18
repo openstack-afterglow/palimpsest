@@ -16,6 +16,7 @@ VALID_STATUSES = {
     "blocked-upstream-protocol",
     "compatible",
     "diverged-stricter-local",
+    "implemented",
     "partial",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
