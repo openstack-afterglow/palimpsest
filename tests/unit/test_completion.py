@@ -14,7 +14,7 @@ import pytest
 from palimpsest_local import cli, completion
 
 
-def test_root_completion_candidates():
+def test_root_completion_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     parser = cli.build_parser()
     candidates = completion.resolve_candidates(parser, [""])
 
@@ -25,9 +25,12 @@ def test_root_completion_candidates():
     assert expected_subcommands.issubset(set(candidates))
     assert expected_root_options.issubset(set(candidates))
 
-    # Never return filesystem entries
-    cwd_files = {p.name for p in Path.cwd().iterdir()}
-    assert not cwd_files.intersection(set(candidates))
+    # Never return filesystem entries from an unrelated cwd
+    sentinel = tmp_path / "zz-not-a-subcommand"
+    sentinel.mkdir()
+    monkeypatch.chdir(tmp_path)
+    candidates = completion.resolve_candidates(parser, [""])
+    assert "zz-not-a-subcommand" not in candidates
 
     # Empty list input behaves identically
     assert completion.resolve_candidates(parser, []) == candidates

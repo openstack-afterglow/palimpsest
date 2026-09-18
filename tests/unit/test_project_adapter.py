@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import project_adapter, state
+from palimpsest_local import platforms, project_adapter, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
 from palimpsest_local.project import load_project
 from palimpsest_local.project_runtime import (
@@ -381,6 +381,7 @@ services:
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
     monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
+    monkeypatch.setattr(project_adapter.platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
 
     existing: object | None = None
 
@@ -518,6 +519,7 @@ services:
         },
     )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+    monkeypatch.setattr(project_adapter.platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
     callbacks = project_adapter.build_project_callbacks(
         project,
         roots,

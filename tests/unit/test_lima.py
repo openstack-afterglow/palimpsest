@@ -487,13 +487,19 @@ def test_lima_logs_read_current_boot_guest_journal(tmp_path: Path, monkeypatch: 
     assert calls[0] == ["limactl", "list", "--format", "json"]
 
 
-def test_lima_stopped_logs_use_local_console_and_cannot_follow(tmp_path: Path):
+def test_lima_stopped_logs_use_local_console_and_cannot_follow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     rpaths = state.run_paths(roots, "mac-prototype")
     rpaths.root.mkdir(parents=True, mode=0o700)
     state.write_owner_record(rpaths)
     state.write_run_state(rpaths, status="stopped", data={"backend": "lima-vz"})
     rpaths.console.write_text("provisioned\n", encoding="utf-8")
+
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        assert argv == ["limactl", "list", "--format", "json"]
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
 
     assert list(lima.logs("mac-prototype", roots=roots)) == ["provisioned\n"]
     with pytest.raises(LifecycleError, match="cannot follow"):
