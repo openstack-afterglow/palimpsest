@@ -1267,6 +1267,21 @@ timeout·nonzero-exit 경로가 caller의 process-group fence 이전에
 62건이 통과했으며 이는 Linux group reaping·libvirt teardown 실기가
 아니다.
 
+게시 후 CI 결과 (2026-09-21, commit `22fc4046c796d8b34ebed5fe41100c0a7495565a`):
+`main`의 `Test` run `35601184854`는 19개 job 전부 success였고 여기에는
+`Native KVM stage-1 proof`와 required `Required native KVM proof`,
+privileged OCI filesystem proof, guest stage-1 binary, local OCI product
+build, Hub job, Linux 6/6·macOS 4/4 portable shard가 포함된다. `main`의
+`Build and Push Palimpsest Hub` run `35601184858`도 image build/push까지
+success다. `Development package`는 branch run `35601173619`에서 success로
+`package-22fc4046c796d8b34ebed5fe41100c0a7495565a` prerelease(wheel,
+sdist, `SHA256SUMS`)를 게시했고, 같은 SHA를 `main`에 올려 다시 실행된
+run `35601184840`의 publish job은 `gh: Reference already exists (HTTP 422)`로
+실패했다. 이는 기존 tag/release를 덮어쓰지 않는 workflow 정책이 동작한
+결과이며 새 결함이 아니다. `dev`의 같은 workflow run은 concurrency로
+cancelled였다. 동일 SHA를 세 branch에 게시하면 이 중복 publish 실패가
+반복된다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
