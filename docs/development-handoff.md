@@ -1254,6 +1254,19 @@ generated CLI reference, architecture working/staged check다. 게시 후 실제
 lock했다. Native KVM, Gate 2, Keystone staging, Kolla 실제 배포와 Hub
 image publication은 여전히 검증되지 않았다.
 
+게시 후 cleanup 순서 보정 (2026-09-20): 독립 검토가 `_run_guest_build`의
+timeout·nonzero-exit 경로가 caller의 process-group fence 이전에
+`_cleanup_guest`를 호출한다고 지적했다. `child.wait()`는 leader 종료만
+증명하므로 descendant가 살아 있는 동안 guest state를 회수할 수 있다.
+두 inline 호출을 제거해 실패를 그대로 전파하고, 기존
+`_stop_interrupted_builder` → `_cleanup_guest` 경로만 cleanup을 수행한다.
+회귀 2건을 추가했다. 실제 nonzero-exit builder 실행에서 cleanup이
+호출되지 않아야 하고, group 정지를 확인하지 못하면 cleanup 없이
+`cleanup_failed`와 job tree 보존으로 멈춰야 한다. 보정 전 code로
+되돌려 첫 회귀가 실패함을 확인한 뒤 원복했다. Hub 집중 7건과 전체
+62건이 통과했으며 이는 Linux group reaping·libvirt teardown 실기가
+아니다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

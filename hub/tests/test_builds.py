@@ -374,3 +374,82 @@ async def test_published_build_stops_worker_when_guest_cleanup_fails(tmp_path: P
         assert (store.root / "builds" / build_id / "input.json").exists()
     finally:
         await engine.dispose()
+
+
+def test_failed_guest_run_never_reclaims_state_before_group_verification(tmp_path: Path, monkeypatch):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    manifest = job_dir / "input.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        build_service,
+        "_cleanup_guest",
+        lambda python, path: pytest.fail("guest cleanup ran before the recorded group was verified"),
+    )
+
+    # The interpreter lacks palimpsest_local, so the builder exits nonzero.
+    with pytest.raises(RuntimeError, match="isolated builder failed"):
+        build_service._run_guest_build(sys.executable, manifest, job_dir, 60)
+    assert (job_dir / "stderr").read_text(encoding="utf-8").strip()
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_builder_group_blocks_guest_cleanup_and_retains_tree(tmp_path: Path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hub.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "store")
+    build_id = "00000000-0000-4000-8000-000000000004"
+    async with factory() as session:
+        session.add(
+            PalimpsestHubBuild(
+                id=build_id,
+                project_id="alpha",
+                name="timed-out",
+                recipe="RUN true",
+                recipe_digest=digest(b"RUN true"),
+                base_digest=digest(b"base"),
+                layer_digests=[],
+                status="queued",
+                created_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
+    monkeypatch.setattr(build_service, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(build_service, "get_blob_store", lambda _settings=None: store)
+    monkeypatch.setattr(
+        build_service,
+        "get_build_worker_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_builder_python="/usr/bin/python3", palimpsest_hub_build_timeout_seconds=60
+        ),
+    )
+
+    async def input_manifest(build_id, job_dir):
+        return {"name": "timed-out"}
+
+    def timed_out(*_args):
+        raise RuntimeError("build timed out")
+
+    def unverifiable_group(job_dir):
+        raise build_service.BuildCleanupError("builder process group could not be reaped")
+
+    monkeypatch.setattr(build_service, "_input_manifest", input_manifest)
+    monkeypatch.setattr(build_service, "_run_guest_build", timed_out)
+    monkeypatch.setattr(build_service, "_stop_interrupted_builder", unverifiable_group)
+    monkeypatch.setattr(
+        build_service,
+        "_cleanup_guest",
+        lambda python, job_dir: pytest.fail("guest cleanup ran without a reaped builder group"),
+    )
+    try:
+        with pytest.raises(build_service.BuildCleanupError):
+            await build_service.process_one_hub_build("owner")
+        async with factory() as session:
+            row = await session.get(PalimpsestHubBuild, build_id)
+            assert row.status == "error" and row.error_code == "cleanup_failed"
+            assert row.lease_owner is None
+        assert (store.root / "builds" / build_id / "input.json").exists()
+    finally:
+        await engine.dispose()

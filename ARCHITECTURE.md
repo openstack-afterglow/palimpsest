@@ -407,6 +407,8 @@ Worker는 SQL 접속 또는 queue claim 전에 설정된 별도 Local interprete
 
 Linux child는 guest 실행 전에 `PR_SET_PDEATHSIG(SIGKILL)`과 parent PID를 확인하고 boot ID·PID·start ticks marker를 private build tree에 fsync한다. Worker 재시작은 그 process-group identity를 검증하고 중지한 뒤 guest cleanup을 수행한다. Identity/cleanup을 확인하지 못하면 job tree를 지우지 않고 `cleanup_failed`로 작업을 멈춘다. Portable test의 mock VM은 이 kernel/libvirt 동작의 live proof가 아니다.
 
+Timeout이나 builder의 nonzero exit은 그 자리에서 guest state를 회수하지 않는다. Leader 종료는 기록된 process group의 소멸을 증명하지 않으므로, 실패는 error로 전파되고 caller가 group identity 검증·종료를 먼저 수행한 뒤에만 cleanup을 호출한다. Group 정지를 확인하지 못하면 cleanup을 실행하지 않고 job tree를 보존한 채 `cleanup_failed`로 멈춘다.
+
 완료한 build의 output row를 SQL commit한 뒤 scratch 삭제 전에 crash가 나도 다음 worker 시작이 exact UUID private job tree를 조사해 owned guest를 검증·정리하고 tree를 제거한다. Cleanup 실패는 완료된 output을 되돌리지 않고 `cleanup_failed`를 남기며 worker가 중단된다. Upload/ingest/build output blob은 file 및 해당 CAS directory ancestor를 fsync한 뒤에만 SQL publication을 허용하고 실패 시 성공을 반환하지 않는다. Portable regression은 이 실패·복구 계약만 증명하며 실제 Linux filesystem crash durability나 libvirt teardown 실기는 아직 없다.
 
 ### 운영 관찰과 실패 경계
@@ -674,9 +676,9 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "7275b9408a2b7dd4165fdeb2334ca75df22f25e7aa41fbb12b03c71f364c121c",
-  "reviewed_at": "2026-09-21T12:39:12Z",
-  "summary": "Merged origin/dev root-package integration (palimpsest-local 0.1.4, requires-python >=3.11, Kolla role shared data, palimpsest-hub 0.1.3, docker/hub context) into the isolated Hub build workflow and direct Git installation documentation; conflicts resolved to the centralized runtime_dispatch/platforms and inventory contracts, with Kolla contracts classified into the portable core-cli lane."
+  "source_sha256": "53115441151bd6f07510671cb3617c785214dc0866100d6a44792354499e83bd",
+  "reviewed_at": "2026-09-21T12:43:10Z",
+  "summary": "Fenced Hub builder guest cleanup behind verified process-group reaping after a timed-out or failed run, with portable regressions; merged dev root-package integration and direct Git installation paths remain as documented, while native KVM and Keystone staging stay unverified."
 }
 ```
 <!-- architecture-review:end -->

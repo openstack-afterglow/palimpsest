@@ -81,8 +81,9 @@ shared blob, suffix byte ranges, canceled lock waiters, retry after interrupted
 blob promotion, refusal on blob directory fsync failure, competing
 identical-digest registrations, competing project enqueue requests, worker
 preflight rejection before SQL access, fail-closed recovery of an unverifiable
-builder marker, and retry of completed-build private scratch cleanup without
-losing its published output. These are portable contract tests: a Linux-only
+builder marker, retry of completed-build private scratch cleanup without
+losing its published output, and refusal to reclaim guest state after a failed
+or timed-out builder run until its recorded process group is verified. These are portable contract tests: a Linux-only
 run must still confirm parent-death signals, exact process-group reaping,
 filesystem crash durability, and libvirt teardown.
 

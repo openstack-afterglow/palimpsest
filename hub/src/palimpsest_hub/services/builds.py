@@ -289,10 +289,10 @@ def _run_guest_build(python: str, manifest: Path, job_dir: Path, timeout: int) -
                 with suppress(ProcessLookupError):
                     os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-            _cleanup_guest(python, job_dir)
+            # Never reclaim guest state here: the leader's exit does not prove the
+            # recorded group is gone. The caller fences cleanup behind _stop_interrupted_builder.
             raise RuntimeError("build timed out") from exc
     if child.returncode:
-        _cleanup_guest(python, job_dir)
         raise RuntimeError("isolated builder failed")
     if (job_dir / "stdout").stat().st_size > 1024:
         raise RuntimeError("builder output exceeds protocol limit")
