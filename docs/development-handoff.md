@@ -1320,6 +1320,23 @@ new project는 `uv init --bare --python 3.11` 후 `uv python pin 3.11`을 쓰고
 `importlib.metadata.version("palimpsest-local")` probe가 local command
 충돌과 실제 설치를 구분한다.
 
+게시 결과 (2026-09-22): 보정 commit
+`279f6a1371fd5c3cc6882af3ef23808722fa8fd1`을
+`codex/oci-root-phase1`, `dev`, `main`에 모두 fast-forward 게시했다. 실제
+remote `main`으로 Python 3.10 project fixture의 floor를 `>=3.11`로 보정하고
+CPython 3.11.15를 pin한 뒤 unpinned Git URL을 `uv add`했다. uv lock은 정확히
+`279f6a1`을 선택했고 distribution metadata와 `palimpsest --version`이 모두
+`0.1.4`를 반환했다. 별도 `uv tool install --python 3.11` remote 설치도 같은
+commit/package와 `0.1.4`를 확인했다. 생성한 proof environment와 artifact는
+제거했다.
+
+`main` Test run `35622426871`은 minimum-Python smoke가 포함된 lint/package,
+Linux 6/6·macOS 4/4 portable, Hub, OCI filesystem, guest binary, local OCI
+product, native KVM 및 required KVM gate를 포함한 19개 job 모두 success다.
+Hub image run `35622426916`도 build/push까지 success이고, work-branch
+Development package run `35622416954`는 verify와 SHA-specific prerelease
+publication 모두 success다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
