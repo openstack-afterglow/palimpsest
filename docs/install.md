@@ -5,9 +5,9 @@ selection, supported host/runtime combinations, external dependencies, initial
 configuration, upgrades, and administrator-owned Linux deployment. It does not
 use a repository checkout as the user installation mechanism.
 
-Palimpsest Local requires Python 3.12 or newer. The source version is
-`0.1.0.dev0`; do not assume a PyPI package exists. pip needs Git on `PATH` and
-network access to GitHub to install the VCS requirement.
+Palimpsest Local requires Python 3.11 or newer. The source version is `0.1.4`;
+do not assume a PyPI package exists. pip needs Git on `PATH` and network access
+to GitHub to install the VCS requirement.
 
 ## Package catalog
 
@@ -21,6 +21,12 @@ The base Local distribution has no required Python runtime dependencies. The
 Hub distribution is separate and installs FastAPI, Uvicorn, SQLAlchemy/asyncmy,
 Redis, OpenStack SDK/Keystone, Pydantic, multipart, and rate-limit dependencies.
 Use the same reviewed Git ref for Local and Hub to prevent source skew.
+
+The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
+under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
+Kolla-Ansible, Ansible, Hub, or their runtime dependencies; deployments pin
+Kolla-Ansible independently. The role's published Hub image default remains
+`0.1.3`, while source builds bind to the configured checkout commit SHA.
 
 ## Supported hosts and runtime scope
 
@@ -405,7 +411,7 @@ Repository contributors can build the sdist/wheel and run the isolated package
 smoke from a trusted checkout:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.1.0.dev0
+uv run python scripts/build_package.py --out-dir dist/package-0.1.4
 ```
 
 This maintainer workflow is not the user installation path. Its local package

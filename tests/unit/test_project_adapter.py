@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import project_adapter, state
+from palimpsest_local import platforms, project_adapter, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
 from palimpsest_local.oci_run_cleanup import OCIRunRemovalError
 from palimpsest_local.project import Project, load_project
@@ -1458,6 +1458,11 @@ services:
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
     monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
     monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "detect_host",
+        lambda: platforms.HostPlatform("Darwin", "aarch64"),
+    )
 
     existing: object | None = None
 
@@ -1600,6 +1605,11 @@ services:
         lambda _arch, **_kwargs: "lima-vz",
     )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms,
+        "detect_host",
+        lambda: platforms.HostPlatform("Darwin", "aarch64"),
+    )
     callbacks = project_adapter.build_project_callbacks(
         project,
         roots,

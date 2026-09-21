@@ -1,8 +1,8 @@
 # Install Palimpsest
 
-Palimpsest requires Python 3.12 or newer. The source version is
-`0.1.0.dev0` and no PyPI release is assumed. Git and outbound HTTPS access to
-GitHub are required for direct VCS installation.
+Palimpsest requires Python 3.11 or newer. The source version is `0.1.4`; no
+PyPI release is assumed. Git and outbound HTTPS access to GitHub are required
+for direct VCS installation.
 
 ## 1. Install the Local CLI
 

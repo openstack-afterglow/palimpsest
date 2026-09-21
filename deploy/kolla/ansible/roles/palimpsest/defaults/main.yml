@@ -1,0 +1,148 @@
+---
+# Palimpsest kolla role defaults
+
+palimpsest_image_tag: "0.1.3"
+palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
+palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
+palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
+
+palimpsest_source_mode: "{{ enable_palimpsest_source_build | default(enable_source_build | default(palimpsest_dev_mode | default(false))) | bool }}"
+palimpsest_source_repo: "https://github.com/openstack-afterglow/palimpsest.git"
+palimpsest_source_version: "98f6dc920af43d0ce906750d918a60ca2f3eacd9"
+palimpsest_source_dir: "{{ palimpsest_source_checkout_path | default('/opt/afterglow/src/palimpsest') }}"
+palimpsest_api_image_ref: "{{ 'afterglow-local/palimpsest-hub-api:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_api_image ~ ':' ~ palimpsest_image_tag) }}"
+palimpsest_worker_image_ref: "{{ 'afterglow-local/palimpsest-hub-worker:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_worker_image ~ ':' ~ palimpsest_image_tag) }}"
+
+enable_palimpsest: "no"
+enable_palimpsest_hub_api: "{{ enable_palimpsest }}"
+enable_palimpsest_hub_worker: "{{ enable_palimpsest }}"
+palimpsest_run_preconditions: true
+
+palimpsest_api_port: 8020
+palimpsest_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
+palimpsest_api_listen_port: 18020
+palimpsest_database_name: "palimpsest_kolla"
+palimpsest_database_user: "palimpsest_kolla"
+palimpsest_database_address: "{{ database_address }}"
+palimpsest_database_port: "{{ database_port }}"
+palimpsest_database_admin_user: "{{ database_user }}"
+palimpsest_database_admin_password: "{{ database_password }}"
+palimpsest_database_url: "mysql+asyncmy://{{ palimpsest_database_user }}:{{ palimpsest_database_password }}@{{ palimpsest_database_address }}:{{ palimpsest_database_port }}/{{ palimpsest_database_name }}"
+palimpsest_valkey_host: "{{ 'api' | kolla_address(groups['valkey'][0]) }}"
+palimpsest_valkey_port: "{{ valkey_server_port }}"
+palimpsest_valkey_password: "{{ valkey_master_password }}"
+palimpsest_redis_db_index: 9
+palimpsest_redis_url: "redis://default:{{ palimpsest_valkey_password }}@{{ palimpsest_valkey_host }}:{{ palimpsest_valkey_port }}/{{ palimpsest_redis_db_index }}"
+
+palimpsest_keystone_user: "palimpsest"
+palimpsest_keystone_auth_url: "{{ keystone_internal_url }}"
+palimpsest_keystone_project_domain_name: "{{ default_project_domain_name }}"
+palimpsest_keystone_user_domain_name: "{{ default_user_domain_name }}"
+palimpsest_keystone_region_name: "{{ openstack_region_name }}"
+palimpsest_keystone_interface: "{{ openstack_interface | default('internal') }}"
+palimpsest_service_project_name: "palimpsest-service"
+palimpsest_external_url: "{{ public_protocol | default('https') }}://{{ kolla_external_fqdn | default('localhost') }}:{{ palimpsest_api_port }}"
+palimpsest_public_endpoint_url: "{{ palimpsest_external_url }}"
+palimpsest_internal_endpoint_url: "{{ internal_protocol | default('http') }}://{{ kolla_internal_fqdn | default(kolla_internal_vip_address) }}:{{ palimpsest_api_port }}"
+palimpsest_admin_endpoint_url: "{{ palimpsest_internal_endpoint_url }}"
+
+palimpsest_hub_volume: "palimpsest_hub"
+palimpsest_hub_path: "/var/lib/palimpsest/hub"
+palimpsest_config_dir: "{{ node_config_directory }}/palimpsest"
+
+palimpsest_public_haproxy_enabled: false
+palimpsest_public_haproxy_fqdn: ""
+
+palimpsest_services:
+  palimpsest-hub-api:
+    container_name: palimpsest_hub_api
+    group: palimpsest
+    enabled: "{{ enable_palimpsest_hub_api | bool }}"
+    image: "{{ palimpsest_api_image_ref }}"
+    network_mode: host
+    command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers"]
+    restart_policy: unless-stopped
+    volumes:
+      - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+      - "kolla_logs:/var/log/kolla/"
+    environment:
+      DATABASE_URL: "{{ palimpsest_database_url }}"
+      REDIS_URL: "{{ palimpsest_redis_url }}"
+      OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+      PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+      OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
+      OS_USERNAME: "{{ palimpsest_keystone_user }}"
+      OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
+      OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
+      OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
+      OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
+      OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
+      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    haproxy:
+      palimpsest-hub-api:
+        enabled: "{{ enable_palimpsest_hub_api | bool }}"
+        external: false
+        port: "{{ palimpsest_api_port }}"
+        listen_port: "{{ palimpsest_api_listen_port }}"
+        host_group: palimpsest
+        frontend_http_extra:
+          - "option forwardfor"
+        backend_http_extra:
+          - "option httpchk GET /v1/health"
+          - "http-check expect status 200"
+
+  palimpsest-hub-worker:
+    container_name: palimpsest_hub_worker
+    group: palimpsest
+    enabled: "{{ enable_palimpsest_hub_worker | bool }}"
+    image: "{{ palimpsest_worker_image_ref }}"
+    command: ["palimpsest-hub-worker"]
+    network_mode: host
+    restart_policy: unless-stopped
+    volumes:
+      - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+      - "kolla_logs:/var/log/kolla/"
+    environment:
+      DATABASE_URL: "{{ palimpsest_database_url }}"
+      REDIS_URL: "{{ palimpsest_redis_url }}"
+      OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+      PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+      OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
+      OS_USERNAME: "{{ palimpsest_keystone_user }}"
+      OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
+      OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
+      OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
+      OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
+      OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
+      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+
+palimpsest_public_haproxy_services:
+  palimpsest-public:
+    group: palimpsest
+    enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool }}"
+    haproxy:
+      palimpsest-public:
+        enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool }}"
+        external: true
+        external_fqdn: "{{ palimpsest_public_haproxy_fqdn }}"
+        mode: http
+        with_frontend: true
+        with_backend: true
+        host_group: palimpsest
+        port: "{{ palimpsest_api_port }}"
+        listen_port: "{{ palimpsest_api_listen_port }}"
+        frontend_http_extra:
+          - "option forwardfor"
+        backend_http_extra:
+          - "option httpchk GET /v1/health"
+          - "http-check expect status 200"
+
+palimpsest_haproxy_services: "{{ palimpsest_services | combine(palimpsest_public_haproxy_services, recursive=True) }}"

@@ -18,6 +18,11 @@ All notable changes to Palimpsest Local are documented here.
 - Added dynamic Zsh, Bash, and Fish completion generated from the live `argparse` command tree.
 - Added OCI-root publication reporting to the top-level `ps` `PORTS` column and typed `inspect` JSON, derived from the committed domain plan without backend calls or state writes.
 
+### Changed
+
+- Moved the Palimpsest Kolla-Ansible role into the `palimpsest-local` root wheel as dependency-free shared data, removed the standalone `palimpsest-kolla` package, and relocated the Hub Dockerfile under `docker/`.
+- Raised the root package version to `0.1.4` without changing the independently published Hub image default.
+
 ### Fixed
 
 - Added `base_image_digest` to Hub layer responses so a pulled root runtime layer preserves its boot-image chain.

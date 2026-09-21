@@ -1,20 +1,20 @@
 # Palimpsest Local
 
-`palimpsest-local` is a Python 3.12+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
+`palimpsest-local` is a Python 3.11+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
 
-It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under a managed state root. The core package has no required Python runtime dependencies; Linux KVM support is an optional extra.
+It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The base package has no required Python runtime dependencies; Linux KVM support is an opt-in extra.
 
 ## Status
 
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Distribution status:** source version `0.1.0.dev0`; no PyPI release is assumed.
+- **Version:** `0.1.4`.
 
 ## Install directly from GitHub
 
 Palimpsest Local supports direct VCS installation from this repository. Python
-3.12+, Git, and outbound HTTPS access to GitHub are required.
+3.11+, Git, and outbound HTTPS access to GitHub are required.
 
 Install the CLI into the active Python environment with pip:
 
@@ -79,6 +79,12 @@ guide](docs/install.md), [command workflows](docs/cli/workflows.md), and
 the checkout-specific commands under [Development](#development); those are not
 the end-user installation path.
 
+The root wheel also ships the `palimpsest` Kolla-Ansible role at
+`share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
+Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
+Kolla-Ansible independently. The role defaults retain the existing published
+Hub image tag (`0.1.3`), while source builds use the checked-out commit SHA.
+
 ## Hub configuration & Standalone Service
 
 Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`). Open `/app` for its same-origin web console: use a project-scoped token to upload, search, and download artifacts; server-side Palimpsestfile builds additionally require a Keystone system administrator.
@@ -92,6 +98,13 @@ Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, b
 - **Isolated Build Worker:** `palimpsest-hub-build-worker` on a separately provisioned Linux `/dev/kvm` host, with `PALIMPSEST_HUB_BUILDER_PYTHON` set to an absolute interpreter containing `palimpsest-local[kvm]` at the same reviewed source ref. Share its SQL database and Hub blob path with the API; do not place the worker or a Docker socket inside the API container.
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
 - **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies source tables into an empty initialized destination; it is not bootstrap.
+
+The canonical Hub container build uses the repository root as context and `docker/hub/Dockerfile` as its Dockerfile:
+
+```sh
+docker build --file docker/hub/Dockerfile --target palimpsest-hub-api .
+docker build --file docker/hub/Dockerfile --target palimpsest-hub-worker .
+```
 
 ### Client Hub Configuration
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. 로컬 패키지(`palimpsest-local`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)이며 이 문서는 `codex/oci-root-phase1` 작업트리를 기준으로 작성했다. 일반 패키지 버전은 `palimpsest-local 0.1.0.dev0`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.1.0`(`hub/pyproject.toml`)이다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. 로컬 패키지(`palimpsest-local`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)이며 이 문서는 `codex/oci-root-phase1` 작업트리를 기준으로 작성했다. 일반 패키지 버전은 `palimpsest-local 0.1.4`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.1.3`(`hub/pyproject.toml`)이다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다.
 
 1분 요약:
 
@@ -376,8 +376,8 @@ Build cap은 같은 store의 project별 filesystem flock 안에서 SQL count+ins
 ### 로컬 패키지
 
 - GitHub 개발 패키지는 `main`, `dev`, `codex/oci-root-phase1` push 또는 허용 branch의 수동 실행에서 생성한다. 기본 token은 read-only이며 검증을 통과한 publish job만 `contents: write`를 가진다. 새 SHA tag 생성은 기존 tag 또는 API 실패에서 중단하고, 기존 release/assets를 덮어쓰지 않는다. tag 생성 뒤 publication이 실패하면 같은 SHA의 자동 재시도도 중단하므로 운영자 확인 또는 새 commit이 필요하다. 이는 workflow의 non-overwrite 정책이며 repository-level tag immutability 보장은 아니다. wheel/sdist와 `SHA256SUMS` 다운로드·설치는 [설치 안내](docs/install.md)를 따른다. 개발 prerelease는 latest/stable이 아니고 VM 부팅·Gate 2 통과를 의미하지 않는다.
-- 사용자 설치 경로는 pip VCS URL이다. 빠른 진입점은 [`install.md`](install.md), 패키지·플랫폼·설정 상세는 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md), 명령별 실행 순서·설정·플랫폼 제한은 [`docs/cli/workflows.md`](docs/cli/workflows.md)다. `palimpsest-local`은 repository root, `palimpsest-hub`는 `#subdirectory=hub` selector로 설치한다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
-- base package는 `palimpsest-local` Python 3.12+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
+- 사용자 설치 경로는 직접 Git VCS 설치다. 빠른 진입점은 [`install.md`](install.md), 패키지·플랫폼·설정 상세는 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md), 명령별 실행 순서·설정·플랫폼 제한은 [`docs/cli/workflows.md`](docs/cli/workflows.md)다. `palimpsest-local`은 repository root, `palimpsest-hub`는 `#subdirectory=hub` selector로 설치한다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
+- base package는 `palimpsest-local` Python 3.11+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
 - conventional macOS Apple Silicon은 Lima 2.1+ VZ(`lima-vz`)를 기본으로 사용하고, Linux KVM은 `/dev/kvm`, QEMU, `qemu:///system`, `default` network와 `cloud-localds`, `mksquashfs`, OpenSSH가 필요하다.
 - OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. OCI network는 `nat`·`host-only`·`none` 세 값만 허용하며 `nat`/`host-only`는 user-mode 지원 QEMU(`-netdev help`의 `user`)를 state 변경 전에 확인한다. guest 내부 loopback과 NIC 검증 때문에 kernel config의 `CONFIG_NET=y`, `CONFIG_INET=y`, `CONFIG_IP_PNP=y`, `CONFIG_VIRTIO_NET=y`를 요구한다. host bridge·libvirt network·firewall rule·IPv6·VM 간 L2는 제공하지 않는다.
 - OCI-root startup event service는 public 준비 connection과 bound monitor connection의 libvirt server keepalive를 위한 bounded 보조 thread일 뿐 materialization deadline을 늘리지 않는다. 10ms 이하 event timer, 1초 handshake/join 경계와 100ms event-lock 대기를 사용하지만 이는 libvirt syscall의 hard wall-clock deadline이 아니다. PID/token/libvirt identity, event-driver lock, strict integer health를 매 cycle과 foreground checkpoint에서 재검증한다. 실패 처리는 phase별로 다르다. `defineXML` 시도 뒤 durable definition 기록 전의 health loss는 기존 exact cleanup을 실행한다. durable definition 뒤 public preparation health loss는 inactive domain과 `defined` ledger를 그대로 보존한다. bound monitor가 activation intent/post-create 뒤 실패하여 connection을 quarantine한 경우에는 exact UUID의 cleanup-required ledger를 기록한다. 어느 phase에서든 quarantine된 exact connection은 자동 cleanup이나 close에 사용하지 않고 reconnect하지 않으며, guest/stage-1/monitor daemon 프로토콜은 바꾸지 않는다.
@@ -636,7 +636,7 @@ packer가 아니라 검증 도구의 기본 wildcard selector가 literal backsla
 escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcards`를 더하는
 변경은 intake/cache/packer artifact 계약을 바꾸지 않는다.
 
-Architecture freshness guard는 package runtime과 분리된 standard-library/Git 도구로, pre-commit과 초기 CI에서 system `python3`로 실행된다. Stamp timestamp는 Python 3.11 전용 `datetime.UTC` alias 대신 `datetime.timezone.utc`를 사용해 Python 3.9에서도 동일한 UTC `Z` JSON 계약을 생성한다. Digest, marker schema, atomic write, staged/working 범위와 package의 Python 3.12+ 지원 계약은 바뀌지 않는다.
+Architecture freshness guard는 package runtime과 분리된 standard-library/Git 도구로, pre-commit과 초기 CI에서 system `python3`로 실행된다. Stamp timestamp는 Python 3.11 전용 `datetime.UTC` alias 대신 `datetime.timezone.utc`를 사용해 Python 3.9에서도 동일한 UTC `Z` JSON 계약을 생성한다. Digest, marker schema, atomic write, staged/working 범위와 package의 지원 Python 하한 계약은 바뀌지 않는다.
 
 Draft PR #1의 첫 full CI는 repository-wide `ruff format --check .`에서 기존11개 Python 파일의 format drift를 발견했다. Pin된 Ruff formatter로 그11개를 정규화하자 `test_oci_dev_cover_live_contract.py`의 한 함수가 Python 동작이 아니라 두 source substring의 기존 줄 배치를 고정하고 있어 실패할 것이 독립 review에서 확인됐다. 해당 source-text 함수는 삭제하고 실제 initramfs 생성 behavior test와 opt-in native proof는 유지했다. 이는 production/runtime, protocol, schema, authority 또는 architecture를 바꾸지 않는다. 전체336개 파일 format check·Ruff lint, `core-cli qualification` 1,384건 통과·7건 skip, `oci-guest` 629건 통과·114건 skip이 뒤따랐다. 별도 `Required native KVM proof` 실패는 repository variable과 self-hosted KVM job이 비활성인 외부 gate이며 이 변경은 그 gate를 skip하거나 완화하지 않는다.
 
@@ -668,13 +668,15 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 
 후속 source review에서 `build_worker.py`의 DB 접속 전 exact interpreter KVM preflight, `BuildWorkerSettings`의 SQL/store-only secret boundary, `hub_store.py`의 CAS file·directory fsync, `builds.py`의 complete/error scratch recovery와 성공 후 guest cleanup을 확인하고 위 runtime/data/배포·실패 계약을 갱신했다. `test_builds.py`와 `test_hub_api.py`의 portable 실패·복구 경계, [`docs/install.md`](docs/install.md), [`docs/testing.md`](docs/testing.md)와 [`docs/development-handoff.md`](docs/development-handoff.md)의 독립 staging 설계를 함께 검토했다. 기존 runner와 KVM/libvirt를 공유하는 `pieroot-server`에 worker를 그냥 병치하는 것은 격리가 아니므로 신규 전용 host를 권장한다. 기존 두 wheel은 이후 source와 불일치하며 Linux-native 전이 의존성을 포함하지 않는다. `cloud-image-utils` APT simulation은 신규 package 2개뿐이나 sudo 비대화형 인증이 없어 설치하지 않았고, Keystone/SQL/Redis·Linux KVM guest·실제 cleanup은 검증하지 않았다.
 
+`origin/dev` merge review: dev의 root package 통합 사실(`palimpsest-local 0.1.4`, `requires-python >=3.11`, `deploy/kolla/ansible/roles/palimpsest` shared-data, `palimpsest-hub 0.1.3`, `docker/hub/Dockerfile` context)을 받아들이고 overview·deployment 문장과 설치 문서를 그 값으로 맞췄다. Conflict 해결은 현재 source 계약을 유지한다. backend 선택은 `runtime_dispatch.platforms`, 로컬 dashboard/store mutation은 `inventory`를 통과한다. Merge가 떨어뜨린 `tests/unit/test_inventory.py`의 `import json`을 복구했고, dev가 `project_adapter.platforms`를 mock하던 host isolation fix는 같은 의도로 `project_adapter.runtime_dispatch.platforms.detect_host` mock으로 옮겼다. dev의 Kolla asset/role/image-ref test 세 파일은 portable `core-cli` lane에 명시 분류하고 release workflow unit 단계에 포함했으며, 기존 guest ELF·BuildKit·OCI filesystem 증거 단계는 유지했다. Kolla role 자체의 실제 배포와 Hub image publication은 이 변경으로 검증되지 않는다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "f2d8dada271e334bed67a864d176fdde73ee841390be27b1b6e2170ae1ca049b",
-  "reviewed_at": "2026-09-21T12:24:26Z",
-  "summary": "Reviewed isolated Hub build workflow, worker recovery and staging boundaries plus direct pip and uv Git VCS installation documentation; exact remote pip/uv installs passed, while native Hub KVM and host package installation remain separately gated."
+  "source_sha256": "7275b9408a2b7dd4165fdeb2334ca75df22f25e7aa41fbb12b03c71f364c121c",
+  "reviewed_at": "2026-09-21T12:39:12Z",
+  "summary": "Merged origin/dev root-package integration (palimpsest-local 0.1.4, requires-python >=3.11, Kolla role shared data, palimpsest-hub 0.1.3, docker/hub context) into the isolated Hub build workflow and direct Git installation documentation; conflicts resolved to the centralized runtime_dispatch/platforms and inventory contracts, with Kolla contracts classified into the portable core-cli lane."
 }
 ```
 <!-- architecture-review:end -->

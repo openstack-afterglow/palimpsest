@@ -18,8 +18,17 @@ env:
 
 jobs:
   test:
-    uses: ./.github/workflows/test.yml
-
+    name: Hub Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Run Hub unit tests
+        run: |
+          cd hub
+          uv run --extra dev pytest tests/
   build-and-push:
     name: Build and push Hub images
     needs: test
@@ -40,6 +49,7 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
             type=sha,prefix=sha-
       - uses: docker/metadata-action@v5
         id: worker
@@ -49,19 +59,20 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
             type=sha,prefix=sha-
       - uses: docker/build-push-action@v5
         with:
-          context: hub
-          file: hub/Dockerfile
+          context: .
+          file: docker/hub/Dockerfile
           target: palimpsest-hub-api
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.api.outputs.tags }}
           labels: ${{ steps.api.outputs.labels }}
       - uses: docker/build-push-action@v5
         with:
-          context: hub
-          file: hub/Dockerfile
+          context: .
+          file: docker/hub/Dockerfile
           target: palimpsest-hub-worker
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.worker.outputs.tags }}

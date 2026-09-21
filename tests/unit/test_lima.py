@@ -1000,6 +1000,12 @@ def test_lima_stopped_logs_use_local_console_and_cannot_follow(
         },
     )
 
+    def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
+        assert argv == ["limactl", "list", "--format", "json"]
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(lima, "_run_command", fake_command)
+
     assert list(lima.logs("mac-prototype", roots=roots)) == ["provisioned\n"]
     with pytest.raises(LifecycleError, match="cannot follow"):
         list(lima.logs("mac-prototype", roots=roots, follow=True))

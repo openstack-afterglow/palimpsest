@@ -35,7 +35,12 @@ PORTABLE_FILES = {
         development_package_workflow
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake sandbox_policy state test_lanes ui
-    """),
+    """)
+    + (
+        "tests/test_kolla_assets.py",
+        "tests/test_kolla_palimpsest_image_ref.py",
+        "tests/test_kolla_role_contracts.py",
+    ),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima pci_preflight
         platforms process_session project project_adapter project_runtime project_volumes oci_host

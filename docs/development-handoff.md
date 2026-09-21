@@ -453,7 +453,7 @@ guest driver/runtime, Nova CPU proof, 실제 GPU 계산은 각각 별도 gate다
 - OCI root volume은 run-exclusive writable root이며 shared data volume이
   아니다. retain은 exact lower graph/generation과 exclusive attachment를
   다시 확인한다. 일반 multi-VM shared data-volume 계약은 미구현이다.
-- base Python package는 Python 3.12+이고 필수 runtime dependency가 없다.
+- base Python package는 Python 3.11+이고 필수 runtime dependency가 없다.
   Linux libvirt는 `[kvm]` extra다. registry intake는 외부 Skopeo 1.13+가
   필요하다. wheel/sdist 성공은 host account provisioning, KVM, packaged ELF,
   native image proof를 대신하지 않는다.
@@ -461,7 +461,7 @@ guest driver/runtime, Nova CPU proof, 실제 GPU 계산은 각각 별도 gate다
 세부사항은 [linux-storage-logging.md](linux-storage-logging.md),
 [oci-linux-process.md](oci-linux-process.md), [testing.md](testing.md)를 본다.
 
-현재 local package version은 `palimpsest-local 0.1.0.dev0`이다.
+현재 local package version은 `palimpsest-local 0.1.4`이고 Hub는 `palimpsest-hub 0.1.3`이다.
 development-package workflow는 허용 branch의 검증 후 exact commit마다
 `package-<full-SHA>` prerelease를 만들고 wheel, sdist, `SHA256SUMS` 세
 asset을 게시한다. 기존 tag/release/assets를 덮어쓰지 않으며 prerelease는
@@ -632,7 +632,7 @@ Architecture guard는 package interpreter가 준비되기 전에도 실행되는
 standard-library/Git 도구다. 현재 source는 stamp timestamp에
 `datetime.timezone.utc`를 사용하므로 문서·pre-commit의 system `python3`가
 3.9여도 `--stamp`가 동작한다. `datetime.UTC` alias를 제거한 subprocess
-regression이 이 경계를 고정하며 package의 Python 3.12+ 지원 범위는 낮추지
+regression이 이 경계를 고정하며 package의 Python 3.11+ 지원 범위는 낮추지
 않는다.
 
 Exact checkout `137fd784ebf3ac329cf3c4e9586fd941925e3126`의 격리된
@@ -1219,6 +1219,27 @@ entrypoint를 제공하므로 바꾸지 않고 `README.md`, `install.md`,
 `docs/install.md`에 unpinned quick path, SHA pin, uv lock 동작을 명시했다.
 Unpinned URL은 moving default branch이므로 운영 재현성에는 full SHA를
 사용한다.
+
+`origin/dev` 통합 (2026-09-20): 게시 전에 `origin/dev`를 작업 branch로
+merge했다. Conflict 16개 중 formatting-only 및 centralization 충돌은 현재
+source 계약(`runtime_dispatch.platforms` 경유 backend 선택, `inventory`
+단일 mutation 경로)을 유지하는 쪽으로 해결하고, dev의 package 사실
+(`palimpsest-local 0.1.4`, `palimpsest-hub 0.1.3`, `requires-python >=3.11`,
+root wheel의 Kolla role shared-data, `docker/hub/Dockerfile`)은 그대로
+받았다. 위 설치 문서의 version·Python 하한도 이 값으로 맞췄다. 앞의 설치
+검증이 보고한 `0.1.0.dev0`은 당시 원격 default branch(main) 값이며, 이
+merge 이후 같은 명령은 `0.1.4`를 설치한다.
+
+Merge가 `tests/unit/test_inventory.py`의 `import json`을 자동으로 떨어뜨려
+`ruff`가 F821로 잡았고 복구했다. dev의 host isolation fix는
+`project_adapter.platforms`를 mock했는데 현재 source에는 그 attribute가
+없어 두 test가 AttributeError로 실패했다. 같은 의도를
+`project_adapter.runtime_dispatch.platforms.detect_host` mock으로 옮겼다.
+dev가 추가한 `tests/test_kolla_assets.py`,
+`tests/test_kolla_palimpsest_image_ref.py`,
+`tests/test_kolla_role_contracts.py`는 `scripts/test_lanes.py`의 portable
+`core-cli` lane에 명시 분류했고, release workflow의 unit 단계도 그 세
+파일을 포함하도록 dev 쪽 명령과 기존 guest/ELF·BuildKit 증거 단계를 합쳤다.
 
 ## 빠른 링크 맵
 

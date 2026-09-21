@@ -1,25 +1,25 @@
 FROM python:3.12-slim AS builder
 
-WORKDIR /app
+WORKDIR /app/hub
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv==0.8.14
-COPY src/ ./src/
-COPY pyproject.toml uv.lock ./
+COPY hub/src/ ./src/
+COPY hub/pyproject.toml hub/uv.lock ./
 RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim AS runtime
 
-WORKDIR /app
-COPY --from=builder /app/.venv /app/.venv
-COPY src/ ./src/
+WORKDIR /app/hub
+COPY --from=builder /app/hub/.venv /app/hub/.venv
+COPY hub/src/ ./src/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl qemu-utils \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin palimpsest \
     && chown -R palimpsest:palimpsest /app
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/hub/.venv/bin:$PATH"
 USER palimpsest
 
 FROM runtime AS palimpsest-hub-api

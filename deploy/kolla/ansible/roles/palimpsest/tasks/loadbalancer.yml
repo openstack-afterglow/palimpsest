@@ -1,0 +1,23 @@
+---
+- name: HAProxy | Remove disabled Palimpsest public route destination
+  become: true
+  ansible.builtin.file:
+    path: "{{ node_config_directory }}/haproxy/services.d/palimpsest-public.cfg"
+    state: absent
+  when: not (palimpsest_public_haproxy_enabled | default(false) | bool)
+
+- name: HAProxy | Remove disabled Palimpsest external frontend map
+  become: true
+  ansible.builtin.blockinfile:
+    path: "{{ node_config_directory }}/haproxy/external-frontend-map"
+    marker: "# {mark} palimpsest-public"
+    state: absent
+  when: not (palimpsest_public_haproxy_enabled | default(false) | bool)
+
+- name: Configure loadbalancer for Palimpsest
+  ansible.builtin.import_role:
+    name: loadbalancer-config
+  vars:
+    project_name: palimpsest
+    project_services: "{{ palimpsest_haproxy_services }}"
+  tags: always

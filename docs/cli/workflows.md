@@ -63,7 +63,7 @@ receipts, documentation, or shell history.
 See the [install/config diagram](../diagrams/palimpsest-install-config.workflow.html).
 
 1. Select a reviewed full Git commit SHA.
-2. Create a Python 3.12+ virtual environment.
+2. Create a Python 3.11+ virtual environment.
 3. Install `palimpsest-local` from the GitHub VCS URL; add `[kvm]` only for a
    libvirt backend.
 4. Install `palimpsest-hub` from `#subdirectory=hub` only on Hub service hosts.
