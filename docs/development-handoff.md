@@ -1241,6 +1241,19 @@ dev가 추가한 `tests/test_kolla_assets.py`,
 `core-cli` lane에 명시 분류했고, release workflow의 unit 단계도 그 세
 파일을 포함하도록 dev 쪽 명령과 기존 guest/ELF·BuildKit 증거 단계를 합쳤다.
 
+게시 결과 (2026-09-20): merge commit `1a23f9c11763eb75bf554d0614fdb709c7585931`을
+`codex/oci-root-phase1`에 만들고 원격에 push한 뒤, 같은 commit을 `dev`와
+`main`에 fast-forward로 게시했다. 세 ref가 모두 이 SHA를 가리킨다. dev는
+다른 worktree(`/tmp/palimpsest-root-package`)가 checkout 중이라 local
+branch를 건드리지 않고 `git push origin codex/oci-root-phase1:dev`로
+올렸다. 게시 전 검사는 `ruff check .`/`ruff format --check .`, 전체
+portable 8 lane 5,851건 통과·217건 skip, Hub 62건 통과, lane manifest,
+generated CLI reference, architecture working/staged check다. 게시 후 실제
+`main`에서 unpinned pip와 uv 설치를 다시 실행해 두 경로 모두
+`palimpsest-local 0.1.4`를 설치하고 `0.1.4`를 보고했으며 uv는 `1a23f9c`를
+lock했다. Native KVM, Gate 2, Keystone staging, Kolla 실제 배포와 Hub
+image publication은 여전히 검증되지 않았다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
