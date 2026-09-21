@@ -399,13 +399,13 @@ def _strict_json_load(directory_fd: int, name: str) -> dict[str, Any]:
 
     try:
         value = json.loads(payload.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        if not isinstance(value, dict):
+            raise StateError("OCI-root volume record must be an object")
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
     except StateError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         raise StateError("OCI-root volume record is invalid JSON") from None
-    if not isinstance(value, dict):
-        raise StateError("OCI-root volume record must be an object")
-    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
     if payload != canonical:
         raise StateError("OCI-root volume record is not canonical JSON")
     return value

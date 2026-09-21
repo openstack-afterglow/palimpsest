@@ -5,8 +5,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Generic, TypeVar
 
 from .errors import ArtifactValidationError
+
+PayloadT = TypeVar("PayloadT")
 
 OCI_CHANGESET_NORMALIZATION_ID = "palimpsest.oci-changeset-normalization.v1"
 
@@ -31,7 +34,7 @@ class EntryKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ChangesetMember[PayloadT]:
+class ChangesetMember(Generic[PayloadT]):
     """One validated physical tar member in exact archive order."""
 
     ordinal: int
@@ -75,7 +78,7 @@ class ChangesetMember[PayloadT]:
 
 
 @dataclass(frozen=True, slots=True)
-class NormalizedEntry[PayloadT]:
+class NormalizedEntry(Generic[PayloadT]):
     """One final path entry after ordered replacement and link resolution."""
 
     path: str
@@ -96,7 +99,7 @@ class NormalizedEntry[PayloadT]:
 
 
 @dataclass(frozen=True, slots=True)
-class NormalizedChangeset[PayloadT]:
+class NormalizedChangeset(Generic[PayloadT]):
     """Immutable deterministic emission-order changeset table."""
 
     entries: tuple[NormalizedEntry[PayloadT], ...]
@@ -106,7 +109,7 @@ class NormalizedChangeset[PayloadT]:
 
 
 @dataclass(slots=True)
-class _Node[PayloadT]:
+class _Node(Generic[PayloadT]):
     member: ChangesetMember[PayloadT]
     kind: EntryKind
     group_id: int | None = None
@@ -123,7 +126,7 @@ def _parent(path: str) -> str | None:
     return value or "."
 
 
-def _synthetic_directory[PayloadT](path: str, mtime: int, ordinal: int) -> ChangesetMember[PayloadT]:
+def _synthetic_directory(path: str, mtime: int, ordinal: int) -> ChangesetMember[PayloadT]:
     return ChangesetMember(
         ordinal=ordinal,
         path=path,
@@ -141,7 +144,7 @@ def _synthetic_directory[PayloadT](path: str, mtime: int, ordinal: int) -> Chang
     )
 
 
-def normalize_changeset[PayloadT](
+def normalize_changeset(
     members: tuple[ChangesetMember[PayloadT], ...],
 ) -> NormalizedChangeset[PayloadT]:
     """Reduce exact physical occurrences into deterministic final filesystem state.

@@ -38,7 +38,7 @@ markers = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py311"
 extend-exclude = [".venv", "build", "dist", "__pycache__"]
 
 [tool.ruff.lint]

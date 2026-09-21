@@ -1282,6 +1282,44 @@ run `35601184840`의 publish job은 `gh: Reference already exists (HTTP 422)`로
 cancelled였다. 동일 SHA를 세 branch에 게시하면 이 중복 publish 실패가
 반복된다.
 
+Python 3.10 host의 uv 설치 실패 보정 (2026-09-22): 사용자가 Ubuntu의
+system Python 3.10.12에서 plain `uv init` 후 Git URL을 `uv add`하자 새
+project의 `requires-python = ">=3.10"` 범위와 `palimpsest-local >=3.11`
+계약이 교차하지 않아 resolver가 거부했다. 이 실패는 current interpreter만
+보는 문제가 아니라 uv가 application의 전체 지원 범위를 해석한 결과다.
+이어 실행한 `uv run palimpsest --version`의 `Hello from palimpsest!`는
+실패한 dependency가 아니라 `uv init`이 만든 local application 출력이므로
+설치 증거가 아니다.
+
+최소 지원 버전을 실제 CPython 3.11.15로 검사하자 resolver와 wheel 설치는
+통과했지만 `oci_changeset.py`의 `class ChangesetMember[PayloadT]`에서
+`SyntaxError`가 발생했다. 같은 Python 3.12 PEP 695 문법은
+`oci_changeset.py`, `oci_materializer_worker.py`, `oci_tar_emitter.py`에 있었다.
+Python 3.11 Kolla control-node 계약을 폐기하지 않고 `TypeVar`/`Generic`
+표현으로 보정하고 Ruff target을 `py311`로 내렸다. CPython 3.11.15에서 세
+파일 compile, changeset/worker 집중 102건, `palimpsest --version`, sdist→wheel
+build, 격리 wheel import와 `uv tool` 설치/`--help`가 통과했다. Main test
+workflow에도 `uv run --python 3.11 --no-dev palimpsest --version`을 추가해
+같은 syntax regression을 차단한다.
+
+첫 full portable Python 3.11 run은 deep JSON fixture에서 한 건 실패했다.
+3.11의 `json.loads`가 nesting limit을 `JSONDecodeError`가 아닌
+`RecursionError`로 보고해 `_strict_json_load`의 `StateError` fail-closed
+경계를 빠져나왔다. Parse와 canonical re-encode의 `RecursionError`를 같은
+invalid-JSON `StateError`로 정규화했다. 기존
+`test_strict_reader_rejects_deep_json_and_observed_replacement`가 보정 전
+실패하고 보정 후 통과했으며, 재실행한 Python 3.11 portable 전체 결과는
+5,851 passed / 217 skipped다.
+
+문서는 CLI-only 경로를 `uv python install 3.11` + isolated
+`uv tool install --python 3.11`로 안내한다. Project dependency가 필요하면
+new project는 `uv init --bare --python 3.11` 후 `uv python pin 3.11`을 쓰고,
+이미 `>=3.10`으로 초기화한 project는 `requires-python`을 `>=3.11`로 높인
+뒤 `uv add`해야 한다. Pin만 바꾸거나 resolver hint의 `--frozen`을 쓰는
+것은 지원 범위를 고치지 않는다.
+`importlib.metadata.version("palimpsest-local")` probe가 local command
+충돌과 실제 설치를 구분한다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

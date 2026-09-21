@@ -16,7 +16,7 @@ It provides the `palimpsest` command and keeps local artifacts, tags, run state,
 Palimpsest Local supports direct VCS installation from this repository. Python
 3.11+, Git, and outbound HTTPS access to GitHub are required.
 
-Install the CLI into the active Python environment with pip:
+Install the CLI into an existing Python 3.11+ environment with pip:
 
 ```sh
 python3.12 -m pip install \
@@ -24,15 +24,39 @@ python3.12 -m pip install \
 palimpsest --version
 ```
 
-Add it to a uv-managed project instead:
+For a CLI that is independent of the current project and the host's system
+Python, use an isolated uv tool environment:
 
 ```sh
+uv python install 3.11
+uv tool install --python 3.11 \
+  "palimpsest-local @ git+https://github.com/openstack-afterglow/palimpsest"
+palimpsest --version
+```
+
+To add Palimpsest as a uv project dependency, the project's complete
+`requires-python` range must be 3.11 or newer. Initialize a new dependency-only
+project explicitly instead of accepting `uv init`'s system-Python default:
+
+```sh
+uv python install 3.11
+uv init --bare --python 3.11
+uv python pin 3.11
 uv add "git+https://github.com/openstack-afterglow/palimpsest"
+uv run python -c "import importlib.metadata as m; print(m.version('palimpsest-local'))"
 uv run palimpsest --version
 ```
 
+For an existing project whose `pyproject.toml` says
+`requires-python = ">=3.10"`, either raise that value to `">=3.11"` before
+`uv add` or use the
+isolated `uv tool install` path. `uv python pin` selects an interpreter but does
+not narrow the project's supported range; `--frozen` also does not make Python
+3.10 compatible. If a local project defines its own `palimpsest` command, the
+metadata probe above distinguishes `palimpsest-local` from that command.
+
 `uv add` records `palimpsest-local` as a Git source in `pyproject.toml` and
-locks the resolved commit in `uv.lock`. The commands above follow the
+locks the resolved commit in `uv.lock`. The unpinned commands follow the
 repository's default branch. For a reproducible installation, pin the full
 40-character commit SHA that you reviewed:
 

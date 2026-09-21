@@ -47,7 +47,7 @@ installation is not native runtime qualification.
 
 ## Install directly from GitHub
 
-Install the default branch into the active Python environment with pip:
+Install the default branch into an active Python 3.11+ environment with pip:
 
 ```sh
 python3.12 -m pip install \
@@ -55,14 +55,38 @@ python3.12 -m pip install \
 palimpsest --version
 ```
 
-For a uv-managed application, add Palimpsest as a project dependency:
+For a standalone CLI, prefer a uv tool environment. This path does not inherit
+an unrelated project's Python support range and can provision Python 3.11 on a
+host whose system interpreter is older:
 
 ```sh
+uv python install 3.11
+uv tool install --python 3.11 \
+  "palimpsest-local @ git+https://github.com/openstack-afterglow/palimpsest"
+palimpsest --version
+```
+
+For a uv-managed application dependency, declare a compatible project range
+when creating the project:
+
+```sh
+uv python install 3.11
+uv init --bare --python 3.11
+uv python pin 3.11
 uv add "git+https://github.com/openstack-afterglow/palimpsest"
+uv run python -c "import importlib.metadata as m; print(m.version('palimpsest-local'))"
 uv run palimpsest --version
 ```
 
-uv records the package as a Git source and locks its resolved commit. For a
+uv resolves every version admitted by the application's `requires-python`
+value. Merely pinning Python 3.11 does not make a project declaring
+`requires-python = ">=3.10"` compatible: raise the project floor to 3.11 or use
+the isolated tool path. Do not use the suggested `--frozen` escape hatch; it
+skips locking/syncing and does not make the package runnable on Python 3.10. If
+`uv init` created a local application that also owns the `palimpsest` command,
+the `importlib.metadata` probe above is the authoritative installation check.
+
+uv records the dependency as a Git source and locks its resolved commit. For a
 reproducible pip or uv installation, pin a reviewed full 40-character SHA:
 
 ```sh

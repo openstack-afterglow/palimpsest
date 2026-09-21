@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .artifact_store import ArtifactStoreError
 from .errors import ArtifactValidationError, UnsupportedPlatformError
@@ -35,6 +35,8 @@ from .oci_worker_protocol import (
 )
 from .state import StatePaths
 
+T = TypeVar("T")
+
 _MAX_WORKER_ADDRESS_SPACE = 40 * 1024**3
 _MAX_WORKER_FILE_SIZE = 40 * 1024**3
 _MAX_WORKER_FDS = 256
@@ -50,7 +52,7 @@ class _WorkerResourceError(Exception):
         super().__init__("OCI worker resource operation failed")
 
 
-def _resource_boundary[T](failure_stage: str, operation: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+def _resource_boundary(failure_stage: str, operation: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     try:
         return operation(*args, **kwargs)
     except BaseException as exc:

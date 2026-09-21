@@ -6,7 +6,7 @@ for direct VCS installation.
 
 ## 1. Install the Local CLI
 
-Install the default branch into the active Python environment with pip:
+Install the default branch into an active Python 3.11+ environment with pip:
 
 ```sh
 python3.12 -m pip install \
@@ -14,12 +14,34 @@ python3.12 -m pip install \
 palimpsest --version
 ```
 
-Or add it to a uv-managed project:
+For a standalone CLI on a host whose system Python is older, let uv own the
+compatible interpreter and tool environment:
 
 ```sh
+uv python install 3.11
+uv tool install --python 3.11 \
+  "palimpsest-local @ git+https://github.com/openstack-afterglow/palimpsest"
+palimpsest --version
+```
+
+To add Palimpsest to a new uv project, declare a compatible project range at
+initialization time:
+
+```sh
+uv python install 3.11
+uv init --bare --python 3.11
+uv python pin 3.11
 uv add "git+https://github.com/openstack-afterglow/palimpsest"
+uv run python -c "import importlib.metadata as m; print(m.version('palimpsest-local'))"
 uv run palimpsest --version
 ```
+
+If an existing `pyproject.toml` says `requires-python = ">=3.10"`, raise it to
+`">=3.11"` before `uv add`, or keep the project range and use `uv tool install`
+instead. uv resolves dependencies for the entire declared range, not only the
+pinned interpreter. `--frozen` is not a compatibility fix. A successful
+metadata probe must report `0.1.4`; output from a same-named local application
+does not verify that `palimpsest-local` was installed.
 
 For a reproducible install, append a reviewed full commit SHA to the Git URL:
 

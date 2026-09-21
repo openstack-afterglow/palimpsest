@@ -7,10 +7,12 @@ import tarfile
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, TypeVar
 
 from .errors import ArtifactValidationError
 from .oci_changeset import EntryKind, NormalizedChangeset, NormalizedEntry
+
+PayloadT = TypeVar("PayloadT")
 
 OCI_NORMALIZED_TAR_EMISSION_ID = "palimpsest.oci-normalized-tar-emission.v1"
 
@@ -108,7 +110,7 @@ def _tar_info(entry: NormalizedEntry[object]) -> tarfile.TarInfo:
     return info
 
 
-def emit_normalized_overlay_tar[PayloadT](
+def emit_normalized_overlay_tar(
     changeset: NormalizedChangeset[PayloadT],
     sink: BinaryIO,
     open_payload: Callable[[PayloadT], AbstractContextManager[_ReadablePayload]],

@@ -672,13 +672,15 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 
 `origin/dev` merge review: dev의 root package 통합 사실(`palimpsest-local 0.1.4`, `requires-python >=3.11`, `deploy/kolla/ansible/roles/palimpsest` shared-data, `palimpsest-hub 0.1.3`, `docker/hub/Dockerfile` context)을 받아들이고 overview·deployment 문장과 설치 문서를 그 값으로 맞췄다. Conflict 해결은 현재 source 계약을 유지한다. backend 선택은 `runtime_dispatch.platforms`, 로컬 dashboard/store mutation은 `inventory`를 통과한다. Merge가 떨어뜨린 `tests/unit/test_inventory.py`의 `import json`을 복구했고, dev가 `project_adapter.platforms`를 mock하던 host isolation fix는 같은 의도로 `project_adapter.runtime_dispatch.platforms.detect_host` mock으로 옮겼다. dev의 Kolla asset/role/image-ref test 세 파일은 portable `core-cli` lane에 명시 분류하고 release workflow unit 단계에 포함했으며, 기존 guest ELF·BuildKit·OCI filesystem 증거 단계는 유지했다. Kolla role 자체의 실제 배포와 Hub image publication은 이 변경으로 검증되지 않는다.
 
+2026-09-22 Python-floor/install review: an Ubuntu host with system Python 3.10 ran plain `uv init`, which declared `requires-python = ">=3.10"`; `uv add` then correctly rejected `palimpsest-local` because a dependency must satisfy the application's whole declared range, not only a selected interpreter. A minimum-version smoke exposed a separate source defect behind that resolver error: the package declared Python 3.11+ but `oci_changeset.py`, `oci_materializer_worker.py`, and `oci_tar_emitter.py` used Python 3.12 PEP 695 generic syntax, so a real Python 3.11 import failed with `SyntaxError`. The generics now use `TypeVar`/`Generic`, Ruff targets `py311`, and the main test workflow executes `palimpsest --version` with Python 3.11. The minimum-version portable run then exposed a Python 3.11 `json.loads` depth failure escaping `_strict_json_load` as `RecursionError`; that boundary now normalizes parse and canonicalization recursion to `StateError`, preserving its fail-closed record contract. CPython 3.11.15 passes the full portable set (5,851 passed, 217 skipped), focused generic/worker tests, CLI smoke, and isolated sdist-to-wheel/tool installation. This preserves the Kolla control-node Python 3.11 contract without changing successful runtime behavior. End-user docs distinguish isolated `uv tool install --python 3.11` from project dependency installation, require a project range of 3.11+, and reject `--frozen` as a compatibility workaround. A same-named local `uv init` application is not installation evidence; the distribution metadata probe verifies `palimpsest-local` directly.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "53115441151bd6f07510671cb3617c785214dc0866100d6a44792354499e83bd",
-  "reviewed_at": "2026-09-21T12:43:10Z",
-  "summary": "Fenced Hub builder guest cleanup behind verified process-group reaping after a timed-out or failed run, with portable regressions; merged dev root-package integration and direct Git installation paths remain as documented, while native KVM and Keystone staging stay unverified."
+  "source_sha256": "3c6ce72ec2d178a05447300aaf6602e2512400b98239528f8d46517604a205ef",
+  "reviewed_at": "2026-09-21T15:56:25Z",
+  "summary": "Restored the declared Python 3.11 package contract by replacing Python 3.12-only generic syntax, normalizing deep-JSON recursion failures, adding a minimum-version CLI smoke, and documenting safe uv tool and project installation paths for Python 3.10 hosts."
 }
 ```
 <!-- architecture-review:end -->
