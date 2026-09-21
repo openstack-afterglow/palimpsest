@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "palimpsest-hub"
 version = "0.1.0"
-description = "Dedicated Palimpsest Hub API and Glance export worker"
+description = "Dedicated Palimpsest Hub API, Glance export worker, and isolated build queue"
 requires-python = ">=3.12"
 dependencies = [
     "asyncmy>=0.2.0",
@@ -33,6 +33,7 @@ dev = [
 [project.scripts]
 palimpsest-hub = "palimpsest_hub.main:run"
 palimpsest-hub-worker = "palimpsest_hub.worker:run"
+palimpsest-hub-build-worker = "palimpsest_hub.build_worker:run"
 palimpsest-hub-bootstrap = "palimpsest_hub.bootstrap:run"
 palimpsest-hub-migrate-data = "palimpsest_hub.migrate:run"
 [tool.hatch.build.targets.wheel]

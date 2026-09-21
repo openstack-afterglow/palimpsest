@@ -106,3 +106,26 @@ class PalimpsestImageExport(Base):
         Index("idx_palimpsest_exports_claim", "status", "next_at"),
         Index("idx_palimpsest_exports_project_created", "project_id", "deleted_at", "created_at"),
     )
+
+
+class PalimpsestHubBuild(Base):
+    __tablename__ = "palimpsest_hub_builds"
+
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(VARCHAR(128))
+    name: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    recipe: Mapped[str] = mapped_column(TEXT, nullable=False)
+    recipe_digest: Mapped[str] = mapped_column(VARCHAR(71), nullable=False)
+    base_digest: Mapped[str] = mapped_column(VARCHAR(71), nullable=False)
+    layer_digests: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="queued")
+    output_digest: Mapped[str | None] = mapped_column(VARCHAR(71))
+    output_size_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    error_code: Mapped[str | None] = mapped_column(VARCHAR(32))
+    lease_owner: Mapped[str | None] = mapped_column(VARCHAR(128))
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    completed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+
+    __table_args__ = (Index("idx_palimpsest_builds_project_created", "project_id", "created_at"),)

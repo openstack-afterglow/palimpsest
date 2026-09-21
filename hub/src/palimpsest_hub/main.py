@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from palimpsest_hub.api.builds import router as build_router
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.cache import close_redis
 from palimpsest_hub.config import get_settings
@@ -63,6 +66,27 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 app.include_router(hub_router, prefix="/v1", tags=["hub"])
+app.include_router(build_router, prefix="/v1", tags=["builds"])
+
+_APP_FILES = Path(__file__).parent / "static"
+_APP_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+@app.get("/app", include_in_schema=False)
+async def hub_console() -> FileResponse:
+    return FileResponse(_APP_FILES / "hub.html", media_type="text/html", headers=_APP_HEADERS)
+
+
+@app.get("/app/{asset}", include_in_schema=False)
+async def hub_console_asset(asset: str) -> FileResponse:
+    if asset not in {"hub.css", "hub.js"}:
+        raise HTTPException(status_code=404)
+    return FileResponse(_APP_FILES / asset, headers=_APP_HEADERS)
 
 
 def _version_document(request: Request) -> VersionDocument:

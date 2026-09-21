@@ -87,6 +87,42 @@ historical failed runs remain untouched.
 
 ## Results
 
+### Disposable-password reachability — `cfb8015`, 2026-09-13
+
+Exact `cfb80157e66bff3933eba9196b5c0925c2e7c1c8` passed the isolated
+random-password MySQL test on `pieroot-server` (117.49 seconds), after160
+focused server tests (7.19 seconds). Local focused147 and architecture13 were
+separate passes. The [development package build](https://github.com/openstack-afterglow/palimpsest/actions/runs/34757445245)
+succeeded. This is the explicit `--user mysql`, guest-generated disposable
+password diagnostic, not the original default or prior passwordless user case.
+
+The original image layers with the test-only config wrapper reached final
+initialization/readiness, public detached run, version and Unix-socket
+reachability. The receipt records `returncode=0`, `reachability=true` and
+`authenticated_sql=false`; no authenticated query is claimed. Loopback/no-NIC
+and capability/NNP/seccomp checks passed. The application's actual `/` matched
+the unchanged before/after authenticated OverlayFS root identity (device21,
+inode2), while direct PID1 root access was denied.
+
+`application_completed=true` and `owned_resources_disposed=true` were checked
+against public stop/rm and absence of the newly owned domain/run/root disk.
+The generated password was not exported to the host or retained OCI config;
+checked output and retained console contained no generated-password pattern.
+This is disposal of this test's workload/database, not physical secure erasure.
+The exact12 historical inactive domains and12 source archives were preserved,
+with zero active VM/QEMU. Its private journal had22 records/11 complete calls.
+
+Evidence: `/tmp/palimpsest-mysql-random-native-8kkydrfr`; disposable runtime
+evidence: `/tmp/p-hub-svc-myr-7750194d`; removed domain:
+`hub-service-mysql-random-b4e8db8c`. The approved MySQL wrapper SHA-256 remained
+`6e9baa54d43024a7fe90ffbe1ba2173c40edb32b4ea9274007838caa86591dc7`.
+Guest ELF was unchanged from the separately verified self-FD implementation
+`93c1eb0`; its stage1/UID0/101/cold results and intermediate failures are in
+[the process checkpoint](oci-linux-process.md#self-fd-verification-checkpoint--93c1eb0).
+No old failed result is relabelled as a pass, and default Postgres/Redis/MySQL/
+NGINX compatibility, authenticated SQL, direct registry run and full Gate2
+remain separate qualifications.
+
 ### Disposable-password initialization — `89fad3c`, 2026-09-13
 
 Exact `89fad3c1fa5d7f5c88dfa303d04809025b60cb87` passed 152 focused tests

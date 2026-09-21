@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Palimpsest Hub</title>
+  <link rel="stylesheet" href="/app/hub.css">
+  <script defer src="/app/hub.js"></script>
+</head>
+<body>
+  <header class="masthead"><div class="brand">PALIMPSEST <span>/ HUB</span></div><a href="/docs">API reference ↗</a></header>
+  <main>
+    <div class="intro"><p class="eyebrow">PROJECT WORKSPACE · V1</p><h1>Build once.<br><em>Keep the layers.</em></h1><p>Run a Palimpsestfile in an isolated build VM, or register an existing image or layer. Every artifact is addressed by its SHA-256 digest.</p></div>
+    <section class="auth" aria-labelledby="auth-heading"><div><h2 id="auth-heading">Connect to your project</h2><p>Use a project-scoped Keystone token. It stays in this tab's memory; use HTTPS outside localhost.</p></div><form id="auth-form"><label for="token">Keystone token</label><div class="inline"><input type="password" id="token" required autocomplete="off" placeholder="Paste project-scoped token"><button type="submit">Connect</button></div><small id="connection">Not connected</small></form></section>
+    <section class="workspace" id="workspace" hidden>
+      <nav class="tabs" aria-label="Workspace sections"><a href="#build">01 / Build</a><a href="#artifacts">02 / Artifacts</a><a href="#upload">03 / Upload</a></nav>
+      <section id="build" class="panel"><div class="panel-heading"><div><p class="eyebrow">01 / SERVER BUILD</p><h2>Build a layer</h2></div><p>Requires a system administrator with a project-scoped token and a configured host worker. No recipe runs in the API process.</p></div>
+        <form id="build-form" class="form-grid"><label>Output name<input id="build-name" required pattern="[a-z0-9][a-z0-9.+-]{0,63}" placeholder="service-base"></label><label>Cloud-image digest<input id="build-base" required pattern="sha256:[0-9a-fA-F]{64}" placeholder="sha256:…"></label><label class="wide">Parent layer digests <span class="hint">One per line, root first. Leave empty for a base-only build.</span><textarea id="build-layers" rows="2" placeholder="sha256:…"></textarea></label><label class="wide">Palimpsestfile <span class="hint">FROM and LAYER must match the digests above. RUN executes inside the guest with network disabled.</span><textarea id="build-recipe" rows="7" required spellcheck="false" placeholder="FROM sha256:…&#10;RUN echo ready > /opt/ready"></textarea></label><div class="wide actions"><button type="submit">Queue build</button><span id="build-message" role="status"></span></div></form>
+        <div class="list-heading"><h3>Recent builds</h3><button type="button" class="secondary" id="refresh-builds">Refresh</button></div><div id="build-list" class="rows" aria-live="polite"></div>
+      </section>
+      <section id="artifacts" class="panel"><div class="panel-heading"><div><p class="eyebrow">02 / CONTENT-ADDRESSED</p><h2>Artifacts</h2></div><p>Visible layers and cloud images. Downloads use the Hub's project-scoped API.</p></div><div class="toolbar"><label>Search by name<input id="search-name" placeholder="Exact name"></label><label>Type<select id="search-kind"><option value="">All</option><option value="squashfs">SquashFS</option><option value="cloud-image">Cloud image</option></select></label><button type="button" class="secondary" id="search">Search</button></div><div id="artifact-list" class="rows" aria-live="polite"></div></section>
+      <section id="upload" class="panel"><div class="panel-heading"><div><p class="eyebrow">03 / REGISTER</p><h2>Upload an artifact</h2></div><p>Transferred in 8 MiB chunks. The server calculates the digest before registration.</p></div><form id="upload-form" class="form-grid"><label>File<input type="file" id="upload-file" required></label><label>Name<input id="upload-name" required pattern="[a-z0-9][a-z0-9.+-]{0,63}" placeholder="ubuntu-base"></label><label>Type<select id="upload-kind"><option value="squashfs">SquashFS layer</option><option value="cloud-image">Cloud image</option></select></label><label>Cloud image format<select id="upload-format"><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label><label>Architecture<select id="upload-arch"><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>Base-image digest <span class="hint">Needed to use this layer as a build parent</span><input id="upload-base" placeholder="sha256:…"></label><label>Parent layer digest <span class="hint">Optional</span><input id="upload-parent" placeholder="sha256:…"></label><div class="wide actions"><button type="submit">Upload & register</button><span id="upload-message" role="status"></span></div></form></section>
+    </section>
+  </main>
+  <footer>Palimpsest Hub <span>Isolated builds · Project-scoped storage · SHA-256</span></footer>
+</body>
+</html>

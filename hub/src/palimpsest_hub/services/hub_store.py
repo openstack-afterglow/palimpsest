@@ -25,12 +25,14 @@ import logging
 import os
 import re
 import shutil
+import stat
+import tempfile
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from palimpsest_hub.config import get_settings
+from palimpsest_hub.config import BuildWorkerSettings, Settings, get_settings
 from palimpsest_hub.services.digest import normalize_digest
 
 _logger = logging.getLogger(__name__)
@@ -110,6 +112,42 @@ class LocalPathBlobStore:
     def __init__(self, root: Path):
         self.root = root
 
+    def _sync_blob_dir(self) -> None:
+        # Sync newly created ancestor entries too; syncing sha256 alone is insufficient.
+        for directory in (self.blobs_dir, self.blobs_dir.parent, self.root):
+            fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def _sync_existing_blob(self, target: Path) -> None:
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise HubStoreError("blob 대상 경로가 일반 파일이 아닙니다")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._sync_blob_dir()
+
+    def _copy_into_blob(self, source: Path, target: Path) -> None:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".upload-", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            try:
+                with source.open("rb") as input_stream:
+                    shutil.copyfileobj(input_stream, temporary, length=_READ_CHUNK)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            except Exception:
+                temporary_path.unlink(missing_ok=True)
+                raise
+        try:
+            os.replace(temporary_path, target)
+            self._sync_blob_dir()
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
     # ── 경로 ────────────────────────────────────────────────────────────
     @property
     def blobs_dir(self) -> Path:
@@ -154,6 +192,60 @@ class LocalPathBlobStore:
         if not _SESSION_ID_RE.match(session_id):
             raise HubStoreError("업로드 세션 ID 형식이 유효하지 않습니다")
         return self.uploads_dir / session_id
+
+    def acquire_upload_lock(self, session_id: str) -> int:
+        """Serialize offset checks, file writes and DB commits per upload session."""
+        self.upload_path(session_id)  # Validate before constructing a lock path.
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.locks_dir / f"upload-{session_id}.lock", flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            os.close(fd)
+            raise
+        return fd
+
+    def acquire_project_upload_lock(self, project_id: str) -> int:
+        """Serialize creation against the per-project active-session cap."""
+        return self._acquire_project_lock(project_id, "upload")
+
+    def acquire_project_build_lock(self, project_id: str) -> int:
+        """Serialize count-and-insert against the per-project build cap."""
+        return self._acquire_project_lock(project_id, "build")
+
+    def _acquire_project_lock(self, project_id: str, kind: str) -> int:
+        name = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.locks_dir / f"project-{kind}-{name}.lock", flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            os.close(fd)
+            raise
+        return fd
+
+    def reconcile_upload(self, session_id: str, expected_size: int) -> None:
+        """Discard unacknowledged bytes left by an interrupted PATCH."""
+        path = self.upload_path(session_id)
+        if path.is_symlink() or not path.is_file() or expected_size < 0:
+            raise HubStoreError("업로드 세션을 찾을 수 없습니다")
+        with path.open("r+b") as handle:
+            actual = os.fstat(handle.fileno()).st_size
+            if actual < expected_size:
+                raise HubStoreError("업로드 파일이 기록된 offset보다 짧습니다")
+            if actual > expected_size:
+                handle.truncate(expected_size)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def sync_upload(self, session_id: str) -> None:
+        path = self.upload_path(session_id)
+        if path.is_symlink() or not path.is_file():
+            raise HubStoreError("업로드 세션을 찾을 수 없습니다")
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
 
     # ── 조회 ────────────────────────────────────────────────────────────
     def exists(self, digest: str) -> bool:
@@ -205,7 +297,7 @@ class LocalPathBlobStore:
         return path.stat().st_size
 
     def finalize_upload(self, session_id: str, declared_digest: str | None) -> FinalizedBlob:
-        """Recompute and verify the digest before atomically promoting an upload."""
+        """Verify and promote bytes; keep the upload until its SQL registration commits."""
         path = self.upload_path(session_id)
         if not path.is_file() or path.is_symlink():
             raise HubStoreError("업로드 세션을 찾을 수 없습니다")
@@ -229,11 +321,10 @@ class LocalPathBlobStore:
         target = self.blob_path(actual)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
-            if not self.exists(actual):
-                raise HubStoreError("blob 대상 경로가 일반 파일이 아닙니다")
-            path.unlink(missing_ok=True)
+            self._sync_existing_blob(target)
         else:
-            os.replace(path, target)
+            # Never hardlink: a resumed PATCH after a crash may mutate its source.
+            self._copy_into_blob(path, target)
         return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
 
     def abort_upload(self, session_id: str) -> None:
@@ -253,10 +344,9 @@ class LocalPathBlobStore:
         target = self.blob_path(actual)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
-            if not self.exists(actual):
-                raise HubStoreError("blob 대상 경로가 일반 파일이 아닙니다")
+            self._sync_existing_blob(target)
         else:
-            shutil.copyfile(source, target)
+            self._copy_into_blob(source, target)
         return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
 
     def promote_file(self, source: Path, *, max_bytes: int) -> FinalizedBlob:
@@ -280,6 +370,7 @@ class LocalPathBlobStore:
                     raise HubStoreError("승격할 파일이 허용 크기를 초과합니다")
                 sha.update(chunk)
                 md5.update(chunk)
+            os.fsync(handle.fileno())
 
         if size != initial_size or resolved.stat().st_size != initial_size:
             raise HubStoreError("승격 중 파일 크기가 변경되었습니다")
@@ -290,12 +381,12 @@ class LocalPathBlobStore:
         lock_fd = self.acquire_blob_lock(actual)
         try:
             if target.exists() or target.is_symlink():
-                if not self.exists(actual):
-                    raise HubStoreError("blob 대상 경로가 일반 파일이 아닙니다")
+                self._sync_existing_blob(target)
                 os.utime(target, None, follow_symlinks=False)
                 resolved.unlink(missing_ok=True)
             else:
                 os.replace(resolved, target)
+                self._sync_blob_dir()
         finally:
             self.release_blob_lock(lock_fd)
         return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
@@ -317,12 +408,12 @@ class LocalPathBlobStore:
         return removed
 
 
-def get_blob_store() -> LocalPathBlobStore:
+def get_blob_store(settings: Settings | BuildWorkerSettings | None = None) -> LocalPathBlobStore:
     """설정된 허브 blob store 를 돌려준다. 미설정이면 `HubStoreUnavailable`.
 
     허브는 선택 기능이다 — 설정하지 않은 배포에서는 엔드포인트가 503 을 준다.
     """
-    settings = get_settings()
+    settings = settings if settings is not None else get_settings()
     root = (settings.palimpsest_hub_local_path or "").strip()
     if not root:
         raise HubStoreUnavailable("[palimpsest] hub_local_path 가 설정되지 않았습니다 — 허브 기능이 비활성입니다")

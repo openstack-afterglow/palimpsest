@@ -24,6 +24,11 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+**최신 추가 checkpoint (2026-09-19):** 아래 `현재 스냅샷`과 frontmatter의
+2026-09-14 값은 당시 기록이다. 현 작업트리의 최신 source 상태와 승인 대기는
+[Hub web API build checkpoint](#hub-web-api-build-2026-09-19) 및 실제 Git 상태를
+우선한다. 당시 snapshot을 지금의 서버 실행 상태로 읽지 않는다.
+
 ## 현재 스냅샷
 
 - branch: `codex/oci-root-phase1`
@@ -513,6 +518,11 @@ PCI 노드도 함께 통과했다.
    제한된 libvirt inventory의 고정 typed facts뿐이며 secret이나 raw log를
    수집하지 않고 어떤 host/device/VM 상태도 바꾸지 않는다.
 
+2. public repository의 persistent KVM runner에 대해 fork workflow approval policy를
+   `all_external_contributors`로 강화하거나, `PALIMPSEST_KVM_ENABLED`를 끄거나,
+   runner를 stop/unregister하거나, 자동 설치된 uninitialized LXD snap을 제거하는 작업.
+   각각 security·availability 또는 destructive host mutation이므로 별도 승인이 필요하다.
+
 `/private/tmp`와 `/tmp` 파일은 durable artifact가 아니며 다른 machine/session에
 자동 전달되지 않는다. helper가 없거나 hash/mode가 달라졌다면 재생성 코드를
 추측하거나 이 문서에 embed하지 말고, 원래 source boundary에 따라 다시
@@ -598,6 +608,12 @@ PCI 노드도 함께 통과했다.
    `ml-pytorch-ed03b448`, `ml-tensorflow-f70228a2`, and all existing inactive
    domains; do not stop, undefine, adopt, or delete their retained trees. Do
    not run the GPU helper, attach, or rebind.
+
+9. **Persistent KVM runner:** commit `785cd02c...`의 현재 qualification은 위 final run과
+   artifact로 완료됐고 즉시 다시 실행할 native KVM node는 없다. 다음 운영 결정은 public
+   fork approval policy를 강화할지, runner와 variable을 계속 online/enabled로 둘지다.
+   결정 전에는 현재 container·두 volume·repository runner registration·variable·LXD를
+   변경하거나 기존 성공 receipt를 새 실행 성공으로 바꾸지 않는다.
 
 ### 이후 backlog — 현재 승인 아님
 
@@ -722,6 +738,77 @@ dispatch key·lifecycle·손상 ledger의 `StateError`·backend 미접근을 검
 `PALIMPSEST_KVM_ENABLED` variable이 비어 native KVM job은 skip되고 `Required native
 KVM proof` gate는 실패했다. 이 run은 runner availability를 입증하지 않으며, 변경은 gate를 우회하거나 완화하지 않는다.
 
+Portable remediation commit `785cd02c638a339acfab9c9f1a6bcb7e97683a5e`의 최종
+`Test` run [`35029001178`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35029001178)은
+Linux portable 6/6, macOS portable 4/4, `Pure contracts (Python 3.12)`,
+`Unit tests (macOS 15)`, lint·manifest·package, Hub, guest stage-1, local OCI
+product build, privileged OCI filesystem proof를 모두 통과했다. 유일한 failure는
+비어 있는 `PALIMPSEST_KVM_ENABLED` 때문에 native job이 skip된 뒤 실패한
+`Required native KVM proof`다. Development package run
+[`35028985909`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35028985909)은
+package verification과 SHA-specific prerelease publication을 모두 통과했다. 재사용
+workflow run [`35029003724`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35029003724)도
+같은 portable·filesystem·package matrix를 통과했고 required KVM gate 때문에 Hub image
+push는 skip됐다. 이 checkpoint는 local-only 후속 기록이며 PR을 ready로 바꾸거나 KVM
+variable·runner를 활성화하는 승인이 아니다.
+
+후속 read-only readiness 확인에서 repository variable API의
+`PALIMPSEST_KVM_ENABLED` 조회는 `404 Not Found`, repository runner API는
+`total_count: 0`을 반환했다. `pieroot-server`는 `x86_64`이고 `/dev/kvm`은
+`root:kvm`·`0660` character device이며 SSH operator `pieroot`는 `kvm` group에
+속한다. Host의 다른 principal 소유 `Runner.Listener` process는 재사용·중단·재구성하지
+않았다. 이후 사용자가 persistent dedicated runner와 gate 실행을 명시적으로 승인했다.
+
+승인 범위에서 repository runner `pieroot-server-palimpsest-kvm`(id `21`, labels
+`self-hosted`, `Linux`, `X64`, `kvm`)를 `pieroot-server`의 persistent Docker
+container `palimpsest-gh-runner`로 등록했다. Runner는 `2.337.0`, restart policy는
+`unless-stopped`다. 공식 runner tar digest는
+`sha256:70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613`, local image는
+`palimpsest/github-runner-kvm:2.337.0` / `sha256:5715aa3aad4d76423f15ba4b320082ec9c7bbe1a567eec459234414b80bdb2ed`다.
+Container는 privileged가 아니며 모든 capability를 drop한 뒤 setup-uv tar의
+ownership·mode 복원에 필요한 `CHOWN`, `DAC_OVERRIDE`, `FOWNER`만 더한다.
+`no-new-privileges`와 PID limit를 유지하고 Docker socket·host home은 mount하지
+않으며 `/dev/kvm`, writable runner-state volume, read-only kernel volume만 제공한다.
+Kernel volume의 root-owned `0400` single-link kernel/config digest는 각각
+`sha256:89f7d4f31f6ef77d0f8d45810de9e19e3f8dededf3dd6ebf89bb540d26d8c0fd`,
+`sha256:4d4aaaed367bd2fb6ed1238b94ea9bb095a5e5a0d0cc67d1cb70595643cc795a`이고 source
+preflight가 두 artifact와 KVM API `12`를 승인했다. Attempt 2는 `DAC_OVERRIDE`만으로
+setup-uv tar ownership을 바꾸지 못해 proof 전에 실패했고, `CHOWN`을 더한 attempt 3은
+mode 변경용 `FOWNER`가 없어 proof 전에 실패했다. 최종 최소 capability 집합은 두
+provisioning 원인을 제거했다.
+
+Repository variable은 `PALIMPSEST_KVM_ENABLED=true`로 설정했다. Commit
+`785cd02c638a339acfab9c9f1a6bcb7e97683a5e`의 `Test` run
+[`35029001178`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35029001178)
+attempt 4는 native job `104817871943`, required gate `104818817590`을 포함해 전체
+성공했다. Native artifact `10448739883`은 450,650 bytes다. 재사용 run
+[`35029003724`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35029003724)의
+native proof도 성공해 artifact `10448829655`(450,902 bytes)를 남겼다. 같은 run의
+attempt 4는 main run에서 통과한 동일 Linux 6/6 shard가
+`test_console_identity_damage_never_returns_foreign_bytes_or_success[symlink]`의
+0.1초 lock timeout 한 건으로 실패했다. Failed-job attempt 5에서 해당 shard,
+`Pure contracts`, required KVM gate, Hub image build가 모두 통과해 최종 run은
+success다. PR event의 image steps는 계약상 `push: false`이므로 registry push 성공은
+주장하지 않는다.
+
+두 artifact를 각각 내려받아 source-defined 45개 파일의 exact set과
+`palimpsest.oci-stage1-kvm-proof.v20` receipt를 검사했다. 두 receipt 모두 44 QEMU
+invocation·43 executed boot, native `kvm`/`x86_64`/`-cpu host`, live PID 1, KVM API
+12, authenticated OverlayFS의 `/` 전환, `switch_root=true`, `pivot_root=false`, reconnect
+proof와 negative-input proof를 기록한다. Runner id `21`은 현재 online/idle이고 variable도
+enabled 상태다.
+
+남은 운영 위험: repository는 public이고 fork workflow approval policy는
+`first_time_contributors`다. Container isolation은 host credential·Docker socket·home
+노출을 제거하지만 `/dev/kvm` attack surface와 persistent runner-state 위험은 남긴다.
+모든 external contributor approval로 강화하거나 runner/variable을 정지하는 것은 별도
+security/availability 결정이므로 이번 승인에서 임의로 적용하지 않았다.
+
+또한 read-only prerequisite 확인 중 `lxc` command-not-found wrapper가 LXD snap
+`5.21.7`을 자동 설치했다. LXD는 initialize하지 않았고 container·storage resource도
+만들지 않았으며 native proof에는 사용하지 않았다. 제거는 별도 destructive host
+mutation이므로 임의로 수행하지 않았다.
+
 
 
 
@@ -745,6 +832,394 @@ source/test 구현을 담당하며, 별도 reviewer/verifier가 author와 독립
 승인하는 형태를 유지한다. reviewer 승인은 commit, push, SSH, helper 실행,
 GPU/VM mutation에 대한 사용자 권한을 대신하지 않는다.
 
+## 설치·명령 문서 재작성 (문서 범위)
+
+사용자 설치 경로를 checkout build에서 pip VCS URL로 바꾸고 명령별 workflow
+문서와 diagram을 추가했다. 이 작업은 문서와 CLI reference 생성기 설명 문자열만
+바꾸며 runtime, schema, 의존성, 테스트 정의는 건드리지 않는다.
+
+- 설치 진입점: [`install.md`](../install.md)는 `python3.12 -m venv` 뒤
+  `pip install "palimpsest-local @ git+https://github.com/openstack-afterglow/palimpsest.git@<full-SHA>"`,
+  `[kvm]` extra, `palimpsest-hub @ ...#subdirectory=hub`를 사용한다.
+  [`docs/install.md`](install.md)에 패키지 카탈로그, 지원 host/runtime 표,
+  기능별 외부 전제, 설정 우선순위, Hub 설정 표, 관리자 설치, upgrade/uninstall,
+  기여자 전용 `scripts/build_package.py`를 분리해 정리했다.
+- 명령 문서: [`docs/cli/workflows.md`](cli/workflows.md)가 Hub artifact,
+  registry/Docker, build, cloud-image VM, OCI-root, Compose, store/UI/completion
+  순서를 실제 명령과 상태 변화, 플랫폼 제한과 함께 기술한다.
+  [`docs/cli/README.md`](cli/README.md)와 `README.md`에서 연결한다.
+- 발견한 문서 결함 수정: `scripts/generate_cli_reference.py`의 `run --network`
+  설명과 [`docs/cli/usage.md`](cli/usage.md)가 OCI-root를 `none` 전용으로
+  기술했으나 `src/palimpsest_local/oci_network.py`의 현재 계약은
+  `nat`(기본)·`host-only`·`none`이다. 설명을 source에 맞추고
+  `docs/cli/reference.md`를 재생성했다.
+- Diagram: `docs/diagrams/`에 Archify workflow 8종의 편집 가능한 JSON과
+  standalone HTML을 커밋한다. PNG/contact-sheet sidecar는 저장하지 않는다.
+  재생성은 archify skill의 `deliver` + `visual-check`로 수행한다.
+- 실행한 검사: `python3 scripts/check_architecture.py`(working) 통과,
+  `uv run python scripts/generate_cli_reference.py --check` 통과,
+  `uv run python scripts/test_lanes.py run core-cli` 1,110건 통과(29.02초),
+  `uv run ruff check`/`ruff format --check scripts/generate_cli_reference.py`
+  통과. Archify `deliver`는 8종 모두 showcase 9/9·오류 0, `visual-check`는
+  1440×900·1600×1000·1920×1080·2048×1320 containment pass다.
+- 이 작업은 native KVM, Gate 2, OCI-root 실기, GitHub 게시나 원격 helper
+  전송을 실행하거나 승인하지 않는다. 기존 승인 대기 항목은 그대로다.
+
+## Hub web API build 2026-09-19
+
+현재 branch `codex/oci-root-phase1`, 기준 HEAD
+`785cd02c638a339acfab9c9f1a6bcb7e97683a5e`이며 새 Hub 구현은 **미커밋**
+working-tree 변경이다. 이전 설치·명령 문서 작업과 사용자 보유의
+`docs/docker-hub-service-matrix.md`, `docs/oci-linux-process.md` 및 architecture의
+MySQL/cloud-image 관련 hunk를 이 변경과 섞지 않는다. GitHub 게시, 원격
+helper 전송, 서버 배포 및 실제 KVM 빌드 실행에 대한 새 승인은 없다.
+
+### 구현된 호출 경로와 결정
+
+1. `hub/src/palimpsest_hub/main.py`의 `/app`은 same-origin browser console이고,
+   `static/hub.js`가 입력한 project-scoped Keystone token을 tab 메모리에서만
+   유지한다. 기존 `/v1/layers` query/download와 `POST → PATCH(Upload-Offset) → PUT`
+   upload endpoint를 그대로 호출한다. Browser는 8MiB 청크로 업로드하며 완료
+   후 server SHA-256 digest를 받는다. Chromium은 streaming save picker,
+   다른 browser는 64MiB 이하 메모리 download만 지원한다.
+2. 새 `POST /v1/builds`는 Keystone **system-admin** + project scope, 보이는
+   x86_64 raw/qcow2 cloud base와 순서/parent/base가 맞는 SquashFS chain을
+   확인하고 SQL `palimpsest_hub_builds` job만 기록한다. `GET /v1/builds`와
+   `GET /v1/builds/{id}`는 같은 project만 조회한다. Recipe 원문과 사용자
+   identity/path를 response에 내보내지 않는다. API container는 guest command를
+   실행하지 않는다. 설정되지 않은 build worker는 503, project queue 4개
+   초과는 429, 생성은 6/hour로 제한한다.
+3. 별도 Linux `/dev/kvm` host의 `palimpsest-hub-build-worker`가 같은 Hub
+   SQL/blob path를 사용한다. singleton store flock 후 queued job을 claim하고
+   입력 권한·digest를 다시 확인한다. `PALIMPSEST_HUB_BUILDER_PYTHON`에 지정한
+   같은 reviewed ref의 `palimpsest-local[kvm]` interpreter가 pinned input과
+   `Palimpsestfile` `FROM`/`LAYER`를 확인하고 `build_layer(network="none")`를
+   guest에서 실행한다. Worker는 output size/sha256을 검증한 뒤 private layer
+   metadata/grant를 commit하고 기존 `/v1/layers/{digest}/blob`에서 배포한다.
+   Timeout/restart에 VM cleanup을 시도하며 확인 불가하면 `cleanup_failed`로
+   worker를 중단하고 private state를 남긴다. Docker socket/chroot runner를
+   Hub API에 붙이지 않는다. 비교한 Afterglow의 admin build 구조는 project
+   boundary를 재사용하지 않았고 legacy global integer build id도 이식하지 않았다.
+   독립 reviewer의 worker-death 결함을 반영해 child는 parent-death signal과
+   fsync한 boot ID/PID/start ticks marker를 남긴 뒤에만 guest 작업을 시작한다.
+   Recovery는 같은 process group을 확인·종료한 후 guest를 청소하며 identity가
+   모호하거나 cleanup이 실패하면 job tree를 보존하고 중단한다.
+4. 기존 upload는 project_id=NULL session 재사용을 거부하고 같은 session의
+   PATCH/PUT/DELETE를 filesystem lock으로 직렬화한다. Interrupted append residue는
+   committed offset으로 절단하고 fsync 뒤 DB offset을 갱신한다. Project별 활성
+   session 4개를 넘기지 않고, 새 session 생성 때 24시간 idle session을 제거한다.
+   DB migration은 새 build table과 기존 project layer grant table을 포함한다.
+   Cancel된 flock waiter의 FD도 eventual acquisition 뒤 반환한다. 같은 digest
+   등록과 project build queue cap은 store-backed lock으로 commit까지 보호한다.
+   Upload는 blob 승격 후에도 별개 staged file을 보존해 DB commit 전 중단 시
+   같은 offset의 PUT을 재시도한다. Browser token 교체는 진행 요청을 abort하고
+   이전 project의 active upload session을 버린다. 악성 bundle digest가 다른
+   기존 blob을 삭제하지 않으며 suffix byte Range를 올바르게 처리한다.
+
+### 실행 증거와 아직 충족되지 않은 전제
+
+Hub의 project-scoped ASGI HTTP fixture는 업로드→base 등록→build enqueue→worker
+claim→private layer 등록→다운로드를 호출했다. 이 fixture는 **VM executor만**
+대체하므로 guest boot·실제 SquashFS mount 증거가 아니다. 별도 host builder
+unit fixture는 base byte tamper와 recipe `FROM` 불일치를 거부하고 guest
+handoff의 network-none 계약을 확인한다. Local `/app` process를
+`uvicorn`으로 띄워 isolated Chrome에서 desktop/mobile 레이아웃, token 연결,
+build form, 청크 upload form을 확인했다. Form 작업의 API 응답은 browser
+interception이므로 Keystone 인증이나 live KVM을 입증하지 않는다. Hub wheel의
+static asset과 `palimpsest-hub-build-worker` entrypoint 포함도 확인했다.
+
+수정 후에도 같은 `/app`을 local `uvicorn`과 isolated Chrome에서 다시 열어
+project A upload의 PATCH를 browser interception으로 지연시키고 token을 B로
+교체했다. B의 새 `POST /v1/uploads` → B session PATCH/PUT이 등록 메시지로
+끝났으며 A session GET 재사용은 **0건**이었다. 요청 header의 token도 각
+project에 맞았다. 이는 실제 UI client의 state 전환 관찰이며 interception
+응답을 이용했으므로 Keystone·DB·KVM의 live end-to-end 실행은 아니다.
+첫 UI server 기동은 필수 `DATABASE_URL`, `REDIS_URL`, `OS_*` 등 7개 설정
+누락으로 시작 전에 실패했고, 비밀이 아닌 local fixture 값으로 재기동해
+UI 자산만 검증했다. 실제 배포 설정·인증 성공으로 기록하지 않는다.
+
+2026-09-19 최종 upload contract 정리 후 재실행: `cd hub && uv run pytest -q`
+**58 passed**, `uv run python scripts/test_lanes.py run build-registry`
+**208 passed**. 이 정리 직전의 `tests/unit/test_hub_builder.py` **1 passed**와
+`uv run python scripts/test_lanes.py run core-cli` **1,110 passed**는 별도 실행 결과다.
+새 test 파일을 `scripts/test_lanes.py`에 분류한 뒤
+`uv run python scripts/test_lanes.py list --check`가 모든 파일을 분류했고,
+`plan --changed HEAD`는 Hub 별도 lane과 portable 관련 lanes를 권고했다.
+초기 `core-cli` 시도는 미분류 새 파일 3개 때문에 실행 전 실패했으며
+분류 후 재실행은 통과했다. 이는 native KVM proof 결과가 아니다.
+
+독립 read-only reviewer는 8개 실질 결함을 보고했다: bundle mismatch의 공유
+blob 삭제, detached builder의 worker-death 생존, 취소된 flock waiter, blob
+승격/SQL commit 사이 retry 손실, 동일 digest 동시 등록, project queue cap
+경쟁, browser token switch의 stale upload, suffix Range. 위 보정과 해당
+regression fixture를 같은 작업트리에 반영했다. 이 portable fixture의
+`cleanup_failed` marker 테스트는 Linux kernel의 PDEATHSIG/reap과 libvirt
+guest 제거를 실행하지 않는다.
+
+최종 review marker의 working-tree source SHA-256은
+`f28c16efec598365945f5d50ddd97590807371d24c9ecb3585a2141279b40897`
+(398 files)이다. `python3 scripts/check_architecture.py` working과
+`--staged` baseline (388 files)은 각각 통과했다. 이 guard는 `docs/`,
+`ARCHITECTURE.md` 및 대부분의 root Markdown을 hash에서 제외하지만, 이전 문서 작업의
+`scripts/generate_cli_reference.py` 변경은 포함한다. 따라서 이 값은 Hub만의
+불변 배포 commit이나 기존 문서 변경의 review/승인이 아니다.
+
+남은 검증은 같은 reviewed source ref를 별도 Linux KVM/Keystone/SQL/shared
+storage host에 승인된 방법으로 설치하고, 실제 pin된 bootable x86_64 cloud
+image의 upload와 정상 Palimpsestfile build를 한 job씩 실행해 guest receipt,
+download digest, parent/base chain, libvirt guest 제거를 대조하는 것이다.
+이는 로컬 portable test와 독립이며 현재 원격 helper·배포 차단을 우회하지
+않는다. 완료된 순서: 독립 reviewer 지적 보정 → Hub/portable test와
+architecture working/staged guard. 다음 작업은 (a) 소스와 기존 문서·예전 미승인
+변경을 분리해 운영 승인 요청, (b) 승인된 Linux KVM host에서만 동일 검토
+source ref로 실제 build를 검증하고 guest·digest·정리 결과와 SHA를 새 checkpoint로
+기록하는 것이다. 승인 전 배포나 원격 helper 전송은 하지 않는다.
+Astra 계획/오케스트레이션 모델은 이 호스트에서 직접
+선택할 수 없어 Sol 구현과 독립 reviewer 검토로만 진행했으며 역할 대체를
+완료된 Astra 승인으로 간주하지 않는다.
+
+### 승인 전 변경 분리와 단일 build 실기 게이트 (2026-09-19)
+
+현재 HEAD는 위 `785cd02c...` 그대로이고 index에는 staged 변경이 없다. Hub
+runtime·test 범위는 `hub/pyproject.toml`, `hub/src/palimpsest_hub/`의
+API/config/main/migrate/models/store/build worker와 `/app` static,
+`hub/tests/test_builds.py`, `test_upload_limits.py`, 기존 Hub test 수정,
+`src/palimpsest_local/hub_builder.py`, `tests/unit/test_hub_builder.py`,
+`scripts/test_lanes.py`다. 별도 새 commit/ref나 package publication은 없다.
+
+`ARCHITECTURE.md`, `README.md`, `install.md`, `docs/install.md`,
+`docs/testing.md`, 이 handoff는 Hub hunk와 이전 작업 hunk가 섞여 있어
+파일 전체를 Hub 변경으로 stage/commit하지 않는다. 이전 작업의
+`docs/docker-hub-service-matrix.md`, `docs/oci-linux-process.md`,
+`docs/cli/*`, `docs/diagrams/`, `scripts/generate_cli_reference.py`도
+보존한다. Source guard SHA에는 마지막 Python script 변경도 포함되므로
+Hub-only source provenance가 필요할 때는 원저자 변경을 침범하지 않는
+별도 검토·분리 절차가 필요하다. 이 checkpoint에서는 index를 변경하지 않았다.
+
+배포 전 확인해야 할 입력은 승인된 별도 Linux x86_64 KVM host와 실행 계정,
+동일 절대 경로를 공유하며 flock/fsync가 작동하는 Hub blob store, 준비된
+Keystone/SQL/Redis/HTTPS, 백업·복구 계획과 schema 변경 허가, 같은 검토
+source의 Hub/Local interpreter, 실제 bootable x86_64 base 및 project-scoped
+system-admin token이다. 비밀값을 이 문서나 shell 명령에 기록하지 않는다.
+`PALIMPSEST_HUB_BUILDER_PYTHON`의 절대 경로만으로 API가 요청을 받으므로
+worker가 살아 있음을 뜻하지 않는다. `/v1/health`도 process 상태뿐이다.
+Project/store 전체 용량 quota 및 완료 build GC가 없고 staging과 blob가
+동시에 디스크를 차지하므로 운영자가 용량·보존 정책을 먼저 정해야 한다.
+미커밋 working tree는 pip의 Git VCS URL에서 `HEAD`로 설치할 수 없다. 현재
+`785cd02c...` ref에는 이 Hub 기능이 없으므로, 운영 승인이 있더라도 먼저
+코드·package digest가 고정된 동일 source artifact를 별도로 준비·대조해야 한다.
+기존 queued job을 worker가 먼저 가져가지 않도록 별도 staging SQL/blob 경계와
+빈 build queue를 확인하기 전에는 worker를 시작하지 않는다.
+
+운영자의 **별도 명시 승인과 대상 지정 후**에만 (1) 기존 상태·DB 백업과
+읽기 전용 `/dev/kvm`/libvirt/storage/Keystone preflight, (2) 동일 검토
+source로 Hub와 별도 worker 설치·schema 준비, (3) pinned base 1건 업로드,
+(4) project-scoped system-admin token으로 Palimpsestfile build 1건,
+(5) output blob SHA-256·parent chain·guest receipt·domain 및 임시 상태
+제거를 검증한다. Worker가
+`cleanup_failed`이면 자동 재시작·job tree 삭제·기존 VM 제거 없이 중단하고
+운영자가 증거를 확인한다. GitHub push/commit, private GPU helper 전송,
+기존 runner 설정·장치·VM 변경은 이 단일 실기 승인에 포함되지 않는다.
+
+### 사용자 선택: 로컬 패키징만 (2026-09-19)
+
+사용자가 위 두 범위 중 **로컬 패키징만** 선택했다. 현재 HEAD의 root/Hub
+package source를 `git archive`로 임시 스냅샷에 복원한 뒤 Hub runtime 변경
+14개 파일만 덮어썼다. `git status --untracked-files=all`에서 해당 runtime
+변경 집합과 overlay 집합이 정확히 일치함을 확인했다. Root `README.md`와
+`pyproject.toml`은 HEAD 원본을 사용해 앞선 문서 재작성과
+`scripts/generate_cli_reference.py` 변경을 package 입력에서 제외했다.
+현재 작업트리와 index는 stage/commit하지 않았다.
+
+로컬 전용 산출물은 gitignored
+`dist/hub-local-only-785cd02-73690b1b404e/`의 두 wheel,
+`source-snapshot.tar.gz`, `SOURCE_MANIFEST.json`, `SHA256SUMS`다.
+Archive SHA-256은 `73690b1b404e761cd34edc13265c5f6945fd486bff45f6a6f692ec8ed2667d16`,
+Hub wheel은 `7ea5f7cd2f3d7b9630dc428a0ffbd2e59a4c6eeaf297a0bdea0c52a3c62d5872`,
+Local wheel은 `7996f4f4aa0e7beff08df9bbe9e3d833cde1e4f5b3177e1e9c256726a9a48213`이다.
+`SOURCE_MANIFEST.json`은 기준 commit과 모든 overlay hash를 기록한다.
+`shasum -a 256 -c SHA256SUMS`가 네 파일 모두 통과했다.
+
+`SOURCE_DATE_EPOCH=1789509812`로 두 package를 각각 세 차례 offline
+빌드했고 원본 임시 소스 및 보관 archive에서 재복원한 소스의 wheel byte가
+각각 동일했다. Wheel 안의 Hub static/build worker/helper bytes와 worker
+entrypoint를 확인했다. Python 3.13 임시 venv에서 dependency 설치를 생략한
+offline wheel 설치, Local CLI `--help`, Hub worker entrypoint metadata도
+통과했다. 이는 Linux runtime dependency 설치, Keystone/SQL 연동 또는 native
+KVM 실기가 아니다. 원격 전송·호스트 설치·DB/schema 변경·VM 실행과 GitHub
+게시는 승인되지 않았으며 모두 실행하지 않았다. 다음 원격 단계는 별도 명시
+승인과 대상 지정, 호스트 적합성 및 빈 전용 staging queue 확인 뒤에만 진행한다.
+
+### 후속 승인 범위와 읽기 전용 host preflight (2026-09-19)
+
+사용자는 그 뒤 **격리 스테이징 실기 1건**을 선택하고 대상은
+`pieroot-server`, 전용 Keystone·SQL·Redis·HTTPS·blob 서비스 준비 여부는
+**모름**이라고 답했다. 이 선택은 앞의 로컬 전용 checkpoint 다음 승인
+범위이며 기존 runner/VM 변경, GitHub 게시, private GPU helper 전송까지
+허용하지 않는다. `ssh`는 BatchMode와 기존 host key 검사를 유지한
+읽기 전용 명령만 사용했다.
+
+현재 host는 Linux 6.8.0-139-generic x86_64, SSH UID 1000이 `kvm`과
+`libvirt` group에 속하며 `/dev/kvm`은 `root:kvm` 0660이고 이 UID의
+read/write `test`가 통과했다. `virsh -c qemu:///system` read-only 목록은
+전체 domain 22개, running 0개, `builder-b-` prefix 0개다. Docker 목록은
+container 34개 중 기존 `palimpsest-gh-runner` 1개이고 Hub 이름의
+container 0개다. 이 domain/container를 재사용·삭제·중지하지 않았다.
+원격 checkout `/home/pieroot/code/palimpsest`는 clean
+`84b30f86e569aa93999e192002d3682ea6b98b8f`로 로컬 package 입력
+`785cd02c...`+14 overlay와 다른 ref다. 원격 checkout을 교체하지 않았다.
+
+`virsh`, `qemu-system-x86_64`, `qemu-img`, `mksquashfs`, `python3.12`는
+PATH에 있으나 **`cloud-localds`가 없고 `cloud-image-utils`도 dpkg에
+설치되지 않았다**. 현재 source의 `kvm.py`는 seed ISO 생성 시 이
+executable을 필수로 호출하므로 지금 그대로는 실제 guest build가 실패한다.
+`palimpsest-hub*` systemd unit과 Hub 이름의 container는 조회되지 않았다.
+Host-local listener 443은 있었지만 5000/3306/6379/8020은 없었고,
+Redis 유사 container 2개는 소유 범위 미확인이다. 이 사실은 외부
+Keystone/SQL/Redis가 부재함을 입증하지도 기존 container 재사용을
+허가하지도 않는다.
+
+따라서 **전용 staging DB/blob 경로와 빈 queue, 비밀 주입 경로, Keystone
+scope, HTTPS endpoint, 저장 용량·백업, bootable pinned base를 아직
+확인하지 못했다.** 기존 공유 host에 `cloud-image-utils`를 설치할지와
+독립 서비스 자원을 누가 어떻게 준비할지도 운영 결정이 필요하다.
+검토한 local archive/wheel을 전송하거나 OS package 설치, schema bootstrap,
+worker 시작, VM 생성은 하지 않았다. 다음은 전용 환경·OS dependency의
+승인 범위 확정과 안전한 자격 증명 주입 후 빈 staging queue를 확인하는
+것이며, 이때까지 실제 build 성공을 주장하지 않는다.
+
+### 후속 선택: 신규 서비스 설계·host 도구 설치 승인 (2026-09-19)
+
+사용자는 공유 host의 신규 staging 서비스는 **구축 범위를 먼저 설계**하고,
+`cloud-image-utils` host 설치는 **승인**했다. 승인된 설치의 정확한
+`apt-get -s --no-install-recommends --no-upgrade --no-remove install
+cloud-image-utils` 계획은 Ubuntu 24.04 `genisoimage`와
+`cloud-image-utils` **신규 2개**, upgrade 0·remove 0이었다. 하지만
+`sudo -n true`는 `sudo: a password is required`로 실패했고
+`sudo -n -l`에는 apt 관련 NOPASSWD 권한이 없다. 비밀번호를 채팅·명령에
+요청하거나 우회하지 않았으며 **설치는 미실행**이다. 운영자가 안전한
+관리 경로에서 이 두 package를 설치하거나 비밀을 노출하지 않는 권한
+경로를 지정해야 한다. 설치 후 `cloud-localds` PATH와 실제 version을
+별도로 확인한다. APT simulation은 변경을 적용하거나 재부팅·서비스
+재시작 안전성을 입증하지 않는다.
+
+다음은 **설계안이지 설치 지시나 실기 증거가 아니다**. 권장 topology는
+**기존 Actions runner가 없는 신규 전용 x86_64 Linux KVM host**에 Hub build
+worker와 일회성 guest를 두고, 다른 신규 staging 서비스 VM/host에 Hub API·
+Keystone v3·MySQL·Redis·TLS endpoint를 두는 것이다. `pieroot-server`에는
+`palimpsest-gh-runner`가 이미 KVM과 libvirt system URI 및 CPU·RAM을
+공유한다. 별도 UID/container/volume만으로 그 runner와 VM·자원 격리를
+보장할 수 없으므로 이 host를 권장 worker 배치로 쓰지 않는다. 기존 443
+listener, runner container, 22개 inactive domain, 소유 미확인 Redis
+container는 사용·수정하지 않는다. Keystone은 별도 test domain/project,
+project-scoped token 및 system scope의 admin role assignment가 필요하며
+Hub service identity가 그 assignment 조회를 허가받아야 한다. Hub와
+Keystone DB는 별도 빈 database/user이고 Redis도 전용 namespace여야
+한다. Hub `/app`와 `/v1`은 같은 HTTPS origin으로만 노출하고 SQL/Redis는
+비공개 network에 둔다. 서비스 비밀은 staging 전용 identity로 주입한다.
+
+API와 worker는 **같은 Hub SQL DB와 같은 절대 blob path**를 본다.
+공유 filesystem은 cross-host `flock`, atomic rename, fsync 동작과
+사용량·백업을 별도로 검증해야 한다. 현재 lock 파일은 0600이므로 API와
+worker가 같은 숫자 UID로 이를 열 수 있어야 한다. Group 권한만 주는
+설계는 동작하지 않는다. API에는 Hub wheel만 설치하고 `/dev/kvm`,
+libvirt socket, Docker socket을 제공하지 않는다. 신규 전용 worker
+host에만 `qemu:///system`과 검토된 Hub·Local runtime을 설치한다.
+전용 host를 제공할 수 없다면 `pieroot-server` 사용은 **대안이 아닌 별도
+운영 결정**이다. 기존 runner의 명시적 drain/fence와 실행 전후 domain·
+container·resource inventory 대조, CPU/RAM/스토리지 한도와 소유권 승인
+없이는 worker를 배치하거나 게스트를 시작하지 않는다. 현재 runner 중지·
+등록 해제·도메인 변경 승인은 없으며 이 경로도 실행하지 않는다.
+
+신규 전용 host의 시작 조건은 자원 소유자·network/HTTPS route·CA,
+비밀 주입 방법, 전용 empty DB/blob/queue, 동일 UID와 공유 파일 잠금,
+bootable pinned x86_64 base image digest, disk headroom(업로드 staging +
+blob + VM overlay), 백업과 cleanup/보존 정책의 명시다. 현재 보관된
+`dist/hub-local-only-785cd02-73690b1b404e/`의 두 wheel은 이전 source
+snapshot만 담은 **무의존성 설치 검사용** 산출물이다. 이후 수정 source와
+일치하지 않고 Hub의 전이 의존성 및 `palimpsest-local[kvm]`이 요구하는
+Linux-native `libvirt-python` closure도 없다. 전송·설치 가능한 package로 간주하지 않는다.
+실제 배포 시에는 검토된 단일 source로 Linux x86_64/Python ABI용 Hub/Local wheel 및 전이 의존 wheel
+전체를 잠그고 각 byte의 SHA-256·출처·ABI를 확인한 offline wheelhouse,
+그리고 root-owned host binary와 `cloud-localds`가 필요하다. Host package
+설치 후에도 별도 interpreter의 `python -I -m palimpsest_local.hub_builder
+preflight`가 `/dev/kvm`/libvirt, tool ownership 및 x86_64 호환성을
+통과하기 전에는 worker가 SQL을 열거나 queue를 claim하지 않는다.
+
+로컬 source는 worker 전용 SQL/blob 설정으로 Keystone·Redis secret의
+불필요한 전달을 제거하고, blob file/ancestor fsync가 실패하면 publication을
+중단하며, 완료 직후의 crash로 남은 private job tree를 다음 시작에서
+검출·정리하도록 보정했다. 이 진술은 source/portable test 범위이고 실제
+host filesystem·guest teardown 검증이 아니다. 빈 schema bootstrap과
+worker 시작은 위 전제와 **별도 명시적 배포 승인** 뒤의 순서이며 기존 DB
+migration, runner stop/unregister, 기존 domain 삭제는 범위 밖이다.
+서비스 기동 뒤에도 `/v1/health`만으로 준비됐다고 간주하지 않고 Keystone
+token/SQL/blob reachability, 실제 one-job output digest, owned libvirt
+guest 및 private scratch 정리를 각각 확인한다. Host 공급·package closure·
+접근 권한·실기 범위가 준비되기 전에는 artifact 전송/설치·서비스 생성·DB
+bootstrap·VM build를 하지 않는다.
+
+독립 read-only staging reviewer가 runner-host 병치 격리 불성립,
+worker preflight·dependency closure·worker secret 범위·CAS fsync·완료
+scratch 누수의 6개 위험을 지적했다. 위 topology 및 source 보정은 이를
+반영한 로컬 변경이다. Astra 계획 모델은 여전히 이 호스트에서 선택할
+수 없어 Sol 구현과 독립 검토만 수행했고 Astra 승인으로 대체하지 않았다.
+
+현재 working source digest는 `ARCHITECTURE.md` marker의
+`f2d8dada271e334bed67a864d176fdde73ee841390be27b1b6e2170ae1ca049b`다.
+`hub` 집중 52개/전체 62개, `build-registry` 208개, `core-cli` 1110개,
+`test_hub_builder.py` 1개가 macOS portable에서 통과했다. `ruff check`,
+`scripts/test_lanes.py list --check`, architecture working/staged check도
+통과했다. macOS의 실제 `python -I -m palimpsest_local.hub_builder preflight`
+실행은 의도대로 `builder host preflight failed` / exit 1이었다.
+`uv build --offline --wheel`로 현재 **dirty working tree**에서 별도
+`dist/hub-local-only-785cd02-f2d8dada/`에 두 application candidate를
+빌드하고 `SHA256SUMS`를 검증했다. Hub wheel SHA-256
+`035779691d0f3fbc762825beca1f232f860d7b359dcb3a939c71bca213ec2beb`,
+Local wheel SHA-256
+`97df5045cae2a4ba1323efcdda5d887647de7296dad6c094744c897a10f708f6`.
+`SOURCE_MANIFEST.json`은 HEAD·working-source digest·한계를 기록한다.
+이 wheel은 이전 후보도, clean-ref 재현 archive도, Linux 의존 closure도
+아니므로 **전송·운영 설치 산출물이 아니다**. 원격 설치·서비스/DB 변경·
+VM 기동·GitHub 게시·private helper 전송은 모두 하지 않았다.
+
+정확한 재개 순서: 운영자가 새 전용 x86_64 KVM host 및 전용 서비스
+VM/host·network/identity/store 자원을 지정한다(또는 runner drain/fence와
+자원 대조를 별도 승인한다). 승인된 `pieroot-server`의
+`cloud-image-utils` 설치는 sudo 비대화형 경로가 없어 미실행이며 운영자
+관리 설치 또는 비밀 노출 없는 설치 채널이 필요하다. **새 전용 host의 OS
+package 설치는 이 승인에 포함되지 않는다**. 선택한 worker host에서
+`cloud-localds`를 확인하고, 같은 검토 source의 Linux-native hashed
+dependency closure, 정확한 worker preflight, 빈 staging DB/blob/queue와
+공유 FS 잠금을 확인하고, **별도 배포/실기 승인** 후에만 schema bootstrap,
+서비스 기동, pinned base 1건·build 1건·digest/guest/scratch 정리를
+실제로 관찰한다. 기존 runner/DB/domain은 그 절차에 포함되지 않는다.
+
+### 직접 Git 설치와 branch publication 승인 (2026-09-20)
+
+사용자는 Python package를 repository URL 자체로 설치할 수 있게 하고,
+README에 pip와 uv 절차를 설명한 뒤 현재 작업을 commit/push하여 `dev`와
+`main`에 모두 merge하라고 명시했다. 이 지시는 이번에 검증한 repository
+변경의 GitHub publication 및 두 target branch merge 차단을 해제한다.
+Private helper 전송, host package/서비스 설치, DB 변경과 KVM 실행 승인은
+포함하지 않는다.
+
+게시 전 원격 default branch에서 정확한 unpinned
+`python3.12 -m pip install
+"git+https://github.com/openstack-afterglow/palimpsest"`와 throwaway uv
+project의 `uv add "git+https://github.com/openstack-afterglow/palimpsest"`
+를 각각 실행했다. 두 경로 모두 `palimpsest-local==0.1.0.dev0`를 설치하고
+`palimpsest --version`/`uv run palimpsest --version`이 `0.1.0.dev0`을
+반환했다. uv는 당시 default commit
+`13f06562357709612f1c3532563a8577431e1e3d`를 lock했다. Full SHA
+`785cd02c638a339acfab9c9f1a6bcb7e97683a5e`를 URL 뒤에 붙인 pip/uv
+설치도 별도 통과했다. 생성한 네 throwaway environment는 제거했다.
+Package metadata는 이미 repository-root VCS build와 `palimpsest`
+entrypoint를 제공하므로 바꾸지 않고 `README.md`, `install.md`,
+`docs/install.md`에 unpinned quick path, SHA pin, uv lock 동작을 명시했다.
+Unpinned URL은 moving default branch이므로 운영 재현성에는 full SHA를
+사용한다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
@@ -760,3 +1235,5 @@ GPU/VM mutation에 대한 사용자 권한을 대신하지 않는다.
 | Linux state·installer·journal | [linux-storage-logging.md](linux-storage-logging.md) |
 | guest process·PID1·stdio | [oci-linux-process.md](oci-linux-process.md) |
 | retained root와 shared volume 구분 | [oci-retained-root-inventory.md](oci-retained-root-inventory.md) |
+| 사용자 설치와 패키지 선택 | [`../install.md`](../install.md), [install.md](install.md) |
+| 명령별 실행 순서와 diagram | [cli/workflows.md](cli/workflows.md), `docs/diagrams/` |

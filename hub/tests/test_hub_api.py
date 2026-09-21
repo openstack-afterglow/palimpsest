@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import tarfile
@@ -9,7 +10,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -33,6 +34,7 @@ from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
     BundleError,
     BundleLayer,
+    ParsedBundle,
     build_manifest,
     iter_bundle_tar,
     parse_bundle,
@@ -63,7 +65,9 @@ def _put_blob(store: LocalPathBlobStore, payload: bytes) -> str:
     store.start_upload(session_id)
     with store.upload_path(session_id).open("wb") as handle:
         handle.write(payload)
-    return store.finalize_upload(session_id, None).blob_digest
+    finalized = store.finalize_upload(session_id, None)
+    store.abort_upload(session_id)
+    return finalized.blob_digest
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,21 @@ def test_upload_finalize_places_blob_at_content_addressed_path(store: LocalPathB
     expected = store.root / "blobs" / "sha256" / digest[len("sha256:") :]
     assert expected.is_file()
     assert expected.read_bytes() == payload
+
+
+def test_blob_promotion_does_not_report_success_without_durable_directory(store: LocalPathBlobStore, monkeypatch):
+    session_id = "a" * 32
+    payload = b"layer awaiting a durable directory entry"
+    store.start_upload(session_id)
+    store.upload_path(session_id).write_bytes(payload)
+
+    def failed_sync():
+        raise OSError("blob directory fsync failed")
+
+    monkeypatch.setattr(store, "_sync_blob_dir", failed_sync)
+    with pytest.raises(OSError, match="fsync failed"):
+        store.finalize_upload(session_id, _sha256(payload))
+    assert store.upload_path(session_id).read_bytes() == payload
 
 
 def test_finalize_rejects_declared_digest_mismatch_and_discards_bytes(store: LocalPathBlobStore):
@@ -121,6 +140,33 @@ def test_iter_blob_supports_range_reads(store: LocalPathBlobStore):
 
     middle = b"".join(store.iter_blob(digest, start=100, length=50))
     assert middle == payload[100:150]
+
+
+@pytest.mark.asyncio
+async def test_blob_response_returns_suffix_bytes_and_rejects_empty_suffix(store: LocalPathBlobStore):
+    payload = bytes(range(100))
+    digest = _put_blob(store, payload)
+    response = hub_api._blob_response(
+        store=store,
+        digest=digest,
+        total=len(payload),
+        media_type="application/octet-stream",
+        filename="layer.sqsh",
+        range_header="bytes=-25",
+    )
+    assert response.status_code == 206
+    assert response.headers["content-range"] == "bytes 75-99/100"
+    assert b"".join([chunk async for chunk in response.body_iterator]) == payload[-25:]
+    with pytest.raises(HTTPException) as denied:
+        hub_api._blob_response(
+            store=store,
+            digest=digest,
+            total=len(payload),
+            media_type="application/octet-stream",
+            filename="layer.sqsh",
+            range_header="bytes=-0",
+        )
+    assert denied.value.status_code == 416
 
 
 @pytest.mark.asyncio
@@ -207,6 +253,39 @@ def test_parse_bundle_reconstructs_parent_chain_from_manifest_order(store: Local
     parsed = parse_bundle(bundle_path)
     parents = [entry["parent_digest"] for entry in parsed.layers]
     assert parents == [None, chain[0].blob_digest, chain[1].blob_digest]
+
+
+@pytest.mark.asyncio
+async def test_bundle_digest_mismatch_cannot_remove_existing_blob(
+    store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
+    payload = b"existing downloadable layer"
+    existing_digest = _put_blob(store, payload)
+    declared = "sha256:" + "b" * 64
+    member = f"blobs/sha256/{declared[7:]}"
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        info = tarfile.TarInfo(member)
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    monkeypatch.setattr(
+        hub_api,
+        "parse_bundle",
+        lambda _: ParsedBundle(layers=[{"blob_digest": declared}], blob_members={declared: member}),
+    )
+    try:
+        result = await hub_api.import_bundle(UploadFile(file=io.BytesIO(raw.getvalue())), {"project_id": "alpha"})
+        assert result["imported_count"] == 0
+        assert result["skipped"][0]["digest"] == declared
+        assert b"".join(store.iter_blob(existing_digest)) == payload
+    finally:
+        await engine.dispose()
 
 
 def test_build_manifest_rejects_empty_chain():
@@ -345,7 +424,7 @@ def test_layer_cannot_declare_disk_format():
         HubLayerMeta(name="torch", kind="squashfs", disk_format="qcow2")
 
 
-def test_layer_dict_exposes_base_image_digest_from_config_json():
+def test_layer_dict_exposes_public_base_descriptor_but_redacts_foreign_ownership():
     base_image_digest = "sha256:" + "b" * 64
     row = PalimpsestHubLayer(
         blob_digest="sha256:" + "a" * 64,
@@ -355,14 +434,22 @@ def test_layer_dict_exposes_base_image_digest_from_config_json():
         config_digest="sha256:" + "c" * 64,
         name="runtime-layer",
         kind="squashfs",
-        config_json={"base_image_digest": base_image_digest},
-        is_published=False,
+        config_json={"base_image_digest": base_image_digest, "private_legacy_field": "do-not-return"},
+        project_id="owner-project",
+        created_by="owner-user",
+        is_published=True,
     )
 
     data = hub_api._layer_dict(row)
 
     assert data["base_image_digest"] == base_image_digest
     assert data["config_json"]["base_image_digest"] == base_image_digest
+    foreign = hub_api._layer_dict(row, {"project_id": "another-project"})
+    assert foreign["project_id"] is None and foreign["created_by"] is None
+    assert foreign["base_image_digest"] == base_image_digest
+    assert "private_legacy_field" not in foreign["config_json"]
+    owner = hub_api._layer_dict(row, {"project_id": "owner-project"})
+    assert owner["project_id"] == "owner-project" and owner["created_by"] == "owner-user"
 
 
 def test_buildkit_cache_download_filename_uses_tar_extension():
@@ -434,6 +521,102 @@ async def test_finalize_buildkit_cache_stores_dedicated_media_type(
         assert row.config_json["kind"] == KIND_BUILDKIT_CACHE
         assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_upload_remains_retryable_after_blob_promotion_precedes_registration(
+    store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
+):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
+    identity = {"project_id": "alpha", "user_id": "member"}
+    payload = b"retryable layer bytes"
+    digest = _sha256(payload)
+    session_id = (await start_upload(HubUploadStartRequest(digest=digest), identity))["session_id"]
+    store.upload_path(session_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, session_id)
+        upload.received_bytes = len(payload)
+        await session.commit()
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/v1/uploads/{session_id}",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    descriptor = HubLayerMeta(name="retryable", kind="squashfs")
+    compute = hub_api.compute_config_digest
+
+    def registration_fails(config):
+        raise RuntimeError("database registration interrupted")
+
+    monkeypatch.setattr(hub_api, "compute_config_digest", registration_fails)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted"):
+            await finalize_upload(session_id, descriptor, request, identity)
+        assert store.upload_path(session_id).read_bytes() == payload
+        monkeypatch.setattr(hub_api, "compute_config_digest", compute)
+        registered = await finalize_upload(session_id, descriptor, request, identity)
+        assert registered["blob_digest"] == digest
+        assert b"".join(store.iter_blob(digest)) == payload
+        assert not store.upload_path(session_id).exists()
+        async with factory() as session:
+            assert await session.get(PalimpsestHubUpload, session_id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_uploads_register_one_blob_and_both_projects(
+    store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hub.sqlite'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
+    payload = b"same bytes for two projects"
+    digest = _sha256(payload)
+    requests = []
+    for project in ("alpha", "beta"):
+        identity = {"project_id": project, "user_id": "member"}
+        session_id = (await start_upload(HubUploadStartRequest(digest=digest), identity))["session_id"]
+        store.upload_path(session_id).write_bytes(payload)
+        async with factory() as session:
+            upload = await session.get(PalimpsestHubUpload, session_id)
+            upload.received_bytes = len(payload)
+            await session.commit()
+        request = Request(
+            {
+                "type": "http",
+                "method": "PUT",
+                "path": f"/v1/uploads/{session_id}",
+                "headers": [(b"upload-offset", str(len(payload)).encode())],
+            }
+        )
+        requests.append((session_id, request, identity))
+    try:
+        results = await asyncio.gather(
+            *(
+                finalize_upload(session_id, HubLayerMeta(name="shared", kind="squashfs"), request, identity)
+                for session_id, request, identity in requests
+            )
+        )
+        assert [result["blob_digest"] for result in results] == [digest, digest]
+        async with factory() as session:
+            assert len((await session.execute(select(PalimpsestHubLayer))).scalars().all()) == 1
+            for project in ("alpha", "beta"):
+                assert await hub_api._load_visible(session, digest, {"project_id": project}) is not None
+        assert b"".join(store.iter_blob(digest)) == payload
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -573,6 +756,23 @@ async def test_private_blob_can_be_registered_by_another_project(
     async with factory() as session:
         assert await session.get(PalimpsestHubLayerAccess, (digest, "project-c")) is None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unscoped_upload_session_is_not_claimable_by_project():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            session.add(PalimpsestHubUpload(id="b" * 32, received_bytes=0, project_id=None))
+            await session.commit()
+            with pytest.raises(HTTPException) as denied:
+                await hub_api._owned_upload(session, "b" * 32, {"project_id": "project-b"})
+            assert denied.value.status_code == 404
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

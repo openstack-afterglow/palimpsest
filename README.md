@@ -6,81 +6,92 @@ It provides the `palimpsest` command and keeps local artifacts, tags, run state,
 
 ## Status
 
-- **macOS Apple Silicon:** default runtime using Lima/VZ (`lima-vz`), with experimental QEMU/libvirt Hypervisor.framework support (`libvirt-hvf`).
-- **Linux:** KVM/libvirt runtime support for `x86_64` and `aarch64` (`virt` machine + EFI). Public `v0.1.0` publication remains blocked by the physical-host KVM release gate.
+- **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
+- **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Version:** `0.1.0.dev0`.
+- **Distribution status:** source version `0.1.0.dev0`; no PyPI release is assumed.
 
-## Install
+## Install directly from GitHub
 
-### Download an exact-SHA development package
+Palimpsest Local supports direct VCS installation from this repository. Python
+3.12+, Git, and outbound HTTPS access to GitHub are required.
 
-Successful pushes to `main`, `dev`, and `codex/oci-root-phase1` publish a
-GitHub prerelease tagged `package-<full-commit-SHA>`. Download all three assets
-for the exact commit, verify them, and then install the wheel:
-
-```sh
-SHA="FULL_40_CHARACTER_COMMIT_SHA"
-BASE="https://github.com/openstack-afterglow/palimpsest/releases/download/package-${SHA}"
-DOWNLOAD_DIR="$(mktemp -d)"
-cd "$DOWNLOAD_DIR"
-curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0-py3-none-any.whl"
-curl -fLO "${BASE}/palimpsest_local-0.1.0.dev0.tar.gz"
-curl -fLO "${BASE}/SHA256SUMS"
-sha256sum -c SHA256SUMS && \
-  uv tool install --no-index ./palimpsest_local-0.1.0.dev0-py3-none-any.whl
-```
-
-The workflow refuses an existing tag instead of replacing its assets. If
-publication fails after tag creation, the tag is preserved and an automatic
-rerun refuses it; recovery is an explicit maintainer operation. These
-packages are development snapshots, are never marked Latest, and are not
-stable, PyPI-published, or Gate 2-qualified. The URLs exist only after that
-commit's workflow succeeds; see the
-[GitHub releases list](https://github.com/openstack-afterglow/palimpsest/releases).
-
-### Build and install locally
-
-From a trusted checkout with Python 3.12+ and
-[uv](https://docs.astral.sh/uv/):
+Install the CLI into the active Python environment with pip:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.1.0.dev0
-uv tool install --no-index \
-  dist/package-0.1.0.dev0/palimpsest_local-0.1.0.dev0-py3-none-any.whl
-palimpsest --help
+python3.12 -m pip install \
+  "git+https://github.com/openstack-afterglow/palimpsest"
+palimpsest --version
 ```
 
-The build produces a wheel and source distribution, checks the packaged guest
-ELF and an isolated offline installation, and writes `SHA256SUMS`. Choose a new
-output directory on each run. This checkout is version `0.1.0.dev0`; do not
-assume a public PyPI package exists.
-
-For development:
+Add it to a uv-managed project instead:
 
 ```sh
-uv sync --extra dev
-uv run palimpsest --help
+uv add "git+https://github.com/openstack-afterglow/palimpsest"
+uv run palimpsest --version
 ```
+
+`uv add` records `palimpsest-local` as a Git source in `pyproject.toml` and
+locks the resolved commit in `uv.lock`. The commands above follow the
+repository's default branch. For a reproducible installation, pin the full
+40-character commit SHA that you reviewed:
+
+```sh
+PALIMPSEST_REF="FULL_40_CHARACTER_COMMIT_SHA"
+
+python3.12 -m pip install \
+  "git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
+
+uv add \
+  "git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
+```
+
+Choose the distribution that matches the role:
+
+```sh
+# Linux libvirt/KVM or experimental macOS libvirt/HVF support.
+python3.12 -m pip install --upgrade \
+  "palimpsest-local[kvm] @ git+https://github.com/openstack-afterglow/palimpsest.git@${PALIMPSEST_REF}"
+
+# Standalone Hub API/worker package from the same reviewed ref.
+python3.12 -m venv "$HOME/.venvs/palimpsest-hub"
+"$HOME/.venvs/palimpsest-hub/bin/python" -m pip install --upgrade pip
+"$HOME/.venvs/palimpsest-hub/bin/python" -m pip install \
+  "palimpsest-hub @ git+https://github.com/openstack-afterglow/palimpsest.git@${PALIMPSEST_REF}#subdirectory=hub"
+"$HOME/.venvs/palimpsest-hub/bin/python" -m pip show palimpsest-hub
+```
+
+`palimpsest-local` provides the `palimpsest` CLI and has no required Python
+runtime dependency. Its `[kvm]` extra adds `libvirt-python>=10.0.0` only; it does
+not install QEMU, libvirt, firmware, host permissions, Lima, Docker/Buildx,
+Skopeo, or other host executables. `palimpsest-hub` is a separate server
+distribution with FastAPI, OpenStack, Redis, and SQL dependencies. Use the same
+commit ref for Local and Hub to avoid source skew.
 
 On Linux, select a private `XDG_STATE_HOME` for user-owned artifact workflows or
 use the explicit administrator-managed account and storage provisioner. Package
-installation never creates accounts, changes privileged groups, or writes
-sudoers policy. KVM also needs the optional `kvm` dependency and host tools.
-See the [short install guide](install.md) and [detailed guide](docs/install.md).
+installation never creates accounts, changes privileged groups, writes sudoers
+policy, or initializes mutable state.
+
+See the [short install guide](install.md), [detailed package/platform/configuration
+guide](docs/install.md), [command workflows](docs/cli/workflows.md), and
+[generated syntax reference](docs/cli/reference.md). Repository contributors use
+the checkout-specific commands under [Development](#development); those are not
+the end-user installation path.
 
 ## Hub configuration & Standalone Service
 
-Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`).
+Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`). Open `/app` for its same-origin web console: use a project-scoped token to upload, search, and download artifacts; server-side Palimpsestfile builds additionally require a Keystone system administrator.
 
-Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, bundles, and BuildKit cache archives. It is not a Docker/OCI `/v2` registry. Ordinary OCI image commands use a separately configured registry profile.
+Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, bundles, and BuildKit cache archives. `POST /v1/builds` queues an isolated VM build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. A separate Linux KVM host worker consumes jobs and registers successful outputs as private layers. The API container does not execute recipes. Hub is not a Docker/OCI `/v2` registry; ordinary OCI image commands use a separately configured registry profile.
 
 ### Entrypoints & Docker Targets
 
-- **API Worker:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`)
-- **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`)
+- **Hub API:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`; `/app` serves the web console).
+- **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`).
+- **Isolated Build Worker:** `palimpsest-hub-build-worker` on a separately provisioned Linux `/dev/kvm` host, with `PALIMPSEST_HUB_BUILDER_PYTHON` set to an absolute interpreter containing `palimpsest-local[kvm]` at the same reviewed source ref. Share its SQL database and Hub blob path with the API; do not place the worker or a Docker socket inside the API container.
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
-- **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies non-empty source tables into an empty initialized destination; it is not bootstrap.
+- **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies source tables into an empty initialized destination; it is not bootstrap.
 
 ### Client Hub Configuration
 
@@ -420,7 +431,9 @@ palimpsest completion zsh|bash|fish          # shell completion generator
 ```
 
 Use `palimpsest <command> --help` for exact arguments. The checked generated
-[CLI reference](docs/cli/README.md) records the complete command tree.
+[CLI reference](docs/cli/README.md) records the complete command tree, and the
+[command workflow catalog](docs/cli/workflows.md) documents the per-command
+order, configuration, and platform limits with Archify workflow diagrams.
 
 ## Shell completion
 

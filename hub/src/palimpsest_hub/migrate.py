@@ -6,9 +6,16 @@ from collections.abc import Sequence
 
 from sqlalchemy import MetaData, Table, func, select
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
-_TABLES = ("palimpsest_hub_layers", "palimpsest_hub_uploads", "palimpsest_image_exports")
+_TABLES = (
+    "palimpsest_hub_layers",
+    "palimpsest_hub_layer_access",
+    "palimpsest_hub_uploads",
+    "palimpsest_image_exports",
+    "palimpsest_hub_builds",
+)
 
 
 class MigrationError(RuntimeError):
@@ -37,7 +44,13 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
     try:
         async with source_engine.connect() as source, destination_engine.begin() as destination:
             for table_name in _TABLES:
-                source_table = await _reflect(source, table_name)
+                try:
+                    source_table = await _reflect(source, table_name)
+                except NoSuchTableError:
+                    if table_name not in {"palimpsest_hub_layer_access", "palimpsest_hub_builds"}:
+                        raise
+                    copied[table_name] = 0
+                    continue
                 destination_table = await _reflect(destination, table_name)
                 destination_count = await _row_count(destination, destination_table)
                 if destination_count:

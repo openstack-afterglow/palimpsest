@@ -125,7 +125,7 @@ PATH_DESCRIPTIONS = {
     (("tag",), "source"): "Existing Docker image reference or ID.",
     (("tag",), "target"): "New target reference, resolved through the selected registry profile.",
     (("oci", "materialize"), "output"): "New file for the canonical materialization receipt; stdout if omitted.",
-    (("run",), "network"): "Runtime network; OCI-root currently permits only `none`.",
+    (("run",), "network"): "OCI-root guest network: `nat` (default when omitted), `host-only`, or `none`.",
     (("run",), "layer"): "Append a verified SquashFS layer digest to a cloud-image stack.",
     (("run",), "detach"): "OCI-root only: return after authenticated READY and leave the VM running.",
     (("store", "rm"), "force"): "Accepted for compatibility; does not bypass referenced-object or lease protections.",

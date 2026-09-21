@@ -5,6 +5,7 @@
 
 ## Detailed workflows
 
+- [Command-by-command workflow catalog and Archify diagrams](workflows.md)
 - [Installation and operating identity](../install.md)
 - [Cloud-image VM workflow](../vm-workflow.md)
 - [Docker/OCI registry profiles](../registries.md)

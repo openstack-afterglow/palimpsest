@@ -122,6 +122,14 @@ QEMU. Evidence: `/tmp/palimpsest-self-fd-cold-w0q0cx7j`; cold-wrapper SHA-256:
 This separate success does not erase the earlier wrong-fixture failure or
 qualify a fresh build/full Gate2.
 
+The test-only ping interpretation follow-up `cfb8015` then passed the separate
+disposable MySQL test (117.49 seconds) and focused160 on the exact server SHA.
+It did not change this guest ELF or repeat the completed stage1/stdio/cold
+proofs. Final initialization, reachability, root/PID1/security and exact owned
+disposal passed; authenticated SQL is explicitly false. See the
+[service matrix](docker-hub-service-matrix.md) for its distinct receipts and
+secrecy/disposal limits.
+
 ## Argument-vector interpretation
 
 Palimpsest's OCI intake supports exactly Linux amd64. The legacy image-config

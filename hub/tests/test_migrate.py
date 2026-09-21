@@ -8,7 +8,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from palimpsest_hub.migrate import MigrationError, migrate
 
-_TABLES = ("palimpsest_hub_layers", "palimpsest_hub_uploads", "palimpsest_image_exports")
+_TABLES = (
+    "palimpsest_hub_layers",
+    "palimpsest_hub_layer_access",
+    "palimpsest_hub_uploads",
+    "palimpsest_image_exports",
+    "palimpsest_hub_builds",
+)
 
 
 async def create_database(url: str, *, with_rows: bool) -> None:
@@ -43,6 +49,22 @@ async def test_migrate_copies_each_hub_table(tmp_path: Path):
                 assert (await connection.scalar(text(f"SELECT value FROM {table}"))) == table
     finally:
         await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migrate_accepts_legacy_source_without_build_table(tmp_path: Path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'old.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'new.sqlite'}"
+    engine = create_async_engine(source_url)
+    try:
+        async with engine.begin() as connection:
+            for table in ("palimpsest_hub_layers", "palimpsest_hub_uploads", "palimpsest_image_exports"):
+                await connection.execute(text(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, value TEXT NOT NULL)"))
+    finally:
+        await engine.dispose()
+    await create_database(destination_url, with_rows=False)
+    copied = await migrate(source_url, destination_url)
+    assert copied == {table: 0 for table in _TABLES}
 
 
 @pytest.mark.asyncio

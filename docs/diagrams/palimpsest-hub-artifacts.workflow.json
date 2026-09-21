@@ -1,0 +1,291 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Hub 이미지·레이어·번들 명령 워크플로우",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "image-flow",
+        "label": "Cloud image",
+        "focus": [
+          "hub_auth",
+          "image_ls",
+          "image_pull",
+          "image_verify",
+          "image_import",
+          "image_push"
+        ],
+        "note": "Hub /v1에서 cloud image를 조회·다운로드·검증·가져오기·게시합니다."
+      },
+      {
+        "id": "layer-bundle",
+        "label": "Layer와 bundle",
+        "focus": [
+          "hub_auth",
+          "layer_ls",
+          "layer_pull",
+          "layer_pack",
+          "layer_push",
+          "bundle_pull",
+          "bundle_verify"
+        ],
+        "note": "레이어와 번들은 Docker registry가 아닌 Hub 계약을 사용합니다."
+      }
+    ],
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "CLI·대화 표면"
+        },
+        "backend": {
+          "label": "Local 처리"
+        },
+        "database": {
+          "label": "State와 store"
+        },
+        "cloud": {
+          "label": "Hub·registry"
+        },
+        "security": {
+          "label": "정책과 증거"
+        },
+        "external": {
+          "label": "외부 도구"
+        },
+        "messagebus": {
+          "label": "로그와 스트림"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "config",
+      "label": "Hub 연결"
+    },
+    {
+      "id": "image",
+      "label": "Cloud image"
+    },
+    {
+      "id": "layer",
+      "label": "Layer"
+    },
+    {
+      "id": "bundle",
+      "label": "Bundle"
+    }
+  ],
+  "phases": [
+    {
+      "id": "discover",
+      "label": "Discover",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "transfer",
+      "label": "Transfer",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "publish",
+      "label": "Verify + publish",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "hub_auth",
+    "image_ls",
+    "image_pull",
+    "image_verify",
+    "image_import",
+    "image_push"
+  ],
+  "nodes": [
+    {
+      "id": "hub_auth",
+      "lane": "config",
+      "col": 0,
+      "type": "security",
+      "label": "Hub 인증",
+      "sublabel": "--url + TOKEN",
+      "width": 164
+    },
+    {
+      "id": "image_ls",
+      "lane": "image",
+      "col": 1,
+      "type": "cloud",
+      "label": "image ls",
+      "sublabel": "목록과 필터",
+      "width": 164
+    },
+    {
+      "id": "image_pull",
+      "lane": "image",
+      "col": 2,
+      "type": "cloud",
+      "label": "image pull",
+      "sublabel": "artifact 내려받기",
+      "width": 164
+    },
+    {
+      "id": "image_verify",
+      "lane": "image",
+      "col": 3,
+      "type": "security",
+      "label": "image verify",
+      "sublabel": "digest 확인",
+      "width": 164
+    },
+    {
+      "id": "image_import",
+      "lane": "image",
+      "col": 4,
+      "type": "backend",
+      "label": "image import",
+      "sublabel": "로컬 store 등록",
+      "width": 164
+    },
+    {
+      "id": "image_push",
+      "lane": "image",
+      "col": 5,
+      "type": "cloud",
+      "label": "image push",
+      "sublabel": "Hub 게시",
+      "width": 164
+    },
+    {
+      "id": "layer_ls",
+      "lane": "layer",
+      "col": 1,
+      "type": "database",
+      "label": "layer ls",
+      "sublabel": "레이어 목록",
+      "width": 164
+    },
+    {
+      "id": "layer_pull",
+      "lane": "layer",
+      "col": 2,
+      "type": "database",
+      "label": "layer pull",
+      "sublabel": "레이어 받기",
+      "width": 164
+    },
+    {
+      "id": "layer_pack",
+      "lane": "layer",
+      "col": 3,
+      "type": "backend",
+      "label": "layer pack",
+      "sublabel": "로컬 패키징",
+      "width": 164
+    },
+    {
+      "id": "layer_push",
+      "lane": "layer",
+      "col": 4,
+      "type": "cloud",
+      "label": "layer push",
+      "sublabel": "체인 게시",
+      "width": 164
+    },
+    {
+      "id": "bundle_pull",
+      "lane": "bundle",
+      "col": 1,
+      "type": "messagebus",
+      "label": "bundle pull",
+      "sublabel": "OCI layout 내보내기",
+      "width": 164
+    },
+    {
+      "id": "bundle_verify",
+      "lane": "bundle",
+      "col": 3,
+      "type": "security",
+      "label": "bundle verify",
+      "sublabel": "manifest 검증",
+      "width": 164
+    }
+  ],
+  "edges": [
+    {
+      "from": "hub_auth",
+      "to": "image_ls"
+    },
+    {
+      "from": "image_ls",
+      "to": "image_pull"
+    },
+    {
+      "from": "image_pull",
+      "to": "image_verify",
+      "variant": "emphasis"
+    },
+    {
+      "from": "image_verify",
+      "to": "image_import",
+      "label": "로컬 등록"
+    },
+    {
+      "from": "image_import",
+      "to": "image_push",
+      "label": "재게시"
+    },
+    {
+      "from": "hub_auth",
+      "to": "layer_ls",
+      "role": "branch"
+    },
+    {
+      "from": "layer_ls",
+      "to": "layer_pull"
+    },
+    {
+      "from": "layer_pull",
+      "to": "layer_pack",
+      "label": "재구성"
+    },
+    {
+      "from": "layer_pack",
+      "to": "layer_push"
+    },
+    {
+      "from": "hub_auth",
+      "to": "bundle_pull",
+      "role": "branch"
+    },
+    {
+      "from": "bundle_pull",
+      "to": "bundle_verify",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Hub 계약",
+      "items": [
+        "--url, PALIMPSEST_URL, config.toml 순서로 endpoint를 고릅니다",
+        "PALIMPSEST_TOKEN은 환경에서만 전달합니다"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "명령 구분",
+      "items": [
+        "image import는 업로드가 아니라 로컬 store 등록입니다",
+        "Hub는 OCI Distribution /v2 registry가 아닙니다"
+      ]
+    }
+  ]
+}

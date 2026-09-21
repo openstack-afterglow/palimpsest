@@ -43,7 +43,7 @@ PORTABLE_FILES = {
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
-    "build-registry": _units("build buildkit hub_contract registry"),
+    "build-registry": _units("build buildkit hub_builder hub_contract registry"),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
         oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff
@@ -98,7 +98,10 @@ SPECIAL_FILES = {
     "filesystem": (),
     "gate1": ("tests/integration/test_buildkit_named_oci_context.py",),
     "gate2": ("tests/e2e/test_local_oci_build_run.py",),
-    "hub": tuple(f"hub/tests/test_{name}.py" for name in ("auth", "hub_api", "image_exports", "migrate")),
+    "hub": tuple(
+        f"hub/tests/test_{name}.py"
+        for name in ("auth", "builds", "hub_api", "image_exports", "migrate", "upload_limits")
+    ),
 }
 SPECIAL_NOTES = {
     "native-live": "Native libvirt requires PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1; public CLI proof additionally requires PALIMPSEST_OCI_PUBLIC_CLI_LIVE=1. Exec engine/public CLI proofs require PALIMPSEST_OCI_EXEC_LIVE=1 / PALIMPSEST_OCI_EXEC_CLI_LIVE=1 respectively and their image. The stdio ownership diagnostic separately requires PALIMPSEST_OCI_STDIO_CLI_LIVE=1 and runs UID 0/101 nodes; it is not compatibility qualification. The PID 1 console-OFD diagnostic separately requires PALIMPSEST_OCI_CONSOLE_OFD_LIVE=1 and does not change the packaged guest. The separate durable-record and retained-root CLI proofs require PALIMPSEST_OCI_EXEC_RECORD_CLI_LIVE=1 / PALIMPSEST_OCI_RETAINED_ROOT_CLI_LIVE=1 and the existing exec image. Docker Hub proofs independently require PALIMPSEST_OCI_DOCKER_HUB_{HELLO,REDIS,REDIS_USER,NGINX}_LIVE=1 plus that selection's exact local IMAGE, ARCHIVE_SHA256, and MANIFEST_SHA256 pins; REDIS_USER is the separate explicit --user redis proof and REDIS remains the unchanged default-process compatibility proof. ML CPU proofs independently require PALIMPSEST_OCI_ML_{TENSORFLOW,PYTORCH}_LIVE=1 plus each selection's exact local IMAGE, ARCHIVE_SHA256, and MANIFEST_SHA256 pins; they use the public command override with the unchanged archive and do not qualify GPU or development workflows. Standalone real-packer component tests require PALIMPSEST_OCI_PACK_LIVE=1 plus an absolute packer path and SHA-256 pin. Runtime proofs require explicit host BOOT config; offline record inspection does not. Missing opt-ins skip their proof, not qualify it.",
@@ -266,7 +269,11 @@ DEPENDENCIES = (
         ("host-runtime", "core-cli", "oci-store", "oci-guest", "oci-monitor", "oci-access", "qualification"),
         ("native-live", "gate2"),
     ),
-    ("build buildkit hub registry refs", ("build-registry", "core-cli", "host-runtime", "oci-store"), ("gate1", "hub")),
+    (
+        "build buildkit hub hub_builder registry refs",
+        ("build-registry", "core-cli", "host-runtime", "oci-store"),
+        ("gate1", "hub"),
+    ),
     (
         "cloud_runtime cloudinit guest lima project project_adapter project_runtime project_volumes platforms kvm",
         ("host-runtime", "core-cli", "oci-store", "oci-guest", "oci-monitor", "oci-access", "qualification"),

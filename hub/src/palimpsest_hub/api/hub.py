@@ -10,12 +10,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import re
 import secrets
 import tempfile
 import uuid
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 from uuid import UUID
@@ -23,7 +29,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from palimpsest_hub.auth import get_os_conn, get_token_info, require_admin
 from palimpsest_hub.cache import get_redis
@@ -85,6 +91,8 @@ _OS_VARIANT_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{0,63}$")
 _PY_VERSION_RE = re.compile(r"^\d+\.\d+$")
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 _MAX_REFS = 32
+_MAX_ACTIVE_UPLOADS = 4
+_UPLOAD_IDLE_TTL = timedelta(hours=24)
 _MAX_BUNDLE_UPLOAD_BYTES = 64 * 1024 * 1024 * 1024  # 64 GiB
 _EXPORT_TOKEN_TTL_SECONDS = 60
 _EXPORT_TOKEN_PREFIX = "afterglow:export-dl-token:"
@@ -428,8 +436,25 @@ async def _grant_layer_access(session, digest: str, token_info: dict) -> None:
         )
 
 
-def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
-    config = dict(row.config_json or {})
+def _layer_dict(row: PalimpsestHubLayer, token_info: dict | None = None) -> dict[str, Any]:
+    config = {
+        key: value
+        for key, value in (row.config_json or {}).items()
+        if key
+        in {
+            "name",
+            "kind",
+            "ubuntu_base",
+            "python_version",
+            "parent_digest",
+            "chain_id",
+            "blob_digest",
+            "disk_format",
+            "arch",
+            "os_variant",
+            "base_image_digest",
+        }
+    }
     raw_base_image_digest = config.get("base_image_digest")
     base_image_digest = normalize_digest(raw_base_image_digest) if isinstance(raw_base_image_digest, str) else None
     return {
@@ -449,9 +474,9 @@ def _layer_dict(row: PalimpsestHubLayer) -> dict[str, Any]:
         "ubuntu_base": row.ubuntu_base,
         "python_version": row.python_version,
         "config_json": config,
-        "project_id": row.project_id,
+        "project_id": row.project_id if token_info and row.project_id == token_info.get("project_id") else None,
         "is_published": row.is_published,
-        "created_by": row.created_by,
+        "created_by": row.created_by if token_info and row.project_id == token_info.get("project_id") else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -522,8 +547,13 @@ def _blob_response(
         match = _RANGE_RE.match(range_header.strip())
         if match:
             raw_start, raw_end = match.group(1), match.group(2)
-            req_start = int(raw_start) if raw_start else 0
-            req_end = int(raw_end) if raw_end else total - 1
+            if raw_start:
+                req_start = int(raw_start)
+                req_end = int(raw_end) if raw_end else total - 1
+            else:
+                suffix = int(raw_end) if raw_end else 0
+                req_start = max(total - suffix, 0) if suffix else total
+                req_end = total - 1
             if req_start <= req_end and req_start < total:
                 start = req_start
                 end = min(req_end, total - 1)
@@ -635,7 +665,7 @@ async def search_hub_layers(
     factory = _factory_or_503()
     async with factory() as session:
         rows = (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).limit(limit))).scalars().all()
-        return [_layer_dict(row) for row in rows]
+        return [_layer_dict(row, token_info) for row in rows]
 
 
 @router.get("/images", response_model=list[HubLayerResponse], operation_id="list_hub_images")
@@ -669,7 +699,7 @@ async def list_hub_images(
     factory = _factory_or_503()
     async with factory() as session:
         rows = (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).limit(limit))).scalars().all()
-        return [_layer_dict(row) for row in rows]
+        return [_layer_dict(row, token_info) for row in rows]
 
 
 @router.post(
@@ -844,7 +874,7 @@ async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info))
         row = await _load_visible(session, normalized, token_info)
         chain = await _ancestor_chain(session, row, token_info)
         return {
-            **_layer_dict(row),
+            **_layer_dict(row, token_info),
             "ancestors": [item.blob_digest for item in chain[:-1]],
             "chain_complete": (chain[0].parent_digest is None),
         }
@@ -859,7 +889,7 @@ async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_to
     factory = _factory_or_503()
     async with factory() as session:
         row = await _load_visible(session, normalized, token_info)
-        return [_layer_dict(item) for item in await _ancestor_chain(session, row, token_info)]
+        return [_layer_dict(item, token_info) for item in await _ancestor_chain(session, row, token_info)]
 
 
 @router.get("/layers/{digest}/blob", operation_id="download_hub_blob")
@@ -892,10 +922,40 @@ async def download_hub_blob(
 # ---------------------------------------------------------------------------
 
 
+async def _expire_project_uploads(factory, store: LocalPathBlobStore, project_id: str) -> None:
+    cutoff = (datetime.now(UTC) - _UPLOAD_IDLE_TTL).replace(tzinfo=None)
+    async with factory() as session:
+        stale_ids = (
+            (
+                await session.execute(
+                    select(PalimpsestHubUpload.id).where(
+                        PalimpsestHubUpload.project_id == project_id, PalimpsestHubUpload.updated_at < cutoff
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for session_id in stale_ids:
+        async with _locked_upload(store, session_id), factory() as session:
+            row = await session.scalar(
+                select(PalimpsestHubUpload).where(
+                    PalimpsestHubUpload.id == session_id,
+                    PalimpsestHubUpload.project_id == project_id,
+                    PalimpsestHubUpload.updated_at < cutoff,
+                )
+            )
+            if row is not None:
+                await asyncio.to_thread(store.abort_upload, session_id)
+                await session.delete(row)
+                await session.commit()
+
+
 @router.post("/uploads", response_model=HubUploadStartResponse, operation_id="start_upload")
 async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
+    project_id = _required_project_id(token_info)
 
     if req.digest and store.exists(req.digest):
         async with factory() as session:
@@ -914,22 +974,35 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(ge
                 "blob_digest": req.digest,
                 "already_present": True,
                 "registered": True,
-                "registration": _layer_dict(existing),
+                "registration": _layer_dict(existing, token_info),
             }
 
     session_id = uuid.uuid4().hex
-    store.start_upload(session_id)
-    async with factory() as session:
-        session.add(
-            PalimpsestHubUpload(
-                id=session_id,
-                declared_digest=req.digest,
-                received_bytes=0,
-                project_id=_project_id(token_info),
-                created_by=token_info.get("user_id"),
+    async with _locked_file(store, lambda: store.acquire_project_upload_lock(project_id)):
+        await _expire_project_uploads(factory, store, project_id)
+        async with factory() as session:
+            active = await session.scalar(
+                select(func.count())
+                .select_from(PalimpsestHubUpload)
+                .where(PalimpsestHubUpload.project_id == project_id)
             )
-        )
-        await session.commit()
+            if active >= _MAX_ACTIVE_UPLOADS:
+                raise HTTPException(status_code=429, detail="project upload session limit reached")
+            store.start_upload(session_id)
+            try:
+                session.add(
+                    PalimpsestHubUpload(
+                        id=session_id,
+                        declared_digest=req.digest,
+                        received_bytes=0,
+                        project_id=project_id,
+                        created_by=token_info.get("user_id"),
+                    )
+                )
+                await session.commit()
+            except Exception:
+                store.abort_upload(session_id)
+                raise
     return {"session_id": session_id, "completed": False, "received_bytes": 0}
 
 
@@ -937,9 +1010,54 @@ async def _owned_upload(session, session_id: str, token_info: dict) -> Palimpses
     upload = await session.get(PalimpsestHubUpload, session_id)
     if upload is None:
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
-    if upload.project_id is not None and upload.project_id != _project_id(token_info):
+    if upload.project_id != _required_project_id(token_info):
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
     return upload
+
+
+@asynccontextmanager
+async def _locked_file(store: LocalPathBlobStore, acquire: Callable[[], int]):
+    task = asyncio.create_task(asyncio.to_thread(acquire))
+    try:
+        fd = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A waiting flock cannot cancel its thread; release its eventual FD.
+        def release_when_ready(done: asyncio.Task[int]) -> None:
+            try:
+                acquired = done.result()
+            except Exception:
+                return
+            store.release_blob_lock(acquired)
+
+        task.add_done_callback(release_when_ready)
+        raise
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(store.release_blob_lock, fd)
+
+
+@asynccontextmanager
+async def _locked_upload(store: LocalPathBlobStore, session_id: str):
+    async with _locked_file(store, lambda: store.acquire_upload_lock(session_id)):
+        yield
+
+
+@asynccontextmanager
+async def _locked_blob(store: LocalPathBlobStore, digest: str):
+    async with _locked_file(store, lambda: store.acquire_blob_lock(digest)):
+        yield
+
+
+def _serialize_upload(fn):
+    @wraps(fn)
+    async def locked(*args, **kwargs):
+        session_id = kwargs.get("session_id") or args[0]
+        store = _store_or_503()
+        async with _locked_upload(store, session_id):
+            return await fn(*args, **kwargs)
+
+    return locked
 
 
 @router.get("/uploads/{session_id}", response_model=HubUploadStatusResponse, operation_id="get_upload_status")
@@ -957,6 +1075,7 @@ async def get_upload_status(session_id: str, token_info: dict = Depends(get_toke
 
 
 @router.patch("/uploads/{session_id}", response_model=HubUploadAppendResponse, operation_id="append_upload")
+@_serialize_upload
 async def append_upload(
     session_id: str, request: Request, response: Response, token_info: dict = Depends(get_token_info)
 ) -> dict[str, Any]:
@@ -984,6 +1103,11 @@ async def append_upload(
         )
 
     try:
+        await asyncio.to_thread(store.reconcile_upload, session_id, already)
+    except HubStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
         total = await write_upload_stream(
             store,
             session_id,
@@ -998,6 +1122,8 @@ async def append_upload(
                 await session.delete(upload)
                 await session.commit()
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    await asyncio.to_thread(store.sync_upload, session_id)
 
     async with factory() as session:
         upload = await session.get(PalimpsestHubUpload, session_id)
@@ -1015,6 +1141,13 @@ async def finalize_upload(
     """수신 바이트의 digest 를 재계산해 검증하고 레이어로 등록한다."""
     if meta.is_published and not token_info.get("is_system_admin"):
         raise HTTPException(status_code=403, detail="공개 레이어 등록은 시스템 관리자만 허용됩니다")
+    return await _finalize_upload_locked(session_id, meta, request, token_info)
+
+
+@_serialize_upload
+async def _finalize_upload_locked(
+    session_id: str, meta: HubLayerMeta, request: Request, token_info: dict
+) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
 
@@ -1037,6 +1170,11 @@ async def finalize_upload(
             detail="Upload-Offset mismatch",
             headers={"Upload-Offset": str(already)},
         )
+
+    try:
+        await asyncio.to_thread(store.reconcile_upload, session_id, already)
+    except HubStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     try:
         finalized = store.finalize_upload(session_id, declared)
@@ -1064,7 +1202,7 @@ async def finalize_upload(
         "base_image_digest": meta.base_image_digest,
     }
 
-    async with factory() as session:
+    async with _locked_blob(store, finalized.blob_digest), factory() as session:
         existing = (
             await session.execute(
                 select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == finalized.blob_digest)
@@ -1098,10 +1236,6 @@ async def finalize_upload(
         else:
             conflicts = _registration_conflicts(existing, meta)
             if conflicts:
-                upload = await session.get(PalimpsestHubUpload, session_id)
-                if upload is not None:
-                    await session.delete(upload)
-                await session.commit()
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -1116,6 +1250,10 @@ async def finalize_upload(
         if upload is not None:
             await session.delete(upload)
         await session.commit()
+    try:
+        store.abort_upload(session_id)
+    except OSError:
+        _logger.warning("registered upload staging could not be removed")
 
     return {
         "blob_digest": finalized.blob_digest,
@@ -1126,6 +1264,7 @@ async def finalize_upload(
 
 
 @router.delete("/uploads/{session_id}", status_code=204, operation_id="abort_upload")
+@_serialize_upload
 async def abort_upload(session_id: str, token_info: dict = Depends(get_token_info)) -> None:
     factory = _factory_or_503()
     store = _store_or_503()
@@ -1231,12 +1370,15 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_i
                 try:
                     staged = tmp / f"blob-{declared[len('sha256:') :][:16]}"
                     extract_blob(bundle_path, parsed.blob_members[declared], staged)
+                    with staged.open("rb") as handle:
+                        actual = "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
+                    if actual != declared:
+                        skipped.append({"digest": declared, "error": "digest 불일치"})
+                        continue
                     finalized = store.ingest_file(staged)
                     staged.unlink(missing_ok=True)
                     if finalized.blob_digest != declared:
-                        store.delete(finalized.blob_digest)
-                        skipped.append({"digest": declared, "error": "digest 불일치"})
-                        continue
+                        raise HubStoreError("imported blob digest changed")
                 except (BundleError, HubStoreError, KeyError, OSError) as exc:
                     skipped.append({"digest": declared, "error": str(exc)[:200]})
                     continue

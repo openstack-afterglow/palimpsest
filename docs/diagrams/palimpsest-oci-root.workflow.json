@@ -1,0 +1,277 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Linux amd64 OCI-root 명령 워크플로우",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "prepare-run",
+        "label": "준비와 실행",
+        "focus": [
+          "init_runtime",
+          "oci_pull",
+          "materialize",
+          "run_root",
+          "root_proof"
+        ],
+        "note": "OCI artifact를 materialize한 뒤 KVM guest의 /로 실행합니다."
+      },
+      {
+        "id": "evidence",
+        "label": "실행 증거",
+        "focus": [
+          "root_proof",
+          "exec_status",
+          "exec_record",
+          "network",
+          "root_volumes",
+          "root_volume"
+        ],
+        "note": "exec·network·volume 상태를 기록된 evidence로 조회합니다."
+      }
+    ],
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "CLI·대화 표면"
+        },
+        "backend": {
+          "label": "Local 처리"
+        },
+        "database": {
+          "label": "State와 store"
+        },
+        "cloud": {
+          "label": "Hub·registry"
+        },
+        "security": {
+          "label": "정책과 증거"
+        },
+        "external": {
+          "label": "외부 도구"
+        },
+        "messagebus": {
+          "label": "로그와 스트림"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "prepare",
+      "label": "Runtime과 artifact"
+    },
+    {
+      "id": "guest",
+      "label": "KVM guest"
+    },
+    {
+      "id": "evidence",
+      "label": "실행 evidence"
+    },
+    {
+      "id": "volume",
+      "label": "Root volume"
+    }
+  ],
+  "phases": [
+    {
+      "id": "prepare",
+      "label": "Prepare",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "boot",
+      "label": "Materialize + boot",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "observe",
+      "label": "Observe",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "init_runtime",
+    "oci_pull",
+    "materialize",
+    "run_root",
+    "root_proof",
+    "exec_status",
+    "exec_record"
+  ],
+  "nodes": [
+    {
+      "id": "init_runtime",
+      "lane": "prepare",
+      "col": 0,
+      "type": "backend",
+      "label": "init-runtime",
+      "sublabel": "runtime parent 생성",
+      "width": 132
+    },
+    {
+      "id": "oci_pull",
+      "lane": "prepare",
+      "col": 1,
+      "type": "cloud",
+      "label": "oci pull",
+      "sublabel": "linux/amd64 취득",
+      "width": 132
+    },
+    {
+      "id": "materialize",
+      "lane": "prepare",
+      "col": 2,
+      "type": "database",
+      "label": "materialize",
+      "sublabel": "OCI rootfs 변환",
+      "width": 132
+    },
+    {
+      "id": "run_root",
+      "lane": "guest",
+      "col": 3,
+      "type": "cloud",
+      "label": "run oci-root",
+      "sublabel": "pivot_root + PID 1",
+      "width": 132
+    },
+    {
+      "id": "network",
+      "lane": "guest",
+      "col": 4,
+      "type": "messagebus",
+      "label": "oci network",
+      "sublabel": "nat/host-only/none",
+      "width": 132
+    },
+    {
+      "id": "resource_status",
+      "lane": "guest",
+      "col": 5,
+      "type": "security",
+      "label": "resource-status",
+      "sublabel": "자원 evidence",
+      "width": 132
+    },
+    {
+      "id": "root_proof",
+      "lane": "evidence",
+      "col": 3,
+      "type": "security",
+      "label": "root-proof",
+      "sublabel": "/proc/1/root",
+      "width": 132
+    },
+    {
+      "id": "exec_status",
+      "lane": "evidence",
+      "col": 4,
+      "type": "backend",
+      "label": "exec-status",
+      "sublabel": "추가 exec 상태",
+      "width": 132
+    },
+    {
+      "id": "exec_record",
+      "lane": "evidence",
+      "col": 5,
+      "type": "database",
+      "label": "exec-record",
+      "sublabel": "완료 기록",
+      "width": 132
+    },
+    {
+      "id": "root_volumes",
+      "lane": "volume",
+      "col": 4,
+      "type": "database",
+      "label": "root-volumes",
+      "sublabel": "보존 volume 목록",
+      "width": 132
+    },
+    {
+      "id": "root_volume",
+      "lane": "volume",
+      "col": 5,
+      "type": "database",
+      "label": "root-volume",
+      "sublabel": "volume 상세",
+      "width": 132
+    }
+  ],
+  "edges": [
+    {
+      "from": "init_runtime",
+      "to": "oci_pull"
+    },
+    {
+      "from": "oci_pull",
+      "to": "materialize"
+    },
+    {
+      "from": "materialize",
+      "to": "run_root",
+      "variant": "emphasis"
+    },
+    {
+      "from": "run_root",
+      "to": "root_proof",
+      "variant": "security"
+    },
+    {
+      "from": "root_proof",
+      "to": "exec_status"
+    },
+    {
+      "from": "exec_status",
+      "to": "exec_record"
+    },
+    {
+      "from": "run_root",
+      "to": "network",
+      "label": "네트워크 실행",
+      "role": "branch"
+    },
+    {
+      "from": "network",
+      "to": "resource_status",
+      "role": "branch"
+    },
+    {
+      "from": "run_root",
+      "to": "root_volumes",
+      "label": "root 보존",
+      "role": "branch"
+    },
+    {
+      "from": "root_volumes",
+      "to": "root_volume"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Root invariant",
+      "items": [
+        "materialize한 OCI 내용이 guest의 /가 됩니다",
+        "PID 1 직접 접근은 계속 거부되며 root 증거는 약화하지 않습니다"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "지원 경계",
+      "items": [
+        "OCI-root runtime은 Linux x86_64/amd64 KVM 전용입니다",
+        "oci pull은 익명 HTTPS linux/amd64 image만 받습니다"
+      ]
+    }
+  ]
+}

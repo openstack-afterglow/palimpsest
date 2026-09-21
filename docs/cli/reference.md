@@ -825,7 +825,7 @@ usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpu
 | `--layer` | string; repeatable | `[]` | Append a verified SquashFS layer digest to a cloud-image stack. |
 | `--memory` | int | `4096` | Guest memory in MiB (valid range: 256–1,048,576). |
 | `--vcpus` | int | `2` | Guest virtual CPUs (valid range: 1–256). |
-| `--network` | string | `None` | Runtime network; OCI-root currently permits only &#96;none&#96;. |
+| `--network` | string | `None` | OCI-root guest network: &#96;nat&#96; (default when omitted), &#96;host-only&#96;, or &#96;none&#96;. |
 | `-p`, `--publish` | string; repeatable | `[]` | publish one OCI-root guest port on the host (default host address 127.0.0.1) |
 | `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf` | `'auto'` | Select or automatically detect the runtime backend. |
 | `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | Disambiguate cloud-image and local OCI-root execution. |

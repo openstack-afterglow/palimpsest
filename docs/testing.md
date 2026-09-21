@@ -55,6 +55,37 @@ assertions, fixtures or production safety checks. A documentation-only edit
 can produce an empty test recommendation; that is not a successful test run.
 Hub tests use their own environment and explicit lane.
 
+The Hub's server-build path has a focused project-scoped HTTP contract lane:
+
+```sh
+cd hub
+uv run pytest -q tests/test_builds.py tests/test_upload_limits.py \
+  tests/test_hub_api.py tests/test_migrate.py
+```
+
+This exercises upload offsets and private download over ASGI HTTP, build
+authorization/visibility, durable queue claim, publication, project quota,
+expiry, and data migration. The main HTTP build test replaces the **guest VM executor**;
+the bytes labeled as a cloud image are a portable fixture, not a bootable
+image. Therefore an HTTP pass proves no KVM guest boot, no native SquashFS
+mount, no Keystone deployment, and no production worker availability. A native
+server-build qualification must separately use a real pinned x86_64 cloud
+image on a provisioned Linux KVM host, observe `palimpsest-hub-build-worker`
+claim and actual `build_layer` guest execution, verify the downloaded SquashFS
+digest and parent/base chain, then check owned VM cleanup. Do not perform that
+host/remote operation or infer success from portable CI without its explicit
+deployment prerequisites and approval.
+
+The Hub lane also exercises a malicious bundle member that must not remove a
+shared blob, suffix byte ranges, canceled lock waiters, retry after interrupted
+blob promotion, refusal on blob directory fsync failure, competing
+identical-digest registrations, competing project enqueue requests, worker
+preflight rejection before SQL access, fail-closed recovery of an unverifiable
+builder marker, and retry of completed-build private scratch cleanup without
+losing its published output. These are portable contract tests: a Linux-only
+run must still confirm parent-death signals, exact process-group reaping,
+filesystem crash durability, and libvirt teardown.
+
 ## CLI reference and distribution checks
 
 For command documentation and packaging-only edits, use the focused contracts:
@@ -171,6 +202,37 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/usr/lib/python3/dist-packages:src \
   PALIMPSEST_KVM_KERNEL_CONFIG=/home/pieroot/palimpsest-kvm-evidence/kernel-6.6.71.config \
   .venv/bin/python scripts/test_lanes.py run native-live
 ```
+
+### Required stage-1 GitHub KVM gate
+
+The reusable `Native KVM stage-1 proof` job is enabled only when repository
+variable `PALIMPSEST_KVM_ENABLED` is exactly `true` and requires runner labels
+`self-hosted`, `linux`, `x64`, and `kvm`. `Required native KVM proof` fails when
+the native job is skipped or fails; do not replace it with a portable or TCG
+result.
+
+The current dedicated repository runner is `pieroot-server-palimpsest-kvm`
+(runner id `21`). It runs Actions runner `2.337.0` in persistent container
+`palimpsest-gh-runner` with restart policy `unless-stopped`. The container is
+not privileged, drops all capabilities before adding only `CHOWN`,
+`DAC_OVERRIDE`, and `FOWNER`, sets `no-new-privileges`, and has no Docker socket
+or host-home mount. Its writable runner-state volume is separate from a
+read-only kernel volume; `/dev/kvm` is the only host device. The root-owned
+mode-`0400`, single-link kernel/config digests are respectively
+`sha256:89f7d4f31f6ef77d0f8d45810de9e19e3f8dededf3dd6ebf89bb540d26d8c0fd`
+and `sha256:4d4aaaed367bd2fb6ed1238b94ea9bb095a5e5a0d0cc67d1cb70595643cc795a`.
+Changing the runner registration, capabilities, volumes, device, kernel pins,
+or repository variable is infrastructure mutation, not test setup.
+
+Commit `785cd02c638a339acfab9c9f1a6bcb7e97683a5e` is qualified by `Test` run
+`35029001178` attempt 4 and reusable run `35029003724` attempts 4/5. Their
+native artifacts `10448739883` and `10448829655` each contain the exact 45-file
+evidence set and a `palimpsest.oci-stage1-kvm-proof.v20` receipt covering 44
+QEMU invocations and 43 executed boots. The repository is public and its
+current fork-workflow approval policy is `first_time_contributors`; persistent
+runner isolation does not eliminate the `/dev/kvm` or cross-job state risk.
+Changing that approval policy, stopping the runner, or disabling the variable
+requires an explicit security/availability decision.
 
 Ordinary server lanes use `env -u PYTHONPATH`, `PYTHONDONTWRITEBYTECODE=1` and
 `umask 022`, as the previous full baseline did. Never run fixture mutations
