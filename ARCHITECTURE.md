@@ -761,13 +761,15 @@ The runner remains online and dedicated, and the variable remains enabled. This 
   - 규칙 11: 새 계약과 잔여 공백을 적었다.
   - 규칙 12: portable node 수 6,091을 더했다.
 
+2026-09-24 CI 최종 검토: medium 1건(문서만)을 반영했다. AGENTS.md 규칙 11이 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었지만, 이 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `.github/workflows/development-package.yml`과 그 계약을 다시 읽고, 임시 복사본에서 변형 9가지(step `if`·`shell`·`continue-on-error`, job `continue-on-error`·`if: always()`, `echo` 감싸기, `if`의 `|| true`)가 세 CI 계약 파일 125건을 모두 통과하는 것을 확인했다. 규칙 11은 이제 검사 항목과 고정하지 않는 항목(두 job의 key 집합, step `if`·`shell`·`continue-on-error`·`env`, 추가 step)을 그대로 적는다. workflow와 계약은 바꾸지 않았고 portable node 수(6,091)도 그대로다. production/runtime·package·Hub에는 구조 영향이 없다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "501597b7d6a0da7fccfc4148eca8915944ed1e7ac6ec0d7fd5d4762d693085a6",
-  "reviewed_at": "2026-09-23T23:02:24Z",
-  "summary": "Reviewed all five workflows (publish paths and permissions of test, release, hub-docker, development-package), test_lanes plugin, test_test_lanes CI contracts and clarified canonical rules 3/10 for CI review round 3; pinned exact job keys of all 11 test.yml jobs, hub defaults by value, test.yml top-level keys and read-only permissions, and no pull_request_target/workflow_run in any workflow; rewrote rule 10 as YAML event gate plus settings backstop with the gate/pin/no-skip conflict, release kvm-proof token exposure and settings paths as owner decisions; rule 3 publish-only gating with three pre-existing exceptions; narrowed rule 5 contract claim; workflows unchanged, no production/runtime impact."
+  "source_sha256": "35e08ab7d1072b93f2a56933b046252a48f32882935d1f0b427fe03804e7670a",
+  "reviewed_at": "2026-09-23T23:19:48Z",
+  "summary": "Reviewed all five workflows (publish paths and permissions of test, release, hub-docker, development-package), test_lanes plugin, test_test_lanes CI contracts and clarified canonical rules 3/10 for CI review round 3; pinned exact job keys of all 11 test.yml jobs, hub defaults by value, test.yml top-level keys and read-only permissions, and no pull_request_target/workflow_run in any workflow; rewrote rule 10 as YAML event gate plus settings backstop with the gate/pin/no-skip conflict, release kvm-proof token exposure and settings paths as owner decisions; rule 3 publish-only gating with three pre-existing exceptions; narrowed rule 5 contract claim. CI final review: re-read development-package.yml and test_development_package_workflow.py; rule 11 no longer claims that contract pins development-package steps, it lists what is checked (triggers, permissions, concurrency, job ids, containment of verify if/run text, publish needs/permissions/uses, checksum order, helper args, forbidden strings) and what is not (job keys, step if/shell/continue-on-error/env, extra steps; 9 scratch mutations pass all 125 CI contract tests). Workflows and contracts unchanged, no production/runtime impact."
 }
 ```
 <!-- architecture-review:end -->

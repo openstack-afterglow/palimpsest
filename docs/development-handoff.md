@@ -1577,6 +1577,11 @@ publication 모두 success다.
   - `actionlint`(workflow 다섯 개): 기존 custom label `kvm` 경고 2건(`test.yml`, `release.yml`)만 있었다.
   - Docker·권한이 필요한 gate와 GitHub 실행은 이번에도 하지 않았다.
 
+**최종 검토(2026-09-24).** round 3 반영분에 대한 최종 검토가 medium 1건(문서만)을 지적했다. AGENTS.md 규칙 11은 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었다. 실제 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `verify`는 SHA별 prerelease를 만드는 `publish`의 유일한 gate다.
+
+- 임시 복사본에서 변형 9가지를 돌렸다. `verify` step `continue-on-error`·`if: false`·`shell: 'true {0}'`, `verify` job `continue-on-error`, checksum step `continue-on-error`·`if: false`, `publish` job `if: always()`, 명령 `echo` 감싸기, `verify` `if`의 `|| true`다. 모두 세 CI 계약 파일(`test_development_package_workflow.py`, `test_test_lanes.py`, `test_oci_convert_security.py`)의 125건을 통과했다.
+- 규칙 11을 검사 항목과 고정하지 않는 항목으로 고쳐 적었다. 계약은 확장하지 않았으므로 workflow·계약·portable node 수(6,091)는 그대로다. 공백을 막으려면 `verify`·`publish`의 job key와 step 목록을 `test_test_lanes.py`의 portable matrix처럼 정확히 고정하는 계약을 따로 추가해야 한다.
+
 **승인 대기·소유자 결정.** 구현하지 않았고 설정도 바꾸지 않았다.
 
 1. self-hosted KVM runner `pieroot-server-palimpsest-kvm`의 노출이다. 이 문서 `명시적 승인 대기 — 실행 금지` 절의 2번과 같은 항목이다.

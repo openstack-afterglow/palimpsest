@@ -154,9 +154,14 @@
     - 고정하지 않는 것도 있다.
       - shard job이 아닌 job(`checks`, `hub`, proof job)의 step 내용. 즉 step `env`나 `$GITHUB_ENV`에 쓰는 추가 step은 고정하지 않는다. `kvm` proof는 evidence가 없으면 upload step의 `if-no-files-found: error`로 실행 중 실패한다.
       - workflow 밖의 무력화. `pyproject.toml`의 `addopts`나 conftest hook은 규칙 5에 적은 대로 막지 않는다.
-      - `test.yml` 밖 workflow의 job 형태. 계약은 trigger, runner, reusable 호출만 본다. 예외는 `test_development_package_workflow.py`가 고정하는 development-package다.
+      - `test.yml` 밖 workflow의 job 형태. `test_test_lanes.py`는 trigger, runner, reusable 호출만 본다. development-package도 예외가 아니다. 그 workflow의 자체 계약이 검사하는 항목과 검사하지 않는 항목은 아래 `test_development_package_workflow.py` 항목에 적었다.
     - `tests/unit/test_oci_convert_security.py`는 `oci-fs-proof`부터 `unit-macos` 직전까지 job-level `if:`가 없는지 텍스트로 검사한다. 그러므로 이 구간의 job 순서를 바꾸지 않는다.
-    - `tests/unit/test_development_package_workflow.py`는 development-package의 trigger·concurrency·step을 고정한다.
+    - `tests/unit/test_development_package_workflow.py`가 `development-package.yml`에서 검사하는 것은 다음뿐이다.
+      - trigger가 `workflow_dispatch`와 허용 branch 세 개의 push인지, workflow `permissions`가 `{contents: read}`인지, ref 단위 `concurrency`와 job id 집합(`verify`·`publish`)
+      - `verify`: job-level `permissions`가 없는지, job `if`에 허용 branch마다 ref 비교가 들어 있는지, step `run` 문자열을 이은 text에 필수 문자열 여섯 개가 들어 있는지. 모두 포함 여부만 본다. 그래서 `if`에 `|| true`를 더하거나 명령을 `echo`로 감싸도 통과한다. `qualification` lane과 `ruff` step은 필수 문자열에 없다.
+      - `publish`: `needs: verify`, `permissions == {contents: write}`, 정확한 `uses` 목록, `sha256sum --check SHA256SUMS`를 담은 `run`이 helper `run`보다 앞에 있는지(순서만 본다), helper `run`의 `--repository`·`--sha`·`--dist-dir` 인자, 금지 문자열(`gh api`, `gh release create`, `--clobber` 등)
+      - 같은 파일은 `release.yml`의 `v*` tag trigger와 PyPI `publish`의 `needs`·`if`를 텍스트로 확인한다.
+    - 따라서 development-package의 두 job 모두 job key 집합, step `if`·`shell`·`continue-on-error`·`env`, 추가 step을 고정하지 않는다. job-level `if`도 `verify`의 포함 검사 외에는 보지 않는다. `verify`의 테스트 step을 건너뛰거나 그 실패를 무시하게 바꿔도 계약은 통과한다. 그러면 `publish`가 `contents: write`로 검증되지 않은 SHA별 prerelease를 만들 수 있다. 이 workflow를 바꿀 때는 이 공백을 리뷰에서 직접 확인한다. 2026-09-24 최종 검토의 임시 복사본 변형 9가지(`verify` step `continue-on-error`·`if: false`·`shell: 'true {0}'`, `verify` job `continue-on-error`, checksum step `continue-on-error`·`if: false`, `publish` job `if: always()`, 명령 `echo` 감싸기, `verify` `if`의 `|| true`)가 모두 이 계약을 통과했다.
     - 새 CI 불변식은 새 파일을 만들기보다 이 파일들을 확장한다. 새 test 파일은 `scripts/test_lanes.py`에 분류해야 하기 때문이다.
 12. **지속 개선.**
     - CI를 바꾸는 변경에는 전후 실측을 첨부한다.
