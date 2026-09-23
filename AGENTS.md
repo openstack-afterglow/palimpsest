@@ -61,7 +61,7 @@
    - image·package **발행(push)과 배포**는 `Test` workflow 전체 결과로 게이팅한다. 아무것도 발행하지 않는 PR 검증 build는 테스트와 병렬로 돌려도 된다. `hub-docker.yml`의 `pull_request` 실행은 이 규칙을 지킨다. `build-and-push`가 두 image를 `push: false`로 build만 하기 때문이다.
    - 다음 세 발행 경로는 `Test` 전체 결과를 기다리지 않는다. 정본 규칙 3의 기존 예외다. 모두 테스트 크리티컬 패스 밖에 있고, 바꾸면 발행 의미가 달라진다. 그래서 소유자 결정 없이 바꾸지 않는다. 결정 항목은 [인계 문서](docs/development-handoff.md) `CI critical-path checkpoint (2026-09-24)` 절의 승인 대기 목록에 있다.
      - `hub-docker.yml` `build-and-push`: `main`·`dev` push, `v*` tag push, `workflow_dispatch`에서 GHCR에 image를 push한다. 자체 `Hub Unit Tests` job(`hub/tests/`)에만 `needs:`를 건다.
-     - `development-package.yml` `publish`: `contents: write`로 SHA별 GitHub prerelease를 만든다. 자체 `verify`에만 `needs:`를 건다. `verify`가 실행하는 테스트는 `core-cli`·`qualification` lane과 development-package 계약뿐이고, 그 밖에는 package build를 한다.
+     - `development-package.yml` `publish`: `contents: write`로 SHA별 GitHub prerelease를 만든다. 자체 `verify`에만 `needs:`를 건다. `verify`가 실행하는 테스트는 `core-cli`·`qualification` lane과 development-package 계약뿐이다. 그 밖에는 architecture freshness·CLI reference·test-lane manifest 검사, 대상 파일 `ruff check`, package build를 한다.
      - `release.yml` `publish`(PyPI)와 그 뒤의 `github-release`: 자체 `verify`와 `kvm-proof`에만 건다. `verify`는 `tests/unit`, Kolla 계약, guest stage-1, BuildKit build를 실행하지만 macOS shard와 portable 전체는 실행하지 않는다.
 4. **job당 고정비를 측정한다.**
    - 고정비는 checkout, `setup-uv`, `setup-python`, `uv sync --frozen --extra dev`에 드는 시간이다. 2026-09 기준으로 Linux shard 약 6초, macOS shard 약 9초였고 각각 job 시간의 약 7%다.

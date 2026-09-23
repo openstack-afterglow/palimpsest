@@ -765,8 +765,8 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9a2f161605858bf64288261b625fc18869acea8b26da45f419689dd0a5e133f1",
-  "reviewed_at": "2026-09-23T23:00:21Z",
+  "source_sha256": "501597b7d6a0da7fccfc4148eca8915944ed1e7ac6ec0d7fd5d4762d693085a6",
+  "reviewed_at": "2026-09-23T23:02:24Z",
   "summary": "Reviewed all five workflows (publish paths and permissions of test, release, hub-docker, development-package), test_lanes plugin, test_test_lanes CI contracts and clarified canonical rules 3/10 for CI review round 3; pinned exact job keys of all 11 test.yml jobs, hub defaults by value, test.yml top-level keys and read-only permissions, and no pull_request_target/workflow_run in any workflow; rewrote rule 10 as YAML event gate plus settings backstop with the gate/pin/no-skip conflict, release kvm-proof token exposure and settings paths as owner decisions; rule 3 publish-only gating with three pre-existing exceptions; narrowed rule 5 contract claim; workflows unchanged, no production/runtime impact."
 }
 ```
