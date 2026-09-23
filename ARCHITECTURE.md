@@ -575,10 +575,12 @@ Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않
 
 GitHub `Test` workflow는 Linux portable 6 shard와 macOS portable 4 shard를 `max-parallel` 없이 한 wave로 실행한다. 이 형태는 `tests/unit/test_test_lanes.py`가 고정한다.
 
-- shard 목록과 `--shard N/M` 분모는 일치해야 한다.
-- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다.
+- portable matrix job 두 개는 정확히 고정된다. job key는 `name`·`runs-on`·`strategy`·`steps`이고, runner, `matrix == {shard: [1..N]}`(`exclude`·`include` 없음), `fail-fast: false`, step 목록 전체(action 버전·`with`·`--shard N/M` 분모를 포함한 shard 명령)를 고정한다. `max-parallel`은 없거나 N 이상이어야 한다. `test.yml`에는 workflow-level `env`·`defaults`가 없다.
+- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다. aggregator가 읽는 의존 job(`checks`, portable 두 개, `kvm`)의 job key 집합도 정확히 고정한다.
+- `test.yml`의 어느 step에도 `shell`·`continue-on-error`가 없고, step `if`는 건너뛰지 않는 `always()`뿐이다.
 - 테스트 job 앞에는 gate job이 없다.
-- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 GitHub-hosted가 아닌 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. 이 계약은 workflow 형태만 고정한다. `pull_request` 코드를 이 runner에서 떼어 놓는 일은 저장소 설정이 맡는다.
+- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 정확한 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. reusable workflow 호출 job은 없어야 하고, `test.yml` trigger는 정확히 `workflow_call`과 `main`·`dev`의 push·`pull_request`다. 이 계약은 workflow 형태만 고정한다. `pull_request` 코드를 이 runner에서 떼어 놓는 일은 저장소 설정이 맡는다.
+- shard별 node 수와 shard 합계는 CI에서 검사하지 않는다. 출력만 한다. 대신 고정된 명령 문자열과 분할 unit test로 보장한다. 이 점은 [`AGENTS.md`](AGENTS.md) 규칙 5에 정본 규칙과 다른 점으로 적혀 있다. shard job이 아닌 job의 step 내용은 고정하지 않는다.
 
 CI 변경의 측정·변경 규칙은 [`AGENTS.md`](AGENTS.md)의 `CI 파이프라인 성능 규정`이 정본이다. 크리티컬 패스 기대치는 push 뒤 실측 전까지 추정이다.
 
@@ -728,13 +730,30 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 - **계약 강화.** `test_test_lanes.py`가 aggregator의 정확한 `needs`와 성공만 받는 verdict step, job-level `if:` 집합, 모든 workflow의 비-hosted runner 집합(`runs-on` mapping 형태 포함)과 `release.yml`의 tag-push trigger를 고정한다. 임시 workflow 변형 14가지를 모두 잡는 것을 확인했다.
 - **사실 정정.** KVM runner에서 실행된 PR run으로 인용한 세 건은 같은 저장소 branch의 실행이었다. fork 코드 노출은 잠재 위험으로 고쳐 적었다. runner group 제한은 저장소 수준 runner에는 쓸 수 없다는 점, PR diff의 merge-base 기준, node 수 기준의 출처(`60fa42f` CI `Lane shard` 합계 6,081)도 바로잡았다.
 
+2026-09-24 CI review round 2: 재검토가 medium 1건·low 8건을 지적했고, 이를 반영했다. `.github/workflows/`의 다섯 workflow, `scripts/test_lanes.py` plugin, `tests/unit/test_test_lanes.py`, `docs/development-handoff.md`의 두 승인 대기 목록을 다시 읽었다.
+
+- **workflow는 바꾸지 않았다.** production/runtime·package·Hub에도 구조 영향이 없다.
+- **계약 강화.** 다섯 가지를 더 고정했다.
+  - portable matrix job 전체(job key·runner·`matrix`·step 목록). 이제 shard `exclude`, step `if`·`shell`·`env`, job-level `env`·`defaults`, `$GITHUB_ENV` step, checkout `ref`를 잡는다.
+  - 의존 job의 job key 집합
+  - `test.yml` 전체 step의 `shell`·`continue-on-error` 부재와 `always()` 외 step `if` 부재
+  - 정확한 hosted label 허용 목록. `ubuntu-kvm` 같은 prefix 위장을 잡는다.
+  - reusable workflow 호출 금지와 `test.yml` trigger
+- **변형 검사.** 임시 workflow 변형 39가지를 모두 잡았다. 의도한 잔여 공백 2가지(비-matrix job의 step `env`, `$GITHUB_ENV` step)는 잡지 않았고, 규정에 그렇게 적었다.
+- **규정 정리.** AGENTS.md 규칙 2, 5, 8, 9, 10을 고쳤다.
+  - 규칙 2: 같은 event의 hosted job 수를 workflow 정의로 셌다. push 17개, PR 16개다.
+  - 규칙 5: shard 수는 계약으로 보장하며, 이 점이 정본 규칙과 다르다고 밝혔다.
+  - 규칙 8: 정본 규칙을 의도적으로 구체화한 것이라고 밝혔다.
+  - 규칙 9: 건너뛰기 조건에 "head branch의 push `Test`가 같은 tree를 테스트했다"를 더했다.
+  - 규칙 10: 승인 대기 항목을 절 이름으로 가리키게 했다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0ab1106ca87b96c3bd1448f748847a980172243eadfa99c7cf531eca26ebcc81",
-  "reviewed_at": "2026-09-23T21:36:57Z",
-  "summary": "Reviewed test.yml, release.yml and all workflows, check_architecture digest scope and test_test_lanes CI contracts for CI review round 1; pinned exact aggregator needs and success-only verdict steps, job-level if set, non-hosted runner set across workflows (runs-on mapping forms) and release tag-only trigger; corrected AGENTS.md rules 5/8/10/12 wording keeping the canonical rule 10 controls; workflows unchanged, no production/runtime impact."
+  "source_sha256": "9c10bffa9e298f236dcc7885ece326217eef96768350f1767bfa7e055a51130c",
+  "reviewed_at": "2026-09-23T22:05:09Z",
+  "summary": "Reviewed all five workflows, test_lanes plugin, test_test_lanes CI contracts and both handoff approval lists for CI review round 2; pinned exact portable matrix jobs (job keys, runner, matrix, full step list), dependency job keys, test.yml-wide step shell/continue-on-error/if rules, exact hosted label allowlist, no reusable-workflow callers and exact test.yml triggers; documented shard-count-by-contract deviation and rules 2/8/9/10 wording; workflows unchanged, no production/runtime impact."
 }
 ```
 <!-- architecture-review:end -->

@@ -52,7 +52,9 @@
 2. **목표 지표를 먼저 정한다.**
    - 이 저장소는 public이고 GitHub-hosted runner 시간이 무료이므로 목표는 wall-clock이다.
    - org `openstack-afterglow`의 Free plan 동시성 한도(hosted 20 job, macOS 5 job)는 lumen·openstack-afterglow·drover·waygate·afterglow-crypto와 공유한다. macOS runner를 쓰는 저장소는 이곳뿐이다.
-   - 한 `Test` 실행은 hosted job 약 15개를 동시에 요구한다. 따라서 dev·main 동시 push처럼 겹치는 실행의 대기도 함께 측정한다.
+   - workflow 정의로 센 값이며 실측이 아니다. `Test` 실행은 시작 시점에 hosted job 15개(macOS 4개 포함)를 요구한다. aggregator 3개는 의존 job이 끝난 뒤 시작하므로 실행 하나의 hosted job은 모두 18개다. `kvm`은 self-hosted라 이 수에 들어가지 않는다.
+   - 같은 event로 다른 workflow도 시작한다. `main`·`dev` push에는 `hub-docker.yml`의 `test`와 `development-package.yml`의 `verify`가 더해져 시작 시점 hosted job이 17개다. `main`·`dev` 대상 PR에는 `hub-docker.yml`의 `test`만 더해져 16개다.
+   - 따라서 dev·main 동시 push(17+17개, macOS 4+4개)는 hosted 20개·macOS 5개 한도를 넘는다. 겹치는 실행의 대기도 함께 측정한다.
 3. **게이트 job을 테스트 job 앞에 두지 않는다.**
    - `Lint, manifests, and package`(`checks`)는 portable shard의 `needs:`로 걸지 않고 병렬로 실행한다. 그 결과는 `Pure contracts (Python 3.12)` aggregator에서만 합친다.
    - `if: always()`와 `needs:`를 함께 가지는 job은 `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof` 세 aggregator뿐이다.
@@ -65,7 +67,11 @@
    - Portable shard는 `scripts/test_lanes.py`의 안정 key 분할을 쓴다. key는 module/class/function과 parameter index의 sha256이다.
    - workflow step은 `uv run python scripts/test_lanes.py run portable --shard ${{ matrix.shard }}/M`을 직접 호출한다. 인자를 누락할 수 있는 다른 script나 `-- --shard` 형태의 wrapper로 감싸지 않는다. 계약 테스트가 이 명령 문자열을 고정한다.
    - matrix의 shard 목록, `--shard …/M`의 분모, job 이름의 분모는 서로 일치해야 한다. `max-parallel`은 없거나 shard 수 이상이어야 한다.
-   - 각 shard는 "Lane shard" 수 줄을 출력한다. 빈 shard나 수집 오류가 나면 실패로 처리한다(fail-closed).
+   - 각 shard는 "Lane shard" 수 줄을 출력하지만, CI는 이 수를 출력만 하고 검증하지 않는다. 실행 중에 실패로 처리되는 경우(fail-closed)는 세 가지다. 빈 shard는 pytest exit 5, 수집 오류는 exit 2, plugin 없이 `--test-lane-shard`가 전달되면 usage error exit 4다.
+   - 정본 규칙 5는 "샤드별 실행 파일 수를 CI에서 검증한다"고 요구한다. 이 저장소는 이를 실행 중 검사 대신 계약으로 보장하며, 이 점이 정본 규칙과 다르다. shard별 node 수와 shard 합계가 portable 전체와 같은지는 CI에서 검사하지 않는다. 대신 다음이 보장한다.
+     - `test_ci_portable_matrix_runs_every_shard_in_one_wave`가 shard job의 step 전체와 명령 문자열을 고정한다. 정본이 경고한 위험, 즉 `test_lanes.py` 앞에서 `--shard`가 빠져 모든 shard가 전체 suite를 실행하는 경우를 막는 것은 이 고정뿐이다. 이 경우 `--test-lane-shard`가 아예 전달되지 않으므로 위 exit 4 검사도 발동하지 않는다.
+     - `test_portable_command_shards_nodes_without_special_selectors_or_environment_mutation`은 `commands()`가 `--test-lane-shard`를 pytest argv에 넣는지 확인한다.
+     - `test_node_shards_are_deterministic_disjoint_and_complete`와 `test_separate_process_random_uuid_parameters_have_exact_complete_shard_union`은 분할이 서로소이고 합이 전체가 되는지 확인한다.
    - shard 수를 바꿀 때는 실측 대기 시간과 org 동시성 한도로 다시 판단한다.
 6. **격리 해제는 opt-in으로만 한다.**
    - 테스트 간 상태 공유나 프로세스 재사용 같은 최적화는 전역에 적용하지 않는다. 먼저 순서를 섞어(shuffle) 2회 이상 실행해 상태 누수가 없는지 확인하고, 안전한 파일만 명시적으로 opt-in한다.
@@ -82,12 +88,17 @@
    - CI에 변경 감지를 도입하면 push는 `github.event.before..github.sha`로 비교하고, zero SHA·forced push·fetch 실패일 때는 전체를 실행한다.
    - PR은 merge-base 기준으로 비교한다. `git diff --name-only <base>...<head>`(세 점), 또는 PR merge ref(`refs/pull/<n>/merge`)의 merge commit에서 `HEAD^1..HEAD`를 쓴다. 두 tip을 바로 비교하는 `git diff <base>..<head>`는 base에만 있는 변경까지 포함하므로 쓰지 않는다. base를 fetch하지 못하면 전체를 실행한다.
    - 그 밖에 push나 PR head checkout에서 `HEAD^1..HEAD`처럼 마지막 commit만 보는 비교는 금지한다. 위 merge ref의 merge commit만 예외다.
+   - 위 두 항목은 정본 규칙 8을 의도적으로 구체화한 것이다. 정본의 "PR은 base..head"는 PR이 들여오는 변경(merge-base 의미)을 뜻하는 것으로 읽는다. git의 두 점 `git diff A..B`는 두 tip을 직접 비교하므로 그 뜻과 다르다. 정본이 금지한 `HEAD^1..HEAD`는 마지막 commit만 보는 비교를 뜻한다. merge ref의 merge commit에서는 첫 parent가 base tip이므로 PR 전체 변경을 비교하게 되어 금지 대상이 아니다. 두 점 diff로 되돌리지 않는다.
    - 발행 산출물(Hub image, development package)은 실제로 발행된 revision을 기준으로 판단한다.
 9. **중복 실행은 입력 동일성으로만 제거한다.**
-   - PR 테스트를 건너뛸 수 있는 경우는 같은 저장소 branch에서 온 PR이면서 merge tree가 head tree와 같을 때뿐이다. branch 이름만으로 판단하지 않는다.
+   - PR 테스트를 건너뛸 수 있으려면 세 조건을 모두 충족해야 한다.
+     - 같은 저장소 branch에서 온 PR이다.
+     - merge tree가 head tree와 같다.
+     - 그 head branch의 push로 완료된 `Test` 실행이 같은 tree를 이미 테스트했다.
+   - branch 이름만으로 판단하지 않는다. fork의 동명 branch로 우회할 수 있다.
+   - `test.yml`의 push trigger는 `main`·`dev`뿐이다. 그래서 지금 세 번째 조건을 충족할 수 있는 head branch도 이 둘뿐이다. 다른 head branch(예: `codex/oci-root-phase1`)에서는 PR 실행이 그 branch의 유일한 `Test` 실행이므로 건너뛰지 않는다.
    - fork PR과 dependabot PR은 항상 테스트한다.
    - 2026-09 실측에서 가장 큰 중복은 같은 SHA를 dev와 main에 3–6초 간격으로 push한 경우였다. 현재 형태의 push 실행 14건 중 7건이 그랬고, 매번 KVM 대기가 142–144초 생겼다. 이를 줄이는 방법(예: dev가 green이 된 뒤 main을 fast-forward)은 소유자가 결정한다.
-   - `codex/oci-root-phase1` → dev PR은 그 branch의 유일한 `Test` 실행이므로 건너뛰지 않는다.
 10. **보안: public 저장소의 `pull_request` 코드를 self-hosted runner에서 실행하지 않는다.**
     - `Test` workflow에서 self-hosted runner(`[self-hosted, linux, x64, kvm]`)를 쓰는 job은 `kvm`뿐이다. `release.yml`의 `kvm-proof`(`Required KVM clean-host proof`)도 같은 runner를 쓰지만 `v*` tag push에서만 실행된다.
     - `pull_request` 실행은 PR 쪽의 workflow 파일을 사용하므로 YAML `if:`(`vars.PALIMPSEST_KVM_ENABLED` 조건 포함)는 통제 수단이 아니다. PR이 그 조건을 지울 수 있다. runner group의 저장소 제한과 fork PR 승인 설정(`all_external_contributors`)으로 보장해야 한다.
@@ -97,15 +108,26 @@
       - 두 통제가 갖춰지기 전까지 완전한 통제는 runner를 stop·unregister하는 것뿐이다.
     - 2026-09-24 읽기 전용 조회에서 API가 나열한 `pull_request` 실행 22건은 모두 이 저장소의 branch에서 왔고, fork에서 온 실행은 나열되지 않았다. KVM runner에서 실행된 run `35600862976`(`dev`)과 `35600812317`·`35029001178`(`codex/oci-root-phase1`)도 같은 저장소 branch의 PR 실행이다.
     - 따라서 fork 코드 노출은 잠재 위험이다. `first_time_contributors`에서는 이전에 merge된 기여가 있는 외부 contributor의 fork PR이 승인 없이 persistent KVM runner에서 실행될 수 있다. 같은 저장소 PR도 `pull_request` 코드다. 현재 `kvm` job은 `pull_request`에서도 실행되므로 이 규칙의 제목을 아직 충족하지 않는다.
-    - 완화 조치는 인계 문서의 승인 대기 2번이며 소유자가 결정한다. 명시적 승인 전에는 설정을 바꾸지 않는다.
+    - 완화 조치는 [인계 문서](docs/development-handoff.md) `명시적 승인 대기 — 실행 금지` 절의 2번이며 소유자가 결정한다. 같은 문서 `CI critical-path checkpoint (2026-09-24)` 절의 승인 대기 1과 같은 항목이다. 명시적 승인 전에는 설정을 바꾸지 않는다.
     - `Required native KVM proof`가 skip을 통과로 받도록 바꾸지 않는다.
 11. **CI 형태는 계약 테스트로 고정한다.**
     - `tests/unit/test_test_lanes.py`는 다음을 검사한다.
-      - portable matrix의 shard 목록·분모·`max-parallel`·`fail-fast`와 shard 명령 문자열
+      - portable matrix 두 개의 형태
+        - job key는 정확히 `name`·`runs-on`·`strategy`·`steps`이다. job-level `if`·`env`·`defaults`·`continue-on-error`가 없어야 한다.
+        - runner(`ubuntu-latest`·`macos-15`)를 고정한다.
+        - `strategy` key는 `fail-fast`·`matrix`·`max-parallel`만 허용한다. `matrix`는 정확히 `{shard: [1..N]}`이어야 하므로 `exclude`·`include`를 쓸 수 없다.
+        - `fail-fast: false`여야 하고, `max-parallel`은 없거나 N 이상이어야 한다.
+        - step 목록 전체를 정확히 고정한다. 여기에는 action 버전과 `with`, shard 명령 문자열과 `--shard …/N` 분모가 포함된다. 따라서 step `if`·`shell`·`env`, checkout `ref`, `$GITHUB_ENV`에 쓰는 추가 step이 들어갈 수 없다.
+        - workflow-level `env`가 없어야 한다.
       - aggregator 세 개의 이름·`if: always()`·정확한 `needs`
-      - aggregator마다 하나뿐인 verdict step의 `env`(각 `needs.<dep>.result`, KVM은 `vars.PALIMPSEST_KVM_ENABLED`도)와 성공만 받는 정확한 `run` 문자열. verdict step과 aggregator job에는 `shell`·`defaults`·`continue-on-error`가, workflow에는 `defaults`가 없어야 하며, 의존 job과 그 step에도 `continue-on-error`가 없어야 한다.
+      - aggregator마다 하나뿐인 verdict step의 `env`(각 `needs.<dep>.result`, KVM은 `vars.PALIMPSEST_KVM_ENABLED`도)와 성공만 받는 정확한 `run` 문자열. verdict step과 aggregator job에는 `shell`·`defaults`·`continue-on-error`가, workflow에는 `defaults`·`env`가 없어야 한다.
+      - aggregator가 읽는 의존 job(`checks`, portable 두 개, `kvm`)의 정확한 job key 집합. `kvm`만 opt-in `if`를 가진다.
+      - `test.yml`의 모든 step에 `shell`·`continue-on-error`가 없고, step `if`는 `always()`뿐이어야 한다. `always()`는 step을 건너뛰지 않으며 upload·cleanup step이 쓴다. `kvm` proof step도 이 규칙에 들어간다.
       - 테스트 job 앞에 gate job이 없는지, aggregator 밖의 job-level `if:`가 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED == 'true'`뿐인지
-      - 모든 workflow에서 GitHub-hosted label(`ubuntu-*`·`macos-*`·`windows-*`)이 아닌 runner를 쓰는 job이 `test.yml`의 `kvm`과 `release.yml`의 `kvm-proof`뿐인지, 그리고 `release.yml`이 `v*` tag push 전용인지. `runs-on`의 문자열·목록·mapping(`group`·`labels`) 형태를 모두 검사한다.
+      - 모든 workflow에서 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job이 `test.yml`의 `kvm`과 `release.yml`의 `kvm-proof`뿐인지. self-hosted runner는 `ubuntu-kvm` 같은 임의 label을 가질 수 있으므로 prefix로는 판정하지 않는다. 새 hosted image는 허용 목록에 정확한 label로 추가한다. `runs-on`의 문자열·목록·mapping(`group`·`labels`) 형태를 모두 검사하고, `runs-on`이 없으면 비-hosted로 본다.
+      - reusable workflow를 부르는 job(`uses:`)이 하나도 없는지. `test.yml`을 부르는 job은 호출자 trigger로 self-hosted `kvm` job을 물려받기 때문이다.
+      - `test.yml`의 trigger가 정확히 `workflow_call`, `main`·`dev` push, `main`·`dev` 대상 `pull_request`인지(`pull_request_target` 없음). 또 `release.yml`이 `v*` tag push 전용인지. 규칙 10의 노출 분석은 이 trigger 집합을 전제로 한다.
+    - 고정하지 않는 것도 있다. shard job이 아닌 job(`checks`, `hub`, proof job)의 step 내용, 즉 step `env`나 `$GITHUB_ENV`에 쓰는 추가 step은 고정하지 않는다. `kvm` proof는 evidence가 없으면 upload step의 `if-no-files-found: error`로 실행 중 실패한다.
     - `tests/unit/test_oci_convert_security.py`는 `oci-fs-proof`부터 `unit-macos` 직전까지 job-level `if:`가 없는지 텍스트로 검사한다. 그러므로 이 구간의 job 순서를 바꾸지 않는다.
     - `tests/unit/test_development_package_workflow.py`는 development-package의 trigger·concurrency·step을 고정한다.
     - 새 CI 불변식은 새 파일을 만들기보다 이 파일들을 확장한다. 새 test 파일은 `scripts/test_lanes.py`에 분류해야 하기 때문이다.
@@ -113,6 +135,6 @@
     - CI를 바꾸는 변경에는 전후 실측을 첨부한다.
     - 다음 중 하나라도 해당하면 1번 절차로 다시 측정하고 가장 늦게 끝나는 job부터 개선한다.
       - `Test` 크리티컬 패스 중앙값이 마지막으로 기록된 기준보다 20% 이상 나빠진다.
-      - portable node 수가 크게 늘어난다. 기준은 `60fa42f`의 CI run `35826465548` "Lane shard" 줄의 선택 node 합계 6,081이다(Linux 6 shard와 macOS 4 shard 합계가 같다; pass 수가 아니다). 그 뒤 CI 형태 계약이 node를 더했다. 로컬 기준으로 `2e37538`은 6,084, review 1차 반영 뒤는 6,088(`--collect-only`)이다.
+      - portable node 수가 크게 늘어난다. 기준은 `60fa42f`의 CI run `35826465548` "Lane shard" 줄의 선택 node 합계 6,081이다(Linux 6 shard와 macOS 4 shard 합계가 같다; pass 수가 아니다). 그 뒤 CI 형태 계약이 node를 더했다. 로컬 기준으로 `2e37538`은 6,084, review 1차 반영 뒤는 6,088, review 2차 반영 뒤는 6,089(`--collect-only`)이다.
       - 새 테스트 계층이나 job을 추가한다.
     - `.github/**`와 `AGENTS.md`는 architecture digest 범위에 들어간다. 이 파일을 바꾸면 Maintenance summary를 갱신하고 `--stamp`와 `--staged` 검사를 거친다.

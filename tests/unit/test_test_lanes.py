@@ -2,7 +2,6 @@
 
 import importlib.util
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -339,26 +338,44 @@ def _test_workflow_jobs():
     return _load_workflow(_TEST_WORKFLOW)["jobs"]
 
 
+_SHARD_SETUP_STEPS = [
+    {"uses": "actions/checkout@v4"},
+    {"uses": "astral-sh/setup-uv@v6"},
+    {"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
+    {"run": "uv sync --frozen --extra dev"},
+]
+_IMPORT_SMOKE = {"run": 'uv run python -c "import palimpsest_local; import palimpsest_local.cli"'}
+
+
 @pytest.mark.parametrize(
-    ("job_id", "count", "aggregator", "check_name"),
+    ("job_id", "count", "runner", "extra_steps", "aggregator", "check_name"),
     [
-        ("portable-linux", 6, "pure", "Pure contracts (Python 3.12)"),
-        ("portable-macos", 4, "unit-macos", "Unit tests (macOS 15)"),
+        ("portable-linux", 6, "ubuntu-latest", [], "pure", "Pure contracts (Python 3.12)"),
+        ("portable-macos", 4, "macos-15", [_IMPORT_SMOKE], "unit-macos", "Unit tests (macOS 15)"),
     ],
 )
-def test_ci_portable_matrix_runs_every_shard_in_one_wave(job_id, count, aggregator, check_name):
-    jobs = _test_workflow_jobs()
-    strategy = jobs[job_id]["strategy"]
-    assert strategy["matrix"]["shard"] == list(range(1, count + 1))
+def test_ci_portable_matrix_runs_every_shard_in_one_wave(job_id, count, runner, extra_steps, aggregator, check_name):
+    workflow = _load_workflow(_TEST_WORKFLOW)
+    jobs = workflow["jobs"]
+    job = jobs[job_id]
+    # No job-level `if`/`env`/`defaults`/`continue-on-error`/`container`: each could make a
+    # shard report success without running its nodes, and the aggregator reads only results.
+    assert set(job) == {"name", "runs-on", "strategy", "steps"}
+    assert job["runs-on"] == runner
+    assert "env" not in workflow  # e.g. PYTEST_ADDOPTS=--collect-only for every shard.
+    strategy = job["strategy"]
+    assert set(strategy) <= {"fail-fast", "matrix", "max-parallel"}
+    # Exactly the shard axis: an `exclude`/`include` would drop or add a shard silently.
+    assert strategy["matrix"] == {"shard": list(range(1, count + 1))}
     assert strategy["fail-fast"] is False
     # A cap below the shard count queues a second wave onto the critical path.
     assert strategy.get("max-parallel", count) >= count
-    (command,) = (step["run"] for step in jobs[job_id]["steps"] if "test_lanes.py run portable" in step.get("run", ""))
-    shard = re.fullmatch(
-        r"uv run python scripts/test_lanes\.py run portable --shard \$\{\{ matrix\.shard \}\}/(\d+)", command
-    )
-    assert shard and int(shard.group(1)) == count, command
-    assert jobs[job_id]["name"].endswith(f"/{count})")
+    # Exact steps: no step `if`/`shell`/`env`/`continue-on-error`, no checkout `ref`, and no
+    # extra step (a `$GITHUB_ENV` write reaches the shard command). The runner is called
+    # directly with the matrix value; no wrapper can drop `--shard`.
+    command = f"uv run python scripts/test_lanes.py run portable --shard ${{{{ matrix.shard }}}}/{count}"
+    assert job["steps"] == [*_SHARD_SETUP_STEPS, *extra_steps, {"run": command}]
+    assert job["name"].endswith(f"/{count})")
     gate = jobs[aggregator]
     assert gate["name"] == check_name
     assert gate["if"] == "always()"
@@ -410,12 +427,24 @@ def test_ci_test_jobs_start_without_a_gate_job_in_front():
     assert conditional == {"kvm": "vars.PALIMPSEST_KVM_ENABLED == 'true'"}
 
 
+# Exact job-level keys of every job an aggregator reads. A job-level `env` (PYTEST_ADDOPTS),
+# `defaults.run.shell`, `if` or `continue-on-error` could turn its result into a success
+# without running its checks; only `kvm` carries its opt-in `if`.
+_DEPENDENCY_JOB_KEYS = {
+    "checks": {"name", "runs-on", "steps"},
+    "portable-linux": {"name", "runs-on", "strategy", "steps"},
+    "portable-macos": {"name", "runs-on", "strategy", "steps"},
+    "kvm": {"name", "if", "runs-on", "steps"},
+}
+
+
 @pytest.mark.parametrize("job_id", sorted(_AGGREGATOR_VERDICTS))
 def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
     workflow = _load_workflow(_TEST_WORKFLOW)
     needs, env, script = _AGGREGATOR_VERDICTS[job_id]
     job = workflow["jobs"][job_id]
     assert "defaults" not in workflow
+    assert "env" not in workflow
     assert set(job) == {"name", "if", "needs", "runs-on", "steps"}
     assert job["needs"] == needs
     (step,) = job["steps"]
@@ -423,36 +452,63 @@ def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
     assert step["env"] == env
     assert step["run"] == script
     for dependency in needs:
-        assert "continue-on-error" not in workflow["jobs"][dependency]
-        assert all(
-            "continue-on-error" not in dependency_step for dependency_step in workflow["jobs"][dependency]["steps"]
-        )
+        assert set(workflow["jobs"][dependency]) == _DEPENDENCY_JOB_KEYS[dependency], dependency
 
 
-# GitHub-hosted image labels. Anything else (a custom label such as `kvm`, `self-hosted`, an
-# expression, or a runner `group`) can route a job onto a persistent host.
-_HOSTED_RUNNER_LABEL = re.compile(r"(ubuntu|macos|windows)-[0-9a-z][0-9a-z.-]*")
+def test_ci_test_steps_cannot_be_skipped_or_neutered():
+    # A step `if` other than `always()` (e.g. `github.event_name == 'push'`), a `shell` such as
+    # `true {0}`, or `continue-on-error` lets a job succeed without running that step. `always()`
+    # never skips a step; it is the upload/cleanup form used by the proof jobs.
+    for job_id, job in _test_workflow_jobs().items():
+        for step in job["steps"]:
+            assert "shell" not in step and "continue-on-error" not in step, (job_id, step)
+            assert step.get("if", "always()") == "always()", (job_id, step)
+
+
+# The exact GitHub-hosted image labels this repository uses. A self-hosted runner can carry
+# any custom label (`ubuntu-kvm` included), so a prefix pattern is not a hosted check. Anything
+# else (a custom label, `self-hosted`, an expression, or a runner `group`) may route a job onto
+# a persistent host. Adopt a new hosted image by adding its exact label here.
+_HOSTED_RUNNER_LABELS = {"ubuntu-latest", "ubuntu-24.04", "macos-15"}
 _NON_HOSTED_ALLOWLIST = {"test.yml": {"kvm"}, "release.yml": {"kvm-proof"}}
 
 
 def _runner_target(runs_on):
     """Return ``(group, labels)`` for the string, list and mapping forms of ``runs-on``."""
+    if runs_on is None:
+        return None, []
     group, labels = (runs_on.get("group"), runs_on.get("labels", [])) if isinstance(runs_on, dict) else (None, runs_on)
     return group, [labels] if isinstance(labels, str) else list(labels)
 
 
 def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
-    non_hosted = {}
+    non_hosted, callers = {}, {}
     for path in sorted(_WORKFLOWS.glob("*.y*ml")):
         for job_id, job in _load_workflow(path)["jobs"].items():
-            group, labels = _runner_target(job["runs-on"])
-            if group is not None or not labels or not all(_HOSTED_RUNNER_LABEL.fullmatch(str(x)) for x in labels):
+            if "uses" in job:
+                callers[f"{path.name}:{job_id}"] = job["uses"]
+                continue
+            group, labels = _runner_target(job.get("runs-on"))
+            if group is not None or not labels or not set(map(str, labels)) <= _HOSTED_RUNNER_LABELS:
                 non_hosted.setdefault(path.name, set()).add(job_id)
+    # A reusable-workflow caller has no `runs-on` of its own; the called workflow picks the
+    # runner under the caller's triggers. A caller of test.yml would inherit the self-hosted
+    # `kvm` job, so none is allowed until its triggers are pinned here as well.
+    assert callers == {}, (
+        "reusable-workflow caller found; a caller of test.yml would inherit the self-hosted kvm job",
+        callers,
+    )
     # This pins the workflow shape only. It does not keep pull_request code off the runner:
     # a pull_request run uses the PR's own workflow file, so repository settings must do that.
     assert non_hosted == _NON_HOSTED_ALLOWLIST
+    # The kvm exposure analysis in AGENTS.md rule 10 assumes exactly these triggers: no
+    # `pull_request_target`, no extra branches. PyYAML (YAML 1.1) reads the `on:` key as True.
+    assert _load_workflow(_TEST_WORKFLOW)[True] == {
+        "workflow_call": None,
+        "push": {"branches": ["main", "dev"]},
+        "pull_request": {"branches": ["main", "dev"]},
+    }
     # release.yml's kvm-proof has no pull_request exposure only while it is tag-push only.
-    # PyYAML (YAML 1.1) reads the `on:` key as True.
     assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["v*"]}}
 
 

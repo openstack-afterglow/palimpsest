@@ -199,26 +199,73 @@ wave.
   before treating this as achieved.
 - **Shared capacity.** The matrices still draw on the organization's Free-plan
   pool of 20 hosted jobs and 5 macOS jobs, shared with sibling repositories.
-  Same-SHA dev and main pushes therefore still queue behind each other,
-  especially on the single KVM runner.
+  The following counts come from the workflow definitions, not from
+  measurement:
+  - a `Test` run starts 15 hosted jobs, 4 of them macOS; the 3 aggregates
+    start later, so a run uses 18 hosted jobs in total (`kvm` is self-hosted);
+  - a `main`/`dev` push also starts `hub-docker.yml` `test` and
+    `development-package.yml` `verify`, so 17 hosted jobs start at once;
+  - a PR also starts `hub-docker.yml` `test`, so 16 start at once.
+
+  Same-SHA dev and main pushes (17 + 17 jobs, 4 + 4 macOS) therefore still
+  queue behind each other, especially on the single KVM runner.
 - **Contract test.** `tests/unit/test_test_lanes.py` pins:
-  - the shard lists, the exact shard command and its `--shard N/M`
-    denominator;
-  - that `max-parallel` is absent or at least the shard count;
+  - each portable matrix job exactly:
+    - its job keys are `name`, `runs-on`, `strategy` and `steps`, so there is
+      no job-level `if`, `env`, `defaults` or `continue-on-error`;
+    - its runner is `ubuntu-latest` or `macos-15`;
+    - `strategy` has only `fail-fast`, `matrix` and `max-parallel`, and
+      `matrix` is exactly `{shard: [1..N]}`, so no `exclude` or `include`;
+    - `fail-fast` is false and `max-parallel` is absent or at least N;
+    - the whole step list is pinned, including action versions, `with`, and
+      the shard command with its `--shard N/M` denominator. No step `if`,
+      `shell` or `env`, no checkout `ref`, and no extra step (a `$GITHUB_ENV`
+      write, for example) can be added;
+  - that `test.yml` sets no workflow-level `env` or `defaults`;
   - the aggregate check names, `if: always()` and their exact `needs`;
   - each aggregate's single verdict step: its `env` maps every dependency to
-    `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), its
-    `run` is the exact success-only script; neither the step nor its job
-    sets `shell`, `defaults` or `continue-on-error`, the workflow has no
-    `defaults`, and no dependency job or step sets `continue-on-error`;
+    `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), and
+    its `run` is the exact success-only script; neither the step nor its job
+    sets `shell`, `defaults` or `continue-on-error`;
+  - the exact job keys of every job an aggregate reads (`checks`, both
+    portable matrices and `kvm`; only `kvm` has its opt-in `if`);
+  - that no step in `test.yml` sets `shell` or `continue-on-error`, and that
+    the only step-level `if` is `always()`, which never skips a step and is
+    used by upload and cleanup steps. The `kvm` proof step is covered too;
   - that no gate job sits in front of the test jobs, and that the only
     job-level `if:` outside the aggregates is the `kvm` opt-in variable;
   - that across all workflows the only jobs whose `runs-on` (string, list or
-    `group`/`labels` mapping) is not a GitHub-hosted `ubuntu-*`, `macos-*` or
-    `windows-*` label are `kvm` in `test.yml` and `kvm-proof` in
-    `release.yml`, and that `release.yml` runs only on `v*` tag pushes.
+    `group`/`labels` mapping; a missing `runs-on` counts as non-hosted) is
+    not in the exact hosted label list `ubuntu-latest`, `ubuntu-24.04`,
+    `macos-15` are `kvm` in `test.yml` and `kvm-proof` in `release.yml`. A
+    self-hosted runner can carry any label, `ubuntu-kvm` included, so a
+    prefix pattern is not a hosted check; adopt a new hosted image by adding
+    its exact label;
+  - that no job calls a reusable workflow (`uses:`). A caller of `test.yml`
+    would inherit the self-hosted `kvm` job under the caller's triggers;
+  - the exact `test.yml` triggers (`workflow_call`, and `push` and
+    `pull_request` for `main`/`dev`, with no `pull_request_target`), and that
+    `release.yml` runs only on `v*` tag pushes.
+
   These pin the workflow shape only. Keeping `pull_request` code off the
-  self-hosted runner is a repository-settings control, not a YAML one.
+  self-hosted runner is a repository-settings control, not a YAML one. Step
+  contents of the non-matrix jobs (`checks`, `hub` and the proof jobs), such
+  as a step `env` or an extra `$GITHUB_ENV` step, are not pinned. The `kvm`
+  proof fails at run time if no evidence file exists, because its upload
+  step sets `if-no-files-found: error`.
+- **Shard counts.** Each shard prints a `Lane shard` count line, but CI only
+  prints it and does not check it. Three cases fail at run time:
+  - an empty shard exits 5;
+  - a collection error exits 2;
+  - `--test-lane-shard` passed without the plugin is a usage error (exit 4).
+
+  Per-shard counts, and whether the shards add up to the portable total, are
+  guaranteed by contract instead: the pinned shard command, the `commands()`
+  argv test, and the disjoint-and-complete assignment tests. This is a
+  documented deviation from the shared CI rule 5 (see AGENTS.md), which asks
+  CI to verify per-shard counts. A `--shard` dropped before `test_lanes.py`
+  would run the full suite in every shard, and only the pinned command string
+  guards against it.
 - **Rules for future CI changes.** Measurement and change rules are in the
   `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
 
