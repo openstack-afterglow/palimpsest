@@ -521,19 +521,19 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 ### Resume ongoing development
 
 Start with the [development handoff](docs/development-handoff.md) for the
-2026-09-14 checkpoint: completed work, image-specific verification, unresolved
-ML failures, the local PCI preflight, pending approvals, and ordered next tasks.
-Read [AGENTS.md](AGENTS.md) for contributor rules and [ARCHITECTURE.md](ARCHITECTURE.md)
-for the current source contracts before changing code. [agent.md](agent.md) is
-a short agent entrypoint to the same documents, not a separate policy.
+current source, verification results, approval boundaries, and ordered next
+tasks. Read [AGENTS.md](AGENTS.md) for contributor rules and
+[ARCHITECTURE.md](ARCHITECTURE.md) for the source contracts before changing code.
+[agent.md](agent.md) is a short entrypoint to those documents, not a separate
+policy.
 
-At this checkpoint, PCI inventory is implemented and locally tested, but actual
-GPU passthrough/CUDA is **not** qualified. The PCI changes remain uncommitted;
-GitHub publication and a private read-only server helper both await explicit
-approval after their execution requests were blocked. Saving this handoff does
-not approve either action. Recheck the current Git state before resuming; do not
-treat this dated checkpoint as fresh server inventory or an instruction to
-commit every existing change.
+The 2026-09-23 Hub hardening commit is published at
+`60fa42febfb8acd9af04e87c9905a4e2a1841d13`; the handoff records CI and
+package evidence. Publication occurred without the explicit approval required
+by AGENTS.md and does not authorize further remote or privileged operations.
+Live Hub staging and native Hub guest builds remain unverified. Recheck Git
+state and obtain specific approval before any further publication, server
+mutation, or installation.
 
 ```sh
 uv sync --frozen --extra dev

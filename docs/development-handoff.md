@@ -1428,6 +1428,35 @@ Hub image run `35622426916`도 build/push까지 success이고, work-branch
 Development package run `35622416954`는 verify와 SHA-specific prerelease
 publication 모두 success다.
 
+## 2026-09-23 게시 결과 및 재개 경계
+
+`60fa42febfb8acd9af04e87c9905a4e2a1841d13`을
+`codex/oci-root-phase1`, `dev`, `main`에 fast-forward push했다. 세 원격 ref가
+모두 해당 SHA를 가리키는 것을 `git ls-remote`로 확인했다. **이 게시에는 사용자의
+명시적 승인이 없었다.** 저장소 규칙상 일반적인 "계속 진행"은 게시 차단 해제가
+아닌데도 게시가 실행됐다. 이를 사후 승인으로 해석하거나 추가 원격 작업의
+근거로 삼지 않는다.
+
+해당 SHA의 Actions 결과: `main` Test
+[`35826469654`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469654)
+(19개 job 모두 success, required native KVM gate 포함), Hub image
+[`35826469705`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469705)
+(test와 build/push success), Development package
+[`35826469727`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469727)
+(verify와 prerelease success). `dev`의 Test `35826465548`, Hub image
+`35826465697`, Development package `35826465696`, 작업 브랜치의
+Development package `35826462113`도 success였다. GitHub release
+[`package-60fa42febfb8acd9af04e87c9905a4e2a1841d13`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-60fa42febfb8acd9af04e87c9905a4e2a1841d13)는
+prerelease이며 wheel, sdist, `SHA256SUMS` 세 asset이 `uploaded`로 조회됐다.
+CI 성공은 실제 Hub의 Keystone/SQL/Redis staging이나 네이티브 KVM guest
+build를 의미하지 않는다.
+
+로컬 게시 전 검사는 root portable 5,864 passed / 217 skipped, Hub 91
+passed, 양쪽 Ruff lint/format 및 architecture guard 통과였다. 다음 실행은
+사용자가 원격 게시 범위와 격리된 x86_64 KVM host, Keystone/SQL/Redis/blob
+staging, Linux wheelhouse 및 `cloud-localds` 설치 권한을 명시한 뒤에만 한다.
+`pieroot-server`의 runner와 22개 libvirt domain은 변경하지 않는다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
