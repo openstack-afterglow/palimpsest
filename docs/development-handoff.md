@@ -1428,9 +1428,9 @@ Hub image run `35622426916`도 build/push까지 success이고, work-branch
 Development package run `35622416954`는 verify와 SHA-specific prerelease
 publication 모두 success다.
 
-### CI critical-path checkpoint (2026-09-24; local only, not pushed)
+### CI critical-path checkpoint (2026-09-24)
 
-기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit으로 남겼다. push·PR·저장소 설정 변경은 하지 않았다.
+기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.
 
 **변경 내용**
 
@@ -1471,11 +1471,41 @@ publication 모두 success다.
 - Docker가 필요한 gate: BuildKit named OCI context, guest stage-1 binary, workload proof ELF 재현, Hub Docker image build. 이후 별도로 순차 실행할 예정이다.
 - 권한이 필요한 OCI filesystem proof, native KVM, GitHub 실행.
 
-**독립 검토.** AGENTS.md가 요구하는 독립 검토는 이 subagent 안에서 받을 수 없어 미충족이다. 조용히 대체하지 않고 제약으로 보고한다.
+**독립 검토 1차(2026-09-24).** `2e37538`에 대한 독립 검토가 medium 2건과 low 7건을 지적했다. 후속 commit `fix: address CI review round 1`에서 모두 반영했으며, 반영분에 대한 재검토는 아직 받지 않았다.
+
+- **KVM runner 노출 근거 정정(medium).** 처음에 "공개 PR 코드가 KVM runner에서 실행됐다"고 인용한 run 세 건은 모두 같은 저장소 branch에서 온 PR 실행이었다(`35600862976`은 `dev`, `35600812317`·`35029001178`은 `codex/oci-root-phase1`; `head_repository = openstack-afterglow/palimpsest`). 2026-09-24 읽기 전용 조회에서 API가 나열한 `pull_request` 실행 22건 중 fork에서 온 실행은 없었다. 위험은 잠재적이다. 아래 승인 대기 1을 그렇게 고쳐 적었다.
+- **aggregator 판정 계약(medium).** 처음 계약은 aggregator의 이름·`if: always()`·`needs` 포함 여부만 봤다. 그래서 verdict를 `true`로 바꾸거나 KVM skip을 받는 변형이 통과했다. 이제 다음을 고정한다.
+  - 정확한 `needs`
+  - 단일 verdict step의 `env`와 성공만 받는 `run` 문자열
+  - `shell`·`defaults`·`continue-on-error`의 부재
+  - aggregator 밖 job-level `if:`가 `kvm`의 변수 조건뿐인지
+- **runner 판정(low).** `runs-on`의 mapping(`group`·`labels`) 형태까지 정규화한다. 범위를 모든 workflow로 넓히고 allowlist를 `test.yml`의 `kvm`과 `release.yml`의 `kvm-proof`로 두었다. `release.yml`이 `v*` tag push 전용인지도 고정한다.
+- **규정 문구(low).** 다섯 가지를 고쳤다.
+  - AGENTS.md 규칙 10을 `Test` workflow 범위로 한정했다.
+  - runner group 제한은 저장소 수준 runner에는 쓸 수 없다고 적었다. `pieroot-server-palimpsest-kvm`은 저장소 수준 runner이고, org plan은 `free`이며, runner-group API는 403이었다.
+  - 규칙 8의 PR diff를 merge-base(세 점) 기준으로 바꿨다.
+  - 규칙 5의 wrapper 문장을 고쳤다.
+  - 규칙 12의 node 수 기준에 출처를 붙였다.
+- **node 수 기준.** 6,081은 `60fa42f`의 CI run `35826465548`에서 "Lane shard" 줄의 선택 node를 더한 값이다. Linux 6 shard와 macOS 4 shard의 합계가 같으며, pass 수가 아니다. 6,084는 `2e37538`의 로컬 순차 6 shard 합계이고, 계약 3 node를 더한 값이다.
+- **변형 검사.** 임시 workflow 변형 14가지를 새 계약이 모두 잡았고, 끝난 뒤 `.github/`를 원복했다. 변형은 다음과 같다.
+  - `pure`·`unit-macos` verdict를 `true`로 바꾸기, `pure`에 `|| true` 붙이기
+  - KVM verdict를 `!= "failure"`로 바꾸기
+  - `pure`의 `needs`에서 `checks` 빼기
+  - KVM step에 `shell: bash {0}` 넣기, KVM env에서 `PALIMPSEST_KVM_ENABLED` 빼기, workflow `defaults.run.shell` 넣기
+  - `portable-linux`에 `continue-on-error`나 job-level `if:` 넣기
+  - `runs-on: {group: kvm-group}`, `runs-on: kvm`, 다른 workflow에 self-hosted job 넣기
+  - `release.yml`에 `pull_request` trigger 넣기
+- **반영 뒤 검사.** 모두 local macOS에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 136 passed.
+  - `run core-cli qualification`: 1,435 node, 1,428 passed, 7 skipped.
+  - portable `--collect-only`: 6,088 node.
+  - `actionlint`(`test.yml`, `release.yml`): 기존 custom label `kvm` 경고 2건만 있었다. workflow 파일은 바꾸지 않았다.
+  - 전체 portable 6 shard는 다시 실행하지 않았다. 바뀐 test 파일은 `core-cli` lane 하나뿐이다.
 
 **승인 대기·소유자 결정.** 구현하지 않았고 설정도 바꾸지 않았다.
 
-1. 공개 PR 코드가 self-hosted KVM runner `pieroot-server-palimpsest-kvm`에서 실행되었다(run `35600862976`, `35600812317`, `35029001178`). 승인 정책은 `first_time_contributors`다. 위 승인 대기 2번과 같은 항목이며 YAML `if:`로는 해결되지 않는다.
+1. self-hosted KVM runner `pieroot-server-palimpsest-kvm`의 잠재 노출이다. 위에 인용한 run 세 건은 모두 같은 저장소의 trusted branch에서 온 PR 실행이다. 그러나 승인 정책이 `first_time_contributors`이므로, 이전에 merge된 기여가 있는 외부 contributor의 fork PR은 승인 없이 이 persistent runner에서 실행될 수 있다. `kvm` job에는 event 제한이 없고 같은 저장소 PR에서도 실행된다. 위 승인 대기 2번과 같은 항목이며 YAML `if:`로는 해결되지 않는다. 지금 쓸 수 있는 통제는 `all_external_contributors` 정책과 runner stop·unregister다. runner group 제한을 쓰려면 먼저 runner를 org runner group으로 옮겨야 한다.
 2. 같은 SHA를 dev와 main에 3–6초 간격으로 push하는 문제다. 현재 형태 push 실행 14건 중 7건이 이 경우였고, 매번 KVM 대기 142–144초가 생겼다. dev가 green이 된 뒤 main을 fast-forward하는 방식 등으로 줄일 수 있다.
 3. 다음 항목은 근거 부족이나 순이득 부족으로 보류했다.
    - pytest-xdist 도입: hermeticity가 미증명이고 "Lane shard" 증거 줄이 사라진다.
@@ -1484,9 +1514,10 @@ publication 모두 success다.
 
 **다음 작업**
 
-1. 승인된 경우에만 push한다.
-2. push 뒤 `Test` 20회 이상의 크리티컬 패스 중앙값·p90을 재측정해 이 절과 AGENTS.md 기준을 갱신한다.
-3. 위 승인 대기 1·2의 결정을 받는다.
+1. review 1차 반영분의 독립 재검토를 받는다.
+2. 승인된 경우에만 push하고, 이 절 첫 문단에 push한 SHA를 적는다.
+3. push 뒤 `Test` 20회 이상의 크리티컬 패스 중앙값·p90을 재측정해 이 절과 AGENTS.md 기준을 갱신한다.
+4. 위 승인 대기 1·2의 결정을 받는다.
 
 ## 빠른 링크 맵
 

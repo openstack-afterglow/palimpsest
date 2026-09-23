@@ -12,7 +12,8 @@ import pytest
 import yaml
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/test_lanes.py"
-_TEST_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/test.yml"
+_WORKFLOWS = Path(__file__).resolve().parents[2] / ".github/workflows"
+_TEST_WORKFLOW = _WORKFLOWS / "test.yml"
 _SPEC = importlib.util.spec_from_file_location("palimpsest_test_lanes", _SCRIPT)
 lanes = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = lanes
@@ -330,8 +331,12 @@ def test_portable_command_shards_nodes_without_special_selectors_or_environment_
         lanes.commands(("native-live",), "1/2")
 
 
+def _load_workflow(path):
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def _test_workflow_jobs():
-    return yaml.safe_load(_TEST_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+    return _load_workflow(_TEST_WORKFLOW)["jobs"]
 
 
 @pytest.mark.parametrize(
@@ -360,19 +365,95 @@ def test_ci_portable_matrix_runs_every_shard_in_one_wave(job_id, count, aggregat
     assert job_id in gate["needs"]
 
 
+_AGGREGATORS = {
+    "pure": "Pure contracts (Python 3.12)",
+    "unit-macos": "Unit tests (macOS 15)",
+    "kvm-required": "Required native KVM proof",
+}
+
+# An `if: always()` aggregator is fail-closed only while its single verdict step names every
+# dependency, reads each exact result and accepts nothing but success. The two-line KVM script
+# also relies on the default `bash -e` shell, so no `shell`, `defaults` or `continue-on-error`.
+_AGGREGATOR_VERDICTS = {
+    "pure": (
+        ["checks", "portable-linux"],
+        {
+            "CHECKS_RESULT": "${{ needs.checks.result }}",
+            "PORTABLE_RESULT": "${{ needs.portable-linux.result }}",
+        },
+        'test "$CHECKS_RESULT" = success && test "$PORTABLE_RESULT" = success',
+    ),
+    "unit-macos": (
+        ["portable-macos"],
+        {"PORTABLE_RESULT": "${{ needs.portable-macos.result }}"},
+        'test "$PORTABLE_RESULT" = success',
+    ),
+    "kvm-required": (
+        ["kvm"],
+        {
+            "PALIMPSEST_KVM_ENABLED": "${{ vars.PALIMPSEST_KVM_ENABLED }}",
+            "PALIMPSEST_KVM_RESULT": "${{ needs.kvm.result }}",
+        },
+        'test "$PALIMPSEST_KVM_ENABLED" = "true"\ntest "$PALIMPSEST_KVM_RESULT" = "success"\n',
+    ),
+}
+
+
 def test_ci_test_jobs_start_without_a_gate_job_in_front():
     jobs = _test_workflow_jobs()
-    aggregators = {
-        "pure": "Pure contracts (Python 3.12)",
-        "unit-macos": "Unit tests (macOS 15)",
-        "kvm-required": "Required native KVM proof",
-    }
-    assert {job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in aggregators} == {}
-    assert {job_id: jobs[job_id]["name"] for job_id in aggregators} == aggregators
-    assert all(jobs[job_id]["if"] == "always()" for job_id in aggregators)
-    # Only the native proof may target the self-hosted runner. This pins the shape; it
-    # does not by itself keep pull_request code off that runner (repository settings do).
-    assert [job_id for job_id, job in jobs.items() if "self-hosted" in job["runs-on"]] == ["kvm"]
+    assert {job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in _AGGREGATORS} == {}
+    assert {job_id: jobs[job_id]["name"] for job_id in _AGGREGATORS} == _AGGREGATORS
+    assert all(jobs[job_id]["if"] == "always()" for job_id in _AGGREGATORS)
+    # Only the opt-in native proof may be conditional; any other job-level `if:` could skip a
+    # shard or gate that an aggregator then reads as its dependency result.
+    conditional = {job_id: job["if"] for job_id, job in jobs.items() if "if" in job and job_id not in _AGGREGATORS}
+    assert conditional == {"kvm": "vars.PALIMPSEST_KVM_ENABLED == 'true'"}
+
+
+@pytest.mark.parametrize("job_id", sorted(_AGGREGATOR_VERDICTS))
+def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
+    workflow = _load_workflow(_TEST_WORKFLOW)
+    needs, env, script = _AGGREGATOR_VERDICTS[job_id]
+    job = workflow["jobs"][job_id]
+    assert "defaults" not in workflow
+    assert set(job) == {"name", "if", "needs", "runs-on", "steps"}
+    assert job["needs"] == needs
+    (step,) = job["steps"]
+    assert set(step) == {"name", "env", "run"}
+    assert step["env"] == env
+    assert step["run"] == script
+    for dependency in needs:
+        assert "continue-on-error" not in workflow["jobs"][dependency]
+        assert all(
+            "continue-on-error" not in dependency_step for dependency_step in workflow["jobs"][dependency]["steps"]
+        )
+
+
+# GitHub-hosted image labels. Anything else (a custom label such as `kvm`, `self-hosted`, an
+# expression, or a runner `group`) can route a job onto a persistent host.
+_HOSTED_RUNNER_LABEL = re.compile(r"(ubuntu|macos|windows)-[0-9a-z][0-9a-z.-]*")
+_NON_HOSTED_ALLOWLIST = {"test.yml": {"kvm"}, "release.yml": {"kvm-proof"}}
+
+
+def _runner_target(runs_on):
+    """Return ``(group, labels)`` for the string, list and mapping forms of ``runs-on``."""
+    group, labels = (runs_on.get("group"), runs_on.get("labels", [])) if isinstance(runs_on, dict) else (None, runs_on)
+    return group, [labels] if isinstance(labels, str) else list(labels)
+
+
+def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
+    non_hosted = {}
+    for path in sorted(_WORKFLOWS.glob("*.y*ml")):
+        for job_id, job in _load_workflow(path)["jobs"].items():
+            group, labels = _runner_target(job["runs-on"])
+            if group is not None or not labels or not all(_HOSTED_RUNNER_LABEL.fullmatch(str(x)) for x in labels):
+                non_hosted.setdefault(path.name, set()).add(job_id)
+    # This pins the workflow shape only. It does not keep pull_request code off the runner:
+    # a pull_request run uses the PR's own workflow file, so repository settings must do that.
+    assert non_hosted == _NON_HOSTED_ALLOWLIST
+    # release.yml's kvm-proof has no pull_request exposure only while it is tag-push only.
+    # PyYAML (YAML 1.1) reads the `on:` key as True.
+    assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["v*"]}}
 
 
 @pytest.mark.parametrize(

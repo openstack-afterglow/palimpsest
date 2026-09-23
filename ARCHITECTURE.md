@@ -576,9 +576,9 @@ Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않
 GitHub `Test` workflow는 Linux portable 6 shard와 macOS portable 4 shard를 `max-parallel` 없이 한 wave로 실행한다. 이 형태는 `tests/unit/test_test_lanes.py`가 고정한다.
 
 - shard 목록과 `--shard N/M` 분모는 일치해야 한다.
-- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다.
+- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다.
 - 테스트 job 앞에는 gate job이 없다.
-- self-hosted runner를 쓰는 job은 `kvm`뿐이다.
+- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 GitHub-hosted가 아닌 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. 이 계약은 workflow 형태만 고정한다. `pull_request` 코드를 이 runner에서 떼어 놓는 일은 저장소 설정이 맡는다.
 
 CI 변경의 측정·변경 규칙은 [`AGENTS.md`](AGENTS.md)의 `CI 파이프라인 성능 규정`이 정본이다. 크리티컬 패스 기대치는 push 뒤 실측 전까지 추정이다.
 
@@ -718,15 +718,23 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 - **기대 효과.** dev/PR 약 155–170초는 추정이며 push 뒤 재측정해야 한다.
 - **추가한 계약.** `test_test_lanes.py`에 계약 두 개를 추가했다. 하나는 shard 목록·분모·`max-parallel`·aggregator를 고정하고, 다른 하나는 gate job이 앞에 없는지와 self-hosted job의 집합을 고정한다.
 - **추가한 규정.** `AGENTS.md`에 12개 CI 성능 규정을 추가했다.
-- **소유자 결정으로 남긴 것.** 공개 PR 코드가 self-hosted KVM runner에서 실행되는 문제(fork 승인 정책·runner 제한)와 같은 SHA의 dev/main 이중 push 중복은 저장소 설정·운영 절차의 문제이며 이 변경에 포함하지 않았다. 이 둘은 인계 문서의 승인 대기 항목으로 남긴다.
+- **소유자 결정으로 남긴 것.** 두 가지이며 모두 저장소 설정·운영 절차의 문제라 이 변경에 포함하지 않았다. 인계 문서의 승인 대기 항목으로 남긴다.
+  - self-hosted KVM runner의 잠재 노출. KVM runner에서 실행된 것으로 인용한 PR run 세 건은 모두 같은 저장소 branch(`dev`, `codex/oci-root-phase1`)의 실행이었다. `first_time_contributors` 정책에서는 이전에 merge된 기여가 있는 외부 contributor의 fork PR이 승인 없이 이 runner에서 실행될 수 있다.
+  - 같은 SHA의 dev/main 이중 push 중복.
+
+2026-09-24 CI review round 1: 독립 검토가 `ci-perf`의 CI 형태 계약과 규정 문구에서 medium 2건·low 7건을 지적했고, 이를 반영했다. `.github/workflows/test.yml`·`release.yml`과 나머지 workflow, `scripts/check_architecture.py`의 digest 범위, `tests/unit/test_test_lanes.py`를 다시 읽었다.
+
+- **workflow는 바꾸지 않았다.** production/runtime·package·Hub에도 구조 영향이 없다.
+- **계약 강화.** `test_test_lanes.py`가 aggregator의 정확한 `needs`와 성공만 받는 verdict step, job-level `if:` 집합, 모든 workflow의 비-hosted runner 집합(`runs-on` mapping 형태 포함)과 `release.yml`의 tag-push trigger를 고정한다. 임시 workflow 변형 14가지를 모두 잡는 것을 확인했다.
+- **사실 정정.** KVM runner에서 실행된 PR run으로 인용한 세 건은 같은 저장소 branch의 실행이었다. fork 코드 노출은 잠재 위험으로 고쳐 적었다. runner group 제한은 저장소 수준 runner에는 쓸 수 없다는 점, PR diff의 merge-base 기준, node 수 기준의 출처(`60fa42f` CI `Lane shard` 합계 6,081)도 바로잡았다.
 
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1a67460894f1984faef51060932f3ce18e6f20489e64406e091b87004d60bb64",
-  "reviewed_at": "2026-09-23T19:09:06Z",
-  "summary": "Reviewed test.yml portable matrices, test_lanes sharding and workflow contract tests; removed max-parallel caps so all 6 Linux and 4 macOS shards start in one wave, added CI shape contracts and AGENTS.md CI performance rules; no production/runtime impact."
+  "source_sha256": "0ab1106ca87b96c3bd1448f748847a980172243eadfa99c7cf531eca26ebcc81",
+  "reviewed_at": "2026-09-23T21:36:57Z",
+  "summary": "Reviewed test.yml, release.yml and all workflows, check_architecture digest scope and test_test_lanes CI contracts for CI review round 1; pinned exact aggregator needs and success-only verdict steps, job-level if set, non-hosted runner set across workflows (runs-on mapping forms) and release tag-only trigger; corrected AGENTS.md rules 5/8/10/12 wording keeping the canonical rule 10 controls; workflows unchanged, no production/runtime impact."
 }
 ```
 <!-- architecture-review:end -->

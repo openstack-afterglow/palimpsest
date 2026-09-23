@@ -202,10 +202,23 @@ wave.
   Same-SHA dev and main pushes therefore still queue behind each other,
   especially on the single KVM runner.
 - **Contract test.** `tests/unit/test_test_lanes.py` pins:
-  - the shard lists and the `--shard N/M` denominators;
+  - the shard lists, the exact shard command and its `--shard N/M`
+    denominator;
   - that `max-parallel` is absent or at least the shard count;
-  - the aggregate check names and their `if: always()` needs;
-  - that no gate job sits in front of the test jobs.
+  - the aggregate check names, `if: always()` and their exact `needs`;
+  - each aggregate's single verdict step: its `env` maps every dependency to
+    `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), its
+    `run` is the exact success-only script; neither the step nor its job
+    sets `shell`, `defaults` or `continue-on-error`, the workflow has no
+    `defaults`, and no dependency job or step sets `continue-on-error`;
+  - that no gate job sits in front of the test jobs, and that the only
+    job-level `if:` outside the aggregates is the `kvm` opt-in variable;
+  - that across all workflows the only jobs whose `runs-on` (string, list or
+    `group`/`labels` mapping) is not a GitHub-hosted `ubuntu-*`, `macos-*` or
+    `windows-*` label are `kvm` in `test.yml` and `kvm-proof` in
+    `release.yml`, and that `release.yml` runs only on `v*` tag pushes.
+  These pin the workflow shape only. Keeping `pull_request` code off the
+  self-hosted runner is a repository-settings control, not a YAML one.
 - **Rules for future CI changes.** Measurement and change rules are in the
   `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
 
