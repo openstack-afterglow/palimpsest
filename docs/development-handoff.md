@@ -1457,6 +1457,37 @@ passed, 양쪽 Ruff lint/format 및 architecture guard 통과였다. 다음 실�
 staging, Linux wheelhouse 및 `cloud-localds` 설치 권한을 명시한 뒤에만 한다.
 `pieroot-server`의 runner와 22개 libvirt domain은 변경하지 않는다.
 
+## 다음 개발 순서 — 2026-09-23 로컬 검증 후
+
+1. **로컬 입력 계약 (`c6ccaaeca76e87eddeed521641111878648215f9`):**
+   `hub_bundle.parse_bundle`이 동일 digest의
+   여러 manifest 선언에서 parent만 확인하고 서로 다른 `mediaType`/config를
+   첫 번째 값으로 조용히 합치는 결함을 확인했다. 두 모순 사례의 회귀가 수정
+   전에는 모두 실패(`DID NOT RAISE`)했고, 수정 후에는 거부된다. 동일한
+   공유 조상은 여전히 한 번만 등록하며, leaf manifest config와 layer
+   annotation의 불일치도 거부한다. HTTP import는 422이고 SQL/CAS에
+   아무것도 게시하지 않는다. Hub 전체 96건과 Ruff lint/format이
+   통과했다. 이는 작은 synthetic tar에 대한 portable 검증이지 대용량
+   압축 tar나 Linux 파일시스템 실기가 아니다.
+2. **격리된 Linux 파일시스템·프로세스 경계:** 전용 disposable 환경에서
+   대용량/압축 bundle의 총량 제한과 실패 시 임시 파일 제거, CAS file 및
+   directory fsync 실패, parent-death와 정확한 process-group reaping을
+   각각 검증한다. 실행 환경의 소유권·용량·보존 자료를 먼저 분리하며
+   기존 runner/KVM domain이나 운영 DB/store에는 접근하지 않는다.
+3. **실제 Hub build 승인 후 검증:** 전용 x86_64 Linux KVM host와 별도
+   Keystone/SQL/Redis/blob staging, 동일 SHA의 Linux-native wheelhouse,
+   `cloud-localds`·QEMU·libvirt·mksquashfs 및 실제 pinned bootable cloud
+   image가 필요하다. 사전 점검은 SQL 접속보다 먼저 통과해야 한다. 한 건만
+   upload→queue→claim→guest build→private SquashFS download를 실행해
+   출력 digest와 parent/base chain, job 상태 및 소유 guest/scratch 정리를
+   기록한다. 실패하면 재시도·강제 삭제하지 않고 보존 상태를 기록한다.
+4. **게시:** 위 증거를 문서에 SHA별로 분리하고 architecture/Hub/root 검사를
+   통과한 뒤, 대상 ref·배포 행위에 대한 명시적 승인으로만 추가 게시한다.
+   현재 `739a98d` 문서 기록과 `c6ccaae` parser 변경은 원격에 게시하지 않았다.
+
+2–4단계는 각각 환경·권한 또는 명시적 승인 전에는 실행하지 않는다.
+현재 접근 가능한 완료 경계는 1단계뿐이다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
