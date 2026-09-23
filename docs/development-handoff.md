@@ -1518,6 +1518,21 @@ marker는 그 새 scratch 아래에 보존했다.
 Keystone/SQL/Redis 및 Hub KVM build는 실행하지 않았다. 기존 서버 checkout,
 runner, domain, 운영 DB/store는 변경하지 않았다.
 
+### 작업 브랜치 게시 결과 (2026-09-23)
+
+`pieroot-server`의 위 격리 checkout에서 검증한
+`25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288`을
+`codex/oci-root-phase1`에만 non-force fast-forward push했다. 원격 조회에서
+그 ref는 이 SHA이고 `dev`와 `main`은 여전히
+`60fa42febfb8acd9af04e87c9905a4e2a1841d13`이었다. GitHub
+[Development package run `35830230057`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35830230057)은
+verify와 SHA-specific prerelease publish 두 job 모두 success였다.
+[`package-25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288)의
+wheel, sdist, `SHA256SUMS` 세 asset이 `uploaded`로 조회됐다. 이 ref에서는
+Test/Hub-image workflow가 실행되지 않았으므로 green image build나
+native KVM proof로 승격하지 않는다. 실제 Hub build는 사용자 지정대로
+이번 실행에서 제외하고 전용 host/staging·별도 승인 대기로 남긴다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
