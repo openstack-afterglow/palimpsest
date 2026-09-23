@@ -43,6 +43,7 @@ from palimpsest_hub.services.hub_bundle import (
     BundleLayer,
     BundleLimitError,
     ParsedBundle,
+    _scan_members,
     build_manifest,
     extract_blob,
     iter_bundle_tar,
@@ -520,6 +521,40 @@ def test_physical_scan_bounds_oversized_pax_payload_before_tarfile_reads_it(tmp_
 
     with pytest.raises(BundleLimitError, match="확장 멤버"):
         parse_bundle(bundle_path, max_blob_bytes=8 * 1024 * 1024, max_expanded_bytes=8 * 1024 * 1024)
+
+
+def test_pax_size_override_round_trips_bounded_member(tmp_path: Path):
+    payload = b"payload"
+    info = tarfile.TarInfo("index.json")
+    info.size = 0
+    info.pax_headers = {"size": str(len(payload))}
+    bundle = tmp_path / "pax-size.tar"
+    bundle.write_bytes(info.tobuf(format=tarfile.PAX_FORMAT) + payload + b"\0" * (512 - len(payload)) + b"\0" * 1024)
+
+    destination = tmp_path / "extracted"
+    extract_blob(bundle, "index.json", destination, expected_size=len(payload), max_blob_bytes=1024)
+    assert destination.read_bytes() == payload
+
+
+def test_pax_export_size_over_eight_gib_scans_sparse_tar(tmp_path: Path):
+    size = (1 << 33) + 1
+    name = "blobs/sha256/" + "a" * 64
+    info = tarfile.TarInfo(name)
+    info.size = size
+    header = info.tobuf(format=tarfile.PAX_FORMAT)
+    assert header[156:157] == b"x"
+    assert header[-512 + 124 : -512 + 136].strip(b"\0 ") == b"00000000000"
+    bundle = tmp_path / "sparse-pax.tar"
+    with bundle.open("wb") as output:
+        output.write(header)
+        output.seek(len(header) + size + (-size % 512))
+        output.write(b"\0" * 1024)
+
+    with pytest.raises(BundleLimitError):
+        _scan_members(bundle, max_member_bytes=size - 1, max_expanded_bytes=size + 1024)
+    members = _scan_members(bundle, max_member_bytes=size, max_expanded_bytes=size + 1024)
+    assert members[name].size_bytes == size
+    assert members[name].data_offset == len(header)
 
 
 def test_parse_bundle_requires_a_materialized_multilayer_tar(store: LocalPathBlobStore, tmp_path: Path):

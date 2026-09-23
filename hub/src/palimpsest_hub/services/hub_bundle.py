@@ -335,11 +335,39 @@ def _consume_zero_trailer(handle: Any) -> bool:
     return True
 
 
+def _pax_size(payload: bytes) -> int | None:
+    """Read the one PAX field that changes physical member boundaries."""
+    offset = 0
+    size: int | None = None
+    while offset < len(payload):
+        separator = payload.find(b" ", offset)
+        if separator < 0 or separator - offset > 8:
+            raise BundleError("PAX record 길이가 유효하지 않습니다")
+        length_text = payload[offset:separator]
+        if not length_text or any(char not in b"0123456789" for char in length_text):
+            raise BundleError("PAX record 길이가 유효하지 않습니다")
+        length = int(length_text)
+        end = offset + length
+        if end > len(payload) or end <= separator + 1 or payload[end - 1 : end] != b"\n":
+            raise BundleError("PAX record가 잘렸습니다")
+        key, delimiter, value = payload[separator + 1 : end - 1].partition(b"=")
+        if not delimiter:
+            raise BundleError("PAX record 형식이 유효하지 않습니다")
+        if key == b"size":
+            if size is not None or not value or len(value) > 20 or any(char not in b"0123456789" for char in value):
+                raise BundleError("PAX size 값이 유효하지 않습니다")
+            size = int(value)
+        offset = end
+    return size
+
+
 def _scan_members(tar_path: Path, *, max_member_bytes: int, max_expanded_bytes: int) -> dict[str, BundleBlobMember]:
     """Pre-scan physical tar headers without allowing tarfile to load extensions."""
     by_name: dict[str, BundleBlobMember] = {}
     member_count = 0
     expanded_bytes = 0
+    pending_size: int | None = None
+    pending_extension = False
     try:
         total_bytes = tar_path.stat().st_size
         offset = 0
@@ -351,9 +379,14 @@ def _scan_members(tar_path: Path, *, max_member_bytes: int, max_expanded_bytes: 
                 header = handle.read(_TAR_BLOCK)
                 if len(header) != _TAR_BLOCK:
                     raise BundleError("tar 헤더를 읽을 수 없습니다")
+                typeflag = header[156:157]
+                if pending_extension and typeflag not in {b"\0", b"0", b"7"}:
+                    raise BundleError("PAX 확장 뒤에 일반 파일이 없습니다")
                 if not any(header):
                     if not _consume_zero_trailer(handle):
                         raise BundleError("tar 종료 블록 뒤에 데이터가 있습니다")
+                    if pending_extension:
+                        raise BundleError("PAX 확장 뒤에 일반 파일이 없습니다")
                     terminated = True
                     break
 
@@ -361,26 +394,38 @@ def _scan_members(tar_path: Path, *, max_member_bytes: int, max_expanded_bytes: 
                 if member_count > _MAX_BUNDLE_MEMBERS:
                     raise BundleLimitError(f"번들 멤버 수가 상한({_MAX_BUNDLE_MEMBERS})을 넘습니다")
                 name = _tar_member_name(header)
-                size = _parse_tar_size(header[124:136], name=name)
+                physical_size = _parse_tar_size(header[124:136], name=name)
+                extension = typeflag in {b"x", b"g", b"L", b"K", b"S"}
+                if extension and physical_size > _MAX_TAR_EXTENSION_BYTES:
+                    raise BundleLimitError(f"tar 확장 멤버 크기가 상한을 넘습니다: {name}")
+                size = pending_size if pending_extension and pending_size is not None else physical_size
+                expanded_bytes += physical_size if extension else size
+                if expanded_bytes > max_expanded_bytes:
+                    raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+                if typeflag in {b"\0", b"0", b"7"} and size > max_member_bytes:
+                    raise BundleLimitError(f"번들 멤버 크기가 상한을 넘습니다: {name}")
                 padded_size = size + (-size % _TAR_BLOCK)
                 data_offset = offset + _TAR_BLOCK
                 next_offset = data_offset + padded_size
                 if next_offset > total_bytes:
                     raise BundleError(f"tar 멤버 payload가 잘렸습니다: {name}")
 
-                typeflag = header[156:157]
-                if typeflag in {b"x", b"g", b"L", b"K", b"S"} and size > _MAX_TAR_EXTENSION_BYTES:
-                    raise BundleLimitError(f"tar 확장 멤버 크기가 상한을 넘습니다: {name}")
-                expanded_bytes += size
-                if expanded_bytes > max_expanded_bytes:
-                    raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+                if typeflag == b"x":
+                    handle.seek(data_offset)
+                    pending_size = _pax_size(handle.read(physical_size))
+                    pending_extension = True
+                elif typeflag == b"g":
+                    handle.seek(data_offset)
+                    if _pax_size(handle.read(physical_size)) is not None:
+                        raise BundleError("전역 PAX size는 지원하지 않습니다")
+                else:
+                    pending_size = None
+                    pending_extension = False
                 if typeflag in {b"\0", b"0", b"7"}:
-                    if size > max_member_bytes:
-                        raise BundleLimitError(f"번들 멤버 크기가 상한을 넘습니다: {name}")
                     if name in by_name:
                         raise BundleError(f"번들에 중복 멤버가 있습니다: {name}")
                     by_name[name] = BundleBlobMember(name=name, size_bytes=size, data_offset=data_offset)
-                handle.seek(padded_size, os.SEEK_CUR)
+                handle.seek(next_offset)
                 offset = next_offset
         if not terminated:
             raise BundleError("tar 종료 블록이 없습니다")

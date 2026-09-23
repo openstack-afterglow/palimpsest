@@ -105,6 +105,12 @@ and a marked new-session child died after its parent exited. These checks
 did not start Hub services, open a database, boot a guest, or simulate a real
 power loss.
 
+PAX `size` is a logical size override: the physical tar header can report
+zero for blobs larger than 8 GiB. The parser regression uses a seven-byte
+override for extraction and a sparse 8 GiB+1 byte member for offset and
+limit checks. Neither test reads or allocates an 8 GiB payload; an actual
+large-blob end-to-end import and crash-durability proof remain separate.
+
 ## CLI reference and distribution checks
 
 For command documentation and packaging-only edits, use the focused contracts:

@@ -373,6 +373,8 @@ Build cap은 같은 store의 project별 filesystem flock 안에서 SQL count+ins
 
 여러 manifest가 같은 blob digest를 참조하면 parser는 부모, media type, 이름, config를 한 번만 받아들이며 이후 선언의 모순을 전체 bundle 오류(422)로 거부한다. Annotation config와 leaf manifest config가 함께 존재할 때도 값이 일치해야 한다. 동일한 공유 조상은 중복 등록하지 않는다.
 
+PAX `x` 확장의 `size` record는 4MiB 확장 payload 상한 안에서 길이를 검증한 뒤 다음 정규 member의 실제 size/offset/상한 계산에 적용한다. 물리 tar header의 size가 0인 8GiB 이상 자체 export도 이 경로를 사용한다. 잘못된 record 또는 전역 `size` override는 거부하며, 스캔한 offset만 추출에 사용한다.
+
 ## Deployment and operations
 
 ### 로컬 패키지
@@ -710,13 +712,15 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 
 2026-09-23 승인된 서버 Linux-only 경계: `05818931b520dc712098a58e6284466978bfe0fd`를 격리 checkout에서 검증했다. Hub 96건, Ruff lint/format, architecture guard 통과. 512MiB zero stream tar.gz(압축 2,342,856B)를 32MiB 확장 상한으로 거부하고 spool 부재를 확인했다. CAS 실제 파일·상위 디렉터리 fsync 성공 경로와 파일 fsync EIO·디렉터리 fsync 실패의 주입 경로에서 성공 거부·독립 staging 보존을 확인했다. Linux process-group reaping과 parent-death signal은 guest 없는 소유 process로 확인했다. 하드웨어 전원 차단 후 durable 복구, 운영 DB/Keystone/Redis, KVM/libvirt teardown은 실행하지 않았다. 이 검증은 구조·schema·배포 설정을 바꾸지 않는다.
 
+2026-09-23 PAX 후속 검토: `TarInfo.tobuf(PAX_FORMAT)`의 8GiB 초과 출력은 `x` 확장의 실제 `size`와 크기 0의 일반 header를 만든다. 기존 `_scan_members`는 확장 내용을 건너뛰어 자체 번들의 논리적 크기와 다음 header 위치를 잘못 해석했다. 7B PAX size override를 실제 `extract_blob`으로 재현한 뒤, 제한된 PAX record 해석과 절대 offset seek로 보정했다. 8GiB+1B sparse tar의 논리 크기·blob 상한도 검사하며 데이터 8GiB를 실제로 쓰거나 읽지 않는다. Hub 98건과 Ruff lint/format은 로컬에서 통과했으나 이 source의 Linux 서버 재검증·게시 결과는 별도 인계에 남긴다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1d9c1f2b236bba99fdb0b71ffa938130fc1be53663d04168361fe9c722d2b29f",
-  "reviewed_at": "2026-09-23T06:49:57Z",
-  "summary": "Reviewed Hub shared-blob descriptor and leaf-config consistency, HTTP 422/no-publication regression, and unchanged storage and KVM boundaries."
+  "source_sha256": "ce2785fb8d33b8d01e45c612abcf233a83f91c6623ee9ec1695418643a58f8cd",
+  "reviewed_at": "2026-09-23T07:18:16Z",
+  "summary": "Reviewed bounded PAX logical-size parsing for 8 GiB exports, sparse offset and limit regressions, and unchanged Hub/KVM deployment boundaries."
 }
 ```
 <!-- architecture-review:end -->
