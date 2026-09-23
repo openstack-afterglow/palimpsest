@@ -1551,9 +1551,15 @@ sparse tar로 작성해 PAX header/offset과 크기 상한만 검사했으며 8G
 payload를 실제로 복사하거나 해시하지 않았다. 기존 512MiB 압축 입력의
 32MiB 확장 제한, file/directory fsync EIO 주입 및 소유 process fence
 증거와 합쳐도 실제 전원 차단 복구나 Hub KVM guest build 결과는 아니다.
-2번 실제 Hub build는 계속 제외하고, 추가 게스트·DB·서비스 변경 없이
-승인된 `codex/oci-root-phase1` 한 ref만 이 검증 source로 fast-forward
-게시하는 것이 다음 단계다.
+2번 실제 Hub build는 계속 제외했다. 서버에서 `0812297ae9d1eb807b7a5ca92bb37ae038a240ea`을
+승인된 `codex/oci-root-phase1`에만 non-force fast-forward 게시했다.
+`dev`와 `main`은 `60fa42febfb8acd9af04e87c9905a4e2a1841d13` 그대로다.
+[Development package run `35831206880`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35831206880)의
+verify와 prerelease 두 job은 성공했고 `package-0812297ae9d1eb807b7a5ca92bb37ae038a240ea`의
+wheel·sdist·`SHA256SUMS`가 모두 `uploaded`다. 해당 작업 브랜치의
+Test/Hub-image workflow나 실제 KVM guest build는 실행되지 않았다.
+이후 필요한 것은 별도 승인을 받은 전용 KVM host/staging의 2번 검증이며,
+`dev`/`main` 추가 게시는 현재 승인 범위가 아니다.
 
 ## 빠른 링크 맵
 
