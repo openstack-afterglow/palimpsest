@@ -32,3 +32,80 @@
 ## Protected historical material
 
 `IMPLEMENTATION_PLAN.md`, `docs/oci-docker-hub-compatibility.md`, `docs/oci-public-runtime-roadmap.md`, and `tracking/afterglow-palimpsest.json` are historical or qualification records. Read them for context, but do not rewrite their evidence as current implementation or alter them without an explicitly scoped task.
+
+## CI 파이프라인 성능 규정
+
+근거는 2026-09-24의 읽기 전용 실측이다. `Test` workflow(`.github/workflows/test.yml`)가 현재의 19-job 형태로 완료한 실행 21건(2026-09-15~09-23; 이 형태는 `1a23f9c`에서 dev에 들어왔다)을 측정했다. 크리티컬 패스는 실행 생성 시각(재실행은 `run_started_at`)부터 마지막 job 종료까지로 잡았고, 중앙값 325초·p90 781초였다. 단일 KVM runner에서 직렬화된 2026-09-21 12:39–12:43 burst 8건을 빼면 13건 기준 중앙값 303초·p90 346초였다. 마지막으로 끝난 job은 21건 중 19건이 `Unit tests (macOS 15)` aggregator였다.
+
+병목은 세 가지였다.
+
+- `portable-macos`의 `max-parallel: 2`가 두 번째 wave를 만들었다. 3/4·4/4 shard의 대기 중앙값이 151·170초였다.
+- `portable-linux`의 `max-parallel: 3`도 두 번째 wave를 만들었다. 4–6 shard 대기가 91–105초였다.
+- `Native KVM stage-1 proof`가 단일 self-hosted runner `pieroot-server-palimpsest-kvm`에서 직렬화된다. 실행 140초, 대기 중앙값 142초·p90 626초였다.
+
+2026-09-24 `ci-perf` 변경은 두 matrix의 `max-parallel`을 제거했다. dev/PR 크리티컬 패스 약 155–170초라는 기대치는 KVM job 약 140초를 하한으로 한 추정이며, push 뒤 재측정 전까지 효과로 주장하지 않는다. CI를 바꾸는 모든 변경은 아래 규칙을 따른다.
+
+1. **측정 먼저, 추정 금지.**
+   - CI를 바꾸기 전과 후에 최근 20회 이상 `Test` 실행의 job·step 시간을 `gh run list --workflow test.yml`와 `gh api repos/openstack-afterglow/palimpsest/actions/runs/<id>/jobs`로 수집한다.
+   - 크리티컬 패스 중앙값과 p90을 commit 본문, [인계 문서](docs/development-handoff.md), `ARCHITECTURE.md` Maintenance summary에 남긴다. 이 저장소에는 OpenSpec이 없다.
+   - 절감은 합산되지 않는다. 가장 늦게 끝나는 job부터 줄이고, 효과는 실제 CI 전후 수치로만 주장한다.
+2. **목표 지표를 먼저 정한다.**
+   - 이 저장소는 public이고 GitHub-hosted runner 시간이 무료이므로 목표는 wall-clock이다.
+   - org `openstack-afterglow`의 Free plan 동시성 한도(hosted 20 job, macOS 5 job)는 lumen·openstack-afterglow·drover·waygate·afterglow-crypto와 공유한다. macOS runner를 쓰는 저장소는 이곳뿐이다.
+   - 한 `Test` 실행은 hosted job 약 15개를 동시에 요구한다. 따라서 dev·main 동시 push처럼 겹치는 실행의 대기도 함께 측정한다.
+3. **게이트 job을 테스트 job 앞에 두지 않는다.**
+   - `Lint, manifests, and package`(`checks`)는 portable shard의 `needs:`로 걸지 않고 병렬로 실행한다. 그 결과는 `Pure contracts (Python 3.12)` aggregator에서만 합친다.
+   - `if: always()`와 `needs:`를 함께 가지는 job은 `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof` 세 aggregator뿐이다.
+   - build·배포 게이팅은 테스트 전체 결과로 한다. `hub-docker.yml`의 `build-and-push`는 현재 자체 `Hub Unit Tests` job에 `needs:`를 건다. 이 구조는 테스트 크리티컬 패스 밖에 있고, 바꾸면 배포 의미가 달라지므로 별도 결정 없이 바꾸지 않는다.
+4. **job당 고정비를 측정한다.**
+   - 고정비는 checkout, `setup-uv`, `setup-python`, `uv sync --frozen --extra dev`에 드는 시간이다. 2026-09 기준으로 Linux shard 약 6초, macOS shard 약 9초였고 각각 job 시간의 약 7%다.
+   - `setup-uv` v6의 기본 cache 덕분에 `uv sync`는 약 1초다. cache 복원이 재설치보다 느리면 cache를 쓰지 않는다.
+   - 서비스 container를 추가하면 health-check interval은 짧게(예: 2초) 두고 retries나 start-period는 충분히 둔다.
+5. **샤딩은 고정비가 작을 때만 하고, 모든 shard를 한 wave로 띄운다.**
+   - Portable shard는 `scripts/test_lanes.py`의 안정 key 분할을 쓴다. key는 module/class/function과 parameter index의 sha256이다.
+   - `run portable --shard N/M`은 wrapper를 거쳐 인자를 넘기지 않고 직접 호출한다.
+   - matrix의 shard 목록, `--shard …/M`의 분모, job 이름의 분모는 서로 일치해야 한다. `max-parallel`은 없거나 shard 수 이상이어야 한다.
+   - 각 shard는 "Lane shard" 수 줄을 출력한다. 빈 shard나 수집 오류가 나면 실패로 처리한다(fail-closed).
+   - shard 수를 바꿀 때는 실측 대기 시간과 org 동시성 한도로 다시 판단한다.
+6. **격리 해제는 opt-in으로만 한다.**
+   - 테스트 간 상태 공유나 프로세스 재사용 같은 최적화는 전역에 적용하지 않는다. 먼저 순서를 섞어(shuffle) 2회 이상 실행해 상태 누수가 없는지 확인하고, 안전한 파일만 명시적으로 opt-in한다.
+   - 환경 변수나 전역 상태를 바꾼 테스트는 `monkeypatch`나 fixture로 반드시 복원한다.
+   - `tests/conftest.py`의 `PALIMPSEST_LOG_HOME` 같은 session 고정값을 약화하지 않는다.
+7. **테스트는 hermetic해야 병렬화할 수 있다.**
+   - portable test는 실제 KVM·libvirt·Docker·원격 서비스·host 전역 디렉터리에 의존하지 않는다. host 설정 유무에 따라 결과나 시간이 달라지면 결함이다.
+   - 현재 pytest-xdist는 쓰지 않는다. 도입하려면 먼저 세 가지를 충족한다.
+     - shuffle 실행으로 hermetic함을 증명한다. Linux 6/6의 0.1초 lock-timeout flake가 아직 해결되지 않았다.
+     - xdist controller는 `pytest_collection_modifyitems`를 실행하지 않아 "Lane shard" 증거 줄이 사라진다. 이 문제를 먼저 해결한다.
+     - worker 수를 runner vCPU에 맞춰 명시한다. `-n auto`는 금지한다.
+8. **변경 감지의 diff 기준을 정확히 한다.**
+   - 현재 CI에는 변경 감지가 없어 모든 push/PR이 전체 portable을 실행한다. `test_lanes.py plan --changed`는 로컬 선택 도구다.
+   - CI에 변경 감지를 도입하면 push는 `github.event.before..github.sha`로 비교하고, zero SHA·forced push·fetch 실패일 때는 전체를 실행한다. PR은 base..head로 비교한다.
+   - `HEAD^1..HEAD`처럼 마지막 commit만 보는 비교는 금지한다.
+   - 발행 산출물(Hub image, development package)은 실제로 발행된 revision을 기준으로 판단한다.
+9. **중복 실행은 입력 동일성으로만 제거한다.**
+   - PR 테스트를 건너뛸 수 있는 경우는 같은 저장소 branch에서 온 PR이면서 merge tree가 head tree와 같을 때뿐이다. branch 이름만으로 판단하지 않는다.
+   - fork PR과 dependabot PR은 항상 테스트한다.
+   - 2026-09 실측에서 가장 큰 중복은 같은 SHA를 dev와 main에 3–6초 간격으로 push한 경우였다. 현재 형태의 push 실행 14건 중 7건이 그랬고, 매번 KVM 대기가 142–144초 생겼다. 이를 줄이는 방법(예: dev가 green이 된 뒤 main을 fast-forward)은 소유자가 결정한다.
+   - `codex/oci-root-phase1` → dev PR은 그 branch의 유일한 `Test` 실행이므로 건너뛰지 않는다.
+10. **보안: public 저장소의 `pull_request` 코드를 self-hosted runner에서 실행하지 않는다.**
+    - self-hosted runner(`[self-hosted, linux, x64, kvm]`)를 쓰는 job은 `kvm`뿐이다.
+    - `pull_request` 실행은 PR 쪽의 workflow 파일을 사용하므로 YAML `if:`는 통제 수단이 아니다. runner group의 저장소·workflow 제한과 fork PR 승인 정책(`all_external_contributors`)으로 보장해야 한다.
+    - 2026-09 기준 승인 정책은 `first_time_contributors`이고, PR 코드가 `pieroot-server-palimpsest-kvm`에서 실행된 기록이 있다(run `35600862976`, `35600812317`, `35029001178`).
+    - 완화 조치는 인계 문서의 승인 대기 2번이다. 명시적 승인 전에는 설정을 바꾸지 않는다.
+    - `Required native KVM proof`가 skip을 통과로 받도록 바꾸지 않는다.
+11. **CI 형태는 계약 테스트로 고정한다.**
+    - `tests/unit/test_test_lanes.py`는 다음을 검사한다.
+      - portable matrix의 shard 목록·분모·`max-parallel`·`fail-fast`
+      - aggregator의 이름·`if: always()`·`needs`
+      - 테스트 job 앞에 gate job이 없는지
+      - self-hosted job의 집합
+    - `tests/unit/test_oci_convert_security.py`는 `oci-fs-proof`부터 `unit-macos` 직전까지 job-level `if:`가 없는지 텍스트로 검사한다. 그러므로 이 구간의 job 순서를 바꾸지 않는다.
+    - `tests/unit/test_development_package_workflow.py`는 development-package의 trigger·concurrency·step을 고정한다.
+    - 새 CI 불변식은 새 파일을 만들기보다 이 파일들을 확장한다. 새 test 파일은 `scripts/test_lanes.py`에 분류해야 하기 때문이다.
+12. **지속 개선.**
+    - CI를 바꾸는 변경에는 전후 실측을 첨부한다.
+    - 다음 중 하나라도 해당하면 1번 절차로 다시 측정하고 가장 늦게 끝나는 job부터 개선한다.
+      - `Test` 크리티컬 패스 중앙값이 마지막으로 기록된 기준보다 20% 이상 나빠진다.
+      - portable node 수(2026-09 기준 약 6,081)가 크게 늘어난다.
+      - 새 테스트 계층이나 job을 추가한다.
+    - `.github/**`와 `AGENTS.md`는 architecture digest 범위에 들어간다. 이 파일을 바꾸면 Maintenance summary를 갱신하고 `--stamp`와 `--staged` 검사를 거친다.

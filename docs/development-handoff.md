@@ -1428,6 +1428,66 @@ Hub image run `35622426916`도 build/push까지 success이고, work-branch
 Development package run `35622416954`는 verify와 SHA-specific prerelease
 publication 모두 success다.
 
+### CI critical-path checkpoint (2026-09-24; local only, not pushed)
+
+기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit으로 남겼다. push·PR·저장소 설정 변경은 하지 않았다.
+
+**변경 내용**
+
+- `.github/workflows/test.yml`에서 `portable-linux`의 `max-parallel: 3`과 `portable-macos`의 `max-parallel: 2`를 제거했다. 이제 6+4 shard가 한 wave로 시작한다.
+- 다음은 바꾸지 않았다: shard 수, job id와 순서, aggregator 이름과 판정, trigger, native KVM 필수 gate.
+- `tests/unit/test_test_lanes.py`에 CI 형태 계약 두 개(3 node)를 추가했다.
+  - shard 목록 `[1..N]`, `--shard …/N` 분모, `max-parallel` 부재 또는 N 이상, `fail-fast: false`, aggregator 이름·`if: always()`·`needs`를 고정한다.
+  - gate job이 앞에 없는지와, self-hosted job이 `kvm` 하나뿐인지를 고정한다.
+  - 임시 변형 workflow 네 가지(macOS cap 2, 분모 5, shard 5개, `needs: checks`)를 모두 잡는 것을 확인했다.
+- `AGENTS.md`에 `CI 파이프라인 성능 규정` 12개를 추가했다.
+- `ARCHITECTURE.md`(Development and verification, Change guide, Maintenance)와 [testing.md](testing.md)를 갱신하고 stamp했다.
+
+**실측 기준.** 읽기 전용 `gh` 조회로 얻은 수치다.
+
+- 표본은 현재 19-job 형태의 `Test` 완료 실행 21건이다.
+- 크리티컬 패스는 중앙값 325초, p90 781초였다. burst 8건을 제외하면 303/346초다.
+- `Unit tests (macOS 15)`가 21건 중 19건에서 마지막으로 끝났다.
+- 두 번째 wave 대기: macOS 3/4·4/4가 151/170초, Linux 4–6이 91–105초.
+- KVM job은 140초 걸렸고 대기 중앙값은 142초였다.
+
+**기대 효과.** dev/PR 약 155–170초는 **추정**이다. push 후 20회 이상 재측정해야 하며, 재측정 전에는 효과로 기록하지 않는다. main push는 같은 SHA의 dev 실행과 단일 KVM runner·macOS 5개 한도를 두고 경쟁하므로 약 290초에 머물 것으로 본다.
+
+**실행한 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+
+- `check_architecture.py`: stamp 후 working 통과.
+- `uv sync --frozen --extra dev`, import smoke, fixture `--check`, CLI reference `--check`, `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+- `plan --changed HEAD`: core-cli와 qualification을 선택했다.
+- `build_package.py`: 통과. Python 3.11 `palimpsest --version`: `0.1.4`.
+- focused 4 파일: 132 passed.
+- `run core-cli qualification`: 1,424 passed, 7 skipped.
+- portable 6 shard를 순차 실행해 합계 6,084 node, 5,867 passed, 217 skipped, 실패 0이었다.
+- `check_filesystem_fixtures.py`: 통과.
+- Hub(`hub/`의 sync, import, ruff, format, pytest 91 passed, `uv build`): 통과.
+- `actionlint`: 기존과 같은 custom label `kvm` 경고 1건만 남았다.
+
+**실행하지 않은 검사**
+
+- Docker가 필요한 gate: BuildKit named OCI context, guest stage-1 binary, workload proof ELF 재현, Hub Docker image build. 이후 별도로 순차 실행할 예정이다.
+- 권한이 필요한 OCI filesystem proof, native KVM, GitHub 실행.
+
+**독립 검토.** AGENTS.md가 요구하는 독립 검토는 이 subagent 안에서 받을 수 없어 미충족이다. 조용히 대체하지 않고 제약으로 보고한다.
+
+**승인 대기·소유자 결정.** 구현하지 않았고 설정도 바꾸지 않았다.
+
+1. 공개 PR 코드가 self-hosted KVM runner `pieroot-server-palimpsest-kvm`에서 실행되었다(run `35600862976`, `35600812317`, `35029001178`). 승인 정책은 `first_time_contributors`다. 위 승인 대기 2번과 같은 항목이며 YAML `if:`로는 해결되지 않는다.
+2. 같은 SHA를 dev와 main에 3–6초 간격으로 push하는 문제다. 현재 형태 push 실행 14건 중 7건이 이 경우였고, 매번 KVM 대기 142–144초가 생겼다. dev가 green이 된 뒤 main을 fast-forward하는 방식 등으로 줄일 수 있다.
+3. 다음 항목은 근거 부족이나 순이득 부족으로 보류했다.
+   - pytest-xdist 도입: hermeticity가 미증명이고 "Lane shard" 증거 줄이 사라진다.
+   - PR/push tree dedup: pre-job 비용이 절감보다 크다.
+   - `hub-docker` 게이팅 변경: 테스트 크리티컬 패스 밖이다.
+
+**다음 작업**
+
+1. 승인된 경우에만 push한다.
+2. push 뒤 `Test` 20회 이상의 크리티컬 패스 중앙값·p90을 재측정해 이 절과 AGENTS.md 기준을 갱신한다.
+3. 위 승인 대기 1·2의 결정을 받는다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

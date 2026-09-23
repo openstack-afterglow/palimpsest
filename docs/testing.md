@@ -182,6 +182,33 @@ case identities across fresh shard processes to prove disjoint complete
 assignment; randomized display IDs are not suitable for that comparison.
 
 CI runs all portable tests across six Linux shards and four macOS shards.
+Neither matrix sets `max-parallel`, so every shard of a run starts in the same
+wave.
+
+- **Why the caps were removed.** The earlier caps allowed 3 Linux and 2 macOS
+  shards at a time, which queued a second wave. Across the 21 completed `Test`
+  runs of the current job shape (2026-09-15 to 2026-09-23):
+  - macOS shards 3/4 and 4/4 waited a median 151s and 170s;
+  - Linux shards 4–6 waited 91–105s;
+  - the `Unit tests (macOS 15)` aggregate finished last in 19 of the 21 runs.
+- **Critical-path baseline.** Median 325s and p90 781s. Excluding one burst
+  that was serialized on the single self-hosted KVM runner, the figures are
+  303s and 346s.
+- **Expected effect (estimate).** A dev/PR critical path of roughly 155–170s.
+  The ~140s native KVM job sets the floor. Re-measure after the change lands
+  before treating this as achieved.
+- **Shared capacity.** The matrices still draw on the organization's Free-plan
+  pool of 20 hosted jobs and 5 macOS jobs, shared with sibling repositories.
+  Same-SHA dev and main pushes therefore still queue behind each other,
+  especially on the single KVM runner.
+- **Contract test.** `tests/unit/test_test_lanes.py` pins:
+  - the shard lists and the `--shard N/M` denominators;
+  - that `max-parallel` is absent or at least the shard count;
+  - the aggregate check names and their `if: always()` needs;
+  - that no gate job sits in front of the test jobs.
+- **Rules for future CI changes.** Measurement and change rules are in the
+  `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
+
 The existing aggregate check names remain, and require every shard to succeed;
 a skipped or cancelled shard cannot satisfy them. Lint, manifest checks and
 package construction run once. The release workflow still performs its broad

@@ -573,6 +573,15 @@ Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않
 
 현재 테스트는 portable unit/contract, separate Hub environment, privileged filesystem, guest-binary, native KVM, BuildKit Gate 1, OCI-root Gate 2로 나뉜다. 2026-09-08 `list --check`와 `core-cli` 1025건, architecture guard focused 13건이 통과했다. 이후 실제 실행한 선별 검사는 아래 checkpoint에 따로 기록한다. 실행하지 않은 다른 lane의 파일 존재는 여전히 `test-defined`일 뿐 `test-passed`가 아니다.
 
+GitHub `Test` workflow는 Linux portable 6 shard와 macOS portable 4 shard를 `max-parallel` 없이 한 wave로 실행한다. 이 형태는 `tests/unit/test_test_lanes.py`가 고정한다.
+
+- shard 목록과 `--shard N/M` 분모는 일치해야 한다.
+- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다.
+- 테스트 job 앞에는 gate job이 없다.
+- self-hosted runner를 쓰는 job은 `kvm`뿐이다.
+
+CI 변경의 측정·변경 규칙은 [`AGENTS.md`](AGENTS.md)의 `CI 파이프라인 성능 규정`이 정본이다. 크리티컬 패스 기대치는 push 뒤 실측 전까지 추정이다.
+
 후속 `a991912`에서 guest fragment 규칙과 배포 ELF를 동기화했다. 로컬 Python/C/ELF 108건(19.26초), 서버 106건·2skip(13.51초) 후 빠진 고정 toolchain과 Docker PID 1 opt-in을 준비한 두 노드가 별도로 통과했다(6.65초). 같은 SHA의 기존 빌드 이미지 cold public exec는 통과(20.47초), 원본 Redis는 filesystem 검증·staging assembly를 지나 root transition에서 실패했다(75.60초). 내부 거부 지점은 아직 미확정이며 workload를 실행하지 않았다. 전체 native 부정 제어 matrix·새 Gate 2·새 애플리케이션 이미지 빌드 통과로 확대하지 않는다. 실패 자료와 원본 archive는 보존하고 다음 검사는 root-transition의 정확한 거부 조건을 좁힌다.
 
 실제 `mksquashfs`를 호출하는 최소 레이어·재현성 검사는 `tests/oci_fs/test_layer_filesystem.py`의 정확한 `native-live` 노드로 분리했다. `PALIMPSEST_OCI_PACK_LIVE=1`과 절대 도구 경로·SHA256 고정값이 있어야 실행하며 portable 선택에서는 제외한다. 입력/tar 64KiB, 검증 출력 1MiB, packer 호출 30초로 제한한 알려진 작은 fixture의 독립 component 검사다. mount·VM·외부 materializer worker의 자원 격리 검증이 아니며, 출력 크기는 생성 뒤 확인하고 최종 reap의 hard deadline이나 부모 강제 종료 뒤 정리를 보장하지 않는다. 실제 실패를 skip/xfail로 바꾸지 않는다. 수정 전 `d255fd2`의 서버에서 디렉터리 전용·빈 레이어가 각각 fragment accounting 오류로 실패했다(0.57초·0.37초). v3 수정의 실제 도구 및 VM 결과는 별도 검증하며 이 실패 재현을 성공 증거로 대신하지 않는다. 정확한 선택 방법은 [테스트 안내](docs/testing.md)에 기록한다.
@@ -637,7 +646,7 @@ uv run python scripts/test_lanes.py run gate2
 | root volume, monitor, guest lifecycle | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py), [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py), [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py), [`guest/stage1/init.c`](guest/stage1/init.c) | related `tests/unit/test_oci_root_*`, `tests/kvm/*`, [`docs/oci-root-proof.md`](docs/oci-root-proof.md), runtime roadmap (read-only qualification record) |
 | Hub API/schema/auth/UI | [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`api/builds.py`](hub/src/palimpsest_hub/api/builds.py), [`auth.py`](hub/src/palimpsest_hub/auth.py), [`models.py`](hub/src/palimpsest_hub/models.py), [`static/hub.js`](hub/src/palimpsest_hub/static/hub.js) | `hub/tests/test_auth.py`, `test_hub_api.py`, `test_builds.py`, `test_upload_limits.py`, [`docs/install.md`](docs/install.md), this document's contracts/security |
 | Hub worker/storage/deployment | [`worker.py`](hub/src/palimpsest_hub/worker.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`services/builds.py`](hub/src/palimpsest_hub/services/builds.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py), `services/hub_store.py`, `bootstrap.py`, `migrate.py` | `hub/tests/test_image_exports.py`, `test_builds.py`, `test_migrate.py`, [`docs/install.md`](docs/install.md), [`docs/testing.md`](docs/testing.md), native KVM 별도 승인/proof |
-| tests, CI, lane membership | [`scripts/test_lanes.py`](scripts/test_lanes.py), [`.github/workflows/test.yml`](.github/workflows/test.yml), `pyproject.toml` | 해당 lane와 [`AGENTS.md`](AGENTS.md), architecture check/stamp |
+| tests, CI, lane membership | [`scripts/test_lanes.py`](scripts/test_lanes.py), [`.github/workflows/test.yml`](.github/workflows/test.yml), `pyproject.toml` | 해당 lane, CI 형태 계약 [`tests/unit/test_test_lanes.py`](tests/unit/test_test_lanes.py), [`docs/testing.md`](docs/testing.md), [`AGENTS.md`](AGENTS.md)의 CI 성능 규정(전후 실측), architecture check/stamp |
 
 구조 영향이 없는 bugfix/refactor도 source를 읽은 뒤 이 문서 `Maintenance`의 최신 summary에 영향 없음과 이유를 남긴다. 계획 문서나 roadmap만 갱신하고 구현 상태를 승격하지 않는다.
 
@@ -702,13 +711,22 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 
 실행한 검사: `hub/`에서 lint·format gate와 portable Hub 91건(같은 lock을 두고 40개가 경쟁하며 중첩 lock과 worker를 요구하는 회귀, export→import cloud-image round trip 포함), root에서 portable 전체 5,862건(217 skip)·publication/workflow/lane/architecture guard·Kolla role 계약. 실제 GitHub 게시, Redis/MySQL 배포, 대용량 compressed tar, native KVM은 실행하지 않았다.
 
+2026-09-24 CI critical-path review: `.github/workflows/test.yml`, `scripts/test_lanes.py`, 기존 workflow 계약 테스트(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`)를 읽은 뒤 portable matrix 두 개의 `max-parallel`(Linux 3, macOS 2)을 제거했다.
+
+- **바꾸지 않은 것.** shard 수 6/4, 안정 key 분할, job id·순서, aggregator 이름과 `if: always()` 판정, native KVM 필수 gate, trigger는 그대로다. production/runtime·package·Hub 계약에는 구조 영향이 없다.
+- **실측 근거.** 현재 형태의 `Test` 완료 실행 21건에서 크리티컬 패스는 중앙값 325초·p90 781초(burst 제외 303/346초)였다. macOS 3/4·4/4 shard의 두 번째 wave 대기가 151/170초였고, `Unit tests (macOS 15)`가 21건 중 19건에서 마지막으로 끝났다.
+- **기대 효과.** dev/PR 약 155–170초는 추정이며 push 뒤 재측정해야 한다.
+- **추가한 계약.** `test_test_lanes.py`에 계약 두 개를 추가했다. 하나는 shard 목록·분모·`max-parallel`·aggregator를 고정하고, 다른 하나는 gate job이 앞에 없는지와 self-hosted job의 집합을 고정한다.
+- **추가한 규정.** `AGENTS.md`에 12개 CI 성능 규정을 추가했다.
+- **소유자 결정으로 남긴 것.** 공개 PR 코드가 self-hosted KVM runner에서 실행되는 문제(fork 승인 정책·runner 제한)와 같은 SHA의 dev/main 이중 push 중복은 저장소 설정·운영 절차의 문제이며 이 변경에 포함하지 않았다. 이 둘은 인계 문서의 승인 대기 항목으로 남긴다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "42d172eca36a702fa19a0679724089f447140074c0ec05bae4b14e3f965c1eca",
-  "reviewed_at": "2026-09-21T19:46:49Z",
-  "summary": "Reviewed thread-free Hub lock acquisition, per-layer bundle config binding, worker admission, digest-lock rollback, and development-package publication recovery against current source."
+  "source_sha256": "1a67460894f1984faef51060932f3ce18e6f20489e64406e091b87004d60bb64",
+  "reviewed_at": "2026-09-23T19:09:06Z",
+  "summary": "Reviewed test.yml portable matrices, test_lanes sharding and workflow contract tests; removed max-parallel caps so all 6 Linux and 4 macOS shards start in one wave, added CI shape contracts and AGENTS.md CI performance rules; no production/runtime impact."
 }
 ```
 <!-- architecture-review:end -->

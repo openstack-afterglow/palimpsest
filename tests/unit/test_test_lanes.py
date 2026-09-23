@@ -2,14 +2,17 @@
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/test_lanes.py"
+_TEST_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/test.yml"
 _SPEC = importlib.util.spec_from_file_location("palimpsest_test_lanes", _SCRIPT)
 lanes = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = lanes
@@ -325,6 +328,51 @@ def test_portable_command_shards_nodes_without_special_selectors_or_environment_
     assert dict(os.environ) == before
     with pytest.raises(lanes.LaneError):
         lanes.commands(("native-live",), "1/2")
+
+
+def _test_workflow_jobs():
+    return yaml.safe_load(_TEST_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+
+
+@pytest.mark.parametrize(
+    ("job_id", "count", "aggregator", "check_name"),
+    [
+        ("portable-linux", 6, "pure", "Pure contracts (Python 3.12)"),
+        ("portable-macos", 4, "unit-macos", "Unit tests (macOS 15)"),
+    ],
+)
+def test_ci_portable_matrix_runs_every_shard_in_one_wave(job_id, count, aggregator, check_name):
+    jobs = _test_workflow_jobs()
+    strategy = jobs[job_id]["strategy"]
+    assert strategy["matrix"]["shard"] == list(range(1, count + 1))
+    assert strategy["fail-fast"] is False
+    # A cap below the shard count queues a second wave onto the critical path.
+    assert strategy.get("max-parallel", count) >= count
+    (command,) = (step["run"] for step in jobs[job_id]["steps"] if "test_lanes.py run portable" in step.get("run", ""))
+    shard = re.fullmatch(
+        r"uv run python scripts/test_lanes\.py run portable --shard \$\{\{ matrix\.shard \}\}/(\d+)", command
+    )
+    assert shard and int(shard.group(1)) == count, command
+    assert jobs[job_id]["name"].endswith(f"/{count})")
+    gate = jobs[aggregator]
+    assert gate["name"] == check_name
+    assert gate["if"] == "always()"
+    assert job_id in gate["needs"]
+
+
+def test_ci_test_jobs_start_without_a_gate_job_in_front():
+    jobs = _test_workflow_jobs()
+    aggregators = {
+        "pure": "Pure contracts (Python 3.12)",
+        "unit-macos": "Unit tests (macOS 15)",
+        "kvm-required": "Required native KVM proof",
+    }
+    assert {job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in aggregators} == {}
+    assert {job_id: jobs[job_id]["name"] for job_id in aggregators} == aggregators
+    assert all(jobs[job_id]["if"] == "always()" for job_id in aggregators)
+    # Only the native proof may target the self-hosted runner. This pins the shape; it
+    # does not by itself keep pull_request code off that runner (repository settings do).
+    assert [job_id for job_id, job in jobs.items() if "self-hosted" in job["runs-on"]] == ["kvm"]
 
 
 @pytest.mark.parametrize(
