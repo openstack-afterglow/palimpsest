@@ -303,6 +303,8 @@ Optional settings and defaults:
 | `DATABASE_POOL_TIMEOUT` | `30` seconds, valid 1–120 |
 | `DATABASE_UNHEALTHY_SECONDS` | `30` seconds, valid 1–3600 |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
+| `PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES` | `107374182400` bytes (100 GiB), minimum 1; total expansion allowed for one imported bundle |
+| `PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` | `2`, valid 1–16; process-wide concurrent hash/copy/parse workers |
 | `PALIMPSEST_HUB_BUILDER_PYTHON` | Empty: build requests return 503. For build service, absolute path to the **separate** `palimpsest-local[kvm]` interpreter on the KVM worker; set the same path string on API and worker. |
 | `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; guest teardown is attempted on timeout. |
 | `OS_USER_DOMAIN_NAME` / `OS_PROJECT_DOMAIN_NAME` | `Default` |
@@ -352,15 +354,32 @@ API/client for larger artifacts. Server-side KVM execution has **not** been
 established by merely installing either package or by passing the portable
 HTTP contract tests.
 
-Cancellation while waiting for an upload/project lock cannot retain its eventual
-file descriptor. A digest-verified upload keeps an independent staging file
-until its layer registration commits: retry the same PUT after a crash before
-commit using the acknowledged offset. Concurrent registration of identical
-bytes and build queue capacity use store-backed digest/project locks, so API
-replicas must share the same filesystem view.
+Lock waits never occupy a worker thread: each attempt is one non-blocking
+`flock`, and a failed attempt sleeps on the event loop before retrying. Waiters
+therefore cannot starve the current owner's unlock, its next lock, or its
+filesystem worker, but acquisition order is not FIFO — per-project session and
+build caps are what bound contention. Blob garbage collection skips a locked
+blob instead of waiting for it. Cancellation while waiting for an upload or
+project lock cannot retain its eventual file descriptor. A digest-verified
+upload keeps an independent staging file until its layer registration commits:
+retry the same PUT after a crash before commit using the acknowledged offset.
+Concurrent registration of identical bytes and build queue capacity use
+store-backed digest/project locks, so API replicas must share the same
+filesystem view.
 
 `PALIMPSEST_HUB_MAX_BLOB_BYTES` is a **per-blob** ceiling, not a per-project
-or whole-store disk quota. Completed build rows and result blobs have no
+or whole-store disk quota. `PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES` bounds
+one bundle import's total expanded bytes; a bundle also refuses more than 4096
+members and any member larger than the per-blob ceiling, and it stages and
+verifies every blob before publishing any of them.
+`PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` bounds how many requests may occupy
+hashing, copying, parsing, or fsync threads at once; raising it trades event
+loop responsiveness and disk throughput for upload concurrency. A disconnected
+client does not abort an in-flight worker, so its file lock is held until that
+worker finishes. The canonical Kolla role exposes the three settings as
+`palimpsest_hub_max_blob_bytes`, `palimpsest_hub_max_bundle_expanded_bytes`,
+and `palimpsest_hub_max_blocking_operations`. Completed build rows and result
+blobs have no
 automatic retention/garbage-collection policy here; provision filesystem
 capacity and operator monitoring separately before exposing uploads/builds.
 

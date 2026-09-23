@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import io
+import json
 import tarfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, Response, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -23,6 +28,7 @@ from palimpsest_hub.api.hub import (
     finalize_upload,
     start_upload,
 )
+from palimpsest_hub.auth import get_token_info
 from palimpsest_hub.main import app
 from palimpsest_hub.models import (
     Base,
@@ -34,9 +40,12 @@ from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
     BundleError,
     BundleLayer,
+    BundleLimitError,
     ParsedBundle,
     build_manifest,
+    extract_blob,
     iter_bundle_tar,
+    materialize_plain_tar,
     parse_bundle,
 )
 from palimpsest_hub.services.hub_store import (
@@ -56,7 +65,15 @@ def _sha256(payload: bytes) -> str:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> LocalPathBlobStore:
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalPathBlobStore:
+    monkeypatch.setattr(
+        hub_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_max_blob_bytes=1024 * 1024,
+            palimpsest_hub_max_bundle_expanded_bytes=1024 * 1024,
+        ),
+    )
     return LocalPathBlobStore(tmp_path / "hub")
 
 
@@ -187,7 +204,7 @@ async def test_write_upload_stream_aborts_when_exceeding_limit(store: LocalPathB
 # ---------------------------------------------------------------------------
 
 
-def _chain(store: LocalPathBlobStore) -> list[BundleLayer]:
+def _chain(store: LocalPathBlobStore, *, leaf_media_type: str = MEDIA_TYPE_LAYER_SQUASHFS) -> list[BundleLayer]:
     root_bytes = b"root layer"
     child_bytes = b"child layer"
     leaf_bytes = b"leaf layer"
@@ -209,6 +226,7 @@ def _chain(store: LocalPathBlobStore) -> list[BundleLayer]:
             size_bytes=len(leaf_bytes),
             name="leaf",
             config={"name": "leaf", "parent_digest": child_digest},
+            media_type=leaf_media_type,
         ),
     ]
 
@@ -233,13 +251,11 @@ def test_bundle_round_trips_through_parse(store: LocalPathBlobStore, tmp_path: P
         for chunk in iter_bundle_tar(store, [chain]):
             out.write(chunk)
 
-    parsed = parse_bundle(bundle_path)
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
     leaf = chain[-1]
     staged = tmp_path / "staged.sqsh"
 
-    from palimpsest_hub.services.hub_bundle import extract_blob
-
-    extract_blob(bundle_path, parsed.blob_members[leaf.blob_digest], staged)
+    extract_blob(bundle_path, parsed.blob_members[leaf.blob_digest], staged, max_blob_bytes=1024 * 1024)
     assert _sha256(staged.read_bytes()) == leaf.blob_digest
 
 
@@ -250,13 +266,41 @@ def test_parse_bundle_reconstructs_parent_chain_from_manifest_order(store: Local
         for chunk in iter_bundle_tar(store, [chain]):
             out.write(chunk)
 
-    parsed = parse_bundle(bundle_path)
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
     parents = [entry["parent_digest"] for entry in parsed.layers]
     assert parents == [None, chain[0].blob_digest, chain[1].blob_digest]
 
 
+def test_parse_bundle_attaches_each_layer_annotated_config(store: LocalPathBlobStore, tmp_path: Path):
+    chain = _chain(store)
+    bundle_path = tmp_path / "bundle.tar"
+    bundle_path.write_bytes(b"".join(iter_bundle_tar(store, [chain])))
+
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+
+    assert [entry["config"] for entry in parsed.layers] == [layer.config for layer in chain]
+
+
+def test_parse_bundle_rejects_annotated_config_parent_that_contradicts_manifest_order(
+    store: LocalPathBlobStore, tmp_path: Path
+):
+    chain = _chain(store)
+    child = chain[1]
+    chain[1] = BundleLayer(
+        blob_digest=child.blob_digest,
+        size_bytes=child.size_bytes,
+        name=child.name,
+        config={**child.config, "parent_digest": chain[-1].blob_digest},
+    )
+    bundle_path = tmp_path / "contradictory.tar"
+    bundle_path.write_bytes(b"".join(iter_bundle_tar(store, [chain])))
+
+    with pytest.raises(BundleError, match="parent_digest.*manifest"):
+        parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+
+
 @pytest.mark.asyncio
-async def test_bundle_digest_mismatch_cannot_remove_existing_blob(
+async def test_bundle_digest_mismatch_rejects_before_cas_publication(
     store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
 ):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -266,6 +310,13 @@ async def test_bundle_digest_mismatch_cannot_remove_existing_blob(
     monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
     monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
     payload = b"existing downloadable layer"
+    monkeypatch.setattr(
+        hub_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_max_blob_bytes=1024 * 1024, palimpsest_hub_max_bundle_expanded_bytes=1024 * 1024
+        ),
+    )
     existing_digest = _put_blob(store, payload)
     declared = "sha256:" + "b" * 64
     member = f"blobs/sha256/{declared[7:]}"
@@ -277,20 +328,427 @@ async def test_bundle_digest_mismatch_cannot_remove_existing_blob(
     monkeypatch.setattr(
         hub_api,
         "parse_bundle",
-        lambda _: ParsedBundle(layers=[{"blob_digest": declared}], blob_members={declared: member}),
+        lambda _, **__: ParsedBundle(
+            layers=[{"blob_digest": declared, "size_bytes": len(payload)}], blob_members={declared: member}
+        ),
     )
     try:
-        result = await hub_api.import_bundle(UploadFile(file=io.BytesIO(raw.getvalue())), {"project_id": "alpha"})
-        assert result["imported_count"] == 0
-        assert result["skipped"][0]["digest"] == declared
+        with pytest.raises(HTTPException) as rejected:
+            await hub_api.import_bundle(UploadFile(file=io.BytesIO(raw.getvalue())), {"project_id": "alpha"})
+        assert rejected.value.status_code == 422
         assert b"".join(store.iter_blob(existing_digest)) == payload
+        assert not store.exists(declared)
     finally:
         await engine.dispose()
+
+
+def _write_single_layer_bundle(
+    bundle_path: Path,
+    payload: bytes,
+    *,
+    descriptor_size: int | None = None,
+    layer_media_type: str | None = None,
+) -> str:
+    digest = _sha256(payload)
+    config = b'{"name":"layer"}'
+    config_digest = _sha256(config)
+    layer = {"digest": digest, "size": len(payload) if descriptor_size is None else descriptor_size}
+    if layer_media_type is not None:
+        layer["mediaType"] = layer_media_type
+    manifest = {
+        "schemaVersion": 2,
+        "config": {"digest": config_digest, "size": len(config)},
+        "layers": [layer],
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    manifest_digest = _sha256(manifest_bytes)
+    index_bytes = json.dumps(
+        {"manifests": [{"digest": manifest_digest, "size": len(manifest_bytes)}]},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    with tarfile.open(bundle_path, mode="w:gz") as archive:
+        for name, value in (
+            ("index.json", index_bytes),
+            (f"blobs/sha256/{manifest_digest[7:]}", manifest_bytes),
+            (f"blobs/sha256/{config_digest[7:]}", config),
+            (f"blobs/sha256/{digest[7:]}", payload),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(value)
+            archive.addfile(info, io.BytesIO(value))
+    return digest
+
+
+def test_bundle_streaming_parser_rejects_4097th_member_without_getmembers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    compressed = tmp_path / "too-many.tar.gz"
+    with tarfile.open(compressed, mode="w:gz") as archive:
+        for index in range(4097):
+            info = tarfile.TarInfo(f"entries/{index}")
+            info.size = 0
+            archive.addfile(info)
+    bundle_path = materialize_plain_tar(compressed, tmp_path / "too-many.tar", max_expanded_bytes=4 * 1024 * 1024)
+    monkeypatch.setattr(tarfile.TarFile, "getmembers", lambda _: (_ for _ in ()).throw(AssertionError("unbounded")))
+    with pytest.raises(BundleLimitError, match="4096"):
+        parse_bundle(bundle_path, max_blob_bytes=1024, max_expanded_bytes=4 * 1024 * 1024)
+
+
+def test_compressed_bundle_blob_limit_and_descriptor_mismatch_leave_no_staging(tmp_path: Path):
+    oversized = tmp_path / "oversized.tar.gz"
+    _write_single_layer_bundle(oversized, b"\0" * 1024)
+    oversized_plain = materialize_plain_tar(oversized, tmp_path / "oversized.tar", max_expanded_bytes=32 * 1024)
+    with pytest.raises(BundleLimitError):
+        parse_bundle(oversized_plain, max_blob_bytes=128, max_expanded_bytes=32 * 1024)
+
+    mismatched = tmp_path / "mismatched.tar.gz"
+    _write_single_layer_bundle(mismatched, b"payload", descriptor_size=8)
+    mismatched_plain = materialize_plain_tar(mismatched, tmp_path / "mismatched.tar", max_expanded_bytes=32 * 1024)
+    with pytest.raises(BundleError, match="선언 크기"):
+        parse_bundle(mismatched_plain, max_blob_bytes=1024, max_expanded_bytes=32 * 1024)
+
+    truncated = tmp_path / "truncated.tar"
+    info = tarfile.TarInfo("blob")
+    info.size = 16
+    truncated.write_bytes(info.tobuf() + b"short")
+    destination = tmp_path / "partial"
+    with pytest.raises(BundleError):
+        extract_blob(truncated, "blob", destination, expected_size=16, max_blob_bytes=1024)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+def test_materialize_supports_each_compressed_tar_format(tmp_path: Path, mode: str):
+    compressed = tmp_path / f"bundle-{mode[-2:]}.tar"
+    with tarfile.open(compressed, mode=mode) as archive:
+        info = tarfile.TarInfo("payload")
+        info.size = len(b"payload")
+        archive.addfile(info, io.BytesIO(b"payload"))
+
+    plain = tmp_path / "bundle.tar"
+    assert materialize_plain_tar(compressed, plain, max_expanded_bytes=32 * 1024) == plain
+    with tarfile.open(plain, mode="r:") as archive:
+        assert archive.getnames() == ["payload"]
+
+
+def test_materialize_rejects_gzip_expansion_and_removes_partial_spool(tmp_path: Path):
+    compressed = tmp_path / "expands.tar.gz"
+    with tarfile.open(compressed, mode="w:gz") as archive:
+        info = tarfile.TarInfo("payload")
+        info.size = 64 * 1024
+        archive.addfile(info, io.BytesIO(b"x" * info.size))
+
+    spool = tmp_path / "expands.tar"
+    with pytest.raises(BundleLimitError):
+        materialize_plain_tar(compressed, spool, max_expanded_bytes=1024)
+    assert not spool.exists()
+
+
+def test_physical_scan_bounds_oversized_pax_payload_before_tarfile_reads_it(tmp_path: Path):
+    bundle_path = tmp_path / "oversized-pax.tar"
+    payload = b"x" * (4 * 1024 * 1024 + 1)
+    with tarfile.open(bundle_path, mode="w") as archive:
+        info = tarfile.TarInfo("pax-header")
+        info.type = tarfile.XHDTYPE
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    with pytest.raises(BundleLimitError, match="확장 멤버"):
+        parse_bundle(bundle_path, max_blob_bytes=8 * 1024 * 1024, max_expanded_bytes=8 * 1024 * 1024)
+
+
+def test_parse_bundle_requires_a_materialized_multilayer_tar(store: LocalPathBlobStore, tmp_path: Path):
+    chain = _chain(store)
+    compressed = tmp_path / "bundle.tar.gz"
+    with tarfile.open(compressed, mode="w:gz") as archive:
+        for chunk in iter_bundle_tar(store, [chain]):
+            archive.fileobj.write(chunk)
+
+    with pytest.raises(BundleError):
+        parse_bundle(compressed, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+    bundle_path = materialize_plain_tar(compressed, tmp_path / "bundle.tar", max_expanded_bytes=1024 * 1024)
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+    assert [layer["blob_digest"] for layer in parsed.layers] == [layer.blob_digest for layer in chain]
+
+
+def test_nonregular_tar_payloads_consume_expansion_budget_and_leave_no_outputs(tmp_path: Path):
+    compressed = tmp_path / "nonregular.tar.gz"
+    with tarfile.open(compressed, mode="w:gz") as archive:
+        for index in range(3):
+            info = tarfile.TarInfo(f"directories/{index}")
+            info.type = tarfile.DIRTYPE
+            info.size = 512
+            archive.addfile(info, io.BytesIO(b"x" * info.size))
+
+    plain = materialize_plain_tar(compressed, tmp_path / "nonregular.tar", max_expanded_bytes=32 * 1024)
+    staged = tmp_path / "staged"
+    with pytest.raises(BundleLimitError):
+        parse_bundle(plain, max_blob_bytes=1024, max_expanded_bytes=1024)
+    assert not staged.exists()
+
+    rejected_spool = tmp_path / "rejected.tar"
+    with pytest.raises(BundleLimitError):
+        materialize_plain_tar(compressed, rejected_spool, max_expanded_bytes=1024)
+    assert not rejected_spool.exists()
+
+
+def test_bundle_round_trip_preserves_disk_layer_media_type(store: LocalPathBlobStore, tmp_path: Path):
+    chain = _chain(store, leaf_media_type=MEDIA_TYPE_IMAGE_QCOW2)
+    bundle_path = tmp_path / "disk-layer.tar"
+    bundle_path.write_bytes(b"".join(iter_bundle_tar(store, [chain])))
+
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+    assert parsed.layers[-1]["media_type"] == MEDIA_TYPE_IMAGE_QCOW2
+
+
+def test_parse_bundle_defaults_and_validates_layer_media_type(tmp_path: Path):
+    default_compressed = tmp_path / "default-media.tar.gz"
+    _write_single_layer_bundle(default_compressed, b"payload")
+    default_plain = materialize_plain_tar(
+        default_compressed, tmp_path / "default-media.tar", max_expanded_bytes=32 * 1024
+    )
+    parsed = parse_bundle(default_plain, max_blob_bytes=1024, max_expanded_bytes=32 * 1024)
+    assert parsed.layers[0]["media_type"] == MEDIA_TYPE_LAYER_SQUASHFS
+
+    invalid_compressed = tmp_path / "invalid-media.tar.gz"
+    _write_single_layer_bundle(invalid_compressed, b"payload", layer_media_type="application/octet-stream")
+    invalid_plain = materialize_plain_tar(
+        invalid_compressed, tmp_path / "invalid-media.tar", max_expanded_bytes=32 * 1024
+    )
+    with pytest.raises(BundleError, match="mediaType"):
+        parse_bundle(invalid_plain, max_blob_bytes=1024, max_expanded_bytes=32 * 1024)
 
 
 def test_build_manifest_rejects_empty_chain():
     with pytest.raises(BundleError):
         build_manifest([], {})
+
+
+async def _import_bundle_over_http(payload: bytes):
+    async def identity(request: Request):
+        return {"project_id": "alpha", "user_id": "member"}
+
+    app.dependency_overrides[get_token_info] = identity
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            return await client.post("/v1/bundles/import", files={"file": ("bundle.tar.gz", payload)})
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def _prepared_hub(tmp_path: Path, name: str, store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
+    return engine, factory
+
+
+def _gzip_bundle(store: LocalPathBlobStore, chain: list[BundleLayer]) -> bytes:
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
+        for chunk in iter_bundle_tar(store, [chain]):
+            compressed.write(chunk)
+    return raw.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_import_registers_the_whole_chain_with_its_declared_parents(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    chain = _chain(store)
+    engine, factory = await _prepared_hub(tmp_path, "import.sqlite", store, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(_gzip_bundle(store, chain))
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["skipped"] == []
+        assert body["imported"] == [layer.blob_digest for layer in chain]
+        async with factory() as session:
+            rows = {row.blob_digest: row for row in (await session.execute(select(PalimpsestHubLayer))).scalars().all()}
+        assert [rows[layer.blob_digest].media_type for layer in chain] == [MEDIA_TYPE_LAYER_SQUASHFS] * 3
+        assert rows[chain[-1].blob_digest].parent_digest == chain[-2].blob_digest
+        assert rows[chain[0].blob_digest].parent_digest is None
+        assert all(store.exists(digest) for digest in rows)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_import_preserves_each_config_in_a_cloud_image_parent_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source_store = LocalPathBlobStore(tmp_path / "source")
+    destination_store = LocalPathBlobStore(tmp_path / "destination")
+    base_payload = b"qcow2 base image bytes"
+    runtime_payload = b"runtime squashfs bytes"
+    app_payload = b"application squashfs bytes"
+    base_digest = _put_blob(source_store, base_payload)
+    runtime_digest = _put_blob(source_store, runtime_payload)
+    app_digest = _put_blob(source_store, app_payload)
+    chain_id = _sha256(b"runtime chain")
+    chain = [
+        BundleLayer(
+            blob_digest=base_digest,
+            size_bytes=len(base_payload),
+            name="jammy",
+            config={
+                "name": "jammy",
+                "kind": "cloud-image",
+                "disk_format": "qcow2",
+                "arch": "x86_64",
+                "blob_digest": base_digest,
+            },
+            media_type=MEDIA_TYPE_IMAGE_QCOW2,
+        ),
+        BundleLayer(
+            blob_digest=runtime_digest,
+            size_bytes=len(runtime_payload),
+            name="runtime",
+            config={
+                "name": "runtime",
+                "blob_digest": runtime_digest,
+                "parent_digest": base_digest,
+                "chain_id": chain_id,
+                "ubuntu_base": "24.04",
+            },
+        ),
+        BundleLayer(
+            blob_digest=app_digest,
+            size_bytes=len(app_payload),
+            name="application",
+            config={
+                "name": "application",
+                "blob_digest": app_digest,
+                "parent_digest": runtime_digest,
+                "chain_id": chain_id,
+                "python_version": "3.12",
+            },
+        ),
+    ]
+    monkeypatch.setattr(
+        hub_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_max_blob_bytes=1024 * 1024,
+            palimpsest_hub_max_bundle_expanded_bytes=1024 * 1024,
+        ),
+    )
+    engine, factory = await _prepared_hub(tmp_path, "full-chain.sqlite", destination_store, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(_gzip_bundle(source_store, chain))
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["skipped"] == []
+        assert body["imported"] == [layer.blob_digest for layer in chain]
+        async with factory() as session:
+            rows = {row.blob_digest: row for row in (await session.execute(select(PalimpsestHubLayer))).scalars().all()}
+        assert set(rows) == {layer.blob_digest for layer in chain}
+        assert all(destination_store.exists(layer.blob_digest) for layer in chain)
+        assert (
+            rows[base_digest].kind,
+            rows[base_digest].disk_format,
+            rows[base_digest].arch,
+            rows[base_digest].media_type,
+            rows[base_digest].parent_digest,
+        ) == ("cloud-image", "qcow2", "x86_64", MEDIA_TYPE_IMAGE_QCOW2, None)
+        assert (
+            rows[runtime_digest].chain_id,
+            rows[runtime_digest].ubuntu_base,
+            rows[runtime_digest].python_version,
+            rows[runtime_digest].parent_digest,
+        ) == (chain_id, "24.04", None, base_digest)
+        assert (
+            rows[app_digest].chain_id,
+            rows[app_digest].ubuntu_base,
+            rows[app_digest].python_version,
+            rows[app_digest].parent_digest,
+        ) == (chain_id, None, "3.12", runtime_digest)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_import_preserves_cloud_image_descriptor_fields(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payload = b"qcow2 base image bytes"
+    digest = _put_blob(store, payload)
+    base = BundleLayer(
+        blob_digest=digest,
+        size_bytes=len(payload),
+        name="jammy",
+        config={"name": "jammy", "kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64"},
+        media_type=MEDIA_TYPE_IMAGE_QCOW2,
+    )
+    engine, factory = await _prepared_hub(tmp_path, "cloud.sqlite", store, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(_gzip_bundle(store, [base]))
+        assert response.status_code == 200, response.text
+        assert response.json()["imported"] == [digest]
+        async with factory() as session:
+            row = (await session.execute(select(PalimpsestHubLayer))).scalar_one()
+        assert (row.media_type, row.kind, row.disk_format, row.arch) == (
+            MEDIA_TYPE_IMAGE_QCOW2,
+            "cloud-image",
+            "qcow2",
+            "x86_64",
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_import_skips_a_descriptor_whose_media_type_contradicts_its_config(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payload = b"mislabelled layer bytes"
+    digest = _put_blob(store, payload)
+    mislabelled = BundleLayer(
+        blob_digest=digest,
+        size_bytes=len(payload),
+        name="mislabelled",
+        config={"name": "mislabelled", "kind": "squashfs"},
+        media_type=MEDIA_TYPE_IMAGE_QCOW2,
+    )
+    engine, factory = await _prepared_hub(tmp_path, "mismatch.sqlite", store, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(_gzip_bundle(store, [mislabelled]))
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["imported"] == []
+        assert [item["digest"] for item in body["skipped"]] == [digest]
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_import_over_expansion_limit_returns_413_without_registering_anything(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    chain = _chain(store)
+    payload = _gzip_bundle(store, chain)
+    engine, factory = await _prepared_hub(tmp_path, "rejected.sqlite", store, monkeypatch)
+    monkeypatch.setattr(
+        hub_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_max_blob_bytes=1024 * 1024,
+            palimpsest_hub_max_bundle_expanded_bytes=64,
+        ),
+    )
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 413, response.text
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+    finally:
+        await engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -783,15 +1241,16 @@ async def test_export_download_ticket_supports_range_resume(monkeypatch: pytest.
     token_key = f"afterglow:export-dl-token:{token}"
 
     class FakeRedis:
-        def __init__(self):
-            self.expirations: list[tuple[str, int]] = []
-
         async def get(self, key: str):
             assert key == token_key
-            return f'{{"export_id":"{export_id}","project_id":"project-1","digest":"{digest}"}}'
-
-        async def expire(self, key: str, ttl: int):
-            self.expirations.append((key, ttl))
+            return json.dumps(
+                {
+                    "export_id": str(export_id),
+                    "project_id": "project-1",
+                    "digest": digest,
+                    "expires_at": int(time.time()) + 60,
+                }
+            )
 
     redis = FakeRedis()
 
@@ -830,5 +1289,81 @@ async def test_export_download_ticket_supports_range_resume(monkeypatch: pytest.
     result = await hub_api.download_image_export_with_token(export_id, request, token)
 
     assert result is not None
-    assert redis.expirations == [(token_key, 60)]
     assert captured["range_header"] == "bytes=1024-2047"
+    assert captured["cache_control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_export_ticket_deadline_is_fixed_and_wrong_export_does_not_refresh(monkeypatch: pytest.MonkeyPatch):
+    export_id = UUID("11111111-1111-1111-1111-111111111111")
+    wrong_export_id = UUID("22222222-2222-2222-2222-222222222222")
+    digest = "sha256:" + "c" * 64
+
+    class FakeRedis:
+        async def get(self, key: str):
+            return json.dumps(
+                {
+                    "export_id": str(export_id),
+                    "project_id": "project-1",
+                    "digest": digest,
+                    "expires_at": int(time.time()) + 60,
+                }
+            )
+
+    async def fake_redis():
+        return FakeRedis()
+
+    monkeypatch.setattr(hub_api, "get_redis", fake_redis)
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    with pytest.raises(HTTPException) as rejected:
+        await hub_api.download_image_export_with_token(wrong_export_id, request, "t" * 32)
+    assert rejected.value.status_code == 404
+
+    class ExpiredRedis:
+        async def get(self, key: str):
+            return json.dumps(
+                {"export_id": str(export_id), "project_id": "project-1", "digest": digest, "expires_at": 0}
+            )
+
+    async def expired_redis():
+        return ExpiredRedis()
+
+    monkeypatch.setattr(hub_api, "get_redis", expired_redis)
+    with pytest.raises(HTTPException) as expired:
+        await hub_api.download_image_export_with_token(export_id, request, "t" * 32)
+    assert expired.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_export_ticket_records_original_absolute_deadline(monkeypatch: pytest.MonkeyPatch):
+    export_id = UUID("33333333-3333-3333-3333-333333333333")
+    digest = "sha256:" + "d" * 64
+    captured: dict[str, object] = {}
+
+    class FakeRedis:
+        async def setex(self, key: str, ttl: int, payload: str):
+            captured.update(key=key, ttl=ttl, payload=json.loads(payload))
+
+    class Export:
+        id = str(export_id)
+
+    async def fake_redis():
+        return FakeRedis()
+
+    async def fake_export(project_id: str, requested_export_id: str):
+        assert (project_id, requested_export_id) == ("project-1", str(export_id))
+        return Export()
+
+    monkeypatch.setattr(hub_api, "get_redis", fake_redis)
+    monkeypatch.setattr(hub_api, "get_project_export", fake_export)
+    monkeypatch.setattr(hub_api, "_store_or_503", lambda: object())
+    monkeypatch.setattr(
+        hub_api, "_complete_export_blob", lambda row, store: (digest, 1, "x", "application/octet-stream")
+    )
+    before = int(time.time())
+    issued = Response()
+    result = await hub_api.create_image_export_download_token(export_id, issued, {"project_id": "project-1"})
+    assert result["expires_in"] == 60
+    assert issued.headers["cache-control"] == "no-store"
+    assert captured["ttl"] == 60
+    assert before + 60 <= captured["payload"]["expires_at"] <= int(time.time()) + 60

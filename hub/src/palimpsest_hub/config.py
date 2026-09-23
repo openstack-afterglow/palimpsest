@@ -22,6 +22,8 @@ class Settings(DatabaseSettings):
 
     palimpsest_hub_local_path: str
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
+    palimpsest_hub_max_bundle_expanded_bytes: int = Field(default=107374182400, ge=1)
+    palimpsest_hub_max_blocking_operations: int = Field(default=2, ge=1, le=16)
     # A separate KVM-capable worker installs palimpsest-local in this interpreter.
     # Unset keeps remote builds disabled; the API container never runs builds.
     palimpsest_hub_builder_python: str = ""

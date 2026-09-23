@@ -103,7 +103,10 @@ async def create_hub_build(
     store = _store_or_503()
     factory = _factory_or_503()
     project_id = token_info["project_id"]
-    async with _locked_file(store, lambda: store.acquire_project_build_lock(project_id)), factory() as session:
+    async with (
+        _locked_file(store, lambda: store.acquire_project_build_lock(project_id, blocking=False)),
+        factory() as session,
+    ):
         queued = await session.scalar(
             select(func.count())
             .select_from(PalimpsestHubBuild)

@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import re
@@ -19,7 +18,7 @@ import secrets
 import tempfile
 import uuid
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -51,8 +50,10 @@ from palimpsest_hub.services.digest import (
 from palimpsest_hub.services.hub_bundle import (
     BundleError,
     BundleLayer,
+    BundleLimitError,
     extract_blob,
     iter_bundle_tar,
+    materialize_plain_tar,
     parse_bundle,
 )
 from palimpsest_hub.services.hub_store import (
@@ -64,8 +65,10 @@ from palimpsest_hub.services.hub_store import (
     MEDIA_TYPE_LAYER_SQUASHFS,
     HubDigestMismatch,
     HubStoreError,
+    HubStoreLimit,
     HubStoreUnavailable,
     LocalPathBlobStore,
+    acquire_lock_by_polling,
     get_blob_store,
     write_upload_stream,
 )
@@ -101,6 +104,44 @@ _SUPPORTED_UPLOAD_MEDIA_TYPES = {
     MEDIA_TYPE_BUILDKIT_CACHE,
     *DISK_FORMAT_MEDIA_TYPES.values(),
 }
+
+_blocking_work_limit = 2
+_blocking_work_slots = asyncio.Semaphore(_blocking_work_limit)
+
+
+def configure_blocking_operations(limit: int) -> None:
+    """Set the process-wide cap before Hub requests begin handling filesystem work."""
+    if type(limit) is not int or not 1 <= limit <= 16:
+        raise ValueError("blocking operation limit must be an integer between 1 and 16")
+    global _blocking_work_limit, _blocking_work_slots
+    if limit == _blocking_work_limit:
+        return
+    _blocking_work_limit = limit
+    _blocking_work_slots = asyncio.Semaphore(limit)
+
+
+async def _wait_without_releasing(awaitable):
+    """Await a worker to completion, remembering rather than propagating cancellation."""
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(awaitable), cancelled
+        except asyncio.CancelledError:
+            cancelled = True
+
+
+async def _run_blocking(operation: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Run bounded filesystem work without letting cancellation strand its locks."""
+    slots = _blocking_work_slots
+    await slots.acquire()
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        result, cancelled = await _wait_without_releasing(worker)
+    finally:
+        slots.release()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -533,12 +574,13 @@ def _blob_response(
     filename: str,
     range_header: str | None,
     allow_ranges: bool = True,
+    cache_control: str = "private, max-age=31536000, immutable",
 ) -> StreamingResponse:
     start, length, status_code = 0, total, 200
     headers: dict[str, str] = {
         "Content-Type": media_type,
         "Content-Disposition": f'attachment; filename="{filename}"',
-        "Cache-Control": "private, max-age=31536000, immutable",
+        "Cache-Control": cache_control,
     }
     if allow_ranges:
         headers["Accept-Ranges"] = "bytes"
@@ -782,6 +824,7 @@ async def download_image_export_blob(
 )
 async def create_image_export_download_token(
     export_id: UUID,
+    response: Response,
     token_info: dict = Depends(get_token_info),
 ) -> dict[str, Any]:
     project_id = _required_project_id(token_info)
@@ -791,8 +834,9 @@ async def create_image_export_download_token(
         _raise_export_http(exc)
     digest, _, _, _ = _complete_export_blob(row, _store_or_503())
     token = secrets.token_urlsafe(32)
+    expires_at = int(datetime.now(UTC).timestamp()) + _EXPORT_TOKEN_TTL_SECONDS
     payload = json.dumps(
-        {"export_id": row.id, "project_id": project_id, "digest": digest},
+        {"export_id": row.id, "project_id": project_id, "digest": digest, "expires_at": expires_at},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -802,6 +846,8 @@ async def create_image_export_download_token(
     except Exception as exc:
         _logger.warning("이미지 내보내기 다운로드 토큰 저장 실패", exc_info=True)
         raise HTTPException(status_code=503, detail="다운로드 토큰을 만들 수 없습니다") from exc
+    # The body carries a bearer-equivalent URL; no cache may retain it.
+    response.headers["Cache-Control"] = "no-store"
     return {
         "url": f"/v1/image-exports/{row.id}/download?dl_token={token}",
         "expires_in": _EXPORT_TOKEN_TTL_SECONDS,
@@ -818,8 +864,6 @@ async def download_image_export_with_token(
     try:
         redis = await get_redis()
         raw_payload = await redis.get(token_key)
-        if raw_payload is not None:
-            await redis.expire(token_key, _EXPORT_TOKEN_TTL_SECONDS)
     except Exception as exc:
         _logger.warning("이미지 내보내기 다운로드 토큰 확인 실패", exc_info=True)
         raise HTTPException(status_code=503, detail="다운로드 토큰을 확인할 수 없습니다") from exc
@@ -830,7 +874,14 @@ async def download_image_export_with_token(
         project_id = payload["project_id"]
         bound_export_id = payload["export_id"]
         bound_digest = normalize_digest(payload["digest"])
-        if not isinstance(project_id, str) or bound_export_id != str(export_id) or bound_digest is None:
+        expires_at = payload["expires_at"]
+        if (
+            not isinstance(project_id, str)
+            or bound_export_id != str(export_id)
+            or bound_digest is None
+            or type(expires_at) is not int
+            or datetime.now(UTC).timestamp() >= expires_at
+        ):
             raise ValueError("invalid ticket binding")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=404, detail="다운로드 토큰이 유효하지 않습니다") from exc
@@ -850,6 +901,7 @@ async def download_image_export_with_token(
         media_type=media_type,
         filename=filename,
         range_header=request.headers.get("range"),
+        cache_control="no-store",
     )
 
 
@@ -978,7 +1030,7 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(ge
             }
 
     session_id = uuid.uuid4().hex
-    async with _locked_file(store, lambda: store.acquire_project_upload_lock(project_id)):
+    async with _locked_file(store, lambda: store.acquire_project_upload_lock(project_id, blocking=False)):
         await _expire_project_uploads(factory, store, project_id)
         async with factory() as session:
             active = await session.scalar(
@@ -1016,36 +1068,24 @@ async def _owned_upload(session, session_id: str, token_info: dict) -> Palimpses
 
 
 @asynccontextmanager
-async def _locked_file(store: LocalPathBlobStore, acquire: Callable[[], int]):
-    task = asyncio.create_task(asyncio.to_thread(acquire))
-    try:
-        fd = await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A waiting flock cannot cancel its thread; release its eventual FD.
-        def release_when_ready(done: asyncio.Task[int]) -> None:
-            try:
-                acquired = done.result()
-            except Exception:
-                return
-            store.release_blob_lock(acquired)
-
-        task.add_done_callback(release_when_ready)
-        raise
+async def _locked_file(store: LocalPathBlobStore, attempt: Callable[[], int | None]):
+    fd = await acquire_lock_by_polling(attempt)
     try:
         yield
     finally:
-        await asyncio.to_thread(store.release_blob_lock, fd)
+        # Unlock is two non-blocking syscalls; never queue it behind a lock waiter.
+        store.release_blob_lock(fd)
 
 
 @asynccontextmanager
 async def _locked_upload(store: LocalPathBlobStore, session_id: str):
-    async with _locked_file(store, lambda: store.acquire_upload_lock(session_id)):
+    async with _locked_file(store, lambda: store.acquire_upload_lock(session_id, blocking=False)):
         yield
 
 
 @asynccontextmanager
 async def _locked_blob(store: LocalPathBlobStore, digest: str):
-    async with _locked_file(store, lambda: store.acquire_blob_lock(digest)):
+    async with _locked_file(store, lambda: store.acquire_blob_lock(digest, blocking=False)):
         yield
 
 
@@ -1058,6 +1098,39 @@ def _serialize_upload(fn):
             return await fn(*args, **kwargs)
 
     return locked
+
+
+@asynccontextmanager
+async def _locked_blobs(store: LocalPathBlobStore, digests: list[str]):
+    """Hold each distinct digest lock in lexical order until the caller commits."""
+    async with AsyncExitStack() as stack:
+        for digest in sorted(set(digests)):
+            await stack.enter_async_context(_locked_blob(store, digest))
+        yield
+
+
+async def _discard_unregistered_blob(store: LocalPathBlobStore, factory, digest: str) -> None:
+    """Remove rolled-back CAS bytes only when SQL proves no layer references them.
+
+    The caller still owns this digest lock, so an ambiguous commit that actually
+    landed keeps its bytes instead of losing them to its own compensation.
+    """
+    try:
+        async with factory() as session:
+            registered = (
+                await session.execute(
+                    select(PalimpsestHubLayer.blob_digest).where(PalimpsestHubLayer.blob_digest == digest)
+                )
+            ).scalar_one_or_none()
+    except Exception:
+        _logger.warning("rolled-back blob retained: registration state unverified", exc_info=True)
+        return
+    if registered is not None:
+        return
+    try:
+        await _run_blocking(store.delete, digest)
+    except OSError:
+        _logger.warning("rolled-back blob could not be removed", exc_info=True)
 
 
 @router.get("/uploads/{session_id}", response_model=HubUploadStatusResponse, operation_id="get_upload_status")
@@ -1150,6 +1223,7 @@ async def _finalize_upload_locked(
 ) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
+    settings = get_settings()
 
     offset_hdr = request.headers.get("Upload-Offset")
     if offset_hdr is None:
@@ -1172,12 +1246,17 @@ async def _finalize_upload_locked(
         )
 
     try:
-        await asyncio.to_thread(store.reconcile_upload, session_id, already)
+        await _run_blocking(store.reconcile_upload, session_id, already)
     except HubStoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     try:
-        finalized = store.finalize_upload(session_id, declared)
+        finalized = await _run_blocking(
+            store.finalize_upload_inspection,
+            session_id,
+            declared,
+            max_bytes=settings.palimpsest_hub_max_blob_bytes,
+        )
     except HubDigestMismatch as exc:
         async with factory() as session:
             row = await session.get(PalimpsestHubUpload, session_id)
@@ -1185,6 +1264,14 @@ async def _finalize_upload_locked(
                 await session.delete(row)
                 await session.commit()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HubStoreLimit as exc:
+        await _run_blocking(store.abort_upload, session_id)
+        async with factory() as session:
+            row = await session.get(PalimpsestHubUpload, session_id)
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     except HubStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1201,57 +1288,64 @@ async def _finalize_upload_locked(
         "os_variant": meta.os_variant,
         "base_image_digest": meta.base_image_digest,
     }
+    created = False
+    existing: PalimpsestHubLayer | None = None
+    async with _locked_blob(store, finalized.blob_digest):
+        created = await _run_blocking(store.publish_verified, store.upload_path(session_id), finalized)
+        try:
+            async with factory() as session:
+                existing = (
+                    await session.execute(
+                        select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == finalized.blob_digest)
+                    )
+                ).scalar_one_or_none()
+                if existing is None:
+                    session.add(
+                        PalimpsestHubLayer(
+                            blob_digest=finalized.blob_digest,
+                            blob_md5=finalized.blob_md5,
+                            size_bytes=finalized.size_bytes,
+                            media_type=meta.resolved_media_type(),
+                            disk_format=meta.disk_format,
+                            arch=meta.arch,
+                            os_variant=meta.os_variant,
+                            config_digest=compute_config_digest(config),
+                            chain_id=meta.chain_id,
+                            parent_digest=meta.parent_digest,
+                            name=meta.name,
+                            kind=meta.kind,
+                            ubuntu_base=meta.ubuntu_base,
+                            python_version=meta.python_version,
+                            config_json=config,
+                            project_id=_project_id(token_info),
+                            is_published=meta.is_published,
+                            created_by=token_info.get("user_id"),
+                        )
+                    )
+                else:
+                    conflicts = _registration_conflicts(existing, meta)
+                    if conflicts:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"blob {finalized.blob_digest} is already registered with incompatible descriptor fields: "
+                                + ", ".join(conflicts)
+                            ),
+                        )
+                    await _grant_layer_access(session, finalized.blob_digest, token_info)
+                    if meta.is_published:
+                        existing.is_published = True
+                upload = await session.get(PalimpsestHubUpload, session_id)
+                if upload is not None:
+                    await session.delete(upload)
+                await session.commit()
+        except BaseException:
+            if created:
+                await _discard_unregistered_blob(store, factory, finalized.blob_digest)
+            raise
 
-    async with _locked_blob(store, finalized.blob_digest), factory() as session:
-        existing = (
-            await session.execute(
-                select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == finalized.blob_digest)
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            session.add(
-                PalimpsestHubLayer(
-                    blob_digest=finalized.blob_digest,
-                    blob_md5=finalized.blob_md5,
-                    size_bytes=finalized.size_bytes,
-                    media_type=meta.resolved_media_type(),
-                    disk_format=meta.disk_format,
-                    # Generic/legacy SquashFS descriptors remain architecture-neutral.
-                    # Cloud images and runtime packs send an explicit architecture.
-                    arch=meta.arch,
-                    os_variant=meta.os_variant,
-                    config_digest=compute_config_digest(config),
-                    chain_id=meta.chain_id,
-                    parent_digest=meta.parent_digest,
-                    name=meta.name,
-                    kind=meta.kind,
-                    ubuntu_base=meta.ubuntu_base,
-                    python_version=meta.python_version,
-                    config_json=config,
-                    project_id=_project_id(token_info),
-                    is_published=meta.is_published,
-                    created_by=token_info.get("user_id"),
-                )
-            )
-        else:
-            conflicts = _registration_conflicts(existing, meta)
-            if conflicts:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"blob {finalized.blob_digest} is already registered with incompatible descriptor fields: "
-                        + ", ".join(conflicts)
-                    ),
-                )
-            await _grant_layer_access(session, finalized.blob_digest, token_info)
-            if meta.is_published:
-                existing.is_published = True
-        upload = await session.get(PalimpsestHubUpload, session_id)
-        if upload is not None:
-            await session.delete(upload)
-        await session.commit()
     try:
-        store.abort_upload(session_id)
+        await _run_blocking(store.abort_upload, session_id)
     except OSError:
         _logger.warning("registered upload staging could not be removed")
 
@@ -1340,12 +1434,95 @@ async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get
     )
 
 
+def _stage_bundle_layers(
+    store: LocalPathBlobStore,
+    bundle_path: Path,
+    stage_dir: Path,
+    *,
+    max_blob_bytes: int,
+    max_expanded_bytes: int,
+) -> list[tuple[dict[str, Any], Path, Any]]:
+    """Parse, extract, and hash every candidate before any CAS publication."""
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    plain = materialize_plain_tar(bundle_path, stage_dir / "bundle.tar", max_expanded_bytes=max_expanded_bytes)
+    parsed = parse_bundle(
+        plain,
+        max_blob_bytes=max_blob_bytes,
+        max_expanded_bytes=max_expanded_bytes,
+    )
+    staged_layers: list[tuple[dict[str, Any], Path, Any]] = []
+    try:
+        for entry in parsed.layers:
+            declared = entry["blob_digest"]
+            staged = stage_dir / f"blob-{declared[len('sha256:') :]}"
+            extract_blob(
+                plain,
+                parsed.blob_members[declared],
+                staged,
+                expected_size=entry["size_bytes"],
+                max_blob_bytes=max_blob_bytes,
+                max_expanded_bytes=max_expanded_bytes,
+            )
+            finalized = store.inspect_file(staged, max_bytes=max_blob_bytes)
+            if finalized.blob_digest != declared or finalized.size_bytes != entry["size_bytes"]:
+                raise BundleError(f"blob digest 또는 실제 크기가 descriptor와 일치하지 않습니다: {declared}")
+            staged_layers.append((entry, staged, finalized))
+    except BaseException:
+        for _, staged, _ in staged_layers:
+            staged.unlink(missing_ok=True)
+        raise
+    return staged_layers
+
+
+def _bundle_registration(entry: dict[str, Any]) -> HubLayerMeta | str:
+    """Return the descriptor validated as upload metadata, or a per-entry skip reason."""
+    raw_config = entry.get("config") or {}
+    if not isinstance(raw_config, dict):
+        return "레이어 config 형식이 유효하지 않습니다"
+    declared_blob = raw_config.get("blob_digest")
+    if declared_blob is not None and declared_blob != entry["blob_digest"]:
+        return "config 의 blob_digest 가 manifest descriptor 와 다릅니다"
+    chain_parent = entry.get("parent_digest")
+    declared_parent = raw_config.get("parent_digest")
+    if declared_parent is not None and declared_parent != chain_parent:
+        return "config 의 parent_digest 가 번들 체인과 다릅니다"
+    try:
+        return HubLayerMeta(
+            name=raw_config.get("name") or entry.get("name") or "",
+            kind=raw_config.get("kind") or "squashfs",
+            ubuntu_base=raw_config.get("ubuntu_base"),
+            python_version=raw_config.get("python_version"),
+            parent_digest=chain_parent,
+            chain_id=raw_config.get("chain_id"),
+            base_image_digest=raw_config.get("base_image_digest"),
+            media_type=entry.get("media_type"),
+            disk_format=raw_config.get("disk_format"),
+            arch=raw_config.get("arch"),
+            os_variant=raw_config.get("os_variant"),
+        )
+    except (TypeError, ValueError):
+        return "레이어 descriptor 가 유효하지 않습니다"
+
+
+def _publish_staged_bundle(
+    store: LocalPathBlobStore, staged_layers: list[tuple[Path, Any]], created: list[str]
+) -> None:
+    """Publish staged bundle bytes; the caller owns every referenced digest lock.
+
+    Partial publication is recorded in `created` so the caller's reference-aware
+    compensation can decide each digest instead of deleting shared bytes here.
+    """
+    for staged, finalized in staged_layers:
+        if store.publish_verified(staged, finalized):
+            created.append(finalized.blob_digest)
+
+
 @router.post("/bundles/import", response_model=HubBundleImportResponse, operation_id="import_bundle")
 async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
-    """번들을 받아 blob digest 를 **전부 재검증**한 뒤 허브에 등록한다."""
+    """Import a bounded OCI bundle without publishing bytes before validation."""
     factory = _factory_or_503()
     store = _store_or_503()
-
+    settings = get_settings()
     imported: list[str] = []
     skipped: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="palimpsest-import-") as tmpdir:
@@ -1360,69 +1537,100 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_i
                 out.write(chunk)
 
         try:
-            parsed = parse_bundle(bundle_path)
-        except (BundleError, HubStoreError) as exc:
+            staged_layers = await _run_blocking(
+                _stage_bundle_layers,
+                store,
+                bundle_path,
+                tmp / "staged",
+                max_blob_bytes=settings.palimpsest_hub_max_blob_bytes,
+                max_expanded_bytes=settings.palimpsest_hub_max_bundle_expanded_bytes,
+            )
+        except (BundleLimitError, HubStoreLimit) as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except (BundleError, HubStoreError, KeyError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        async with factory() as session:
-            for entry in parsed.layers:
-                declared = entry["blob_digest"]
+        publishable: list[tuple[Path, Any, HubLayerMeta]] = []
+        for entry, staged, finalized in staged_layers:
+            registration = _bundle_registration(entry)
+            if isinstance(registration, str):
+                skipped.append({"digest": finalized.blob_digest, "error": registration})
+                continue
+            publishable.append((staged, finalized, registration))
+
+        if publishable:
+            created: list[str] = []
+            async with _locked_blobs(store, [finalized.blob_digest for _, finalized, _ in publishable]):
                 try:
-                    staged = tmp / f"blob-{declared[len('sha256:') :][:16]}"
-                    extract_blob(bundle_path, parsed.blob_members[declared], staged)
-                    with staged.open("rb") as handle:
-                        actual = "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
-                    if actual != declared:
-                        skipped.append({"digest": declared, "error": "digest 불일치"})
-                        continue
-                    finalized = store.ingest_file(staged)
-                    staged.unlink(missing_ok=True)
-                    if finalized.blob_digest != declared:
-                        raise HubStoreError("imported blob digest changed")
-                except (BundleError, HubStoreError, KeyError, OSError) as exc:
-                    skipped.append({"digest": declared, "error": str(exc)[:200]})
-                    continue
-
-                existing = (
-                    await session.execute(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == declared))
-                ).scalar_one_or_none()
-                if existing is not None:
-                    await _grant_layer_access(session, declared, token_info)
-                    imported.append(declared)
-                    continue
-
-                config = dict(entry.get("config") or {})
-                parent_digest = normalize_digest(entry.get("parent_digest") or "")
-                name = config.get("name") or entry.get("name") or ""
-                if not _NAME_RE.match(name or ""):
-                    skipped.append({"digest": declared, "error": "레이어 이름 형식이 유효하지 않습니다"})
-                    continue
-                kind = config.get("kind") or "squashfs"
-                if not _KIND_RE.match(kind):
-                    skipped.append({"digest": declared, "error": "kind 형식이 유효하지 않습니다"})
-                    continue
-
-                session.add(
-                    PalimpsestHubLayer(
-                        blob_digest=declared,
-                        blob_md5=finalized.blob_md5,
-                        size_bytes=finalized.size_bytes,
-                        media_type=MEDIA_TYPE_LAYER_SQUASHFS,
-                        config_digest=compute_config_digest(config or {"blob_digest": declared}),
-                        chain_id=normalize_digest(config.get("chain_id") or ""),
-                        parent_digest=parent_digest,
-                        name=name,
-                        kind=kind,
-                        ubuntu_base=config.get("ubuntu_base"),
-                        python_version=config.get("python_version"),
-                        config_json=config or {"blob_digest": declared},
-                        project_id=_project_id(token_info),
-                        is_published=False,
-                        created_by=token_info.get("user_id"),
+                    await _run_blocking(
+                        _publish_staged_bundle,
+                        store,
+                        [(staged, finalized) for staged, finalized, _ in publishable],
+                        created,
                     )
-                )
-                imported.append(declared)
-            await session.commit()
+                    async with factory() as session:
+                        for _, finalized, meta in publishable:
+                            existing = (
+                                await session.execute(
+                                    select(PalimpsestHubLayer).where(
+                                        PalimpsestHubLayer.blob_digest == finalized.blob_digest
+                                    )
+                                )
+                            ).scalar_one_or_none()
+                            if existing is not None:
+                                conflicts = _registration_conflicts(existing, meta)
+                                if conflicts:
+                                    skipped.append(
+                                        {
+                                            "digest": finalized.blob_digest,
+                                            "error": "등록된 descriptor 와 호환되지 않습니다: " + ", ".join(conflicts),
+                                        }
+                                    )
+                                    continue
+                                await _grant_layer_access(session, finalized.blob_digest, token_info)
+                            else:
+                                config = {
+                                    "name": meta.name,
+                                    "kind": meta.kind,
+                                    "ubuntu_base": meta.ubuntu_base,
+                                    "python_version": meta.python_version,
+                                    "parent_digest": meta.parent_digest,
+                                    "chain_id": meta.chain_id,
+                                    "blob_digest": finalized.blob_digest,
+                                    "disk_format": meta.disk_format,
+                                    "arch": meta.arch,
+                                    "os_variant": meta.os_variant,
+                                    "base_image_digest": meta.base_image_digest,
+                                }
+                                session.add(
+                                    PalimpsestHubLayer(
+                                        blob_digest=finalized.blob_digest,
+                                        blob_md5=finalized.blob_md5,
+                                        size_bytes=finalized.size_bytes,
+                                        media_type=meta.resolved_media_type(),
+                                        disk_format=meta.disk_format,
+                                        arch=meta.arch,
+                                        os_variant=meta.os_variant,
+                                        config_digest=compute_config_digest(config),
+                                        chain_id=meta.chain_id,
+                                        parent_digest=meta.parent_digest,
+                                        name=meta.name,
+                                        kind=meta.kind,
+                                        ubuntu_base=meta.ubuntu_base,
+                                        python_version=meta.python_version,
+                                        config_json=config,
+                                        project_id=_project_id(token_info),
+                                        is_published=False,
+                                        created_by=token_info.get("user_id"),
+                                    )
+                                )
+                            imported.append(finalized.blob_digest)
+                        await session.commit()
+                except BaseException:
+                    imported.clear()
+                    for digest in reversed(created):
+                        await _discard_unregistered_blob(store, factory, digest)
+                    raise
 
     return {"imported": imported, "imported_count": len(imported), "skipped": skipped}
 

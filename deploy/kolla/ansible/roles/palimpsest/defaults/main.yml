@@ -49,6 +49,9 @@ palimpsest_admin_endpoint_url: "{{ palimpsest_internal_endpoint_url }}"
 palimpsest_hub_volume: "palimpsest_hub"
 palimpsest_hub_path: "/var/lib/palimpsest/hub"
 palimpsest_config_dir: "{{ node_config_directory }}/palimpsest"
+palimpsest_hub_max_blob_bytes: 107374182400
+palimpsest_hub_max_bundle_expanded_bytes: 107374182400
+palimpsest_hub_max_blocking_operations: 2
 
 palimpsest_public_haproxy_enabled: false
 palimpsest_public_haproxy_fqdn: ""
@@ -71,6 +74,9 @@ palimpsest_services:
       REDIS_URL: "{{ palimpsest_redis_url }}"
       OS_PASSWORD: "{{ palimpsest_keystone_password }}"
       PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+      PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
+      PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
+      PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
       OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
       OS_USERNAME: "{{ palimpsest_keystone_user }}"
       OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
@@ -115,6 +121,7 @@ palimpsest_services:
       REDIS_URL: "{{ palimpsest_redis_url }}"
       OS_PASSWORD: "{{ palimpsest_keystone_password }}"
       PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+      PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
       OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
       OS_USERNAME: "{{ palimpsest_keystone_user }}"
       OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"

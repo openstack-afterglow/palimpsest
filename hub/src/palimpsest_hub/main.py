@@ -12,6 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from palimpsest_hub.api.builds import router as build_router
+from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.cache import close_redis
 from palimpsest_hub.config import get_settings
@@ -46,6 +47,7 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
+    configure_blocking_operations(settings.palimpsest_hub_max_blocking_operations)
     init_db(
         settings.database_url,
         pool_size=settings.database_pool_size,

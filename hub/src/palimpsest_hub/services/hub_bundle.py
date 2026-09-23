@@ -18,9 +18,13 @@ tar 스트리밍은 `tarfile.addfile` 을 쓰지 않는다 — 그 API 는 큰 b
 
 from __future__ import annotations
 
-import io
+import bz2
+import gzip
+import hashlib
 import json
 import logging
+import lzma
+import os
 import tarfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -29,9 +33,10 @@ from typing import Any
 
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.hub_store import (
+    DISK_FORMAT_MEDIA_TYPES,
+    MEDIA_TYPE_BUILDKIT_CACHE,
     MEDIA_TYPE_LAYER_CONFIG,
     MEDIA_TYPE_LAYER_SQUASHFS,
-    HubStoreError,
     LocalPathBlobStore,
 )
 
@@ -41,15 +46,74 @@ OCI_LAYOUT_VERSION = "1.0.0"
 MEDIA_TYPE_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 MEDIA_TYPE_INDEX = "application/vnd.oci.image.index.v1+json"
 ANNOTATION_NAME = "dev.afterglow.palimpsest.name"
+ANNOTATION_CONFIG_DIGEST = "dev.afterglow.palimpsest.config-digest"
 ANNOTATION_CHAIN_ID = "dev.afterglow.palimpsest.chain-id"
 
 _MAX_BUNDLE_MEMBERS = 4096
 _MAX_JSON_BYTES = 4 * 1024 * 1024
+_MAX_TAR_EXTENSION_BYTES = 4 * 1024 * 1024
+_DECOMPRESSION_CHUNK_BYTES = 1024 * 1024
 _TAR_BLOCK = 512
 
 
 class BundleError(ValueError):
     """번들 구성/해석 실패."""
+
+
+class BundleLimitError(BundleError):
+    """번들이 명시된 자원 상한을 넘었다."""
+
+
+def materialize_plain_tar(source: Path, destination: Path, *, max_expanded_bytes: int) -> Path:
+    """Return an uncompressed tar, expanding a supported stream into ``destination`` when needed."""
+    if type(max_expanded_bytes) is not int or max_expanded_bytes < 1:
+        raise ValueError("max_expanded_bytes must be a positive integer")
+    try:
+        with source.open("rb") as handle:
+            prefix = handle.read(_TAR_BLOCK)
+    except OSError as exc:
+        raise BundleError("번들 파일을 읽을 수 없습니다") from exc
+
+    if prefix.startswith(b"\x1f\x8b"):
+        opener = gzip.open
+    elif prefix.startswith(b"BZh"):
+        opener = bz2.open
+    elif prefix.startswith(b"\xfd7zXZ\x00"):
+        opener = lzma.open
+    elif len(prefix) == _TAR_BLOCK and prefix[257:262] == b"ustar":
+        try:
+            if source.stat().st_size > max_expanded_bytes:
+                raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+        except OSError as exc:
+            raise BundleError("번들 파일을 읽을 수 없습니다") from exc
+        return source
+    else:
+        raise BundleError("지원하지 않는 번들 압축 형식입니다")
+
+    if source == destination:
+        raise BundleError("압축 번들 대상은 원본과 달라야 합니다")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.unlink(missing_ok=True)
+        written = 0
+        with opener(source, "rb") as compressed, destination.open("xb") as plain:
+            while chunk := compressed.read(_DECOMPRESSION_CHUNK_BYTES):
+                if written + len(chunk) > max_expanded_bytes:
+                    raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+                plain.write(chunk)
+                written += len(chunk)
+            plain.flush()
+            os.fsync(plain.fileno())
+        return destination
+    except BundleError:
+        destination.unlink(missing_ok=True)
+        raise
+    except (OSError, EOFError, lzma.LZMAError) as exc:
+        destination.unlink(missing_ok=True)
+        raise BundleError("압축 번들을 풀 수 없습니다") from exc
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 @dataclass(frozen=True)
@@ -121,7 +185,10 @@ def build_manifest(chain: list[BundleLayer], config_blobs: dict[str, bytes]) -> 
                 "mediaType": layer.media_type,
                 "digest": layer.blob_digest,
                 "size": layer.size_bytes,
-                "annotations": {ANNOTATION_NAME: layer.name},
+                "annotations": {
+                    ANNOTATION_NAME: layer.name,
+                    ANNOTATION_CONFIG_DIGEST: _config_digest(config_blobs[layer.blob_digest]),
+                },
             }
             for layer in chain
         ],
@@ -212,12 +279,21 @@ def iter_bundle_tar(store: LocalPathBlobStore, chains: list[list[BundleLayer]]) 
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class BundleBlobMember:
+    """A validated regular tar member and the byte offset of its payload."""
+
+    name: str
+    size_bytes: int
+    data_offset: int
+
+
 @dataclass
 class ParsedBundle:
     """번들에서 읽어낸 것. blob 은 아직 허브에 편입되지 않았다."""
 
     layers: list[dict[str, Any]]  # 루트→리프 순서, 중복 제거됨
-    blob_members: dict[str, str]  # digest → tar 내부 멤버 이름
+    blob_members: dict[str, BundleBlobMember]  # digest → 검증된 tar 멤버
 
 
 def _safe_member_name(name: str) -> str:
@@ -227,113 +303,381 @@ def _safe_member_name(name: str) -> str:
     return name
 
 
-def parse_bundle(tar_path: Path) -> ParsedBundle:
-    """번들 tar 를 해석해 레이어 메타를 뽑는다. blob 편입은 호출자 몫.
+def _parse_tar_size(field: bytes, *, name: str) -> int:
+    """Parse the tar size field without accepting a negative or malformed value."""
+    if not field:
+        raise BundleError(f"tar 멤버 크기가 유효하지 않습니다: {name!r}")
+    if field[0] & 0x80:
+        # GNU base-256 values reserve the high bit as a marker; 0xff represents
+        # a negative value and is never a valid member size.
+        if field[0] == 0xFF:
+            raise BundleError(f"tar 멤버 크기가 유효하지 않습니다: {name!r}")
+        return int.from_bytes(bytes([field[0] & 0x7F]) + field[1:], "big")
+    value = field.rstrip(b"\0 ")
+    if not value:
+        return 0
+    if any(digit not in b"01234567" for digit in value):
+        raise BundleError(f"tar 멤버 크기가 유효하지 않습니다: {name!r}")
+    return int(value, 8)
 
-    검증: 멤버 수 상한, 경로 traversal 거부, `index.json`/manifest/config 존재,
-    layers[] digest 형식. blob 바이트의 digest 재계산은 편입 시 `store.ingest_file` 이 한다.
-    """
+
+def _tar_member_name(header: bytes) -> str:
+    name = header[:100].split(b"\0", 1)[0]
+    prefix = header[345:500].split(b"\0", 1)[0]
+    raw_name = prefix + (b"/" if prefix and name else b"") + name
+    return _safe_member_name(raw_name.decode("utf-8", "surrogateescape"))
+
+
+def _consume_zero_trailer(handle: Any) -> bool:
+    while chunk := handle.read(_DECOMPRESSION_CHUNK_BYTES):
+        if any(chunk):
+            return False
+    return True
+
+
+def _scan_members(tar_path: Path, *, max_member_bytes: int, max_expanded_bytes: int) -> dict[str, BundleBlobMember]:
+    """Pre-scan physical tar headers without allowing tarfile to load extensions."""
+    by_name: dict[str, BundleBlobMember] = {}
+    member_count = 0
+    expanded_bytes = 0
+    try:
+        total_bytes = tar_path.stat().st_size
+        offset = 0
+        terminated = False
+        with tar_path.open("rb") as handle:
+            while offset < total_bytes:
+                if total_bytes - offset < _TAR_BLOCK:
+                    raise BundleError("tar 헤더가 잘렸습니다")
+                header = handle.read(_TAR_BLOCK)
+                if len(header) != _TAR_BLOCK:
+                    raise BundleError("tar 헤더를 읽을 수 없습니다")
+                if not any(header):
+                    if not _consume_zero_trailer(handle):
+                        raise BundleError("tar 종료 블록 뒤에 데이터가 있습니다")
+                    terminated = True
+                    break
+
+                member_count += 1
+                if member_count > _MAX_BUNDLE_MEMBERS:
+                    raise BundleLimitError(f"번들 멤버 수가 상한({_MAX_BUNDLE_MEMBERS})을 넘습니다")
+                name = _tar_member_name(header)
+                size = _parse_tar_size(header[124:136], name=name)
+                padded_size = size + (-size % _TAR_BLOCK)
+                data_offset = offset + _TAR_BLOCK
+                next_offset = data_offset + padded_size
+                if next_offset > total_bytes:
+                    raise BundleError(f"tar 멤버 payload가 잘렸습니다: {name}")
+
+                typeflag = header[156:157]
+                if typeflag in {b"x", b"g", b"L", b"K", b"S"} and size > _MAX_TAR_EXTENSION_BYTES:
+                    raise BundleLimitError(f"tar 확장 멤버 크기가 상한을 넘습니다: {name}")
+                expanded_bytes += size
+                if expanded_bytes > max_expanded_bytes:
+                    raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+                if typeflag in {b"\0", b"0", b"7"}:
+                    if size > max_member_bytes:
+                        raise BundleLimitError(f"번들 멤버 크기가 상한을 넘습니다: {name}")
+                    if name in by_name:
+                        raise BundleError(f"번들에 중복 멤버가 있습니다: {name}")
+                    by_name[name] = BundleBlobMember(name=name, size_bytes=size, data_offset=data_offset)
+                handle.seek(padded_size, os.SEEK_CUR)
+                offset = next_offset
+        if not terminated:
+            raise BundleError("tar 종료 블록이 없습니다")
+    except BundleError:
+        raise
+    except OSError as exc:
+        raise BundleError("번들 tar를 읽을 수 없습니다") from exc
+    return by_name
+
+
+def _plain_member_chunks(tar_path: Path, member: BundleBlobMember) -> Iterator[bytes]:
+    """Read an already pre-scanned member at its payload offset from a plain tar."""
+    try:
+        with tar_path.open("rb") as handle:
+            handle.seek(member.data_offset)
+            remaining = member.size_bytes
+            while remaining:
+                chunk = handle.read(min(_DECOMPRESSION_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise BundleError(f"{member.name} 실제 크기가 tar 헤더와 일치하지 않습니다")
+                remaining -= len(chunk)
+                yield chunk
+    except BundleError:
+        raise
+    except OSError as exc:
+        raise BundleError("번들 tar를 읽을 수 없습니다") from exc
+
+
+def _read_member_bytes(
+    tar_path: Path, member: BundleBlobMember, *, max_member_bytes: int, max_expanded_bytes: int
+) -> bytes:
+    """Read one already-scanned JSON member directly from its payload offset."""
+    if member.size_bytes > max_member_bytes or member.size_bytes > _MAX_JSON_BYTES:
+        raise BundleLimitError(f"{member.name} 크기가 상한을 넘습니다")
+    if member.size_bytes > max_expanded_bytes:
+        raise BundleLimitError("번들 확장 크기가 상한을 넘습니다")
+    return b"".join(_plain_member_chunks(tar_path, member))
+
+
+def _descriptor_member(
+    descriptor: Any, by_name: dict[str, BundleBlobMember], *, label: str
+) -> tuple[str, BundleBlobMember]:
+    if not isinstance(descriptor, dict):
+        raise BundleError(f"{label} 형식이 유효하지 않습니다")
+    digest = normalize_digest(descriptor.get("digest", ""))
+    size = descriptor.get("size")
+    if digest is None:
+        raise BundleError(f"{label} 의 digest 형식이 유효하지 않습니다")
+    if type(size) is not int or size < 0:
+        raise BundleError(f"{label} 의 size 형식이 유효하지 않습니다")
+    member_name = f"blobs/sha256/{digest[len('sha256:') :]}"
+    member = by_name.get(member_name)
+    if member is None:
+        raise BundleError(f"번들에 blob 이 없습니다: {digest}")
+    if member.size_bytes != size:
+        raise BundleError(f"{label} 의 선언 크기와 tar 크기가 일치하지 않습니다: {digest}")
+    return digest, member
+
+
+def _read_json(
+    tar_path: Path,
+    member: BundleBlobMember,
+    *,
+    max_member_bytes: int,
+    max_expanded_bytes: int,
+    expected_digest: str | None = None,
+) -> Any:
+    payload = _read_member_bytes(
+        tar_path,
+        member,
+        max_member_bytes=max_member_bytes,
+        max_expanded_bytes=max_expanded_bytes,
+    )
+    if expected_digest is not None:
+        actual = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        if actual != expected_digest:
+            raise BundleError(f"{member.name} digest 가 descriptor와 일치하지 않습니다")
+    try:
+        return json.loads(payload)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BundleError(f"{member.name} JSON 형식이 유효하지 않습니다") from exc
+
+
+def _annotated_layer_config(
+    tar_path: Path,
+    layer_desc: dict[str, Any],
+    by_name: dict[str, BundleBlobMember],
+    configs_by_digest: dict[str, dict[str, Any]],
+    *,
+    blob_digest: str,
+    parent_digest: str | None,
+    max_blob_bytes: int,
+    max_expanded_bytes: int,
+) -> dict[str, Any] | None:
+    """Resolve and validate the optional per-layer config annotation."""
+    annotations = layer_desc.get("annotations")
+    if annotations is None:
+        return None
+    if not isinstance(annotations, dict):
+        raise BundleError("layer descriptor 의 annotations 형식이 유효하지 않습니다")
+    if ANNOTATION_CONFIG_DIGEST not in annotations:
+        return None
+    raw_config_digest = annotations[ANNOTATION_CONFIG_DIGEST]
+    config_digest = normalize_digest(raw_config_digest) if isinstance(raw_config_digest, str) else None
+    if config_digest is None:
+        raise BundleError("layer descriptor 의 config-digest annotation 형식이 유효하지 않습니다")
+    member_name = f"blobs/sha256/{config_digest[len('sha256:') :]}"
+    config_member = by_name.get(member_name)
+    if config_member is None:
+        raise BundleError(f"config-digest annotation blob 이 번들에 없습니다: {config_digest}")
+    if config_digest not in configs_by_digest:
+        config = _read_json(
+            tar_path,
+            config_member,
+            max_member_bytes=max_blob_bytes,
+            max_expanded_bytes=max_expanded_bytes,
+            expected_digest=config_digest,
+        )
+        if not isinstance(config, dict):
+            raise BundleError("config-digest annotation JSON 형식이 유효하지 않습니다")
+        configs_by_digest[config_digest] = config
+    config = configs_by_digest[config_digest]
+    _validate_layer_config(config, blob_digest=blob_digest, parent_digest=parent_digest)
+    return config
+
+
+def _validate_layer_config(config: dict[str, Any], *, blob_digest: str, parent_digest: str | None) -> None:
+    """Reject config identity fields that contradict this manifest layer."""
+    if "blob_digest" in config and config["blob_digest"] != blob_digest:
+        raise BundleError(f"config 의 blob_digest 가 layer descriptor 와 일치하지 않습니다: {blob_digest}")
+    if "parent_digest" in config and config["parent_digest"] != parent_digest:
+        raise BundleError(f"config 의 parent_digest 가 manifest 체인과 일치하지 않습니다: {blob_digest}")
+
+
+def parse_bundle(tar_path: Path, *, max_blob_bytes: int, max_expanded_bytes: int) -> ParsedBundle:
+    """Parse a pre-materialized OCI tar with bounded header and content reads."""
+    if type(max_blob_bytes) is not int or max_blob_bytes < 1:
+        raise ValueError("max_blob_bytes must be a positive integer")
+    if type(max_expanded_bytes) is not int or max_expanded_bytes < 1:
+        raise ValueError("max_expanded_bytes must be a positive integer")
+
     layers_by_digest: dict[str, dict[str, Any]] = {}
     ordered: list[str] = []
-    blob_members: dict[str, str] = {}
-
-    with tarfile.open(tar_path, mode="r:*") as tar:
-        members = tar.getmembers()
-        if len(members) > _MAX_BUNDLE_MEMBERS:
-            raise BundleError(f"번들 멤버 수가 상한({_MAX_BUNDLE_MEMBERS})을 넘습니다")
-
-        by_name: dict[str, tarfile.TarInfo] = {}
-        for member in members:
-            if not member.isfile():
-                continue
-            by_name[_safe_member_name(member.name)] = member
-
-        if "index.json" not in by_name:
-            raise BundleError("번들에 index.json 이 없습니다")
-
-        def _read_json(name: str) -> Any:
-            info = by_name.get(name)
-            if info is None:
-                raise BundleError(f"번들에 {name} 이(가) 없습니다")
-            if info.size > _MAX_JSON_BYTES:
-                raise BundleError(f"{name} 크기가 상한을 넘습니다")
-            handle = tar.extractfile(info)
-            if handle is None:
-                raise BundleError(f"{name} 을(를) 읽을 수 없습니다")
-            return json.loads(io.TextIOWrapper(handle, encoding="utf-8").read())
-
-        index = _read_json("index.json")
-        manifests = index.get("manifests") if isinstance(index, dict) else None
-        if not isinstance(manifests, list) or not manifests:
-            raise BundleError("index.json 에 manifests 가 없습니다")
-
-        for descriptor in manifests:
-            digest = normalize_digest((descriptor or {}).get("digest", ""))
-            if digest is None:
-                raise BundleError("manifest descriptor 의 digest 형식이 유효하지 않습니다")
-            manifest = _read_json(f"blobs/sha256/{digest[len('sha256:') :]}")
-            layer_descriptors = manifest.get("layers") if isinstance(manifest, dict) else None
-            if not isinstance(layer_descriptors, list) or not layer_descriptors:
-                raise BundleError("manifest 에 layers 가 없습니다")
-
-            # 🔴 부모 체인의 권위는 **manifest 의 layers[] 순서**다(루트→리프).
-            # config blob 에서 parent_digest 를 읽으면 안 된다 — manifest 는 leaf 의 config 만
-            # 참조하므로 조상들은 config 를 못 받아 전부 루트로 import 되고 체인이 조용히 사라진다.
-            previous_digest: str | None = None
-            for layer_desc in layer_descriptors:
-                blob_digest = normalize_digest((layer_desc or {}).get("digest", ""))
-                if blob_digest is None:
-                    raise BundleError("layer descriptor 의 digest 형식이 유효하지 않습니다")
-                member_name = f"blobs/sha256/{blob_digest[len('sha256:') :]}"
-                if member_name not in by_name:
-                    raise BundleError(f"번들에 blob 이 없습니다: {blob_digest}")
-                blob_members[blob_digest] = member_name
-                if blob_digest in layers_by_digest:
-                    # 여러 manifest 가 공통 조상을 공유하면 여기로 온다. 이미 기록된 부모가
-                    # 이번 체인과 다르면 번들이 모순이다 — 조용히 덮어쓰지 않는다.
-                    known_parent = layers_by_digest[blob_digest].get("parent_digest")
-                    if known_parent != previous_digest:
-                        raise BundleError(
-                            f"번들의 부모 체인이 모순됩니다: {blob_digest} 의 부모가 "
-                            f"{known_parent} 와 {previous_digest} 로 다릅니다"
-                        )
-                    previous_digest = blob_digest
-                    continue
-                ordered.append(blob_digest)
-                layers_by_digest[blob_digest] = {
-                    "blob_digest": blob_digest,
-                    "size_bytes": int((layer_desc or {}).get("size") or 0),
-                    "name": ((layer_desc or {}).get("annotations") or {}).get(ANNOTATION_NAME, ""),
-                    "parent_digest": previous_digest,
-                }
-                previous_digest = blob_digest
-
-            # config 는 leaf 것만 manifest 가 참조한다. 메타 보강용으로만 쓰고,
-            # parent_digest 는 위에서 정한 값을 신뢰한다.
-            config_desc = manifest.get("config") if isinstance(manifest, dict) else None
-            config_digest = normalize_digest((config_desc or {}).get("digest", ""))
-            if config_digest is not None:
-                config_name = f"blobs/sha256/{config_digest[len('sha256:') :]}"
-                if config_name in by_name:
-                    config = _read_json(config_name)
-                    leaf_digest = normalize_digest(layer_descriptors[-1].get("digest", ""))
-                    if leaf_digest and leaf_digest in layers_by_digest and isinstance(config, dict):
-                        layers_by_digest[leaf_digest]["config"] = config
-
-    return ParsedBundle(
-        layers=[layers_by_digest[d] for d in ordered],
-        blob_members=blob_members,
+    blob_members: dict[str, BundleBlobMember] = {}
+    by_name = _scan_members(
+        tar_path,
+        max_member_bytes=max_blob_bytes,
+        max_expanded_bytes=max_expanded_bytes,
     )
+    index_member = by_name.get("index.json")
+    if index_member is None:
+        raise BundleError("번들에 index.json 이 없습니다")
+    index = _read_json(
+        tar_path,
+        index_member,
+        max_member_bytes=max_blob_bytes,
+        max_expanded_bytes=max_expanded_bytes,
+    )
+    manifests = index.get("manifests") if isinstance(index, dict) else None
+    if not isinstance(manifests, list) or not manifests:
+        raise BundleError("index.json 에 manifests 가 없습니다")
+    if len(manifests) > _MAX_BUNDLE_MEMBERS:
+        raise BundleLimitError(f"manifest 수가 상한({_MAX_BUNDLE_MEMBERS})을 넘습니다")
+
+    manifests_by_digest: dict[str, Any] = {}
+    configs_by_digest: dict[str, dict[str, Any]] = {}
+    allowed_layer_media_types = {
+        MEDIA_TYPE_LAYER_SQUASHFS,
+        MEDIA_TYPE_BUILDKIT_CACHE,
+        *DISK_FORMAT_MEDIA_TYPES.values(),
+    }
+    for manifest_descriptor in manifests:
+        digest, manifest_member = _descriptor_member(manifest_descriptor, by_name, label="manifest descriptor")
+        if digest not in manifests_by_digest:
+            manifests_by_digest[digest] = _read_json(
+                tar_path,
+                manifest_member,
+                max_member_bytes=max_blob_bytes,
+                max_expanded_bytes=max_expanded_bytes,
+                expected_digest=digest,
+            )
+        manifest = manifests_by_digest[digest]
+        layer_descriptors = manifest.get("layers") if isinstance(manifest, dict) else None
+        if not isinstance(layer_descriptors, list) or not layer_descriptors:
+            raise BundleError("manifest 에 layers 가 없습니다")
+        if len(layer_descriptors) > _MAX_BUNDLE_MEMBERS:
+            raise BundleLimitError(f"manifest layer 수가 상한({_MAX_BUNDLE_MEMBERS})을 넘습니다")
+
+        previous_digest: str | None = None
+        for layer_desc in layer_descriptors:
+            blob_digest, member = _descriptor_member(layer_desc, by_name, label="layer descriptor")
+            media_type = layer_desc.get("mediaType", MEDIA_TYPE_LAYER_SQUASHFS)
+            if type(media_type) is not str or media_type not in allowed_layer_media_types:
+                raise BundleError(f"layer descriptor 의 mediaType 이 유효하지 않습니다: {media_type!r}")
+            annotations = layer_desc.get("annotations")
+            name = annotations.get(ANNOTATION_NAME, "") if isinstance(annotations, dict) else ""
+            config = _annotated_layer_config(
+                tar_path,
+                layer_desc,
+                by_name,
+                configs_by_digest,
+                blob_digest=blob_digest,
+                parent_digest=previous_digest,
+                max_blob_bytes=max_blob_bytes,
+                max_expanded_bytes=max_expanded_bytes,
+            )
+            blob_members[blob_digest] = member
+            if blob_digest in layers_by_digest:
+                known_layer = layers_by_digest[blob_digest]
+                known_parent = known_layer.get("parent_digest")
+                if known_parent != previous_digest:
+                    raise BundleError(
+                        f"번들의 부모 체인이 모순됩니다: {blob_digest} 의 부모가 "
+                        f"{known_parent} 와 {previous_digest} 로 다릅니다"
+                    )
+                if config is not None:
+                    known_layer.setdefault("config", config)
+                previous_digest = blob_digest
+                continue
+            ordered.append(blob_digest)
+            layers_by_digest[blob_digest] = {
+                "blob_digest": blob_digest,
+                "size_bytes": member.size_bytes,
+                "media_type": media_type,
+                "name": name,
+                "parent_digest": previous_digest,
+            }
+            if config is not None:
+                layers_by_digest[blob_digest]["config"] = config
+            previous_digest = blob_digest
+
+        config_desc = manifest.get("config") if isinstance(manifest, dict) else None
+        if config_desc is not None:
+            config_digest, config_member = _descriptor_member(config_desc, by_name, label="config descriptor")
+            if config_digest not in configs_by_digest:
+                config = _read_json(
+                    tar_path,
+                    config_member,
+                    max_member_bytes=max_blob_bytes,
+                    max_expanded_bytes=max_expanded_bytes,
+                    expected_digest=config_digest,
+                )
+                if not isinstance(config, dict):
+                    raise BundleError("config JSON 형식이 유효하지 않습니다")
+                configs_by_digest[config_digest] = config
+            if previous_digest is not None:
+                config = configs_by_digest[config_digest]
+                _validate_layer_config(
+                    config,
+                    blob_digest=previous_digest,
+                    parent_digest=layers_by_digest[previous_digest]["parent_digest"],
+                )
+                layers_by_digest[previous_digest].setdefault("config", config)
+
+    return ParsedBundle(layers=[layers_by_digest[digest] for digest in ordered], blob_members=blob_members)
 
 
-def extract_blob(tar_path: Path, member_name: str, destination: Path) -> None:
-    """번들에서 blob 하나를 꺼내 임시 파일로 쓴다(편입 전)."""
-    with tarfile.open(tar_path, mode="r:*") as tar:
-        info = tar.getmember(_safe_member_name(member_name))
-        handle = tar.extractfile(info)
-        if handle is None:
-            raise HubStoreError(f"번들에서 blob 을 읽을 수 없습니다: {member_name}")
+def extract_blob(
+    tar_path: Path,
+    member: BundleBlobMember | str,
+    destination: Path,
+    *,
+    expected_size: int | None = None,
+    max_blob_bytes: int | None = None,
+    max_expanded_bytes: int = 107374182400,
+) -> None:
+    """Extract one bounded blob directly from its verified plain-tar offset."""
+    max_member_bytes = max_blob_bytes if max_blob_bytes is not None else max_expanded_bytes
+    destination.unlink(missing_ok=True)
+    try:
+        scanned = _scan_members(
+            tar_path,
+            max_member_bytes=max_member_bytes,
+            max_expanded_bytes=max_expanded_bytes,
+        )
+        member_name = _safe_member_name(member) if isinstance(member, str) else member.name
+        scanned_member = scanned.get(member_name)
+        if scanned_member is None:
+            raise BundleError(f"번들에 {member_name} 이(가) 없습니다")
+        if not isinstance(member, str) and member != scanned_member:
+            raise BundleError(f"번들 멤버가 스캔 결과와 일치하지 않습니다: {member.name}")
+        required_size = scanned_member.size_bytes if expected_size is None else expected_size
+        if type(required_size) is not int or required_size < 0 or required_size != scanned_member.size_bytes:
+            raise BundleError(f"blob 선언 크기와 tar 크기가 일치하지 않습니다: {member_name}")
+
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as out:
-            while chunk := handle.read(1024 * 1024):
+        written = 0
+        with destination.open("xb") as out:
+            for chunk in _plain_member_chunks(tar_path, scanned_member):
+                written += len(chunk)
+                if written > required_size:
+                    raise BundleLimitError(f"blob 크기가 상한을 넘습니다: {member_name}")
                 out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if written != required_size:
+            raise BundleError(f"blob 실제 크기가 tar 헤더와 일치하지 않습니다: {member_name}")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise

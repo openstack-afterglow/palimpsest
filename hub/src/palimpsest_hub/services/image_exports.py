@@ -34,6 +34,7 @@ from palimpsest_hub.models import PalimpsestHubLayer, PalimpsestImageExport
 from palimpsest_hub.openstack import get_admin_connection_for_project, get_image
 from palimpsest_hub.services.hub_store import (
     IMAGE_FORMAT_SPECS,
+    acquire_lock_by_polling,
     get_blob_store,
 )
 
@@ -413,7 +414,9 @@ async def enqueue_image_export(
     reuse_lock_fd: int | None = None
     try:
         if reuse_digest:
-            reuse_lock_fd = await asyncio.to_thread(blob_store.acquire_blob_lock, reuse_digest)
+            reuse_lock_fd = await acquire_lock_by_polling(
+                lambda: blob_store.acquire_blob_lock(reuse_digest, blocking=False)
+            )
             if valid_same_digest:
                 same_blob_present = blob_store.exists(valid_same_digest)
             if valid_global_digest:
@@ -485,7 +488,7 @@ async def enqueue_image_export(
             return target
     finally:
         if reuse_lock_fd is not None:
-            await asyncio.to_thread(blob_store.release_blob_lock, reuse_lock_fd)
+            blob_store.release_blob_lock(reuse_lock_fd)
 
 
 async def list_project_exports(
@@ -1296,7 +1299,10 @@ async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
         digest = f"sha256:{entry.name}"
         lock_fd: int | None = None
         try:
-            lock_fd = await asyncio.to_thread(blob_store.acquire_blob_lock, digest)
+            lock_fd = blob_store.acquire_blob_lock(digest, blocking=False)
+            if lock_fd is None:
+                # Another owner is publishing or reading these bytes; never wait on GC.
+                continue
             if not entry.is_file() or entry.is_symlink():
                 continue
             if now_epoch - entry.stat().st_mtime <= max_age_seconds:
@@ -1332,4 +1338,4 @@ async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
             _logger.warning("Failed Palimpsest blob GC for %s", digest, exc_info=True)
         finally:
             if lock_fd is not None:
-                await asyncio.to_thread(blob_store.release_blob_lock, lock_fd)
+                blob_store.release_blob_lock(lock_fd)

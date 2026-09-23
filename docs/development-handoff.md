@@ -1282,6 +1282,97 @@ run `35601184840`의 publish job은 `gh: Reference already exists (HTTP 422)`로
 cancelled였다. 동일 SHA를 세 branch에 게시하면 이 중복 publish 실패가
 반복된다.
 
+### Development-package recovery source checkpoint (2026-09-22; remote unverified)
+
+`development-package.yml` now serializes by ref rather than SHA, so the three
+allowed branch runs are no longer cancelled solely for sharing one commit. Its
+publish job checks out the helper source, retains the transferred-artifact
+checksum guard, then calls `scripts/publish_development_package.py`. The helper
+uses `gh` to create-or-verify the immutable lightweight tag and prerelease:
+the exact SHA, prerelease metadata, exact asset names, and downloaded
+SHA-256 bytes are required for success. Tag/release creation conflicts are
+re-read; an otherwise exact partial release may receive only its missing
+expected assets. A different tag, metadata, extra/duplicate asset, or changed
+bytes fails closed. It neither force-updates/deletes a ref nor deletes/clobbers
+an asset.
+
+`tests/unit/test_publish_development_package.py` provides fake-`gh` behavioral
+contracts for these states, and the workflow invokes it directly.
+
+### Development-package and Hub resource-boundary checkpoint (2026-09-22; remote unverified)
+
+The helper now judges every mutation by re-reading remote state instead of by
+its own exit status, so a tag, release, or asset creation whose response was
+lost still converges; the original error surfaces only when the re-read remains
+incomplete. Because ref-scoped concurrency lets three branches publish one
+commit simultaneously, an asset another run is still uploading is awaited until
+GitHub reports it `uploaded` and is never re-uploaded; a release that never
+converges fails closed.
+
+Two independent reviews then found three real defects in that Hub work, each
+now fixed and covered:
+
+1. The bounded worker gate waited for its semaphore inside the same thread pool
+   that later ran the admitted work, so enough concurrent callers deadlocked the
+   pool. A throwaway probe reproduced the hang with 64 concurrent calls.
+   Admission moved to an `asyncio.Semaphore`, and flock waits moved to a
+   dedicated executor so a lock waiter can never occupy a work thread.
+2. Rollback deleted CAS bytes after any pre-commit exception, including an
+   ambiguous commit that had actually landed, and it ran after the digest lock
+   was released. Compensation now runs inside the lock and deletes only when SQL
+   confirms no layer row references the digest; an unreadable database retains
+   the bytes.
+3. Bundle parsing re-decompressed the whole stream for each metadata read and
+   each blob, and let `tarfile` read PAX/GNU extension payloads before any
+   ceiling applied. A supported compressed bundle is now expanded once into a
+   bounded seekable spool, a direct 512-byte physical header pre-scan charges
+   every member payload to the expansion budget and caps extension members at
+   4 MiB, and layer `mediaType` is preserved and validated as `HubLayerMeta`
+   before registration instead of being hardcoded to SquashFS.
+
+The ticket issuance response is now `Cache-Control: no-store` as well, the three
+Hub ceilings are exposed as Kolla role variables, and `ARCHITECTURE.md` carries
+one authoritative table of fixed and configurable Hub limits.
+
+Executed locally on this checkpoint: `hub/` `ruff check .`, `ruff format
+--check .`, and `uv run pytest -q` (87 passed, including HTTP bundle-import
+proofs for chain registration, cloud-image descriptor preservation, contradictory
+descriptor skipping, and a 413 expansion ceiling); root `ruff check .`, `ruff
+format --check .`, `scripts/test_lanes.py run portable` (5,862 passed, 217
+skipped), the publication/workflow/lane/architecture-guard and Kolla role
+contracts, `scripts/test_lanes.py list --check`, and
+`scripts/check_architecture.py`, which is stamped. No GitHub API, workflow run,
+artifact download, tag, release, remote publication, real Redis/MySQL, large
+compressed-tar, or native KVM behavior was exercised; do not present this
+checkpoint as a green CI or remote publication result. Remote publication
+remains blocked pending explicit approval.
+
+Follow-up review closed two further defects in the same change:
+
+4. Moving the worker gate to `asyncio.Semaphore` left lock waiting on a
+   dedicated pool, which merely relocated the hang: fill that pool with waiters
+   for a held lock and the owner's unlock queues behind them. A probe confirmed
+   the previous design never completed 40 same-lock contenders. Every lock is
+   now taken with a single `LOCK_NB` attempt plus event-loop backoff, unlock runs
+   inline without a thread, and blob GC skips a locked blob instead of waiting.
+   Acquisition is therefore not FIFO; per-project session and build caps bound
+   contention. The regression runs 40 contenders on one lock, each acquiring a
+   second lock and a bounded worker while holding the first, against a two-thread
+   default executor.
+5. `export_bundle(include_base_image=True)` referenced only the leaf config in
+   the manifest, so every ancestor — including that base cloud image — was
+   re-imported with an empty config, defaulted to SquashFS, and a qcow2 base was
+   then skipped outright. Each layer descriptor now carries its own config blob
+   digest as `dev.afterglow.palimpsest.config-digest`, and import restores that
+   config after verifying its content digest and its agreement with the
+   manifest-order parent. An export-to-import round trip over HTTP proves a
+   cloud-image base plus two descendants all register with their real
+   `kind`/`disk_format`/`arch`/`chain_id`/parents.
+
+Hub verification for this follow-up: 91 passed, `ruff check .` and
+`ruff format --check .` clean.
+
+
 Python 3.10 host의 uv 설치 실패 보정 (2026-09-22): 사용자가 Ubuntu의
 system Python 3.10.12에서 plain `uv init` 후 Git URL을 `uv add`하자 새
 project의 `requires-python = ">=3.10"` 범위와 `palimpsest-local >=3.11`

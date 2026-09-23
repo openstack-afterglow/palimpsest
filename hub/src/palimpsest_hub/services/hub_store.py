@@ -27,7 +27,7 @@ import re
 import shutil
 import stat
 import tempfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -86,6 +86,10 @@ class HubStoreUnavailable(HubStoreError):
 
 class HubDigestMismatch(HubStoreError):
     """수신한 바이트의 digest 가 선언된 digest 와 다르다 (fail-closed)."""
+
+
+class HubStoreLimit(HubStoreError):
+    """A local Hub file exceeded an explicit resource ceiling."""
 
 
 @dataclass(frozen=True)
@@ -165,18 +169,25 @@ class LocalPathBlobStore:
     def locks_dir(self) -> Path:
         return self.root / "locks"
 
-    def acquire_blob_lock(self, digest: str) -> int:
-        """Acquire a cross-process exclusive lock for one validated blob digest."""
-        hex_part = _digest_hex(digest)
+    def _acquire_lock_file(self, name: str, *, blocking: bool) -> int | None:
+        """Open one lock file and take it exclusively; ``None`` means another owner holds it."""
         self.locks_dir.mkdir(parents=True, exist_ok=True)
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.locks_dir / f"{hex_part}.lock", flags, 0o600)
+        fd = os.open(self.locks_dir / name, flags, 0o600)
+        operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, operation)
+        except BlockingIOError:
+            os.close(fd)
+            return None
         except Exception:
             os.close(fd)
             raise
         return fd
+
+    def acquire_blob_lock(self, digest: str, *, blocking: bool = True) -> int | None:
+        """Acquire a cross-process exclusive lock for one validated blob digest."""
+        return self._acquire_lock_file(f"{_digest_hex(digest)}.lock", blocking=blocking)
 
     @staticmethod
     def release_blob_lock(fd: int) -> None:
@@ -193,38 +204,22 @@ class LocalPathBlobStore:
             raise HubStoreError("업로드 세션 ID 형식이 유효하지 않습니다")
         return self.uploads_dir / session_id
 
-    def acquire_upload_lock(self, session_id: str) -> int:
+    def acquire_upload_lock(self, session_id: str, *, blocking: bool = True) -> int | None:
         """Serialize offset checks, file writes and DB commits per upload session."""
         self.upload_path(session_id)  # Validate before constructing a lock path.
-        self.locks_dir.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.locks_dir / f"upload-{session_id}.lock", flags, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except Exception:
-            os.close(fd)
-            raise
-        return fd
+        return self._acquire_lock_file(f"upload-{session_id}.lock", blocking=blocking)
 
-    def acquire_project_upload_lock(self, project_id: str) -> int:
+    def acquire_project_upload_lock(self, project_id: str, *, blocking: bool = True) -> int | None:
         """Serialize creation against the per-project active-session cap."""
-        return self._acquire_project_lock(project_id, "upload")
+        return self._acquire_project_lock(project_id, "upload", blocking=blocking)
 
-    def acquire_project_build_lock(self, project_id: str) -> int:
+    def acquire_project_build_lock(self, project_id: str, *, blocking: bool = True) -> int | None:
         """Serialize count-and-insert against the per-project build cap."""
-        return self._acquire_project_lock(project_id, "build")
+        return self._acquire_project_lock(project_id, "build", blocking=blocking)
 
-    def _acquire_project_lock(self, project_id: str, kind: str) -> int:
+    def _acquire_project_lock(self, project_id: str, kind: str, *, blocking: bool) -> int | None:
         name = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
-        self.locks_dir.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(self.locks_dir / f"project-{kind}-{name}.lock", flags, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except Exception:
-            os.close(fd)
-            raise
-        return fd
+        return self._acquire_lock_file(f"project-{kind}-{name}.lock", blocking=blocking)
 
     def reconcile_upload(self, session_id: str, expected_size: int) -> None:
         """Discard unacknowledged bytes left by an interrupted PATCH."""
@@ -296,58 +291,89 @@ class LocalPathBlobStore:
             handle.write(chunk)
         return path.stat().st_size
 
-    def finalize_upload(self, session_id: str, declared_digest: str | None) -> FinalizedBlob:
-        """Verify and promote bytes; keep the upload until its SQL registration commits."""
-        path = self.upload_path(session_id)
-        if not path.is_file() or path.is_symlink():
-            raise HubStoreError("업로드 세션을 찾을 수 없습니다")
+    def inspect_file(self, source: Path, *, max_bytes: int) -> FinalizedBlob:
+        """Hash a stable bounded regular file without publishing it to CAS."""
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        if source.is_symlink() or not source.is_file():
+            raise HubStoreError("검사할 파일은 일반 파일이어야 합니다")
+        initial_size = source.stat().st_size
+        if initial_size < 0 or initial_size > max_bytes:
+            raise HubStoreLimit("파일이 허용 크기를 초과합니다")
 
         sha = hashlib.sha256()
         md5 = hashlib.md5()  # noqa: S324 — 보조 검색 키. 무결성 권위는 sha256
         size = 0
-        with path.open("rb") as handle:
+        with source.open("rb") as handle:
             while chunk := handle.read(_READ_CHUNK):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HubStoreLimit("파일이 허용 크기를 초과합니다")
                 sha.update(chunk)
                 md5.update(chunk)
-                size += len(chunk)
+            os.fsync(handle.fileno())
+        if size != initial_size or source.stat().st_size != initial_size:
+            raise HubStoreError("검사 중 파일 크기가 변경되었습니다")
+        return FinalizedBlob(blob_digest=f"sha256:{sha.hexdigest()}", blob_md5=md5.hexdigest(), size_bytes=size)
 
-        actual = f"sha256:{sha.hexdigest()}"
+    def publish_verified(self, source: Path, finalized: FinalizedBlob) -> bool:
+        """Publish a previously inspected source while the caller owns its digest lock.
+
+        Returns whether this call created/repaired the CAS target.  The caller must
+        retain both the digest lock and source staging through its SQL commit.
+        """
+        target = self.blob_path(finalized.blob_digest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        needs_copy = True
+        if target.exists() or target.is_symlink():
+            try:
+                existing = self.inspect_file(target, max_bytes=max(finalized.size_bytes, 1))
+            except HubStoreError:
+                existing = None
+            if existing is not None and existing == finalized:
+                self._sync_existing_blob(target)
+                os.utime(target, None, follow_symlinks=False)
+                needs_copy = False
+        if needs_copy:
+            try:
+                self._copy_into_blob(source, target)
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+            return True
+        return False
+
+    def finalize_upload(self, session_id: str, declared_digest: str | None) -> FinalizedBlob:
+        """Legacy standalone finalization; API publication additionally holds SQL lock coverage."""
+        path = self.upload_path(session_id)
+        finalized = self.inspect_file(path, max_bytes=2**63 - 1)
         if declared_digest is not None:
             expected = normalize_digest(declared_digest)
-            if expected is None or not hmac.compare_digest(expected, actual):
+            if expected is None or not hmac.compare_digest(expected, finalized.blob_digest):
                 path.unlink(missing_ok=True)
-                raise HubDigestMismatch(f"digest 불일치 — 선언={declared_digest!r} 실제={actual}")
+                raise HubDigestMismatch(f"digest 불일치 — 선언={declared_digest!r} 실제={finalized.blob_digest}")
+        lock_fd = self.acquire_blob_lock(finalized.blob_digest)
+        try:
+            self.publish_verified(path, finalized)
+        finally:
+            self.release_blob_lock(lock_fd)
+        return finalized
 
-        target = self.blob_path(actual)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            self._sync_existing_blob(target)
-        else:
-            # Never hardlink: a resumed PATCH after a crash may mutate its source.
-            self._copy_into_blob(path, target)
-        return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
+    def finalize_upload_inspection(
+        self, session_id: str, declared_digest: str | None, *, max_bytes: int
+    ) -> FinalizedBlob:
+        """Verify staged upload bytes, retaining valid staging for retryable registration."""
+        path = self.upload_path(session_id)
+        finalized = self.inspect_file(path, max_bytes=max_bytes)
+        if declared_digest is not None:
+            expected = normalize_digest(declared_digest)
+            if expected is None or not hmac.compare_digest(expected, finalized.blob_digest):
+                path.unlink(missing_ok=True)
+                raise HubDigestMismatch(f"digest 불일치 — 선언={declared_digest!r} 실제={finalized.blob_digest}")
+        return finalized
 
     def abort_upload(self, session_id: str) -> None:
         self.upload_path(session_id).unlink(missing_ok=True)
-
-    def ingest_file(self, source: Path) -> FinalizedBlob:
-        """이미 로컬에 있는 파일을 blob 으로 편입한다(번들 import 용)."""
-        sha = hashlib.sha256()
-        md5 = hashlib.md5()  # noqa: S324
-        size = 0
-        with source.open("rb") as handle:
-            while chunk := handle.read(_READ_CHUNK):
-                sha.update(chunk)
-                md5.update(chunk)
-                size += len(chunk)
-        actual = f"sha256:{sha.hexdigest()}"
-        target = self.blob_path(actual)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            self._sync_existing_blob(target)
-        else:
-            self._copy_into_blob(source, target)
-        return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
 
     def promote_file(self, source: Path, *, max_bytes: int) -> FinalizedBlob:
         """Atomically promote a bounded regular scratch file into the blob store."""
@@ -418,6 +444,42 @@ def get_blob_store(settings: Settings | BuildWorkerSettings | None = None) -> Lo
     if not root:
         raise HubStoreUnavailable("[palimpsest] hub_local_path 가 설정되지 않았습니다 — 허브 기능이 비활성입니다")
     return LocalPathBlobStore(Path(root))
+
+
+_LOCK_POLL_INITIAL_SECONDS = 0.002
+_LOCK_POLL_MAX_SECONDS = 0.05
+
+
+async def acquire_lock_by_polling(attempt: Callable[[], int | None]) -> int:
+    """Acquire a flock without ever parking a worker thread on the wait.
+
+    A blocking ``flock`` holds its thread for the whole wait, so enough waiters
+    fill the pool and the current owner's own work — or its unlock — can never be
+    scheduled.  Each attempt here returns immediately, so waiting costs only an
+    event-loop sleep.  Ordering is therefore not FIFO; the per-project session and
+    build caps are what bound contention on any one lock.
+    """
+    delay = _LOCK_POLL_INITIAL_SECONDS
+    while True:
+        task = asyncio.create_task(asyncio.to_thread(attempt))
+        try:
+            fd = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The attempt cannot be cancelled; release whatever it still wins.
+            def release_when_ready(done: asyncio.Task[int | None]) -> None:
+                try:
+                    acquired = done.result()
+                except Exception:
+                    return
+                if acquired is not None:
+                    LocalPathBlobStore.release_blob_lock(acquired)
+
+            task.add_done_callback(release_when_ready)
+            raise
+        if fd is not None:
+            return fd
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _LOCK_POLL_MAX_SECONDS)
 
 
 async def write_upload_stream(

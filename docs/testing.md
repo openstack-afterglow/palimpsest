@@ -119,17 +119,32 @@ changes to `/var/lib/palimpsest` or `/var/log/palimpsest`.
 
 The separate `development-package.yml` workflow runs the architecture guard,
 CLI reference check, lane-manifest check, focused lint, `core-cli` plus
-`qualification`, and the real package smoke before the publish job receives
-`contents: write`. It accepts pushes only from `main`, `dev`, or
-`codex/oci-root-phase1`, plus manual dispatch of those same refs; pull requests
-cannot publish. A successful run creates the unique
-`package-<full-commit-SHA>` prerelease with the wheel, sdist, and
-`SHA256SUMS`. It verifies the transferred checksums, atomically refuses an
-existing tag, and never clobbers assets. The prerelease is not Latest, a PyPI
-publication, or evidence that native KVM, guest-binary, filesystem, Gate 1, or
-Gate 2 lanes passed.
-If publication fails after tag creation, the tag remains and an automatic
-rerun fails closed; inspection and recovery are separate maintainer actions.
+`qualification`, the focused publication contracts, and the real package smoke
+before the publish job receives `contents: write`. It accepts pushes only from
+`main`, `dev`, or `codex/oci-root-phase1`, plus manual dispatch of those same
+refs; pull requests cannot publish. Ref-scoped concurrency lets those three
+branch runs reach their own publish job even when they share a commit SHA.
+
+After local transfer checksum verification, the standard-library
+`scripts/publish_development_package.py` helper treats
+`package-<full-commit-SHA>` as an immutable create-or-verify publication. It
+creates an absent lightweight tag at exactly the event SHA and refuses a
+different tag. It creates an absent prerelease with the wheel, sdist, and
+`SHA256SUMS`, then requires exact tag/title/notes/draft/prerelease metadata,
+exact asset names, and downloaded SHA-256 bytes. Every mutation is judged by
+re-reading remote state rather than by its own exit status, so a conflict or an
+interrupted response that already created the tag, release, or asset still
+succeeds; the original error surfaces only when the re-read is still
+incomplete. An otherwise exact partial release may upload only its missing
+expected assets. An asset another run is still uploading is awaited until
+GitHub reports it `uploaded`, never re-uploaded, and a release that never
+converges fails closed. An extra, duplicate, or byte-mismatched asset fails
+closed. The helper never force-updates or deletes a ref, deletes an asset, or
+uses `--clobber`.
+
+These are source and fake-`gh` unit contracts, not remote publication
+verification. The prerelease is not Latest, a PyPI publication, or evidence
+that native KVM, guest-binary, filesystem, Gate 1, or Gate 2 lanes passed.
 
 The two tooling scripts select `core-cli` in the changed-file planner. CI also
 runs the real package smoke explicitly; ordinary unit lanes do not need to

@@ -32,7 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
-        development_package_workflow
+        development_package_workflow publish_development_package
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake sandbox_policy state test_lanes ui
     """)
