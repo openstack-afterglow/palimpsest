@@ -221,14 +221,21 @@ wave.
       the shard command with its `--shard N/M` denominator. No step `if`,
       `shell` or `env`, no checkout `ref`, and no extra step (a `$GITHUB_ENV`
       write, for example) can be added;
-  - that `test.yml` sets no workflow-level `env` or `defaults`;
+  - that `test.yml` has exactly the top-level keys `name`, `on`,
+    `permissions` and `jobs`, and that `permissions` is exactly
+    `{contents: read}`, so there is no workflow `env`, `defaults` or write
+    token;
   - the aggregate check names, `if: always()` and their exact `needs`;
   - each aggregate's single verdict step: its `env` maps every dependency to
     `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), and
     its `run` is the exact success-only script; neither the step nor its job
     sets `shell`, `defaults` or `continue-on-error`;
-  - the exact job keys of every job an aggregate reads (`checks`, both
-    portable matrices and `kvm`; only `kvm` has its opt-in `if`);
+  - the exact job keys of every `test.yml` job, and the exact set of job
+    ids, so a new job needs its own table entry. No job sets job-level
+    `env`, `permissions` or `continue-on-error`; only the aggregates and
+    `kvm` set `if`; only `hub` sets `defaults`, pinned by value to
+    `{run: {working-directory: hub}}`, so no `defaults.run.shell` can
+    turn its steps green;
   - that no step in `test.yml` sets `shell` or `continue-on-error`, and that
     the only step-level `if` is `always()`, which never skips a step and is
     used by upload and cleanup steps. The `kvm` proof step is covered too;
@@ -245,27 +252,48 @@ wave.
     would inherit the self-hosted `kvm` job under the caller's triggers;
   - the exact `test.yml` triggers (`workflow_call`, and `push` and
     `pull_request` for `main`/`dev`, with no `pull_request_target`), and that
-    `release.yml` runs only on `v*` tag pushes.
+    `release.yml` runs only on `v*` tag pushes;
+  - that no workflow uses a `pull_request_target` or `workflow_run` trigger
+    (the allowlist is empty), reading the string, list and mapping forms of
+    `on`. Both run with the base repository's token and secrets even when a
+    fork PR triggers them.
 
-  These pin the workflow shape only. Keeping `pull_request` code off the
-  self-hosted runner is a repository-settings control, not a YAML one. Step
-  contents of the non-matrix jobs (`checks`, `hub` and the proof jobs), such
-  as a step `env` or an extra `$GITHUB_ENV` step, are not pinned. The `kvm`
-  proof fails at run time if no evidence file exists, because its upload
-  step sets `if-no-files-found: error`.
+  These pin the workflow shape only. `kvm` has no event gate yet, so
+  `pull_request` runs still reach the self-hosted runner. AGENTS.md rule 10
+  requires two layers: a YAML event gate that keeps `pull_request` runs off
+  the runner, and repository or organization settings as the backstop
+  against a PR that edits that gate. Adding the gate waits for an owner
+  decision, because `Required native KVM proof` and the exact `kvm` `if`
+  pin must change with it.
+
+  Not pinned:
+  - step contents of the non-matrix jobs (`checks`, `hub` and the proof
+    jobs), such as a step `env` or an extra `$GITHUB_ENV` step. The `kvm`
+    proof fails at run time if no evidence file exists, because its upload
+    step sets `if-no-files-found: error`;
+  - neutering outside the workflow, such as a `pyproject.toml` `addopts` or
+    a conftest hook (see Shard counts below);
+  - the job shape of workflows other than `test.yml`, beyond triggers,
+    runners and reusable calls. The development-package workflow has its
+    own contract.
 - **Shard counts.** Each shard prints a `Lane shard` count line, but CI only
   prints it and does not check it. Three cases fail at run time:
   - an empty shard exits 5;
   - a collection error exits 2;
   - `--test-lane-shard` passed without the plugin is a usage error (exit 4).
 
-  Per-shard counts, and whether the shards add up to the portable total, are
-  guaranteed by contract instead: the pinned shard command, the `commands()`
-  argv test, and the disjoint-and-complete assignment tests. This is a
-  documented deviation from the shared CI rule 5 (see AGENTS.md), which asks
-  CI to verify per-shard counts. A `--shard` dropped before `test_lanes.py`
-  would run the full suite in every shard, and only the pinned command string
-  guards against it.
+  CI does not check per-shard counts, or whether the shards add up to the
+  portable total. This is a documented deviation from the shared CI rule 5
+  (see AGENTS.md), which asks CI to verify per-shard counts. The pinned shard
+  command, the `commands()` argv test, and the disjoint-and-complete
+  assignment tests cover only the wrapper risk that rule names: a `--shard`
+  dropped before `test_lanes.py` would run the full suite in every shard, and
+  only the pinned command string guards against it. They do not catch
+  neutering outside the workflow. On 2026-09-24, locally,
+  `run portable --shard 1/256` with `PYTEST_ADDOPTS=--collect-only` printed
+  its `Lane shard` line for 24 selected nodes, ran none, and exited 0. A
+  run-time check of executed against selected counts would catch that;
+  whether to add one is an owner decision.
 - **Rules for future CI changes.** Measurement and change rules are in the
   `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
 

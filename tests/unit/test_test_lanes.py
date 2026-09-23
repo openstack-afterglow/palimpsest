@@ -424,18 +424,43 @@ def test_ci_test_jobs_start_without_a_gate_job_in_front():
     # Only the opt-in native proof may be conditional; any other job-level `if:` could skip a
     # shard or gate that an aggregator then reads as its dependency result.
     conditional = {job_id: job["if"] for job_id, job in jobs.items() if "if" in job and job_id not in _AGGREGATORS}
+    # This exact pin also rejects a `github.event_name != 'pull_request'` gate on `kvm`, the
+    # YAML layer of AGENTS.md rule 10. Adding that gate would make `Required native KVM proof`
+    # fail on every PR unless its verdict changes too, so the gate, this pin and the rule-10
+    # "no skip" clause change together, and only after the owner decides (handoff checkpoint).
     assert conditional == {"kvm": "vars.PALIMPSEST_KVM_ENABLED == 'true'"}
 
 
-# Exact job-level keys of every job an aggregator reads. A job-level `env` (PYTEST_ADDOPTS),
-# `defaults.run.shell`, `if` or `continue-on-error` could turn its result into a success
-# without running its checks; only `kvm` carries its opt-in `if`.
-_DEPENDENCY_JOB_KEYS = {
+# Exact job-level keys of every test.yml job. A job-level `env` (PYTEST_ADDOPTS),
+# `defaults.run.shell`, `permissions`, `if` or `continue-on-error` could turn a job green
+# without running its checks, or hand a write token to the self-hosted `kvm` job. Outside the
+# aggregates, only `kvm` carries its opt-in `if`. A new job must be added here with its keys.
+_TEST_JOB_KEYS = {
     "checks": {"name", "runs-on", "steps"},
     "portable-linux": {"name", "runs-on", "strategy", "steps"},
+    "pure": {"name", "if", "needs", "runs-on", "steps"},
+    "oci-fs-proof": {"name", "runs-on", "steps"},
+    "local-oci-build": {"name", "runs-on", "steps"},
+    "guest-stage1-binary": {"name", "runs-on", "steps"},
     "portable-macos": {"name", "runs-on", "strategy", "steps"},
+    "unit-macos": {"name", "if", "needs", "runs-on", "steps"},
+    "hub": {"name", "runs-on", "defaults", "steps"},
     "kvm": {"name", "if", "runs-on", "steps"},
+    "kvm-required": {"name", "if", "needs", "runs-on", "steps"},
 }
+
+
+def test_ci_test_workflow_jobs_and_token_are_pinned():
+    workflow = _load_workflow(_TEST_WORKFLOW)
+    # Top level: no workflow `env`/`defaults`/`concurrency`, and a read-only token. PyYAML
+    # (YAML 1.1) reads the `on:` key as True.
+    assert set(workflow) == {"name", True, "permissions", "jobs"}
+    assert workflow["permissions"] == {"contents": "read"}
+    jobs = workflow["jobs"]
+    assert {job_id: set(job) for job_id, job in jobs.items()} == _TEST_JOB_KEYS
+    # hub's `defaults` is pinned by value: a `defaults.run.shell` such as `true {0}` would
+    # turn every hub step green without running it.
+    assert jobs["hub"]["defaults"] == {"run": {"working-directory": "hub"}}
 
 
 @pytest.mark.parametrize("job_id", sorted(_AGGREGATOR_VERDICTS))
@@ -452,7 +477,7 @@ def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
     assert step["env"] == env
     assert step["run"] == script
     for dependency in needs:
-        assert set(workflow["jobs"][dependency]) == _DEPENDENCY_JOB_KEYS[dependency], dependency
+        assert set(workflow["jobs"][dependency]) == _TEST_JOB_KEYS[dependency], dependency
 
 
 def test_ci_test_steps_cannot_be_skipped_or_neutered():
@@ -498,8 +523,9 @@ def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
         "reusable-workflow caller found; a caller of test.yml would inherit the self-hosted kvm job",
         callers,
     )
-    # This pins the workflow shape only. It does not keep pull_request code off the runner:
-    # a pull_request run uses the PR's own workflow file, so repository settings must do that.
+    # This pins the workflow shape only. `kvm` has no event gate today, so pull_request runs
+    # still reach the runner. AGENTS.md rule 10 layers a YAML event gate (which a PR can edit,
+    # because a pull_request run uses the PR's workflow file) over settings as the backstop.
     assert non_hosted == _NON_HOSTED_ALLOWLIST
     # The kvm exposure analysis in AGENTS.md rule 10 assumes exactly these triggers: no
     # `pull_request_target`, no extra branches. PyYAML (YAML 1.1) reads the `on:` key as True.
@@ -510,6 +536,33 @@ def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
     }
     # release.yml's kvm-proof has no pull_request exposure only while it is tag-push only.
     assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["v*"]}}
+
+
+# Workflows allowed to use a privileged trigger, by file name. `pull_request_target` runs with
+# the base repository's token and secrets even for fork PRs, and `workflow_run` runs with the
+# same privileges after a PR-triggered run. With a PR-head checkout or PR artifacts, either
+# hands PR code write access on any runner, hosted included. None is allowed today; add one
+# only after security review.
+_PRIVILEGED_TRIGGERS = {"pull_request_target", "workflow_run"}
+_PRIVILEGED_TRIGGER_ALLOWLIST: dict[str, set[str]] = {}
+
+
+def _workflow_events(workflow):
+    """Return the event names of the string, list and mapping forms of ``on``."""
+    # PyYAML (YAML 1.1) reads a bare `on:` key as True; a quoted "on" stays a string.
+    triggers = workflow.get(True, workflow.get("on"))
+    if isinstance(triggers, str):
+        return {triggers}
+    return set(triggers or ())
+
+
+def test_ci_no_workflow_uses_a_privileged_pull_request_trigger():
+    privileged = {}
+    for path in sorted(_WORKFLOWS.glob("*.y*ml")):
+        events = _workflow_events(_load_workflow(path)) & _PRIVILEGED_TRIGGERS
+        if events:
+            privileged[path.name] = events
+    assert privileged == _PRIVILEGED_TRIGGER_ALLOWLIST
 
 
 @pytest.mark.parametrize(

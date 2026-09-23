@@ -575,12 +575,12 @@ Cold public exec proof는 보존된 실패 `exec-cli` 등록과 충돌하지 않
 
 GitHub `Test` workflow는 Linux portable 6 shard와 macOS portable 4 shard를 `max-parallel` 없이 한 wave로 실행한다. 이 형태는 `tests/unit/test_test_lanes.py`가 고정한다.
 
-- portable matrix job 두 개는 정확히 고정된다. job key는 `name`·`runs-on`·`strategy`·`steps`이고, runner, `matrix == {shard: [1..N]}`(`exclude`·`include` 없음), `fail-fast: false`, step 목록 전체(action 버전·`with`·`--shard N/M` 분모를 포함한 shard 명령)를 고정한다. `max-parallel`은 없거나 N 이상이어야 한다. `test.yml`에는 workflow-level `env`·`defaults`가 없다.
-- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다. aggregator가 읽는 의존 job(`checks`, portable 두 개, `kvm`)의 job key 집합도 정확히 고정한다.
+- portable matrix job 두 개는 정확히 고정된다. job key는 `name`·`runs-on`·`strategy`·`steps`이고, runner, `matrix == {shard: [1..N]}`(`exclude`·`include` 없음), `fail-fast: false`, step 목록 전체(action 버전·`with`·`--shard N/M` 분모를 포함한 shard 명령)를 고정한다. `max-parallel`은 없거나 N 이상이어야 한다. `test.yml`의 top-level key는 `name`·`on`·`permissions`·`jobs`뿐이고, `permissions`는 정확히 `{contents: read}`이다. 그래서 workflow-level `env`·`defaults`와 write token이 없다.
+- aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다. `test.yml`의 모든 job(11개)의 job key 집합도 정확히 고정한다. job-level `env`·`permissions`·`continue-on-error`는 어느 job에도 없고, `defaults`는 `hub`만 가지며 값(`{run: {working-directory: hub}}`)까지 고정한다. 새 job은 계약의 표에 추가해야 한다.
 - `test.yml`의 어느 step에도 `shell`·`continue-on-error`가 없고, step `if`는 건너뛰지 않는 `always()`뿐이다.
 - 테스트 job 앞에는 gate job이 없다.
-- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 정확한 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. reusable workflow 호출 job은 없어야 하고, `test.yml` trigger는 정확히 `workflow_call`과 `main`·`dev`의 push·`pull_request`다. 이 계약은 workflow 형태만 고정한다. `pull_request` 코드를 이 runner에서 떼어 놓는 일은 저장소 설정이 맡는다.
-- shard별 node 수와 shard 합계는 CI에서 검사하지 않는다. 출력만 한다. 대신 고정된 명령 문자열과 분할 unit test로 보장한다. 이 점은 [`AGENTS.md`](AGENTS.md) 규칙 5에 정본 규칙과 다른 점으로 적혀 있다. shard job이 아닌 job의 step 내용은 고정하지 않는다.
+- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 정확한 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. reusable workflow 호출 job은 없어야 하고, `test.yml` trigger는 정확히 `workflow_call`과 `main`·`dev`의 push·`pull_request`다. 어느 workflow도 `pull_request_target`·`workflow_run` trigger를 쓰지 않는다. 이 계약은 workflow 형태만 고정한다. `kvm`에는 아직 event gate가 없어 `pull_request` 실행도 이 runner에 온다. [`AGENTS.md`](AGENTS.md) 규칙 10은 두 층을 요구한다. 하나는 `pull_request` 실행을 막는 YAML event gate이고, 다른 하나는 그 gate를 지우는 PR에 대한 설정 backstop이다. gate 추가는 `Required native KVM proof`의 PR 의미와 계약의 `kvm` `if` 고정을 함께 바꿔야 하므로 소유자 결정을 기다린다.
+- shard별 node 수와 shard 합계는 CI에서 검사하지 않고 출력만 한다. 고정된 명령 문자열과 분할 unit test는 `--shard`가 빠지는 wrapper 위험만 막는다. `pyproject.toml`의 `addopts`나 conftest hook 같은 workflow 밖의 무력화는 막지 않는다. 이 차이는 [`AGENTS.md`](AGENTS.md) 규칙 5에 정본 규칙과 다른 점으로 적혀 있고 소유자 결정을 기다린다. shard job이 아닌 job의 step 내용(step `env`, `$GITHUB_ENV` step)과 `test.yml` 밖 workflow의 job 형태도 고정하지 않는다.
 
 CI 변경의 측정·변경 규칙은 [`AGENTS.md`](AGENTS.md)의 `CI 파이프라인 성능 규정`이 정본이다. 크리티컬 패스 기대치는 push 뒤 실측 전까지 추정이다.
 
@@ -747,13 +747,27 @@ The runner remains online and dedicated, and the variable remains enabled. This 
   - 규칙 9: 건너뛰기 조건에 "head branch의 push `Test`가 같은 tree를 테스트했다"를 더했다.
   - 규칙 10: 승인 대기 항목을 절 이름으로 가리키게 했다.
 
+2026-09-24 CI review round 3: 재검토가 medium 1건·low 4건을 지적했고, 이를 반영했다. `.github/workflows/`의 다섯 workflow(특히 `test.yml`, `release.yml`, `hub-docker.yml`, `development-package.yml`의 발행 경로와 permissions), `scripts/test_lanes.py` plugin, `tests/unit/test_test_lanes.py`, 명확해진 정본 규칙 3·10을 다시 읽었다.
+
+- **workflow는 바꾸지 않았다.** production/runtime·package·Hub에도 구조 영향이 없다.
+- **규칙 10(medium, 문서만).** YAML event gate와 설정 backstop의 두 층으로 고쳐 적었다. 설정만으로는 같은 저장소 branch PR, Dependabot PR, 승인된 fork PR을 막지 못한다고 밝혔다. gate, `kvm` `if` 계약 고정, skip 금지 조항의 충돌과 해소 방안을 소유자 결정으로 남겼다. `release.yml` `kvm-proof`의 write token 노출과 설정 위치도 적었다.
+- **계약 강화.** 두 계약을 더했다.
+  - `test.yml` 11개 job의 key 집합, `hub` `defaults` 값, top-level key 집합, `permissions == {contents: read}`
+  - 모든 workflow의 `pull_request_target`·`workflow_run` 금지
+- **변형 검사.** 임시 복사본에서 변형 16가지를 모두 잡았다. 의도한 잔여 공백 2가지(비-matrix job의 step `env`, `$GITHUB_ENV` step)는 잡지 않았다.
+- **규정 정리.** AGENTS.md 규칙 3, 5, 10, 11, 12를 고쳤다.
+  - 규칙 3: 발행·배포만 `Test` 전체 결과로 게이팅하고, 발행하지 않는 PR build는 병렬로 돌려도 된다. 기존 예외 세 발행 경로를 적었다.
+  - 규칙 5: 계약은 wrapper 위험만 막고, workflow 밖 무력화(`addopts`, conftest)는 막지 않는다고 좁혔다.
+  - 규칙 11: 새 계약과 잔여 공백을 적었다.
+  - 규칙 12: portable node 수 6,091을 더했다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9c10bffa9e298f236dcc7885ece326217eef96768350f1767bfa7e055a51130c",
-  "reviewed_at": "2026-09-23T22:05:09Z",
-  "summary": "Reviewed all five workflows, test_lanes plugin, test_test_lanes CI contracts and both handoff approval lists for CI review round 2; pinned exact portable matrix jobs (job keys, runner, matrix, full step list), dependency job keys, test.yml-wide step shell/continue-on-error/if rules, exact hosted label allowlist, no reusable-workflow callers and exact test.yml triggers; documented shard-count-by-contract deviation and rules 2/8/9/10 wording; workflows unchanged, no production/runtime impact."
+  "source_sha256": "9a2f161605858bf64288261b625fc18869acea8b26da45f419689dd0a5e133f1",
+  "reviewed_at": "2026-09-23T23:00:21Z",
+  "summary": "Reviewed all five workflows (publish paths and permissions of test, release, hub-docker, development-package), test_lanes plugin, test_test_lanes CI contracts and clarified canonical rules 3/10 for CI review round 3; pinned exact job keys of all 11 test.yml jobs, hub defaults by value, test.yml top-level keys and read-only permissions, and no pull_request_target/workflow_run in any workflow; rewrote rule 10 as YAML event gate plus settings backstop with the gate/pin/no-skip conflict, release kvm-proof token exposure and settings paths as owner decisions; rule 3 publish-only gating with three pre-existing exceptions; narrowed rule 5 contract claim; workflows unchanged, no production/runtime impact."
 }
 ```
 <!-- architecture-review:end -->
