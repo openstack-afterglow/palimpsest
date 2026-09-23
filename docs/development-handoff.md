@@ -1533,6 +1533,28 @@ Test/Hub-image workflow가 실행되지 않았으므로 green image build나
 native KVM proof로 승격하지 않는다. 실제 Hub build는 사용자 지정대로
 이번 실행에서 제외하고 전용 host/staging·별도 승인 대기로 남긴다.
 
+### PAX 8GiB 경계 보정과 서버 재검증 (2026-09-23)
+
+앞서 게시된 source에서 `TarInfo.tobuf(PAX_FORMAT)`가 8GiB 초과 layer의
+크기를 PAX `size`에 넣고 다음 물리 header size를 0으로 만드는 경우,
+`_scan_members`가 PAX payload를 건너뛰어 자체 export의 다음 header를
+잘못 찾는 결함을 추가로 확인했다. 7B PAX override를 가진 tar의
+`extract_blob` 실패를 수정 전에 재현했다. `7d383a54fa4d27791c94f3abdb8326cfd9dc25c0`은
+4MiB 확장 payload 상한을 유지하며 PAX record 길이와 decimal `size`를
+검증하고, 유효한 로컬 override를 다음 member의 논리 크기·offset·상한에
+적용한다. 전역 PAX size와 잘못된 record는 거부한다.
+
+동일한 서버 격리 checkout으로 checksum 확인 후 해당 SHA를 checkout했다.
+Hub 전체 **98 passed**, Hub Ruff lint/format, root architecture guard
+**14 passed** 및 root Ruff lint가 통과했다. 테스트의 8GiB+1B member는
+sparse tar로 작성해 PAX header/offset과 크기 상한만 검사했으며 8GiB
+payload를 실제로 복사하거나 해시하지 않았다. 기존 512MiB 압축 입력의
+32MiB 확장 제한, file/directory fsync EIO 주입 및 소유 process fence
+증거와 합쳐도 실제 전원 차단 복구나 Hub KVM guest build 결과는 아니다.
+2번 실제 Hub build는 계속 제외하고, 추가 게스트·DB·서비스 변경 없이
+승인된 `codex/oci-root-phase1` 한 ref만 이 검증 source로 fast-forward
+게시하는 것이 다음 단계다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
