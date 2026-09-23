@@ -87,6 +87,13 @@ or timed-out builder run until its recorded process group is verified. These are
 run must still confirm parent-death signals, exact process-group reaping,
 filesystem crash durability, and libvirt teardown.
 
+Multi-manifest bundle regression also checks that a shared ancestor with the
+same digest and descriptor registers once, while a different media type or
+config for that digest fails parsing before registration. A leaf manifest
+config that disagrees with its layer annotation is rejected. These are
+portable parser contracts, not a large-tar throughput or live-filesystem
+qualification.
+
 ## CLI reference and distribution checks
 
 For command documentation and packaging-only edits, use the focused contracts:

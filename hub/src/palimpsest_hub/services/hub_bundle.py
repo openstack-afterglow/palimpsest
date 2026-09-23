@@ -226,7 +226,7 @@ def iter_bundle_tar(store: LocalPathBlobStore, chains: list[list[BundleLayer]]) 
     for chain in chains:
         config_blobs = {layer.blob_digest: _canonical_json(layer.config) for layer in chain}
 
-        # config blob (leaf 것만 manifest 가 참조하지만, 조상 config 도 함께 담아 재구성 가능하게 한다)
+        # 각 layer descriptor가 자신의 config blob을 참조한다.
         for layer in chain:
             payload = config_blobs[layer.blob_digest]
             digest = _config_digest(payload)
@@ -590,14 +590,16 @@ def parse_bundle(tar_path: Path, *, max_blob_bytes: int, max_expanded_bytes: int
             blob_members[blob_digest] = member
             if blob_digest in layers_by_digest:
                 known_layer = layers_by_digest[blob_digest]
-                known_parent = known_layer.get("parent_digest")
-                if known_parent != previous_digest:
-                    raise BundleError(
-                        f"번들의 부모 체인이 모순됩니다: {blob_digest} 의 부모가 "
-                        f"{known_parent} 와 {previous_digest} 로 다릅니다"
-                    )
+                if (
+                    known_layer["parent_digest"] != previous_digest
+                    or known_layer["media_type"] != media_type
+                    or known_layer["name"] != name
+                ):
+                    raise BundleError(f"번들의 공유 blob descriptor가 모순됩니다: {blob_digest}")
                 if config is not None:
-                    known_layer.setdefault("config", config)
+                    if "config" in known_layer and known_layer["config"] != config:
+                        raise BundleError(f"번들의 공유 blob config가 모순됩니다: {blob_digest}")
+                    known_layer["config"] = config
                 previous_digest = blob_digest
                 continue
             ordered.append(blob_digest)
@@ -633,7 +635,10 @@ def parse_bundle(tar_path: Path, *, max_blob_bytes: int, max_expanded_bytes: int
                     blob_digest=previous_digest,
                     parent_digest=layers_by_digest[previous_digest]["parent_digest"],
                 )
-                layers_by_digest[previous_digest].setdefault("config", config)
+                known_config = layers_by_digest[previous_digest].get("config")
+                if known_config is not None and known_config != config:
+                    raise BundleError(f"번들의 leaf config가 layer annotation과 모순됩니다: {previous_digest}")
+                layers_by_digest[previous_digest]["config"] = config
 
     return ParsedBundle(layers=[layers_by_digest[digest] for digest in ordered], blob_members=blob_members)
 
