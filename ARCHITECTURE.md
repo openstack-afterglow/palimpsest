@@ -409,6 +409,8 @@ Worker는 SQL 접속 또는 queue claim 전에 설정된 별도 Local interprete
 
 Linux child는 guest 실행 전에 `PR_SET_PDEATHSIG(SIGKILL)`과 parent PID를 확인하고 boot ID·PID·start ticks marker를 private build tree에 fsync한다. Worker 재시작은 그 process-group identity를 검증하고 중지한 뒤 guest cleanup을 수행한다. Identity/cleanup을 확인하지 못하면 job tree를 지우지 않고 `cleanup_failed`로 작업을 멈춘다. Portable test의 mock VM은 이 kernel/libvirt 동작의 live proof가 아니다.
 
+2026-09-23 `pieroot-server`의 분리된 임시 checkout에서는 실제 Linux 커널을 대상으로 guest를 띄우지 않는 두 process probe만 실행했다. 새 session의 표시된 child에 `_mark_builder`가 parent-death `SIGKILL`과 marker fsync를 설정한 뒤 parent 종료 시 child가 사라졌고, 별도 소유 process group은 `_stop_interrupted_builder`가 marker의 boot ID/PID/start ticks를 확인해 중지했다. 이는 mock을 넘는 kernel process 경계 증거지만 실제 libvirt guest 회수·worker restart·SQL queue claim은 아니다.
+
 Timeout이나 builder의 nonzero exit은 그 자리에서 guest state를 회수하지 않는다. Leader 종료는 기록된 process group의 소멸을 증명하지 않으므로, 실패는 error로 전파되고 caller가 group identity 검증·종료를 먼저 수행한 뒤에만 cleanup을 호출한다. Group 정지를 확인하지 못하면 cleanup을 실행하지 않고 job tree를 보존한 채 `cleanup_failed`로 멈춘다.
 
 완료한 build의 output row를 SQL commit한 뒤 scratch 삭제 전에 crash가 나도 다음 worker 시작이 exact UUID private job tree를 조사해 owned guest를 검증·정리하고 tree를 제거한다. Cleanup 실패는 완료된 output을 되돌리지 않고 `cleanup_failed`를 남기며 worker가 중단된다. Upload/ingest/build output blob은 file 및 해당 CAS directory ancestor를 fsync한 뒤에만 SQL publication을 허용하고 실패 시 성공을 반환하지 않는다. Portable regression은 이 실패·복구 계약만 증명하며 실제 Linux filesystem crash durability나 libvirt teardown 실기는 아직 없다.
@@ -705,6 +707,8 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 실행한 검사: `hub/`에서 lint·format gate와 portable Hub 91건(같은 lock을 두고 40개가 경쟁하며 중첩 lock과 worker를 요구하는 회귀, export→import cloud-image round trip 포함), root에서 portable 전체 5,862건(217 skip)·publication/workflow/lane/architecture guard·Kolla role 계약. 실제 GitHub 게시, Redis/MySQL 배포, 대용량 compressed tar, native KVM은 실행하지 않았다.
 
 2026-09-23 로컬 후속 개발: bundle parser는 동일 digest가 다른 manifest에서 다시 등장하면 parent만 비교하고 `mediaType`/config 차이를 무시해 첫 번째 descriptor를 채택했다. 실제 두 manifest bundle에서 media type/config 충돌 두 건 모두 무오류로 수용되는 것을 회귀로 재현했다. 이제 부모·media type·이름·config를 일치 검증하고 leaf manifest config와 layer annotation도 비교한다. 정상 공유 조상은 하나로 합친다. HTTP import는 모순 bundle에 422를 반환하고 SQL/CAS에 아무것도 게시하지 않는 것을 확인했다. 이는 import 입력 계약만 변경하며 storage schema, KVM 실행, 배포 경계는 바꾸지 않는다. Hub 96건 및 Ruff 검증을 실행했다.
+
+2026-09-23 승인된 서버 Linux-only 경계: `05818931b520dc712098a58e6284466978bfe0fd`를 격리 checkout에서 검증했다. Hub 96건, Ruff lint/format, architecture guard 통과. 512MiB zero stream tar.gz(압축 2,342,856B)를 32MiB 확장 상한으로 거부하고 spool 부재를 확인했다. CAS 실제 파일·상위 디렉터리 fsync 성공 경로와 파일 fsync EIO·디렉터리 fsync 실패의 주입 경로에서 성공 거부·독립 staging 보존을 확인했다. Linux process-group reaping과 parent-death signal은 guest 없는 소유 process로 확인했다. 하드웨어 전원 차단 후 durable 복구, 운영 DB/Keystone/Redis, KVM/libvirt teardown은 실행하지 않았다. 이 검증은 구조·schema·배포 설정을 바꾸지 않는다.
 
 <!-- architecture-review:start -->
 ```json

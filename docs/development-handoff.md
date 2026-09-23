@@ -1483,10 +1483,40 @@ staging, Linux wheelhouse 및 `cloud-localds` 설치 권한을 명시한 뒤에�
    기록한다. 실패하면 재시도·강제 삭제하지 않고 보존 상태를 기록한다.
 4. **게시:** 위 증거를 문서에 SHA별로 분리하고 architecture/Hub/root 검사를
    통과한 뒤, 대상 ref·배포 행위에 대한 명시적 승인으로만 추가 게시한다.
-   현재 `739a98d` 문서 기록과 `c6ccaae` parser 변경은 원격에 게시하지 않았다.
+   게시 전 세 원격 ref의 기준 SHA는 `60fa42febfb8acd9af04e87c9905a4e2a1841d13`이었다.
 
-2–4단계는 각각 환경·권한 또는 명시적 승인 전에는 실행하지 않는다.
-현재 접근 가능한 완료 경계는 1단계뿐이다.
+2단계는 아래 경계 안에서 완료됐다. 사용자가 3단계 실제 Hub build는 이번
+실행에서 제외했고, 4단계 게시는 `codex/oci-root-phase1` 한 ref에만 승인했다.
+`dev`와 `main`은 변경하지 않는다.
+
+### `pieroot-server` Linux-only proof (2026-09-23)
+
+원본 checkout은 건드리지 않고 `/mnt/hdd/WD_8TB/code/palimpsest-validation-LB5L6WCf`
+아래에 새 checkout을 만든 뒤, checksum을 확인한 Git bundle로 정확히
+`05818931b520dc712098a58e6284466978bfe0fd`를 checkout했다. 첫 Hub
+dependency sync는 system Python 3.12.3의 `Python.h` 부재로
+`netifaces==0.11.0` build가 실패했다. 호스트 APT/sudo는 사용하지 않고
+사용자 영역의 uv 관리형 CPython 3.12.14로 별도 venv를 만들어 74개
+Python package를 설치했다.
+
+실행 결과: Hub `pytest -q` **96 passed**; Hub Ruff lint/format 및
+`python3 scripts/check_architecture.py` 통과. 32MiB gzip 확장을 8MiB
+상한에서 거부하고 spool을 지웠다. 별도 streamed 512MiB tar.gz(압축
+2,342,856B)는 32MiB 확장 상한을 넘자 거부하고 partial spool을 남기지
+않았다. 독립 CAS scratch에서 실제 Linux file/ancestor-directory fsync
+성공과 주입한 directory-fsync 실패, file-fsync `EIO` 실패를 구분했다.
+실패는 성공으로 보고하지 않았고 staging bytes가 남았으며 file-fsync
+실패 후 재시도는 성공했다. 새 session의 소유 child에 `_mark_builder`가
+설정한 `PR_SET_PDEATHSIG(SIGKILL)`이 parent 종료 후 child를 중지했고,
+별도 소유 process group은 `_stop_interrupted_builder`가 기록된
+boot ID/PID/start ticks를 대조한 후 종료했다. `verify_linux_boundaries.py`,
+`verify_large_bundle.py`, `verify_file_fsync.py`와 작은 compressed tar 및
+marker는 그 새 scratch 아래에 보존했다.
+
+이는 Python-level fsync 실패 주입과 guest 없는 Linux process 증거다.
+전원 차단 후 crash durability, 실제 worker restart·libvirt guest cleanup,
+Keystone/SQL/Redis 및 Hub KVM build는 실행하지 않았다. 기존 서버 checkout,
+runner, domain, 운영 DB/store는 변경하지 않았다.
 
 ## 빠른 링크 맵
 

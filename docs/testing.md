@@ -83,9 +83,10 @@ identical-digest registrations, competing project enqueue requests, worker
 preflight rejection before SQL access, fail-closed recovery of an unverifiable
 builder marker, retry of completed-build private scratch cleanup without
 losing its published output, and refusal to reclaim guest state after a failed
-or timed-out builder run until its recorded process group is verified. These are portable contract tests: a Linux-only
-run must still confirm parent-death signals, exact process-group reaping,
-filesystem crash durability, and libvirt teardown.
+or timed-out builder run until its recorded process group is verified. These
+are portable contract tests. A Linux stand-in process probe has exercised
+`PR_SET_PDEATHSIG` and exact owned-group reaping separately; real builder
+restart, filesystem crash durability, and libvirt teardown are not proven.
 
 Multi-manifest bundle regression also checks that a shared ancestor with the
 same digest and descriptor registers once, while a different media type or
@@ -93,6 +94,16 @@ config for that digest fails parsing before registration. A leaf manifest
 config that disagrees with its layer annotation is rejected. These are
 portable parser contracts, not a large-tar throughput or live-filesystem
 qualification.
+
+The 2026-09-23 isolated `pieroot-server` run at source `0581893` used only a
+new scratch checkout. A streamed 512 MiB gzip tar (2,342,856 compressed bytes)
+hit a 32 MiB expansion cap and left no spool. CAS promotion completed real
+file/ancestor-directory fsync calls; separately injected file-fsync `EIO` and
+directory-fsync failures refused success and preserved staging for retry.
+The stand-in builder process group was reaped after exact marker verification,
+and a marked new-session child died after its parent exited. These checks
+did not start Hub services, open a database, boot a guest, or simulate a real
+power loss.
 
 ## CLI reference and distribution checks
 
