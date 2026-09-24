@@ -369,6 +369,8 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 - native Hub `/v1`는 OCI Distribution `/v2` endpoint가 아니다. `palimpsest pull/push` registry wrapper와 `palimpsest image pull/push` Hub artifact 명령도 서로 다른 namespace와 credential path를 가진다.
 - Hub `POST /v1/builds`는 Keystone **system-admin**과 project scope를 함께 요구하고, 보이는 x86_64 raw/qcow2 cloud base와 순서·parent/base가 일치하는 SquashFS 25개 이하만 큐에 넣는다. 1MiB 이하 recipe의 `FROM`/`LAYER`와 요청 digest는 worker의 `verify_build_integrity`에서 정확히 비교한다. 요청은 project별 동시 queued/building 최대4개·시간당 생성6개로 제한하며 output `blob_digest`는 같은 project의 private layer와 표준 `/v1/layers/{digest}/blob`에서 조회한다. `GET /v1/builds`/`{id}`는 다른 project에 404/빈 목록이고 raw recipe·worker 경로·user id를 반환하지 않는다. `/app`은 token을 storage/cookie에 넣지 않는 같은 origin의 선택적 browser client다.
 
+- `GET /v1/layers/{digest}`의 상세 `HubLayerDetailResponse`는 보이는 root→parent 순서의 `ancestors`와, 해당 체인이 root까지 도달했는지의 필수 boolean `chain_complete`를 포함한다. 별도 `/ancestors`는 root→self 목록을 반환하며, parent가 누락되거나 보이지 않으면 체인이 끊기고 상세 응답의 `chain_complete=false`다. 검색·업로드·조상 목록은 기존 `HubLayerResponse` 형태를 유지한다. 이는 앞선 native proof에서 발견된 단일 metadata projection 누락만 고친다. 실제 native build/recovery를 다시 실행한 증거는 아니다.
+
 Build cap은 같은 store의 project별 filesystem flock 안에서 SQL count+insert를 commit해 동시 POST가 4개를 넘지 못하게 한다. 같은 digest를 두 project가 동시에 등록할 때는 digest별 flock으로 descriptor 조회·grant/insert·commit을 직렬화한다. Bundle import는 지원하는 압축을 상한 안에서 한 번만 풀어 seekable plain tar로 만들고, 512바이트 물리 header를 직접 훑어 member 수·확장 총량·PAX/GNU 확장 payload 상한을 적용한 뒤에야 `tarfile`에 넘긴다. Export는 각 layer descriptor에 자신의 config blob digest를 `dev.afterglow.palimpsest.config-digest`로 기록하므로 leaf뿐 아니라 base cloud image를 포함한 모든 조상도 자신의 config로 복원된다. Layer의 `mediaType`과 그 config는 등록 전에 `HubLayerMeta`로 함께 검증하고, config의 `blob_digest`/`parent_digest`가 manifest 순서와 어긋나면 거부한다. 모든 blob을 staging에 풀어 선언 digest/size와 비교한 뒤에야 정렬된 digest lock 집합 안에서 CAS publish와 SQL commit을 수행한다. 등록에 실패하면 이 호출이 만든 CAS 대상만, 그리고 참조하는 layer row가 없다고 SQL로 확인될 때만 지운다. Range `bytes=-N`은 마지막 N바이트를 뜻하고 `-0`은416이다.
 
 여러 manifest가 같은 blob digest를 참조하면 parser는 부모, media type, 이름, config를 한 번만 받아들이며 이후 선언의 모순을 전체 bundle 오류(422)로 거부한다. Annotation config와 leaf manifest config가 함께 존재할 때도 값이 일치해야 한다. 동일한 공유 조상은 중복 등록하지 않는다.
@@ -405,7 +407,84 @@ uv run palimpsest-hub-worker
 
 첫 명령 `Base.metadata.create_all`은 기존 Hub DB에도 새 `palimpsest_hub_builds` schema를 준비하는 bootstrap이다. Data migration은 별도 database의 비어 있는 destination에 layer, project layer grants, upload, image export, build rows를 복사하며 legacy source에 grant/build table이 없으면 해당 table만 건너뛴다. API/export worker/build worker는 같은 `DATABASE_URL`과 `PALIMPSEST_HUB_LOCAL_PATH`를 사용하고, store 경로 문자열도 동일해야 한다. Build worker 전용 settings에는 SQL·store·builder 설정만 필요하며 Redis/Keystone 자격증명이 필요하지 않다. API/export worker에는 기존 Hub 설정이 필요하다. `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020`의 `/v1/health`는 process-level `status: ok`일 뿐 SQL/Redis/Glance/KVM readiness가 아니다. 기존 export worker는 qemu-img 지원을 확인한 후 SQL export job을 polling하고 2초 idle/시간당 maintenance를 수행한다.
 
+2026-09-23 사용자 승인 아래 `pieroot-server`에서 실제 운영 OpenStack의
+`admin-openrc`(Keystone admin 자격증명)로 `OS_*` 설정을 채우고, SQL/Redis는
+운영 인스턴스를 재사용하지 않고 전용 docker network 위 임시 MySQL 8.0.40·
+Redis 7 컨테이너로 새로 준비해 API를 기동했다. 토큰 없는 `GET /v1/layers`는
+401, admin-openrc 계정으로 실제 Keystone에 password 인증해 받은
+project-scope 토큰으로는 200을 받았다. `require_admin`이 걸린
+`DELETE /v1/layers/{digest}`를 존재하지 않는 형식의 digest로 호출했을 때
+403이 아니라 422(형식 검증)까지 도달해, `_is_system_admin`이 실제 Keystone
+`role_assignments`(`system="all"`, role `admin`)를 조회해 이 계정을
+system-admin으로 판정했음을 처음으로 실기 확인했다. `get_os_conn`과 동일한
+caller-scoped token 패턴으로 Glance에도 연결해 이미지 개수만 read-only로
+셌다(생성·삭제 없음). 실행 종료 시 API 프로세스·임시 컨테이너·전용
+network·임시 자격증명 파일을 모두 제거했다. 이는 Keystone 인증과
+system-admin 판정, Glance read-only 도달성의 첫 실 OpenStack 증거이며,
+Glance image export 생성이나 아래 Hub KVM build worker는 포함하지 않는다.
+
+이후 같은 날 별도 임시 MySQL/Redis와 scratch store, 실제 Hub API 및
+export worker로 기존 Glance CirrOS raw image(46,137,344B)를 qcow2로
+내보냈다. `POST /v1/image-exports` 202 이후 worker가 complete를
+기록했고, 인증된 blob HTTP 다운로드 전체 18,022,400B의 SHA-256가
+`6bde96963adf0322f176e32a90154ff9eefdcc64cfea47a8764a43cf6c9ce942`와
+일치했다. 독립 `qemu-img info`에서도 qcow2 및 원본 virtual size를
+확인했다. Glance는 읽기만 했으며 임시 DB·Redis·network는 종료,
+출력 QCOW2는 0700 scratch에 보존했다. 실제 KVM build worker는
+아래 preflight가 해당 공유 runner host에서 실패하고 전용 host가
+없어 가동하지 않았다. 이 export 증거를 guest build 증거로 승격하지 않는다.
+
+별도 Ubuntu 24.04 live probe는 기존 Glance image
+`4da46b06-1e48-4bf8-adac-4c0ed5424797`에서 실제 비동기 Hub export
+`88c70150-3a87-463b-94ee-91178548601a`를 완료했다. QCOW2
+1,842,282,496B의 CAS SHA-256은
+`961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`로
+독립 검증됐고, 인증 HTTP Range 206의 첫 1,024B도 CAS와 같았다. 신규
+temporary MySQL/Redis 및 API/worker/network는 이 export 이후 종료했다.
+이는 Glance read→Hub export 경계만 검증하며 아래 별도 KVM build host의
+upload·queue·guest·SquashFS 계약은 이 사실만으로 승격하지 않는다.
+
 Server-side build를 사용할 때만 별도 Linux KVM host에 `palimpsest-local[kvm]`를 같은 reviewed ref로 설치하고 `PALIMPSEST_HUB_BUILDER_PYTHON`에 그 interpreter 절대 경로를 API/worker에 설정한다. Host에서 별도 `palimpsest-hub-build-worker` process를 supervision한다. Worker는 `/dev/kvm` read/write, `qemu:///system`, conventional cloud-image VM의 firmware/QEMU/cloud-localds/mksquashfs 전제를 요구하며 API container나 Docker socket에 의존하지 않는다. Store singleton flock과 SQL claim으로 한 job씩 처리한다. Timeout 또는 worker restart 시 private build state의 guest를 회수하지 못하면 `cleanup_failed`를 남기고 더 이상 새 job을 받지 않는다. 이 작업은 macOS의 portable HTTP proof만 실행했으며 새 host 배포나 KVM guest boot는 수행하지 않았다.
+
+2026-09-24 사용자 승인 아래 별도 Nova instance(전용, `/dev/kvm` 노출,
+nested KVM)를 KVM build worker host로 사용해 처음으로 실제 upload→
+queue→guest build→SquashFS 성공을 증명했다. `palimpsest-hub-build-worker`가
+`libvirt`를 `qemu:///system`으로 시스템 서비스로 연결하고, 위 Ubuntu
+24.04 QCOW2(`sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`)를
+실제 project-scoped Keystone 토큰으로 업로드·등록한 뒤,
+`POST /v1/builds`(`FROM <base>\nRUN printf hub-live-ok > /opt/palimpsest-build-proof`)가
+202로 큐에 들어갔다. Worker가 `qemu:///system` 아래 disposable
+network-none guest를 defineXML·create하고 시리얼 출력 SquashFS를
+수신해 SQL에 `complete`로 커밋했다. 인증된
+`GET /v1/layers/{digest}/blob` 200 전체 스트림의 SHA-256과 CAS 파일이
+일치했고, `unsquashfs -cat`로 guest가 실제로 쓴 `hub-live-ok` 파일
+내용을 재확인했다. 빌드 종료 뒤 `virsh list --all`에 domain이 남지
+않아 guest cleanup도 확인했다.
+결과 build `32d735ba-4aaf-4bc9-8466-adf447039864`의 SquashFS는
+`sha256:76f5045267e1ede4bb8b4c4c6e9ecd546dc3784ae5970e136a7529c8ef7212cf`
+(4096B)였다.
+
+같은 과정에서 첫 시도는 `qemu.conf`의 `libvirt-qemu` 계정이 build
+worker가 만든 job tree(사용자 소유)에 접근할 수 없어
+`Permission denied`로 실패했다. Worker와 QEMU를 같은 no-sudo 전용
+계정으로 맞춘 뒤 재현하자 `PALIMPSEST_HUB_LOCAL_PATH`가 길면
+`state/runs/builder-<id>/builder.sock` 절대경로가 Linux `AF_UNIX`
+`sun_path`의 108바이트 상한을 넘어 `internal error: UNIX socket path ...
+too long`으로 실패했다. 두 실패 모두 source 결함이 아니라 배포
+계정/경로 선택의 운영 제약이며, `PALIMPSEST_HUB_LOCAL_PATH`는 build
+worker를 쓰는 배포에서 짧게(예: `/srv/h`) 선택해야 한다. QEMU 실행
+사용자는 worker의 private job tree와 overlay disk에 접근할 수 있어야 하며,
+이번 검증은 두 프로세스를 동일한 no-sudo 사용자로 실행했다. QEMU group은
+worker의 primary group과 같을 필요는 없고 `/dev/kvm` 접근도 유지해야 한다.
+이 두 전제를 `docs/install.md`에 반영한다. 검증에
+사용한 전용 Nova VM·Cinder volume·security group은 실행 종료 시
+정확한 ID 대조 후 모두 삭제해 원래 상태로 되돌렸다.
+
+이 임시 VM의 API, build worker, QEMU는 같은 UID로 실행됐고 private staging에
+관리자 `admin-openrc` 사본을 배치했다. 따라서 이 성공은 production의
+API/worker/QEMU 계정 분리나 credential isolation을 검증하지 않는다.
+같은 UID 설정은 해당 probe의 private artifact 접근 문제를 해결한 방법이지
+운영 계정 구성을 요구하는 계약이 아니다.
 
 Worker는 SQL 접속 또는 queue claim 전에 설정된 별도 Local interpreter로 `python -I -m palimpsest_local.hub_builder preflight`를 실행해 x86_64 Linux `/dev/kvm`, KVM backend, 필수 root-owned 불변 tool과 read-only `qemu:///system` 접속을 확인한다. Guest 실행 증거는 아니며 전용 host 및 해당 interpreter의 Linux-native `palimpsest-local[kvm]` 의존 closure가 별도로 필요하다. 기존 Actions runner host의 KVM/libvirt·자원을 공유하는 colocated worker는 별도 계정/container만으로 격리되지 않는다. 전용 신규 KVM host가 권장되며 runner drain/fence를 수반하는 대안은 별도 승인 대상이다.
 
@@ -714,13 +793,98 @@ The runner remains online and dedicated, and the variable remains enabled. This 
 
 2026-09-23 PAX 후속 검토: `TarInfo.tobuf(PAX_FORMAT)`의 8GiB 초과 출력은 `x` 확장의 실제 `size`와 크기 0의 일반 header를 만든다. 기존 `_scan_members`는 확장 내용을 건너뛰어 자체 번들의 논리적 크기와 다음 header 위치를 잘못 해석했다. 7B PAX size override를 실제 `extract_blob`으로 재현한 뒤, 제한된 PAX record 해석과 절대 offset seek로 보정했다. 8GiB+1B sparse tar의 논리 크기·blob 상한도 검사하며 데이터 8GiB를 실제로 쓰거나 읽지 않는다. Hub 98건과 Ruff lint/format은 로컬에서 통과했으나 이 source의 Linux 서버 재검증·게시 결과는 별도 인계에 남긴다.
 
+2026-09-24 후속 Hub test-only review: `api/builds.py`의 visible parent-chain admission,
+`services/builds.py`의 private output parent 등록과 interrupted claim reconciliation,
+`hub_builder.py`의 recipe integrity/guest 실행 경계를 검토했다. HTTP→SQL→CAS
+portable 회귀는 private output을 다음 LAYER 입력으로 사용하는 build의 완료·
+다운로드·foreign project 404 및 parent skip 422/queue 불변을 검사하고,
+guest 생성 전 끊긴 building claim을 `worker_interrupted`로 terminal 처리하면서
+queued job을 보존하는 경계도 검사한다. `hub/tests/test_builds.py`만 변경했고
+schema, runtime, 권한 및 배포 구조는 바꾸지 않았다. VM executor가 test double이므로
+다중 RUN의 guest 실행이나 실제 worker 재시작·guest 회수 증거는 아니다.
+
+로컬 Hub 전체 99건과 Ruff lint/format이 통과했다. 이 결과는 Linux-native
+KVM 재검증이나 실제 SQL/MySQL·Redis·Keystone staging 검사를 대신하지 않는다.
+
+2026-09-23 UTC, 정확한 source HEAD `720761b605d6307dfa764601ccec01d5a474a754`의
+추가 승인된 단일 native chain 시도: 신규 전용 Nova x86_64 KVM VM, 분리된
+SQL/Redis/store, `/srv/h`와 동일 no-sudo QEMU/worker UID에서 앞선 성공
+Ubuntu base(위 digest)와 순서가 있는 두 SquashFS LAYER를 실제 인증 HTTP로
+등록했다. 두 RUN이 포함된 **한** recipe는 build
+`22457a43-7ab9-46b8-875c-764340b35252`로 202에 수락됐으나
+`building` 뒤 `error`/`build_failed`로 끝났다. libvirt의 해당 QEMU 로그는
+`cannot set up guest memory 'pc.ram': Cannot allocate memory`를 기록했다.
+`build.py`는 builder guest에 4096MiB(4,294,967,296B)를 고정 요청하고,
+이번 Nova host의 물리 메모리는 4,106,240,000B에 불과했다. Guest는 부팅하지
+못했고 두 RUN, 결과 SquashFS, parent/ancestor 조회 및 digest 검증은 **성공
+증거가 없다**. Job 종료 후 `virsh list --all`에 domain이 없고 private
+`builds/`도 비었으며, 소유 Nova VM·volume·SG를 ID 대조 후 삭제해 부재를
+확인했다. 두 번째 build는 하지 않았다. 다음 native 시도에는 guest 4GiB
+외에 QEMU/Hub/SQL/Redis headroom이 있는 전용 host와 별도 승인이 필요하다.
+
+2026-09-24 UTC, **별도 재승인**으로 8192MiB flavor의 신규 전용 Nova
+KVM host(guest 가용 물리 메모리 8,327,811,072B)에서 같은 source HEAD의
+ordered two-layer/two-RUN build를 **한 번** 실행했다. 인증 업로드는
+Ubuntu base `sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`,
+첫 SquashFS `sha256:46be08051539b9bdfb7754eb322a7d84a42853b3b2c49f561010775a7a1425a7`,
+둘째 `sha256:029821b551e18cf35e862ad8726171d6d0d3253c7b47776be8eb0ad59e646fa8`를
+등록했다. Job `3d7e3db8-17e2-40e2-8c0b-7a75ea4c2930`는
+202→queued→building→SQL `complete`(02:32:12 UTC)를 기록했다. 결과
+`sha256:21a96b8509c8333f1f4ef7d996819b2a15f52b16a08e10170cca99ed1fe2a690`
+(4096B)의 CAS bytes SHA-256, guest가 순서대로 쓴 `run-one=ran-one`과
+`run-two=ran-two`, 인증된 HTTP blob 200/전량 digest, 각 layer의
+`parent_digest`와 전용 `/ancestors`의 `[first, second, output]`를 확인했다.
+Guest domain과 private build scratch는 남지 않았고, 소유 VM·volume·SG의
+정확한 ID만 삭제한 뒤 세 자원의 부재를 다시 조회했다. 이는 2-layer/2-RUN
+network-none 최소 사례의 live proof이지 timeout/restart recovery, 운영 계정·
+자격증명 분리, 더 큰 recipe의 일반 증거가 아니다. 단일 layer metadata의
+`ancestors`/`chain_complete` projection 누락은 이 native proof의 exact SHA에서 미수정이었다.
+
+2026-09-24 로컬 Hub API projection 수정: `get_hub_layer`가 계산한
+`ancestors`/`chain_complete`가 `HubLayerResponse` 직렬화에서 삭제되는 것을
+project-scoped 실제 HTTP regression의 `KeyError: 'ancestors'`로 재현했다.
+상세 경로만 필수 두 field를 가진 `HubLayerDetailResponse`로 분리하고
+검색·업로드·조상 목록의 기존 응답 형태는 유지했다. 수정 후 같은 검사가
+통과했으며 Hub 전체99건, 변경 파일 Ruff lint/format 및 임시 SQL 기반
+ASGI route smoke(root/child/orphan와 검색 shape)가 통과했다. DB schema,
+인증·visibility query, worker/guest 실행 계약은 바꾸지 않았다. 앞선 native
+proof는 이전 source SHA의 증거다. 로컬 수정 직후에는 수정본의 native
+실기가 없었고, 아래 별도 승인 실기는 timeout/restart만 검증한다. GitHub
+게시와 원격 helper 전송은 여전히 수행하지 않았다.
+
+2026-09-24 UTC, 사용자가 timeout·worker restart 실기의 새 전용 KVM 자원과
+실패 주입·정확한 정리를 별도로 승인했다. 기존 HEAD `720761b605d6307dfa764601ccec01d5a474a754`에
+미커밋 Hub detail projection 수정이 포함된 현재 source snapshot을
+`sha256:d4197cce5fab4fb28dfdd591c06f774fec27407282dbbc2d145ee314ae7f5560`으로
+고정해 별도 8192MiB Nova host에 설치했다. 인증 HTTP로 등록한 기존 Ubuntu
+base에서 `RUN echo <case-marker> && sleep 1800`, worker timeout 900초를
+각각 실행했다. Timeout job `8bd3d352-c71d-46fe-999f-405d08ec6d40`은
+guest marker와 live libvirt domain을 확인한 뒤 `error/build_failed`로
+종료했고, domain·private scratch·output이 없으며 원래 worker는 살아 있었다.
+Restart job `21796b0d-1e0e-4129-9a6f-61261658bbdc`도 별개 guest의 RUN
+marker, SQL `building`, fsync된 builder identity와 worker PID를 확인한 뒤
+**그 전용 worker main만** SIGKILL하고 새 worker를 시작했다. Startup에서
+`Reconciled 1`을 기록하고 `error/worker_interrupted`, guest·scratch·output
+부재, 새 worker 생존을 확인했다. VM·20GiB volume·SSH-only SG는 사전에
+기록한 ID/소유·volume attachment를 대조해 삭제하고 모두 부재를 조회했다.
+이는 두 소유 job의 network-none timeout/restart 실제 회수 증거이며,
+전원 차단·일반 recipe·운영 계정/자격증명 분리 증거는 아니다. Source 동작이나
+architecture contract는 이 실기로 변경하지 않았다. GitHub 게시, 공유
+runner/domain, 기존 운영 helper도 건드리지 않았다.
+
+2026-09-24 UTC, 후속 로컬 게시 전 검토에서는 위 timeout/restart 실기를
+`README.md`의 개발 요약과 인계에 반영하고 현재 Hub detail response model·
+상세 route·project-scoped test를 다시 읽었다. Runtime/source 계약 변경은
+없다. Hub 99건, 변경 Python 두 파일 Ruff lint/format, working-tree
+architecture guard가 통과했다. 새로운 native 실행이나 게시 증거는 아니다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ce2785fb8d33b8d01e45c612abcf233a83f91c6623ee9ec1695418643a58f8cd",
-  "reviewed_at": "2026-09-23T07:18:16Z",
-  "summary": "Reviewed bounded PAX logical-size parsing for 8 GiB exports, sparse offset and limit regressions, and unchanged Hub/KVM deployment boundaries."
+  "source_sha256": "2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c",
+  "reviewed_at": "2026-09-24T09:29:50Z",
+  "summary": "Reviewed Hub detail response model, route, and project-scoped chain test after updating README and handoff with separately approved live timeout/restart proof. Source and architecture contracts unchanged; Hub 99 tests, changed Python Ruff lint/format, and working-tree architecture guard passed. No additional native proof or publication."
 }
 ```
 <!-- architecture-review:end -->

@@ -1561,6 +1561,340 @@ Test/Hub-image workflow나 실제 KVM guest build는 실행되지 않았다.
 이후 필요한 것은 별도 승인을 받은 전용 KVM host/staging의 2번 검증이며,
 `dev`/`main` 추가 게시는 현재 승인 범위가 아니다.
 
+### 실 OpenStack Keystone/Glance 연동 증거 (2026-09-23)
+
+사용자가 `pieroot-server`의 `code/palimpsest/admin-openrc`(실제 운영 OpenStack의
+admin 자격증명)로 Hub가 접근 가능한 OpenStack 서비스에 한해 연결을 승인했다.
+단, SQL과 Redis는 운영 인스턴스를 재사용하지 않고 임시로 직접 준비하라는
+제약을 받았다. 이에 따라 기존 checkout(`720761b605d6307dfa764601ccec01d5a474a754`,
+`git status` clean)은 건드리지 않고, 전용 docker network
+(`palimpsest-oss-probe-net`) 위에 이번 실행 전용 MySQL 8.0.40 컨테이너와
+Redis 7 컨테이너를 무작위 생성 자격증명으로 새로 띄웠다. 두 컨테이너 모두
+`127.0.0.1`에만 바인딩했고 기존 DB/Redis 컨테이너·볼륨(`bms-api_db_data` 등)은
+전혀 참조하지 않았다.
+
+`hub/` 기존 venv로 `palimpsest-hub-bootstrap`을 이 임시 MySQL에 대해 실행한 뒤
+`uvicorn palimpsest_hub.main:app`을 `OS_AUTH_URL`/`OS_USERNAME`/`OS_PASSWORD`/
+`OS_PROJECT_NAME` 등 admin-openrc의 실제 값으로 기동했다. `admin-openrc`의
+`OS_USERNAME`/`OS_PASSWORD`로 실제 Keystone에 password 인증해 project-scope
+토큰을 받았고(비밀번호·토큰 문자열은 로그·transcript에 출력하지 않음), 그
+토큰으로만 검증했다.
+
+관측 결과: 토큰 없이 `GET /v1/layers` → 401. 실제 토큰으로 같은 요청 →
+200과 빈 배열(새 스키마라 데이터 없음). `require_admin` 의존성이 걸린
+`DELETE /v1/layers/{digest}`를 존재하지 않는 잘못된 형식의 digest로 호출 →
+403이 아니라 422(`digest 형식` 검증)까지 도달했다. 즉 `_is_system_admin`이
+실제 Keystone `role_assignments`(`system="all"`, `admin`)를 조회해 이
+admin-openrc 계정이 system-admin임을 실제로 확인했다는 뜻이며, 이 경로가
+mock이 아니라 실제 Keystone에 도달한 첫 증거다. 마지막으로
+`get_os_conn`과 동일한 caller-scoped token 패턴으로 Glance에 연결해 이미지
+개수만 세었다(`image_count=58`, 이름/ID는 출력하지 않음) — 생성·수정·삭제
+없이 read-only 도달성만 확인했다.
+
+실행 종료 시 `trap cleanup EXIT`가 Hub API 프로세스 종료, 두 컨테이너와
+전용 network 제거, 임시 자격증명 파일 삭제를 모두 수행했음을 사후에
+`docker ps -a`/`docker network ls` 재조회로 확인했다. Hub API 로그에도 토큰이
+기록되지 않았다. 이번 실행은 Keystone 인증·시스템 관리자 판정·Glance
+read-only 도달성만 증명하며, Glance 이미지 export 생성이나 Hub KVM build
+worker(별도 host 필요, 여전히 미승인)는 실행하지 않았다. 운영 OpenStack
+project/이미지/역할 데이터는 전혀 변경하지 않았다.
+
+### 실제 Glance export 완료와 Hub build host 사전 점검 (2026-09-23)
+
+사용자의 실 추출·빌드 시도 요청에 따라 기존 checkout SHA
+`720761b605d6307dfa764601ccec01d5a474a754`에서 별도
+`openstack-probe/export-live-RgIfyWJx` 0700 작업 디렉터리를 사용했다.
+전용 docker network 및 임시 MySQL 8.0.40·Redis 7 컨테이너(`--rm`,
+localhost-bound)를 새로 띄우고, 실제 `admin-openrc`로 Keystone 인증한
+Hub API와 export worker를 같은 scratch SQL·blob store에 연결했다.
+기존 OpenStack 이미지 `CirrOS`(raw 46,137,344B)를 **읽기만** 하는
+`POST /v1/image-exports` raw→qcow2 요청은 202를 반환했다. 실제
+worker는 queued→downloading→complete로 끝났으며 결과는
+`sha256:6bde96963adf0322f176e32a90154ff9eefdcc64cfea47a8764a43cf6c9ce942`
+(18,022,400B)였다. 인증된 `GET /v1/image-exports/{id}/blob` 200의
+전체 스트림을 SHA-256·길이로 검증했다. 별도 `qemu-img info -f qcow2`에서
+qcow2/virtual-size 46,137,344B를 확인했고 파일 SHA-256도 일치했다.
+Glance 이미지·프로젝트·역할에는 쓰지 않았다. API와 worker 정상 종료,
+전용 컨테이너·network 제거를 사후 조회했다. 저장된 QCOW2 증거는
+이 scratch store에만 남고 운영 Hub store/SQL/Redis를 사용하지 않는다.
+
+실제 Hub build worker는 시작하지 않았다. 현재 `pieroot-server`에는
+기존 GitHub runner와 여러 libvirt domain이 공유로 존재하고,
+`cloud-localds`와 root venv의 `libvirt` 패키지가 없으며,
+`python -I -m palimpsest_local.hub_builder preflight`가 exit 1이다.
+임의로 builder path를 설정해 queue를 적재하거나 shared libvirt에
+guest를 띄워 기존 runner/domain과 충돌시키지 않았다. 요청한
+upload→queue→guest build→SquashFS 성공은 아직 증명되지 않았다.
+전용 KVM host(또는 별도 승인된 격리 Nova VM에서 `/dev/kvm` 노출과
+도구·network·shared SQL/store를 먼저 입증)가 필요하다. 기존
+`admin-openrc`가 group-readable 0664였으므로 0600으로 제한했다;
+Ansible 관리 파일이므로 이후 재생성 시 권한 유지 여부를 점검해야 한다.
+
+### 공식 Ubuntu 24.04 Glance image의 실제 대용량 Hub export (2026-09-23)
+
+동일한 reviewed source `720761b605d6307dfa764601ccec01d5a474a754`에서
+별도 `openstack-probe/export-ubuntu-3Cet3REN` 0700 scratch store와 새 임시
+MySQL/Redis를 사용했다. 기존 Glance Ubuntu 24.04 KVM image
+`4da46b06-1e48-4bf8-adac-4c0ed5424797`를 읽어 실제 Hub API의
+`POST /v1/image-exports`를 호출했고, export
+`88c70150-3a87-463b-94ee-91178548601a`가 worker의 비동기 처리 끝에
+`complete`가 되었다. 출력 QCOW2는 1,842,282,496B이며 scratch CAS의
+SHA-256 `961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`를
+독립적으로 재계산해 일치했다. 같은 token으로 HTTP Range 206의 첫 1,024B를
+받아 CAS와 비교했다. 임시 API/worker/DB/Redis/network는 종료했고,
+이 증거는 Ubuntu 이미지를 이용한 실제 Glance→Hub export까지다. 새
+Hub upload·SQL build queue·KVM guest 실행·SquashFS 생성/다운로드의
+성공은 이 export만으로 주장하지 않는다.
+
+### 실제 KVM guest build 성공: upload→queue→guest→SquashFS→download (2026-09-24)
+
+사용자가 전용 Nova instance(nested KVM, `/dev/kvm` 노출)를 KVM build
+worker host로 쓰도록 승인했다. reviewed source
+`720761b605d6307dfa764601ccec01d5a474a754`를 그 VM에 설치하고, 위
+검증된 Ubuntu 24.04 QCOW2를 실제 project-scoped Keystone 토큰으로
+업로드·등록한 뒤 `POST /v1/builds`(`RUN printf hub-live-ok > /opt/...`)를
+큐에 넣었다. 실 `palimpsest-hub-build-worker`가 `qemu:///system`
+아래 disposable guest를 만들어 RUN을 실행했고, 결과 SquashFS를
+SQL에 `complete`로 커밋했다. 인증된 blob 다운로드의 SHA-256이
+CAS와 일치했고 `unsquashfs -cat`로 guest가 실제로 쓴
+`hub-live-ok` 내용을 재확인했다. `virsh list --all`은 domain 없음을
+보였다(guest cleanup 성공).
+결과 build `32d735ba-4aaf-4bc9-8466-adf447039864`의 SquashFS digest는
+`sha256:76f5045267e1ede4bb8b4c4c6e9ecd546dc3784ae5970e136a7529c8ef7212cf`
+(4096B)였다.
+
+두 번의 실패를 먼저 겪고 원인을 확인했다. (1) `qemu.conf`가
+`libvirt-qemu` 기본 계정을 쓰는데 build worker의 job tree는 다른
+계정 소유라 overlay 디스크에 `Permission denied`. Worker와 QEMU를
+같은 no-sudo 전용 계정으로 맞춰 해결했다. (2) 그 뒤에도
+`PALIMPSEST_HUB_LOCAL_PATH`가 길어 guest control socket 경로
+(`.../builds/<uuid>/state/runs/builder-<id>/builder.sock`)가 Linux
+`AF_UNIX` `sun_path` 108바이트 상한을 넘어 `UNIX socket path ...
+too long`으로 실패했다. Store 경로를 `/srv/h`로 짧게 바꾸자 성공했다.
+두 제약은 `ARCHITECTURE.md`와 `docs/install.md`에 배포 전제로 반영했다.
+
+검증에 쓴 전용 Nova VM·Cinder volume(20GiB)·security group은 실행
+종료 시 정확한 server/volume/SG ID를 대조한 뒤 삭제를 요청했고,
+server가 `ResourceNotFound`, volume과 security group 조회가 `None`을
+반환할 때까지 폴링해 세 자원의 실제 삭제를 확인했다. 이번 검증은
+network-none, RUN 한 줄, 4096B
+SquashFS 결과의 최소 사례이며, 더 큰 recipe·다중 RUN·LAYER 체이닝·
+build timeout·worker 재시작 중 crash recovery의 실기는 여전히
+별도 증거가 필요하다.
+
+### 다음 검증 경계: 로컬 chain/recovery 계약 (2026-09-24)
+
+현재 checkout `720761b605d6307dfa764601ccec01d5a474a754`에서
+`hub/tests/test_builds.py`에 두 portable 경계를 추가했다. 첫째, 이미
+완료된 private output을 다음 build의 LAYER 입력으로 사용해 HTTP 202→
+worker 처리→새 output 등록/다운로드, 부모와 base digest, 타 project 404를
+확인하고 부모를 건너뛴 입력은 422이며 queue가 불변임을 검사했다. Recipe는
+두 RUN을 포함하지만 VM executor는 test double이므로 guest에서 두 명령을
+실제로 실행했다는 증거가 아니다. 둘째, guest 생성 전 끊긴 building claim은
+시작 시 `worker_interrupted`로 닫히고 queued job은 보존됨을 검사했다.
+선별 `hub/tests/test_builds.py` **8 passed**, Hub 전체 **99 passed**,
+Ruff lint/format 통과.
+이 단계는 production code/schema 변경 없이 테스트 계약만 확장한다.
+
+앞선 실기 VM에서는 API·worker·QEMU가 동일 UID였고 private staging에
+관리자 `admin-openrc` 사본이 있었다. 동일 UID는 private artifact에 접근하기
+위한 이번 probe의 임시 구성이지 운영 계정/자격증명 분리의 증거가 아니다.
+다음 native proof는 별도 소유 전용 KVM host와 분리된
+임시 SQL/Redis/store, 짧은 Unix socket 경로, private tree에 접근 가능한
+QEMU 사용자, 기존 cloud image의 읽기 전용 사용을 준비한 뒤에만 진행한다.
+검증 순서는 **실제** 다중 RUN과 순서가 있는 LAYER 체인의 guest output·
+digest·parent 조회, 그 다음 별도 timeout/worker restart에서 소유 guest와
+scratch의 정확한 회수 또는 보존 실패를 확인하는 것이다. 새 Nova 자원 생성,
+원격 helper 전송, GitHub ref/패키지 게시, 기존 runner/domain 조작은
+이번 로컬 검증에 포함되지 않았으며 각각 필요한 범위의 명시적 승인을
+기다린다. 기존 삭제된 전용 VM을 재사용했다고 주장하지 않는다.
+
+### 추가 승인된 단일 native chain 시도 — guest 시작 전 메모리 실패 (2026-09-23 UTC)
+
+정확한 source HEAD `720761b605d6307dfa764601ccec01d5a474a754`를
+새 전용 Nova VM `nova-builder-a7f94a020ad6`
+(`d8e03dc3-c5b2-4fad-8b79-b10c9190ea52`, x86_64 `/dev/kvm`)에
+가져왔다. 별도 20GiB Cinder volume, SG, SQL/Redis, `/srv/h` store,
+동일 no-sudo API/worker/QEMU UID와 private 관리자 자격증명을 사용했다.
+Pinned Ubuntu base `sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`
+(1,842,282,496B)와 두 4096B SquashFS
+`sha256:6ce89023a16e1ce268085ca49b44595a80556ea22a1f89d01de6ad7028e4d97e`,
+`sha256:b79f6ae3089fb945a76387ffc1b59460f00c2cdb59e220f2070eee2422a5fdc6`를
+인증 HTTP로 업로드·등록했다. 두 번째 layer는 첫 번째를 parent로 하고
+`/opt/probe-order/value`를 `first`→`second`로 덮는다. Recipe의 첫 RUN은
+덮어쓰기와 첫 layer의 `first`를 검사해 `run-one`을 쓰고, 두 번째 RUN은
+`run-one`과 둘째 layer의 `second`를 검사해 `run-two`를 쓰도록 설계했다.
+이는 실행되었음을 뜻하지 않는다.
+
+단일 `POST /v1/builds`는 202/job
+`22457a43-7ab9-46b8-875c-764340b35252`를 반환했고, job은
+`building`→`error`(`build_failed`)였다. 해당 libvirt QEMU 로그의 마지막
+오류는 `cannot set up guest memory 'pc.ram': Cannot allocate memory`다.
+Builder source는 4096MiB(4,294,967,296B)를 guest에 고정 요청하지만
+이 Nova host의 전체 물리 메모리는 4,106,240,000B, swap 0이었다.
+따라서 guest 부팅·두 RUN·output SquashFS·parent/ancestors·인증 다운로드의
+실기 성공은 **없다**. Worker 종료 뒤 `virsh list --all`에 domain이 없고
+`/srv/h/builds/`는 비었다. 두 번째 build는 수행하지 않았다.
+
+소유 VM, volume `85721a4d-6a5c-4ce7-8209-cd7078092d0d`, SG
+`3fe84351-4676-4f50-8e51-57a45a13e6fe`는 정확한 ID/프로젝트/이름을
+검증하고 부재까지 확인했다. 첫 SG cleanup의 SDK 서버 필터
+`ports(security_group_id=...)`는 이 cloud에서 **365개 다른 port를 포함해**
+반환했으므로 자동 삭제가 안전하게 중단됐다. 각 port의 실제
+`security_group_ids`를 확인하니 이 SG에 연결된 port는 0개였고,
+exact-ID 후속 삭제만 수행했다. 다른 VM/volume/SG/port는 변경하지 않았다.
+민감값 없는 실패 receipt는 서버의 전용 임시 디렉터리
+`openstack-probe/nova-builder-a7f94a020ad6/proof-failure.json`에 남겼다.
+다음 native proof는 4GiB guest **외의** QEMU/Hub/SQL/Redis 여유가 있는
+새 전용 host 및 자원 생성·guest build에 대한 **별도 승인**을 받은 뒤,
+동일 ordered recipe를 한 번 실행하고 guest file·CAS/HTTP digest·parent
+조회로 판정한다. Timeout/restart recovery는 그 뒤의 별도 범위다.
+
+### 별도 재승인된 8GiB host native chain 성공 (2026-09-24 UTC)
+
+앞의 4GiB 실패 뒤 사용자가 새 전용 8GiB 이상 VM·임시 volume·SG와
+**빌드 한 번**을 별도로 승인했다. 전용 Nova VM
+`nova-builder-be76f0ea2d75` (`87772b81-a6dc-43e5-ab80-8a3431623e04`),
+8192MiB flavor `cpu.2c_8g`(guest 물리 8,327,811,072B), 별도 20GiB
+volume `db3dc4c9-8902-4783-bed4-3fe428565157`, SSH-only SG
+`42d14b05-a485-401a-8fab-44381061293e`를 생성했다. 새 VM host key를
+Nova console의 ED25519 fingerprint로 pin했고 `/dev/kvm`, `/srv/h`,
+분리된 SQL/Redis와 exact source HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`를 확인했다. 이 임시
+API/worker/QEMU는 동일 no-sudo UID와 private 관리자 자격증명을 사용했으므로
+운영 credential/account separation 증거는 아니다.
+
+기존 Ubuntu base digest는 그대로이고, 새로 만든 ordered 4096B layer는
+첫째 `sha256:46be08051539b9bdfb7754eb322a7d84a42853b3b2c49f561010775a7a1425a7`,
+둘째 `sha256:029821b551e18cf35e862ad8726171d6d0d3253c7b47776be8eb0ad59e646fa8`다.
+둘째의 parent는 첫째이며 `value=first`를 `second`로 덮고,
+첫 RUN은 `value=second`와 첫째 layer의 `first`를 검사해 `run-one`을,
+둘째 RUN은 `run-one`과 둘째 layer의 `second`를 검사해 `run-two`를 쓴다.
+정확히 한 build `3d7e3db8-17e2-40e2-8c0b-7a75ea4c2930`는
+인증 HTTP 202→queued→building→SQL `complete`(02:32:12 UTC)였다.
+Output `sha256:21a96b8509c8333f1f4ef7d996819b2a15f52b16a08e10170cca99ed1fe2a690`
+(4096B)의 CAS SHA-256, `unsquashfs`의 guest-written `run-one=ran-one` 및
+`run-two=ran-two`, project token의 `/v1/layers/{digest}/blob` HTTP 200
+전량 digest, `/v1/layers/{digest}/ancestors`의
+`[first, second, output]` 순서와 부모 `[null, first, second]`, base digest를
+독립된 read-only 검증에서 모두 확인했다. `virsh list --all`은 비었고
+`/srv/h/builds/`도 비었다. Sanitized receipt는 서버의 전용 임시 디렉터리
+`openstack-probe/nova-builder-be76f0ea2d75/chain-evidence.json`에 남겼다.
+
+첫 verifier의 끝부분이 기대한 단일 `GET /v1/layers/{digest}` 응답의
+`ancestors`/`chain_complete`는 실제 HTTP에서 **빠졌다**. Handler는 둘을
+계산하지만 `response_model=HubLayerResponse`가 해당 field를 선언하지 않아
+제거한다. 별도 `/ancestors` endpoint와 각 `parent_digest`는 정상 동작했다.
+이 projection 결함은 아직 source를 고치지 않았고, 첫 verifier가 끝까지
+완료됐다고 주장하지 않는다. 그 후 단일 API를 read-only로 열고 독립
+verifier가 output/HTTP/chain을 재검증했다. Timeout과 worker restart의
+actual guest/scratch recovery, 더 큰 recipe, production account separation은
+여전히 별도 native gate다. 이를 portable 99건이나 이전 단일 RUN proof와
+혼합하지 않는다.
+
+검증 후 API를 내리고 VM·volume·SG의 정확한 이름/ID/프로젝트 및 volume
+attachment/metadata를 대조해 삭제했고, 세 ID의 부재를 **독립 재조회**했다.
+임시 VM SSH private key도 서버 scratch에서 제거했다. 공유 runner/domain,
+다른 cloud 자원과 GitHub ref/패키지는 변경하지 않았다. 검증 전용 script는
+소유 VM에만 복사했고 기존 운영 remote helper는 변경하지 않았다.
+다음 작업 순서는 미수정 metadata projection 결함을 별도 범위에서 수정·
+회귀 검증할지 결정하고, timeout/worker restart recovery 실기는 전용 host
+전제와 새 승인 뒤에만 실행하는 것이다.
+
+### Hub layer 상세 metadata projection 수정 (2026-09-24 UTC)
+
+앞선 native proof의 source HEAD `720761b605d6307dfa764601ccec01d5a474a754`에서
+`GET /v1/layers/{digest}` handler는 `ancestors`/`chain_complete`를 계산했지만
+공통 `HubLayerResponse`에 두 field가 없어서 FastAPI 응답 직렬화 시 제거했다.
+현재 **미커밋 로컬 작업트리**는 상세 조회만 필수 두 field를 가진
+`HubLayerDetailResponse`로 바꿨다. 검색·업로드·별도 `/ancestors` 응답은
+기존 공통 model 형태를 유지하고 조회 권한·조상 탐색·저장소·schema는
+바꾸지 않았다. 앞선 native source의 누락 사실은 그대로 역사적 증거다.
+
+기존 `hub/tests/test_builds.py`의 project-scoped HTTP build chain에 실제
+`ancestors=[parent]`, `chain_complete=true` 응답 확인을 추가했다.
+수정 전 exact test는 `KeyError: 'ancestors'`로 실패했고 수정 후 통과했다.
+Hub 전체 **99 passed**, 변경 두 Python 파일의 Ruff lint/format 통과.
+별도 임시 SQL·실제 ASGI route smoke는 root의 `[]/true`, child의
+`[root]/true`, 없는 parent의 `[]/false`, 검색 결과의 기존 기본 shape를
+확인했다. 이는 portable HTTP/local source 증거이며 새로운 Linux KVM
+guest·OpenStack 배포 검증이 아니다. Native proof의 output digest나
+resource cleanup을 이 수정본의 재검증으로 승격하지 않는다.
+
+이 로컬 수정 직후에는 timeout/worker restart용 새 전용 KVM host·자원 및
+실패 주입·정리 범위의 승인을 기다렸다. 이후 별도 승인된 실기는 바로 아래에
+구분해 기록한다. GitHub 게시, 기존 runner/domain/운영 helper 조작은
+이 로컬 수정과 후속 실기 양쪽 모두에 포함되지 않았다.
+
+### 별도 승인된 실제 timeout·worker restart guest 회수 (2026-09-24 UTC)
+
+사용자가 신규 전용 KVM VM·volume·SG 생성, 소유 build 두 건의 timeout 및
+worker SIGKILL 주입, 정확한 소유 자원 정리를 별도로 승인했다. Project의 기존
+instance 수 0을 확인한 뒤 `cpu.2c_8g` Nova VM `nova-builder-ad667fe5bef0`
+(`9d41d2d6-8428-44d9-a63f-931ffc0d886b`), 20GiB Cinder volume
+`02a96832-5935-4ece-b1d8-371aeda72927`, SSH-only SG
+`f732a932-dbfa-434a-9386-c1f4ae232822`를 만들었다. Nova console의
+ED25519 fingerprint와 SSH host key를 맞춘 뒤에만 접속했다. 새 VM에만
+전용 SQL/Redis, `/srv/h` store, no-sudo `palimpsest-probe` worker/QEMU,
+별도 systemd API·worker unit을 설정했다. Source는 기존 HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`와 현재 **미커밋**
+Hub projection 수정이 포함된 tar
+`sha256:d4197cce5fab4fb28dfdd591c06f774fec27407282dbbc2d145ee314ae7f5560`이다.
+위에서 검증된 Ubuntu QCOW2
+`sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`를
+같은 VM의 인증 Hub HTTP API에 등록했다. 이 실기는 성공 output의 상세
+`GET /v1/layers/{digest}`나 production 자격증명 격리를 재검증하지 않았다.
+
+Timeout job `8bd3d352-c71d-46fe-999f-405d08ec6d40`:
+`FROM <Ubuntu base>`와 `RUN echo PROBE_TIMEOUT_RUN_STARTED && sleep 1800`,
+worker timeout 900초. HTTP 202→queued→building 후 `builder-b-cc2425de4dce`의
+host console에서 **실제 RUN marker**, 같은 live libvirt domain, fsync된
+builder process identity 및 부모 worker PID를 확인했다. Timeout 후 API는
+`status=error`, `error_code=build_failed`, `output_digest=null`; domain과
+`/srv/h/builds/<job-id>`는 없고 원래 worker PID 10288이 계속 살아 있었다.
+
+Restart job `21796b0d-1e0e-4129-9a6f-61261658bbdc`:
+별개 `RUN echo PROBE_RESTART_RUN_STARTED && sleep 1800`의 guest
+`builder-b-6ea3e55f52c6` RUN marker, SQL `building`, 정확한 domain,
+builder PID 10850의 parent/boot/start-tick과 전용 worker main PID 10288을
+확인한 뒤 **그 unit main만** SIGKILL했다. 이전 main 부재와 SQL `building`을
+확인하고 worker PID 10983을 새 전용 unit으로 시작했다. Startup journal은
+`Reconciled 1 interrupted or retained private build jobs`를 기록했다. API는
+`error/worker_interrupted`, `output_digest=null`; domain·private job scratch
+부재 및 새 worker 생존을 확인했다. VM 안의 `virsh list --all`도 빈 목록이었다.
+Sanitized 두 건의 receipt는 서버 전용 scratch의
+`openstack-probe/nova-builder-ad667fe5bef0/recovery-evidence.json`에 있다.
+
+두 guest의 회수를 확인한 **후** 정확한 VM·volume·SG 이름/ID/project,
+volume metadata/attachment와 SG port binding을 대조하여 소유 세 자원만
+삭제했고 세 ID의 부재를 조회했다. 신규 VM SSH private key와 서버 scratch의
+임시 source 복사본도 제거했다. 공유 runner/domain, 운영 DB/store/helper,
+GitHub ref/package는 변경하지 않았다. 검증 전용 script는 새 VM에만 보냈다.
+이 결과는 해당 8GiB host와 두 network-none 장시간 RUN의 native
+timeout/restart 회수에 한정된다. Host power loss, 일반 workload,
+운영 account/credential separation의 증거가 아니다. 남은 승인 차단은
+GitHub 게시와 기존 원격 helper 전송·공유 runner/domain 조작이며, 이 새
+실기 승인으로 해제되지 않았다.
+
+### 이어지는 로컬 검토·게시 전 경계 (2026-09-24 UTC)
+
+현재 branch `codex/oci-root-phase1`, HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`에 위 projection 수정과
+증거 문서는 여전히 **unstaged·미커밋**이다. 최신 timeout/restart 실기를
+`README.md` Development 소개에 반영하되 이전 ordered-chain proof 및
+현재 상세 응답의 portable HTTP 증거와 구별했다. Hub 응답 model·상세
+route·project-scoped chain test를 검토했고 추가 runtime/code 변경은 하지 않았다.
+이번 로컬 실행은 `hub/`의 `uv run pytest -q` **99 passed**, 수정된 두
+Python 파일의 Ruff lint/format 통과, working-tree architecture guard
+`source_sha256=2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c`
+통과다. 이는 앞선 native proof를 다시 실행한 결과가 아니다.
+
+다음 외부 단계인 commit/push·package 또는 branch 게시에는 정확한 대상과
+별도 명시적 승인이 필요하다. 일반적인 '계속 진행'을 해당 승인으로 확대하지
+않는다. 기존 helper 전송·shared runner/domain 조작 역시 승인 대기이며,
+새 host power-loss 또는 production credential/account 분리 실기도 새
+자원·실패 주입 범위의 별도 결정 없이는 실행하지 않는다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

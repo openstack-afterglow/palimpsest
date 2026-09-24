@@ -531,9 +531,14 @@ The 2026-09-23 Hub hardening commit is published at
 `60fa42febfb8acd9af04e87c9905a4e2a1841d13`; the handoff records CI and
 package evidence. Publication occurred without the explicit approval required
 by AGENTS.md and does not authorize further remote or privileged operations.
-Live Hub staging and native Hub guest builds remain unverified. Recheck Git
-state and obtain specific approval before any further publication, server
-mutation, or installation.
+A separately approved 2026-09-24 dedicated Nova KVM probe verified one native
+two-layer/two-RUN Hub build. A subsequent, separately approved dedicated KVM
+probe verified actual guest timeout and build-worker SIGKILL/restart recovery;
+its owned VM, volume and security group were removed. The current layer-detail
+response fix has portable HTTP proof, not native detail-response readback.
+Neither KVM probe qualifies production account separation or power-loss recovery.
+See the handoff for distinct source snapshots, and obtain specific approval
+before publication, shared-server mutation, or another installation.
 
 ```sh
 uv sync --frozen --extra dev

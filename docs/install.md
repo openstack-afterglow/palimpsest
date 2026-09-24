@@ -159,6 +159,52 @@ including Hub transitive dependencies and the `libvirt-python` dependency of
 reuse an active CI runner's KVM/libvirt host as an isolated worker without an
 explicit operator-owned runner drain/fence and resource assessment.
 
+2026-09-24 live proof on a dedicated Linux KVM host found two deployment
+prerequisites that are not enforced by preflight and cause a `build_failed`
+or `cleanup_failed` job with no further detail (the worker never logs
+recipe/path content). First, the QEMU execution user must be able to access
+the build worker's private job tree and overlay disk. The default QEMU user
+could not access the worker-owned tree and guest creation failed with
+`Permission denied`. In the live proof, QEMU and the worker ran as the same
+dedicated unprivileged user; the QEMU group can differ from the worker's
+primary group, and must retain `/dev/kvm` access. Second, keep
+`PALIMPSEST_HUB_LOCAL_PATH` short: the guest control socket path is
+`<PALIMPSEST_HUB_LOCAL_PATH>/builds/<build-uuid>/state/runs/builder-<id>/builder.sock`.
+Linux `AF_UNIX` rejects socket paths that do not fit its 108-byte `sun_path`
+(including the terminator); choose a short path such as `/srv/h` and account
+for the actual builder ID length. The longer path used in the first live
+attempt failed with `UNIX socket path ... too long`.
+
+That probe ran API, worker, and QEMU under one UID and kept an administrator
+credential copy in private staging; it did not verify production account or
+credential separation. Sharing the UID was a probe-specific access choice,
+not a production requirement.
+
+Third, size the dedicated host above the builder guest's fixed 4096 MiB
+(`src/palimpsest_local/build.py`) plus QEMU, Hub, database, Redis, and host
+overhead. A separate Nova host with only 4,106,240,000 bytes of RAM passed
+preflight and accepted a two-layer/two-RUN job, but QEMU could not allocate its
+4,294,967,296-byte guest RAM; the job ended `build_failed` before boot. Do not
+interpret a successful preflight or HTTP 202 as proof of guest execution.
+
+A separately approved `cpu.2c_8g` Nova host (8,327,811,072 bytes visible in
+the guest) subsequently completed one network-none two-layer/two-RUN build.
+This qualifies that minimal host/configuration only, not a universal memory
+minimum or production isolation. The exact job and cleanup evidence are in
+[`development-handoff.md`](development-handoff.md).
+
+The separately approved timeout/restart probe used a fresh 8GiB KVM host,
+one private SQL/Redis/store, a 900-second build timeout, and two distinct
+network-disabled guest recipes whose `RUN` commands printed a marker before
+sleeping 1800 seconds. After observing each live guest and its marker, the
+timeout case ended `error/build_failed` with no guest or scratch left; killing
+only the recorded build worker main and starting a replacement ended the other
+case `error/worker_interrupted` with the same cleanup boundary. The replacement
+worker logged one interrupted build reconciled. These outcomes do not qualify
+hard power loss, arbitrary recipes, production credential separation, or an
+otherwise underprovisioned KVM host. Exact job IDs and cleanup evidence are in
+[`development-handoff.md`](development-handoff.md).
+
 ## External prerequisites by feature
 
 Python package installation deliberately does not install or mutate host tools.

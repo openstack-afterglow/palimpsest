@@ -157,6 +157,47 @@ async def test_project_build_consumes_uploaded_base_and_publishes_private_layer(
             assert (await client.get(f"/v1/layers/{output_digest}/blob")).content == output
             assert (await client.get(f"/v1/layers/{output_digest}/blob", headers=foreign)).status_code == 404
             assert (await client.get("/v1/builds", headers=foreign)).json() == []
+            # A completed private output may be used as the next build's parent,
+            # but skipping that parent must not enqueue a broken chain.
+            chained_output = b"hsqs\x00\x00chained-layer"
+            chained_digest = digest(chained_output)
+            chained_recipe = f"FROM {base_digest}\nLAYER {output_digest}\nRUN echo first\nRUN echo second"
+
+            def chained_executor(python, manifest, job_dir, timeout):
+                parents = json.loads(manifest.read_text())["layers"]
+                assert len(parents) == 1 and parents[0]["digest"] == output_digest
+                (job_dir / "result.sqsh").write_bytes(chained_output)
+                return {"digest": chained_digest, "size_bytes": len(chained_output)}
+
+            monkeypatch.setattr(build_service, "_run_guest_build", chained_executor)
+            chained_input = {
+                "name": "chained-output",
+                "base_digest": base_digest,
+                "layer_digests": [output_digest],
+                "recipe": chained_recipe,
+            }
+            chained = await client.post("/v1/builds", headers={"X-Role": "admin"}, json=chained_input)
+            assert chained.status_code == 202, chained.text
+            assert await build_service.process_one_hub_build("test-worker") is True
+            chained_job = (await client.get(f"/v1/builds/{chained.json()['id']}", headers={"X-Role": "admin"})).json()
+            assert chained_job["status"] == "complete" and chained_job["output_digest"] == chained_digest
+            layer = (await client.get(f"/v1/layers/{chained_digest}")).json()
+            assert layer["parent_digest"] == output_digest
+            assert layer["base_image_digest"] == base_digest
+            assert layer["ancestors"] == [output_digest]
+            assert layer["chain_complete"] is True
+            assert (await client.get(f"/v1/layers/{chained_digest}/blob")).content == chained_output
+            assert (await client.get(f"/v1/layers/{chained_digest}/blob", headers=foreign)).status_code == 404
+            existing_ids = {item["id"] for item in (await client.get("/v1/builds", headers={"X-Role": "admin"})).json()}
+            broken = await client.post(
+                "/v1/builds",
+                headers={"X-Role": "admin"},
+                json={**chained_input, "layer_digests": [chained_digest]},
+            )
+            assert broken.status_code == 422
+            assert {
+                item["id"] for item in (await client.get("/v1/builds", headers={"X-Role": "admin"})).json()
+            } == existing_ids
 
             wrong_digest = digest(b"different output")
 
@@ -245,6 +286,52 @@ async def test_interrupted_builder_with_unverifiable_identity_stops_worker_and_r
             row = await session.get(PalimpsestHubBuild, build_id)
             assert row.status == "error" and row.error_code == "cleanup_failed"
         assert (job_dir / "builder.pid").read_text() == "{invalid"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_claim_without_guest_releases_queue_on_recovery(tmp_path: Path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hub.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "store")
+    interrupted_id = "00000000-0000-4000-8000-000000000005"
+    queued_id = "00000000-0000-4000-8000-000000000006"
+    async with factory() as session:
+        for build_id, status in ((interrupted_id, "building"), (queued_id, "queued")):
+            session.add(
+                PalimpsestHubBuild(
+                    id=build_id,
+                    project_id="alpha",
+                    name="recovery",
+                    recipe="RUN true",
+                    recipe_digest=digest(b"RUN true"),
+                    base_digest=digest(b"base"),
+                    layer_digests=[],
+                    status=status,
+                    lease_owner="old-worker" if status == "building" else None,
+                    created_at=datetime.now(UTC),
+                )
+            )
+        await session.commit()
+    monkeypatch.setattr(build_service, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(build_service, "get_blob_store", lambda _settings=None: store)
+    monkeypatch.setattr(
+        build_service,
+        "get_build_worker_settings",
+        lambda: SimpleNamespace(palimpsest_hub_builder_python="/usr/bin/python3"),
+    )
+    try:
+        assert await build_service.fail_interrupted_builds() == 1
+        async with factory() as session:
+            interrupted = await session.get(PalimpsestHubBuild, interrupted_id)
+            queued = await session.get(PalimpsestHubBuild, queued_id)
+            assert interrupted.status == "error" and interrupted.error_code == "worker_interrupted"
+            assert interrupted.lease_owner is None and interrupted.completed_at is not None
+            assert queued.status == "queued" and queued.error_code is None
+        assert await build_service.fail_interrupted_builds() == 0
     finally:
         await engine.dispose()
 
