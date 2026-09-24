@@ -911,6 +911,18 @@ GitHub/ref·공유 runner/domain·원격 helper에는 접근하지 않았다.
 공유 KVM host의 기존 domain 22개는 이름만 읽었다. Linux KVM/OCI-root
 native 성공 증거는 여전히 추가되지 않았다.
 
+2026-09-24 UTC, 사용자가 PR로 native KVM gate 실행을 명시적으로 선택했다.
+`codex/oci-root-phase1`→`dev`로 PR #3을 열었고(merge 요청 아님), 최초
+`mergeable_state=dirty`였다. Open과 close→reopen 뒤 각각 대기했지만 이
+head SHA `61757c7`에는 `pull_request` 이벤트의 GitHub Actions check-suite가
+전혀 생성되지 않았다(관련 없는 `claude` app check-suite만 `queued`). 같은
+SHA로의 직전 `push`는 `Test`/`Development package`/`Hub` 세 workflow를
+모두 정상 트리거했으므로 이는 `pull_request` 트리거만의 관측된 제약이다.
+workflow 파일, repository Actions 권한, branch protection은 이 확인을 위해
+바꾸지 않았다. 전용 runner `pieroot-server-palimpsest-kvm`(id 21)은 여전히
+online·idle이었다. `dev`/`main`은 이 PR로 변경되지 않았고 병합은 요청하지
+않았다.
+
 <!-- architecture-review:start -->
 ```json
 {

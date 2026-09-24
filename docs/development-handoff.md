@@ -1990,6 +1990,26 @@ push 또는 PR, `workflow_call`에서 native job을 실행하며 수동 dispatch
 게시 범위가 달라, 공유 자원 변경 목적·대상을 확정하기 전까지 수행하지
 않았다. 이 source의 Linux KVM/OCI-root native 통과 증거는 아직 없다.
 
+### PR을 통한 native KVM gate 트리거 시도 (2026-09-24 UTC)
+
+사용자가 앞선 선택지 중 "PR로 native KVM gate 실행"을 확정해 PR
+[`#3`](https://github.com/openstack-afterglow/palimpsest/pull/3)을
+`codex/oci-root-phase1`→`dev`로 열었다(merge 요청 아님, native gate 트리거
+목적). 열림 직후 `mergeable_state=dirty`, `statusCheckRollup=[]`이었다.
+~45초 대기 후에도 `pull_request` event run이 없어 PR을 close→reopen했지만
+동일했다. Head SHA `61757c71f656324971466a8e102a2b7fbecbd8e1`의
+check-suites 조회에는 무관한 `claude` app 항목만 `queued`이고 GitHub
+Actions check-suite가 없다. 같은 SHA의 직전 `push` 이벤트는 `Test`,
+`Development package`, `Build and Push Palimpsest Hub` 세 workflow를 모두
+성공적으로 트리거했으므로, 이는 이 repository의 `pull_request` 트리거에
+한정된 관측된 동작이다. `actions/permissions`는 `enabled:true`,
+`allowed_actions:"all"`이고 `dev` branch protection은 없다(404). 이
+제약을 우회하려고 workflow 파일이나 repository 설정, branch protection을
+변경하지 않았다. 전용 GitHub runner `pieroot-server-palimpsest-kvm`(id 21,
+`PALIMPSEST_KVM_ENABLED=true`)은 online·idle 상태 그대로다. 이 PR로
+`dev`/`main`은 변경되지 않았고 병합도 요청하지 않았다. Linux KVM/OCI-root
+native 통과 증거는 이 시도로 추가되지 않았다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
