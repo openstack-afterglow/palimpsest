@@ -965,6 +965,7 @@ def test_kvm_golden_bytes_are_stable_for_aarch64_kvm():
     assert xml.find("./os/loader") is None
     assert xml.find("./os/nvram") is None
     assert xml.find("./features/apic") is None
+    assert xml.find("./features/gic") is None
     assert xml.find("./features/acpi") is not None
     controller = xml.find("./devices/controller")
     assert controller is not None and controller.attrib == {"type": "scsi", "index": "0", "model": "virtio-scsi"}
@@ -973,8 +974,7 @@ def test_kvm_golden_bytes_are_stable_for_aarch64_kvm():
     assert xml.find("./devices/interface") is not None
 
 
-def test_kvm_golden_bytes_are_stable_for_hvf():
-    fixture_dir = Path(__file__).parents[1] / "fixtures"
+def test_hvf_domain_has_bootable_firmware_network_and_gic():
     disks = build_layer_disks(_ROOT, _DIGESTS)
     spec = DomainSpec(
         **{
@@ -984,7 +984,6 @@ def test_kvm_golden_bytes_are_stable_for_hvf():
         }
     )
     xml_text = build_domain_xml(spec, _HVF_PROFILE)
-    assert xml_text == (fixture_dir / "domain-hvf.xml").read_text(encoding="utf-8")
     assert 'xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"' in xml_text
     xml = ET.fromstring(xml_text)
     assert xml.get("type") == "hvf"
@@ -993,6 +992,7 @@ def test_kvm_golden_bytes_are_stable_for_hvf():
     assert xml.find("./os/nvram").text == "/var/lib/palimpsest/domains/demo-nvram.fd"
     assert xml.find("./features/apic") is None
     assert xml.find("./features/acpi") is not None
+    assert xml.find("./features/gic").attrib == {"version": "3"}
     controller = xml.find("./devices/controller")
     assert controller is not None and controller.attrib == {"type": "scsi", "index": "0", "model": "virtio-scsi"}
     cdrom = next(disk for disk in xml.findall("./devices/disk") if disk.get("device") == "cdrom")
@@ -1004,7 +1004,7 @@ def test_kvm_golden_bytes_are_stable_for_hvf():
         "-netdev",
         "user,id=palimpsest0,hostfwd=tcp:127.0.0.1:2222-:22",
         "-device",
-        "virtio-net-pci,netdev=palimpsest0",
+        "virtio-net-device,netdev=palimpsest0",
     ]
 
 

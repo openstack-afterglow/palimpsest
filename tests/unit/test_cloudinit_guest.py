@@ -55,7 +55,24 @@ def test_user_data_structure():
     assert cloudinit.READY_SCRIPT_PATH in ud
     assert cloudinit.READY_UNIT_PATH in ud
     assert cloudinit.READY_SENTINEL in ud
-    assert cloudinit.CONSOLE_DEVICE in ud
+    assert ud.count("exec >>/dev/ttyS0 2>&1") == 2
+    assert "echo PALIMPSEST_READY=1 >>/dev/ttyS0" in ud
+    assert "/dev/console" not in ud
+
+
+def test_arm_user_data_writes_readiness_to_virt_serial():
+    user_data = cloudinit.build_user_data(
+        client_public_key="ssh-ed25519 AAAAClient client@host",
+        host_private_key="-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----\n",
+        host_public_key="ssh-ed25519 AAAAHost host@guest",
+        activation_script="true\n",
+        arch="aarch64",
+    )
+
+    assert user_data.count("exec >>/dev/ttyAMA0 2>&1") == 2
+    assert "/dev/ttyS0" not in user_data
+    assert "echo PALIMPSEST_READY=1 >>/dev/ttyAMA0" in user_data
+    assert "/dev/console" not in user_data
 
 
 def test_user_data_appends_guest_environment_without_shell_interpolation():
@@ -109,8 +126,16 @@ def test_typed_cloud_init_is_compiled_before_final_readiness():
     ]
     assert cloudinit.READY_SENTINEL not in activation_script
     assert f"After={cloudinit.ACTIVATION_UNIT_NAME} cloud-final.service" in user_data
+    assert "WantedBy=cloud-init.target" in user_data
     assert f"systemctl enable {cloudinit.READY_UNIT_NAME}" in user_data
     assert f"systemctl enable --now {cloudinit.READY_UNIT_NAME}" not in user_data
+    assert f"ConditionPathExists={cloudinit.BOOTSTRAP_MARKER_PATH}" in user_data
+    assert "ConditionPathExists=/etc/cloud/cloud-init.disabled" in user_data
+    assert f"After={cloudinit.ACTIVATION_UNIT_NAME}\n" in user_data
+    assert f"systemctl enable {cloudinit.READY_FALLBACK_UNIT_NAME}" in user_data
+    assert "WantedBy=multi-user.target" in user_data
+    assert project_script.index("hello; not-a-shell") < project_script.index(cloudinit.BOOTSTRAP_MARKER_PATH)
+    assert project_script.index(cloudinit.BOOTSTRAP_MARKER_PATH) < project_script.index(cloudinit.READY_SENTINEL)
 
 
 def test_typed_cloud_init_cannot_overwrite_runtime_paths():

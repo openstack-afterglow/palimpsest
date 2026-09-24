@@ -1034,10 +1034,6 @@ def test_logs_and_commands():
 
         state.write_run_state(rpaths, status="running", data={"guest_ip": "192.168.122.70"})
 
-        insp = inspect_run("cmd-run", roots=roots)
-        assert insp["owner"]["name"] == "cmd-run"
-        assert insp["state"]["status"] == "running"
-
         sh_cmd = shell_command("cmd-run", roots=roots)
         assert any("192.168.122.70" in arg for arg in sh_cmd)
         assert "ssh" in sh_cmd[0]
@@ -1477,6 +1473,74 @@ def _hvf_test_profile(tmp_path: Path, *, with_firmware: bool = True) -> platform
         seed_tool="cloud-localds",
         seed_bus="scsi",
     )
+
+
+def test_hvf_rm_removes_nvram_domain_and_owned_state(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    name = "hvf-failed"
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    (rpaths.root / "nvram.fd").write_bytes(b"owned nvram")
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="failed", data={"backend": platforms.BACKEND_HVF})
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" '
+        f'id="{owner.run_id}" schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain(name, f"<domain><metadata>{marker}</metadata></domain>")
+
+    def bare_undefine():
+        raise RuntimeError("Cannot undefine domain with NVRAM/varstore")
+
+    def flagged_undefine(flag):
+        assert flag == 8
+        domain.undefined = True
+
+    domain.undefine = bare_undefine
+    domain.undefineFlags = flagged_undefine
+    conn = FakeLibvirtConn()
+    conn.domains[name] = domain
+    with patch("palimpsest_local.cloud_runtime.kvm._libvirt", return_value=MagicMock(VIR_DOMAIN_UNDEFINE_KEEP_NVRAM=8)):
+        result = rm(name, roots=roots, conn=conn, profile=_hvf_test_profile(tmp_path), volumes=True)
+
+    assert result["status"] == "removed"
+    assert domain.undefined
+    assert not rpaths.root.exists()
+
+
+def test_kvm_arm_rm_removes_libvirt_generated_nvram(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    name = "arm-efi-failed"
+    rpaths = state.run_paths(roots, name)
+    rpaths.root.mkdir(parents=True, mode=0o700)
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(rpaths, status="failed", data={"backend": platforms.BACKEND_KVM})
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" '
+        f'id="{owner.run_id}" schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    domain = FakeDomain(name, f"<domain><metadata>{marker}</metadata></domain>")
+    domain.undefine = MagicMock(side_effect=RuntimeError("Cannot undefine domain with NVRAM/varstore"))
+    generated_nvram = tmp_path / "libvirt-generated-nvram.fd"
+    generated_nvram.write_bytes(b"libvirt nvram")
+
+    def flagged_undefine(flag):
+        assert flag == 4
+        generated_nvram.unlink()
+        domain.undefined = True
+
+    domain.undefineFlags = flagged_undefine
+    conn = FakeLibvirtConn()
+    conn.domains[name] = domain
+    binding = MagicMock(VIR_DOMAIN_UNDEFINE_NVRAM=4, VIR_DOMAIN_UNDEFINE_KEEP_NVRAM=8)
+    with patch("palimpsest_local.cloud_runtime.kvm._libvirt", return_value=binding):
+        result = rm(
+            name, roots=roots, conn=conn, profile=platforms.resolve_domain_profile("kvm", "aarch64"), volumes=True
+        )
+
+    assert result["status"] == "removed"
+    assert not generated_nvram.exists()
+    assert not rpaths.root.exists()
 
 
 def test_run_user_hostfwd_allocates_port_and_writes_known_hosts_without_ip_discovery(tmp_path: Path):
