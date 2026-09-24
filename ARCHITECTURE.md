@@ -878,13 +878,24 @@ runner/domain, 기존 운영 helper도 건드리지 않았다.
 없다. Hub 99건, 변경 Python 두 파일 Ruff lint/format, working-tree
 architecture guard가 통과했다. 새로운 native 실행이나 게시 증거는 아니다.
 
+2026-09-24 UTC, 이후 사용자가 현 여섯 파일의
+`codex/oci-root-phase1` branch 단독 게시만 승인했다. Staged source digest는
+위 marker와 같고 Hub 99건·Ruff·staged architecture guard 뒤 commit
+`1d82d90b2b2786bb7e52877cc6d8d68b0cfc5c19`를 원격 branch에
+fast-forward 게시했다. Push-triggered development-package run
+`35985109659`는 package 권한 범위 밖이라 취소했고 verify/publish job은
+모두 cancelled, 해당 SHA의 package tag·release는 없다. 이 게시 receipt는
+Actions skip marker를 가진 docs-only commit으로 남긴다. Source·schema·
+architecture contract 변경이나 새 native 실행은 없고, `dev`·`main`·
+shared runner·원격 helper는 여전히 별도 승인 경계다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
   "source_sha256": "2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c",
-  "reviewed_at": "2026-09-24T09:29:50Z",
-  "summary": "Reviewed Hub detail response model, route, and project-scoped chain test after updating README and handoff with separately approved live timeout/restart proof. Source and architecture contracts unchanged; Hub 99 tests, changed Python Ruff lint/format, and working-tree architecture guard passed. No additional native proof or publication."
+  "reviewed_at": "2026-09-24T10:07:36Z",
+  "summary": "Reviewed docs-only receipt for approved codex/oci-root-phase1 publication of Hub detail response fix and bounded native evidence. Source, schema, and architecture contracts unchanged. Push-triggered development-package run 35985109659 was cancelled; its verify/publish jobs cancelled and package tag/release absent. No dev/main, shared runner, or helper mutation."
 }
 ```
 <!-- architecture-review:end -->

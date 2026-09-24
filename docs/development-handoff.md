@@ -1895,6 +1895,31 @@ Python 파일의 Ruff lint/format 통과, working-tree architecture guard
 새 host power-loss 또는 production credential/account 분리 실기도 새
 자원·실패 주입 범위의 별도 결정 없이는 실행하지 않는다.
 
+### 승인된 작업 브랜치 게시와 자동 package gate (2026-09-24 UTC)
+
+사용자가 **현재 여섯 파일만** `codex/oci-root-phase1`에 commit/push하도록
+명시적으로 승인했다. 대상은 `ARCHITECTURE.md`, `README.md`, 이 인계,
+`docs/install.md`, `hub/src/palimpsest_hub/api/hub.py`,
+`hub/tests/test_builds.py`이며 `dev`·`main`·PR·패키지·원격 helper·shared
+runner/domain은 제외했다. Push 전 원격 branch tip은 기존 HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`였고, 여섯 경로만 stage한
+staged architecture guard가 source digest
+`2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c`로
+통과했다. Commit `1d82d90b2b2786bb7e52877cc6d8d68b0cfc5c19`를
+fast-forward push한 뒤 같은 원격 branch tip을 조회했다.
+
+Branch push가 `.github/workflows/development-package.yml`의 SHA-specific
+prerelease workflow run `35985109659`를 자동 시작한 것을 발견했다.
+패키지 게시는 승인 범위 밖이므로 이 run을 취소했다. `verify`와 `publish`
+job이 모두 `cancelled`인 것을 확인했고, 그 SHA의
+`refs/tags/package-1d82d90b2b2786bb7e52877cc6d8d68b0cfc5c19` 및
+release는 없음을 조회했다. 이 게시 receipt만 추가하는 다음 docs-only
+commit에는 Actions skip marker를 사용해 package workflow를 다시
+시작시키지 않는다. Workflow 자체를 변경·비활성화하지 않는다.
+기존 GPU helper 전송, shared runner/domain 조작, 새 실기는 계속 별도 승인
+대기다. 첫 commit의 Hub 99건·Ruff·architecture 검증 외 추가 native
+검증은 이 게시 과정에서 수행하지 않았다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
