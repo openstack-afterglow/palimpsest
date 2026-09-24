@@ -2039,6 +2039,19 @@ HEAD commit일 때도 동일하게 적용된다. 문서 receipt commit에 실제
 않는다. 조직 billing/webhook 장애 가설은 근거 부족으로 철회한다. 다음
 항목에서 그 토큰 문자열을 전혀 포함하지 않는 새 commit으로 재검증한다.
 
+**Native KVM gate 실제 트리거·통과 확인 (2026-09-24 UTC).** 토큰 문자열이
+전혀 없는 commit
+[`1572025a5a1368a8e53783762f2643ff9137e4ed`](https://github.com/openstack-afterglow/palimpsest/commit/1572025a5a1368a8e53783762f2643ff9137e4ed)를
+push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
+([run `36010249678`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36010249678))와
+`Build and Push Palimpsest Hub`, `push` 이벤트로 `Development package`가
+모두 시작해 세 workflow 전부 `success`로 끝났다. `Test`의 job 목록에서
+`Native KVM stage-1 proof`와 `Required native KVM proof`가 모두
+`success`이고, `stage1-native-kvm-proof` artifact(450,980B)와
+`oci-filesystem-proof` artifact(1,905B)가 이 실행에 남았다. 이는 사용자가
+선택한 "PR로 native KVM gate 실행"의 실제 성공 증거다. PR #3은 여전히
+열려 있고 병합은 요청하지 않았으며, `dev`/`main`은 변경되지 않았다.
+
 ### CI critical-path checkpoint (2026-09-24)
 
 기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 1·2·3차 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.

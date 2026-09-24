@@ -961,6 +961,17 @@ trigger 이벤트를 모두 막는다. 조직 billing/webhook 장애 가설은 �
 부족으로 철회하며, 이어지는 항목에서 토큰 문자열을 전혀 포함하지 않는
 새 commit으로 재검증한다.
 
+**Native KVM gate 실제 트리거·통과 확인 (2026-09-24 UTC).** 토큰 문자열
+없는 commit `1572025`를 push한 뒤 15초 안에 `pull_request` 이벤트로
+`Test`(run `36010249678`)와 `Build and Push Palimpsest Hub`, `push`
+이벤트로 `Development package`가 모두 시작해 `success`로 끝났다.
+`Test`의 job 목록에서 `Native KVM stage-1 proof`와
+`Required native KVM proof` 모두 `success`이며, `stage1-native-kvm-proof`
+artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
+`UNSTABLE`(다른 checkGate 미완료)에서 이 확인 시점 재조회가 필요하지만
+세 workflow 모두 통과했다. 이는 PR을 통한 native KVM gate 트리거라는
+승인된 작업의 실제 성공 증거이며, 병합은 요청하지 않았다.
+
 2026-09-24 CI critical-path review: `.github/workflows/test.yml`, `scripts/test_lanes.py`, 기존 workflow 계약 테스트(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`)를 읽은 뒤 portable matrix 두 개의 `max-parallel`(Linux 3, macOS 2)을 제거했다.
 
 - **바꾸지 않은 것.** shard 수 6/4, 안정 key 분할, job id·순서, aggregator 이름과 `if: always()` 판정, native KVM 필수 gate, trigger는 그대로다. production/runtime·package·Hub 계약에는 구조 영향이 없다.
@@ -1016,8 +1027,8 @@ trigger 이벤트를 모두 막는다. 조직 billing/webhook 장애 가설은 �
 {
   "schema_version": 1,
   "source_sha256": "66048823bd34e0ea61acbc490e32fbd494a2ee9ee1a00af6a13d5ef2b64dcef3",
-  "reviewed_at": "2026-09-24T14:04:58Z",
-  "summary": "Retracted the repository-wide Actions-stoppage claim: the real cause was that two prior commit message bodies still contained the literal GitHub skip-ci token string even while describing its removal, and GitHub matches that token literally regardless of negating context. This commit and its message contain no such token so push and PR synchronize can trigger Test cleanly; verified after push."
+  "reviewed_at": "2026-09-24T14:09:46Z",
+  "summary": "Recorded confirmed native KVM gate success: after publishing a genuinely token-free commit, pull_request Test run 36010249678 (including Native KVM stage-1 proof and Required native KVM proof jobs) and the Hub/Development-package workflows all completed success on this SHA. No production/runtime/schema contract change; PR remains open and unmerged, dev/main untouched."
 }
 ```
 <!-- architecture-review:end -->
