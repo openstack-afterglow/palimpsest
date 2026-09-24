@@ -952,6 +952,24 @@ PR #3은 `dev`와의 실제 file-level conflict(`ARCHITECTURE.md`,
 자체는 이 merge로 변경되지 않는다(fast-forward 대상은 여전히
 `codex/oci-root-phase1`뿐). Source/schema 계약은 바뀌지 않았다.
 
+**후속 확인: gate 미트리거의 실제 원인은 다르다 (2026-09-24 UTC).** 위 두
+원인(skip 지시문, merge conflict)을 모두 제거한 뒤에도 `pull_request`는
+여전히 반응하지 않았다. Merge 뒤 PR #3은 `mergeable_state=CLEAN`이었고 이
+merge commit `d88be61`에는 `[skip actions]`가 없었지만, push와 PR
+synchronize 양쪽 모두 60초 이상 대기 후에도 `Test`용 check-suite가
+없었다(`claude` app만 `queued`). 결정적으로, `codex/oci-root-phase1`의
+push 목록에 명시된 `development-package.yml`도 이 **skip 없는** push에
+반응하지 않았다. `event=pull_request` 및 전체 run 목록을 조회한 결과
+저장소 전체에서 `2026-09-24T11:04:18Z`(무관한 `dev` push) 이후 **어떤
+이벤트로도 새 workflow run이 생성되지 않았다**. 이는 skip 지시문이나
+`pull_request` 트리거 자체의 문제가 아니라 그 시각 이후 이 저장소의
+Actions 실행이 이벤트 종류와 무관하게 멈춘 것으로 관측된다. 원인은
+billing/spending limit, org 수준 Actions 정지, 또는 webhook delivery
+장애일 수 있으나 이 세션의 권한으로는 org billing API(410/스코프 부족)에
+접근할 수 없어 확정하지 못했다. Repository 자체는 `disabled=false`,
+`archived=false`이고 `actions/permissions`는 `enabled:true`다. 추가
+push/PR 조작으로 해결되지 않으므로 여기서 멈춘다.
+
 2026-09-24 CI critical-path review: `.github/workflows/test.yml`, `scripts/test_lanes.py`, 기존 workflow 계약 테스트(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`)를 읽은 뒤 portable matrix 두 개의 `max-parallel`(Linux 3, macOS 2)을 제거했다.
 
 - **바꾸지 않은 것.** shard 수 6/4, 안정 key 분할, job id·순서, aggregator 이름과 `if: always()` 판정, native KVM 필수 gate, trigger는 그대로다. production/runtime·package·Hub 계약에는 구조 영향이 없다.
@@ -1007,8 +1025,8 @@ PR #3은 `dev`와의 실제 file-level conflict(`ARCHITECTURE.md`,
 {
   "schema_version": 1,
   "source_sha256": "66048823bd34e0ea61acbc490e32fbd494a2ee9ee1a00af6a13d5ef2b64dcef3",
-  "reviewed_at": "2026-09-24T13:58:40Z",
-  "summary": "Merged origin/dev (CI critical-path review chain: perf, round 1-3, final) into codex/oci-root-phase1 to resolve PR #3 file conflicts in ARCHITECTURE.md and docs/development-handoff.md (both purely additive chronological logs; concatenated ours-then-theirs, no shared lines edited by both). Root cause of the prior non-triggering pull_request checks was the [skip actions] directive on the two prior docs commits, mistakenly applied to a receipt commit using the same convention as an actual source-fix commit; corrected the mis-attributed push-success evidence in the same edit. This merge commit carries no skip directive so push and the PR synchronize event can trigger Test (including the kvm job, which AGENTS.md rule 10 already documents as ungated for pull_request). No production/runtime/schema contract change."
+  "reviewed_at": "2026-09-24T14:02:59Z",
+  "summary": "Reviewed docs-only follow-up: after removing the [skip actions] directive and resolving the dev merge, PR #3 became mergeable/CLEAN but pull_request still did not trigger Test. A skip-free push to codex/oci-root-phase1 also failed to trigger development-package.yml (which explicitly lists that branch), and no workflow run of any event/type has been created repository-wide since 2026-09-24T11:04:18Z. This points to a repository/org-level Actions stoppage unrelated to skip directives or pull_request semantics; org billing API was inaccessible (410/insufficient scope) to confirm the cause. No further push/PR mutation attempted."
 }
 ```
 <!-- architecture-review:end -->
