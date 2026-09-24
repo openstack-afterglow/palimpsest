@@ -521,6 +521,9 @@ PCI 노드도 함께 통과했다.
 2. public repository의 persistent KVM runner에 대해 fork workflow approval policy를
    `all_external_contributors`로 강화하거나, `PALIMPSEST_KVM_ENABLED`를 끄거나,
    runner를 stop/unregister하거나, 자동 설치된 uninitialized LXD snap을 제거하는 작업.
+   `kvm` job에 `pull_request` event gate를 두고 PR에서 `Required native KVM proof`가
+   무엇을 뜻할지 정하는 workflow·계약·규정 변경도 여기에 속한다. 통제의 두 층과
+   설정 위치는 [AGENTS.md](../AGENTS.md) 규칙 10에 있다.
    각각 security·availability 또는 destructive host mutation이므로 별도 승인이 필요하다.
 
 `/private/tmp`와 `/tmp` 파일은 durable artifact가 아니며 다른 machine/session에
@@ -2009,6 +2012,205 @@ Actions check-suite가 없다. 같은 SHA의 직전 `push` 이벤트는 `Test`,
 `PALIMPSEST_KVM_ENABLED=true`)은 online·idle 상태 그대로다. 이 PR로
 `dev`/`main`은 변경되지 않았고 병합도 요청하지 않았다. Linux KVM/OCI-root
 native 통과 증거는 이 시도로 추가되지 않았다.
+
+**정정 및 conflict 해소 (2026-09-24 UTC).** 위에서 "직전 push가 Test 등
+세 workflow를 모두 정상 트리거했다"고 인용한 근거는 실제로는 이 branch의
+커밋이 아니라 같은 시각 `dev`에 독립적으로 push된 무관한 SHA
+`3705880e5c03486b69ac052fd78ddad8ce799655`(아래 `ci-perf` 게시 commit)의
+실행이었다. 재확인 결과 이를 정정한다. `pull_request` 트리거가 반응하지
+않은 실제 원인은 `61757c7`/`6de46ac` 두 commit의 HEAD message에 있던
+`[skip actions]` 지시문이다. GitHub의 skip-ci 문서는 이 지시문이 `push`와
+`pull_request` 양쪽 이벤트의 workflow 실행을 모두 막는다고 명시하며, PR의
+HEAD commit일 때도 동일하게 적용된다. 문서 receipt commit에 실제 소스
+수정 commit(`a54f1e9`)과 같은 관례로 이 지시문을 붙인 것이 오류였다. PR
+#3은 `dev`와의 실제 file-level conflict(`ARCHITECTURE.md`,
+`docs/development-handoff.md`)로 `mergeable_state=dirty`이기도 했다.
+`origin/dev`를 이 branch에 non-force merge commit으로 통합해 두 conflict를
+해소했다(각 파일의 diverged 구간은 순수 추가형이라 양쪽 서술을 모두
+보존했다). 이 merge commit 메시지에는 `[skip actions]`를 넣지 않아 push와
+새 PR synchronize 이벤트가 정상적으로 `Test`(및 AGENTS.md 규칙10이 기록한
+대로 `pull_request`에서도 실행되는 `kvm` job)를 트리거하도록 했다. `dev`
+자체는 이 merge로 변경되지 않는다. Source/schema 계약은 바뀌지 않았다.
+
+### CI critical-path checkpoint (2026-09-24)
+
+기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 1·2·3차 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.
+
+**변경 내용**
+
+- `.github/workflows/test.yml`에서 `portable-linux`의 `max-parallel: 3`과 `portable-macos`의 `max-parallel: 2`를 제거했다. 이제 6+4 shard가 한 wave로 시작한다.
+- 다음은 바꾸지 않았다: shard 수, job id와 순서, aggregator 이름과 판정, trigger, native KVM 필수 gate.
+- `tests/unit/test_test_lanes.py`에 CI 형태 계약 두 개(3 node)를 추가했다.
+  - shard 목록 `[1..N]`, `--shard …/N` 분모, `max-parallel` 부재 또는 N 이상, `fail-fast: false`, aggregator 이름·`if: always()`·`needs`를 고정한다.
+  - gate job이 앞에 없는지와, self-hosted job이 `kvm` 하나뿐인지를 고정한다.
+  - 임시 변형 workflow 네 가지(macOS cap 2, 분모 5, shard 5개, `needs: checks`)를 모두 잡는 것을 확인했다.
+- `AGENTS.md`에 `CI 파이프라인 성능 규정` 12개를 추가했다.
+- `ARCHITECTURE.md`(Development and verification, Change guide, Maintenance)와 [testing.md](testing.md)를 갱신하고 stamp했다.
+
+**실측 기준.** 읽기 전용 `gh` 조회로 얻은 수치다.
+
+- 표본은 현재 19-job 형태의 `Test` 완료 실행 21건이다.
+- 크리티컬 패스는 중앙값 325초, p90 781초였다. burst 8건을 제외하면 303/346초다.
+- `Unit tests (macOS 15)`가 21건 중 19건에서 마지막으로 끝났다.
+- 두 번째 wave 대기: macOS 3/4·4/4가 151/170초, Linux 4–6이 91–105초.
+- KVM job은 140초 걸렸고 대기 중앙값은 142초였다.
+
+**기대 효과.** dev/PR 약 155–170초는 **추정**이다. push 후 20회 이상 재측정해야 하며, 재측정 전에는 효과로 기록하지 않는다. main push는 같은 SHA의 dev 실행과 단일 KVM runner·macOS 5개 한도를 두고 경쟁하므로 약 290초에 머물 것으로 본다.
+
+**실행한 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+
+- `check_architecture.py`: stamp 후 working 통과.
+- `uv sync --frozen --extra dev`, import smoke, fixture `--check`, CLI reference `--check`, `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+- `plan --changed HEAD`: core-cli와 qualification을 선택했다.
+- `build_package.py`: 통과. Python 3.11 `palimpsest --version`: `0.1.4`.
+- focused 4 파일: 132 passed.
+- `run core-cli qualification`: 1,424 passed, 7 skipped.
+- portable 6 shard를 순차 실행해 합계 6,084 node, 5,867 passed, 217 skipped, 실패 0이었다.
+- `check_filesystem_fixtures.py`: 통과.
+- Hub(`hub/`의 sync, import, ruff, format, pytest 91 passed, `uv build`): 통과.
+- `actionlint`: 기존과 같은 custom label `kvm` 경고 1건만 남았다.
+
+**실행하지 않은 검사**
+
+- Docker가 필요한 gate: BuildKit named OCI context, guest stage-1 binary, workload proof ELF 재현, Hub Docker image build. 이후 별도로 순차 실행할 예정이다.
+- 권한이 필요한 OCI filesystem proof, native KVM, GitHub 실행.
+
+**독립 검토 1차(2026-09-24).** `2e37538`에 대한 독립 검토가 medium 2건과 low 7건을 지적했다. 후속 commit `fix: address CI review round 1`에서 모두 반영했다. 반영분에 대한 재검토는 아래 독립 검토 2차다.
+
+- **KVM runner 노출 근거 정정(medium).** 처음에 "공개 PR 코드가 KVM runner에서 실행됐다"고 인용한 run 세 건은 모두 같은 저장소 branch에서 온 PR 실행이었다(`35600862976`은 `dev`, `35600812317`·`35029001178`은 `codex/oci-root-phase1`; `head_repository = openstack-afterglow/palimpsest`). 2026-09-24 읽기 전용 조회에서 API가 나열한 `pull_request` 실행 22건 중 fork에서 온 실행은 없었다. 위험은 잠재적이다. 이 절 아래의 승인 대기 1을 그렇게 고쳐 적었다.
+- **aggregator 판정 계약(medium).** 처음 계약은 aggregator의 이름·`if: always()`·`needs` 포함 여부만 봤다. 그래서 verdict를 `true`로 바꾸거나 KVM skip을 받는 변형이 통과했다. 이제 다음을 고정한다.
+  - 정확한 `needs`
+  - 단일 verdict step의 `env`와 성공만 받는 `run` 문자열
+  - `shell`·`defaults`·`continue-on-error`의 부재
+  - aggregator 밖 job-level `if:`가 `kvm`의 변수 조건뿐인지
+- **runner 판정(low).** `runs-on`의 mapping(`group`·`labels`) 형태까지 정규화한다. 범위를 모든 workflow로 넓히고 allowlist를 `test.yml`의 `kvm`과 `release.yml`의 `kvm-proof`로 두었다. `release.yml`이 `v*` tag push 전용인지도 고정한다.
+- **규정 문구(low).** 다섯 가지를 고쳤다.
+  - AGENTS.md 규칙 10을 `Test` workflow 범위로 한정했다.
+  - runner group 제한은 저장소 수준 runner에는 쓸 수 없다고 적었다. `pieroot-server-palimpsest-kvm`은 저장소 수준 runner이고, org plan은 `free`이며, runner-group API는 403이었다.
+  - 규칙 8의 PR diff를 merge-base(세 점) 기준으로 바꿨다.
+  - 규칙 5의 wrapper 문장을 고쳤다.
+  - 규칙 12의 node 수 기준에 출처를 붙였다.
+- **node 수 기준.** 6,081은 `60fa42f`의 CI run `35826465548`에서 "Lane shard" 줄의 선택 node를 더한 값이다. Linux 6 shard와 macOS 4 shard의 합계가 같으며, pass 수가 아니다. 6,084는 `2e37538`의 로컬 순차 6 shard 합계이고, 계약 3 node를 더한 값이다.
+- **변형 검사.** 임시 workflow 변형 14가지를 새 계약이 모두 잡았고, 끝난 뒤 `.github/`를 원복했다. 변형은 다음과 같다.
+  - `pure`·`unit-macos` verdict를 `true`로 바꾸기, `pure`에 `|| true` 붙이기
+  - KVM verdict를 `!= "failure"`로 바꾸기
+  - `pure`의 `needs`에서 `checks` 빼기
+  - KVM step에 `shell: bash {0}` 넣기, KVM env에서 `PALIMPSEST_KVM_ENABLED` 빼기, workflow `defaults.run.shell` 넣기
+  - `portable-linux`에 `continue-on-error`나 job-level `if:` 넣기
+  - `runs-on: {group: kvm-group}`, `runs-on: kvm`, 다른 workflow에 self-hosted job 넣기
+  - `release.yml`에 `pull_request` trigger 넣기
+- **반영 뒤 검사.** 모두 local macOS에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 136 passed.
+  - `run core-cli qualification`: 1,435 node, 1,428 passed, 7 skipped.
+  - portable `--collect-only`: 6,088 node.
+  - `actionlint`(`test.yml`, `release.yml`): 기존 custom label `kvm` 경고 2건만 있었다. workflow 파일은 바꾸지 않았다.
+  - 전체 portable 6 shard는 다시 실행하지 않았다. 바뀐 test 파일은 `core-cli` lane 하나뿐이다.
+
+**독립 검토 2차(2026-09-24).** round 1 반영분에 대한 재검토가 medium 1건과 low 8건을 지적했다. 후속 commit `fix: address CI review round 2`에서 반영했으며, 반영분에 대한 재검토는 아직 받지 않았다. workflow 파일은 바꾸지 않았다.
+
+- **shard 실행 계약(medium).** round 1 계약은 matrix의 `shard` 목록·`fail-fast`·`max-parallel`과 shard 명령 문자열만 봤다. 그래서 다음 변형이 모두 통과했고 aggregator는 green이었다.
+  - `exclude: [{shard: 6}]`
+  - macOS shard step의 `if: github.event_name == 'push'`
+  - step `shell: "true {0}"`, job `defaults.run.shell: "true {0}"`
+  - job·workflow `env: PYTEST_ADDOPTS: --collect-only`
+  - `checks` step의 `if`
+
+  이제 다음을 고정한다.
+  - portable matrix job 두 개의 job key·runner·`matrix`와 step 목록 전체
+  - `test.yml`의 workflow-level `env` 부재
+  - aggregator가 읽는 의존 job(`checks`, portable 두 개, `kvm`)의 job key 집합
+  - `test.yml` 전체 step의 `shell`·`continue-on-error` 부재와 `always()` 외 step `if` 부재
+
+  `kvm` upload의 `if: always()`는 step을 건너뛰지 않으므로 허용한다. `kvm` proof step의 `if: false`는 잡는다.
+- **hosted label(low).** prefix 정규식을 정확한 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)으로 바꿨다. `runs-on: ubuntu-kvm`을 잡는다.
+- **`test.yml` trigger(low).** `workflow_call`, `main`·`dev` push·`pull_request`를 정확히 고정한다. `pull_request_target` 추가를 잡는다.
+- **reusable caller(low).** `uses:` job은 `KeyError` 대신 명시적 assertion으로 거부한다. `test.yml` 호출자는 self-hosted `kvm` job을 물려받기 때문이다.
+- **규정 문구(low).** AGENTS.md의 다섯 곳을 고쳤다.
+  - 규칙 10: 승인 대기 항목을 절 이름으로 가리키게 했다. 이 절의 승인 대기 1에도 같은 수정을 했다.
+  - 규칙 9: 건너뛰기 조건에 "head branch의 push `Test`가 같은 tree를 이미 테스트했다"를 더했다. 지금은 `main`·`dev`만 해당한다.
+  - 규칙 5: CI는 "Lane shard" 수를 출력만 한다는 점을 밝혔다. 실행 중 실패로 처리되는 경우는 exit 5·2·4다. shard별 수와 합계는 계약으로 보장하며, 이 점이 정본 규칙 5와 다르다.
+  - 규칙 8: 두 점 diff 금지와 merge ref의 `HEAD^1..HEAD` 허용이 정본 규칙 8을 의도적으로 구체화한 것이라고 밝혔다.
+  - 규칙 2: 같은 event의 hosted job 수를 적었다. `Test` 시작 시점 15개(총 18개)에 `hub-docker` `test`와 `development-package` `verify`를 더해 push 17개, PR 16개다. workflow 정의로 센 값이며 실측이 아니다.
+- **변형 검사.** 임시 복사본에서 workflow 변형 41가지를 돌렸다. 대상 파일은 `test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`이고, 변형 전 baseline 123 passed를 먼저 확인했다.
+  - 39가지를 잡았다(pytest exit 1). 재검토 목록 17가지와 추가 변형이다. 추가 변형은 `$GITHUB_ENV` step, checkout `ref: main`, step `env`·`continue-on-error`, `checks`·`kvm`의 job-level `env`·`defaults`, matrix `include`, macOS job의 `ubuntu-latest`, job-level `if`·`continue-on-error`, `hub` step의 `shell`·`continue-on-error`, `if: failure()`, 분모 5, wrapper 명령, push branch 추가, `runs-on` 누락, 다른 workflow의 self-hosted job, `release.yml` `pull_request`, `pure` verdict `true`다.
+  - 의도한 잔여 공백 2가지는 잡지 않았다. `hub` step의 `env: PYTEST_ADDOPTS`와 `checks`의 `$GITHUB_ENV` step이다. 비-matrix job의 step 내용은 고정하지 않으며, 이를 AGENTS.md 규칙 11과 [testing.md](testing.md)에 적었다.
+- **반영 뒤 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 137 passed.
+  - `run core-cli qualification`: 1,436 node, 1,429 passed, 7 skipped.
+  - portable 6 shard를 순차 실행했다. 합계 6,089 node(1,045·954·1,052·997·1,019·1,022), 5,872 passed, 217 skipped, 실패 0이었다. portable `--collect-only`도 6,089 node다.
+  - `actionlint`(workflow 다섯 개): 기존 custom label `kvm` 경고 2건(`test.yml`, `release.yml`)만 있었다.
+  - Docker·권한이 필요한 gate와 GitHub 실행은 이번에도 하지 않았다.
+
+**독립 검토 3차(2026-09-24).** round 2 반영분에 대한 재검토가 medium 1건과 low 4건을 지적했다. 후속 commit `fix: address CI review round 3`에서 반영했으며, 반영분에 대한 재검토는 아직 받지 않았다. workflow 파일은 바꾸지 않았다. 같은 때 정본 규칙 3과 10의 해석이 명확해졌다.
+
+- **규칙 10 통제 모델(medium, 문서만).** 이전 문구는 YAML `if:`가 "통제 수단이 아니"라고 했다. 그리고 runner group 저장소 제한과 `all_external_contributors`가 함께 갖춰지면 충분한 것처럼 읽혔다. 둘 다 정본 규칙 10과 다르다. 이제 AGENTS.md 규칙 10은 두 층으로 적는다.
+  - YAML event gate가 `pull_request` 실행을 runner에서 떼어 놓는다. 설정은 그 gate를 지우는 PR에 대한 backstop이다.
+  - 두 설정을 모두 갖춰도 같은 저장소 branch PR, Dependabot PR, 승인된 fork PR은 막지 못한다고 밝혔다.
+  - gate, `kvm` `if` 계약 고정, "skip을 통과로 받지 않는다" 조항이 서로 충돌한다는 점을 적었다. 해소는 아래 승인 대기 1에 넣었다.
+  - `release.yml` `kvm-proof`가 받는 workflow-level `contents: write`·`id-token: write`의 노출을 적었다.
+  - 설정 위치를 적었다. 저장소 수준 runner라 runner group이 없으므로, 설정 층은 소유자 작업이다.
+  - 같은 문구를 이 절 승인 대기 1, `명시적 승인 대기 — 실행 금지` 절 2번, `ARCHITECTURE.md`, [testing.md](testing.md), 계약 test 주석에서도 고쳤다.
+- **job 형태·token 계약(low).** 이전 계약은 aggregator가 읽는 job의 key 집합만 고정했다. 그래서 `hub`·`guest-stage1-binary`의 `defaults.run.shell: "true {0}"`, `hub`의 job-level `env: PYTEST_ADDOPTS`, `permissions: write-all`이 통과했다. 새 계약 `test_ci_test_workflow_jobs_and_token_are_pinned`가 다음을 고정한다.
+  - `test.yml` 11개 job 전체의 key 집합과 job id 집합
+  - `hub`의 `defaults` 값 `{run: {working-directory: hub}}`
+  - top-level key 집합(`name`·`on`·`permissions`·`jobs`)과 `permissions == {contents: read}`
+- **발행 게이팅 문구(low).** AGENTS.md 규칙 3을 명확해진 정본에 맞췄다. 발행(push)과 배포만 `Test` 전체 결과로 게이팅한다. 아무것도 발행하지 않는 PR 검증 build는 병렬로 돌려도 되며, `hub-docker`의 PR build가 여기에 해당한다. 기존 예외 세 가지를 적었다. `hub-docker` push·tag·dispatch의 `build-and-push`, `development-package` `publish`, `release` `publish`·`github-release`다. 아래 승인 대기 3에 넣었다.
+- **규칙 5 차이(low, 문서만).** 계약이 막는 것은 wrapper가 `--shard`를 빠뜨리는 경우뿐이라고 좁혀 적었다. workflow 밖 무력화의 실측을 기록했다. `PYTEST_ADDOPTS=--collect-only`로 `run portable --shard 1/256`을 실행하니 "Lane shard" 줄에 selected 24 node를 출력하고 한 건도 실행하지 않은 채 exit 0이었다. 실행 중 검사는 plugin 동작을 바꾸므로 추가하지 않았다. 아래 승인 대기 4에 넣었다.
+- **특권 trigger(low).** 새 계약 `test_ci_no_workflow_uses_a_privileged_pull_request_trigger`가 모든 workflow에서 `pull_request_target`·`workflow_run`을 거부한다. 허용 목록은 비어 있다. `on`의 문자열·목록·mapping 형태와 따옴표 친 `"on"` key를 모두 읽는다.
+- **변형 검사.** 임시 복사본에서 변형 18가지를 돌렸다. 대상 파일은 `test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`이고, 변형 전 baseline 125 passed를 먼저 확인했다.
+  - 16가지를 잡았다(pytest exit 1). 재검토 목록의 4가지(`hub`·`guest-stage1-binary` `defaults.run.shell`, `hub` job `env`, `permissions: write-all`)가 들어 있다. 추가로 잡은 변형은 다음과 같다.
+    - workflow `contents: write`, `kvm` job-level `permissions`
+    - `oci-fs-proof` job `continue-on-error`, `local-oci-build` job `env`
+    - workflow `concurrency`, 표에 없는 새 job
+    - `kvm` event gate. 규칙 10 충돌을 확인하는 변형이다.
+    - 새 `pull_request_target` workflow(hosted, PR head checkout), 새 `workflow_run` workflow
+    - 따옴표 친 `"on": pull_request_target`, 목록 형태 `on: [push, pull_request_target]`
+    - `hub-docker.yml` trigger에 `pull_request_target` 추가
+  - 의도한 잔여 공백 2가지는 잡지 않았다. `hub` step의 `env: PYTEST_ADDOPTS`와 `checks`의 `$GITHUB_ENV` step이다.
+  - 새 파일 변형은 끝날 때마다 지웠다. 끝난 뒤 복사본의 `.github/`가 worktree와 같은지 `diff -r`로 확인했다.
+- **반영 뒤 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 139 passed.
+  - `run core-cli qualification`: 1,438 node, 1,431 passed, 7 skipped.
+  - portable `--collect-only`: 6,091 node. 바뀐 test 파일은 `core-cli` lane 하나뿐이라 portable 6 shard는 다시 실행하지 않았다.
+  - `actionlint`(workflow 다섯 개): 기존 custom label `kvm` 경고 2건(`test.yml`, `release.yml`)만 있었다.
+  - Docker·권한이 필요한 gate와 GitHub 실행은 이번에도 하지 않았다.
+
+**최종 검토(2026-09-24).** round 3 반영분에 대한 최종 검토가 medium 1건(문서만)을 지적했다. AGENTS.md 규칙 11은 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었다. 실제 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `verify`는 SHA별 prerelease를 만드는 `publish`의 유일한 gate다.
+
+- 임시 복사본에서 변형 9가지를 돌렸다. `verify` step `continue-on-error`·`if: false`·`shell: 'true {0}'`, `verify` job `continue-on-error`, checksum step `continue-on-error`·`if: false`, `publish` job `if: always()`, 명령 `echo` 감싸기, `verify` `if`의 `|| true`다. 모두 세 CI 계약 파일(`test_development_package_workflow.py`, `test_test_lanes.py`, `test_oci_convert_security.py`)의 125건을 통과했다.
+- 규칙 11을 검사 항목과 고정하지 않는 항목으로 고쳐 적었다. 계약은 확장하지 않았으므로 workflow·계약·portable node 수(6,091)는 그대로다. 공백을 막으려면 `verify`·`publish`의 job key와 step 목록을 `test_test_lanes.py`의 portable matrix처럼 정확히 고정하는 계약을 따로 추가해야 한다.
+
+**승인 대기·소유자 결정.** 구현하지 않았고 설정도 바꾸지 않았다.
+
+1. self-hosted KVM runner `pieroot-server-palimpsest-kvm`의 노출이다. 이 문서 `명시적 승인 대기 — 실행 금지` 절의 2번과 같은 항목이다.
+   - 현재 상태: 위에 인용한 run 세 건은 모두 같은 저장소의 trusted branch에서 온 PR 실행이다. 그러나 `kvm` job에는 event gate가 없어 모든 `pull_request` 실행이 이 persistent runner에서 돈다. 승인 정책이 `first_time_contributors`이므로, 이전에 merge된 기여가 있는 외부 contributor의 fork PR도 승인 없이 실행될 수 있다.
+   - 통제는 두 층이다(AGENTS.md 규칙 10). YAML event gate가 `pull_request` 실행을 막고, 설정은 그 gate를 지우는 PR에 대한 backstop이다. 설정만으로는 부족하다. `all_external_contributors`와 runner group 저장소 제한을 모두 갖춰도 같은 저장소 branch PR, Dependabot PR, 승인된 fork PR은 여전히 이 runner에서 실행된다.
+   - 충돌: YAML gate를 넣으면 PR에서 `kvm`이 skip되고, `Required native KVM proof`가 모든 PR에서 red가 된다. AGENTS.md 규칙 10의 "skip을 통과로 받지 않는다" 조항과 `test_ci_test_jobs_start_without_a_gate_job_in_front`의 정확한 `kvm` `if` 고정도 gate 추가를 막는다.
+   - 결정할 것 (a): 충돌 해소 방안. 예를 들어 KVM proof를 push 전용(`github.event_name != 'pull_request'`)으로 두고, PR에서 `Required native KVM proof`가 무엇을 뜻할지 정한다. PR에서만 event 조건으로 skip을 받게 하거나, PR의 required check에서 빼는 방법이 있다. 결정되면 gate, aggregator verdict, 계약, 규정을 한 변경에서 바꾼다.
+   - 결정할 것 (b): 설정 backstop. fork PR 승인은 저장소 `Settings` → `Actions` → `General`의 `Approval for running fork pull request workflows from contributors`에서 `Require approval for all external contributors`를 고른다. runner group 제한은 저장소 수준 runner에는 없으므로 org 수준 재등록이 먼저다. Free plan에서 그 제한을 쓸 수 있는지는 확인하지 않았다.
+   - 결정할 것 (c): 두 층이 갖춰지기 전의 조치. PR의 workflow 수정까지 포함해 노출을 확실히 없애는 방법은 runner stop·unregister뿐이다.
+   - `release.yml` `kvm-proof`는 같은 runner에서 workflow-level `contents: write`·`id-token: write`를 받는다. 앞선 PR 실행이 runner에 남긴 state를 release 실행이 쓰면, PR 코드가 그 token에 닿을 수 있다.
+2. 같은 SHA를 dev와 main에 3–6초 간격으로 push하는 문제다. 현재 형태 push 실행 14건 중 7건이 이 경우였고, 매번 KVM 대기 142–144초가 생겼다. dev가 green이 된 뒤 main을 fast-forward하는 방식 등으로 줄일 수 있다.
+3. 정본 규칙 3의 기존 예외다. 다음 세 발행 경로는 `Test` 전체 결과를 기다리지 않는다.
+   - `hub-docker.yml` `build-and-push`: `main`·`dev` push, `v*` tag push, `workflow_dispatch`에서 GHCR에 push한다. 자체 `Hub Unit Tests`에만 건다.
+   - `development-package.yml` `publish`: SHA별 GitHub prerelease를 만든다. 자체 `verify`에만 건다. `verify`가 실행하는 테스트는 `core-cli`·`qualification` lane과 development-package 계약뿐이다.
+   - `release.yml` `publish`·`github-release`: 자체 `verify`와 `kvm-proof`에만 건다. macOS shard와 portable 전체는 실행하지 않는다.
+   - `hub-docker`의 PR build는 아무것도 발행하지 않으므로 규칙을 지킨다. 세 경로 모두 테스트 크리티컬 패스 밖에 있고, 바꾸면 발행 의미가 달라진다.
+4. 정본 규칙 5와의 차이다. CI는 shard별 실행 수를 검사하지 않는다. 계약은 wrapper가 `--shard`를 빠뜨리는 경우만 막고, `pyproject.toml` `addopts`나 conftest hook 같은 workflow 밖 무력화는 막지 않는다. 위 3차 기록의 `--collect-only` 실측이 그 예다. 결정할 것은 둘 중 하나다. 실행된 수를 selected 수와 대조하는 실행 중 검사를 `scripts/test_lanes.py` plugin에 추가하거나, 이 차이를 받아들인다.
+5. 다음 항목은 근거 부족이나 순이득 부족으로 보류했다.
+   - pytest-xdist 도입: hermeticity가 미증명이고 "Lane shard" 증거 줄이 사라진다.
+   - PR/push tree dedup: pre-job 비용이 절감보다 크다.
+   - `hub-docker` 게이팅 변경은 3번으로 옮겼다.
+
+**다음 작업**
+
+1. review 3차 반영분의 독립 재검토를 받는다.
+2. 승인된 경우에만 push하고, 이 절 첫 문단에 push한 SHA를 적는다.
+3. push 뒤 `Test` 20회 이상의 크리티컬 패스 중앙값·p90을 재측정해 이 절과 AGENTS.md 기준을 갱신한다.
+4. 이 절의 승인 대기 1–4에 대한 결정을 받는다.
 
 ## 빠른 링크 맵
 
