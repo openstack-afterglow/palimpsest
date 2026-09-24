@@ -24,10 +24,12 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
-**최신 추가 checkpoint (2026-09-19):** 아래 `현재 스냅샷`과 frontmatter의
-2026-09-14 값은 당시 기록이다. 현 작업트리의 최신 source 상태와 승인 대기는
-[Hub web API build checkpoint](#hub-web-api-build-2026-09-19) 및 실제 Git 상태를
-우선한다. 당시 snapshot을 지금의 서버 실행 상태로 읽지 않는다.
+**현재 인계 (2026-09-25):** 이 작업트리는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev`이며 root `palimpsest-local`과 Hub `palimpsest-hub` 버전은 모두 `0.2.0`이다. 현재 릴리스 판단과 병합 후 native 검증 공백은 [아래 릴리스 인계](#현재-릴리스-인계-2026-09-25)를 따른다. 아래의 2026-09-14 snapshot 및 이후 날짜별 branch·SHA·실기 영수증은 당시 기록이지 현재 버전이나 게시 상태가 아니다.
+
+**2026-09-19 기록 안내:** 아래 `현재 스냅샷`과 frontmatter의
+2026-09-14 값은 당시 기록이다. 당시 작업트리의 source 상태와 승인 대기는
+[Hub web API build checkpoint](#hub-web-api-build-2026-09-19) 및 그때의 Git 상태를
+우선했다. 당시 snapshot을 지금의 서버 실행 상태로 읽지 않는다.
 
 ## 현재 스냅샷
 
@@ -461,7 +463,7 @@ guest driver/runtime, Nova CPU proof, 실제 GPU 계산은 각각 별도 gate다
 세부사항은 [linux-storage-logging.md](linux-storage-logging.md),
 [oci-linux-process.md](oci-linux-process.md), [testing.md](testing.md)를 본다.
 
-현재 local package version은 `palimpsest-local 0.1.4`이고 Hub는 `palimpsest-hub 0.1.3`이다.
+현재 작업트리의 package version은 `palimpsest-local 0.2.0`과 `palimpsest-hub 0.2.0`이며 Kolla Hub API/worker의 image tag 기본값도 `0.2.0`이다. 버전 정렬 자체는 tag, PyPI 또는 GHCR 이미지의 게시 증거가 아니다.
 development-package workflow는 허용 branch의 검증 후 exact commit마다
 `package-<full-SHA>` prerelease를 만들고 wheel, sdist, `SHA256SUMS` 세
 asset을 게시한다. 기존 tag/release/assets를 덮어쓰지 않으며 prerelease는
@@ -2245,6 +2247,12 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 2. 변경을 포함한 완료 `Test` 표본은 source push 직후 4건이다. 자연스럽게 20회 이상 쌓인 뒤에만 크리티컬 패스 중앙값·p90을 재측정하고 이 절과 AGENTS.md 기준을 갱신한다. 표본을 만들기 위한 강제 workflow 실행은 하지 않는다.
 3. self-hosted KVM runner 노출, dev/main 중복 push, 발행 gate 예외, shard 실행 수 검사에 대한 소유자 결정(위 승인 대기 1–4)을 받는다.
 4. 승인된 작업 브랜치 게시 외에 PR merge 및 x86 KVM/cloud-init-disabled reboot 실기는 각각 대상·자원을 정한 별도 명시적 승인 뒤에 진행한다.
+
+## 현재 릴리스 인계 — 2026-09-25
+
+- 로컬 `dev`에는 PR #4의 OCI-root·conventional cloud-image·Hub 구현이 병합됐다. 앞서 기록한 OCI native stage-1 KVM gate, macOS aarch64 HVF base-only 부팅/SSH/재시작, Glance export, 전용 KVM host의 Hub ordered-chain build와 timeout/restart 회수는 각각 해당 SHA·환경의 증거다. 병합 후 conventional-cloud x86 KVM boot 및 `/etc/cloud/cloud-init.disabled` 이후 reboot readiness의 native 실기는 아직 없으며 stage-1 KVM gate나 portable seed 확인으로 대체할 수 없다.
+- Release readiness는 root/Hub `0.2.0`과 Kolla 기본 image tag `0.2.0`의 정렬에 더해, 검토한 source로 위 conventional-cloud native 공백을 확인하고 `v*` tag의 `release.yml`에서 root package 검증과 필수 native `kvm-proof`를 통과시키는 것이다. 그 뒤에만 root wheel/sdist의 PyPI 발행과 GitHub release를 성공으로 판정한다. 같은 tag의 `hub-docker.yml`은 별도 Hub unit gate 뒤 GHCR API·worker semver tag(`0.2.0`, `v0.2.0`)를 게시하므로 두 경로의 결과를 각각 확인한다. 현재 이 handoff는 실제 `v0.2.0` tag 실행이나 게시 성공을 주장하지 않는다.
+- OpenSpec 디렉터리는 이 작업트리에 없다. 새 OpenSpec 파일을 만들지 않았고, 이전 날짜별 승인·branch/PR 상태는 소급 갱신하지 않았다. Architecture review JSON marker 갱신은 최종 source 검토를 맡은 Main의 작업이다.
 
 ## 빠른 링크 맵
 

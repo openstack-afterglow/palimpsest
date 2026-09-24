@@ -1,8 +1,10 @@
 # Install Palimpsest
 
-Palimpsest requires Python 3.11 or newer. The source version is `0.1.4`; no
-PyPI release is assumed. Git and outbound HTTPS access to GitHub are required
-for direct VCS installation.
+Palimpsest requires Python 3.11 or newer. The root `palimpsest-local` release
+target is `0.2.0`, not a claim that a tag or PyPI package has been published.
+Git and outbound HTTPS access to GitHub are required for direct VCS installation.
+Hub's independently versioned Python package (`palimpsest-hub`) is also `0.2.0`
+in this source tree; a repository release tag does not publish that wheel.
 
 ## 1. Install the Local CLI
 
@@ -40,8 +42,10 @@ If an existing `pyproject.toml` says `requires-python = ">=3.10"`, raise it to
 `">=3.11"` before `uv add`, or keep the project range and use `uv tool install`
 instead. uv resolves dependencies for the entire declared range, not only the
 pinned interpreter. `--frozen` is not a compatibility fix. A successful
-metadata probe must report `0.1.4`; output from a same-named local application
-does not verify that `palimpsest-local` was installed.
+metadata probe for an installed 0.2.0 root package must report `0.2.0`;
+before promotion, the unpinned default branch may still resolve an older
+version. Output from a same-named local application does not verify that
+`palimpsest-local` was installed.
 
 For a reproducible install, append a reviewed full commit SHA to the Git URL:
 
@@ -85,6 +89,17 @@ Hub is a server distribution with FastAPI, OpenStack, Redis, SQLAlchemy, and
 Uvicorn dependencies. Its service entrypoints require database, Redis, local
 storage, and OpenStack settings before startup.
 
+The repository `v0.2.0` tag, if created, also drives GHCR tags `0.2.0` and
+`v0.2.0` for both `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
+`ghcr.io/openstack-afterglow/palimpsest-hub-worker`; these are image labels,
+not the Hub wheel version. The Kolla role in this source tree defaults to Hub
+image tag `0.2.0`, which requires both images to be published and verified
+before deployment. Root PyPI publishing requires the tag-triggered
+artifact checks and a successful native stage-1 proof on an enabled self-hosted
+Linux x86_64 KVM runner; development packages and portable tests alone are
+not sufficient. No 0.2.0 image/package release or Kolla deployment is claimed
+by these instructions.
+
 The Hub serves `/app` for browser upload/search/download and system-admin-only
 server builds. The API package alone cannot run a build: install
 `palimpsest-local[kvm]` at the same reviewed ref on a **separate Linux x86_64
@@ -104,6 +119,11 @@ for prerequisites and failure boundaries.
 | Linux `x86_64`/`amd64`, OCI-root | Supported narrow runtime | `palimpsest-local[kvm]` | Qualified KVM host, runtime kernel/initramfs/packer, Skopeo 1.13+ for registry acquisition |
 | Standalone Hub | Service role, not a VM backend | `palimpsest-hub` | MySQL-compatible database, Redis, OpenStack credentials, local blob path |
 | Hub server build worker | Separately provisioned service role | `palimpsest-hub` + `palimpsest-local[kvm]` at the same ref | Linux x86_64 KVM/libvirt and conventional cloud-image build tools; shared Hub DB/blob path |
+
+The native KVM release gate covers the OCI-root guest stage-1, not the revised
+conventional cloud-image readiness path. That path's serial-bound first boot
+and cloud-init-disabled reboot still lack a post-merge native boot check;
+installing `[kvm]` or passing the stage-1 gate does not close the gap.
 
 Package installation never installs hypervisors, creates system accounts,
 changes privileged groups, writes sudoers policy, or initializes mutable state.

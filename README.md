@@ -9,7 +9,7 @@ It provides the `palimpsest` command and keeps local artifacts, tags, run state,
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Version:** `0.1.4`.
+- **0.2.0 release target:** `palimpsest-local` and the independently versioned `palimpsest-hub` Python distribution. This is not a claim of a published tag, PyPI distribution, or GHCR image.
 
 ## Install directly from GitHub
 
@@ -106,8 +106,19 @@ the end-user installation path.
 The root wheel also ships the `palimpsest` Kolla-Ansible role at
 `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
 Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
-Kolla-Ansible independently. The role defaults retain the existing published
-Hub image tag (`0.1.3`), while source builds use the checked-out commit SHA.
+Kolla-Ansible independently. This source role defaults to Hub image tag `0.2.0`,
+while source builds use the configured checkout SHA. Do not deploy this default
+before verifying both Hub images are published; the root package version does
+not automatically set the independent Hub Python distribution version.
+
+A repository `v0.2.0` tag is intended to produce both
+`ghcr.io/openstack-afterglow/palimpsest-hub-api` and
+`ghcr.io/openstack-afterglow/palimpsest-hub-worker` with `0.2.0` and `v0.2.0`
+tags. Those are image tags derived from the repository tag, not Hub wheel
+versions. The root PyPI release waits for release artifact verification **and**
+the native stage-1 KVM proof on an enabled self-hosted Linux x86_64 runner;
+development-package artifacts and PR KVM checks do not publish PyPI. None of
+the 0.2.0 tag, image or PyPI publication, or Kolla deployment is asserted here.
 
 ## Hub configuration & Standalone Service
 
@@ -371,6 +382,13 @@ palimpsest rm web-dev --volumes
 ```
 
 Layers are exposed inside the guest at `/opt/layers/merged` in leaf-to-root overlay order.
+
+The branch PR's native KVM stage-1 gate verifies OCI-root guest root switching
+and PID 1; it does not prove the revised conventional cloud-image readiness
+path after merge. The serial-bound first-boot and cloud-init-disabled reboot
+changes still need a native post-merge cloud-image boot/reboot check before
+being treated as a deployed runtime qualification. Release builds and
+deployment are outside this documentation update.
 
 ## Multi-VM projects (`palimpsest.yml`)
 
