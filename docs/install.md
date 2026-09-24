@@ -216,8 +216,14 @@ Python package installation deliberately does not install or mutate host tools.
 - TCP publication only for Compose-shaped project ports.
 
 The experimental libvirt/HVF backend additionally needs QEMU, libvirt,
-`qemu:///session`, `hdiutil`, and the Local `[kvm]` extra. Treat it as
-experimental even when dependency installation succeeds.
+`qemu:///session`, `hdiutil`, and the Local `[kvm]` extra. With Homebrew,
+`brew install qemu pkgconf` supplies the separate QEMU tools and the
+`pkg-config` executable needed to build `libvirt-python` against the already
+installed host libvirt. In a source checkout, install the optional binding with
+`uv sync --frozen --extra dev --extra kvm`; verify session access with
+`virsh -c qemu:///session list --all` before explicitly selecting
+`--backend libvirt-hvf`. Package installation or successful preflight alone
+does not prove a guest can boot; Lima/VZ remains the macOS default.
 
 ### Linux conventional cloud-image runtime
 

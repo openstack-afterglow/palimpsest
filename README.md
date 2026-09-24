@@ -309,6 +309,21 @@ palimpsest exec ubuntu-arm -- uname -m
 
 The VZ backend provides managed NAT. `inspect` reports the guest IPv4 address and Lima's host-local SSH endpoint. `shell` opens a Lima shell; `exec` runs one command in the guest.
 
+The experimental QEMU/libvirt alternative requires the host tools and `[kvm]`
+extra in [the install guide](docs/install.md). It is opt-in, runs conventional
+ARM64 cloud images through `qemu:///session`, and leaves Lima/VZ as the default:
+
+```sh
+virsh -c qemu:///session list --all
+palimpsest run sha256:<image-digest> --name ubuntu-hvf \
+  --memory 2048 --vcpus 2 --backend libvirt-hvf
+palimpsest exec ubuntu-hvf -- uname -m
+palimpsest stop ubuntu-hvf
+palimpsest rm ubuntu-hvf --volumes
+```
+
+This does not enable the Linux-only OCI-root runtime on macOS.
+
 A macOS build uses a disposable Lima guest and produces the same portable SquashFS layer artifact used by the content store:
 
 ```sh

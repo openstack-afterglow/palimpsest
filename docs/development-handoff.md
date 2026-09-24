@@ -1920,6 +1920,51 @@ commit에는 Actions skip marker를 사용해 package workflow를 다시
 대기다. 첫 commit의 Hub 99건·Ruff·architecture 검증 외 추가 native
 검증은 이 게시 과정에서 수행하지 않았다.
 
+### 로컬 Apple Silicon libvirt/HVF conventional VM 실기 (2026-09-24 UTC)
+
+시작 branch `codex/oci-root-phase1`, HEAD
+`056760b0947917372ff0619c7bd555e0118056d4`의 clean tree에서
+사용자가 이 Mac의 기존 libvirt 동작 확인을 요청했다. `qemu:///session`은
+처음에 소유 domain이 없었고, `kern.hv_support=1` 및 aarch64 `virt`/HVF
+capabilities를 확인했다. Homebrew QEMU 11.1.1·`pkgconf`를 설치하고
+`uv sync --frozen --extra dev --extra kvm`으로 `libvirt-python 12.5.0`을
+빌드했다. VM·이미지·상태는 전용 `/private/tmp/palimpsest-hvf-tgkFqoT1`
+하위에만 두고 Ubuntu 24.04 arm64 공식 cloud image
+`sha256:7b682958a67ff5de068e36de6af8b75fa645d296af5a70d6500527f6a33781db`를
+가져왔다.
+
+첫 native 시도에서 HVF는 GICv2를 거부하고 실패한 domain의 EFI varstore
+undefine도 거부했다. GICv3와 explicit run-owned EFI 보존 후에는 QEMU
+virtio-net-pci와 libvirt root-port의 PCI 슬롯이 충돌했고, NIC를
+virtio-mmio로 바꾼 뒤 guest가 부팅되었지만 `ttyS0`에 쓰는 cloud-init
+helper가 실제 ARM `ttyAMA0` console에 readiness를 전달하지 못했다.
+`/dev/console`로 변경한 첫 부팅은 성공했고 SSH `exec`에서 `aarch64`,
+`cloud-init status --long`의 `status: done`, `errors: []`를 확인했다.
+처음 `stop`/`start`는 300초 readiness timeout으로 실패했다. 실제 reboot
+console은 cloud-final 완료까지 기록했지만 ready unit은 실행되지 않았다.
+`After=cloud-final.service`와 `WantedBy=multi-user.target`의 ordering
+cycle을 제거하려고 ready unit을 `cloud-init.target`에 연결했다.
+
+수정한 새 run `hvf-proof-tgkfqot1`은 초기 부팅·localhost SSH `exec`·
+cloud-init 완료 후 `stop`→`start`까지 성공했다. SSH forwarding endpoint는
+첫 부팅 `127.0.0.1:54337`, 재부팅 `127.0.0.1:54582`였고,
+재부팅 console에 `PALIMPSEST_READY=1`과 ready unit 시작·완료가 기록됐다.
+guest `ExecMainStatus=0`, `Result=success`, cloud-init `errors: []`도
+확인했다. `rm --volumes` 후 `virsh -c qemu:///session list --all --name`과
+격리 `runs/`가 모두 비었으며 전용 scratch를 삭제했다. QEMU·pkgconf 및
+로컬 Python 개발 환경의 `[kvm]` extra는 설치된 상태다.
+
+이번 결과는 **이 Mac과 위 단일 Ubuntu base의 experimental
+`libvirt-hvf` conventional run/SSH/lifecycle**에 한정한다. Layer,
+build, project, 다른 OS image, Linux KVM 및 OCI-root 실기 통과로
+일반화하지 않는다. 이번 최종 source에 대해 cloud-init 집중 검사 13건,
+`core-cli` lane 1146건, `host-runtime` lane 947건, 수정 Python 여섯 파일
+Ruff lint/format, working-tree architecture guard
+`source_sha256=15a9e0354654820e1778106909f5de2f05374afc9f72e4ad910d8af7b2471c15`가
+통과했다. 다음 작업은 이 **unstaged·미커밋** source 변경을 별도로 검토하는
+것이다. GitHub commit/push·package 게시·기존 원격 helper 전송·shared
+runner/domain 조작은 이 로컬 실기 요청으로 승인되지 않았다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

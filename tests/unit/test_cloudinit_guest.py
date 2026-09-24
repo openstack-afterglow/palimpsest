@@ -55,7 +55,9 @@ def test_user_data_structure():
     assert cloudinit.READY_SCRIPT_PATH in ud
     assert cloudinit.READY_UNIT_PATH in ud
     assert cloudinit.READY_SENTINEL in ud
-    assert cloudinit.CONSOLE_DEVICE in ud
+    assert "exec >>/dev/console 2>&1" in ud
+    assert "echo PALIMPSEST_READY=1 >>/dev/console" in ud
+    assert "/dev/ttyS0" not in ud
 
 
 def test_user_data_appends_guest_environment_without_shell_interpolation():
@@ -109,6 +111,7 @@ def test_typed_cloud_init_is_compiled_before_final_readiness():
     ]
     assert cloudinit.READY_SENTINEL not in activation_script
     assert f"After={cloudinit.ACTIVATION_UNIT_NAME} cloud-final.service" in user_data
+    assert "WantedBy=cloud-init.target" in user_data
     assert f"systemctl enable {cloudinit.READY_UNIT_NAME}" in user_data
     assert f"systemctl enable --now {cloudinit.READY_UNIT_NAME}" not in user_data
 

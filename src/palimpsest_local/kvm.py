@@ -214,6 +214,8 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
         ET.SubElement(os_element, "nvram").text = str(spec.nvram)
     features = ET.SubElement(domain, "features")
     ET.SubElement(features, "acpi")
+    if profile.domain_type == "hvf":
+        ET.SubElement(features, "gic", {"version": "3"})
     if profile.arch == "x86_64":
         ET.SubElement(features, "apic")
     ET.SubElement(domain, "cpu", {"mode": "host-passthrough"})
@@ -277,7 +279,7 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
             {"value": f"user,id=palimpsest0,hostfwd=tcp:127.0.0.1:{spec.ssh_host_port}-:22"},
         )
         ET.SubElement(commandline, "qemu:arg", {"value": "-device"})
-        ET.SubElement(commandline, "qemu:arg", {"value": "virtio-net-pci,netdev=palimpsest0"})
+        ET.SubElement(commandline, "qemu:arg", {"value": "virtio-net-device,netdev=palimpsest0"})
     return ET.tostring(domain, encoding="unicode")
 
 

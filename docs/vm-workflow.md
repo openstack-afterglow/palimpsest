@@ -43,6 +43,19 @@ prerequisites are listed in [install.md](install.md).
 `libvirt-hvf` and Linux KVM need the optional `[kvm]` extra
 (`libvirt-python`). The default macOS Lima/VZ path does not.
 
+For a macOS HVF guest, pass `--backend libvirt-hvf` explicitly. Its `virt`
+machine uses GICv3 and a virtio-mmio NIC with QEMU user-mode networking, so
+libvirt's PCI root-port allocation does not collide with the forwarded SSH
+device. UEFI variables live under the owned run tree and are removed with
+`palimpsest rm NAME --volumes`; the network does not need a libvirt `default`
+network. This is a conventional cloud-image path, not Linux OCI-root.
+
+The first boot emits readiness from cloud-init after project initialization. On
+later boots, `palimpsest-ready.service` is pulled in by `cloud-init.target`
+after layer activation and `cloud-final.service`. Attaching that service to
+`multi-user.target` instead creates an ordering cycle with cloud-final on
+Ubuntu and prevents restart readiness.
+
 ## 1. Import a base image
 
 ```bash

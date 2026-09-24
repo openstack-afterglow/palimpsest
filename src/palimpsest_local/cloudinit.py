@@ -28,7 +28,7 @@ ACTIVATION_UNIT_NAME = "palimpsest-activate.service"
 READY_SCRIPT_PATH = "/usr/local/libexec/palimpsest-ready"
 READY_UNIT_PATH = "/etc/systemd/system/palimpsest-ready.service"
 READY_UNIT_NAME = "palimpsest-ready.service"
-CONSOLE_DEVICE = "/dev/ttyS0"
+CONSOLE_DEVICE = "/dev/console"
 BUILD_CHANNEL_NAME = "org.afterglow.palimpsest.builder.v1"
 BUILD_JOB_PATH = "/etc/palimpsest/build-job.json"
 BUILD_WORKER_PATH = "/usr/local/libexec/palimpsest-builder"
@@ -371,7 +371,7 @@ def build_user_data(
         f"ExecStart={READY_SCRIPT_PATH}\n"
         "\n"
         "[Install]\n"
-        "WantedBy=multi-user.target\n"
+        "WantedBy=cloud-init.target\n"
     )
 
     environment_lines: list[str] = []
