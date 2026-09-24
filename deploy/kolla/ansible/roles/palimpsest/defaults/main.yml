@@ -84,7 +84,7 @@ palimpsest_services:
       OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
       OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
       OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
-      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+      SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
       interval: 30s
@@ -129,7 +129,7 @@ palimpsest_services:
       OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
       OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
       OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
-      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+      SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
 
 palimpsest_public_haproxy_services:
   palimpsest-public:

@@ -4,8 +4,24 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-The entries for 0.2.0 below describe the release candidate; they do not mean a
-version tag, PyPI distribution, GHCR image, or Kolla deployment is published.
+## [0.2.1] - 2026-09-25
+
+`palimpsest-local 0.2.1` only. `palimpsest-hub` stays at 0.2.0 and the packaged
+Kolla Hub image default remains `0.2.0`; the `v0.2.1` tag re-labels the same Hub
+images under the existing image workflow.
+
+### Fixed
+
+- Kolla role: `SSL_VERIFY` in the API/worker service definitions and the bootstrap
+  task rendered as a boolean, which `community.docker.docker_container` rejects
+  ("Non-string value found for env option") and which blocked the first production
+  deploy. All three now render through `| string`; a role contract test requires
+  explicit stringification for every non-string env expression.
+
+The 0.2.0 entries below describe the 0.2.0 release; the `v0.2.0` tag's verify and
+native KVM proof passed and the Hub images were published, while the PyPI trusted
+publisher exchange was refused (no publisher registered) so no PyPI distribution
+or GitHub release exists for 0.2.0.
 
 ## [0.2.0] - pending publication
 

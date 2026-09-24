@@ -34,7 +34,7 @@
       OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
       OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
       OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
-      SSL_VERIFY: "{{ not (openstack_insecure | default(false) | bool) }}"
+      SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
   no_log: true
   register: palimpsest_bootstrap_result
   run_once: true
