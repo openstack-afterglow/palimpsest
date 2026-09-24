@@ -169,8 +169,8 @@ def _is_missing_domain_error(exc: Exception) -> bool:
         return False
 
 
-def _destroy_and_undefine_domain(domain: Any) -> None:
-    """Safely destroy and undefine a domain object without importing libvirt."""
+def _destroy_and_undefine_domain(domain: Any, *, profile: platforms.DomainProfile | None = None) -> None:
+    """Destroy an owned domain and handle its EFI varstore according to ownership."""
     try:
         is_act = domain.isActive() if hasattr(domain, "isActive") else False
         if is_act and hasattr(domain, "destroy"):
@@ -178,7 +178,15 @@ def _destroy_and_undefine_domain(domain: Any) -> None:
     except Exception:
         _logger.warning("failed to destroy domain", exc_info=True)
     try:
-        if hasattr(domain, "undefine"):
+        if profile is not None and (profile.firmware is not None or profile.autoselect_firmware):
+            libvirt = kvm._libvirt()
+            flag = (
+                libvirt.VIR_DOMAIN_UNDEFINE_KEEP_NVRAM
+                if profile.firmware is not None
+                else libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
+            )
+            domain.undefineFlags(flag)
+        else:
             domain.undefine()
     except Exception:
         _logger.warning("failed to undefine domain", exc_info=True)
@@ -359,6 +367,7 @@ def _generate_seed_iso(
         activation_script=activation_script,
         environment=spec.environment,
         cloud_init=spec.cloud_init,
+        arch=profile.arch,
     )
     _write_seed_iso(rpaths, profile, meta_data, user_data)
 
@@ -677,7 +686,7 @@ def run(
                     if libvirt_domain is not None:
                         domain_run_id = kvm.get_domain_run_id(libvirt_domain)
                         if domain_run_id == run_id:
-                            _destroy_and_undefine_domain(libvirt_domain)
+                            _destroy_and_undefine_domain(libvirt_domain, profile=profile)
                 except BaseException:
                     pass
 
@@ -941,7 +950,7 @@ def start_serial_builder(
                 try:
                     domain = conn_obj.lookupByName(spec.name)
                     if domain is not None and kvm.get_domain_run_id(domain) == run_id:
-                        _destroy_and_undefine_domain(domain)
+                        _destroy_and_undefine_domain(domain, profile=profile)
                 except BaseException:
                     pass
             if not isinstance(exc, Exception):
@@ -1206,7 +1215,7 @@ def rm(
                 )
 
             mutation.verify_binding()
-            _destroy_and_undefine_domain(domain)
+            _destroy_and_undefine_domain(domain, profile=resolved_profile)
             try:
                 remaining = conn_obj.lookupByName(name)
             except Exception as exc:

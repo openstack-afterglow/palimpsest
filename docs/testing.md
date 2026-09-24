@@ -83,9 +83,33 @@ identical-digest registrations, competing project enqueue requests, worker
 preflight rejection before SQL access, fail-closed recovery of an unverifiable
 builder marker, retry of completed-build private scratch cleanup without
 losing its published output, and refusal to reclaim guest state after a failed
-or timed-out builder run until its recorded process group is verified. These are portable contract tests: a Linux-only
-run must still confirm parent-death signals, exact process-group reaping,
-filesystem crash durability, and libvirt teardown.
+or timed-out builder run until its recorded process group is verified. These
+are portable contract tests. A Linux stand-in process probe has exercised
+`PR_SET_PDEATHSIG` and exact owned-group reaping separately; real builder
+restart, filesystem crash durability, and libvirt teardown are not proven.
+
+Multi-manifest bundle regression also checks that a shared ancestor with the
+same digest and descriptor registers once, while a different media type or
+config for that digest fails parsing before registration. A leaf manifest
+config that disagrees with its layer annotation is rejected. These are
+portable parser contracts, not a large-tar throughput or live-filesystem
+qualification.
+
+The 2026-09-23 isolated `pieroot-server` run at source `0581893` used only a
+new scratch checkout. A streamed 512 MiB gzip tar (2,342,856 compressed bytes)
+hit a 32 MiB expansion cap and left no spool. CAS promotion completed real
+file/ancestor-directory fsync calls; separately injected file-fsync `EIO` and
+directory-fsync failures refused success and preserved staging for retry.
+The stand-in builder process group was reaped after exact marker verification,
+and a marked new-session child died after its parent exited. These checks
+did not start Hub services, open a database, boot a guest, or simulate a real
+power loss.
+
+PAX `size` is a logical size override: the physical tar header can report
+zero for blobs larger than 8 GiB. The parser regression uses a seven-byte
+override for extraction and a sparse 8 GiB+1 byte member for offset and
+limit checks. Neither test reads or allocates an 8 GiB payload; an actual
+large-blob end-to-end import and crash-durability proof remain separate.
 
 ## CLI reference and distribution checks
 
@@ -182,6 +206,121 @@ case identities across fresh shard processes to prove disjoint complete
 assignment; randomized display IDs are not suitable for that comparison.
 
 CI runs all portable tests across six Linux shards and four macOS shards.
+Neither matrix sets `max-parallel`, so every shard of a run starts in the same
+wave.
+
+- **Why the caps were removed.** The earlier caps allowed 3 Linux and 2 macOS
+  shards at a time, which queued a second wave. Across the 21 completed `Test`
+  runs of the current job shape (2026-09-15 to 2026-09-23):
+  - macOS shards 3/4 and 4/4 waited a median 151s and 170s;
+  - Linux shards 4–6 waited 91–105s;
+  - the `Unit tests (macOS 15)` aggregate finished last in 19 of the 21 runs.
+- **Critical-path baseline.** Median 325s and p90 781s. Excluding one burst
+  that was serialized on the single self-hosted KVM runner, the figures are
+  303s and 346s.
+- **Expected effect (estimate).** A dev/PR critical path of roughly 155–170s.
+  The ~140s native KVM job sets the floor. Re-measure after the change lands
+  before treating this as achieved.
+- **Shared capacity.** The matrices still draw on the organization's Free-plan
+  pool of 20 hosted jobs and 5 macOS jobs, shared with sibling repositories.
+  The following counts come from the workflow definitions, not from
+  measurement:
+  - a `Test` run starts 15 hosted jobs, 4 of them macOS; the 3 aggregates
+    start later, so a run uses 18 hosted jobs in total (`kvm` is self-hosted);
+  - a `main`/`dev` push also starts `hub-docker.yml` `test` and
+    `development-package.yml` `verify`, so 17 hosted jobs start at once;
+  - a PR also starts `hub-docker.yml` `test`, so 16 start at once.
+
+  Same-SHA dev and main pushes (17 + 17 jobs, 4 + 4 macOS) therefore still
+  queue behind each other, especially on the single KVM runner.
+- **Contract test.** `tests/unit/test_test_lanes.py` pins:
+  - each portable matrix job exactly:
+    - its job keys are `name`, `runs-on`, `strategy` and `steps`, so there is
+      no job-level `if`, `env`, `defaults` or `continue-on-error`;
+    - its runner is `ubuntu-latest` or `macos-15`;
+    - `strategy` has only `fail-fast`, `matrix` and `max-parallel`, and
+      `matrix` is exactly `{shard: [1..N]}`, so no `exclude` or `include`;
+    - `fail-fast` is false and `max-parallel` is absent or at least N;
+    - the whole step list is pinned, including action versions, `with`, and
+      the shard command with its `--shard N/M` denominator. No step `if`,
+      `shell` or `env`, no checkout `ref`, and no extra step (a `$GITHUB_ENV`
+      write, for example) can be added;
+  - that `test.yml` has exactly the top-level keys `name`, `on`,
+    `permissions` and `jobs`, and that `permissions` is exactly
+    `{contents: read}`, so there is no workflow `env`, `defaults` or write
+    token;
+  - the aggregate check names, `if: always()` and their exact `needs`;
+  - each aggregate's single verdict step: its `env` maps every dependency to
+    `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), and
+    its `run` is the exact success-only script; neither the step nor its job
+    sets `shell`, `defaults` or `continue-on-error`;
+  - the exact job keys of every `test.yml` job, and the exact set of job
+    ids, so a new job needs its own table entry. No job sets job-level
+    `env`, `permissions` or `continue-on-error`; only the aggregates and
+    `kvm` set `if`; only `hub` sets `defaults`, pinned by value to
+    `{run: {working-directory: hub}}`, so no `defaults.run.shell` can
+    turn its steps green;
+  - that no step in `test.yml` sets `shell` or `continue-on-error`, and that
+    the only step-level `if` is `always()`, which never skips a step and is
+    used by upload and cleanup steps. The `kvm` proof step is covered too;
+  - that no gate job sits in front of the test jobs, and that the only
+    job-level `if:` outside the aggregates is the `kvm` opt-in variable;
+  - that across all workflows the only jobs whose `runs-on` (string, list or
+    `group`/`labels` mapping; a missing `runs-on` counts as non-hosted) is
+    not in the exact hosted label list `ubuntu-latest`, `ubuntu-24.04`,
+    `macos-15` are `kvm` in `test.yml` and `kvm-proof` in `release.yml`. A
+    self-hosted runner can carry any label, `ubuntu-kvm` included, so a
+    prefix pattern is not a hosted check; adopt a new hosted image by adding
+    its exact label;
+  - that no job calls a reusable workflow (`uses:`). A caller of `test.yml`
+    would inherit the self-hosted `kvm` job under the caller's triggers;
+  - the exact `test.yml` triggers (`workflow_call`, and `push` and
+    `pull_request` for `main`/`dev`, with no `pull_request_target`), and that
+    `release.yml` runs only on `v*` tag pushes;
+  - that no workflow uses a `pull_request_target` or `workflow_run` trigger
+    (the allowlist is empty), reading the string, list and mapping forms of
+    `on`. Both run with the base repository's token and secrets even when a
+    fork PR triggers them.
+
+  These pin the workflow shape only. `kvm` has no event gate yet, so
+  `pull_request` runs still reach the self-hosted runner. AGENTS.md rule 10
+  requires two layers: a YAML event gate that keeps `pull_request` runs off
+  the runner, and repository or organization settings as the backstop
+  against a PR that edits that gate. Adding the gate waits for an owner
+  decision, because `Required native KVM proof` and the exact `kvm` `if`
+  pin must change with it.
+
+  Not pinned:
+  - step contents of the non-matrix jobs (`checks`, `hub` and the proof
+    jobs), such as a step `env` or an extra `$GITHUB_ENV` step. The `kvm`
+    proof fails at run time if no evidence file exists, because its upload
+    step sets `if-no-files-found: error`;
+  - neutering outside the workflow, such as a `pyproject.toml` `addopts` or
+    a conftest hook (see Shard counts below);
+  - the job shape of workflows other than `test.yml`, beyond triggers,
+    runners and reusable calls. The development-package workflow has its
+    own contract.
+- **Shard counts.** Each shard prints a `Lane shard` count line, but CI only
+  prints it and does not check it. Three cases fail at run time:
+  - an empty shard exits 5;
+  - a collection error exits 2;
+  - `--test-lane-shard` passed without the plugin is a usage error (exit 4).
+
+  CI does not check per-shard counts, or whether the shards add up to the
+  portable total. This is a documented deviation from the shared CI rule 5
+  (see AGENTS.md), which asks CI to verify per-shard counts. The pinned shard
+  command, the `commands()` argv test, and the disjoint-and-complete
+  assignment tests cover only the wrapper risk that rule names: a `--shard`
+  dropped before `test_lanes.py` would run the full suite in every shard, and
+  only the pinned command string guards against it. They do not catch
+  neutering outside the workflow. On 2026-09-24, locally,
+  `run portable --shard 1/256` with `PYTEST_ADDOPTS=--collect-only` printed
+  its `Lane shard` line for 24 selected nodes, ran none, and exited 0. A
+  run-time check of executed against selected counts would catch that;
+  whether to add one is an owner decision.
+- **Rules for future CI changes.** Measurement and change rules are in the
+  `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
+
 The existing aggregate check names remain, and require every shard to succeed;
 a skipped or cancelled shard cannot satisfy them. Lint, manifest checks and
 package construction run once. The release workflow still performs its broad

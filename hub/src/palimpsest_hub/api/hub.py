@@ -356,6 +356,11 @@ class HubLayerResponse(BaseModel):
     created_at: str | None = None
 
 
+class HubLayerDetailResponse(HubLayerResponse):
+    ancestors: list[str]
+    chain_complete: bool
+
+
 class HubUploadStartResponse(BaseModel):
     session_id: str | None = None
     completed: bool
@@ -916,7 +921,7 @@ async def delete_image_export(
         _raise_export_http(exc)
 
 
-@router.get("/layers/{digest}", response_model=HubLayerResponse, operation_id="get_hub_layer")
+@router.get("/layers/{digest}", response_model=HubLayerDetailResponse, operation_id="get_hub_layer")
 async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
     normalized = normalize_digest(digest)
     if normalized is None:
@@ -934,7 +939,7 @@ async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info))
 
 @router.get("/layers/{digest}/ancestors", response_model=list[HubLayerResponse], operation_id="get_hub_layer_ancestors")
 async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_token_info)) -> list[dict[str, Any]]:
-    """루트 → 자기 자신 순서. 허브에 없는 조상에서 끊기며 `chain_complete` 로 판별한다."""
+    """루트 → 자기 자신 순서. 누락된 조상은 상세 조회의 chain_complete 로 판별한다."""
     normalized = normalize_digest(digest)
     if normalized is None:
         raise HTTPException(status_code=422, detail="digest 는 sha256:<64hex> 형식이어야 합니다")

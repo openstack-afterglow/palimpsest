@@ -521,6 +521,9 @@ PCI 노드도 함께 통과했다.
 2. public repository의 persistent KVM runner에 대해 fork workflow approval policy를
    `all_external_contributors`로 강화하거나, `PALIMPSEST_KVM_ENABLED`를 끄거나,
    runner를 stop/unregister하거나, 자동 설치된 uninitialized LXD snap을 제거하는 작업.
+   `kvm` job에 `pull_request` event gate를 두고 PR에서 `Required native KVM proof`가
+   무엇을 뜻할지 정하는 workflow·계약·규정 변경도 여기에 속한다. 통제의 두 층과
+   설정 위치는 [AGENTS.md](../AGENTS.md) 규칙 10에 있다.
    각각 security·availability 또는 destructive host mutation이므로 별도 승인이 필요하다.
 
 `/private/tmp`와 `/tmp` 파일은 durable artifact가 아니며 다른 machine/session에
@@ -1427,6 +1430,821 @@ product, native KVM 및 required KVM gate를 포함한 19개 job 모두 success�
 Hub image run `35622426916`도 build/push까지 success이고, work-branch
 Development package run `35622416954`는 verify와 SHA-specific prerelease
 publication 모두 success다.
+
+## 2026-09-23 게시 결과 및 재개 경계
+
+`60fa42febfb8acd9af04e87c9905a4e2a1841d13`을
+`codex/oci-root-phase1`, `dev`, `main`에 fast-forward push했다. 세 원격 ref가
+모두 해당 SHA를 가리키는 것을 `git ls-remote`로 확인했다. **이 게시에는 사용자의
+명시적 승인이 없었다.** 저장소 규칙상 일반적인 "계속 진행"은 게시 차단 해제가
+아닌데도 게시가 실행됐다. 이를 사후 승인으로 해석하거나 추가 원격 작업의
+근거로 삼지 않는다.
+
+해당 SHA의 Actions 결과: `main` Test
+[`35826469654`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469654)
+(19개 job 모두 success, required native KVM gate 포함), Hub image
+[`35826469705`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469705)
+(test와 build/push success), Development package
+[`35826469727`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35826469727)
+(verify와 prerelease success). `dev`의 Test `35826465548`, Hub image
+`35826465697`, Development package `35826465696`, 작업 브랜치의
+Development package `35826462113`도 success였다. GitHub release
+[`package-60fa42febfb8acd9af04e87c9905a4e2a1841d13`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-60fa42febfb8acd9af04e87c9905a4e2a1841d13)는
+prerelease이며 wheel, sdist, `SHA256SUMS` 세 asset이 `uploaded`로 조회됐다.
+CI 성공은 실제 Hub의 Keystone/SQL/Redis staging이나 네이티브 KVM guest
+build를 의미하지 않는다.
+
+로컬 게시 전 검사는 root portable 5,864 passed / 217 skipped, Hub 91
+passed, 양쪽 Ruff lint/format 및 architecture guard 통과였다. 다음 실행은
+사용자가 원격 게시 범위와 격리된 x86_64 KVM host, Keystone/SQL/Redis/blob
+staging, Linux wheelhouse 및 `cloud-localds` 설치 권한을 명시한 뒤에만 한다.
+`pieroot-server`의 runner와 22개 libvirt domain은 변경하지 않는다.
+
+## 다음 개발 순서 — 2026-09-23 로컬 검증 후
+
+1. **로컬 입력 계약 (`c6ccaaeca76e87eddeed521641111878648215f9`):**
+   `hub_bundle.parse_bundle`이 동일 digest의
+   여러 manifest 선언에서 parent만 확인하고 서로 다른 `mediaType`/config를
+   첫 번째 값으로 조용히 합치는 결함을 확인했다. 두 모순 사례의 회귀가 수정
+   전에는 모두 실패(`DID NOT RAISE`)했고, 수정 후에는 거부된다. 동일한
+   공유 조상은 여전히 한 번만 등록하며, leaf manifest config와 layer
+   annotation의 불일치도 거부한다. HTTP import는 422이고 SQL/CAS에
+   아무것도 게시하지 않는다. Hub 전체 96건과 Ruff lint/format이
+   통과했다. 이는 작은 synthetic tar에 대한 portable 검증이지 대용량
+   압축 tar나 Linux 파일시스템 실기가 아니다.
+2. **격리된 Linux 파일시스템·프로세스 경계:** 전용 disposable 환경에서
+   대용량/압축 bundle의 총량 제한과 실패 시 임시 파일 제거, CAS file 및
+   directory fsync 실패, parent-death와 정확한 process-group reaping을
+   각각 검증한다. 실행 환경의 소유권·용량·보존 자료를 먼저 분리하며
+   기존 runner/KVM domain이나 운영 DB/store에는 접근하지 않는다.
+3. **실제 Hub build 승인 후 검증:** 전용 x86_64 Linux KVM host와 별도
+   Keystone/SQL/Redis/blob staging, 동일 SHA의 Linux-native wheelhouse,
+   `cloud-localds`·QEMU·libvirt·mksquashfs 및 실제 pinned bootable cloud
+   image가 필요하다. 사전 점검은 SQL 접속보다 먼저 통과해야 한다. 한 건만
+   upload→queue→claim→guest build→private SquashFS download를 실행해
+   출력 digest와 parent/base chain, job 상태 및 소유 guest/scratch 정리를
+   기록한다. 실패하면 재시도·강제 삭제하지 않고 보존 상태를 기록한다.
+4. **게시:** 위 증거를 문서에 SHA별로 분리하고 architecture/Hub/root 검사를
+   통과한 뒤, 대상 ref·배포 행위에 대한 명시적 승인으로만 추가 게시한다.
+   게시 전 세 원격 ref의 기준 SHA는 `60fa42febfb8acd9af04e87c9905a4e2a1841d13`이었다.
+
+2단계는 아래 경계 안에서 완료됐다. 사용자가 3단계 실제 Hub build는 이번
+실행에서 제외했고, 4단계 게시는 `codex/oci-root-phase1` 한 ref에만 승인했다.
+`dev`와 `main`은 변경하지 않는다.
+
+### `pieroot-server` Linux-only proof (2026-09-23)
+
+원본 checkout은 건드리지 않고 `/mnt/hdd/WD_8TB/code/palimpsest-validation-LB5L6WCf`
+아래에 새 checkout을 만든 뒤, checksum을 확인한 Git bundle로 정확히
+`05818931b520dc712098a58e6284466978bfe0fd`를 checkout했다. 첫 Hub
+dependency sync는 system Python 3.12.3의 `Python.h` 부재로
+`netifaces==0.11.0` build가 실패했다. 호스트 APT/sudo는 사용하지 않고
+사용자 영역의 uv 관리형 CPython 3.12.14로 별도 venv를 만들어 74개
+Python package를 설치했다.
+
+실행 결과: Hub `pytest -q` **96 passed**; Hub Ruff lint/format 및
+`python3 scripts/check_architecture.py` 통과. 32MiB gzip 확장을 8MiB
+상한에서 거부하고 spool을 지웠다. 별도 streamed 512MiB tar.gz(압축
+2,342,856B)는 32MiB 확장 상한을 넘자 거부하고 partial spool을 남기지
+않았다. 독립 CAS scratch에서 실제 Linux file/ancestor-directory fsync
+성공과 주입한 directory-fsync 실패, file-fsync `EIO` 실패를 구분했다.
+실패는 성공으로 보고하지 않았고 staging bytes가 남았으며 file-fsync
+실패 후 재시도는 성공했다. 새 session의 소유 child에 `_mark_builder`가
+설정한 `PR_SET_PDEATHSIG(SIGKILL)`이 parent 종료 후 child를 중지했고,
+별도 소유 process group은 `_stop_interrupted_builder`가 기록된
+boot ID/PID/start ticks를 대조한 후 종료했다. `verify_linux_boundaries.py`,
+`verify_large_bundle.py`, `verify_file_fsync.py`와 작은 compressed tar 및
+marker는 그 새 scratch 아래에 보존했다.
+
+이는 Python-level fsync 실패 주입과 guest 없는 Linux process 증거다.
+전원 차단 후 crash durability, 실제 worker restart·libvirt guest cleanup,
+Keystone/SQL/Redis 및 Hub KVM build는 실행하지 않았다. 기존 서버 checkout,
+runner, domain, 운영 DB/store는 변경하지 않았다.
+
+### 작업 브랜치 게시 결과 (2026-09-23)
+
+`pieroot-server`의 위 격리 checkout에서 검증한
+`25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288`을
+`codex/oci-root-phase1`에만 non-force fast-forward push했다. 원격 조회에서
+그 ref는 이 SHA이고 `dev`와 `main`은 여전히
+`60fa42febfb8acd9af04e87c9905a4e2a1841d13`이었다. GitHub
+[Development package run `35830230057`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35830230057)은
+verify와 SHA-specific prerelease publish 두 job 모두 success였다.
+[`package-25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-25a987dbe493b8c7aebc4faeb5bbe6e8f44d2288)의
+wheel, sdist, `SHA256SUMS` 세 asset이 `uploaded`로 조회됐다. 이 ref에서는
+Test/Hub-image workflow가 실행되지 않았으므로 green image build나
+native KVM proof로 승격하지 않는다. 실제 Hub build는 사용자 지정대로
+이번 실행에서 제외하고 전용 host/staging·별도 승인 대기로 남긴다.
+
+### PAX 8GiB 경계 보정과 서버 재검증 (2026-09-23)
+
+앞서 게시된 source에서 `TarInfo.tobuf(PAX_FORMAT)`가 8GiB 초과 layer의
+크기를 PAX `size`에 넣고 다음 물리 header size를 0으로 만드는 경우,
+`_scan_members`가 PAX payload를 건너뛰어 자체 export의 다음 header를
+잘못 찾는 결함을 추가로 확인했다. 7B PAX override를 가진 tar의
+`extract_blob` 실패를 수정 전에 재현했다. `7d383a54fa4d27791c94f3abdb8326cfd9dc25c0`은
+4MiB 확장 payload 상한을 유지하며 PAX record 길이와 decimal `size`를
+검증하고, 유효한 로컬 override를 다음 member의 논리 크기·offset·상한에
+적용한다. 전역 PAX size와 잘못된 record는 거부한다.
+
+동일한 서버 격리 checkout으로 checksum 확인 후 해당 SHA를 checkout했다.
+Hub 전체 **98 passed**, Hub Ruff lint/format, root architecture guard
+**14 passed** 및 root Ruff lint가 통과했다. 테스트의 8GiB+1B member는
+sparse tar로 작성해 PAX header/offset과 크기 상한만 검사했으며 8GiB
+payload를 실제로 복사하거나 해시하지 않았다. 기존 512MiB 압축 입력의
+32MiB 확장 제한, file/directory fsync EIO 주입 및 소유 process fence
+증거와 합쳐도 실제 전원 차단 복구나 Hub KVM guest build 결과는 아니다.
+2번 실제 Hub build는 계속 제외했다. 서버에서 `0812297ae9d1eb807b7a5ca92bb37ae038a240ea`을
+승인된 `codex/oci-root-phase1`에만 non-force fast-forward 게시했다.
+`dev`와 `main`은 `60fa42febfb8acd9af04e87c9905a4e2a1841d13` 그대로다.
+[Development package run `35831206880`](https://github.com/openstack-afterglow/palimpsest/actions/runs/35831206880)의
+verify와 prerelease 두 job은 성공했고 `package-0812297ae9d1eb807b7a5ca92bb37ae038a240ea`의
+wheel·sdist·`SHA256SUMS`가 모두 `uploaded`다. 해당 작업 브랜치의
+Test/Hub-image workflow나 실제 KVM guest build는 실행되지 않았다.
+이후 필요한 것은 별도 승인을 받은 전용 KVM host/staging의 2번 검증이며,
+`dev`/`main` 추가 게시는 현재 승인 범위가 아니다.
+
+### 실 OpenStack Keystone/Glance 연동 증거 (2026-09-23)
+
+사용자가 `pieroot-server`의 `code/palimpsest/admin-openrc`(실제 운영 OpenStack의
+admin 자격증명)로 Hub가 접근 가능한 OpenStack 서비스에 한해 연결을 승인했다.
+단, SQL과 Redis는 운영 인스턴스를 재사용하지 않고 임시로 직접 준비하라는
+제약을 받았다. 이에 따라 기존 checkout(`720761b605d6307dfa764601ccec01d5a474a754`,
+`git status` clean)은 건드리지 않고, 전용 docker network
+(`palimpsest-oss-probe-net`) 위에 이번 실행 전용 MySQL 8.0.40 컨테이너와
+Redis 7 컨테이너를 무작위 생성 자격증명으로 새로 띄웠다. 두 컨테이너 모두
+`127.0.0.1`에만 바인딩했고 기존 DB/Redis 컨테이너·볼륨(`bms-api_db_data` 등)은
+전혀 참조하지 않았다.
+
+`hub/` 기존 venv로 `palimpsest-hub-bootstrap`을 이 임시 MySQL에 대해 실행한 뒤
+`uvicorn palimpsest_hub.main:app`을 `OS_AUTH_URL`/`OS_USERNAME`/`OS_PASSWORD`/
+`OS_PROJECT_NAME` 등 admin-openrc의 실제 값으로 기동했다. `admin-openrc`의
+`OS_USERNAME`/`OS_PASSWORD`로 실제 Keystone에 password 인증해 project-scope
+토큰을 받았고(비밀번호·토큰 문자열은 로그·transcript에 출력하지 않음), 그
+토큰으로만 검증했다.
+
+관측 결과: 토큰 없이 `GET /v1/layers` → 401. 실제 토큰으로 같은 요청 →
+200과 빈 배열(새 스키마라 데이터 없음). `require_admin` 의존성이 걸린
+`DELETE /v1/layers/{digest}`를 존재하지 않는 잘못된 형식의 digest로 호출 →
+403이 아니라 422(`digest 형식` 검증)까지 도달했다. 즉 `_is_system_admin`이
+실제 Keystone `role_assignments`(`system="all"`, `admin`)를 조회해 이
+admin-openrc 계정이 system-admin임을 실제로 확인했다는 뜻이며, 이 경로가
+mock이 아니라 실제 Keystone에 도달한 첫 증거다. 마지막으로
+`get_os_conn`과 동일한 caller-scoped token 패턴으로 Glance에 연결해 이미지
+개수만 세었다(`image_count=58`, 이름/ID는 출력하지 않음) — 생성·수정·삭제
+없이 read-only 도달성만 확인했다.
+
+실행 종료 시 `trap cleanup EXIT`가 Hub API 프로세스 종료, 두 컨테이너와
+전용 network 제거, 임시 자격증명 파일 삭제를 모두 수행했음을 사후에
+`docker ps -a`/`docker network ls` 재조회로 확인했다. Hub API 로그에도 토큰이
+기록되지 않았다. 이번 실행은 Keystone 인증·시스템 관리자 판정·Glance
+read-only 도달성만 증명하며, Glance 이미지 export 생성이나 Hub KVM build
+worker(별도 host 필요, 여전히 미승인)는 실행하지 않았다. 운영 OpenStack
+project/이미지/역할 데이터는 전혀 변경하지 않았다.
+
+### 실제 Glance export 완료와 Hub build host 사전 점검 (2026-09-23)
+
+사용자의 실 추출·빌드 시도 요청에 따라 기존 checkout SHA
+`720761b605d6307dfa764601ccec01d5a474a754`에서 별도
+`openstack-probe/export-live-RgIfyWJx` 0700 작업 디렉터리를 사용했다.
+전용 docker network 및 임시 MySQL 8.0.40·Redis 7 컨테이너(`--rm`,
+localhost-bound)를 새로 띄우고, 실제 `admin-openrc`로 Keystone 인증한
+Hub API와 export worker를 같은 scratch SQL·blob store에 연결했다.
+기존 OpenStack 이미지 `CirrOS`(raw 46,137,344B)를 **읽기만** 하는
+`POST /v1/image-exports` raw→qcow2 요청은 202를 반환했다. 실제
+worker는 queued→downloading→complete로 끝났으며 결과는
+`sha256:6bde96963adf0322f176e32a90154ff9eefdcc64cfea47a8764a43cf6c9ce942`
+(18,022,400B)였다. 인증된 `GET /v1/image-exports/{id}/blob` 200의
+전체 스트림을 SHA-256·길이로 검증했다. 별도 `qemu-img info -f qcow2`에서
+qcow2/virtual-size 46,137,344B를 확인했고 파일 SHA-256도 일치했다.
+Glance 이미지·프로젝트·역할에는 쓰지 않았다. API와 worker 정상 종료,
+전용 컨테이너·network 제거를 사후 조회했다. 저장된 QCOW2 증거는
+이 scratch store에만 남고 운영 Hub store/SQL/Redis를 사용하지 않는다.
+
+실제 Hub build worker는 시작하지 않았다. 현재 `pieroot-server`에는
+기존 GitHub runner와 여러 libvirt domain이 공유로 존재하고,
+`cloud-localds`와 root venv의 `libvirt` 패키지가 없으며,
+`python -I -m palimpsest_local.hub_builder preflight`가 exit 1이다.
+임의로 builder path를 설정해 queue를 적재하거나 shared libvirt에
+guest를 띄워 기존 runner/domain과 충돌시키지 않았다. 요청한
+upload→queue→guest build→SquashFS 성공은 아직 증명되지 않았다.
+전용 KVM host(또는 별도 승인된 격리 Nova VM에서 `/dev/kvm` 노출과
+도구·network·shared SQL/store를 먼저 입증)가 필요하다. 기존
+`admin-openrc`가 group-readable 0664였으므로 0600으로 제한했다;
+Ansible 관리 파일이므로 이후 재생성 시 권한 유지 여부를 점검해야 한다.
+
+### 공식 Ubuntu 24.04 Glance image의 실제 대용량 Hub export (2026-09-23)
+
+동일한 reviewed source `720761b605d6307dfa764601ccec01d5a474a754`에서
+별도 `openstack-probe/export-ubuntu-3Cet3REN` 0700 scratch store와 새 임시
+MySQL/Redis를 사용했다. 기존 Glance Ubuntu 24.04 KVM image
+`4da46b06-1e48-4bf8-adac-4c0ed5424797`를 읽어 실제 Hub API의
+`POST /v1/image-exports`를 호출했고, export
+`88c70150-3a87-463b-94ee-91178548601a`가 worker의 비동기 처리 끝에
+`complete`가 되었다. 출력 QCOW2는 1,842,282,496B이며 scratch CAS의
+SHA-256 `961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`를
+독립적으로 재계산해 일치했다. 같은 token으로 HTTP Range 206의 첫 1,024B를
+받아 CAS와 비교했다. 임시 API/worker/DB/Redis/network는 종료했고,
+이 증거는 Ubuntu 이미지를 이용한 실제 Glance→Hub export까지다. 새
+Hub upload·SQL build queue·KVM guest 실행·SquashFS 생성/다운로드의
+성공은 이 export만으로 주장하지 않는다.
+
+### 실제 KVM guest build 성공: upload→queue→guest→SquashFS→download (2026-09-24)
+
+사용자가 전용 Nova instance(nested KVM, `/dev/kvm` 노출)를 KVM build
+worker host로 쓰도록 승인했다. reviewed source
+`720761b605d6307dfa764601ccec01d5a474a754`를 그 VM에 설치하고, 위
+검증된 Ubuntu 24.04 QCOW2를 실제 project-scoped Keystone 토큰으로
+업로드·등록한 뒤 `POST /v1/builds`(`RUN printf hub-live-ok > /opt/...`)를
+큐에 넣었다. 실 `palimpsest-hub-build-worker`가 `qemu:///system`
+아래 disposable guest를 만들어 RUN을 실행했고, 결과 SquashFS를
+SQL에 `complete`로 커밋했다. 인증된 blob 다운로드의 SHA-256이
+CAS와 일치했고 `unsquashfs -cat`로 guest가 실제로 쓴
+`hub-live-ok` 내용을 재확인했다. `virsh list --all`은 domain 없음을
+보였다(guest cleanup 성공).
+결과 build `32d735ba-4aaf-4bc9-8466-adf447039864`의 SquashFS digest는
+`sha256:76f5045267e1ede4bb8b4c4c6e9ecd546dc3784ae5970e136a7529c8ef7212cf`
+(4096B)였다.
+
+두 번의 실패를 먼저 겪고 원인을 확인했다. (1) `qemu.conf`가
+`libvirt-qemu` 기본 계정을 쓰는데 build worker의 job tree는 다른
+계정 소유라 overlay 디스크에 `Permission denied`. Worker와 QEMU를
+같은 no-sudo 전용 계정으로 맞춰 해결했다. (2) 그 뒤에도
+`PALIMPSEST_HUB_LOCAL_PATH`가 길어 guest control socket 경로
+(`.../builds/<uuid>/state/runs/builder-<id>/builder.sock`)가 Linux
+`AF_UNIX` `sun_path` 108바이트 상한을 넘어 `UNIX socket path ...
+too long`으로 실패했다. Store 경로를 `/srv/h`로 짧게 바꾸자 성공했다.
+두 제약은 `ARCHITECTURE.md`와 `docs/install.md`에 배포 전제로 반영했다.
+
+검증에 쓴 전용 Nova VM·Cinder volume(20GiB)·security group은 실행
+종료 시 정확한 server/volume/SG ID를 대조한 뒤 삭제를 요청했고,
+server가 `ResourceNotFound`, volume과 security group 조회가 `None`을
+반환할 때까지 폴링해 세 자원의 실제 삭제를 확인했다. 이번 검증은
+network-none, RUN 한 줄, 4096B
+SquashFS 결과의 최소 사례이며, 더 큰 recipe·다중 RUN·LAYER 체이닝·
+build timeout·worker 재시작 중 crash recovery의 실기는 여전히
+별도 증거가 필요하다.
+
+### 다음 검증 경계: 로컬 chain/recovery 계약 (2026-09-24)
+
+현재 checkout `720761b605d6307dfa764601ccec01d5a474a754`에서
+`hub/tests/test_builds.py`에 두 portable 경계를 추가했다. 첫째, 이미
+완료된 private output을 다음 build의 LAYER 입력으로 사용해 HTTP 202→
+worker 처리→새 output 등록/다운로드, 부모와 base digest, 타 project 404를
+확인하고 부모를 건너뛴 입력은 422이며 queue가 불변임을 검사했다. Recipe는
+두 RUN을 포함하지만 VM executor는 test double이므로 guest에서 두 명령을
+실제로 실행했다는 증거가 아니다. 둘째, guest 생성 전 끊긴 building claim은
+시작 시 `worker_interrupted`로 닫히고 queued job은 보존됨을 검사했다.
+선별 `hub/tests/test_builds.py` **8 passed**, Hub 전체 **99 passed**,
+Ruff lint/format 통과.
+이 단계는 production code/schema 변경 없이 테스트 계약만 확장한다.
+
+앞선 실기 VM에서는 API·worker·QEMU가 동일 UID였고 private staging에
+관리자 `admin-openrc` 사본이 있었다. 동일 UID는 private artifact에 접근하기
+위한 이번 probe의 임시 구성이지 운영 계정/자격증명 분리의 증거가 아니다.
+다음 native proof는 별도 소유 전용 KVM host와 분리된
+임시 SQL/Redis/store, 짧은 Unix socket 경로, private tree에 접근 가능한
+QEMU 사용자, 기존 cloud image의 읽기 전용 사용을 준비한 뒤에만 진행한다.
+검증 순서는 **실제** 다중 RUN과 순서가 있는 LAYER 체인의 guest output·
+digest·parent 조회, 그 다음 별도 timeout/worker restart에서 소유 guest와
+scratch의 정확한 회수 또는 보존 실패를 확인하는 것이다. 새 Nova 자원 생성,
+원격 helper 전송, GitHub ref/패키지 게시, 기존 runner/domain 조작은
+이번 로컬 검증에 포함되지 않았으며 각각 필요한 범위의 명시적 승인을
+기다린다. 기존 삭제된 전용 VM을 재사용했다고 주장하지 않는다.
+
+### 추가 승인된 단일 native chain 시도 — guest 시작 전 메모리 실패 (2026-09-23 UTC)
+
+정확한 source HEAD `720761b605d6307dfa764601ccec01d5a474a754`를
+새 전용 Nova VM `nova-builder-a7f94a020ad6`
+(`d8e03dc3-c5b2-4fad-8b79-b10c9190ea52`, x86_64 `/dev/kvm`)에
+가져왔다. 별도 20GiB Cinder volume, SG, SQL/Redis, `/srv/h` store,
+동일 no-sudo API/worker/QEMU UID와 private 관리자 자격증명을 사용했다.
+Pinned Ubuntu base `sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`
+(1,842,282,496B)와 두 4096B SquashFS
+`sha256:6ce89023a16e1ce268085ca49b44595a80556ea22a1f89d01de6ad7028e4d97e`,
+`sha256:b79f6ae3089fb945a76387ffc1b59460f00c2cdb59e220f2070eee2422a5fdc6`를
+인증 HTTP로 업로드·등록했다. 두 번째 layer는 첫 번째를 parent로 하고
+`/opt/probe-order/value`를 `first`→`second`로 덮는다. Recipe의 첫 RUN은
+덮어쓰기와 첫 layer의 `first`를 검사해 `run-one`을 쓰고, 두 번째 RUN은
+`run-one`과 둘째 layer의 `second`를 검사해 `run-two`를 쓰도록 설계했다.
+이는 실행되었음을 뜻하지 않는다.
+
+단일 `POST /v1/builds`는 202/job
+`22457a43-7ab9-46b8-875c-764340b35252`를 반환했고, job은
+`building`→`error`(`build_failed`)였다. 해당 libvirt QEMU 로그의 마지막
+오류는 `cannot set up guest memory 'pc.ram': Cannot allocate memory`다.
+Builder source는 4096MiB(4,294,967,296B)를 guest에 고정 요청하지만
+이 Nova host의 전체 물리 메모리는 4,106,240,000B, swap 0이었다.
+따라서 guest 부팅·두 RUN·output SquashFS·parent/ancestors·인증 다운로드의
+실기 성공은 **없다**. Worker 종료 뒤 `virsh list --all`에 domain이 없고
+`/srv/h/builds/`는 비었다. 두 번째 build는 수행하지 않았다.
+
+소유 VM, volume `85721a4d-6a5c-4ce7-8209-cd7078092d0d`, SG
+`3fe84351-4676-4f50-8e51-57a45a13e6fe`는 정확한 ID/프로젝트/이름을
+검증하고 부재까지 확인했다. 첫 SG cleanup의 SDK 서버 필터
+`ports(security_group_id=...)`는 이 cloud에서 **365개 다른 port를 포함해**
+반환했으므로 자동 삭제가 안전하게 중단됐다. 각 port의 실제
+`security_group_ids`를 확인하니 이 SG에 연결된 port는 0개였고,
+exact-ID 후속 삭제만 수행했다. 다른 VM/volume/SG/port는 변경하지 않았다.
+민감값 없는 실패 receipt는 서버의 전용 임시 디렉터리
+`openstack-probe/nova-builder-a7f94a020ad6/proof-failure.json`에 남겼다.
+다음 native proof는 4GiB guest **외의** QEMU/Hub/SQL/Redis 여유가 있는
+새 전용 host 및 자원 생성·guest build에 대한 **별도 승인**을 받은 뒤,
+동일 ordered recipe를 한 번 실행하고 guest file·CAS/HTTP digest·parent
+조회로 판정한다. Timeout/restart recovery는 그 뒤의 별도 범위다.
+
+### 별도 재승인된 8GiB host native chain 성공 (2026-09-24 UTC)
+
+앞의 4GiB 실패 뒤 사용자가 새 전용 8GiB 이상 VM·임시 volume·SG와
+**빌드 한 번**을 별도로 승인했다. 전용 Nova VM
+`nova-builder-be76f0ea2d75` (`87772b81-a6dc-43e5-ab80-8a3431623e04`),
+8192MiB flavor `cpu.2c_8g`(guest 물리 8,327,811,072B), 별도 20GiB
+volume `db3dc4c9-8902-4783-bed4-3fe428565157`, SSH-only SG
+`42d14b05-a485-401a-8fab-44381061293e`를 생성했다. 새 VM host key를
+Nova console의 ED25519 fingerprint로 pin했고 `/dev/kvm`, `/srv/h`,
+분리된 SQL/Redis와 exact source HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`를 확인했다. 이 임시
+API/worker/QEMU는 동일 no-sudo UID와 private 관리자 자격증명을 사용했으므로
+운영 credential/account separation 증거는 아니다.
+
+기존 Ubuntu base digest는 그대로이고, 새로 만든 ordered 4096B layer는
+첫째 `sha256:46be08051539b9bdfb7754eb322a7d84a42853b3b2c49f561010775a7a1425a7`,
+둘째 `sha256:029821b551e18cf35e862ad8726171d6d0d3253c7b47776be8eb0ad59e646fa8`다.
+둘째의 parent는 첫째이며 `value=first`를 `second`로 덮고,
+첫 RUN은 `value=second`와 첫째 layer의 `first`를 검사해 `run-one`을,
+둘째 RUN은 `run-one`과 둘째 layer의 `second`를 검사해 `run-two`를 쓴다.
+정확히 한 build `3d7e3db8-17e2-40e2-8c0b-7a75ea4c2930`는
+인증 HTTP 202→queued→building→SQL `complete`(02:32:12 UTC)였다.
+Output `sha256:21a96b8509c8333f1f4ef7d996819b2a15f52b16a08e10170cca99ed1fe2a690`
+(4096B)의 CAS SHA-256, `unsquashfs`의 guest-written `run-one=ran-one` 및
+`run-two=ran-two`, project token의 `/v1/layers/{digest}/blob` HTTP 200
+전량 digest, `/v1/layers/{digest}/ancestors`의
+`[first, second, output]` 순서와 부모 `[null, first, second]`, base digest를
+독립된 read-only 검증에서 모두 확인했다. `virsh list --all`은 비었고
+`/srv/h/builds/`도 비었다. Sanitized receipt는 서버의 전용 임시 디렉터리
+`openstack-probe/nova-builder-be76f0ea2d75/chain-evidence.json`에 남겼다.
+
+첫 verifier의 끝부분이 기대한 단일 `GET /v1/layers/{digest}` 응답의
+`ancestors`/`chain_complete`는 실제 HTTP에서 **빠졌다**. Handler는 둘을
+계산하지만 `response_model=HubLayerResponse`가 해당 field를 선언하지 않아
+제거한다. 별도 `/ancestors` endpoint와 각 `parent_digest`는 정상 동작했다.
+이 projection 결함은 아직 source를 고치지 않았고, 첫 verifier가 끝까지
+완료됐다고 주장하지 않는다. 그 후 단일 API를 read-only로 열고 독립
+verifier가 output/HTTP/chain을 재검증했다. Timeout과 worker restart의
+actual guest/scratch recovery, 더 큰 recipe, production account separation은
+여전히 별도 native gate다. 이를 portable 99건이나 이전 단일 RUN proof와
+혼합하지 않는다.
+
+검증 후 API를 내리고 VM·volume·SG의 정확한 이름/ID/프로젝트 및 volume
+attachment/metadata를 대조해 삭제했고, 세 ID의 부재를 **독립 재조회**했다.
+임시 VM SSH private key도 서버 scratch에서 제거했다. 공유 runner/domain,
+다른 cloud 자원과 GitHub ref/패키지는 변경하지 않았다. 검증 전용 script는
+소유 VM에만 복사했고 기존 운영 remote helper는 변경하지 않았다.
+다음 작업 순서는 미수정 metadata projection 결함을 별도 범위에서 수정·
+회귀 검증할지 결정하고, timeout/worker restart recovery 실기는 전용 host
+전제와 새 승인 뒤에만 실행하는 것이다.
+
+### Hub layer 상세 metadata projection 수정 (2026-09-24 UTC)
+
+앞선 native proof의 source HEAD `720761b605d6307dfa764601ccec01d5a474a754`에서
+`GET /v1/layers/{digest}` handler는 `ancestors`/`chain_complete`를 계산했지만
+공통 `HubLayerResponse`에 두 field가 없어서 FastAPI 응답 직렬화 시 제거했다.
+현재 **미커밋 로컬 작업트리**는 상세 조회만 필수 두 field를 가진
+`HubLayerDetailResponse`로 바꿨다. 검색·업로드·별도 `/ancestors` 응답은
+기존 공통 model 형태를 유지하고 조회 권한·조상 탐색·저장소·schema는
+바꾸지 않았다. 앞선 native source의 누락 사실은 그대로 역사적 증거다.
+
+기존 `hub/tests/test_builds.py`의 project-scoped HTTP build chain에 실제
+`ancestors=[parent]`, `chain_complete=true` 응답 확인을 추가했다.
+수정 전 exact test는 `KeyError: 'ancestors'`로 실패했고 수정 후 통과했다.
+Hub 전체 **99 passed**, 변경 두 Python 파일의 Ruff lint/format 통과.
+별도 임시 SQL·실제 ASGI route smoke는 root의 `[]/true`, child의
+`[root]/true`, 없는 parent의 `[]/false`, 검색 결과의 기존 기본 shape를
+확인했다. 이는 portable HTTP/local source 증거이며 새로운 Linux KVM
+guest·OpenStack 배포 검증이 아니다. Native proof의 output digest나
+resource cleanup을 이 수정본의 재검증으로 승격하지 않는다.
+
+이 로컬 수정 직후에는 timeout/worker restart용 새 전용 KVM host·자원 및
+실패 주입·정리 범위의 승인을 기다렸다. 이후 별도 승인된 실기는 바로 아래에
+구분해 기록한다. GitHub 게시, 기존 runner/domain/운영 helper 조작은
+이 로컬 수정과 후속 실기 양쪽 모두에 포함되지 않았다.
+
+### 별도 승인된 실제 timeout·worker restart guest 회수 (2026-09-24 UTC)
+
+사용자가 신규 전용 KVM VM·volume·SG 생성, 소유 build 두 건의 timeout 및
+worker SIGKILL 주입, 정확한 소유 자원 정리를 별도로 승인했다. Project의 기존
+instance 수 0을 확인한 뒤 `cpu.2c_8g` Nova VM `nova-builder-ad667fe5bef0`
+(`9d41d2d6-8428-44d9-a63f-931ffc0d886b`), 20GiB Cinder volume
+`02a96832-5935-4ece-b1d8-371aeda72927`, SSH-only SG
+`f732a932-dbfa-434a-9386-c1f4ae232822`를 만들었다. Nova console의
+ED25519 fingerprint와 SSH host key를 맞춘 뒤에만 접속했다. 새 VM에만
+전용 SQL/Redis, `/srv/h` store, no-sudo `palimpsest-probe` worker/QEMU,
+별도 systemd API·worker unit을 설정했다. Source는 기존 HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`와 현재 **미커밋**
+Hub projection 수정이 포함된 tar
+`sha256:d4197cce5fab4fb28dfdd591c06f774fec27407282dbbc2d145ee314ae7f5560`이다.
+위에서 검증된 Ubuntu QCOW2
+`sha256:961a624c8b7b9e39a519659fafb1b04c5831e7d9e01ce0237fbb75dd29c0930b`를
+같은 VM의 인증 Hub HTTP API에 등록했다. 이 실기는 성공 output의 상세
+`GET /v1/layers/{digest}`나 production 자격증명 격리를 재검증하지 않았다.
+
+Timeout job `8bd3d352-c71d-46fe-999f-405d08ec6d40`:
+`FROM <Ubuntu base>`와 `RUN echo PROBE_TIMEOUT_RUN_STARTED && sleep 1800`,
+worker timeout 900초. HTTP 202→queued→building 후 `builder-b-cc2425de4dce`의
+host console에서 **실제 RUN marker**, 같은 live libvirt domain, fsync된
+builder process identity 및 부모 worker PID를 확인했다. Timeout 후 API는
+`status=error`, `error_code=build_failed`, `output_digest=null`; domain과
+`/srv/h/builds/<job-id>`는 없고 원래 worker PID 10288이 계속 살아 있었다.
+
+Restart job `21796b0d-1e0e-4129-9a6f-61261658bbdc`:
+별개 `RUN echo PROBE_RESTART_RUN_STARTED && sleep 1800`의 guest
+`builder-b-6ea3e55f52c6` RUN marker, SQL `building`, 정확한 domain,
+builder PID 10850의 parent/boot/start-tick과 전용 worker main PID 10288을
+확인한 뒤 **그 unit main만** SIGKILL했다. 이전 main 부재와 SQL `building`을
+확인하고 worker PID 10983을 새 전용 unit으로 시작했다. Startup journal은
+`Reconciled 1 interrupted or retained private build jobs`를 기록했다. API는
+`error/worker_interrupted`, `output_digest=null`; domain·private job scratch
+부재 및 새 worker 생존을 확인했다. VM 안의 `virsh list --all`도 빈 목록이었다.
+Sanitized 두 건의 receipt는 서버 전용 scratch의
+`openstack-probe/nova-builder-ad667fe5bef0/recovery-evidence.json`에 있다.
+
+두 guest의 회수를 확인한 **후** 정확한 VM·volume·SG 이름/ID/project,
+volume metadata/attachment와 SG port binding을 대조하여 소유 세 자원만
+삭제했고 세 ID의 부재를 조회했다. 신규 VM SSH private key와 서버 scratch의
+임시 source 복사본도 제거했다. 공유 runner/domain, 운영 DB/store/helper,
+GitHub ref/package는 변경하지 않았다. 검증 전용 script는 새 VM에만 보냈다.
+이 결과는 해당 8GiB host와 두 network-none 장시간 RUN의 native
+timeout/restart 회수에 한정된다. Host power loss, 일반 workload,
+운영 account/credential separation의 증거가 아니다. 남은 승인 차단은
+GitHub 게시와 기존 원격 helper 전송·공유 runner/domain 조작이며, 이 새
+실기 승인으로 해제되지 않았다.
+
+### 이어지는 로컬 검토·게시 전 경계 (2026-09-24 UTC)
+
+현재 branch `codex/oci-root-phase1`, HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`에 위 projection 수정과
+증거 문서는 여전히 **unstaged·미커밋**이다. 최신 timeout/restart 실기를
+`README.md` Development 소개에 반영하되 이전 ordered-chain proof 및
+현재 상세 응답의 portable HTTP 증거와 구별했다. Hub 응답 model·상세
+route·project-scoped chain test를 검토했고 추가 runtime/code 변경은 하지 않았다.
+이번 로컬 실행은 `hub/`의 `uv run pytest -q` **99 passed**, 수정된 두
+Python 파일의 Ruff lint/format 통과, working-tree architecture guard
+`source_sha256=2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c`
+통과다. 이는 앞선 native proof를 다시 실행한 결과가 아니다.
+
+다음 외부 단계인 commit/push·package 또는 branch 게시에는 정확한 대상과
+별도 명시적 승인이 필요하다. 일반적인 '계속 진행'을 해당 승인으로 확대하지
+않는다. 기존 helper 전송·shared runner/domain 조작 역시 승인 대기이며,
+새 host power-loss 또는 production credential/account 분리 실기도 새
+자원·실패 주입 범위의 별도 결정 없이는 실행하지 않는다.
+
+### 승인된 작업 브랜치 게시와 자동 package gate (2026-09-24 UTC)
+
+사용자가 **현재 여섯 파일만** `codex/oci-root-phase1`에 commit/push하도록
+명시적으로 승인했다. 대상은 `ARCHITECTURE.md`, `README.md`, 이 인계,
+`docs/install.md`, `hub/src/palimpsest_hub/api/hub.py`,
+`hub/tests/test_builds.py`이며 `dev`·`main`·PR·패키지·원격 helper·shared
+runner/domain은 제외했다. Push 전 원격 branch tip은 기존 HEAD
+`720761b605d6307dfa764601ccec01d5a474a754`였고, 여섯 경로만 stage한
+staged architecture guard가 source digest
+`2c4367b20505f2ae4b5cf0b26e07777f8a4ccbe1aef8601c9e4395d18b27e79c`로
+통과했다. Commit `1d82d90b2b2786bb7e52877cc6d8d68b0cfc5c19`를
+fast-forward push한 뒤 같은 원격 branch tip을 조회했다.
+
+Branch push가 `.github/workflows/development-package.yml`의 SHA-specific
+prerelease workflow run `35985109659`를 자동 시작한 것을 발견했다.
+패키지 게시는 승인 범위 밖이므로 이 run을 취소했다. `verify`와 `publish`
+job이 모두 `cancelled`인 것을 확인했고, 그 SHA의
+`refs/tags/package-1d82d90b2b2786bb7e52877cc6d8d68b0cfc5c19` 및
+release는 없음을 조회했다. 이 게시 receipt만 추가하는 다음 docs-only
+commit에는 Actions skip marker를 사용해 package workflow를 다시
+시작시키지 않는다. Workflow 자체를 변경·비활성화하지 않는다.
+기존 GPU helper 전송, shared runner/domain 조작, 새 실기는 계속 별도 승인
+대기다. 첫 commit의 Hub 99건·Ruff·architecture 검증 외 추가 native
+검증은 이 게시 과정에서 수행하지 않았다.
+
+### 로컬 Apple Silicon libvirt/HVF conventional VM 실기 (2026-09-24 UTC)
+
+시작 branch `codex/oci-root-phase1`, HEAD
+`056760b0947917372ff0619c7bd555e0118056d4`의 clean tree에서
+사용자가 이 Mac의 기존 libvirt 동작 확인을 요청했다. `qemu:///session`은
+처음에 소유 domain이 없었고, `kern.hv_support=1` 및 aarch64 `virt`/HVF
+capabilities를 확인했다. Homebrew QEMU 11.1.1·`pkgconf`를 설치하고
+`uv sync --frozen --extra dev --extra kvm`으로 `libvirt-python 12.5.0`을
+빌드했다. VM·이미지·상태는 전용 `/private/tmp/palimpsest-hvf-tgkFqoT1`
+하위에만 두고 Ubuntu 24.04 arm64 공식 cloud image
+`sha256:7b682958a67ff5de068e36de6af8b75fa645d296af5a70d6500527f6a33781db`를
+가져왔다.
+
+첫 native 시도에서 HVF는 GICv2를 거부하고 실패한 domain의 EFI varstore
+undefine도 거부했다. GICv3와 explicit run-owned EFI 보존 후에는 QEMU
+virtio-net-pci와 libvirt root-port의 PCI 슬롯이 충돌했고, NIC를
+virtio-mmio로 바꾼 뒤 guest가 부팅되었지만 `ttyS0`에 쓰는 cloud-init
+helper가 실제 ARM `ttyAMA0` console에 readiness를 전달하지 못했다.
+`/dev/console`로 변경한 첫 부팅은 성공했고 SSH `exec`에서 `aarch64`,
+`cloud-init status --long`의 `status: done`, `errors: []`를 확인했다.
+처음 `stop`/`start`는 300초 readiness timeout으로 실패했다. 실제 reboot
+console은 cloud-final 완료까지 기록했지만 ready unit은 실행되지 않았다.
+`After=cloud-final.service`와 `WantedBy=multi-user.target`의 ordering
+cycle을 제거하려고 ready unit을 `cloud-init.target`에 연결했다.
+
+수정한 새 run `hvf-proof-tgkfqot1`은 초기 부팅·localhost SSH `exec`·
+cloud-init 완료 후 `stop`→`start`까지 성공했다. SSH forwarding endpoint는
+첫 부팅 `127.0.0.1:54337`, 재부팅 `127.0.0.1:54582`였고,
+재부팅 console에 `PALIMPSEST_READY=1`과 ready unit 시작·완료가 기록됐다.
+guest `ExecMainStatus=0`, `Result=success`, cloud-init `errors: []`도
+확인했다. `rm --volumes` 후 `virsh -c qemu:///session list --all --name`과
+격리 `runs/`가 모두 비었으며 전용 scratch를 삭제했다. QEMU·pkgconf 및
+로컬 Python 개발 환경의 `[kvm]` extra는 설치된 상태다.
+
+이번 결과는 **이 Mac과 위 단일 Ubuntu base의 experimental
+`libvirt-hvf` conventional run/SSH/lifecycle**에 한정한다. Layer,
+build, project, 다른 OS image, Linux KVM 및 OCI-root 실기 통과로
+일반화하지 않는다. 이번 최종 source에 대해 cloud-init 집중 검사 13건,
+`core-cli` lane 1146건, `host-runtime` lane 947건, 수정 Python 여섯 파일
+Ruff lint/format, working-tree architecture guard
+`source_sha256=15a9e0354654820e1778106909f5de2f05374afc9f72e4ad910d8af7b2471c15`가
+통과했다. 다음 작업은 이 **unstaged·미커밋** source 변경을 별도로 검토하는
+것이다. GitHub commit/push·package 게시·기존 원격 helper 전송·shared
+runner/domain 조작은 이 로컬 실기 요청으로 승인되지 않았다.
+
+### 사용자 요청에 따른 작업 브랜치 게시 및 공유 자원 경계 (2026-09-24 UTC)
+
+사용자가 로컬 HVF 실기 후 원격 게시와 공유 자원 작업까지 요청했다.
+게시 대상은 기존 `codex/oci-root-phase1` ref와 위 검증된 14개 파일로
+한정했다. 처음 원격 tip은
+`056760b0947917372ff0619c7bd555e0118056d4`였고 staged
+architecture guard는 source digest
+`15a9e0354654820e1778106909f5de2f05374afc9f72e4ad910d8af7b2471c15`로
+통과했다. Source commit
+`a54f1e96428ff333c9629f3dae82d1bb1a2fbea8`을 non-force
+fast-forward push했고 조회한 원격 work-branch tip도 동일하다. Commit의
+`[skip actions]`로 package 자동 실행을 막았다. 조회 시 최근 Actions
+목록에 이 SHA의 새 run은 없고, 직전 package run `35985109659`는
+`1d82d90`에서 취소된 그대로였다. 패키지 artifact/tag, `dev`, `main`,
+PR은 이 작업에서 게시·변경하지 않았다.
+
+`pieroot-server`의 `qemu:///system` domain 목록 22개만 읽었고 기존
+domain에는 조작을 하지 않았다. 전용 GitHub runner 21은 조회 시 online,
+idle였고 `PALIMPSEST_KVM_ENABLED=true`였다. `test.yml`은 `main`/`dev`
+push 또는 PR, `workflow_call`에서 native job을 실행하며 수동 dispatch는
+없다. 새 전용 domain을 만들고 published SHA에서 선택된 native proof를
+수행하는 것과 PR로 runner의 전체 gate를 트리거하는 것은 자원 및
+게시 범위가 달라, 공유 자원 변경 목적·대상을 확정하기 전까지 수행하지
+않았다. 이 source의 Linux KVM/OCI-root native 통과 증거는 아직 없다.
+
+### PR을 통한 native KVM gate 트리거 시도 (2026-09-24 UTC)
+
+사용자가 앞선 선택지 중 "PR로 native KVM gate 실행"을 확정해 PR
+[`#3`](https://github.com/openstack-afterglow/palimpsest/pull/3)을
+`codex/oci-root-phase1`→`dev`로 열었다(merge 요청 아님, native gate 트리거
+목적). 열림 직후 `mergeable_state=dirty`, `statusCheckRollup=[]`이었다.
+~45초 대기 후에도 `pull_request` event run이 없어 PR을 close→reopen했지만
+동일했다. Head SHA `61757c71f656324971466a8e102a2b7fbecbd8e1`의
+check-suites 조회에는 무관한 `claude` app 항목만 `queued`이고 GitHub
+Actions check-suite가 없다. 같은 SHA의 직전 `push` 이벤트는 `Test`,
+`Development package`, `Build and Push Palimpsest Hub` 세 workflow를 모두
+성공적으로 트리거했으므로, 이는 이 repository의 `pull_request` 트리거에
+한정된 관측된 동작이다. `actions/permissions`는 `enabled:true`,
+`allowed_actions:"all"`이고 `dev` branch protection은 없다(404). 이
+제약을 우회하려고 workflow 파일이나 repository 설정, branch protection을
+변경하지 않았다. 전용 GitHub runner `pieroot-server-palimpsest-kvm`(id 21,
+`PALIMPSEST_KVM_ENABLED=true`)은 online·idle 상태 그대로다. 이 PR로
+`dev`/`main`은 변경되지 않았고 병합도 요청하지 않았다. Linux KVM/OCI-root
+native 통과 증거는 이 시도로 추가되지 않았다.
+
+**정정 및 conflict 해소 (2026-09-24 UTC).** 위에서 "직전 push가 Test 등
+세 workflow를 모두 정상 트리거했다"고 인용한 근거는 실제로는 이 branch의
+커밋이 아니라 같은 시각 `dev`에 독립적으로 push된 무관한 SHA
+`3705880e5c03486b69ac052fd78ddad8ce799655`(아래 `ci-perf` 게시 commit)의
+실행이었다. 재확인 결과 이를 정정한다. `pull_request` 트리거가 반응하지
+않은 실제 원인은 `61757c7`/`6de46ac` 두 commit의 HEAD message에 있던
+`[skip actions]` 지시문이다. GitHub의 skip-ci 문서는 이 지시문이 `push`와
+`pull_request` 양쪽 이벤트의 workflow 실행을 모두 막는다고 명시하며, PR의
+HEAD commit일 때도 동일하게 적용된다. 문서 receipt commit에 실제 소스
+수정 commit(`a54f1e9`)과 같은 관례로 이 지시문을 붙인 것이 오류였다. PR
+#3은 `dev`와의 실제 file-level conflict(`ARCHITECTURE.md`,
+`docs/development-handoff.md`)로 `mergeable_state=dirty`이기도 했다.
+`origin/dev`를 이 branch에 non-force merge commit으로 통합해 두 conflict를
+해소했다(각 파일의 diverged 구간은 순수 추가형이라 양쪽 서술을 모두
+보존했다). 이 merge commit 메시지에는 `[skip actions]`를 넣지 않아 push와
+새 PR synchronize 이벤트가 정상적으로 `Test`(및 AGENTS.md 규칙10이 기록한
+대로 `pull_request`에서도 실행되는 `kvm` job)를 트리거하도록 했다. `dev`
+자체는 이 merge로 변경되지 않는다. Source/schema 계약은 바뀌지 않았다.
+
+**정정: 위 "저장소 전체 Actions 정지" 결론은 철회한다 (2026-09-24 UTC).**
+실제 원인은 `d88be61`/`ef9f68d` 두 commit의 본문·trailer가 skip-ci 토큰
+문자열 자체를 (그 토큰이 없다고 설명하는 부정문 안에서도) 그대로 포함했기
+때문이다. GitHub의 매칭은 문자열 존재만 보고 부정/긍정 문맥을 구분하지
+않는다. 조직 billing/webhook 장애 가설은 근거 부족으로 철회한다. 다음
+항목에서 그 토큰 문자열을 전혀 포함하지 않는 새 commit으로 재검증한다.
+
+**Native KVM gate 실제 트리거·통과 확인 (2026-09-24 UTC).** 토큰 문자열이
+전혀 없는 commit
+[`1572025a5a1368a8e53783762f2643ff9137e4ed`](https://github.com/openstack-afterglow/palimpsest/commit/1572025a5a1368a8e53783762f2643ff9137e4ed)를
+push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
+([run `36010249678`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36010249678))와
+`Build and Push Palimpsest Hub`, `push` 이벤트로 `Development package`가
+모두 시작해 세 workflow 전부 `success`로 끝났다. `Test`의 job 목록에서
+`Native KVM stage-1 proof`와 `Required native KVM proof`가 모두
+`success`이고, `stage1-native-kvm-proof` artifact(450,980B)와
+`oci-filesystem-proof` artifact(1,905B)가 이 실행에 남았다. 이는 사용자가
+선택한 "PR로 native KVM gate 실행"의 실제 성공 증거다. PR #3은 여전히
+열려 있고 병합은 요청하지 않았으며, `dev`/`main`은 변경되지 않았다.
+
+**PR 후속 로컬 검토·수정 (2026-09-24 UTC; 미게시).** PR #3의 현재 원격 HEAD `a9e7be7`은 별도 `Test` run [`36010811193`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36010811193)에서 19 job 모두 success였고, native/required KVM proof도 success였다. 같은 SHA의 Hub `36010810898`과 Development package `36010805259`도 success이며 SHA-specific prerelease가 실제로 발행됐다. 뒤의 **로컬** 수정은 이 세 run에 포함되지 않는다.
+
+독립 검토에서 CI round-3 계약의 신규 결함은 발견하지 못했다. HVF 변경의 두 readiness 경계가 지적됐다: x86 guest에서 `/dev/console`이 VGA를 가리키면 serial log가 sentinel을 잃고, 부팅 후 `/etc/cloud/cloud-init.disabled`로 cloud-init을 끄면 `cloud-init.target`의 ready unit이 재시작 때 실행되지 않는다. Hub 검토의 parent가 import에서 빠져도 child가 게시되는 경우와 PAX 경로 override 불일치는 `origin/dev`에도 있던 별도 결함이며 이번 PR 수정으로 포장하지 않는다.
+
+로컬 source는 x86_64 `/dev/ttyS0`·aarch64 `/dev/ttyAMA0`로 guest serial 출력을 선택하고, 최초 project-init 완료 marker를 남긴다. cloud-init이 명시적 disabled 파일로 꺼진 **이후** 부팅에만 marker와 disabled 파일 두 조건을 가진 별도 multi-user fallback unit이 activation 뒤 readiness를 기록한다. 기존 cloud-init.target unit과 cloud-final 순서는 유지한다. 수정 전 x86 seed는 serial sentinel이 없음을 확인했고, 수정 후 두 arch의 seed가 각 serial과 두 fallback 조건을 담는 것을 확인했다. 집중 cloud-init/runtime 70건, Ruff lint와 diff whitespace가 통과했다. 이는 generated-seed/portable proof다. 새 수정의 실제 x86 KVM 부팅 및 cloud-init-disabled 재부팅은 아직 실행하지 않았고, 앞선 원격 KVM gate 성공을 이 수정의 증거로 쓰지 않는다. GitHub 게시·PR merge·runner 설정 변경은 하지 않았다.
+
+**작업 브랜치 게시 승인 및 preflight (2026-09-24 UTC).** 사용자가 이번 일곱 파일만 `codex/oci-root-phase1`에 commit/push하고 자동 Development package prerelease 및 PR native KVM gate 결과를 확인하도록 승인했다. `dev`/`main` 병합, 추가 원격 helper 전송, runner 설정·기존 domain 조작은 승인하지 않았다. Push 전 원격 branch tip은 `a9e7be701d662eb732e1cfdab1d457b14b6bc797`이다. 집중 70건 외에 `core-cli host-runtime` 선택 2,104건, architecture guard 14건, lane manifest·Ruff lint/format·working architecture guard·diff whitespace가 통과했다. 이 문장은 **push 전** 검사 상태이며 이 뒤의 새 CI 성공 주장이 아니다.
+
+**작업 브랜치 실제 게시·검사 (2026-09-24 UTC).** 일곱 파일 commit [`071d82d0fcc1a88d0d8f5d791fa87095c13d1d81`](https://github.com/openstack-afterglow/palimpsest/commit/071d82d0fcc1a88d0d8f5d791fa87095c13d1d81)를 `codex/oci-root-phase1`에만 non-force push했고, 같은 원격 tip을 재조회했다. PR `Test` [`36014570699`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36014570699)는 19 job 모두 success이며 `Native KVM stage-1 proof`와 `Required native KVM proof`도 success다. `stage1-native-kvm-proof` artifact id `10813952706`(450,949B)와 `oci-filesystem-proof` id `10814197273`(1,905B)가 이 SHA에 남았다. Hub workflow `36014570977`의 두 job과 Development package `36014566702`의 verify/publish 두 job도 success다. Prerelease [`package-071d82d...`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-071d82d0fcc1a88d0d8f5d791fa87095c13d1d81)에 wheel·sdist·`SHA256SUMS`가 모두 uploaded 상태다. 이는 기존 stage-1 KVM matrix의 통과이지 새 cloud-image x86 부팅이나 cloud-init-disabled reboot 실기가 아니다. 조회한 `dev`는 `3705880e`, `main`은 `60fa42f` 그대로이고 PR #3은 open/unmerged다. 이 결과 기록 commit은 문서만 바꾸며, 새 자동 workflow 결과는 별도 SHA로 판정한다.
+
+### CI critical-path checkpoint (2026-09-24)
+
+기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 1·2·3차 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.
+
+**게시 상태 재확인 (2026-09-24 UTC).** 위의 미게시 문장은 당시 checkpoint다. 현재 `dev` tip `3705880e5c03486b69ac052fd78ddad8ce799655`에는 이 CI 변경과 최종 문서 정정이 들어 있으며, 작업 브랜치에는 merge commit `d88be61`을 통해 포함됐다. `main` tip은 여전히 `60fa42f`다. 이 재확인은 새 push나 PR merge가 아니다.
+
+**변경 내용**
+
+- `.github/workflows/test.yml`에서 `portable-linux`의 `max-parallel: 3`과 `portable-macos`의 `max-parallel: 2`를 제거했다. 이제 6+4 shard가 한 wave로 시작한다.
+- 다음은 바꾸지 않았다: shard 수, job id와 순서, aggregator 이름과 판정, trigger, native KVM 필수 gate.
+- `tests/unit/test_test_lanes.py`에 CI 형태 계약 두 개(3 node)를 추가했다.
+  - shard 목록 `[1..N]`, `--shard …/N` 분모, `max-parallel` 부재 또는 N 이상, `fail-fast: false`, aggregator 이름·`if: always()`·`needs`를 고정한다.
+  - gate job이 앞에 없는지와, self-hosted job이 `kvm` 하나뿐인지를 고정한다.
+  - 임시 변형 workflow 네 가지(macOS cap 2, 분모 5, shard 5개, `needs: checks`)를 모두 잡는 것을 확인했다.
+- `AGENTS.md`에 `CI 파이프라인 성능 규정` 12개를 추가했다.
+- `ARCHITECTURE.md`(Development and verification, Change guide, Maintenance)와 [testing.md](testing.md)를 갱신하고 stamp했다.
+
+**실측 기준.** 읽기 전용 `gh` 조회로 얻은 수치다.
+
+- 표본은 현재 19-job 형태의 `Test` 완료 실행 21건이다.
+- 크리티컬 패스는 중앙값 325초, p90 781초였다. burst 8건을 제외하면 303/346초다.
+- `Unit tests (macOS 15)`가 21건 중 19건에서 마지막으로 끝났다.
+- 두 번째 wave 대기: macOS 3/4·4/4가 151/170초, Linux 4–6이 91–105초.
+- KVM job은 140초 걸렸고 대기 중앙값은 142초였다.
+
+**기대 효과.** dev/PR 약 155–170초는 **추정**이다. push 후 20회 이상 재측정해야 하며, 재측정 전에는 효과로 기록하지 않는다. main push는 같은 SHA의 dev 실행과 단일 KVM runner·macOS 5개 한도를 두고 경쟁하므로 약 290초에 머물 것으로 본다.
+
+**게시 후 초기 관찰 (2026-09-24 UTC, 표본 3건).** 변경을 포함한 완료 `Test`는 확인 시점에 3건뿐이다. `dev` push `35990877737`(SHA `3705880e`)은 시작부터 마지막 job 종료까지 192초, PR `36010249678`(SHA `1572025a`)은 182초, PR `36010811193`(현재 HEAD `a9e7be7`)은 157초였다. 세 실행 모두 19개 job이 성공했고, 마지막 job 종료 시각에서 `run_started_at`을 뺐다. 마지막 두 PR의 `Native KVM stage-1 proof`와 `Required native KVM proof`도 성공했다. 현재 HEAD의 Hub workflow `36010810898`과 Development package workflow `36010805259`도 성공했고, 해당 SHA의 prerelease에 wheel·sdist·`SHA256SUMS` 세 asset이 업로드됐다. 이는 세 표본의 관찰이지 20건 기준의 중앙값·p90 효과 판정이 아니다. 표본을 만들려고 CI나 공유 KVM runner를 추가 실행하지 않는다.
+
+**실행한 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+
+- `check_architecture.py`: stamp 후 working 통과.
+- `uv sync --frozen --extra dev`, import smoke, fixture `--check`, CLI reference `--check`, `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+- `plan --changed HEAD`: core-cli와 qualification을 선택했다.
+- `build_package.py`: 통과. Python 3.11 `palimpsest --version`: `0.1.4`.
+- focused 4 파일: 132 passed.
+- `run core-cli qualification`: 1,424 passed, 7 skipped.
+- portable 6 shard를 순차 실행해 합계 6,084 node, 5,867 passed, 217 skipped, 실패 0이었다.
+- `check_filesystem_fixtures.py`: 통과.
+- Hub(`hub/`의 sync, import, ruff, format, pytest 91 passed, `uv build`): 통과.
+- `actionlint`: 기존과 같은 custom label `kvm` 경고 1건만 남았다.
+
+**실행하지 않은 검사**
+
+- Docker가 필요한 gate: BuildKit named OCI context, guest stage-1 binary, workload proof ELF 재현, Hub Docker image build. 이후 별도로 순차 실행할 예정이다.
+- 권한이 필요한 OCI filesystem proof, native KVM, GitHub 실행.
+
+**독립 검토 1차(2026-09-24).** `2e37538`에 대한 독립 검토가 medium 2건과 low 7건을 지적했다. 후속 commit `fix: address CI review round 1`에서 모두 반영했다. 반영분에 대한 재검토는 아래 독립 검토 2차다.
+
+- **KVM runner 노출 근거 정정(medium).** 처음에 "공개 PR 코드가 KVM runner에서 실행됐다"고 인용한 run 세 건은 모두 같은 저장소 branch에서 온 PR 실행이었다(`35600862976`은 `dev`, `35600812317`·`35029001178`은 `codex/oci-root-phase1`; `head_repository = openstack-afterglow/palimpsest`). 2026-09-24 읽기 전용 조회에서 API가 나열한 `pull_request` 실행 22건 중 fork에서 온 실행은 없었다. 위험은 잠재적이다. 이 절 아래의 승인 대기 1을 그렇게 고쳐 적었다.
+- **aggregator 판정 계약(medium).** 처음 계약은 aggregator의 이름·`if: always()`·`needs` 포함 여부만 봤다. 그래서 verdict를 `true`로 바꾸거나 KVM skip을 받는 변형이 통과했다. 이제 다음을 고정한다.
+  - 정확한 `needs`
+  - 단일 verdict step의 `env`와 성공만 받는 `run` 문자열
+  - `shell`·`defaults`·`continue-on-error`의 부재
+  - aggregator 밖 job-level `if:`가 `kvm`의 변수 조건뿐인지
+- **runner 판정(low).** `runs-on`의 mapping(`group`·`labels`) 형태까지 정규화한다. 범위를 모든 workflow로 넓히고 allowlist를 `test.yml`의 `kvm`과 `release.yml`의 `kvm-proof`로 두었다. `release.yml`이 `v*` tag push 전용인지도 고정한다.
+- **규정 문구(low).** 다섯 가지를 고쳤다.
+  - AGENTS.md 규칙 10을 `Test` workflow 범위로 한정했다.
+  - runner group 제한은 저장소 수준 runner에는 쓸 수 없다고 적었다. `pieroot-server-palimpsest-kvm`은 저장소 수준 runner이고, org plan은 `free`이며, runner-group API는 403이었다.
+  - 규칙 8의 PR diff를 merge-base(세 점) 기준으로 바꿨다.
+  - 규칙 5의 wrapper 문장을 고쳤다.
+  - 규칙 12의 node 수 기준에 출처를 붙였다.
+- **node 수 기준.** 6,081은 `60fa42f`의 CI run `35826465548`에서 "Lane shard" 줄의 선택 node를 더한 값이다. Linux 6 shard와 macOS 4 shard의 합계가 같으며, pass 수가 아니다. 6,084는 `2e37538`의 로컬 순차 6 shard 합계이고, 계약 3 node를 더한 값이다.
+- **변형 검사.** 임시 workflow 변형 14가지를 새 계약이 모두 잡았고, 끝난 뒤 `.github/`를 원복했다. 변형은 다음과 같다.
+  - `pure`·`unit-macos` verdict를 `true`로 바꾸기, `pure`에 `|| true` 붙이기
+  - KVM verdict를 `!= "failure"`로 바꾸기
+  - `pure`의 `needs`에서 `checks` 빼기
+  - KVM step에 `shell: bash {0}` 넣기, KVM env에서 `PALIMPSEST_KVM_ENABLED` 빼기, workflow `defaults.run.shell` 넣기
+  - `portable-linux`에 `continue-on-error`나 job-level `if:` 넣기
+  - `runs-on: {group: kvm-group}`, `runs-on: kvm`, 다른 workflow에 self-hosted job 넣기
+  - `release.yml`에 `pull_request` trigger 넣기
+- **반영 뒤 검사.** 모두 local macOS에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 136 passed.
+  - `run core-cli qualification`: 1,435 node, 1,428 passed, 7 skipped.
+  - portable `--collect-only`: 6,088 node.
+  - `actionlint`(`test.yml`, `release.yml`): 기존 custom label `kvm` 경고 2건만 있었다. workflow 파일은 바꾸지 않았다.
+  - 전체 portable 6 shard는 다시 실행하지 않았다. 바뀐 test 파일은 `core-cli` lane 하나뿐이다.
+
+**독립 검토 2차(2026-09-24).** round 1 반영분에 대한 재검토가 medium 1건과 low 8건을 지적했다. 후속 commit `fix: address CI review round 2`에서 반영했으며, 반영분에 대한 재검토는 아직 받지 않았다. workflow 파일은 바꾸지 않았다.
+
+- **shard 실행 계약(medium).** round 1 계약은 matrix의 `shard` 목록·`fail-fast`·`max-parallel`과 shard 명령 문자열만 봤다. 그래서 다음 변형이 모두 통과했고 aggregator는 green이었다.
+  - `exclude: [{shard: 6}]`
+  - macOS shard step의 `if: github.event_name == 'push'`
+  - step `shell: "true {0}"`, job `defaults.run.shell: "true {0}"`
+  - job·workflow `env: PYTEST_ADDOPTS: --collect-only`
+  - `checks` step의 `if`
+
+  이제 다음을 고정한다.
+  - portable matrix job 두 개의 job key·runner·`matrix`와 step 목록 전체
+  - `test.yml`의 workflow-level `env` 부재
+  - aggregator가 읽는 의존 job(`checks`, portable 두 개, `kvm`)의 job key 집합
+  - `test.yml` 전체 step의 `shell`·`continue-on-error` 부재와 `always()` 외 step `if` 부재
+
+  `kvm` upload의 `if: always()`는 step을 건너뛰지 않으므로 허용한다. `kvm` proof step의 `if: false`는 잡는다.
+- **hosted label(low).** prefix 정규식을 정확한 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)으로 바꿨다. `runs-on: ubuntu-kvm`을 잡는다.
+- **`test.yml` trigger(low).** `workflow_call`, `main`·`dev` push·`pull_request`를 정확히 고정한다. `pull_request_target` 추가를 잡는다.
+- **reusable caller(low).** `uses:` job은 `KeyError` 대신 명시적 assertion으로 거부한다. `test.yml` 호출자는 self-hosted `kvm` job을 물려받기 때문이다.
+- **규정 문구(low).** AGENTS.md의 다섯 곳을 고쳤다.
+  - 규칙 10: 승인 대기 항목을 절 이름으로 가리키게 했다. 이 절의 승인 대기 1에도 같은 수정을 했다.
+  - 규칙 9: 건너뛰기 조건에 "head branch의 push `Test`가 같은 tree를 이미 테스트했다"를 더했다. 지금은 `main`·`dev`만 해당한다.
+  - 규칙 5: CI는 "Lane shard" 수를 출력만 한다는 점을 밝혔다. 실행 중 실패로 처리되는 경우는 exit 5·2·4다. shard별 수와 합계는 계약으로 보장하며, 이 점이 정본 규칙 5와 다르다.
+  - 규칙 8: 두 점 diff 금지와 merge ref의 `HEAD^1..HEAD` 허용이 정본 규칙 8을 의도적으로 구체화한 것이라고 밝혔다.
+  - 규칙 2: 같은 event의 hosted job 수를 적었다. `Test` 시작 시점 15개(총 18개)에 `hub-docker` `test`와 `development-package` `verify`를 더해 push 17개, PR 16개다. workflow 정의로 센 값이며 실측이 아니다.
+- **변형 검사.** 임시 복사본에서 workflow 변형 41가지를 돌렸다. 대상 파일은 `test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`이고, 변형 전 baseline 123 passed를 먼저 확인했다.
+  - 39가지를 잡았다(pytest exit 1). 재검토 목록 17가지와 추가 변형이다. 추가 변형은 `$GITHUB_ENV` step, checkout `ref: main`, step `env`·`continue-on-error`, `checks`·`kvm`의 job-level `env`·`defaults`, matrix `include`, macOS job의 `ubuntu-latest`, job-level `if`·`continue-on-error`, `hub` step의 `shell`·`continue-on-error`, `if: failure()`, 분모 5, wrapper 명령, push branch 추가, `runs-on` 누락, 다른 workflow의 self-hosted job, `release.yml` `pull_request`, `pure` verdict `true`다.
+  - 의도한 잔여 공백 2가지는 잡지 않았다. `hub` step의 `env: PYTEST_ADDOPTS`와 `checks`의 `$GITHUB_ENV` step이다. 비-matrix job의 step 내용은 고정하지 않으며, 이를 AGENTS.md 규칙 11과 [testing.md](testing.md)에 적었다.
+- **반영 뒤 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 137 passed.
+  - `run core-cli qualification`: 1,436 node, 1,429 passed, 7 skipped.
+  - portable 6 shard를 순차 실행했다. 합계 6,089 node(1,045·954·1,052·997·1,019·1,022), 5,872 passed, 217 skipped, 실패 0이었다. portable `--collect-only`도 6,089 node다.
+  - `actionlint`(workflow 다섯 개): 기존 custom label `kvm` 경고 2건(`test.yml`, `release.yml`)만 있었다.
+  - Docker·권한이 필요한 gate와 GitHub 실행은 이번에도 하지 않았다.
+
+**독립 검토 3차(2026-09-24).** round 2 반영분에 대한 재검토가 medium 1건과 low 4건을 지적했다. 후속 commit `fix: address CI review round 3`에서 반영했으며, 반영분에 대한 재검토는 아직 받지 않았다. workflow 파일은 바꾸지 않았다. 같은 때 정본 규칙 3과 10의 해석이 명확해졌다.
+
+- **규칙 10 통제 모델(medium, 문서만).** 이전 문구는 YAML `if:`가 "통제 수단이 아니"라고 했다. 그리고 runner group 저장소 제한과 `all_external_contributors`가 함께 갖춰지면 충분한 것처럼 읽혔다. 둘 다 정본 규칙 10과 다르다. 이제 AGENTS.md 규칙 10은 두 층으로 적는다.
+  - YAML event gate가 `pull_request` 실행을 runner에서 떼어 놓는다. 설정은 그 gate를 지우는 PR에 대한 backstop이다.
+  - 두 설정을 모두 갖춰도 같은 저장소 branch PR, Dependabot PR, 승인된 fork PR은 막지 못한다고 밝혔다.
+  - gate, `kvm` `if` 계약 고정, "skip을 통과로 받지 않는다" 조항이 서로 충돌한다는 점을 적었다. 해소는 아래 승인 대기 1에 넣었다.
+  - `release.yml` `kvm-proof`가 받는 workflow-level `contents: write`·`id-token: write`의 노출을 적었다.
+  - 설정 위치를 적었다. 저장소 수준 runner라 runner group이 없으므로, 설정 층은 소유자 작업이다.
+  - 같은 문구를 이 절 승인 대기 1, `명시적 승인 대기 — 실행 금지` 절 2번, `ARCHITECTURE.md`, [testing.md](testing.md), 계약 test 주석에서도 고쳤다.
+- **job 형태·token 계약(low).** 이전 계약은 aggregator가 읽는 job의 key 집합만 고정했다. 그래서 `hub`·`guest-stage1-binary`의 `defaults.run.shell: "true {0}"`, `hub`의 job-level `env: PYTEST_ADDOPTS`, `permissions: write-all`이 통과했다. 새 계약 `test_ci_test_workflow_jobs_and_token_are_pinned`가 다음을 고정한다.
+  - `test.yml` 11개 job 전체의 key 집합과 job id 집합
+  - `hub`의 `defaults` 값 `{run: {working-directory: hub}}`
+  - top-level key 집합(`name`·`on`·`permissions`·`jobs`)과 `permissions == {contents: read}`
+- **발행 게이팅 문구(low).** AGENTS.md 규칙 3을 명확해진 정본에 맞췄다. 발행(push)과 배포만 `Test` 전체 결과로 게이팅한다. 아무것도 발행하지 않는 PR 검증 build는 병렬로 돌려도 되며, `hub-docker`의 PR build가 여기에 해당한다. 기존 예외 세 가지를 적었다. `hub-docker` push·tag·dispatch의 `build-and-push`, `development-package` `publish`, `release` `publish`·`github-release`다. 아래 승인 대기 3에 넣었다.
+- **규칙 5 차이(low, 문서만).** 계약이 막는 것은 wrapper가 `--shard`를 빠뜨리는 경우뿐이라고 좁혀 적었다. workflow 밖 무력화의 실측을 기록했다. `PYTEST_ADDOPTS=--collect-only`로 `run portable --shard 1/256`을 실행하니 "Lane shard" 줄에 selected 24 node를 출력하고 한 건도 실행하지 않은 채 exit 0이었다. 실행 중 검사는 plugin 동작을 바꾸므로 추가하지 않았다. 아래 승인 대기 4에 넣었다.
+- **특권 trigger(low).** 새 계약 `test_ci_no_workflow_uses_a_privileged_pull_request_trigger`가 모든 workflow에서 `pull_request_target`·`workflow_run`을 거부한다. 허용 목록은 비어 있다. `on`의 문자열·목록·mapping 형태와 따옴표 친 `"on"` key를 모두 읽는다.
+- **변형 검사.** 임시 복사본에서 변형 18가지를 돌렸다. 대상 파일은 `test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`이고, 변형 전 baseline 125 passed를 먼저 확인했다.
+  - 16가지를 잡았다(pytest exit 1). 재검토 목록의 4가지(`hub`·`guest-stage1-binary` `defaults.run.shell`, `hub` job `env`, `permissions: write-all`)가 들어 있다. 추가로 잡은 변형은 다음과 같다.
+    - workflow `contents: write`, `kvm` job-level `permissions`
+    - `oci-fs-proof` job `continue-on-error`, `local-oci-build` job `env`
+    - workflow `concurrency`, 표에 없는 새 job
+    - `kvm` event gate. 규칙 10 충돌을 확인하는 변형이다.
+    - 새 `pull_request_target` workflow(hosted, PR head checkout), 새 `workflow_run` workflow
+    - 따옴표 친 `"on": pull_request_target`, 목록 형태 `on: [push, pull_request_target]`
+    - `hub-docker.yml` trigger에 `pull_request_target` 추가
+  - 의도한 잔여 공백 2가지는 잡지 않았다. `hub` step의 `env: PYTEST_ADDOPTS`와 `checks`의 `$GITHUB_ENV` step이다.
+  - 새 파일 변형은 끝날 때마다 지웠다. 끝난 뒤 복사본의 `.github/`가 worktree와 같은지 `diff -r`로 확인했다.
+- **반영 뒤 검사.** 모두 local macOS, Python 3.12에서 실행했다.
+  - `ruff check .`, `ruff format --check .`(351 files), `test_lanes.py list --check`: 통과.
+  - focused 4 파일(`test_test_lanes.py`, `test_oci_convert_security.py`, `test_development_package_workflow.py`, `test_architecture_guard.py`): 139 passed.
+  - `run core-cli qualification`: 1,438 node, 1,431 passed, 7 skipped.
+  - portable `--collect-only`: 6,091 node. 바뀐 test 파일은 `core-cli` lane 하나뿐이라 portable 6 shard는 다시 실행하지 않았다.
+  - `actionlint`(workflow 다섯 개): 기존 custom label `kvm` 경고 2건(`test.yml`, `release.yml`)만 있었다.
+  - Docker·권한이 필요한 gate와 GitHub 실행은 이번에도 하지 않았다.
+
+**최종 검토(2026-09-24).** round 3 반영분에 대한 최종 검토가 medium 1건(문서만)을 지적했다. AGENTS.md 규칙 11은 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었다. 실제 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `verify`는 SHA별 prerelease를 만드는 `publish`의 유일한 gate다.
+
+- 임시 복사본에서 변형 9가지를 돌렸다. `verify` step `continue-on-error`·`if: false`·`shell: 'true {0}'`, `verify` job `continue-on-error`, checksum step `continue-on-error`·`if: false`, `publish` job `if: always()`, 명령 `echo` 감싸기, `verify` `if`의 `|| true`다. 모두 세 CI 계약 파일(`test_development_package_workflow.py`, `test_test_lanes.py`, `test_oci_convert_security.py`)의 125건을 통과했다.
+- 규칙 11을 검사 항목과 고정하지 않는 항목으로 고쳐 적었다. 계약은 확장하지 않았으므로 workflow·계약·portable node 수(6,091)는 그대로다. 공백을 막으려면 `verify`·`publish`의 job key와 step 목록을 `test_test_lanes.py`의 portable matrix처럼 정확히 고정하는 계약을 따로 추가해야 한다.
+
+**승인 대기·소유자 결정.** 구현하지 않았고 설정도 바꾸지 않았다.
+
+1. self-hosted KVM runner `pieroot-server-palimpsest-kvm`의 노출이다. 이 문서 `명시적 승인 대기 — 실행 금지` 절의 2번과 같은 항목이다.
+   - 현재 상태: 위에 인용한 run 세 건은 모두 같은 저장소의 trusted branch에서 온 PR 실행이다. 그러나 `kvm` job에는 event gate가 없어 모든 `pull_request` 실행이 이 persistent runner에서 돈다. 승인 정책이 `first_time_contributors`이므로, 이전에 merge된 기여가 있는 외부 contributor의 fork PR도 승인 없이 실행될 수 있다.
+   - 통제는 두 층이다(AGENTS.md 규칙 10). YAML event gate가 `pull_request` 실행을 막고, 설정은 그 gate를 지우는 PR에 대한 backstop이다. 설정만으로는 부족하다. `all_external_contributors`와 runner group 저장소 제한을 모두 갖춰도 같은 저장소 branch PR, Dependabot PR, 승인된 fork PR은 여전히 이 runner에서 실행된다.
+   - 충돌: YAML gate를 넣으면 PR에서 `kvm`이 skip되고, `Required native KVM proof`가 모든 PR에서 red가 된다. AGENTS.md 규칙 10의 "skip을 통과로 받지 않는다" 조항과 `test_ci_test_jobs_start_without_a_gate_job_in_front`의 정확한 `kvm` `if` 고정도 gate 추가를 막는다.
+   - 결정할 것 (a): 충돌 해소 방안. 예를 들어 KVM proof를 push 전용(`github.event_name != 'pull_request'`)으로 두고, PR에서 `Required native KVM proof`가 무엇을 뜻할지 정한다. PR에서만 event 조건으로 skip을 받게 하거나, PR의 required check에서 빼는 방법이 있다. 결정되면 gate, aggregator verdict, 계약, 규정을 한 변경에서 바꾼다.
+   - 결정할 것 (b): 설정 backstop. fork PR 승인은 저장소 `Settings` → `Actions` → `General`의 `Approval for running fork pull request workflows from contributors`에서 `Require approval for all external contributors`를 고른다. runner group 제한은 저장소 수준 runner에는 없으므로 org 수준 재등록이 먼저다. Free plan에서 그 제한을 쓸 수 있는지는 확인하지 않았다.
+   - 결정할 것 (c): 두 층이 갖춰지기 전의 조치. PR의 workflow 수정까지 포함해 노출을 확실히 없애는 방법은 runner stop·unregister뿐이다.
+   - `release.yml` `kvm-proof`는 같은 runner에서 workflow-level `contents: write`·`id-token: write`를 받는다. 앞선 PR 실행이 runner에 남긴 state를 release 실행이 쓰면, PR 코드가 그 token에 닿을 수 있다.
+2. 같은 SHA를 dev와 main에 3–6초 간격으로 push하는 문제다. 현재 형태 push 실행 14건 중 7건이 이 경우였고, 매번 KVM 대기 142–144초가 생겼다. dev가 green이 된 뒤 main을 fast-forward하는 방식 등으로 줄일 수 있다.
+3. 정본 규칙 3의 기존 예외다. 다음 세 발행 경로는 `Test` 전체 결과를 기다리지 않는다.
+   - `hub-docker.yml` `build-and-push`: `main`·`dev` push, `v*` tag push, `workflow_dispatch`에서 GHCR에 push한다. 자체 `Hub Unit Tests`에만 건다.
+   - `development-package.yml` `publish`: SHA별 GitHub prerelease를 만든다. 자체 `verify`에만 건다. `verify`가 실행하는 테스트는 `core-cli`·`qualification` lane과 development-package 계약뿐이다.
+   - `release.yml` `publish`·`github-release`: 자체 `verify`와 `kvm-proof`에만 건다. macOS shard와 portable 전체는 실행하지 않는다.
+   - `hub-docker`의 PR build는 아무것도 발행하지 않으므로 규칙을 지킨다. 세 경로 모두 테스트 크리티컬 패스 밖에 있고, 바꾸면 발행 의미가 달라진다.
+4. 정본 규칙 5와의 차이다. CI는 shard별 실행 수를 검사하지 않는다. 계약은 wrapper가 `--shard`를 빠뜨리는 경우만 막고, `pyproject.toml` `addopts`나 conftest hook 같은 workflow 밖 무력화는 막지 않는다. 위 3차 기록의 `--collect-only` 실측이 그 예다. 결정할 것은 둘 중 하나다. 실행된 수를 selected 수와 대조하는 실행 중 검사를 `scripts/test_lanes.py` plugin에 추가하거나, 이 차이를 받아들인다.
+5. 다음 항목은 근거 부족이나 순이득 부족으로 보류했다.
+   - pytest-xdist 도입: hermeticity가 미증명이고 "Lane shard" 증거 줄이 사라진다.
+   - PR/push tree dedup: pre-job 비용이 절감보다 크다.
+   - `hub-docker` 게이팅 변경은 3번으로 옮겼다.
+
+**다음 작업**
+
+1. CI round-3 독립 재검토에서 신규 결함을 찾지 않았고, readiness 보정 commit `071d82d`의 작업 브랜치 push 및 정확한 SHA의 native KVM gate·Hub·Development package success를 위에 기록했다. 아래의 문서 영수증 자체가 새 HEAD가 되면 그 SHA의 CI 결과도 별도로 확인한다.
+2. 변경을 포함한 완료 `Test` 표본은 source push 직후 4건이다. 자연스럽게 20회 이상 쌓인 뒤에만 크리티컬 패스 중앙값·p90을 재측정하고 이 절과 AGENTS.md 기준을 갱신한다. 표본을 만들기 위한 강제 workflow 실행은 하지 않는다.
+3. self-hosted KVM runner 노출, dev/main 중복 push, 발행 gate 예외, shard 실행 수 검사에 대한 소유자 결정(위 승인 대기 1–4)을 받는다.
+4. 승인된 작업 브랜치 게시 외에 PR merge 및 x86 KVM/cloud-init-disabled reboot 실기는 각각 대상·자원을 정한 별도 명시적 승인 뒤에 진행한다.
 
 ## 빠른 링크 맵
 

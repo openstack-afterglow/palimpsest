@@ -38,10 +38,12 @@ from palimpsest_hub.models import (
 )
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
+    ANNOTATION_CONFIG_DIGEST,
     BundleError,
     BundleLayer,
     BundleLimitError,
     ParsedBundle,
+    _scan_members,
     build_manifest,
     extract_blob,
     iter_bundle_tar,
@@ -299,6 +301,69 @@ def test_parse_bundle_rejects_annotated_config_parent_that_contradicts_manifest_
         parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
 
 
+def test_parse_bundle_rejects_leaf_config_that_disagrees_with_annotation(tmp_path: Path):
+    payload = b"layer bytes"
+    annotated = b'{"name":"annotated"}'
+    leaf = b'{"name":"manifest"}'
+    manifest = {
+        "layers": [
+            {
+                "digest": _sha256(payload),
+                "size": len(payload),
+                "annotations": {ANNOTATION_CONFIG_DIGEST: _sha256(annotated)},
+            }
+        ],
+        "config": {"digest": _sha256(leaf), "size": len(leaf)},
+    }
+    manifest_bytes = json.dumps(manifest).encode()
+    index_bytes = json.dumps({"manifests": [{"digest": _sha256(manifest_bytes), "size": len(manifest_bytes)}]}).encode()
+    bundle_path = tmp_path / "contradictory-leaf.tar"
+    with tarfile.open(bundle_path, mode="w") as archive:
+        for name, data in (
+            ("index.json", index_bytes),
+            (f"blobs/sha256/{_sha256(manifest_bytes)[7:]}", manifest_bytes),
+            (f"blobs/sha256/{_sha256(annotated)[7:]}", annotated),
+            (f"blobs/sha256/{_sha256(leaf)[7:]}", leaf),
+            (f"blobs/sha256/{_sha256(payload)[7:]}", payload),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+
+    with pytest.raises(BundleError, match="leaf config.*모순"):
+        parse_bundle(bundle_path, max_blob_bytes=1024, max_expanded_bytes=32 * 1024)
+
+
+def test_parse_bundle_deduplicates_consistent_shared_parent(store: LocalPathBlobStore, tmp_path: Path):
+    chain = _chain(store)
+    bundle_path = tmp_path / "shared-parent.tar"
+    bundle_path.write_bytes(b"".join(iter_bundle_tar(store, [chain, chain[:2]])))
+
+    parsed = parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+
+    assert [entry["blob_digest"] for entry in parsed.layers] == [layer.blob_digest for layer in chain]
+
+
+@pytest.mark.parametrize("conflict", ["media_type", "config"])
+def test_parse_bundle_rejects_conflicting_descriptors_for_shared_blob(
+    store: LocalPathBlobStore, tmp_path: Path, conflict: str
+):
+    chain = _chain(store)
+    root = chain[0]
+    duplicate = BundleLayer(
+        blob_digest=root.blob_digest,
+        size_bytes=root.size_bytes,
+        name=root.name,
+        config={"name": "different"} if conflict == "config" else root.config,
+        media_type=MEDIA_TYPE_IMAGE_QCOW2 if conflict == "media_type" else root.media_type,
+    )
+    bundle_path = tmp_path / "contradictory-shared-blob.tar"
+    bundle_path.write_bytes(b"".join(iter_bundle_tar(store, [chain, [duplicate]])))
+
+    with pytest.raises(BundleError, match="모순"):
+        parse_bundle(bundle_path, max_blob_bytes=1024 * 1024, max_expanded_bytes=1024 * 1024)
+
+
 @pytest.mark.asyncio
 async def test_bundle_digest_mismatch_rejects_before_cas_publication(
     store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
@@ -458,6 +523,40 @@ def test_physical_scan_bounds_oversized_pax_payload_before_tarfile_reads_it(tmp_
         parse_bundle(bundle_path, max_blob_bytes=8 * 1024 * 1024, max_expanded_bytes=8 * 1024 * 1024)
 
 
+def test_pax_size_override_round_trips_bounded_member(tmp_path: Path):
+    payload = b"payload"
+    info = tarfile.TarInfo("index.json")
+    info.size = 0
+    info.pax_headers = {"size": str(len(payload))}
+    bundle = tmp_path / "pax-size.tar"
+    bundle.write_bytes(info.tobuf(format=tarfile.PAX_FORMAT) + payload + b"\0" * (512 - len(payload)) + b"\0" * 1024)
+
+    destination = tmp_path / "extracted"
+    extract_blob(bundle, "index.json", destination, expected_size=len(payload), max_blob_bytes=1024)
+    assert destination.read_bytes() == payload
+
+
+def test_pax_export_size_over_eight_gib_scans_sparse_tar(tmp_path: Path):
+    size = (1 << 33) + 1
+    name = "blobs/sha256/" + "a" * 64
+    info = tarfile.TarInfo(name)
+    info.size = size
+    header = info.tobuf(format=tarfile.PAX_FORMAT)
+    assert header[156:157] == b"x"
+    assert header[-512 + 124 : -512 + 136].strip(b"\0 ") == b"00000000000"
+    bundle = tmp_path / "sparse-pax.tar"
+    with bundle.open("wb") as output:
+        output.write(header)
+        output.seek(len(header) + size + (-size % 512))
+        output.write(b"\0" * 1024)
+
+    with pytest.raises(BundleLimitError):
+        _scan_members(bundle, max_member_bytes=size - 1, max_expanded_bytes=size + 1024)
+    members = _scan_members(bundle, max_member_bytes=size, max_expanded_bytes=size + 1024)
+    assert members[name].size_bytes == size
+    assert members[name].data_offset == len(header)
+
+
 def test_parse_bundle_requires_a_materialized_multilayer_tar(store: LocalPathBlobStore, tmp_path: Path):
     chain = _chain(store)
     compressed = tmp_path / "bundle.tar.gz"
@@ -553,6 +652,26 @@ def _gzip_bundle(store: LocalPathBlobStore, chain: list[BundleLayer]) -> bytes:
         for chunk in iter_bundle_tar(store, [chain]):
             compressed.write(chunk)
     return raw.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_import_rejects_conflicting_shared_descriptor_without_publishing(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    destination = LocalPathBlobStore(tmp_path / "destination")
+    chain = _chain(store)
+    root = chain[0]
+    duplicate = BundleLayer(root.blob_digest, root.size_bytes, root.name, {"name": "different"})
+    payload = b"".join(iter_bundle_tar(store, [chain, [duplicate]]))
+    engine, factory = await _prepared_hub(tmp_path, "conflict.sqlite", destination, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 422, response.text
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+        assert not destination.exists(root.blob_digest)
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
