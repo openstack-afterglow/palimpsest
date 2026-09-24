@@ -1965,6 +1965,31 @@ Ruff lint/format, working-tree architecture guard
 것이다. GitHub commit/push·package 게시·기존 원격 helper 전송·shared
 runner/domain 조작은 이 로컬 실기 요청으로 승인되지 않았다.
 
+### 사용자 요청에 따른 작업 브랜치 게시 및 공유 자원 경계 (2026-09-24 UTC)
+
+사용자가 로컬 HVF 실기 후 원격 게시와 공유 자원 작업까지 요청했다.
+게시 대상은 기존 `codex/oci-root-phase1` ref와 위 검증된 14개 파일로
+한정했다. 처음 원격 tip은
+`056760b0947917372ff0619c7bd555e0118056d4`였고 staged
+architecture guard는 source digest
+`15a9e0354654820e1778106909f5de2f05374afc9f72e4ad910d8af7b2471c15`로
+통과했다. Source commit
+`a54f1e96428ff333c9629f3dae82d1bb1a2fbea8`을 non-force
+fast-forward push했고 조회한 원격 work-branch tip도 동일하다. Commit의
+`[skip actions]`로 package 자동 실행을 막았다. 조회 시 최근 Actions
+목록에 이 SHA의 새 run은 없고, 직전 package run `35985109659`는
+`1d82d90`에서 취소된 그대로였다. 패키지 artifact/tag, `dev`, `main`,
+PR은 이 작업에서 게시·변경하지 않았다.
+
+`pieroot-server`의 `qemu:///system` domain 목록 22개만 읽었고 기존
+domain에는 조작을 하지 않았다. 전용 GitHub runner 21은 조회 시 online,
+idle였고 `PALIMPSEST_KVM_ENABLED=true`였다. `test.yml`은 `main`/`dev`
+push 또는 PR, `workflow_call`에서 native job을 실행하며 수동 dispatch는
+없다. 새 전용 domain을 만들고 published SHA에서 선택된 native proof를
+수행하는 것과 PR로 runner의 전체 gate를 트리거하는 것은 자원 및
+게시 범위가 달라, 공유 자원 변경 목적·대상을 확정하기 전까지 수행하지
+않았다. 이 source의 Linux KVM/OCI-root native 통과 증거는 아직 없다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |

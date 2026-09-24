@@ -902,13 +902,22 @@ systemd ordering cycle을 각각 재현하고 source에서 수정했다. 새 이
 OCI-root, SquashFS layers, build 및 project 전체 동작의 실기 증거는 아니다.
 GitHub/ref·공유 runner/domain·원격 helper에는 접근하지 않았다.
 
+2026-09-24 UTC, 사용자가 로컬 HVF 수정의 원격 게시 및 공유 자원 작업을
+요청했다. 위 source만 `a54f1e96428ff333c9629f3dae82d1bb1a2fbea8`로
+`codex/oci-root-phase1`에 non-force fast-forward 게시하고 원격 ref를
+대조했다. `[skip actions]`로 SHA-specific package workflow는 시작하지
+않았다. 이 docs-only receipt는 runtime·schema·architecture 계약을 변경하지
+않는다. `dev`·`main`·PR 및 공유 runner/domain 설정은 변경하지 않았고,
+공유 KVM host의 기존 domain 22개는 이름만 읽었다. Linux KVM/OCI-root
+native 성공 증거는 여전히 추가되지 않았다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
   "source_sha256": "15a9e0354654820e1778106909f5de2f05374afc9f72e4ad910d8af7b2471c15",
-  "reviewed_at": "2026-09-24T11:50:51Z",
-  "summary": "Reviewed local macOS aarch64 conventional libvirt-HVF boot, SSH, stop, restart and removal. Fixed GICv3, MMIO NIC, owned EFI cleanup, console readiness and cycle-free reboot unit. Ubuntu base only; no Linux KVM, OCI-root, layers, build or project native proof; no remote mutations."
+  "reviewed_at": "2026-09-24T12:47:00Z",
+  "summary": "Reviewed docs-only receipt for the non-force codex/oci-root-phase1 publication of the macOS HVF fix at a54f1e96428ff333c9629f3dae82d1bb1a2fbea8. Source and architecture contracts unchanged; no package run, PR, dev/main mutation or shared domain/runner mutation; Linux KVM and OCI-root native proof remain outstanding."
 }
 ```
 <!-- architecture-review:end -->
