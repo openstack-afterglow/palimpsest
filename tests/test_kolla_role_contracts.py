@@ -63,6 +63,33 @@ def test_api_and_worker_ports_commands_and_health_path():
     assert "/v1/health" in services["palimpsest-hub-api"]["healthcheck"]["test"][3]
 
 
+def test_container_env_values_are_explicitly_stringified():
+    """community.docker.docker_container rejects non-string env values.
+
+    Ansible renders Jinja with native types, so an env expression that yields a
+    bool/int (``| bool``, ``not …``, an integer default) reaches the module as a
+    non-string and deploy fails with "Non-string value found for env option".
+    Every such expression in the service definitions and the bootstrap task must
+    end in ``| string``. Plain variable references are passed through as-is.
+    """
+    bootstrap_env = next(
+        task["community.docker.docker_container"]["env"]
+        for task in yaml.safe_load(bootstrap_text)
+        if "community.docker.docker_container" in task
+    )
+    env_maps = {
+        "bootstrap": bootstrap_env,
+        **{name: svc["environment"] for name, svc in defaults_yaml["palimpsest_services"].items()},
+    }
+    non_string_expression = re.compile(r"\| *bool\b|\bnot\b|_bytes|_operations|_port\b")
+    for owner, mapping in env_maps.items():
+        for key, template in mapping.items():
+            if non_string_expression.search(template):
+                assert re.search(r"\| *string *\}\}\s*$", template), (
+                    f"{owner}.{key} = {template!r} must end with '| string' for docker_container env"
+                )
+
+
 def test_redis_db_index_pinned_to_nine_and_hub_volume_paths():
     assert defaults_yaml["palimpsest_redis_db_index"] == 9
     assert defaults_yaml["palimpsest_hub_volume"] == "palimpsest_hub"

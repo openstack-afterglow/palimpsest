@@ -1036,9 +1036,9 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "00a5bccfaa6817d8198fbd860ec61d11a4933f9eed5e6c88153e852bfbc4dca8",
-  "reviewed_at": "2026-09-24T16:46:41Z",
-  "summary": "Reviewed 0.2.0 root and Hub manifests, locks and packaged Kolla image default with no service structure change. Staged snapshot intentionally excludes the unrelated preserved Git recovery pointer; native conventional-cloud proof remains separate."
+  "source_sha256": "172e6b44a7bda217d41c10233afc0edb3653331d68d728fe045f67023d529a12",
+  "reviewed_at": "2026-09-24T23:31:59Z",
+  "summary": "0.2.1: Kolla role SSL_VERIFY env now renders as a string for docker_container in API/worker/bootstrap; regression contract added. No runtime or Hub change."
 }
 ```
 <!-- architecture-review:end -->
