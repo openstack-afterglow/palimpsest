@@ -2032,24 +2032,12 @@ HEAD commit일 때도 동일하게 적용된다. 문서 receipt commit에 실제
 대로 `pull_request`에서도 실행되는 `kvm` job)를 트리거하도록 했다. `dev`
 자체는 이 merge로 변경되지 않는다. Source/schema 계약은 바뀌지 않았다.
 
-**후속 확인: gate 미트리거의 실제 원인은 다르다 (2026-09-24 UTC).** skip
-지시문 제거와 conflict 해소 뒤에도 `pull_request`는 반응하지 않았다. PR
-#3은 merge 뒤 `mergeable_state=CLEAN`이었고 merge commit `d88be61`에는
-`[skip actions]`가 없었지만, push와 PR synchronize 각각 60초 이상 대기
-후에도 `Test` check-suite가 생성되지 않았다(`claude` app만 `queued`).
-결정적 증거는 `codex/oci-root-phase1`의 push 목록에 명시적으로 포함된
-`development-package.yml`도 이 **skip 없는** push에 반응하지 않았다는
-점이다. `event=pull_request` 조회와 저장소 전체 최근 run 조회 모두
-`2026-09-24T11:04:18Z`(무관한 `dev` push) 이후 **어떤 이벤트로도 새
-workflow run이 없음**을 보였다. 즉 skip 지시문이나 `pull_request` 트리거
-자체가 원인이 아니라, 그 시각 이후 이 저장소의 Actions 실행이 이벤트
-종류와 무관하게 멈춘 것으로 관측된다. billing/spending limit, org 수준
-정지, webhook 장애 중 하나일 수 있으나 이 세션 권한으로는 org billing
-API(410 moved / `admin:org` 스코프 부족)에 접근할 수 없어 확정하지
-못했다. `repos/.../palimpsest`는 `disabled=false`·`archived=false`이고
-`actions/permissions`는 `enabled:true`다. 추가 push/PR 조작으로 해결되지
-않는 문제이므로 여기서 멈춘다. PR #3은 열린 채로 남아 있고 `dev`/`main`은
-변경되지 않았다.
+**정정: 위 "저장소 전체 Actions 정지" 결론은 철회한다 (2026-09-24 UTC).**
+실제 원인은 `d88be61`/`ef9f68d` 두 commit의 본문·trailer가 skip-ci 토큰
+문자열 자체를 (그 토큰이 없다고 설명하는 부정문 안에서도) 그대로 포함했기
+때문이다. GitHub의 매칭은 문자열 존재만 보고 부정/긍정 문맥을 구분하지
+않는다. 조직 billing/webhook 장애 가설은 근거 부족으로 철회한다. 다음
+항목에서 그 토큰 문자열을 전혀 포함하지 않는 새 commit으로 재검증한다.
 
 ### CI critical-path checkpoint (2026-09-24)
 
