@@ -1022,17 +1022,19 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-24 CI 최종 검토: medium 1건(문서만)을 반영했다. AGENTS.md 규칙 11이 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었지만, 이 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `.github/workflows/development-package.yml`과 그 계약을 다시 읽고, 임시 복사본에서 변형 9가지(step `if`·`shell`·`continue-on-error`, job `continue-on-error`·`if: always()`, `echo` 감싸기, `if`의 `|| true`)가 세 CI 계약 파일 125건을 모두 통과하는 것을 확인했다. 규칙 11은 이제 검사 항목과 고정하지 않는 항목(두 job의 key 집합, step `if`·`shell`·`continue-on-error`·`env`, 추가 step)을 그대로 적는다. workflow와 계약은 바꾸지 않았고 portable node 수(6,091)도 그대로다. production/runtime·package·Hub에는 구조 영향이 없다.
 
-2026-09-24 CI rollout 재확인: `dev` tip `3705880e`에 matrix 동시 실행 변경과 review 반영분이 포함됐고, 작업 브랜치에는 merge `d88be61`로 들어왔다. 게시 후 확인된 19-job `Test` 3건의 시작→마지막 job 종료는 dev push `35990877737` 192초, PR `36010249678` 182초, 현재 HEAD `a9e7be7`의 PR `36010811193` 157초였다. 세 실행 모두 success이며 현재 HEAD의 native KVM proof와 required gate도 success다. 세 표본만으로 중앙값·p90 또는 개선 효과를 확정하지 않는다(규정은 20건 이상). 이 추가 기록은 architecture/runtime/workflow 계약을 바꾸지 않는다.
+2026-09-24 CI rollout 재확인: `dev` tip `3705880e`에 matrix 동시 실행 변경과 review 반영분이 포함됐고, 작업 브랜치에는 merge `d88be61`로 들어왔다. 게시 후 당시 확인한 19-job `Test` 3건의 시작→마지막 job 종료는 dev push `35990877737` 192초, PR `36010249678` 182초, 당시 HEAD `a9e7be7`의 PR `36010811193` 157초였다. 세 실행 모두 success이며 당시 HEAD의 native KVM proof와 required gate도 success였다. 세 표본만으로 중앙값·p90 또는 개선 효과를 확정하지 않는다(규정은 20건 이상). 이 추가 기록은 architecture/runtime/workflow 계약을 바꾸지 않는다.
 
-2026-09-24 PR 후속 로컬 review: `cloudinit.py`가 모든 cloud-image guest의 sentinel을 `/dev/console`로 보냈지만 x86에서 kernel console이 VGA이면 `cloud_runtime.py`가 읽는 serial `console.log`에 도달하지 않는다. 또한 `cloud-init.target`만으로는 완료 후 `/etc/cloud/cloud-init.disabled`를 설정한 guest의 재시작을 감지할 수 없다. 생성 seed를 수정 전 재현하고, profile arch에 따라 x86_64 `/dev/ttyS0`·aarch64 `/dev/ttyAMA0`로 분기했다. 첫 project-init 뒤 bootstrap marker를 남기고, marker와 disabled 파일이 모두 있는 다음 부팅에만 별도 multi-user unit이 activation 이후 ready script를 실행한다. 기존 cloud-final/cloud-init.target unit의 일반 부팅 순서는 그대로다. Conventional guest seed·재부팅 준비 경계만 바뀌며 OCI-root·Hub·CI 형태는 바뀌지 않는다. 새 경계의 generated-seed smoke와 집중 cloud-init/runtime 70건은 통과했으나 native x86 KVM 또는 cloud-init-disabled reboot는 미실행이다. 현재 PR 원격 HEAD `a9e7be7`의 green KVM gate는 이 **미게시** 보정의 증거가 아니다.
+2026-09-24 PR 후속 로컬 review: `cloudinit.py`가 모든 cloud-image guest의 sentinel을 `/dev/console`로 보냈지만 x86에서 kernel console이 VGA이면 `cloud_runtime.py`가 읽는 serial `console.log`에 도달하지 않는다. 또한 `cloud-init.target`만으로는 완료 후 `/etc/cloud/cloud-init.disabled`를 설정한 guest의 재시작을 감지할 수 없다. 생성 seed를 수정 전 재현하고, profile arch에 따라 x86_64 `/dev/ttyS0`·aarch64 `/dev/ttyAMA0`로 분기했다. 첫 project-init 뒤 bootstrap marker를 남기고, marker와 disabled 파일이 모두 있는 다음 부팅에만 별도 multi-user unit이 activation 이후 ready script를 실행한다. 기존 cloud-final/cloud-init.target unit의 일반 부팅 순서는 그대로다. Conventional guest seed·재부팅 준비 경계만 바뀌며 OCI-root·Hub·CI 형태는 바뀌지 않는다. 새 경계의 generated-seed smoke와 집중 cloud-init/runtime 70건은 통과했으나 native x86 KVM 또는 cloud-init-disabled reboot는 미실행이다. 당시 PR 원격 HEAD `a9e7be7`의 green KVM gate는 그 시점의 **미게시** 보정의 증거가 아니었다.
+
+2026-09-24 작업 브랜치 게시: 승인된 일곱 파일 commit `071d82d0fcc1a88d0d8f5d791fa87095c13d1d81`을 `codex/oci-root-phase1`에만 push했다. Push 전 `core-cli host-runtime` 2,104건·architecture guard 14건, generated-seed smoke, Ruff, working/staged architecture guard가 통과했다. 같은 SHA의 PR `Test` run `36014570699`는 19 job 모두 success(native KVM·required KVM 포함), Hub `36014570977`과 Development package `36014566702`도 success이고 SHA별 prerelease의 wheel·sdist·checksums가 업로드됐다. 이는 stage-1 KVM matrix의 통과이며 새 cloud-image x86 또는 disabled-cloud-init reboot의 native 증거는 아니다. `dev`/`main`은 그대로이고 PR은 열려 있다. 이 뒤 문서 receipt commit은 CI 별도 판정 대상이다.
 
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
   "source_sha256": "60a658fa6e41fc0738c53d1f0afb54df9895cb2ea8401f81545732f81f718bd8",
-  "reviewed_at": "2026-09-24T14:32:23Z",
-  "summary": "Reviewed architecture-specific cloud-image serial output in activation, project-init and reboot-ready scripts plus guarded cloud-init-disabled fallback; recorded exact rollout samples. Portable 70 passed, native x86 and disabled-cloud-init reboot unverified, local changes unpublished."
+  "reviewed_at": "2026-09-24T14:46:50Z",
+  "summary": "Recorded exact 071d82d branch-only publication and successful PR Test/native KVM, Hub and development-package runs; docs-only receipt, no source or architecture contract change. Cloud-image x86 and disabled-cloud-init native reboot remain unverified."
 }
 ```
 <!-- architecture-review:end -->

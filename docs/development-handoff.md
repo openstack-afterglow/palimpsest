@@ -2060,6 +2060,8 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 
 **작업 브랜치 게시 승인 및 preflight (2026-09-24 UTC).** 사용자가 이번 일곱 파일만 `codex/oci-root-phase1`에 commit/push하고 자동 Development package prerelease 및 PR native KVM gate 결과를 확인하도록 승인했다. `dev`/`main` 병합, 추가 원격 helper 전송, runner 설정·기존 domain 조작은 승인하지 않았다. Push 전 원격 branch tip은 `a9e7be701d662eb732e1cfdab1d457b14b6bc797`이다. 집중 70건 외에 `core-cli host-runtime` 선택 2,104건, architecture guard 14건, lane manifest·Ruff lint/format·working architecture guard·diff whitespace가 통과했다. 이 문장은 **push 전** 검사 상태이며 이 뒤의 새 CI 성공 주장이 아니다.
 
+**작업 브랜치 실제 게시·검사 (2026-09-24 UTC).** 일곱 파일 commit [`071d82d0fcc1a88d0d8f5d791fa87095c13d1d81`](https://github.com/openstack-afterglow/palimpsest/commit/071d82d0fcc1a88d0d8f5d791fa87095c13d1d81)를 `codex/oci-root-phase1`에만 non-force push했고, 같은 원격 tip을 재조회했다. PR `Test` [`36014570699`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36014570699)는 19 job 모두 success이며 `Native KVM stage-1 proof`와 `Required native KVM proof`도 success다. `stage1-native-kvm-proof` artifact id `10813952706`(450,949B)와 `oci-filesystem-proof` id `10814197273`(1,905B)가 이 SHA에 남았다. Hub workflow `36014570977`의 두 job과 Development package `36014566702`의 verify/publish 두 job도 success다. Prerelease [`package-071d82d...`](https://github.com/openstack-afterglow/palimpsest/releases/tag/package-071d82d0fcc1a88d0d8f5d791fa87095c13d1d81)에 wheel·sdist·`SHA256SUMS`가 모두 uploaded 상태다. 이는 기존 stage-1 KVM matrix의 통과이지 새 cloud-image x86 부팅이나 cloud-init-disabled reboot 실기가 아니다. 조회한 `dev`는 `3705880e`, `main`은 `60fa42f` 그대로이고 PR #3은 open/unmerged다. 이 결과 기록 commit은 문서만 바꾸며, 새 자동 workflow 결과는 별도 SHA로 판정한다.
+
 ### CI critical-path checkpoint (2026-09-24)
 
 기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 1·2·3차 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.
@@ -2239,8 +2241,8 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 
 **다음 작업**
 
-1. CI round-3 독립 재검토에서 신규 결함을 찾지 않았고 `dev` 게시 SHA `3705880e`를 위에 기록했다. 이번 readiness 보정은 위 범위로 작업 브랜치 게시 승인을 받았다. 새 commit의 CI/KVM 결과를 정확한 SHA로 확인한다.
-2. 변경을 포함한 완료 `Test` 표본은 현재 3건이다. 자연스럽게 20회 이상 쌓인 뒤에만 크리티컬 패스 중앙값·p90을 재측정하고 이 절과 AGENTS.md 기준을 갱신한다. 표본을 만들기 위한 강제 workflow 실행은 하지 않는다.
+1. CI round-3 독립 재검토에서 신규 결함을 찾지 않았고, readiness 보정 commit `071d82d`의 작업 브랜치 push 및 정확한 SHA의 native KVM gate·Hub·Development package success를 위에 기록했다. 아래의 문서 영수증 자체가 새 HEAD가 되면 그 SHA의 CI 결과도 별도로 확인한다.
+2. 변경을 포함한 완료 `Test` 표본은 source push 직후 4건이다. 자연스럽게 20회 이상 쌓인 뒤에만 크리티컬 패스 중앙값·p90을 재측정하고 이 절과 AGENTS.md 기준을 갱신한다. 표본을 만들기 위한 강제 workflow 실행은 하지 않는다.
 3. self-hosted KVM runner 노출, dev/main 중복 push, 발행 gate 예외, shard 실행 수 검사에 대한 소유자 결정(위 승인 대기 1–4)을 받는다.
 4. 승인된 작업 브랜치 게시 외에 PR merge 및 x86 KVM/cloud-init-disabled reboot 실기는 각각 대상·자원을 정한 별도 명시적 승인 뒤에 진행한다.
 
