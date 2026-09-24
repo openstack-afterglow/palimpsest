@@ -5,9 +5,10 @@ selection, supported host/runtime combinations, external dependencies, initial
 configuration, upgrades, and administrator-owned Linux deployment. It does not
 use a repository checkout as the user installation mechanism.
 
-Palimpsest Local requires Python 3.11 or newer. The source version is `0.1.4`;
-do not assume a PyPI package exists. pip needs Git on `PATH` and network access
-to GitHub to install the VCS requirement.
+Palimpsest Local requires Python 3.11 or newer. The root release target is
+`palimpsest-local 0.2.0`; this is not a claim of PyPI publication. pip needs
+Git on `PATH` and network access to GitHub for a VCS install. The independently
+versioned Hub Python distribution is also `palimpsest-hub 0.2.0` in this tree.
 
 ## Package catalog
 
@@ -25,8 +26,20 @@ Use the same reviewed Git ref for Local and Hub to prevent source skew.
 The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
 under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
 Kolla-Ansible, Ansible, Hub, or their runtime dependencies; deployments pin
-Kolla-Ansible independently. The role's published Hub image default remains
-`0.1.3`, while source builds bind to the configured checkout commit SHA.
+Kolla-Ansible independently. This source role defaults to Hub image tag `0.2.0`,
+while source builds bind to the configured checkout commit SHA. Publish and
+verify both `0.2.0` Hub images before deploying this default; source metadata
+alone does not establish image availability.
+
+If a repository `v0.2.0` tag is pushed, the Hub image workflow labels both
+`ghcr.io/openstack-afterglow/palimpsest-hub-api` and
+`ghcr.io/openstack-afterglow/palimpsest-hub-worker` with `0.2.0` and `v0.2.0`.
+Those image tags follow the repository tag, not the Hub wheel version. The
+separate root PyPI workflow requires successful release artifact verification
+and its native stage-1 KVM proof on an enabled self-hosted Linux x86_64 runner
+before publishing. A development-package prerelease, PR check, or skipped KVM
+job cannot substitute for that gate. The 0.2.0 release builds, PyPI/GHCR
+publication, and Kolla deployment were not run for this documentation update.
 
 ## Supported hosts and runtime scope
 
@@ -44,6 +57,11 @@ semantics. A conventional VM boots its cloud image and mounts Palimpsest layers
 under `/opt/layers/merged`. OCI-root materializes a Linux `amd64` OCI artifact,
 switches the guest root, and runs the workload as PID 1. Portable package
 installation is not native runtime qualification.
+
+The branch PR's native stage-1 proof checks OCI-root guest `/` switching and
+PID 1; it is not a conventional cloud-image VM boot. The serial-bound first
+boot and cloud-init-disabled reboot readiness changes still lack a post-merge
+native conventional-cloud boot/reboot check, even if the stage-1 gate passed.
 
 ## Install directly from GitHub
 
@@ -506,7 +524,7 @@ Repository contributors can build the sdist/wheel and run the isolated package
 smoke from a trusted checkout:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.1.4
+uv run python scripts/build_package.py --out-dir dist/package-0.2.0
 ```
 
 This maintainer workflow is not the user installation path. Its local package
