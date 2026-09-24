@@ -28,7 +28,11 @@ ACTIVATION_UNIT_NAME = "palimpsest-activate.service"
 READY_SCRIPT_PATH = "/usr/local/libexec/palimpsest-ready"
 READY_UNIT_PATH = "/etc/systemd/system/palimpsest-ready.service"
 READY_UNIT_NAME = "palimpsest-ready.service"
-CONSOLE_DEVICE = "/dev/console"
+READY_FALLBACK_UNIT_PATH = "/etc/systemd/system/palimpsest-ready-without-cloud-init.service"
+READY_FALLBACK_UNIT_NAME = "palimpsest-ready-without-cloud-init.service"
+BOOTSTRAP_MARKER_PATH = "/var/lib/palimpsest/bootstrapped"
+CONSOLE_DEVICE = "/dev/ttyS0"
+_SERIAL_CONSOLES = {"x86_64": CONSOLE_DEVICE, "aarch64": "/dev/ttyAMA0"}
 BUILD_CHANNEL_NAME = "org.afterglow.palimpsest.builder.v1"
 BUILD_JOB_PATH = "/etc/palimpsest/build-job.json"
 BUILD_WORKER_PATH = "/usr/local/libexec/palimpsest-builder"
@@ -48,6 +52,8 @@ _RESERVED_GUEST_PATHS = (
     ACTIVATION_UNIT_PATH,
     READY_SCRIPT_PATH,
     READY_UNIT_PATH,
+    READY_FALLBACK_UNIT_PATH,
+    BOOTSTRAP_MARKER_PATH,
     PROJECT_INIT_PATH,
 )
 
@@ -307,7 +313,9 @@ def build_meta_data(instance_id: str, *, hostname: str = "palimpsest") -> str:
     return f"instance-id: {instance_id}\nlocal-hostname: {hostname}\n"
 
 
-def build_activation_unit(activation_script: str, *, emit_ready: bool = True) -> tuple[str, str]:
+def build_activation_unit(
+    activation_script: str, *, emit_ready: bool = True, console_device: str = CONSOLE_DEVICE
+) -> tuple[str, str]:
     """Return ``(helper_script_text, systemd_unit_text)`` for layer activation.
 
     Wraps ``activation_script`` (e.g. from
@@ -318,7 +326,7 @@ def build_activation_unit(activation_script: str, *, emit_ready: bool = True) ->
     if not activation_script.strip():
         raise GuestError("activation_script must be nonempty")
     body = activation_script if activation_script.endswith("\n") else activation_script + "\n"
-    helper_script = "#!/bin/bash\nset -euo pipefail\nexec >>" + CONSOLE_DEVICE + " 2>&1\n" + body
+    helper_script = "#!/bin/bash\nset -euo pipefail\nexec >>" + console_device + " 2>&1\n" + body
     if emit_ready:
         helper_script += f"echo {READY_SENTINEL}\n"
     unit_text = (
@@ -348,6 +356,7 @@ def build_user_data(
     activation_script: str,
     environment: tuple[tuple[str, str], ...] = (),
     cloud_init: object | None = None,
+    arch: str = "x86_64",
 ) -> str:
     """Render the full NoCloud ``user-data`` ``#cloud-config`` document for one run.
 
@@ -355,11 +364,14 @@ def build_user_data(
     literal key text or a ``Path`` to read it from — callers may hold generated key
     material in memory or on disk under a run's ``ssh/`` directory.
     """
+    if arch not in _SERIAL_CONSOLES:
+        raise GuestError(f"unsupported guest serial console architecture: {arch}")
+    console_device = _SERIAL_CONSOLES[arch]
     client_key = read_public_key_line(client_public_key)
     host_public = read_public_key_line(host_public_key)
     host_private = read_key_material(host_private_key).rstrip("\n")
-    helper_script, unit_text = build_activation_unit(activation_script, emit_ready=False)
-    ready_script = f"#!/bin/bash\nset -euo pipefail\necho {READY_SENTINEL} >>{CONSOLE_DEVICE}\n"
+    helper_script, unit_text = build_activation_unit(activation_script, emit_ready=False, console_device=console_device)
+    ready_script = f"#!/bin/bash\nset -euo pipefail\necho {READY_SENTINEL} >>{console_device}\n"
     ready_unit = (
         "[Unit]\n"
         "Description=Palimpsest boot readiness\n"
@@ -372,6 +384,24 @@ def build_user_data(
         "\n"
         "[Install]\n"
         "WantedBy=cloud-init.target\n"
+    )
+    # cloud-init.target is not pulled in after cloud-init is explicitly disabled.
+    # A separate multi-user unit covers only already-bootstrapped guests in that case;
+    # it cannot run early during the cloud-final/project-init first boot.
+    fallback_unit = (
+        "[Unit]\n"
+        "Description=Palimpsest boot readiness without cloud-init\n"
+        f"ConditionPathExists={BOOTSTRAP_MARKER_PATH}\n"
+        "ConditionPathExists=/etc/cloud/cloud-init.disabled\n"
+        f"Requires={ACTIVATION_UNIT_NAME}\n"
+        f"After={ACTIVATION_UNIT_NAME}\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={READY_SCRIPT_PATH}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
     )
 
     environment_lines: list[str] = []
@@ -392,11 +422,12 @@ def build_user_data(
     commands = tuple(getattr(cloud_init, "runcmd", ())) if cloud_init is not None else ()
     if not all(isinstance(package, str) and package and "\x00" not in package for package in packages):
         raise GuestError("cloud-init packages entries must be nonempty NUL-free strings")
-    project_script_lines = ["#!/bin/bash", "set -euo pipefail", f"exec >>{CONSOLE_DEVICE} 2>&1"]
+    project_script_lines = ["#!/bin/bash", "set -euo pipefail", f"exec >>{console_device} 2>&1"]
     for command in commands:
         if not isinstance(command, tuple) or not command or not all(isinstance(argument, str) for argument in command):
             raise GuestError("cloud-init runcmd entries must be nonempty argv tuples")
         project_script_lines.append(shlex.join(command))
+    project_script_lines.append(f"install -D -m 0644 /dev/null {BOOTSTRAP_MARKER_PATH}")
     project_script_lines.append(f"echo {READY_SENTINEL}")
     project_script = "\n".join(project_script_lines) + "\n"
 
@@ -443,6 +474,11 @@ def build_user_data(
         "    owner: root:root",
         "    content: |",
         _literal_block(ready_unit.rstrip("\n"), 6),
+        f"  - path: {READY_FALLBACK_UNIT_PATH}",
+        "    permissions: '0644'",
+        "    owner: root:root",
+        "    content: |",
+        _literal_block(fallback_unit.rstrip("\n"), 6),
         f"  - path: {PROJECT_INIT_PATH}",
         "    permissions: '0755'",
         "    owner: root:root",
@@ -495,6 +531,7 @@ def build_user_data(
             "  - systemctl daemon-reload",
             f"  - systemctl enable --now {ACTIVATION_UNIT_NAME}",
             f"  - systemctl enable {READY_UNIT_NAME}",
+            f"  - systemctl enable {READY_FALLBACK_UNIT_NAME}",
             f"  - {PROJECT_INIT_PATH}",
             "",
         ]

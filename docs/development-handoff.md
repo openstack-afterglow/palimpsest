@@ -2052,9 +2052,19 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 선택한 "PR로 native KVM gate 실행"의 실제 성공 증거다. PR #3은 여전히
 열려 있고 병합은 요청하지 않았으며, `dev`/`main`은 변경되지 않았다.
 
+**PR 후속 로컬 검토·수정 (2026-09-24 UTC; 미게시).** PR #3의 현재 원격 HEAD `a9e7be7`은 별도 `Test` run [`36010811193`](https://github.com/openstack-afterglow/palimpsest/actions/runs/36010811193)에서 19 job 모두 success였고, native/required KVM proof도 success였다. 같은 SHA의 Hub `36010810898`과 Development package `36010805259`도 success이며 SHA-specific prerelease가 실제로 발행됐다. 뒤의 **로컬** 수정은 이 세 run에 포함되지 않는다.
+
+독립 검토에서 CI round-3 계약의 신규 결함은 발견하지 못했다. HVF 변경의 두 readiness 경계가 지적됐다: x86 guest에서 `/dev/console`이 VGA를 가리키면 serial log가 sentinel을 잃고, 부팅 후 `/etc/cloud/cloud-init.disabled`로 cloud-init을 끄면 `cloud-init.target`의 ready unit이 재시작 때 실행되지 않는다. Hub 검토의 parent가 import에서 빠져도 child가 게시되는 경우와 PAX 경로 override 불일치는 `origin/dev`에도 있던 별도 결함이며 이번 PR 수정으로 포장하지 않는다.
+
+로컬 source는 x86_64 `/dev/ttyS0`·aarch64 `/dev/ttyAMA0`로 guest serial 출력을 선택하고, 최초 project-init 완료 marker를 남긴다. cloud-init이 명시적 disabled 파일로 꺼진 **이후** 부팅에만 marker와 disabled 파일 두 조건을 가진 별도 multi-user fallback unit이 activation 뒤 readiness를 기록한다. 기존 cloud-init.target unit과 cloud-final 순서는 유지한다. 수정 전 x86 seed는 serial sentinel이 없음을 확인했고, 수정 후 두 arch의 seed가 각 serial과 두 fallback 조건을 담는 것을 확인했다. 집중 cloud-init/runtime 70건, Ruff lint와 diff whitespace가 통과했다. 이는 generated-seed/portable proof다. 새 수정의 실제 x86 KVM 부팅 및 cloud-init-disabled 재부팅은 아직 실행하지 않았고, 앞선 원격 KVM gate 성공을 이 수정의 증거로 쓰지 않는다. GitHub 게시·PR merge·runner 설정 변경은 하지 않았다.
+
+**작업 브랜치 게시 승인 및 preflight (2026-09-24 UTC).** 사용자가 이번 일곱 파일만 `codex/oci-root-phase1`에 commit/push하고 자동 Development package prerelease 및 PR native KVM gate 결과를 확인하도록 승인했다. `dev`/`main` 병합, 추가 원격 helper 전송, runner 설정·기존 domain 조작은 승인하지 않았다. Push 전 원격 branch tip은 `a9e7be701d662eb732e1cfdab1d457b14b6bc797`이다. 집중 70건 외에 `core-cli host-runtime` 선택 2,104건, architecture guard 14건, lane manifest·Ruff lint/format·working architecture guard·diff whitespace가 통과했다. 이 문장은 **push 전** 검사 상태이며 이 뒤의 새 CI 성공 주장이 아니다.
+
 ### CI critical-path checkpoint (2026-09-24)
 
 기준 SHA는 `60fa42f`(= 당시 `origin/dev` = `origin/main`)이고, branch `ci-perf`에 local commit `2e37538`과 review 1·2·3차 반영 commit으로 남겼다. 이 기록 시점(2026-09-24)에는 push·PR·저장소 설정 변경을 하지 않았다. push하면 이 문단에 push한 SHA를 적는다.
+
+**게시 상태 재확인 (2026-09-24 UTC).** 위의 미게시 문장은 당시 checkpoint다. 현재 `dev` tip `3705880e5c03486b69ac052fd78ddad8ce799655`에는 이 CI 변경과 최종 문서 정정이 들어 있으며, 작업 브랜치에는 merge commit `d88be61`을 통해 포함됐다. `main` tip은 여전히 `60fa42f`다. 이 재확인은 새 push나 PR merge가 아니다.
 
 **변경 내용**
 
@@ -2076,6 +2086,8 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 - KVM job은 140초 걸렸고 대기 중앙값은 142초였다.
 
 **기대 효과.** dev/PR 약 155–170초는 **추정**이다. push 후 20회 이상 재측정해야 하며, 재측정 전에는 효과로 기록하지 않는다. main push는 같은 SHA의 dev 실행과 단일 KVM runner·macOS 5개 한도를 두고 경쟁하므로 약 290초에 머물 것으로 본다.
+
+**게시 후 초기 관찰 (2026-09-24 UTC, 표본 3건).** 변경을 포함한 완료 `Test`는 확인 시점에 3건뿐이다. `dev` push `35990877737`(SHA `3705880e`)은 시작부터 마지막 job 종료까지 192초, PR `36010249678`(SHA `1572025a`)은 182초, PR `36010811193`(현재 HEAD `a9e7be7`)은 157초였다. 세 실행 모두 19개 job이 성공했고, 마지막 job 종료 시각에서 `run_started_at`을 뺐다. 마지막 두 PR의 `Native KVM stage-1 proof`와 `Required native KVM proof`도 성공했다. 현재 HEAD의 Hub workflow `36010810898`과 Development package workflow `36010805259`도 성공했고, 해당 SHA의 prerelease에 wheel·sdist·`SHA256SUMS` 세 asset이 업로드됐다. 이는 세 표본의 관찰이지 20건 기준의 중앙값·p90 효과 판정이 아니다. 표본을 만들려고 CI나 공유 KVM runner를 추가 실행하지 않는다.
 
 **실행한 검사.** 모두 local macOS, Python 3.12에서 실행했다.
 
@@ -2227,10 +2239,10 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 
 **다음 작업**
 
-1. review 3차 반영분의 독립 재검토를 받는다.
-2. 승인된 경우에만 push하고, 이 절 첫 문단에 push한 SHA를 적는다.
-3. push 뒤 `Test` 20회 이상의 크리티컬 패스 중앙값·p90을 재측정해 이 절과 AGENTS.md 기준을 갱신한다.
-4. 이 절의 승인 대기 1–4에 대한 결정을 받는다.
+1. CI round-3 독립 재검토에서 신규 결함을 찾지 않았고 `dev` 게시 SHA `3705880e`를 위에 기록했다. 이번 readiness 보정은 위 범위로 작업 브랜치 게시 승인을 받았다. 새 commit의 CI/KVM 결과를 정확한 SHA로 확인한다.
+2. 변경을 포함한 완료 `Test` 표본은 현재 3건이다. 자연스럽게 20회 이상 쌓인 뒤에만 크리티컬 패스 중앙값·p90을 재측정하고 이 절과 AGENTS.md 기준을 갱신한다. 표본을 만들기 위한 강제 workflow 실행은 하지 않는다.
+3. self-hosted KVM runner 노출, dev/main 중복 push, 발행 gate 예외, shard 실행 수 검사에 대한 소유자 결정(위 승인 대기 1–4)을 받는다.
+4. 승인된 작업 브랜치 게시 외에 PR merge 및 x86 KVM/cloud-init-disabled reboot 실기는 각각 대상·자원을 정한 별도 명시적 승인 뒤에 진행한다.
 
 ## 빠른 링크 맵
 

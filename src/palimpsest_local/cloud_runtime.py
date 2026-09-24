@@ -367,6 +367,7 @@ def _generate_seed_iso(
         activation_script=activation_script,
         environment=spec.environment,
         cloud_init=spec.cloud_init,
+        arch=profile.arch,
     )
     _write_seed_iso(rpaths, profile, meta_data, user_data)
 

@@ -321,8 +321,8 @@ Linux process parser는 legacy `ArgsEscaped`의 absent/null/strict boolean을 �
 
 `image import/pull`이 검증된 `qcow2` 또는 `raw` base를 local content store에 둔다. `cloud_runtime` 또는 `lima`는 실행마다 writable qcow2 overlay를 만들고 base는 read-only로 유지한다. layer SquashFS는 KVM의 `vdb..vdz` read-only virtio disks 또는 Lima guest 복사본으로 전달된다. NoCloud/cloud-init이 guest에서 layer disks를 `/mnt/palimpsest/lowerN`에 mount하고 leaf → root 순서의 OverlayFS를 `/opt/layers/merged`에 만든다. macOS의 명시적 `libvirt-hvf`는 `qemu:///session`에서 `virt`/UEFI와 GICv3, PCI 슬롯을 예약하지 않는 QEMU virtio-mmio NIC 및 loopback SSH `hostfwd`를 사용한다. `rm`과 실패한 `run`의 소유 domain만 undefine하며, run-tree에 속한 EFI varstore는 보존해 run-tree 제거와 함께 삭제하고 libvirt가 자동 생성한 EFI varstore는 libvirt에 삭제를 요청한다. `exec`, `shell`, `logs`, `stop`, `rm`은 owner ledger와 backend identity를 재확인한다. Linux KVM의 project `ports`는 현재 안전한 forwarding 경계가 없어 거부되며, Lima는 static TCP forwarding만 제공한다.
 
-Guest의 activation·project-init·ready helper는 x86의 `ttyS0`이나 ARM의 `ttyAMA0`를 가정하지 않고 `/dev/console`에 readiness를 출력한다. 이는 실제 커널 console에 도달한 sentinel을 host의 owner-only `console.log`에서 관찰하기 위한 계약이며, cloud-init 자체의 성공 여부는 guest 실행으로 별도 확인한다.
-첫 부팅은 cloud-init의 project-init이 마지막 sentinel을 기록한다. 다음 부팅의 `palimpsest-ready.service`는 activation 및 `cloud-final.service` 이후 `cloud-init.target`에서 시작한다. `cloud-final.service`보다 먼저 도달하는 `multi-user.target`에 ready를 연결하면 ordering cycle로 서비스가 실행되지 않아 재시작이 준비 대기에서 실패한다.
+Guest activation·project-init·ready helper는 profile architecture의 libvirt serial port에 직접 쓴다(x86_64 `/dev/ttyS0`, aarch64 `/dev/ttyAMA0`). `/dev/console`은 kernel `console=`의 마지막 장치가 VGA일 때 serial log가 아닐 수 있다. Host는 run 소유 `console.log`에서 sentinel을 관찰하며, cloud-init 성공 여부는 guest 실행으로 별도 확인한다.
+첫 부팅의 project-init은 사용자 명령이 끝난 뒤 bootstrap marker를 기록하고 마지막 sentinel을 출력한다. 다음 부팅에서 cloud-init이 켜져 있으면 `palimpsest-ready.service`가 activation 및 `cloud-final.service` 뒤 `cloud-init.target`에서 시작한다. 사용자에 의해 `/etc/cloud/cloud-init.disabled`가 설치된 이후 부팅만 별도의 `multi-user.target` fallback unit이 bootstrap marker와 disabled 파일을 함께 확인하고 activation 뒤 sentinel을 출력한다. 본래 ready unit을 `multi-user.target`에 연결하고 cloud-final 뒤로 정렬하면 Ubuntu에서 ordering cycle이 생기므로 두 unit을 합치지 않는다. fallback은 cloud-init의 다른 비활성화 방식까지 포괄한다고 주장하지 않는다.
 
 ### OCI-root materialize → run flow
 
@@ -1022,13 +1022,17 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-24 CI 최종 검토: medium 1건(문서만)을 반영했다. AGENTS.md 규칙 11이 `test_development_package_workflow.py`가 development-package의 step을 고정한다고 적었지만, 이 계약은 trigger·permissions·concurrency·job id, `verify` `if`와 run text의 포함 여부, `publish`의 `needs`·`permissions`·`uses`·checksum 순서·helper 인자·금지 문자열만 본다. `.github/workflows/development-package.yml`과 그 계약을 다시 읽고, 임시 복사본에서 변형 9가지(step `if`·`shell`·`continue-on-error`, job `continue-on-error`·`if: always()`, `echo` 감싸기, `if`의 `|| true`)가 세 CI 계약 파일 125건을 모두 통과하는 것을 확인했다. 규칙 11은 이제 검사 항목과 고정하지 않는 항목(두 job의 key 집합, step `if`·`shell`·`continue-on-error`·`env`, 추가 step)을 그대로 적는다. workflow와 계약은 바꾸지 않았고 portable node 수(6,091)도 그대로다. production/runtime·package·Hub에는 구조 영향이 없다.
 
+2026-09-24 CI rollout 재확인: `dev` tip `3705880e`에 matrix 동시 실행 변경과 review 반영분이 포함됐고, 작업 브랜치에는 merge `d88be61`로 들어왔다. 게시 후 확인된 19-job `Test` 3건의 시작→마지막 job 종료는 dev push `35990877737` 192초, PR `36010249678` 182초, 현재 HEAD `a9e7be7`의 PR `36010811193` 157초였다. 세 실행 모두 success이며 현재 HEAD의 native KVM proof와 required gate도 success다. 세 표본만으로 중앙값·p90 또는 개선 효과를 확정하지 않는다(규정은 20건 이상). 이 추가 기록은 architecture/runtime/workflow 계약을 바꾸지 않는다.
+
+2026-09-24 PR 후속 로컬 review: `cloudinit.py`가 모든 cloud-image guest의 sentinel을 `/dev/console`로 보냈지만 x86에서 kernel console이 VGA이면 `cloud_runtime.py`가 읽는 serial `console.log`에 도달하지 않는다. 또한 `cloud-init.target`만으로는 완료 후 `/etc/cloud/cloud-init.disabled`를 설정한 guest의 재시작을 감지할 수 없다. 생성 seed를 수정 전 재현하고, profile arch에 따라 x86_64 `/dev/ttyS0`·aarch64 `/dev/ttyAMA0`로 분기했다. 첫 project-init 뒤 bootstrap marker를 남기고, marker와 disabled 파일이 모두 있는 다음 부팅에만 별도 multi-user unit이 activation 이후 ready script를 실행한다. 기존 cloud-final/cloud-init.target unit의 일반 부팅 순서는 그대로다. Conventional guest seed·재부팅 준비 경계만 바뀌며 OCI-root·Hub·CI 형태는 바뀌지 않는다. 새 경계의 generated-seed smoke와 집중 cloud-init/runtime 70건은 통과했으나 native x86 KVM 또는 cloud-init-disabled reboot는 미실행이다. 현재 PR 원격 HEAD `a9e7be7`의 green KVM gate는 이 **미게시** 보정의 증거가 아니다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "66048823bd34e0ea61acbc490e32fbd494a2ee9ee1a00af6a13d5ef2b64dcef3",
-  "reviewed_at": "2026-09-24T14:09:46Z",
-  "summary": "Recorded confirmed native KVM gate success: after publishing a genuinely token-free commit, pull_request Test run 36010249678 (including Native KVM stage-1 proof and Required native KVM proof jobs) and the Hub/Development-package workflows all completed success on this SHA. No production/runtime/schema contract change; PR remains open and unmerged, dev/main untouched."
+  "source_sha256": "60a658fa6e41fc0738c53d1f0afb54df9895cb2ea8401f81545732f81f718bd8",
+  "reviewed_at": "2026-09-24T14:32:23Z",
+  "summary": "Reviewed architecture-specific cloud-image serial output in activation, project-init and reboot-ready scripts plus guarded cloud-init-disabled fallback; recorded exact rollout samples. Portable 70 passed, native x86 and disabled-cloud-init reboot unverified, local changes unpublished."
 }
 ```
 <!-- architecture-review:end -->
