@@ -1034,15 +1034,15 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-25 DMSLAB Kolla 운영 검증: v0.2.1 설치로 Hub API/worker가 healthy였지만 controller1의 `palimpsest_hub` Docker volume root는 0:0 mode0755였고 image process는 1000:1000이므로 두 container에서 실제 파일 생성이 permission denied였다. v0.2.2 role은 이미 pin된 Hub API image를 사용한 임시 root container가 named volume의 **root만** `palimpsest:palimpsest`로 chown한 후 비특권 bootstrap과 API/worker를 실행한다. 기존 blob/CAS 하위 경로는 recursive 변경하지 않는다. 같은 발행 image의 disposable named volume에서 수정 전 쓰기 실패 → 소유권 초기화 → UID1000 쓰기 성공을 재현했다. 이 변경은 Hub artifact/schema/auth 계약과 image 자체는 바꾸지 않는다. 운영 배포 후 인증 업로드·정리 증거는 별도 확인한다.
 
-2026-09-25 배포판 이름 후속 변경: root PyPI 프로젝트와 배포판 식별자는 `palimpsest-client 0.2.3`이며, `palimpsest_local` import와 `palimpsest` CLI, 저장된 libvirt domain marker namespace와 OCI artifact marker는 유지한다. 별도 `palimpsest-hub 0.2.0` image/서비스/스키마는 변경하지 않는다. 최초 PyPI 발행에는 GitHub `openstack-afterglow/palimpsest`의 `release.yml` + `pypi` environment에 대한 `palimpsest-client` pending trusted publisher가 필요하다. PyPI publish 성공 뒤에만 GitHub Release job이 실행된다.
+2026-09-25 배포판 이름 후속 변경: root PyPI 프로젝트와 배포판 식별자는 `palimpsest-client 0.2.3`이며, `palimpsest_local` import와 `palimpsest` CLI, 저장된 libvirt domain marker namespace와 OCI artifact marker는 유지한다. 별도 `palimpsest-hub 0.2.0` Python 배포판/서비스/스키마는 변경하지 않는다. tag `v0.2.3` commit `fc729e3bb33ed9a4a860ad0d8c1c79b192891331`의 [root release run 36081630018](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630018)은 검증과 native stage-1 KVM gate를 통과하고 `pypi` environment의 trusted publisher로 PyPI wheel (`sha256:ca4aed347c5a7bd85e31a4aac6d3a22455c288e331b1963120326fae15f94258`)·sdist (`sha256:90318b083c8456ff2abc207fe39a3e7a6200541557b191cf64c74ccba1772ffa`)를 발행한 다음 GitHub Release를 생성했다. 별도 [Hub image run 36081630008](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630008)은 같은 source ref의 API·worker amd64 image를 발행했다. 이 기록은 package/image 발행의 증거이며 운영 Kolla 교체·인증 upload 성공의 증거는 아니다.
 
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
   "source_sha256": "5e04bd4068e730bfaa40e8a8e142bec924f2e184dd4b5feebad7f39ab0124b77",
-  "reviewed_at": "2026-09-25T01:15:34Z",
-  "summary": "0.2.3: root PyPI distribution renamed palimpsest-local -> palimpsest-client for trusted publisher; import palimpsest_local, CLI, role files, domain/artifact markers and Hub 0.2.0 unchanged; wheel build/install smoke and portable lanes pass."
+  "reviewed_at": "2026-09-25T08:45:25Z",
+  "summary": "Docs-only release receipt: verified palimpsest-client 0.2.3 trusted PyPI wheel/sdist and GitHub Release run 36081630018, Hub images run 36081630008; pyproject and release workflow source unchanged; Kolla promotion pending."
 }
 ```
 <!-- architecture-review:end -->

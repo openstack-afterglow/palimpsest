@@ -2254,6 +2254,11 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 - Release readiness는 root/Hub `0.2.0`과 Kolla 기본 image tag `0.2.0`의 정렬에 더해, 검토한 source로 위 conventional-cloud native 공백을 확인하고 `v*` tag의 `release.yml`에서 root package 검증과 필수 native `kvm-proof`를 통과시키는 것이다. 그 뒤에만 root wheel/sdist의 PyPI 발행과 GitHub release를 성공으로 판정한다. 같은 tag의 `hub-docker.yml`은 별도 Hub unit gate 뒤 GHCR API·worker semver tag(`0.2.0`, `v0.2.0`)를 게시하므로 두 경로의 결과를 각각 확인한다. 현재 이 handoff는 실제 `v0.2.0` tag 실행이나 게시 성공을 주장하지 않는다.
 - OpenSpec 디렉터리는 이 작업트리에 없다. 새 OpenSpec 파일을 만들지 않았고, 이전 날짜별 승인·branch/PR 상태는 소급 갱신하지 않았다. Architecture review JSON marker 갱신은 최종 source 검토를 맡은 Main의 작업이다.
 
+## 배포판 발행 인계 — 2026-09-25
+
+- `v0.2.3` tag/source `fc729e3bb33ed9a4a860ad0d8c1c79b192891331`의 [release run 36081630018](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630018)이 native stage-1 KVM proof와 package 검증을 통과하고 `palimpsest-client` trusted publisher로 PyPI wheel(`ca4aed347c5a7bd85e31a4aac6d3a22455c288e331b1963120326fae15f94258`)·sdist(`90318b083c8456ff2abc207fe39a3e7a6200541557b191cf64c74ccba1772ffa`)를 발행했다. [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3)에는 두 검증 산출물이 있다. `uvx --from palimpsest-client==0.2.3 palimpsest --version`은 `0.2.3`을 반환했다.
+- [Hub image run 36081630008](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630008)이 같은 tag의 API·worker linux/amd64 이미지를 게시했다. Hub Python distribution은 여전히 `palimpsest-hub 0.2.0`이다. 운영 Kolla에서 root 패키지 교체와 Hub image promotion을 수행했는지는 별도 검증한다. 위의 과거 `0.2.0` handoff 기록은 해당 시점의 기록이며 현재 발행 상태의 근거가 아니다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
