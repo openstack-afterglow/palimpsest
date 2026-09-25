@@ -553,7 +553,7 @@ def _libvirt() -> Any:
     try:
         import libvirt
     except ImportError as exc:
-        raise KvmUnavailable("libvirt-python is not installed; install palimpsest-local[kvm]") from exc
+        raise KvmUnavailable("libvirt-python is not installed; install palimpsest-client[kvm]") from exc
     return libvirt
 
 

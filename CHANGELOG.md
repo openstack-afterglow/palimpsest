@@ -4,6 +4,11 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-25 (pending PyPI publication)
+
+- Renamed the root PyPI distribution from `palimpsest-local` to `palimpsest-client` for 0.2.3. The Python module `palimpsest_local`, CLI `palimpsest`, optional `[kvm]` extra, and packaged Kolla role remain unchanged.
+- The trusted publisher for `palimpsest-client` is pending registration; this entry does not claim a PyPI release. The independent `palimpsest-hub` Python distribution remains 0.2.0.
+
 ## [0.2.2] - 2026-09-25
 
 `palimpsest-local` Kolla role hotfix; Hub image distribution remains 0.2.0.

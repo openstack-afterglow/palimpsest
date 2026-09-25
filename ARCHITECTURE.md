@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. 로컬 패키지(`palimpsest-local`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 `palimpsest-local 0.2.2`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.2.0`(`hub/pyproject.toml`)이다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값은 `0.2.0`이다. Kolla 배포는 image 기본 UID1000과 root 소유로 생성된 named volume의 경계를 bootstrap 직전에 조정하며, source image로부터 실제 `palimpsest` 사용자 ID를 해석한다. Root/Hub 버전·image tag는 독립적으로 관리한다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 `palimpsest-client 0.2.3`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.2.0`(`hub/pyproject.toml`)이다. Python import 경로 `palimpsest_local`과 CLI `palimpsest`는 유지한다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값은 `0.2.0`이다. Kolla 배포는 image 기본 UID1000과 root 소유로 생성된 named volume의 경계를 bootstrap 직전에 조정하며, source image로부터 실제 `palimpsest` 사용자 ID를 해석한다. Root/Hub 버전·image tag는 독립적으로 관리한다.
 
 1분 요약:
 
@@ -261,7 +261,7 @@ flowchart LR
     hubapi --> hubredis[(Redis ephemeral tokens)]
     hubbuild[Separate Linux KVM build worker] --> hubsql
     hubbuild --> hubblob
-    hubbuild --> guestbuild[palimpsest-local build_layer guest network none]
+    hubbuild --> guestbuild[palimpsest-client build_layer guest network none]
     hubworker[Hub Glance export worker] --> hubsql
     hubworker --> glance[OpenStack Glance]
     hubworker --> qemuimg[qemu-img conversion]
@@ -305,9 +305,9 @@ flowchart LR
 | ML CPU compatibility proof | [`test_oci_ml_cpu_live.py`](tests/kvm/test_oci_ml_cpu_live.py), [`test_oci_ml_cpu_live_contract.py`](tests/unit/test_oci_ml_cpu_live_contract.py) | 두 공식 원본 pin과 공개 command override를 사용한 별도 opt-in. 순차 8GiB/2vCPU·network none에서 정확한 CPU matmul과 별도 guest-loopback HTTP Transformer health/반복 inference, v4 provenance, root/PID1, NIC/hostdev/host filesystem 부재 및 owned cleanup을 검사; host/external service reachability, pretrained model 품질, GPU 성공과 분리 |
 | disposable MySQL initialization diagnostic | 같은 service matrix의 `MYSQL_USER_RANDOM_PASSWORD`, `_service_probe_ok` | 원본 pin과 별도 파생 config를 인증하고 guest-only 난수 wrapper를 실행하는 테스트 경계. 이 사례만 mysqladmin ping의 exit0을 Unix-socket 도달성으로 판정하며 receipt의 authenticated_sql=false로 한정한다. 최종 초기화 readiness·비밀값 패턴 검사·정확한 owned root 폐기를 구분하며 public secret 전달 API가 아님 |
 | Hub API와 web console | [`hub/src/palimpsest_hub/main.py`](hub/src/palimpsest_hub/main.py), [`hub/src/palimpsest_hub/static/hub.html`](hub/src/palimpsest_hub/static/hub.html), [`hub/src/palimpsest_hub/auth.py`](hub/src/palimpsest_hub/auth.py), [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`api/builds.py`](hub/src/palimpsest_hub/api/builds.py) | `/v1` Keystone token/project scope, layer query/resumable upload/download, bundle, image-export와 system-admin-only build queue; `/app`은 같은 API의 browser client |
-| Hub persistence/ops | [`models.py`](hub/src/palimpsest_hub/models.py), [`services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`worker.py`](hub/src/palimpsest_hub/worker.py), [`services/builds.py`](hub/src/palimpsest_hub/services/builds.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py) | SQL rows·filesystem blobs가 정본; export와 build worker는 독립 process. build worker는 별도 host interpreter로 `palimpsest-local.build_layer`를 호출해 disposable KVM guest에서만 RUN 실행하고 결과를 private layer로 등록 |
+| Hub persistence/ops | [`models.py`](hub/src/palimpsest_hub/models.py), [`services/hub_store.py`](hub/src/palimpsest_hub/services/hub_store.py), [`services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`worker.py`](hub/src/palimpsest_hub/worker.py), [`services/builds.py`](hub/src/palimpsest_hub/services/builds.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py) | SQL rows·filesystem blobs가 정본; export와 build worker는 독립 process. build worker는 별도 host interpreter로 `palimpsest_local.build_layer`를 호출해 disposable KVM guest에서만 RUN 실행하고 결과를 private layer로 등록 |
 
-의존 방향은 `cli 또는 /app → Hub /v1 → SQL + blob store → 별도 worker → local VM runtime`이다. Hub API package는 local package의 Python 모듈을 import하지 않는다. Worker가 고정 argv로 호출하는 별도 `palimpsest-local[kvm]` interpreter만 guest build를 수행하며 사용자 Keystone token과 Hub service password를 전달하지 않는다.
+의존 방향은 `cli 또는 /app → Hub /v1 → SQL + blob store → 별도 worker → local VM runtime`이다. Hub API package는 local package의 Python 모듈을 import하지 않는다. Worker가 고정 argv로 호출하는 별도 `palimpsest-client[kvm]` interpreter만 guest build를 수행하며 사용자 Keystone token과 Hub service password를 전달하지 않는다.
 
 OCI `run --user`는 `OCIUserSpec.from_override_value`에서 빈 값 없는 이름/숫자와 선택 group으로 파싱하고 `LocalOCIRunRequest.user_override`로 전달한다. adapter → root preparation → boot intent가 typed override를 보존한다. `OCIProcessSpec.with_user`는 user만 바꾸며 materialization receipt의 원본 process는 수정하지 않는다. cloud-image 요청은 runtime stack 해석·실행 전에 거부한다.
 
@@ -387,8 +387,8 @@ PAX `x` 확장의 `size` record는 4MiB 확장 payload 상한 안에서 길이�
 ### 로컬 패키지
 
 - GitHub 개발 패키지는 `main`, `dev`, `codex/oci-root-phase1` push 또는 허용 branch의 수동 실행에서 생성한다. 기본 token은 read-only이며 검증을 통과한 publish job만 `contents: write`를 가진다. Concurrency는 ref 단위라 같은 commit을 공유하는 세 branch run이 서로를 대기열에서 취소하지 않는다. `scripts/publish_development_package.py`는 `package-<SHA>` tag/prerelease를 create-or-verify로 판정한다. 이미 정확히 존재하면 read와 byte 검증만 하고, 생성 conflict나 응답이 끊긴 mutation은 원격 상태를 다시 읽어 판정하며, 나머지가 정확한 partial release에만 빠진 asset을 올린다. 다른 tag·metadata·추가/중복 asset·bytes 불일치는 fail-closed이고 force-update·ref 삭제·asset 삭제·`--clobber`는 사용하지 않는다. 동시 게시 중인 asset은 `uploaded` 상태가 될 때까지 기다렸다가 검증하며, 수렴하지 않으면 실패한다. 이는 workflow의 non-overwrite 정책이며 repository-level tag immutability 보장은 아니다. wheel/sdist와 `SHA256SUMS` 다운로드·설치는 [설치 안내](docs/install.md)를 따른다. 개발 prerelease는 latest/stable이 아니고 VM 부팅·Gate 2 통과를 의미하지 않는다.
-- 사용자 설치 경로는 직접 Git VCS 설치다. 빠른 진입점은 [`install.md`](install.md), 패키지·플랫폼·설정 상세는 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md), 명령별 실행 순서·설정·플랫폼 제한은 [`docs/cli/workflows.md`](docs/cli/workflows.md)다. `palimpsest-local`은 repository root, `palimpsest-hub`는 `#subdirectory=hub` selector로 설치한다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
-- base package는 `palimpsest-local` Python 3.11+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
+- 사용자 설치 경로는 직접 Git VCS 설치다. 빠른 진입점은 [`install.md`](install.md), 패키지·플랫폼·설정 상세는 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md), 명령별 실행 순서·설정·플랫폼 제한은 [`docs/cli/workflows.md`](docs/cli/workflows.md)다. `palimpsest-client`는 repository root, `palimpsest-hub`는 `#subdirectory=hub` selector로 설치한다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
+- base package는 `palimpsest-client` Python 3.11+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
 - conventional macOS Apple Silicon은 Lima 2.1+ VZ(`lima-vz`)를 기본으로 사용한다. 명시적 실험용 `libvirt-hvf`는 Homebrew QEMU, `pkgconf`(`libvirt-python` 빌드 시), host libvirt, `[kvm]` extra, `qemu:///session` 및 `hdiutil`이 필요하며 conventional aarch64 cloud-image VM에만 적용된다. Linux KVM은 `/dev/kvm`, QEMU, `qemu:///system`, `default` network와 `cloud-localds`, `mksquashfs`, OpenSSH가 필요하다.
 - OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. OCI network는 `nat`·`host-only`·`none` 세 값만 허용하며 `nat`/`host-only`는 user-mode 지원 QEMU(`-netdev help`의 `user`)를 state 변경 전에 확인한다. guest 내부 loopback과 NIC 검증 때문에 kernel config의 `CONFIG_NET=y`, `CONFIG_INET=y`, `CONFIG_IP_PNP=y`, `CONFIG_VIRTIO_NET=y`를 요구한다. host bridge·libvirt network·firewall rule·IPv6·VM 간 L2는 제공하지 않는다.
 - OCI-root startup event service는 public 준비 connection과 bound monitor connection의 libvirt server keepalive를 위한 bounded 보조 thread일 뿐 materialization deadline을 늘리지 않는다. 10ms 이하 event timer, 1초 handshake/join 경계와 100ms event-lock 대기를 사용하지만 이는 libvirt syscall의 hard wall-clock deadline이 아니다. PID/token/libvirt identity, event-driver lock, strict integer health를 매 cycle과 foreground checkpoint에서 재검증한다. 실패 처리는 phase별로 다르다. `defineXML` 시도 뒤 durable definition 기록 전의 health loss는 기존 exact cleanup을 실행한다. durable definition 뒤 public preparation health loss는 inactive domain과 `defined` ledger를 그대로 보존한다. bound monitor가 activation intent/post-create 뒤 실패하여 connection을 quarantine한 경우에는 exact UUID의 cleanup-required ledger를 기록한다. 어느 phase에서든 quarantine된 exact connection은 자동 cleanup이나 close에 사용하지 않고 reconnect하지 않으며, guest/stage-1/monitor daemon 프로토콜은 바꾸지 않는다.
@@ -449,7 +449,7 @@ temporary MySQL/Redis 및 API/worker/network는 이 export 이후 종료했다.
 이는 Glance read→Hub export 경계만 검증하며 아래 별도 KVM build host의
 upload·queue·guest·SquashFS 계약은 이 사실만으로 승격하지 않는다.
 
-Server-side build를 사용할 때만 별도 Linux KVM host에 `palimpsest-local[kvm]`를 같은 reviewed ref로 설치하고 `PALIMPSEST_HUB_BUILDER_PYTHON`에 그 interpreter 절대 경로를 API/worker에 설정한다. Host에서 별도 `palimpsest-hub-build-worker` process를 supervision한다. Worker는 `/dev/kvm` read/write, `qemu:///system`, conventional cloud-image VM의 firmware/QEMU/cloud-localds/mksquashfs 전제를 요구하며 API container나 Docker socket에 의존하지 않는다. Store singleton flock과 SQL claim으로 한 job씩 처리한다. Timeout 또는 worker restart 시 private build state의 guest를 회수하지 못하면 `cleanup_failed`를 남기고 더 이상 새 job을 받지 않는다. 아래의 전용 KVM host 실기는 기능 경계의 증거이며 운영 계정·credential 분리나 host power-loss 복구의 증거는 아니다.
+Server-side build를 사용할 때만 별도 Linux KVM host에 `palimpsest-client[kvm]`를 같은 reviewed ref로 설치하고 `PALIMPSEST_HUB_BUILDER_PYTHON`에 그 interpreter 절대 경로를 API/worker에 설정한다. Host에서 별도 `palimpsest-hub-build-worker` process를 supervision한다. Worker는 `/dev/kvm` read/write, `qemu:///system`, conventional cloud-image VM의 firmware/QEMU/cloud-localds/mksquashfs 전제를 요구하며 API container나 Docker socket에 의존하지 않는다. Store singleton flock과 SQL claim으로 한 job씩 처리한다. Timeout 또는 worker restart 시 private build state의 guest를 회수하지 못하면 `cleanup_failed`를 남기고 더 이상 새 job을 받지 않는다. 아래의 전용 KVM host 실기는 기능 경계의 증거이며 운영 계정·credential 분리나 host power-loss 복구의 증거는 아니다.
 
 2026-09-24 사용자 승인 아래 별도 Nova instance(전용, `/dev/kvm` 노출,
 nested KVM)를 KVM build worker host로 사용해 처음으로 실제 upload→
@@ -491,7 +491,7 @@ API/worker/QEMU 계정 분리나 credential isolation을 검증하지 않는다.
 같은 UID 설정은 해당 probe의 private artifact 접근 문제를 해결한 방법이지
 운영 계정 구성을 요구하는 계약이 아니다.
 
-Worker는 SQL 접속 또는 queue claim 전에 설정된 별도 Local interpreter로 `python -I -m palimpsest_local.hub_builder preflight`를 실행해 x86_64 Linux `/dev/kvm`, KVM backend, 필수 root-owned 불변 tool과 read-only `qemu:///system` 접속을 확인한다. Guest 실행 증거는 아니며 전용 host 및 해당 interpreter의 Linux-native `palimpsest-local[kvm]` 의존 closure가 별도로 필요하다. 기존 Actions runner host의 KVM/libvirt·자원을 공유하는 colocated worker는 별도 계정/container만으로 격리되지 않는다. 전용 신규 KVM host가 권장되며 runner drain/fence를 수반하는 대안은 별도 승인 대상이다.
+Worker는 SQL 접속 또는 queue claim 전에 설정된 별도 Local interpreter로 `python -I -m palimpsest_local.hub_builder preflight`를 실행해 x86_64 Linux `/dev/kvm`, KVM backend, 필수 root-owned 불변 tool과 read-only `qemu:///system` 접속을 확인한다. Guest 실행 증거는 아니며 전용 host 및 해당 interpreter의 Linux-native `palimpsest-client[kvm]` 의존 closure가 별도로 필요하다. 기존 Actions runner host의 KVM/libvirt·자원을 공유하는 colocated worker는 별도 계정/container만으로 격리되지 않는다. 전용 신규 KVM host가 권장되며 runner drain/fence를 수반하는 대안은 별도 승인 대상이다.
 
 Linux child는 guest 실행 전에 `PR_SET_PDEATHSIG(SIGKILL)`과 parent PID를 확인하고 boot ID·PID·start ticks marker를 private build tree에 fsync한다. Worker 재시작은 그 process-group identity를 검증하고 중지한 뒤 guest cleanup을 수행한다. Identity/cleanup을 확인하지 못하면 job tree를 지우지 않고 `cleanup_failed`로 작업을 멈춘다. Portable test의 mock VM은 이 kernel/libvirt 동작의 live proof가 아니다.
 
@@ -1034,13 +1034,15 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-25 DMSLAB Kolla 운영 검증: v0.2.1 설치로 Hub API/worker가 healthy였지만 controller1의 `palimpsest_hub` Docker volume root는 0:0 mode0755였고 image process는 1000:1000이므로 두 container에서 실제 파일 생성이 permission denied였다. v0.2.2 role은 이미 pin된 Hub API image를 사용한 임시 root container가 named volume의 **root만** `palimpsest:palimpsest`로 chown한 후 비특권 bootstrap과 API/worker를 실행한다. 기존 blob/CAS 하위 경로는 recursive 변경하지 않는다. 같은 발행 image의 disposable named volume에서 수정 전 쓰기 실패 → 소유권 초기화 → UID1000 쓰기 성공을 재현했다. 이 변경은 Hub artifact/schema/auth 계약과 image 자체는 바꾸지 않는다. 운영 배포 후 인증 업로드·정리 증거는 별도 확인한다.
 
+2026-09-25 배포판 이름 후속 변경: root PyPI 프로젝트와 배포판 식별자는 `palimpsest-client 0.2.3`이며, `palimpsest_local` import와 `palimpsest` CLI, 저장된 libvirt domain marker namespace와 OCI artifact marker는 유지한다. 별도 `palimpsest-hub 0.2.0` image/서비스/스키마는 변경하지 않는다. 최초 PyPI 발행에는 GitHub `openstack-afterglow/palimpsest`의 `release.yml` + `pypi` environment에 대한 `palimpsest-client` pending trusted publisher가 필요하다. PyPI publish 성공 뒤에만 GitHub Release job이 실행된다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "7d7d39aaeffd5d00fc4521f6a6437c21e03caf27bf9a1609d0300adb01888456",
-  "reviewed_at": "2026-09-25T00:15:14Z",
-  "summary": "0.2.2 role: short-lived root container in pinned Hub image sets only named-volume root owner to runtime palimpsest user before unprivileged bootstrap; image and Hub API unchanged; disposable volume write failed before and passed after."
+  "source_sha256": "5e04bd4068e730bfaa40e8a8e142bec924f2e184dd4b5feebad7f39ab0124b77",
+  "reviewed_at": "2026-09-25T01:15:34Z",
+  "summary": "0.2.3: root PyPI distribution renamed palimpsest-local -> palimpsest-client for trusted publisher; import palimpsest_local, CLI, role files, domain/artifact markers and Hub 0.2.0 unchanged; wheel build/install smoke and portable lanes pass."
 }
 ```
 <!-- architecture-review:end -->

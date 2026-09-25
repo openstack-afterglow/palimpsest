@@ -80,7 +80,7 @@ def _verify_install(wheel: Path, workspace: Path, uv: str, version: str) -> None
     )
     probe = (
         "import importlib.metadata, pathlib, sys; import palimpsest_local; "
-        f"assert importlib.metadata.version('palimpsest-local') == {version!r}; "
+        f"assert importlib.metadata.version('palimpsest-client') == {version!r}; "
         "assert pathlib.Path(palimpsest_local.__file__).is_relative_to(pathlib.Path(sys.prefix)); "
         "from palimpsest_local.oci_initramfs import _bootstrap_stage1_binary; "
         "_bootstrap_stage1_binary()"
