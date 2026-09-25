@@ -4,6 +4,16 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-25
+
+`palimpsest-local` Kolla role hotfix; Hub image distribution remains 0.2.0.
+Before bootstrap, a short-lived root container from the pinned Hub API image
+sets the persistent Hub volume root owner to the image's `palimpsest` user.
+Docker creates a new named volume root as `root:root` (0755), while the Hub
+process runs as UID 1000; without this step even a healthy API cannot stage an
+upload. The ownership step changes only the volume root, never recursive
+application data, and runs before the regular unprivileged bootstrap.
+
 ## [0.2.1] - 2026-09-25
 
 `palimpsest-local 0.2.1` only. `palimpsest-hub` stays at 0.2.0 and the packaged

@@ -75,7 +75,7 @@ def test_container_env_values_are_explicitly_stringified():
     bootstrap_env = next(
         task["community.docker.docker_container"]["env"]
         for task in yaml.safe_load(bootstrap_text)
-        if "community.docker.docker_container" in task
+        if "env" in task.get("community.docker.docker_container", {})
     )
     env_maps = {
         "bootstrap": bootstrap_env,
