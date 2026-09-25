@@ -105,7 +105,7 @@ SPECIAL_FILES = {
     "gate2": ("tests/e2e/test_local_oci_build_run.py",),
     "hub": tuple(
         f"hub/tests/test_{name}.py"
-        for name in ("auth", "builds", "hub_api", "image_exports", "migrate", "upload_limits")
+        for name in ("auth", "builds", "database_pool", "hub_api", "image_exports", "migrate", "upload_limits")
     ),
 }
 SPECIAL_NOTES = {

@@ -1040,13 +1040,15 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-25 Hub pool incident review: Kolla PR #83 배포 뒤 production 인증 `POST /api/v1/palimpsest/hub/uploads` 첫 요청이 500, 같은 disposable upload의 두 번째 요청은 start/append/read/abort/gone 200/200/200/204/404였다. Hub traceback은 `_expire_project_uploads` 첫 SQL checkout의 asyncmy pre-ping에서 uvloop `RuntimeError` (`TCPTransport closed=True`, `handler is closed`)가 DBAPI disconnect 판정을 우회함을 보였다. 독립 SQLAlchemy 재현에서도 기존 `pool_pre_ping=True`의 `handle_error` 미호출과 예외 전파를 확인했다. Hub 0.2.1은 각 asyncmy engine의 ping에만 닫힌 transport 판정을 붙여 pool에 `False`를 돌려 새 연결을 사용하며, unrelated RuntimeError와 in-flight transaction은 그대로 실패한다. Root 배포판 0.2.3, schema/auth/blob 계약과 Hub worker 구조는 바뀌지 않는다. 회귀 테스트는 fix 전 수집 실패/독립 SQLAlchemy 예외 재현 뒤 수정 후 통과했으며, 이 문단 작성 시점에 새 Hub image 운영 배포는 아직 검증되지 않았다.
 
+2026-09-25 Hub CI lane 후속: 새 `hub/tests/test_database_pool.py`가 최초 dev run `36169071658`의 test-lane 정본에 누락되어 portable/lint가 공통 실패했다. `scripts/test_lanes.py`의 hub 전용 lane에 해당 파일을 포함하고 `list --check`가 전체 테스트 파일의 정확한 분류를 확인했다. Hub API/worker는 Docker daemon builder에서 linux/amd64·linux/arm64 각 실제 image build와 image 내부 `palimpsest-hub 0.2.1` import smoke가 통과했다. docker-container builder의 Docker Hub DNS 불가를 daemon-backed builder로 우회했으며 CI와 새 digest 운영 승격은 별도 결과가 필요하다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6d700bc4b40db619159b15cac9ccc87767e501ad68175e5d806e33a297e3c4f0",
-  "reviewed_at": "2026-09-25T17:43:39Z",
-  "summary": "Hub 0.2.1 closed asyncmy transport pre-ping recovery; root 0.2.3 unchanged; Hub 100-test suite passed; production image promotion pending"
+  "source_sha256": "b12d6aa474e3514bc5ad88444a5731228910d0d9101738cc94718b476a89e357",
+  "reviewed_at": "2026-09-25T17:48:00Z",
+  "summary": "Hub 0.2.1 stale asyncmy ping recovery tested in four local images; classified new Hub test in canonical lane after CI manifest failure; production digest rollout pending"
 }
 ```
 <!-- architecture-review:end -->

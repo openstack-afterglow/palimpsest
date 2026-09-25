@@ -55,6 +55,11 @@ assertions, fixtures or production safety checks. A documentation-only edit
 can produce an empty test recommendation; that is not a successful test run.
 Hub tests use their own environment and explicit lane.
 
+`hub/tests/test_database_pool.py` checks that a closed-transport pre-ping renews
+the pooled connection and that an unrelated runtime error still propagates. The
+`hub` lane includes this file; the fixture is isolated SQLite and does not
+claim live MariaDB failover or in-flight transaction recovery.
+
 The Hub's server-build path has a focused project-scoped HTTP contract lane:
 
 ```sh
