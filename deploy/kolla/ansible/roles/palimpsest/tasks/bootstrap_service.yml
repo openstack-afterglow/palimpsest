@@ -9,6 +9,23 @@
   delegate_to: "{{ groups['palimpsest'] | first }}"
   when: not (palimpsest_source_mode | default(false) | bool)
 
+- name: Bootstrap | Set Hub volume owner to image runtime user
+  become: true
+  community.docker.docker_container:
+    name: palimpsest_hub_volume_owner
+    image: "{{ palimpsest_api_image_ref }}"
+    pull: never
+    command: ["chown", "palimpsest:palimpsest", "{{ palimpsest_hub_path }}"]
+    user: "0:0"
+    state: started
+    detach: false
+    cleanup: true
+    network_mode: none
+    volumes:
+      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+  run_once: true
+  delegate_to: "{{ groups['palimpsest'] | first }}"
+
 - name: Bootstrap | Run Palimpsest Hub bootstrap
   become: true
   community.docker.docker_container:

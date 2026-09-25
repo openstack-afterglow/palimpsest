@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. 로컬 패키지(`palimpsest-local`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 `palimpsest-local 0.2.0`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.2.0`(`hub/pyproject.toml`)이다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값도 `0.2.0`이다. 이 버전 정렬은 tag·PyPI·GHCR 게시 성공의 증거가 아니다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. 로컬 패키지(`palimpsest-local`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 `palimpsest-local 0.2.2`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.2.0`(`hub/pyproject.toml`)이다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값은 `0.2.0`이다. Kolla 배포는 image 기본 UID1000과 root 소유로 생성된 named volume의 경계를 bootstrap 직전에 조정하며, source image로부터 실제 `palimpsest` 사용자 ID를 해석한다. Root/Hub 버전·image tag는 독립적으로 관리한다.
 
 1분 요약:
 
@@ -1032,13 +1032,15 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-25 release/version maintenance review: PR #4가 통합된 로컬 `dev` source는 OCI-root, conventional cloud-image 및 Hub 경계를 유지하고, root `palimpsest-local`·Hub `palimpsest-hub`를 각각 `0.2.0`으로 맞춘다. Kolla의 Hub API/worker image 기본 tag는 `0.2.0`이며 source-build mode의 별도 pinned ref를 바꾸지 않는다. `v*` tag push의 `release.yml`은 root wheel/sdist 검증 및 실제 native KVM clean-host `kvm-proof` 성공을 요구한 뒤 PyPI와 GitHub release를 게시한다. 같은 tag의 `hub-docker.yml`은 자체 Hub unit gate 뒤 GHCR Hub API·worker에 semver (`0.2.0`/`v0.2.0`) tag를 생성한다. 이 두 발행 경로는 서로의 성공을 자동 증명하지 않으며, 현재 버전 선언만으로 release readiness나 게시를 주장하지 않는다. 병합 후 conventional-cloud x86 KVM boot와 cloud-init-disabled reboot의 native readiness 실기가 남아 있다. OpenSpec 디렉터리는 이 작업트리에 없으며 새 spec 파일을 만들지 않는다. 과거 branch/SHA별 qualification과 위 날짜별 검토는 당시 증거 그대로 둔다.
 
+2026-09-25 DMSLAB Kolla 운영 검증: v0.2.1 설치로 Hub API/worker가 healthy였지만 controller1의 `palimpsest_hub` Docker volume root는 0:0 mode0755였고 image process는 1000:1000이므로 두 container에서 실제 파일 생성이 permission denied였다. v0.2.2 role은 이미 pin된 Hub API image를 사용한 임시 root container가 named volume의 **root만** `palimpsest:palimpsest`로 chown한 후 비특권 bootstrap과 API/worker를 실행한다. 기존 blob/CAS 하위 경로는 recursive 변경하지 않는다. 같은 발행 image의 disposable named volume에서 수정 전 쓰기 실패 → 소유권 초기화 → UID1000 쓰기 성공을 재현했다. 이 변경은 Hub artifact/schema/auth 계약과 image 자체는 바꾸지 않는다. 운영 배포 후 인증 업로드·정리 증거는 별도 확인한다.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "172e6b44a7bda217d41c10233afc0edb3653331d68d728fe045f67023d529a12",
-  "reviewed_at": "2026-09-24T23:31:59Z",
-  "summary": "0.2.1: Kolla role SSL_VERIFY env now renders as a string for docker_container in API/worker/bootstrap; regression contract added. No runtime or Hub change."
+  "source_sha256": "7d7d39aaeffd5d00fc4521f6a6437c21e03caf27bf9a1609d0300adb01888456",
+  "reviewed_at": "2026-09-25T00:15:14Z",
+  "summary": "0.2.2 role: short-lived root container in pinned Hub image sets only named-volume root owner to runtime palimpsest user before unprivileged bootstrap; image and Hub API unchanged; disposable volume write failed before and passed after."
 }
 ```
 <!-- architecture-review:end -->
