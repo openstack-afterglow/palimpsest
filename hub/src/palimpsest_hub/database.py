@@ -9,6 +9,23 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _recover_closed_transport_ping(engine: AsyncEngine) -> None:
+    ping = engine.sync_engine.dialect.do_ping
+
+    def do_ping(connection) -> bool:
+        try:
+            return ping(connection)
+        except RuntimeError as exc:
+            # asyncmy lets uvloop's closed-socket RuntimeError escape its DBAPI adapter.
+            # Report only that disconnected transport to SQLAlchemy's pool pre-ping.
+            message = str(exc)
+            if "TCPTransport closed=True" not in message or "handler is closed" not in message:
+                raise
+            return False
+
+    engine.sync_engine.dialect.do_ping = do_ping
+
+
 def init_db(
     database_url: str,
     *,
@@ -30,6 +47,8 @@ def init_db(
         pool_timeout=pool_timeout,
         connect_args={"connect_timeout": connect_timeout},
     )
+    if _engine.sync_engine.dialect.driver == "asyncmy":
+        _recover_closed_transport_ping(_engine)
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 

@@ -12,7 +12,18 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Root release target:** `palimpsest-client` 0.2.3; the independently versioned `palimpsest-hub` Python distribution remains 0.2.0. The root PyPI publisher is pending; source metadata is not proof of publication.
+- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The independently versioned `palimpsest-hub` Python distribution remains 0.2.0.
+
+## Install from PyPI
+
+Requires Python 3.11 or newer:
+
+```sh
+python3.12 -m pip install "palimpsest-client==0.2.3"
+palimpsest --version
+```
+
+For an isolated one-off invocation, `uvx --from palimpsest-client==0.2.3 palimpsest --version` also reports `0.2.3`.
 
 ## Install directly from GitHub
 
@@ -116,11 +127,13 @@ set the independent Hub Python distribution version.
 
 A repository tag labels both `ghcr.io/openstack-afterglow/palimpsest-hub-api`
 and `ghcr.io/openstack-afterglow/palimpsest-hub-worker` with tags derived from
-that repository tag, not from the independent Hub wheel version. Root PyPI
-publication requires release artifact verification, native stage-1 KVM proof
-on an enabled self-hosted Linux x86_64 runner, and a registered trusted
-publisher for `palimpsest-client`. The publisher is pending; this documentation
-does not claim a 0.2.3 PyPI publication or Kolla deployment.
+that repository tag, not from the independent Hub wheel version. The
+`v0.2.3` [root release workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630018)
+passed artifact verification and native stage-1 KVM proof, published through the
+`palimpsest-client` trusted publisher, and created the GitHub Release. The
+separate [Hub image workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630008)
+published API and worker images for that tag. A release does not by itself
+establish that an operator has deployed those images.
 
 ## Hub configuration & Standalone Service
 

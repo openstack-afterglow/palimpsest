@@ -1,15 +1,21 @@
 # Detailed installation and configuration guide
 
-This guide covers end-user installation from a GitHub VCS URL, package
-selection, supported host/runtime combinations, external dependencies, initial
-configuration, upgrades, and administrator-owned Linux deployment. It does not
-use a repository checkout as the user installation mechanism.
+This guide covers end-user installation from PyPI or a GitHub VCS URL,
+package selection, supported host/runtime combinations, external dependencies,
+initial configuration, upgrades, and administrator-owned Linux deployment.
+It does not use a repository checkout as the user installation mechanism.
 
-Palimpsest Local requires Python 3.11 or newer. The root release target is
-`palimpsest-client 0.2.3`; its trusted PyPI publisher is pending, so this is
-not a claim of publication. pip needs Git on `PATH` and network access to
-GitHub for a VCS install. The independently versioned Hub distribution remains
-`palimpsest-hub 0.2.0` in this tree.
+Palimpsest Local requires Python 3.11 or newer. The root distribution
+[`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
+is published on PyPI. The independently versioned Hub distribution is
+`palimpsest-hub 0.2.1` in this tree; this source version is not a PyPI release.
+Git and outbound HTTPS access to GitHub
+are required only for the direct VCS installation examples below.
+
+Install the published CLI with `python3.12 -m pip install "palimpsest-client==0.2.3"`,
+then run `palimpsest --version`. The isolated invocation
+`uvx --from palimpsest-client==0.2.3 palimpsest --version` was verified against
+the published wheel and reports `0.2.3`.
 
 ## Package catalog
 
@@ -35,15 +41,21 @@ while source builds bind to the configured checkout commit SHA. Verify both
 `0.2.0` Hub images before deploying this default; source metadata
 alone does not establish image availability.
 
+The role default remains older than the Hub 0.2.1 source. Operators deploying
+the closed-connection fix must pin reviewed API and worker image digests in
+Kolla globals; a Python version bump alone does not change running containers.
+
 Repository tags label both
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` with tags derived from
-the repository tag, not from the Hub wheel version. The separate root PyPI
-workflow requires successful release artifact verification, its native
-stage-1 KVM proof on an enabled self-hosted Linux x86_64 runner, and a
-registered trusted publisher for `palimpsest-client`. A development-package
-prerelease, PR check, or skipped KVM job cannot substitute for that gate.
-No 0.2.3 PyPI publication or Kolla deployment is claimed here.
+the repository tag, not from the Hub wheel version. The root
+[`v0.2.3` release workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630018)
+completed artifact verification and native stage-1 KVM proof, published through
+the `palimpsest-client` trusted publisher, and created the GitHub Release. The
+separate [Hub image workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630008)
+published tagged API and worker images. A PR check, development prerelease,
+or skipped KVM job alone cannot substitute for the root release gate; neither
+published artifact proves an operator deployment.
 
 ## Supported hosts and runtime scope
 
@@ -173,6 +185,12 @@ worker only reads `DATABASE_URL`, the database pool settings,
 `PALIMPSEST_HUB_LOCAL_PATH`, `PALIMPSEST_HUB_MAX_BLOB_BYTES`,
 `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS`, and
 `PALIMPSEST_HUB_BUILDER_PYTHON`; it does not require Redis or `OS_*` credentials.
+
+On a reused asyncmy connection whose uvloop TCP transport was already closed,
+Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connection
+before the request's SQL operation. It does not retry transactions that lose
+their connection after checkout; reconcile those requests before retrying.
+
 The build worker executes `python -I -m palimpsest_local.hub_builder preflight`
 using that exact Local interpreter **before** opening SQL or claiming a job.
 Preflight requires an x86_64 Linux KVM host, an accessible system libvirt URI,

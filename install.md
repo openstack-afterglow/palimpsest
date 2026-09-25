@@ -1,10 +1,13 @@
 # Install Palimpsest
 
-Palimpsest requires Python 3.11 or newer. The root `palimpsest-client` release
-target is `0.2.3`, not a claim that its PyPI package has been published.
-Git and outbound HTTPS access to GitHub are required for direct VCS installation.
-Hub's independently versioned Python package (`palimpsest-hub`) remains `0.2.0`
-in this source tree; a repository release tag does not publish that wheel.
+Palimpsest requires Python 3.11 or newer. The root
+[`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
+is published on PyPI; install it with
+`python3.12 -m pip install "palimpsest-client==0.2.3"` and verify with
+`palimpsest --version`. Git and outbound HTTPS access to GitHub are required
+only for the VCS installation examples below. Hub's independent Python package
+(`palimpsest-hub`) remains `0.2.0` in this source tree; the root release tag
+does not publish that wheel.
 
 ## 1. Install the Local CLI
 
@@ -42,8 +45,8 @@ If an existing `pyproject.toml` says `requires-python = ">=3.10"`, raise it to
 `">=3.11"` before `uv add`, or keep the project range and use `uv tool install`
 instead. uv resolves dependencies for the entire declared range, not only the
 pinned interpreter. `--frozen` is not a compatibility fix. A successful
-metadata probe for an installed 0.2.3 root package must report `0.2.3`;
-before promotion, the unpinned default branch may still resolve an older
+metadata probe for an installed 0.2.3 root package must report `0.2.3`.
+The unpinned Git URL follows the default branch and can resolve a different
 version. Output from a same-named local application does not verify that
 `palimpsest-client` was installed.
 

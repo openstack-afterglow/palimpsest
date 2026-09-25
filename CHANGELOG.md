@@ -4,10 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.2.3] - 2026-09-25 (pending PyPI publication)
+### Hub 0.2.1 (not independently published to PyPI)
+
+- Recover stale pooled asyncmy connections whose closed uvloop transport raises a non-DBAPI `RuntimeError` during SQLAlchemy pre-ping. Only the closed-transport signature is treated as a disconnect; unrelated runtime errors and interrupted transactions still propagate. Root `palimpsest-client` remains 0.2.3.
+
+## [0.2.3] - 2026-09-25
 
 - Renamed the root PyPI distribution from `palimpsest-local` to `palimpsest-client` for 0.2.3. The Python module `palimpsest_local`, CLI `palimpsest`, optional `[kvm]` extra, and packaged Kolla role remain unchanged.
-- The trusted publisher for `palimpsest-client` is pending registration; this entry does not claim a PyPI release. The independent `palimpsest-hub` Python distribution remains 0.2.0.
+- The `palimpsest-client` trusted publisher published the root wheel and sdist to [PyPI](https://pypi.org/project/palimpsest-client/0.2.3/), and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3) contains the verified artifacts. The independent `palimpsest-hub` Python distribution remains 0.2.0; publication is not deployment.
 
 ## [0.2.2] - 2026-09-25
 
