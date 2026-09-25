@@ -66,7 +66,7 @@ def test_kolla_required_assets_exist_without_standalone_package():
 
 def test_root_metadata_owns_kolla_shared_data_without_runtime_dependencies():
     project = root_pyproject["project"]
-    assert project["name"] == "palimpsest-local"
+    assert project["name"] == "palimpsest-client"
     assert project["dependencies"] == []
     assert "service" not in project["optional-dependencies"]
     assert all(
@@ -112,11 +112,11 @@ def test_root_wheel_builds_and_installs_kolla_shared_data(tmp_path: Path):
     wheels = list(dist_dir.glob("*.whl"))
     assert len(wheels) == 1
     wheel_path = wheels[0]
-    assert f"palimpsest_local-{root_version}" in wheel_path.name
+    assert f"palimpsest_client-{root_version}" in wheel_path.name
 
     with zipfile.ZipFile(wheel_path, "r") as zf:
         namelist = zf.namelist()
-        data_prefix = f"palimpsest_local-{root_version}.data/data/share/kolla-ansible/ansible/roles/palimpsest/"
+        data_prefix = f"palimpsest_client-{root_version}.data/data/share/kolla-ansible/ansible/roles/palimpsest/"
         role_files = [name for name in namelist if name.startswith(data_prefix)]
         assert role_files, "No shared-data role files found in wheel"
 
@@ -138,7 +138,7 @@ def test_root_wheel_builds_and_installs_kolla_shared_data(tmp_path: Path):
     assert (installed_role / "templates" / "palimpsest.conf.j2").is_file()
 
     res_uninst = subprocess.run(
-        ["uv", "pip", "uninstall", "--python", str(venv_python), "palimpsest-local"],
+        ["uv", "pip", "uninstall", "--python", str(venv_python), "palimpsest-client"],
         capture_output=True,
         text=True,
     )

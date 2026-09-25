@@ -122,8 +122,8 @@ wheels = [
 ]
 
 [[package]]
-name = "palimpsest-local"
-version = "0.2.2"
+name = "palimpsest-client"
+version = "0.2.3"
 source = { editable = "." }
 
 [package.optional-dependencies]

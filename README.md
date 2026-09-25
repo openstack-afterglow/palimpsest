@@ -1,15 +1,18 @@
 # Palimpsest Local
 
-`palimpsest-local` is a Python 3.11+ CLI for managing Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered virtual machines.
-
-It provides the `palimpsest` command and keeps local artifacts, tags, run state, and build records under XDG state directories. The base package has no required Python runtime dependencies; Linux KVM support is an opt-in extra.
+`palimpsest-client` 0.2.3 is the root Python 3.11+ distribution for managing
+Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered
+virtual machines. The Python module remains `palimpsest_local` and the CLI
+remains `palimpsest`. Local artifacts, tags, run state, and build records live
+under XDG state directories. The base package has no required Python runtime
+dependencies; Linux KVM support is an opt-in extra.
 
 ## Status
 
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **0.2.0 release target:** `palimpsest-local` and the independently versioned `palimpsest-hub` Python distribution. This is not a claim of a published tag, PyPI distribution, or GHCR image.
+- **Root release target:** `palimpsest-client` 0.2.3; the independently versioned `palimpsest-hub` Python distribution remains 0.2.0. The root PyPI publisher is pending; source metadata is not proof of publication.
 
 ## Install directly from GitHub
 
@@ -20,7 +23,7 @@ Install the CLI into an existing Python 3.11+ environment with pip:
 
 ```sh
 python3.12 -m pip install \
-  "git+https://github.com/openstack-afterglow/palimpsest"
+  "palimpsest-client @ git+https://github.com/openstack-afterglow/palimpsest"
 palimpsest --version
 ```
 
@@ -30,7 +33,7 @@ Python, use an isolated uv tool environment:
 ```sh
 uv python install 3.11
 uv tool install --python 3.11 \
-  "palimpsest-local @ git+https://github.com/openstack-afterglow/palimpsest"
+  "palimpsest-client @ git+https://github.com/openstack-afterglow/palimpsest"
 palimpsest --version
 ```
 
@@ -42,8 +45,8 @@ project explicitly instead of accepting `uv init`'s system-Python default:
 uv python install 3.11
 uv init --bare --python 3.11
 uv python pin 3.11
-uv add "git+https://github.com/openstack-afterglow/palimpsest"
-uv run python -c "import importlib.metadata as m; print(m.version('palimpsest-local'))"
+uv add "palimpsest-client @ git+https://github.com/openstack-afterglow/palimpsest"
+uv run python -c "import importlib.metadata as m; print(m.version('palimpsest-client'))"
 uv run palimpsest --version
 ```
 
@@ -53,9 +56,9 @@ For an existing project whose `pyproject.toml` says
 isolated `uv tool install` path. `uv python pin` selects an interpreter but does
 not narrow the project's supported range; `--frozen` also does not make Python
 3.10 compatible. If a local project defines its own `palimpsest` command, the
-metadata probe above distinguishes `palimpsest-local` from that command.
+metadata probe above distinguishes `palimpsest-client` from that command.
 
-`uv add` records `palimpsest-local` as a Git source in `pyproject.toml` and
+`uv add` records `palimpsest-client` as a Git source in `pyproject.toml` and
 locks the resolved commit in `uv.lock`. The unpinned commands follow the
 repository's default branch. For a reproducible installation, pin the full
 40-character commit SHA that you reviewed:
@@ -64,10 +67,10 @@ repository's default branch. For a reproducible installation, pin the full
 PALIMPSEST_REF="FULL_40_CHARACTER_COMMIT_SHA"
 
 python3.12 -m pip install \
-  "git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
+  "palimpsest-client @ git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
 
 uv add \
-  "git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
+  "palimpsest-client @ git+https://github.com/openstack-afterglow/palimpsest@${PALIMPSEST_REF}"
 ```
 
 Choose the distribution that matches the role:
@@ -75,7 +78,7 @@ Choose the distribution that matches the role:
 ```sh
 # Linux libvirt/KVM or experimental macOS libvirt/HVF support.
 python3.12 -m pip install --upgrade \
-  "palimpsest-local[kvm] @ git+https://github.com/openstack-afterglow/palimpsest.git@${PALIMPSEST_REF}"
+  "palimpsest-client[kvm] @ git+https://github.com/openstack-afterglow/palimpsest.git@${PALIMPSEST_REF}"
 
 # Standalone Hub API/worker package from the same reviewed ref.
 python3.12 -m venv "$HOME/.venvs/palimpsest-hub"
@@ -85,7 +88,7 @@ python3.12 -m venv "$HOME/.venvs/palimpsest-hub"
 "$HOME/.venvs/palimpsest-hub/bin/python" -m pip show palimpsest-hub
 ```
 
-`palimpsest-local` provides the `palimpsest` CLI and has no required Python
+`palimpsest-client` provides the `palimpsest` CLI and has no required Python
 runtime dependency. Its `[kvm]` extra adds `libvirt-python>=10.0.0` only; it does
 not install QEMU, libvirt, firmware, host permissions, Lima, Docker/Buildx,
 Skopeo, or other host executables. `palimpsest-hub` is a separate server
@@ -107,18 +110,17 @@ The root wheel also ships the `palimpsest` Kolla-Ansible role at
 `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
 Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
 Kolla-Ansible independently. This source role defaults to Hub image tag `0.2.0`,
-while source builds use the configured checkout SHA. Do not deploy this default
-before verifying both Hub images are published; the root package version does
-not automatically set the independent Hub Python distribution version.
+while source builds use the configured checkout SHA. Verify both Hub images
+before deploying this default; the root package version does not automatically
+set the independent Hub Python distribution version.
 
-A repository `v0.2.0` tag is intended to produce both
-`ghcr.io/openstack-afterglow/palimpsest-hub-api` and
-`ghcr.io/openstack-afterglow/palimpsest-hub-worker` with `0.2.0` and `v0.2.0`
-tags. Those are image tags derived from the repository tag, not Hub wheel
-versions. The root PyPI release waits for release artifact verification **and**
-the native stage-1 KVM proof on an enabled self-hosted Linux x86_64 runner;
-development-package artifacts and PR KVM checks do not publish PyPI. None of
-the 0.2.0 tag, image or PyPI publication, or Kolla deployment is asserted here.
+A repository tag labels both `ghcr.io/openstack-afterglow/palimpsest-hub-api`
+and `ghcr.io/openstack-afterglow/palimpsest-hub-worker` with tags derived from
+that repository tag, not from the independent Hub wheel version. Root PyPI
+publication requires release artifact verification, native stage-1 KVM proof
+on an enabled self-hosted Linux x86_64 runner, and a registered trusted
+publisher for `palimpsest-client`. The publisher is pending; this documentation
+does not claim a 0.2.3 PyPI publication or Kolla deployment.
 
 ## Hub configuration & Standalone Service
 
@@ -130,7 +132,7 @@ Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, b
 
 - **Hub API:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`; `/app` serves the web console).
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`).
-- **Isolated Build Worker:** `palimpsest-hub-build-worker` on a separately provisioned Linux `/dev/kvm` host, with `PALIMPSEST_HUB_BUILDER_PYTHON` set to an absolute interpreter containing `palimpsest-local[kvm]` at the same reviewed source ref. Share its SQL database and Hub blob path with the API; do not place the worker or a Docker socket inside the API container.
+- **Isolated Build Worker:** `palimpsest-hub-build-worker` on a separately provisioned Linux `/dev/kvm` host, with `PALIMPSEST_HUB_BUILDER_PYTHON` set to an absolute interpreter containing `palimpsest-client[kvm]` at the same reviewed source ref. Share its SQL database and Hub blob path with the API; do not place the worker or a Docker socket inside the API container.
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
 - **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies source tables into an empty initialized destination; it is not bootstrap.
 
@@ -359,7 +361,7 @@ The KVM runtime requires:
 - Linux x86_64 with `/dev/kvm`
 - QEMU, libvirt, `qemu-img`, `cloud-localds`, `mksquashfs`, OpenSSH
 - a configured `qemu:///system` connection and `default` libvirt network
-- `palimpsest-local[kvm]`
+- `palimpsest-client[kvm]`
 
 Run a base image and ordered layers:
 

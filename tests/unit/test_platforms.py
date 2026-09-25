@@ -356,7 +356,7 @@ def test_preflight_kvm_wraps_missing_libvirt_python_as_lifecycle_error(monkeypat
     monkeypatch.setattr(platforms.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def raise_unavailable():
-        raise kvm_module.KvmUnavailable("libvirt-python is not installed; install palimpsest-local[kvm]")
+        raise kvm_module.KvmUnavailable("libvirt-python is not installed; install palimpsest-client[kvm]")
 
     monkeypatch.setattr(kvm_module, "_libvirt", raise_unavailable)
     host = platforms.HostPlatform(system="Linux", machine="x86_64")
@@ -423,7 +423,7 @@ def test_preflight_hvf_wraps_missing_libvirt_python_as_lifecycle_error(tmp_path:
     monkeypatch.setattr(platforms.shutil, "which", lambda name: str(emulator))
 
     def raise_unavailable():
-        raise kvm_module.KvmUnavailable("libvirt-python is not installed; install palimpsest-local[kvm]")
+        raise kvm_module.KvmUnavailable("libvirt-python is not installed; install palimpsest-client[kvm]")
 
     monkeypatch.setattr(kvm_module, "_libvirt", raise_unavailable)
     host = platforms.HostPlatform(system="Darwin", machine="aarch64")
