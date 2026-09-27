@@ -667,10 +667,10 @@ GitHub `Test` workflow는 Linux portable 6 shard와 macOS portable 4 shard를 `m
 - aggregator 세 개(`Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof`)만 `if: always()`와 `needs:`를 가진다. 각 aggregator의 정확한 `needs`와, 성공만 받는 단일 verdict step(`env`·`run` 문자열, `shell`·`defaults`·`continue-on-error` 부재)도 고정한다. `test.yml`의 모든 job(11개)의 job key 집합도 정확히 고정한다. job-level `env`·`permissions`·`continue-on-error`는 어느 job에도 없고, `defaults`는 `hub`만 가지며 값(`{run: {working-directory: hub}}`)까지 고정한다. 새 job은 계약의 표에 추가해야 한다.
 - `test.yml`의 어느 step에도 `shell`·`continue-on-error`가 없고, step `if`는 건너뛰지 않는 `always()`뿐이다.
 - 테스트 job 앞에는 gate job이 없다.
-- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 정확한 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. reusable workflow 호출 job은 없어야 하고, `test.yml` trigger는 정확히 `workflow_call`과 `main`·`dev`의 push·`pull_request`다. 어느 workflow도 `pull_request_target`·`workflow_run` trigger를 쓰지 않는다. 이 계약은 workflow 형태만 고정한다. `kvm`에는 아직 event gate가 없어 `pull_request` 실행도 이 runner에 온다. [`AGENTS.md`](AGENTS.md) 규칙 10은 두 층을 요구한다. 하나는 `pull_request` 실행을 막는 YAML event gate이고, 다른 하나는 그 gate를 지우는 PR에 대한 설정 backstop이다. gate 추가는 `Required native KVM proof`의 PR 의미와 계약의 `kvm` `if` 고정을 함께 바꿔야 하므로 소유자 결정을 기다린다.
-- shard별 node 수와 shard 합계는 CI에서 검사하지 않고 출력만 한다. 고정된 명령 문자열과 분할 unit test는 `--shard`가 빠지는 wrapper 위험만 막는다. `pyproject.toml`의 `addopts`나 conftest hook 같은 workflow 밖의 무력화는 막지 않는다. 이 차이는 [`AGENTS.md`](AGENTS.md) 규칙 5에 정본 규칙과 다른 점으로 적혀 있고 소유자 결정을 기다린다. shard job이 아닌 job의 step 내용(step `env`, `$GITHUB_ENV` step)과 `test.yml` 밖 workflow의 job 형태도 고정하지 않는다.
+- `Test` workflow에서 self-hosted runner를 쓰는 job은 `kvm`뿐이고, aggregator 밖의 job-level `if:`도 `kvm`의 `vars.PALIMPSEST_KVM_ENABLED` 조건뿐이다. 저장소 전체에서 정확한 hosted label 허용 목록(`ubuntu-latest`·`ubuntu-24.04`·`macos-15`)에 없는 runner를 쓰는 job은 이것과 `release.yml`의 `kvm-proof`(`v*` tag push 전용)뿐이다. reusable workflow 호출 job은 없어야 하고, `test.yml` trigger는 정확히 `workflow_call`과 `main`·`dev`의 push·`pull_request`다. 어느 workflow도 `pull_request_target`·`workflow_run` trigger를 쓰지 않는다. 이 계약은 workflow 형태만 고정한다. `kvm`에는 아직 event gate가 없어 `pull_request` 실행도 이 runner에 온다. 과거 AGENTS 규칙 10의 두 층(YAML event gate와 PR이 gate를 지우는 경우의 설정 backstop)은 [CI safeguards spec](openspec/specs/ci-safeguards/spec.md) 규칙 10으로 이동했다. gate 추가는 `Required native KVM proof`의 PR 의미와 계약의 `kvm` `if` 고정을 함께 바꿔야 하므로 소유자 결정을 기다린다.
+- shard별 node 수와 shard 합계는 CI에서 검사하지 않고 출력만 한다. 고정된 명령 문자열과 분할 unit test는 `--shard`가 빠지는 wrapper 위험만 막는다. `pyproject.toml`의 `addopts`나 conftest hook 같은 workflow 밖의 무력화는 막지 않는다. 과거 AGENTS 규칙 5의 정본 대비 차이와 소유자 결정은 [CI safeguards spec](openspec/specs/ci-safeguards/spec.md) 규칙 5에 있다. shard job이 아닌 job의 step 내용(step `env`, `$GITHUB_ENV` step)과 `test.yml` 밖 workflow의 job 형태도 고정하지 않는다.
 
-CI 변경의 측정·변경 규칙은 [`AGENTS.md`](AGENTS.md)의 `CI 파이프라인 성능 규정`이 정본이다. 크리티컬 패스 기대치는 push 뒤 실측 전까지 추정이다.
+CI 변경의 측정·변경 규칙은 [CI safeguards spec](openspec/specs/ci-safeguards/spec.md)의 규칙 1–12에 있다(이전 AGENTS.md CI 절). 크리티컬 패스 기대치는 충분한 게시 후 실측 전까지 추정이다.
 
 후속 `a991912`에서 guest fragment 규칙과 배포 ELF를 동기화했다. 로컬 Python/C/ELF 108건(19.26초), 서버 106건·2skip(13.51초) 후 빠진 고정 toolchain과 Docker PID 1 opt-in을 준비한 두 노드가 별도로 통과했다(6.65초). 같은 SHA의 기존 빌드 이미지 cold public exec는 통과(20.47초), 원본 Redis는 filesystem 검증·staging assembly를 지나 root transition에서 실패했다(75.60초). 내부 거부 지점은 아직 미확정이며 workload를 실행하지 않았다. 전체 native 부정 제어 matrix·새 Gate 2·새 애플리케이션 이미지 빌드 통과로 확대하지 않는다. 실패 자료와 원본 archive는 보존하고 다음 검사는 root-transition의 정확한 거부 조건을 좁힌다.
 
@@ -736,7 +736,7 @@ uv run python scripts/test_lanes.py run gate2
 | root volume, monitor, guest lifecycle | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py), [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py), [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py), [`guest/stage1/init.c`](guest/stage1/init.c) | related `tests/unit/test_oci_root_*`, `tests/kvm/*`, [`docs/oci-root-proof.md`](docs/oci-root-proof.md), runtime roadmap (read-only qualification record) |
 | Hub API/schema/auth/UI | [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`api/builds.py`](hub/src/palimpsest_hub/api/builds.py), [`auth.py`](hub/src/palimpsest_hub/auth.py), [`models.py`](hub/src/palimpsest_hub/models.py), [`static/hub.js`](hub/src/palimpsest_hub/static/hub.js) | `hub/tests/test_auth.py`, `test_hub_api.py`, `test_builds.py`, `test_upload_limits.py`, [`docs/install.md`](docs/install.md), this document's contracts/security |
 | Hub worker/storage/deployment | [`worker.py`](hub/src/palimpsest_hub/worker.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`services/builds.py`](hub/src/palimpsest_hub/services/builds.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py), `services/hub_store.py`, `bootstrap.py`, `migrate.py` | `hub/tests/test_image_exports.py`, `test_builds.py`, `test_migrate.py`, [`docs/install.md`](docs/install.md), [`docs/testing.md`](docs/testing.md), native KVM 별도 승인/proof |
-| tests, CI, lane membership | [`scripts/test_lanes.py`](scripts/test_lanes.py), [`.github/workflows/test.yml`](.github/workflows/test.yml), `pyproject.toml` | 해당 lane, CI 형태 계약 [`tests/unit/test_test_lanes.py`](tests/unit/test_test_lanes.py), [`docs/testing.md`](docs/testing.md), [`AGENTS.md`](AGENTS.md)의 CI 성능 규정(전후 실측), architecture check/stamp |
+| tests, CI, lane membership | [`scripts/test_lanes.py`](scripts/test_lanes.py), [`.github/workflows/test.yml`](.github/workflows/test.yml), `pyproject.toml` | 해당 lane, CI 형태 계약 [`tests/unit/test_test_lanes.py`](tests/unit/test_test_lanes.py), [`docs/testing.md`](docs/testing.md), [CI safeguards spec](openspec/specs/ci-safeguards/spec.md)(전후 실측), architecture check/stamp |
 
 구조 영향이 없는 bugfix/refactor도 source를 읽은 뒤 이 문서 `Maintenance`의 최신 summary에 영향 없음과 이유를 남긴다. 계획 문서나 roadmap만 갱신하고 구현 상태를 승격하지 않는다.
 
@@ -750,6 +750,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 4. 실제 검토가 끝난 뒤 working 또는 staged 범위에 맞춰 review marker를 `python3 scripts/check_architecture.py --stamp --summary "..."` 또는 `--stamp --staged --summary "..."`로 갱신한다. 이 명령은 자동 stage/commit하지 않는다.
 5. 완료/commit 전에 `python3 scripts/check_architecture.py` 또는 staged 제출 범위라면 `python3 scripts/check_architecture.py --staged`를 실행한다. pre-commit의 `architecture` hook도 같은 staged 검사를 수행한다.
 6. marker의 summary는 변경 경로와 구조 영향/영향 없음을 한 건의 최신 검토로 남기며, credential/token은 기록하지 않는다.
+
+문서 진입점 이관: root [`AGENTS.md`](AGENTS.md)·[`agent.md`](agent.md)의 상세 의무는 [contributor workflow spec](openspec/specs/contributor-workflow/spec.md)과 [CI safeguards spec](openspec/specs/ci-safeguards/spec.md)(옛 AGENTS 규칙 1–12)으로 이동했다. 기존 Maintenance 및 아래 날짜별 증거는 유지한다. 이번 문서 이관은 source/CI/원격 상태를 변경하거나 새 승인·검증을 주장하지 않으며 review marker를 stamp하거나 guard를 실행하지 않는다.
 
 `3f8e79e` synthetic readback 실패의 source review 결과, production converter나
 packer가 아니라 검증 도구의 기본 wildcard selector가 literal backslash를
@@ -1032,9 +1034,9 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "60a658fa6e41fc0738c53d1f0afb54df9895cb2ea8401f81545732f81f718bd8",
-  "reviewed_at": "2026-09-24T14:46:50Z",
-  "summary": "Recorded exact 071d82d branch-only publication and successful PR Test/native KVM, Hub and development-package runs; docs-only receipt, no source or architecture contract change. Cloud-image x86 and disabled-cloud-init native reboot remain unverified."
+  "source_sha256": "f3683c6ecd8380b4665e70851d5d2ee7c22595205ba095ecb177fffd7ae87baa",
+  "reviewed_at": "2026-09-27T17:08:02Z",
+  "summary": "Reviewed source-branch documentation migration before explicitly approved local dev integration; root guidance moved to OpenSpec without runtime changes; historical CI content will be reconciled with newer dev policy during merge; no fresh native or remote verification claimed"
 }
 ```
 <!-- architecture-review:end -->

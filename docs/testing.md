@@ -283,11 +283,11 @@ wave.
     fork PR triggers them.
 
   These pin the workflow shape only. `kvm` has no event gate yet, so
-  `pull_request` runs still reach the self-hosted runner. AGENTS.md rule 10
-  requires two layers: a YAML event gate that keeps `pull_request` runs off
-  the runner, and repository or organization settings as the backstop
-  against a PR that edits that gate. Adding the gate waits for an owner
-  decision, because `Required native KVM proof` and the exact `kvm` `if`
+  `pull_request` runs still reach the self-hosted runner. The migrated
+  [CI safeguards spec](../openspec/specs/ci-safeguards/spec.md) rule 10
+  requires a YAML event gate and repository/organization settings as a
+  backstop against PR edits to the gate. Adding the gate awaits an owner
+  decision because `Required native KVM proof` and the exact `kvm` `if`
   pin must change with it.
 
   Not pinned:
@@ -307,8 +307,9 @@ wave.
   - `--test-lane-shard` passed without the plugin is a usage error (exit 4).
 
   CI does not check per-shard counts, or whether the shards add up to the
-  portable total. This is a documented deviation from the shared CI rule 5
-  (see AGENTS.md), which asks CI to verify per-shard counts. The pinned shard
+  portable total. This is a documented deviation from the shared rule 5
+  (migrated to the [CI safeguards spec](../openspec/specs/ci-safeguards/spec.md)),
+  which asks CI to verify per-shard counts. The pinned shard
   command, the `commands()` argv test, and the disjoint-and-complete
   assignment tests cover only the wrapper risk that rule names: a `--shard`
   dropped before `test_lanes.py` would run the full suite in every shard, and
@@ -318,8 +319,8 @@ wave.
   its `Lane shard` line for 24 selected nodes, ran none, and exited 0. A
   run-time check of executed against selected counts would catch that;
   whether to add one is an owner decision.
-- **Rules for future CI changes.** Measurement and change rules are in the
-  `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
+- **Rules for future CI changes.** Measurement and change rules 1–12 are in
+  the [CI safeguards spec](../openspec/specs/ci-safeguards/spec.md), formerly the `AGENTS.md` CI section.
 
 The existing aggregate check names remain, and require every shard to succeed;
 a skipped or cancelled shard cannot satisfy them. Lint, manifest checks and

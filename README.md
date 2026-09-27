@@ -542,6 +542,12 @@ tasks. Read [AGENTS.md](AGENTS.md) for contributor rules and
 [agent.md](agent.md) is a short entrypoint to those documents, not a separate
 policy.
 
+The concise [AGENTS.md](AGENTS.md) and [agent.md](agent.md) now link to the
+[contributor workflow](openspec/specs/contributor-workflow/spec.md) and
+[CI safeguards (former AGENTS rules 1–12)](openspec/specs/ci-safeguards/spec.md).
+This documentation migration adds no CI, native, remote, or GPU verification
+and grants no new publication or shared-resource approval.
+
 The 2026-09-23 Hub hardening commit is published at
 `60fa42febfb8acd9af04e87c9905a4e2a1841d13`; the handoff records CI and
 package evidence. Publication occurred without the explicit approval required

@@ -2246,6 +2246,10 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 3. self-hosted KVM runner 노출, dev/main 중복 push, 발행 gate 예외, shard 실행 수 검사에 대한 소유자 결정(위 승인 대기 1–4)을 받는다.
 4. 승인된 작업 브랜치 게시 외에 PR merge 및 x86 KVM/cloud-init-disabled reboot 실기는 각각 대상·자원을 정한 별도 명시적 승인 뒤에 진행한다.
 
+### Documentation guidance migration (2026-09-28; no new verification)
+
+이 작업 브랜치 `codex/oci-root-phase1`에서 root `AGENTS.md`·`agent.md`를 짧은 진입점으로 바꾸고 [contributor workflow spec](../openspec/specs/contributor-workflow/spec.md)과 [CI safeguards spec](../openspec/specs/ci-safeguards/spec.md)으로 상세 의무를 이관했다. 위 날짜별 기록과 승인 대기 1–4는 그대로 유지한다. 이 문서의 과거 `AGENTS.md` 규칙 1–12 참조는 이제 CI spec의 같은 번호를 가리킨다. 특히 runner PR event gate/required KVM verdict/계약 충돌, 발행 gate 예외, shard 실행 수 미검사 및 dev/main 중복 push는 여전히 소유자 결정 대기다. 이 이관은 다른 저장소의 Nova cutover 구현이나 승인, 새로운 원격/GPU/CI 실측의 근거가 아니다. 코드·테스트·workflow·저장소 설정을 바꾸지 않았고 이번 문서 변경에서 architecture review marker stamp 또는 검증을 실행하지 않았다. 명시적 승인 전 remote helper 전송·추가 게시·shared runner/VM 조작은 차단한다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
