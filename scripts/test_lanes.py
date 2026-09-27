@@ -32,7 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
-        development_package_workflow publish_development_package
+        development_package_workflow native_kvm_openstack publish_development_package
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake sandbox_policy state test_lanes ui
     """)
@@ -406,6 +406,8 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
             "scripts/test_lanes.py",
             ".github/workflows/test.yml",
             ".github/workflows/development-package.yml",
+            ".github/workflows/release.yml",
+            "scripts/run_native_kvm_openstack.py",
         }:
             selected.update(("core-cli", "qualification"))
             reasons.append(

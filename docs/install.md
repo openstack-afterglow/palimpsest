@@ -529,6 +529,132 @@ sudo -H -u palimpsest env -u PALIMPSEST_STATE_HOME -u PALIMPSEST_LOG_HOME \
   /opt/palimpsest/bin/python -I -m palimpsest_local.cli store show
 ```
 
+## Isolated Hub candidate access and data safety
+
+This is an operator handoff for the **candidate**, not a production installation
+recipe or a claim that `0.2.4` is published. The private local workdir is
+`/Users/pieroot/.local/share/palimpsest-candidate-024/`; consult its nonsecret
+`candidate-resources.json`, `artifact-receipt.json`, `reboot-receipt.json` and
+the [dated evidence](development-handoff.md#격리-hub-후보-운영-인계--2026-09-27-production-미승격).
+Do not paste its `api.env`, `build-worker.env`, `compose.env`, Keystone input,
+SSH private key, or token into logs, tickets or commands. Root-owned candidate
+configuration on the VM is `/etc/palimpsest-candidate/` (directory 0700,
+files 0600). Its service state is `/srv/h` on the **separate mounted ext4 data
+volume**, not the boot disk. API, export worker and bootstrap containers run
+as UID/GID 2001 and mount `/srv/h:/srv/h`; the host KVM build worker is also
+UID 2001. `/opt/palimpsest/local/bin/python` and
+`/opt/palimpsest/hub/bin/python` are root-controlled interpreters. The candidate
+uses `palimpsest-client 0.2.4` and Hub `0.2.1`, not the Kolla default Hub tag
+`0.2.0` and not the already-published root `0.2.3`.
+
+Candidate SSH config and alias are held in the private workdir. From an
+authorized operator workstation, **after verifying the host key and access**:
+
+```sh
+WORKDIR="$HOME/.local/share/palimpsest-candidate-024"
+ssh -F "$WORKDIR/ssh_config" -N -L 127.0.0.1:18020:127.0.0.1:8020 palimpsest-candidate-024
+```
+
+Leave that foreground process running for local `http://127.0.0.1:18020/app`
+and `/v1` access; Ctrl-C closes only the tunnel. API port 8020 and SQL port
+3306 are bound to **VM loopback**, Redis is not published, and local HTTP here
+is inside the SSH forwarding boundary. Do not turn these into public listeners
+or place tokens in URLs, command arguments, saved browser profiles or shell
+history. Supply the project-scoped user token via the approved private input
+path (browser tab memory or `PALIMPSEST_TOKEN` process environment), and the
+CLI endpoint via `PALIMPSEST_URL=http://127.0.0.1:18020`; source Keystone
+keys stay in protected input/env, never argv. Browser download links that
+contain short-lived bearer tokens must not be shared or logged.
+
+On the VM, service names are `palimpsest-candidate.service` (systemd oneshot
+running `docker compose --env-file compose.env -f compose.yml up -d --wait
+palimpsest-api palimpsest-worker` in `/etc/palimpsest-candidate`) and
+`palimpsest-build-worker.service` (separate native KVM worker). Check active
+units, mounted `/srv/h`, Compose bootstrap exit 0, API/export worker state,
+MariaDB health, and the worker singleton before acting; use `docker compose
+--env-file compose.env -f compose.yml ps` from that config directory without
+printing resolved environment. `/v1/health` returning `{"status":"ok"}` is
+**liveness only**, not SQL, Redis, auth, CAS, CLI or guest-build readiness.
+The private `verify_readiness.py` documents stronger SQL `SELECT 1`, Redis
+`PING`, UID/mount, loopback, disk and environment checks; inspect its scope,
+do not output `/proc/*/environ`. The installed oneshot unit has **no
+`ExecStop`**: stopping it alone leaves Compose containers running. Do not run
+`docker compose down -v`; named/bind-mounted data must survive restart and
+rollback.
+
+### Consistent backup and isolated restore (procedure only; not executed)
+
+These steps require an approved maintenance window and storage/SQL credentials;
+there is **no** backup/restore proof in the candidate receipts. Restrict the
+backup destination and transfer, encrypt it, record hashes and timestamps,
+and test restoration on a separately isolated host before production use.
+
+1. Verify `/srv/h` is the expected mounted data volume, not an empty mountpoint
+   on the boot disk. Record source image IDs, package versions, current unit and
+   container state, schema version, volume UUID and free space. Confirm **zero
+   queued/building/exporting jobs and idle workers** (including any other
+   writer, upload or garbage collector); do not merely trust `/v1/health`.
+   Reject/defer new requests at the loopback/tunnel ingress, stop the native
+   `palimpsest-build-worker.service` and stop API/export containers via Compose
+   `stop` (not `down -v`). `systemctl stop palimpsest-candidate.service` is not
+   a container stop. Recheck no writers remain and fail closed if a job or
+   cleanup is ambiguous; never delete its private job tree.
+
+   On the candidate host, once idleworker/no-new-ingress is established, the
+   stop sequence is `sudo systemctl stop palimpsest-build-worker.service`,
+   then, from `/etc/palimpsest-candidate`, `sudo docker compose --env-file
+   compose.env -f compose.yml stop palimpsest-api palimpsest-worker`.
+   Check the actual process/container states after each command; the still
+   enabled units can restart services on reboot, so protect the maintenance
+   window against an unexpected host restart. Do not stop MariaDB until after
+   the logical dump (or before a deliberate cold full-volume snapshot).
+2. With SQL still running and **no application writers**, take a
+   transaction-consistent logical dump of the candidate `palimpsest` schema
+   using credentials supplied by the protected Compose/container environment,
+   **not** a password argument or saved shell history. Keep SQL credentials
+   off stdout/stderr. Stop Redis cleanly after the workers are idle so its AOF
+   is durable; copy mounted `/srv/h` (CAS blobs, metadata, private builds/
+   uploads, Redis AOF/state) preserving numeric owners, permissions, symlinks
+   and sparse files as appropriate, but **exclude `/srv/h/mysql` from this
+   logical-dump restore set**. The SQL dump and CAS copy must span the **same
+   no-writers interval**: a standalone SQL dump or live filesystem copy cannot
+   prove referential consistency. `/srv/h/mysql` is MariaDB's live datadir and
+   must not be copied as though it were a consistent cold snapshot. For a
+   separate full-volume block snapshot, stop MariaDB and Redis cleanly first;
+   restore that snapshot as a unit, not mixed with an unrelated SQL dump.
+   Record dump/archive hashes, source volume identity and time, then verify no
+   writer raced the snapshot.
+3. On an isolated, empty replacement volume, restore the copied tree (without
+   the old MariaDB datadir), preserving recorded numeric owners and exact modes.
+   Hub CAS/build/upload files retain UID/GID 2001; Redis and database storage
+   retain their own service identities, not a blanket recursive chown to 2001.
+   Initialize a **new** MariaDB datadir/schema and import the matching SQL dump with credentials
+   kept off argv/logs, and leave API/export/build workers stopped until SQL
+   import and mounted CAS checks complete. Bring Redis up with its recovered
+   AOF, check SQL and Redis, referenced blob digests and upload/job states,
+   then start Compose API/export and the build-worker unit. If restoring a
+   separately captured, consistently stopped whole-volume snapshot instead,
+   do **not** import the logical dump on top of its MariaDB datadir; choose one
+   database restore method. Inspect per-unit state, authenticated reads, blob
+   digests and a disposable write/cleanup before reopening ingress. A health
+   response alone does not certify restore. Retain the untouched backup and
+   original volume until approval to retire.
+
+For restart on the existing host after a verified backup, start the database
+first if stopped; use `systemctl restart palimpsest-candidate.service` to
+reissue its Compose `up` (a plain `start` of an already-active oneshot may do
+nothing), then start the native build-worker unit. On reboot, the systemd
+units require `/srv/h`; verify the mount and actual application readiness
+again. Before any image rollback, record the **current candidate local** API
+and worker image IDs in `artifact-receipt.json` and separately fetch the
+**actual previous production immutable image digests** from production
+deployment records. Those production previous digests are not in candidate
+receipts and must never be guessed from candidate IDs, mutable tags or the
+Kolla default. Retain volumes and SQL/CAS backup; switch both API and export
+worker together only with schema compatibility reviewed, then verify the
+restored path. No `down -v`, broad prune, destructive `install_host.py` rerun,
+or production-ready claim follows from this candidate procedure.
+
 ## Upgrade and uninstall
 
 Upgrade Local by reinstalling a newly reviewed SHA in the same environment:

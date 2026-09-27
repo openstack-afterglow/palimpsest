@@ -2274,6 +2274,161 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 - Pre-review local verification for the earlier 0.2.4 candidate snapshot: root pytest 5,696 passed and 209 skipped; Hub pytest 100 passed; root and Hub Ruff checks and formatting passed; canonical lane manifest validated; `uv build --wheel` and `scripts/build_package.py` produced a wheel/sdist whose installed CLI reports 0.2.4 and whose Kolla role payload is present. Hub API/worker were built from that checkout for linux/amd64 and linux/arm64; all four images imported the 0.2.1 Hub distribution without network and reported the expected guest architecture. The earlier staged architecture freshness guard passed. These results do not validate the subsequent reviewer-driven source/role edits. No 0.2.4 native KVM proof, GitHub workflow, PyPI publication, immutable image digest, production role upgrade or authenticated Hub upload has been observed.
 - Follow-up local checks on the corrected worktree: the isolated root `tests/` suite passed 5,913 with 260 skipped; 18 focused Kolla/package tests and all 100 isolated Hub tests passed. Root/Hub frozen locks, canonical lane manifest, Ruff checks and formatting passed; Hub module and installed distribution both report 0.2.1. `scripts/build_package.py` built the root 0.2.4 wheel and sdist, installed the sdist-built wheel in isolation and exercised the CLI. The root wheel contains per-host image-pull/volume tasks and a single-host database bootstrap. Rebuilt Hub API/worker linux/amd64 and linux/arm64 images all ran offline, imported the matching 0.2.1 module/distribution and reported the expected guest architecture. The production volume-owner command changed two distinct disposable named volume roots to 1000:1000 before they were removed. This same-daemon proxy is not a real multi-host Ansible run, native KVM proof, authenticated upload, remote publication or deployment. Architecture working/staged freshness checks apply only to the final reviewed index.
 
+## 격리 Hub 후보 운영 인계 — 2026-09-27 (production 미승격)
+
+이 절은 위 날짜별 기록을 고치지 않는다. 근거는 private workdir
+`/Users/pieroot/.local/share/palimpsest-candidate-024/`의 **비밀이 아닌**
+`candidate-resources.json`, `artifact-receipt.json`, `base-receipt.json`,
+`transport-receipt.json`, `http-receipt.json`, `cli-receipt.json`,
+`normal-build-receipt.json`, `recovery-receipt.json`, `reboot-receipt.json`과
+`browser-receipt.json`이다. 이들은 시점별 관찰이지 현재 상태의 자동 보증이
+아니다. `api.env`, `build-worker.env`, `compose.env`, private SSH key와
+Keystone 입력은 출력·문서화하지 않는다. 기존 `palimpsest-dev` 소스는 미게시
+root client `0.2.4` / Hub `0.2.1`; Kolla 기본 Hub tag는 `0.2.0`이며
+published root `0.2.3`과 다르다.
+
+- 격리 자원: owner `palimpsest-candidate-024`, Nova server
+  `38cadbb8-6f1c-45ab-a7ec-d11339d78f7a` (`172.30.104.11` private),
+  boot volume `61cfa349-e14f-4e33-be7d-1302590223e6`, 40 GiB data volume
+  `fc4f7e9e-ff25-473a-a610-376ecd9c6492`. 원본 Glance base image
+  `4da46b06-1e48-4bf8-adac-4c0ed5424797`는 3,758,096,384 bytes,
+  SHA-256 `08d3b10e89e6d1d0d089b09302794e2949e0deb731c3fd240ec6b445d535a3df`.
+  설치 스크립트 `install_host.py`는 data disk serial/size/blankness를 확인한
+  뒤 ext4로 만들고 UUID fstab mount `/srv/h`(UID/GID 2001, 0700)을 설정한다.
+  **이미 설치된 disk에 이 일회성 스크립트를 재실행하지 않는다.** Hub API,
+  export worker와 bootstrap은 container UID/GID `2001:2001`로 `/srv/h:/srv/h`를
+  mount하고, 별도 KVM build worker는 UID 2001의 systemd process다. Local
+  interpreter `/opt/palimpsest/local/bin/python`, Hub interpreter
+  `/opt/palimpsest/hub/bin/python`, config `/etc/palimpsest-candidate/`(0700;
+  env/compose 파일 0600), Compose project `palimpsest-candidate-024`이다.
+- Source transfer `source.tar` SHA-256
+  `88cd80c29c7bcba6a338df2bb3c2eebc5b452cea653a41885cd16d3a9ba0d30d`,
+  amd64 image archive `hub-amd64.tar` SHA-256
+  `3ba68c8eb37ef5d2141f9e660bc38f5998fdbd1b312c24403701f142427a28e4`.
+  Source archive hash binds the copied candidate bytes (including the
+  worktree's local changes), **not** a published Git commit or production
+  reproducibility receipt; `source-manifest.json` is private audit input.
+  Candidate **local Docker image IDs** (not registry digests): API amd64
+  `sha256:4641f6f90bc8e44fd12c3650c560757262d9278654ca9739684100cb9cac82e3`,
+  API arm64 `sha256:4cf67d6412599106d02f32e32f1c84e8f604787e05c5149bfe322d9441a2dbb6`,
+  worker amd64 `sha256:066df451b348a70daf61ce67f2c1a8da4404f17ba32e3a983b4307a3ecf9fce8`,
+  worker arm64 `sha256:6eb51f9a94094ac68479ac3f2670aefdc99f8bf6c6e3e21af147414323c656a7`.
+  Wheel receipts: client 0.2.4 `4e1ae84ce2dfff9936a4e97449ba81ebf49fc60e6b90c67346d89d5949246b29`,
+  Hub 0.2.1 `2629a8539991fdcc1e20a1ade54baaecdd69b3adb0f088ef630e8aab7ed37abd`.
+  These do not establish published immutable GHCR digests or production image pins.
+- Access is deliberately loopback-only: Compose publishes API
+  `127.0.0.1:8020` and MariaDB `127.0.0.1:3306` on the candidate host, with no
+  Redis host port. Use the private SSH config and candidate alias with local
+  forwarding (see [install guide](install.md#isolated-hub-candidate-access-and-data-safety));
+  browser/API URL `http://127.0.0.1:18020` is localhost at the **client** end
+  of SSH, not an unauthenticated public HTTP listener. Stop the tunnel by ending
+  its SSH foreground process; it does not stop services. For services, inspect
+  `systemctl status palimpsest-candidate.service palimpsest-build-worker.service`
+  and `docker compose --env-file compose.env -f compose.yml ps` from
+  `/etc/palimpsest-candidate` on the candidate host. The two enabled units
+  start Compose API/export worker and the separate build worker, require the
+  `/srv/h` mount, and reboot through systemd. A `systemctl stop` of the oneshot
+  Compose unit alone **does not stop its containers** (no `ExecStop`); follow
+  the explicit safe stop procedure in the install guide before backup.
+- `/v1/health` returning `{"status":"ok"}` only confirms an API process. The
+  separate `verify_readiness.py` checks active units, successful bootstrap,
+  running UID 2001 API/export containers, no privileged devices/host PID,
+  exact mount and loopback bindings, isolated build-worker environment, SQL
+  `SELECT 1`, Redis `PING`, `/srv/h` space and health. It is a script contract,
+  not a claim that health implies SQL/Redis/authenticated writes or guest boot.
+  `transport-receipt.json` records uvloop 0.22.1, asyncmy 0.2.13,
+  SQLAlchemy 2.0.51, closed TCP connection pre-ping classified as
+  `OperationalError`, renewed connection and `SELECT 1` both protected and
+  unprotected; exact upstream `uvloop RuntimeError` was **not reproduced**.
+- Authenticated HTTP `http-receipt.json` includes unauthorized layers 401,
+  authorized list 200, resumable upload start/PATCH/query, offset-conflict
+  409 and recovery, finalized layer blob 200 and range 206, metadata/ancestor
+  reads. `cli-receipt.json` records `image ls --arch x86_64 --disk-format raw`,
+  `layer ls --name candidate-024-layer-one`, `layer pull` (all exit 0) and
+  byte-matched 3,758,096,384-byte base; the CLI pull output path is a
+  **directory**, not a regular file. The earlier command journal warning was
+  fixed by creating a private log directory. The ordinary two-layer/two-RUN
+  KVM build `41f491a9-a11b-45f6-a0ae-b43b8924bc91` advanced
+  queued→building→complete, returned the 4,096-byte SquashFS
+  `sha256:1007b6e2eb16daa752fdce76ef737ab22cf871babc1383e3e6c39f8435b88df6`,
+  recorded exact two RUN files and absent owned domain/scratch. A restricted
+  application credential received 401 for build status; separately, an actual
+  project member password token received build 403 (`nonadmin-build-receipt.json`).
+- Timeout build `1ad5444e-24c2-4391-bec1-ea09e15302c1` ended
+  `error/build_failed`; killed-main-worker restart build
+  `0e807e8e-6d3e-434b-b799-0fc3e3716c03` ended
+  `error/worker_interrupted`, with owned guest/domain/scratch absent and the
+  temporary build deadline returned to 3600 seconds. Reboot receipt has
+  different boot IDs `8199f365-ab55-425a-a0f7-7c71504d56c0` →
+  `f97beedf-059d-495f-a9e5-c7ad327e3c2b`, zero active jobs, authenticated
+  layer checks, full base SHA-256 on mounted CAS and a fresh post-reboot layer
+  upload `sha256:26ddc4a177769b0226458adfc20c5ba84c32a05180e47ad1e634377bc5be1c3b`.
+  This is candidate single-host durability, not production restart/failover.
+  Earlier `browser-receipt.json` shows the layer/build lists and a 4,096-byte
+  authenticated layer download with matching digest. Later
+  `c6-browser-receipt.json` records a **real browser UI submission** of build
+  `ff672fef-f991-436d-b8d5-0ee074b39ff0`: queued→building→complete,
+  output 4,096 bytes at
+  `sha256:21c85bbe39bd85170cd27c4c24ff450d395d58cbf43308d85890da928ab73044`,
+  saved-file SHA-256 equal, and exact `ran-one`/`ran-two` files in the output.
+  The real Chrome download used the supported anchor fallback after launching
+  Chrome with FileSystemAccess disabled; the default native macOS file picker
+  was not automatable and no saved-file claim is made for that earlier attempt.
+  The Hub console has no detail button: authenticated build/layer/ancestor
+  details were read in actual `/docs` Swagger UI (chain complete), not by
+  inventing an app detail view. No console errors were observed in this flow.
+  Candidate native-CI Glance input image `4217de09-9771-40af-8d01-964f09566cf0`
+  is active in `ci-image-receipt.json` with SHA-512 matching the base receipt;
+  protected CI environment and helper are separate from Hub user credentials.
+  The initial helper rejected an internal HTTP Keystone URL before creation.
+  Actual HTTPS attempts then exposed QEMU `/dev/kvm` permission denial behind
+  a lifecycle socket reset. The helper now adds only the disposable guest user
+  to `kvm` and starts native proof with refreshed supplementary groups instead
+  of relying on a one-time device ACL.
+- **Manual native proof passed**, owner `openstack-afterglow/palimpsest/202609271/6`.
+  `native-openstack-evidence-6/native-proof-receipt.json` binds the original
+  candidate tar SHA-256
+  `88cd80c29c7bcba6a338df2bb3c2eebc5b452cea653a41885cd16d3a9ba0d30d`,
+  pinned kernel/config, **43 boots / 44 QEMU invocations**, exact 45-file stage-1
+  evidence and matching mounted SquashFS/replay receipts plus EROFS evidence.
+  Stage-1 receipt SHA-256 is
+  `6e9ec697c8802cd9cefb9a3dc4f2a7180c276af101aefe34f78259eafc163e94`.
+  Server `91ab2a05-7f11-4694-b3ae-7a0d8279a312`, volume
+  `37c41b83-98da-4aa5-9e91-9f68a0b884b6`, port
+  `e7286606-95e9-455a-9010-e5e820bd6c18`, SG
+  `021bf145-721b-42fe-9ea8-60abc3e06e8e` and run key were reclaimed;
+  manifest requires `cleanup_verified=true`. Failed and diagnostic attempts
+  retain their separate receipts; diagnostic archives do not qualify the candidate.
+  Focused helper/workflow/architecture contracts: **188 passed**, Ruff and lane
+  classification passed. **No GitHub push, GitHub native CI run, publication or
+  production release is claimed.** Protected environment kernel/config HTTPS
+  URL variables are still unset and fail closed; configure reviewed URLs for
+  the pinned bytes before an approved trusted-ref CI execution.
+  The current restricted CI application credential expires at
+  `2026-10-27T16:01:38Z`; renew it with the same member-only project/role and
+  protected environment policy before expiry. `final-resource-receipt.json`
+  confirms candidate VM ACTIVE and both data/boot volumes attached, plus exact
+  server/volume/port/SG absence for all six created native attempts. Per-attempt
+  cleanup manifests also verify run-key absence. Diagnostic source instrumentation
+  and temporary diagnostic archives were removed; original source and all run
+  receipts/logs remain private.
+- Outstanding production promotion gates: source-based candidate IDs are not
+  current production image digests; recover the **actual** previous production
+  API/worker immutable digests before any rollback plan or promotion. Confirm
+  source review, image provenance, deploy-specific backups and restore drill,
+  production credential/account separation, resource/retention policies,
+  external authorization and exact release/CI gates. Source review found direct
+  Hub build of an uploaded QCOW2 with an external data file is not rejected at
+  the build boundary (the export path rejects it; this proof used pinned raw),
+  and multipart UploadFile body can spool before authentication/size gating;
+  bound ingress/temp storage before public exposure. Nonexistent upload IDs can
+  allocate persistent locks before ownership; authenticated blob responses use
+  long-lived immutable cache headers without `Vary` authorization/project.
+  Candidate loopback+SSH mitigates exposure of its HTTP listener; these findings
+  remain production review gates, not observed candidate exploitation. Do not
+  claim production readiness from a candidate health check, historical tests,
+  or an unreviewed image tag.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
@@ -2291,3 +2446,26 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 | retained root와 shared volume 구분 | [oci-retained-root-inventory.md](oci-retained-root-inventory.md) |
 | 사용자 설치와 패키지 선택 | [`../install.md`](../install.md), [install.md](install.md) |
 | 명령별 실행 순서와 diagram | [cli/workflows.md](cli/workflows.md), `docs/diagrams/` |
+
+## Guidance migration (after the 2026-09-27 checkpoint)
+
+The detailed root `AGENTS.md` obligations were moved without changing their approval or evidence boundaries to [contributor workflow](../openspec/specs/contributor-workflow/spec.md) and [CI safety/performance](../openspec/specs/ci-safety-and-performance/spec.md). Read both via [AGENTS.md](../AGENTS.md) or [agent.md](../agent.md) before resuming. Older references in this handoff to AGENTS rules 1–12 (including the 2026-09-24 CI checkpoint's rule 10) now refer to rules 1–12 in the CI spec; their descriptions remain dated evidence, not today's permission. The 2026-09-25 note that there was no OpenSpec was true of that checkpoint; this later docs-only migration supersedes that choice without revising the earlier entry. No code, workflow, runner, credential, remote CI, native proof or publication was changed or verified by this note; preserve the 2026-09-27 source/manual-proof evidence and separate pending approvals.
+
+## Local dev continuation — 2026-09-27
+
+- The user explicitly approved committing all current changes and continuing on
+  `dev`. `/Users/pieroot/code/palimpsest-dev` already checks out that branch;
+  there is no separate feature-branch merge to perform. The original staged
+  release/Hub-volume preparation is commit `37a6639`; the subsequent commit
+  contains isolated native CI, operational evidence and the OpenSpec guidance
+  migration. This approval supersedes the earlier local commit hold only.
+- Continue from this `dev` worktree, not the older
+  `/Users/pieroot/code/palimpsest` (`codex/oci-root-phase1`) checkout. Existing
+  native proof binds its recorded candidate tar, not an invented post-commit
+  GitHub run. The actual 188-pass contract result and manual 43-boot/44-QEMU
+  proof remain the evidence above; committing does not rerun or expand them.
+- Remote push/tag, automatic GHCR/development-package publication and production
+  replacement are not authorized by this local integration. Next remote gates:
+  reviewed pinned kernel/config HTTPS URLs, publication-path approval, then
+  trusted-ref CI and before/after timing measurements. Production backup/restore,
+  immutable rollback inputs and security/isolation findings remain separate.
