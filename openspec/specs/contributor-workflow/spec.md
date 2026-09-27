@@ -1,39 +1,29 @@
-# Contributor workflow requirements
+# Contributor workflow specification
 
-This specification carries the detailed contributor and architecture-maintenance obligations from the root guidance. The short entry points are [AGENTS.md](../../../AGENTS.md) and [agent.md](../../../agent.md); dated handoff records remain evidence, not present-day authorization.
+## Scope and authority
 
-## Resume ongoing work
+This specification migrates the operating obligations previously in root `AGENTS.md` (resume, architecture maintenance, verification, protected material). `AGENTS.md` and `agent.md` are entrypoints, not independent approvals. Consult [`README.md` Development](../../../README.md#development), the dated [`development-handoff.md`](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md), affected detailed documents, and the [CI safety/performance specification](../ci-safety-and-performance/spec.md). Historical checkpoints describe their own date and source snapshot, not current server state or new authorization. The approved Nova cutover documented in this repository is not permission for another ref, resource or remote action.
 
-- 새 세션에서는 [`README.md`](../../../README.md)의 Development, [`docs/development-handoff.md`](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md)를 읽고 현재 Git/source 상태와 대조한다. [`agent.md`](../../../agent.md)는 root guidance로 연결하는 진입점이며 별도 규칙이 아니다.
-- 인계 문서에는 전체 목표·확정 결정·이미지별 결과·미완료 작업·승인 대기·정확한 재개 순서가 있다. 날짜가 있는 기록을 현재 서버 상태나 새 승인으로 해석하지 않는다.
-- 먼저 `git status --short`, `git diff --stat`, `git diff --cached --stat`, `git log -5 --oneline`으로 staged/unstaged와 마지막 commit을 구분한다. 기존 미승인 증거 문서와 새 작업을 섞어 commit하지 않는다.
-- 사용자 지정 역할은 Astra의 계획·오케스트레이션·관리, Sol의 개발이며 독립 검토를 거친다. 호스트에서 해당 모델/검토가 불가능하면 대체를 조용히 확정하지 말고 제약을 보고한다.
-- 개발 중에는 정확한 노드 또는 영향받은 test lane부터 실행한다. native/ML/GPU 실기는 별도 전제와 승인 범위에서 순차 실행하고, portable 통과를 실기 성공으로 기록하지 않는다.
-- 인계에 남은 GitHub 게시 및 원격 helper 전송 차단은 명시적 승인 전까지 유지한다. 문서화·계속 진행 요청만으로 해제하지 않으며 다른 경로로 같은 차단 작업을 우회하지 않는다. 장치 재할당·driver unbind/reset·기존 실패 VM 제거는 읽기 전용 점검과 별도 권한이다.
-- 작업 종료 시 인계의 다음 작업·근거 SHA·실행한 검사·실패·승인 대기를 갱신한다. 과거 결과를 새 성공으로 덮어쓰거나 실제 비밀값을 기록하지 않는다.
+## Requirements
 
-## Architecture maintenance
+### Resume and authority boundaries
 
-- 작업 전에 root [`ARCHITECTURE.md`](../../../ARCHITECTURE.md)와 영향을 받는 상세 문서를 읽는다.
-- code/config/schema/dependency/deploy/test를 바꾸면 현재 source를 먼저 검토하고, 영향받은 architecture 본문·code map·contracts·limits와 상세 문서를 같은 변경에서 갱신한다.
-- bugfix/refactor가 구조에 영향을 주지 않는 경우에도 그 판단과 근거를 `ARCHITECTURE.md`의 최신 Maintenance review summary에 남긴다.
-- 계획, roadmap, historical baseline은 구현 또는 검증 증거가 아니다. source와 현재 테스트 정의가 충돌하면 source를 정본으로 삼는다.
-- 실제 source 검토가 끝난 뒤에만 review marker를 stamp한다. credential, password, bearer token, private key를 문서·ledger·로그에 복사하지 않는다.
-- 완료 또는 commit 전에 working-tree 범위는 `python3 scripts/check_architecture.py`, staged 범위는 `python3 scripts/check_architecture.py --staged`로 검사한다. 이 검사는 문서 본문을 자동 생성하거나 source를 수정하지 않는다.
-- 문서 변경만으로 테스트 통과를 주장하지 않는다. 테스트 정의(`test-defined`), 실제 실행(`test-passed`), 실제 환경 관찰(`live-verified`)을 구분한다.
+- Before work, compare the handoff and architecture to actual Git/source state. Inspect `git status --short`, `git diff --stat`, `git diff --cached --stat`, `git log -5 --oneline`; distinguish staged, unstaged, and latest commit. Do not mix earlier unapproved evidence with a new commit. Check branch/ref and exact scope before an action: prior branch-only approval does not authorize `dev`/`main` publication, merge, package release, or shared-resource changes.
+- The requested roles are Astra for planning/orchestration/management, Sol for development, with independent review. If that model/review cannot be obtained on the host, report the constraint rather than silently declaring a substitute approved. Review does not grant user authorization for commit, push, SSH, helper execution, or GPU/VM mutation.
+- Preserve the handoff's GitHub publication and remote helper transfer blocks until *specific* explicit authorization. A documentation or continuation request is not authorization, and another route to the same blocked outcome is not allowed. Previously approved actions in dated checkpoints authorize only their recorded ref, resources, and scope; do not replay them as standing approval. The private helper transfer/execution is separate even from branch publication. Remote installation/deployment and native/cloud proof require separately specified resources and permission.
+- GPU inspection is not GPU allocation. Read-only PCI/IOMMU/driver/in-use inventory is separate from driver unbind/reset, device reassignment, or deleting a failed VM. Before any newly authorized server work, refresh read-only baseline, exact reviewed SHA, ownership, prerequisites, and resource boundaries; do not infer actual GPU passthrough or CUDA success from portable tests, PCI preflight, local KVM, or an earlier CPU-only proof. The selected OpenStack GPU instance booting an OCI rootfs is a design choice, not authorization to manipulate a Nova host or proof that local nested KVM works.
+- At handoff, update next steps, evidence SHA, checks actually run and failures, and pending approvals. Do not overwrite older results with new success claims or record secret values. `test-defined`, `test-passed`, and `live-verified` are different claims; a plan, roadmap, historical baseline, dry run, or docs edit does not prove execution.
 
-## Verification entry points
+### Architecture maintenance
 
-- Portable manifest: `uv run python scripts/test_lanes.py list --check`
-- Changed-file plan: `uv run python scripts/test_lanes.py plan --changed HEAD`
-- Core lane: `uv run python scripts/test_lanes.py run core-cli`
-- Architecture guard regression: `uv run pytest -q tests/unit/test_architecture_guard.py`
-- Hub tests use the independent environment under `hub/`: `cd hub && uv run pytest -v`
-- Native KVM, privileged filesystem, guest binary, BuildKit, and Gate 2 lanes are explicit opt-in proofs; their prerequisites and commands are documented in `ARCHITECTURE.md` and `docs/testing.md`.
+- Read root `ARCHITECTURE.md` and affected detailed docs before changing source. For code/config/schema/dependency/deployment/test changes, read reachable source and current tests first; update affected architecture narrative, code map, contracts/limits and detailed docs in the same change. Even when a bugfix/refactor has no structural impact, record the decision and reason in the *latest* `ARCHITECTURE.md` Maintenance review summary. Prefer actual source to an obsolete plan when they disagree.
+- Only after real source review, stamp the appropriate working/staged review marker using the procedure in `ARCHITECTURE.md` Maintenance. Do not stamp for a docs-only migration that explicitly forbids stamping. Never copy credentials, passwords, bearer tokens, or private keys into documentation, marker, or logs. Before a normal completion/commit, check working scope with `python3 scripts/check_architecture.py` or staged submission with `python3 scripts/check_architecture.py --staged`; the guard does not generate prose or edit source. A scoped instruction forbidding verification takes precedence for that task; report it rather than claim an unrun check.
 
-## Protected historical material
+### Verification entrypoints and protected material
 
-`IMPLEMENTATION_PLAN.md`, `docs/oci-docker-hub-compatibility.md`, `docs/oci-public-runtime-roadmap.md`, and `tracking/afterglow-palimpsest.json` are historical or qualification records. Read them for context, but do not rewrite their evidence as current implementation or alter them without an explicitly scoped task.
+- During development, run the exact changed node or impacted test lane first. Use `uv run python scripts/test_lanes.py list --check` for the portable manifest, `uv run python scripts/test_lanes.py plan --changed HEAD` for a changed-file plan, `uv run python scripts/test_lanes.py run core-cli` for the core lane, `uv run pytest -q tests/unit/test_architecture_guard.py` for architecture guard regression, and `cd hub && uv run pytest -v` for Hub tests in its separate environment. Native KVM, privileged filesystem, guest binary, BuildKit, and Gate 2 lanes are explicit opt-in proofs with prerequisites in `ARCHITECTURE.md` and `docs/testing.md`; portable pass is not native success.
+- Run native/ML/GPU proofs sequentially within their explicit prerequisite and approval scope; never report a portable pass as a live proof.
+- `IMPLEMENTATION_PLAN.md`, `docs/oci-docker-hub-compatibility.md`, `docs/oci-public-runtime-roadmap.md`, and `tracking/afterglow-palimpsest.json` are historical/qualification records. Read for context, but neither upgrade their evidence to current implementation nor alter them without explicitly scoped work.
 
 ## Historical resume boundary from `agent.md`
 

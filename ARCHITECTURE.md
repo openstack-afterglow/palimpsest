@@ -761,6 +761,8 @@ Architecture maintenance는 다음 순서로 수행한다.
 5. 완료/commit 전에 `python3 scripts/check_architecture.py` 또는 staged 제출 범위라면 `python3 scripts/check_architecture.py --staged`를 실행한다. pre-commit의 `architecture` hook도 같은 staged 검사를 수행한다.
 6. marker의 summary는 변경 경로와 구조 영향/영향 없음을 한 건의 최신 검토로 남기며, credential/token은 기록하지 않는다.
 
+문서 진입점 이관: root [`AGENTS.md`](AGENTS.md)·[`agent.md`](agent.md)의 상세 의무는 [contributor workflow spec](openspec/specs/contributor-workflow/spec.md)과 [CI safety/performance spec](openspec/specs/ci-safety-and-performance/spec.md)(옛 AGENTS 규칙 1–12)으로 이동했다. 기존 Maintenance 및 아래 날짜별 증거는 유지한다. 문서 이관 자체는 source/CI/원격 상태를 변경하거나 새 승인·검증을 주장하지 않는다. 후속 승인된 dev 통합의 marker와 검사는 별도 기록한다.
+
 `3f8e79e` synthetic readback 실패의 source review 결과, production converter나
 packer가 아니라 검증 도구의 기본 wildcard selector가 literal backslash를
 escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcards`를 더하는
@@ -1058,13 +1060,15 @@ Documentation migration (after the 2026-09-27 checkpoint): the former long root 
 
 Local dev integration — 2026-09-27: explicit user approval now permits committing the current candidate and guidance migration on the already-checked-out `dev` branch. Reviewed the shortened root rules against both OpenSpec specifications; the approval, evidence and native isolation boundaries remain unchanged. The subsequent review stamp includes the current `AGENTS.md` bytes. No runtime code changed during this commit step; the recorded 188-pass contracts and original-source manual native proof remain their prior exercised evidence, not a fresh GitHub run. Remote push/publication and production replacement remain separately blocked.
 
+Current-workspace dev integration: explicitly approved preservation commit `2d1882f` brings the remaining contributor-guidance migration into local dev based on `f14d77d`. Reviewed both branches' entrypoints, contributor specification, CI rules and navigation against dev's unchanged source/workflow contracts. Conflict resolution retains the hosted-only PR/protected Nova policy, stronger exact-ref approvals, remote/GPU boundaries and dated evidence. Duplicate CI specifications are consolidated into `ci-safety-and-performance/spec.md`. No runtime, schema, dependency, workflow or test implementation changes; only guidance, links and the architecture digest for the merged `AGENTS.md` change. Local guard and CLI checks are separate from the earlier native proof; no new remote execution or publication is claimed.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "24efc3b0cce7c4424dc3d893485196cfd3c349219df70fc9a0ed50905d018a63",
-  "reviewed_at": "2026-09-27T16:44:04Z",
-  "summary": "Reviewed local dev integration and OpenSpec guidance migration with unchanged approval boundaries; prior exercised evidence: 188 contracts and manual native 43 boots/44 QEMU invocations; current working source includes hosted-only workflows and exact-owned cleanup; no remote publication authorization"
+  "source_sha256": "b1858a6fe7f69e31589b5a186cc76ae1430cc7e10f4ccb30eb6d1d565d40e16a",
+  "reviewed_at": "2026-09-27T17:12:44Z",
+  "summary": "Merged remaining contributor guidance from 2d1882f into dev f14d77d; retained current hosted-only PR and protected Nova CI contracts, exact-ref approvals and historical evidence; consolidated CI specifications. Docs-only merge, no runtime or workflow change."
 }
 ```
 <!-- architecture-review:end -->

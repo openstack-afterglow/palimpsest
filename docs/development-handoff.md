@@ -2429,6 +2429,12 @@ published root `0.2.3`과 다르다.
   claim production readiness from a candidate health check, historical tests,
   or an unreviewed image tag.
 
+### Documentation guidance migration (2026-09-28; no new verification)
+
+이 작업 브랜치 `codex/oci-root-phase1`에서 root `AGENTS.md`·`agent.md`를 짧은 진입점으로 바꾸고 [contributor workflow spec](../openspec/specs/contributor-workflow/spec.md)과 [CI safeguards spec](../openspec/specs/ci-safety-and-performance/spec.md)으로 상세 의무를 이관했다. 위 날짜별 기록과 승인 대기 1–4는 그대로 유지한다. 이 문서의 과거 `AGENTS.md` 규칙 1–12 참조는 이제 CI spec의 같은 번호를 가리킨다. 특히 runner PR event gate/required KVM verdict/계약 충돌, 발행 gate 예외, shard 실행 수 미검사 및 dev/main 중복 push는 여전히 소유자 결정 대기다. 이 이관은 다른 저장소의 Nova cutover 구현이나 승인, 새로운 원격/GPU/CI 실측의 근거가 아니다. 코드·테스트·workflow·저장소 설정을 바꾸지 않았고 이번 문서 변경에서 architecture review marker stamp 또는 검증을 실행하지 않았다. 명시적 승인 전 remote helper 전송·추가 게시·shared runner/VM 조작은 차단한다.
+
+통합 주석: 위 문단은 source branch의 문서 이관 시점 기록이다. 승인된 dev 병합에서는 같은 저장소의 최신 Nova cutover와 수동 proof를 유지하고 CI spec을 `ci-safety-and-performance/spec.md`로 통합했다. 이전 persistent-runner 충돌 설명을 현재 정책으로 되돌리지 않는다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
@@ -2469,3 +2475,11 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   reviewed pinned kernel/config HTTPS URLs, publication-path approval, then
   trusted-ref CI and before/after timing measurements. Production backup/restore,
   immutable rollback inputs and security/isolation findings remain separate.
+
+## Current-workspace dev integration
+
+- 사용자가 현재 작업공간의 미커밋 변경까지 dev에 병합하고 현재 작업공간을 dev로 전환하도록 승인했다. 원본 변경은 `codex/oci-root-phase1`의 `2d1882f`에 보존했으며, `f14d77d` 기준 dev와 문서 충돌을 해결해 통합한다.
+- Contributor 권한·GPU 경계·재개 절차와 README/testing 탐색 개선을 반영했다. 중복 CI spec은 최신 `ci-safety-and-performance/spec.md`로 통합하고 hosted-only PR, protected Nova native, offline runner21과 기존 live receipt를 보존했다. Runtime/workflow/test source는 dev 기준 그대로다.
+- 이어서 작업할 위치는 `/Users/pieroot/code/palimpsest`의 `dev`다. 보조 `/Users/pieroot/code/palimpsest-dev` 작업트리는 같은 병합 commit을 detached HEAD로 보존하여 dev의 중복 checkout을 피한다. 기존 branch와 작업트리를 삭제하지 않는다.
+- 이번 승인은 로컬 commit/merge/branch 전환 범위다. 원격 push, 발행, 후보 또는 운영 자원 변경은 수행하지 않는다.
+- 로컬 검증: architecture working guard는 427개 source file digest를 확인했고, `uv run pytest -q tests/unit/test_architecture_guard.py`는 14 passed, `uv run palimpsest --version`은 0.2.4였다. 병합 변경은 Markdown 8개뿐이며 관련 spec/navigation link 28개가 해석되고 conflict marker·폐기된 CI spec 링크가 없음을 확인했다. 최초 stamp 시도는 index의 unmerged entry 때문에 중단됐고, 해결 파일을 stage한 뒤 stamp와 working guard가 통과했다. 병합 commit 전 staged guard도 확인한다. Native/GitHub/원격 검증은 추가 실행하지 않았다.

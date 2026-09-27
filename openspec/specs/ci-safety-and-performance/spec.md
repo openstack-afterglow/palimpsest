@@ -18,6 +18,7 @@ This specification carries the 2026-09-27 Nova cutover and the detailed CI oblig
    - CI를 바꾸기 전과 후에 최근 20회 이상 `Test` 실행의 job·step 시간을 `gh run list --workflow test.yml`와 `gh api repos/openstack-afterglow/palimpsest/actions/runs/<id>/jobs`로 수집한다.
    - 크리티컬 패스 중앙값과 p90을 commit 본문, [인계 문서](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md) Maintenance summary에 남긴다. 이 spec은 2026-09-25의 OpenSpec 부재 기록 이후의 문서 이전이며 과거 실행 결과를 갱신하지 않는다.
    - 절감은 합산되지 않는다. 가장 늦게 끝나는 job부터 줄이고, 효과는 실제 CI 전후 수치로만 주장한다.
+   - 표본 수를 채우기 위해 강제 workflow 실행으로 측정값을 만들지 않는다.
 2. **목표 지표를 먼저 정한다.**
    - 이 저장소는 public이고 GitHub-hosted runner 시간이 무료이므로 목표는 wall-clock이다.
    - org `openstack-afterglow`의 Free plan 동시성 한도(hosted 20 job, macOS 5 job)는 lumen·openstack-afterglow·drover·waygate·afterglow-crypto와 공유한다. macOS runner를 쓰는 저장소는 이곳뿐이다.
