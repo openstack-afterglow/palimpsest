@@ -4,9 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Root 0.2.4 (prepared, not published)
+
+- Prepare the `palimpsest-client` patch version in the root metadata, CLI version, and lockfile. The separate Hub 0.2.1 source already contains the closed-transport pool fix; it is not installed or deployed by a root package update. The packaged Kolla role still defaults to Hub image tag 0.2.0, so operators must explicitly pin reviewed fixed API and worker images. No PyPI, GitHub release, or image publication is claimed.
+- Correct the Hub module's version to match its separate 0.2.1 package without coupling it to the Kolla image default. During deploy/upgrade, pull the API image and initialize the local Hub volume root on each Palimpsest host before starting its API/worker containers; keep the database bootstrap single-host and do not recursively change existing blobs.
+
 ### Hub 0.2.1 (not independently published to PyPI)
 
-- Recover stale pooled asyncmy connections whose closed uvloop transport raises a non-DBAPI `RuntimeError` during SQLAlchemy pre-ping. Only the closed-transport signature is treated as a disconnect; unrelated runtime errors and interrupted transactions still propagate. Root `palimpsest-client` remains 0.2.3.
+- Recover stale pooled asyncmy connections whose closed uvloop transport raises a non-DBAPI `RuntimeError` during SQLAlchemy pre-ping. Only the closed-transport signature is treated as a disconnect; unrelated runtime errors and interrupted transactions still propagate. At the time of the Hub fix the published root `palimpsest-client` was 0.2.3.
 
 ## [0.2.3] - 2026-09-25
 

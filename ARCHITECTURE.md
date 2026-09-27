@@ -2,7 +2,9 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 `palimpsest-client 0.2.3`(`pyproject.toml`), 별도 Hub 패키지는 `palimpsest-hub 0.2.0`(`hub/pyproject.toml`)이다. Python import 경로 `palimpsest_local`과 CLI `palimpsest`는 유지한다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값은 `0.2.0`이다. Kolla 배포는 image 기본 UID1000과 root 소유로 생성된 named volume의 경계를 bootstrap 직전에 조정하며, source image로부터 실제 `palimpsest` 사용자 ID를 해석한다. Root/Hub 버전·image tag는 독립적으로 관리한다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 이 문서는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev` 작업트리의 현재 source를 설명한다. Root 패키지는 준비 중인 `palimpsest-client 0.2.4`(`pyproject.toml`; 마지막 게시판 0.2.3), 별도 Hub 패키지는 source 기준 `palimpsest-hub 0.2.1`(`hub/pyproject.toml`)이다. Python import 경로 `palimpsest_local`과 CLI `palimpsest`는 유지한다. Root wheel은 `deploy/kolla/ansible/roles/palimpsest` role을 shared data로 함께 설치하며 Kolla-Ansible 자체를 설치하지 않는다. Kolla의 Hub API/worker image tag 기본값은 `0.2.0`이다. Kolla 배포는 image 기본 UID1000과 root 소유로 생성된 named volume의 경계를 bootstrap 직전에 조정하며, source image로부터 실제 `palimpsest` 사용자 ID를 해석한다. Root/Hub 버전·image tag는 독립적으로 관리한다.
+
+Multi-host Kolla deployments prepare each host's local Hub volume with its reviewed API image before starting API/worker containers; only the database bootstrap is delegated to the first host.
 
 1분 요약:
 
@@ -1042,13 +1044,15 @@ artifact(450,980B)가 이 실행에 남았다. PR #3의 `mergeStateStatus`는
 
 2026-09-25 Hub CI lane 후속: 새 `hub/tests/test_database_pool.py`가 최초 dev run `36169071658`의 test-lane 정본에 누락되어 portable/lint가 공통 실패했다. `scripts/test_lanes.py`의 hub 전용 lane에 해당 파일을 포함하고 `list --check`가 전체 테스트 파일의 정확한 분류를 확인했다. Hub API/worker는 Docker daemon builder에서 linux/amd64·linux/arm64 각 실제 image build와 image 내부 `palimpsest-hub 0.2.1` import smoke가 통과했다. docker-container builder의 Docker Hub DNS 불가를 daemon-backed builder로 우회했으며 CI와 새 digest 운영 승격은 별도 결과가 필요하다.
 
+2026-09-27 dev release preparation: root `palimpsest-client` metadata, CLI constant, and root `uv.lock` editable distribution agree at 0.2.4; this is a patch candidate, not a published artifact. The existing Hub 0.2.1 asyncmy pre-ping closed-transport recovery and its `hub/tests/test_database_pool.py` regression were reviewed on `dev` and are unchanged. The separate Hub package metadata and `__version__` now both report 0.2.1; Kolla's API/worker image default remains the independent, older 0.2.0 tag rather than tracking that package constant. Deploy/upgrade pulls the API image and sets each Palimpsest host's local named volume root owner before starting containers; schema bootstrap remains run once on the first host and nested blob paths are not recursively changed. The published PyPI/Release evidence remains for root 0.2.3; a future tag must independently pass the root release/KVM gate and Hub image gate, and operators must explicitly pin fixed Hub image digests before a Kolla rollout.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b12d6aa474e3514bc5ad88444a5731228910d0d9101738cc94718b476a89e357",
-  "reviewed_at": "2026-09-25T17:48:00Z",
-  "summary": "Hub 0.2.1 stale asyncmy ping recovery tested in four local images; classified new Hub test in canonical lane after CI manifest failure; production digest rollout pending"
+  "source_sha256": "e7e986f6a31ab0f243c995648be41fec1d5c074756ddf9072800b7fe705ab93e",
+  "reviewed_at": "2026-09-27T07:36:45Z",
+  "summary": "Reviewed root 0.2.4 and Hub 0.2.1 separation plus per-host volumes and single-host DB bootstrap; root 5913, Hub 100, Kolla 18 tests and wheel/sdist plus four offline image and two volume smokes passed; Astra/native/publication remain unverified"
 }
 ```
 <!-- architecture-review:end -->

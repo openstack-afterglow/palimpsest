@@ -17,6 +17,11 @@ then run `palimpsest --version`. The isolated invocation
 `uvx --from palimpsest-client==0.2.3 palimpsest --version` was verified against
 the published wheel and reports `0.2.3`.
 
+The current checkout prepares root `palimpsest-client 0.2.4`, which is not
+published by these commands. The Hub 0.2.1 closed-transport pool recovery is
+separate source; update both reviewed Kolla API and worker image digests to
+deploy it, rather than assuming a root wheel upgrade updates running services.
+
 ## Package catalog
 
 | Distribution | Install selector | Entrypoints | Purpose |
@@ -44,6 +49,12 @@ alone does not establish image availability.
 The role default remains older than the Hub 0.2.1 source. Operators deploying
 the closed-connection fix must pin reviewed API and worker image digests in
 Kolla globals; a Python version bump alone does not change running containers.
+
+On deploy and upgrade, each Palimpsest host pulls the API image and sets the
+root of its own named Hub volume to the image's runtime user before containers
+start. Database/bootstrap initialization remains a single operation on the
+first host; a local Docker volume is not shared across hosts. Existing blob
+subdirectories are not recursively changed.
 
 Repository tags label both
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
@@ -549,7 +560,7 @@ Repository contributors can build the sdist/wheel and run the isolated package
 smoke from a trusted checkout:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.2.3
+uv run python scripts/build_package.py --out-dir dist/package-0.2.4
 ```
 
 This maintainer workflow is not the user installation path. Its local package

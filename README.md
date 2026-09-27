@@ -1,9 +1,10 @@
 # Palimpsest Local
 
-`palimpsest-client` 0.2.3 is the root Python 3.11+ distribution for managing
-Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered
-virtual machines. The Python module remains `palimpsest_local` and the CLI
-remains `palimpsest`. Local artifacts, tags, run state, and build records live
+`palimpsest-client` 0.2.4 is the prepared, unpublished root Python 3.11+
+distribution for managing Palimpsest boot images, SquashFS layers, OCI-layout
+bundles, and local layered virtual machines. The Python module remains
+`palimpsest_local` and the CLI remains `palimpsest`. Local artifacts, tags,
+run state, and build records live
 under XDG state directories. The base package has no required Python runtime
 dependencies; Linux KVM support is an opt-in extra.
 
@@ -12,7 +13,7 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The independently versioned `palimpsest-hub` Python distribution remains 0.2.0.
+- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The 0.2.4 source is not yet published; the independently versioned Hub source is 0.2.1, while the role's default image tag remains 0.2.0.
 
 ## Install from PyPI
 
@@ -24,6 +25,11 @@ palimpsest --version
 ```
 
 For an isolated one-off invocation, `uvx --from palimpsest-client==0.2.3 palimpsest --version` also reports `0.2.3`.
+
+The published commands above install 0.2.3, not the untagged 0.2.4 checkout.
+The Hub 0.2.1 closed-transport pool fix is in the separate Hub source and must
+be deployed as reviewed API and worker images; updating the root wheel alone
+does not update running Kolla containers.
 
 ## Install directly from GitHub
 
