@@ -1083,9 +1083,9 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a3027cbe25dbcb259f81e539cc19aade6bcf84bf0afbf408d2806fd49e124916",
-  "reviewed_at": "2026-10-02T06:23:25Z",
-  "summary": "Reviewed native packages/cache/auth/OCI/CAS/logging/UI and 0.3.0 release consumers; final candidate-only formatting/import corrections satisfy required CI style. Real HTTPS BuildKit/deferred push/pull/cache and Chromium proof passed; native/cloud/main publication remains owner-gated."
+  "source_sha256": "8f64dbde7852dca6d04ab613050929505a71c5f5f971d64e17bad63d6f1caa16",
+  "reviewed_at": "2026-10-02T06:30:36Z",
+  "summary": "Final 0.3.0 application source and both functional gates verified; Kolla source pin targets c4887f7806608e98f215abbd377d2eafe159ff76 containing all final application changes. Source-pin-only metadata follow-up passes Kolla contracts; main/tag/publication/cloud remain owner-gated."
 }
 ```
 <!-- architecture-review:end -->

@@ -2892,9 +2892,12 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   versions/lockfiles agree at **0.3.0**, a minor for the native registry and
   dashboard additions, not a claim of publication. Kolla's image-tag candidate
   also prepares 0.3.0, and source-build pins reviewed commit
-  `a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b`; image availability must be verified
+  `c4887f7806608e98f215abbd377d2eafe159ff76`; image availability must be verified
   before rollout. The source-build contract requires an immutable full SHA,
   not a mutable branch or an unresolved release tag.
+  This immutable application-source commit includes every final source/style
+  change and the 0.3.0 metadata. The later source-pin/stamp documentation
+  commit deliberately references it, avoiding a circular self-referential SHA.
 - Review fixes: native authority/alias routing, completed-reference bounds,
   API-base/namespace local-cache isolation, mandatory online cache refresh,
   malformed actor/graph handling and OCI/runtime client/Hub validation parity;
@@ -2916,6 +2919,10 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   files and Hub checked all 37. Three import-spacing/order findings and
   formatting in 34 candidate files were corrected without changing CI
   exclusions or functional contracts; both functional suites were rerun.
+- The metadata-only final source-pin follow-up passed all **24** Kolla asset,
+  immutable image-ref and role contracts. Local commits prepared the complete
+  candidate and then its application-source pin; dev push remains withheld
+  pending the owner's explicit decision on workflow side effects.
 - Real source boundary proof: normal CLI plus source Uvicorn/CAS/package APIs
   over loopback HTTPS with a trusted temporary certificate, scratch SQLite
   and a synthetic system-reader/member Keystone endpoint. An existing running
@@ -2952,7 +2959,7 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   service/migration readiness proof. Build caches were not pruned.
 - Architecture was stamped only after source review and corrected-test review;
   the final source fingerprint is
-  `a3027cbe25dbcb259f81e539cc19aade6bcf84bf0afbf408d2806fd49e124916`
+  `8f64dbde7852dca6d04ab613050929505a71c5f5f971d64e17bad63d6f1caa16`
   over 441 source files. Staged guard and secret scanning are commit barriers.
 - Publication/integration boundaries: no main-target PR was created/edited,
   no main merge, tag, release, GHCR push, private helper transfer, remote

@@ -8,7 +8,7 @@ palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker
 
 palimpsest_source_mode: "{{ enable_palimpsest_source_build | default(enable_source_build | default(palimpsest_dev_mode | default(false))) | bool }}"
 palimpsest_source_repo: "https://github.com/openstack-afterglow/palimpsest.git"
-palimpsest_source_version: "a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b"
+palimpsest_source_version: "c4887f7806608e98f215abbd377d2eafe159ff76"
 palimpsest_source_dir: "{{ palimpsest_source_checkout_path | default('/opt/afterglow/src/palimpsest') }}"
 palimpsest_api_image_ref: "{{ 'afterglow-local/palimpsest-hub-api:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_api_image ~ ':' ~ palimpsest_image_tag) }}"
 palimpsest_worker_image_ref: "{{ 'afterglow-local/palimpsest-hub-worker:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_worker_image ~ ':' ~ palimpsest_image_tag) }}"
