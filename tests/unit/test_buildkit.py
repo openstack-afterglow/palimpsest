@@ -805,7 +805,6 @@ def test_online_build_cannot_disable_mandatory_native_cache_refresh(tmp_path: Pa
         _spec(tmp_path, push_cache=False)
 
 
-
 def test_external_cache_spec_rejects_inline_secret_shaped_options(tmp_path: Path):
     with pytest.raises(PalimpsestError, match="credential"):
         _spec(
@@ -1344,9 +1343,7 @@ def test_online_cache_rejects_archive_binding_before_solve(tmp_path: Path, resol
     roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     spec = _spec(tmp_path)
     build_key = compute_build_key(spec, builder_fingerprint=_test_builder_fingerprint())
-    cache = _NativeCache(
-        _remote_cache_tar(tmp_path, build_key, **binding), build_key=build_key, resolution=resolution
-    )
+    cache = _NativeCache(_remote_cache_tar(tmp_path, build_key, **binding), build_key=build_key, resolution=resolution)
     runner = _SuccessfulBuildxRunner(spec)
 
     with pytest.raises(PalimpsestError, match="mismatch"):
@@ -1453,17 +1450,31 @@ def test_native_export_callback_retains_verified_reference_when_cache_finalize_f
         archive.addfile(member, io.BytesIO(payload))
     layer = layer_stream.getvalue()
     layer_digest = "sha256:" + hashlib.sha256(layer).hexdigest()
-    config = json.dumps({
-        "architecture": "amd64", "os": "linux", "config": {},
-        "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
-    }).encode()
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+        }
+    ).encode()
     manifest = _add_oci_descriptor(layout, layer, config=config)
     manifest_path = layout / "blobs" / "sha256" / manifest.split(":", 1)[1]
-    (layout / "index.json").write_text(json.dumps({
-        "schemaVersion": 2,
-        "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
-                       "digest": manifest, "size": manifest_path.stat().st_size}],
-    }), encoding="utf-8")
+    (layout / "index.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": manifest,
+                        "size": manifest_path.stat().st_size,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     buildx = _SuccessfulBuildxRunner(spec)
 
     def runner(argv, **kwargs):
@@ -1479,13 +1490,23 @@ def test_native_export_callback_retains_verified_reference_when_cache_finalize_f
             retained = roots.state / "package-artifacts" / (snapshot.archive_digest.split(":", 1)[1] + ".oci.tar")
             retained.parent.mkdir(parents=True)
             shutil.copyfile(snapshot.archive, retained)
-            write_package_reference(roots, LocalPackageReference(
-                reference=reference, authority="cloud.example", api_base="https://cloud.example/v1",
-                namespace="example-project", package=CACHE_PACKAGE, archive=str(retained),
-                archive_digest=snapshot.archive_digest, archive_size_bytes=snapshot.archive_size_bytes,
-                root_digest=snapshot.root_digest, package_type=snapshot.package_type,
-                project_id=PROJECT_ID, build_id=build_id,
-            ))
+            write_package_reference(
+                roots,
+                LocalPackageReference(
+                    reference=reference,
+                    authority="cloud.example",
+                    api_base="https://cloud.example/v1",
+                    namespace="example-project",
+                    package=CACHE_PACKAGE,
+                    archive=str(retained),
+                    archive_digest=snapshot.archive_digest,
+                    archive_size_bytes=snapshot.archive_size_bytes,
+                    root_digest=snapshot.root_digest,
+                    package_type=snapshot.package_type,
+                    project_id=PROJECT_ID,
+                    build_id=build_id,
+                ),
+            )
 
     class RevokedDuringFinalize(_NativeCache):
         def push_cache(self, package: str, archive: Path, descriptor: dict[str, object]):
@@ -1493,8 +1514,12 @@ def test_native_export_callback_retains_verified_reference_when_cache_finalize_f
 
     with pytest.raises(HubError, match="revoked"):
         build_with_buildkit(
-            spec, roots, hub_client=RevokedDuringFinalize(), cache_package=CACHE_PACKAGE,
-            on_oci_export=retain_export, runner=runner,
+            spec,
+            roots,
+            hub_client=RevokedDuringFinalize(),
+            cache_package=CACHE_PACKAGE,
+            on_oci_export=retain_export,
+            runner=runner,
         )
 
     spec.output.write_bytes(b"mutable exporter output replaced after failure")

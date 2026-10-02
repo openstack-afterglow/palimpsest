@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 기본 checkout의 현재 source는 root `palimpsest-client 0.3.0`과 별도 `palimpsest-hub 0.3.0` native project-package registry 후보를 준비한다. 두 package metadata/lock/module version은 각 배포판 기준으로 일치하지만 게시·배포 증거는 아니다. Kolla Hub API/worker image 기본 tag는 독립적인 기존 `0.2.0`이며 운영자는 검토된 image digest를 별도로 pin해야 한다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 기본 checkout의 현재 source는 root `palimpsest-client 0.3.0`과 별도 `palimpsest-hub 0.3.0` native project-package registry 후보를 준비한다. 두 package metadata/lock/module version 및 Kolla image-tag 후보는 0.3.0으로 일치하지만 게시·배포 증거는 아니다. Kolla source-build 기본 ref는 검토·검증된 후보 commit `a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b`이며 운영자는 게시된 API/worker image와 검토된 digest를 별도로 확인·pin해야 한다.
 
 Multi-host Kolla deployments prepare each host's local Hub volume with its reviewed API image before starting API/worker containers; only the database bootstrap is delegated to the first host.
 
@@ -1083,9 +1083,9 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "46bee367eed4f8bd2dbd8c121c1fcfc9b9a90a27a4bd7480d6148861cf1d7815",
-  "reviewed_at": "2026-10-02T06:01:15Z",
-  "summary": "Reviewed integrated native project-package/cache/auth/OCI/CAS/logging and local UI safety paths. Portable 6131/217, Hub 215, real loopback HTTPS BuildKit/deferred-push/pull and exact remote-cache reuse, Chromium regression proof, and arm64/amd64 API/worker build/import checks passed; production/native qualification remains separate."
+  "source_sha256": "a3027cbe25dbcb259f81e539cc19aade6bcf84bf0afbf408d2806fd49e124916",
+  "reviewed_at": "2026-10-02T06:23:25Z",
+  "summary": "Reviewed native packages/cache/auth/OCI/CAS/logging/UI and 0.3.0 release consumers; final candidate-only formatting/import corrections satisfy required CI style. Real HTTPS BuildKit/deferred push/pull/cache and Chromium proof passed; native/cloud/main publication remains owner-gated."
 }
 ```
 <!-- architecture-review:end -->

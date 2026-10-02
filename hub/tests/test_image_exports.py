@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,8 +13,8 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.models import Base, PalimpsestImageExport
-from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services import image_exports
+from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.image_exports import (
     CONVERTER_CONTRACT,
     STATUS_COMPLETE,
@@ -165,6 +165,7 @@ def test_promote_file_refreshes_existing_blob_gc_age(tmp_path: Path):
     assert promoted1.blob_digest == promoted2.blob_digest
     assert not second_file.exists()
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["complete", "error", "lease_lost"])
 async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, monkeypatch, caplog, outcome):
@@ -177,11 +178,20 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
     source = b"image content"
     checksum = hashlib.sha256(source).hexdigest()
     job = PalimpsestImageExport(
-        id="export-secret-id", project_id="project-secret-id", source_image_id="image-secret-id",
-        source_name=secret, source_disk_format="raw", source_size_bytes=len(source),
-        source_virtual_size_bytes=len(source), source_hash_algo="sha256", source_hash_value=checksum,
-        source_fingerprint="a" * 64, artifact_key="b" * 64, target_disk_format="raw",
-        status="queued", progress_pct=0,
+        id="export-secret-id",
+        project_id="project-secret-id",
+        source_image_id="image-secret-id",
+        source_name=secret,
+        source_disk_format="raw",
+        source_size_bytes=len(source),
+        source_virtual_size_bytes=len(source),
+        source_hash_algo="sha256",
+        source_hash_value=checksum,
+        source_fingerprint="a" * 64,
+        artifact_key="b" * 64,
+        target_disk_format="raw",
+        status="queued",
+        progress_pct=0,
     )
     async with factory() as session:
         session.add(job)
@@ -195,11 +205,19 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
             pass
 
     openstack_image = SimpleNamespace(
-        status="active", owner=job.project_id, disk_format="raw", size=len(source),
-        virtual_size=len(source), checksum=None, os_hash_algo="sha256", os_hash_value=checksum,
+        status="active",
+        owner=job.project_id,
+        disk_format="raw",
+        size=len(source),
+        virtual_size=len(source),
+        checksum=None,
+        os_hash_algo="sha256",
+        os_hash_value=checksum,
         updated_at=None,
     )
-    admin_conn = SimpleNamespace(image=SimpleNamespace(download_image=lambda *args, **kwargs: Response()), close=lambda: None)
+    admin_conn = SimpleNamespace(
+        image=SimpleNamespace(download_image=lambda *args, **kwargs: Response()), close=lambda: None
+    )
     monkeypatch.setattr(image_exports, "get_session_factory", lambda: factory)
     monkeypatch.setattr(image_exports, "get_blob_store", lambda: store)
     monkeypatch.setattr(image_exports, "get_settings", lambda: SimpleNamespace(palimpsest_hub_max_blob_bytes=1024))

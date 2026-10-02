@@ -64,7 +64,10 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
                 try:
                     source_table = await _reflect(source, table_name)
                 except NoSuchTableError:
-                    if table_name not in {"palimpsest_hub_layer_access", "palimpsest_hub_builds"} and not table_name.startswith(("palimpsest_package_", "palimpsest_packages")):
+                    if table_name not in {
+                        "palimpsest_hub_layer_access",
+                        "palimpsest_hub_builds",
+                    } and not table_name.startswith(("palimpsest_package_", "palimpsest_packages")):
                         raise
                     copied[table_name] = 0
                     continue

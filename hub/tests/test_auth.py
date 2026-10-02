@@ -35,14 +35,16 @@ def settings(monkeypatch: pytest.MonkeyPatch):
         "OS_PASSWORD": "password",
         "OS_PROJECT_NAME": "palimpsest-service",
     }
-    values.update({
-        "OS_READER_USERNAME": "read-only-validator",
-        "OS_READER_PASSWORD": "synthetic-read-secret",
-        "PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS": json.dumps(["e" * 32]),
-        "PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS": json.dumps(["d" * 32]),
-        "PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS": "{}",
-        "PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN": "https://packages.example",
-    })
+    values.update(
+        {
+            "OS_READER_USERNAME": "read-only-validator",
+            "OS_READER_PASSWORD": "synthetic-read-secret",
+            "PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS": json.dumps(["e" * 32]),
+            "PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS": json.dumps(["d" * 32]),
+            "PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS": "{}",
+            "PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN": "https://packages.example",
+        }
+    )
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -50,8 +52,6 @@ def settings(monkeypatch: pytest.MonkeyPatch):
     yield
     get_settings.cache_clear()
     _reader_client_for.cache_clear()
-
-
 
 
 def make_request(headers: dict[str, str] | None = None) -> Request:
@@ -65,8 +65,6 @@ async def test_require_token_missing_header_raises_401():
     with pytest.raises(HTTPException) as exc_info:
         await require_token(req, x_auth_token=None, x_project_id=None)
     assert exc_info.value.status_code == 401
-
-
 
 
 @pytest.mark.asyncio
@@ -156,7 +154,9 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
                 "name": "read-only-validator" if reader else "federated-member",
                 "domain": {"id": "default", "name": "Default"},
             },
-            "roles": [{"id": f"role-{name}", "name": name} for name in state["validator_roles" if reader else "token_roles"]],
+            "roles": [
+                {"id": f"role-{name}", "name": name} for name in state["validator_roles" if reader else "token_roles"]
+            ],
             "catalog": [],
         }
         if reader:
@@ -196,13 +196,19 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
 
         def do_GET(self):
             parsed = urlsplit(self.path)
-            state["requests"].append({
-                "method": "GET", "path": parsed.path,
-                "actor_token": self.headers.get("X-Auth-Token"),
-                "subject_token": self.headers.get("X-Subject-Token"),
-            })
+            state["requests"].append(
+                {
+                    "method": "GET",
+                    "path": parsed.path,
+                    "actor_token": self.headers.get("X-Auth-Token"),
+                    "subject_token": self.headers.get("X-Subject-Token"),
+                }
+            )
             if parsed.path == "/compute/ping":
-                self.send_json(200, {"project_id": PROJECT_A, "original_subject": self.headers.get("X-Auth-Token") == ORIGINAL_SUBJECT})
+                self.send_json(
+                    200,
+                    {"project_id": PROJECT_A, "original_subject": self.headers.get("X-Auth-Token") == ORIGINAL_SUBJECT},
+                )
                 return
             if state["unavailable"]:
                 self.send_json(503, {"error": {"message": "Identity temporarily unavailable"}})
@@ -216,15 +222,42 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
                 else:
                     self.send_json(401, {"error": {"message": "Invalid subject"}})
             elif parsed.path == f"/v3/users/{state['user_id']}":
-                self.send_json(200, {"user": {"id": state["user_id"], "name": "federated-member", "enabled": state["user_enabled"]}})
+                self.send_json(
+                    200,
+                    {"user": {"id": state["user_id"], "name": "federated-member", "enabled": state["user_enabled"]}},
+                )
             elif parsed.path == f"/v3/projects/{state['project_id']}":
-                self.send_json(200, {"project": {"id": state["project_id"], "name": "selected-project", "enabled": state["project_enabled"], "domain_id": "default"}})
+                self.send_json(
+                    200,
+                    {
+                        "project": {
+                            "id": state["project_id"],
+                            "name": "selected-project",
+                            "enabled": state["project_enabled"],
+                            "domain_id": "default",
+                        }
+                    },
+                )
             elif parsed.path == "/v3/role_assignments":
                 query = parse_qs(parsed.query)
                 assignments = []
                 if not query.get("scope.system"):
-                    assignments.extend({"user": {"id": state["user_id"]}, "scope": {"project": {"id": state["project_id"]}}, "role": {"id": name, "name": name}} for name in state["project_roles"])
-                    assignments.extend({"user": {"id": state["user_id"]}, "scope": {"project": {"id": PROJECT_B}}, "role": {"id": name, "name": name}} for name in state["other_roles"])
+                    assignments.extend(
+                        {
+                            "user": {"id": state["user_id"]},
+                            "scope": {"project": {"id": state["project_id"]}},
+                            "role": {"id": name, "name": name},
+                        }
+                        for name in state["project_roles"]
+                    )
+                    assignments.extend(
+                        {
+                            "user": {"id": state["user_id"]},
+                            "scope": {"project": {"id": PROJECT_B}},
+                            "role": {"id": name, "name": name},
+                        }
+                        for name in state["other_roles"]
+                    )
                 self.send_json(200, {"role_assignments": assignments})
             else:
                 self.send_json(404, {"error": {"message": "Unknown identity resource"}})

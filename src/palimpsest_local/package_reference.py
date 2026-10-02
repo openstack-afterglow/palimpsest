@@ -41,13 +41,25 @@ class LocalPackageReference:
     published_digest: str | None = None
 
     def __post_init__(self) -> None:
-        text_fields = (self.reference, self.authority, self.api_base, self.namespace,
-                       self.package, self.archive, self.archive_digest, self.root_digest, self.package_type)
+        text_fields = (
+            self.reference,
+            self.authority,
+            self.api_base,
+            self.namespace,
+            self.package,
+            self.archive,
+            self.archive_digest,
+            self.root_digest,
+            self.package_type,
+        )
         if any(not isinstance(value, str) or not value or len(value) > 4096 for value in text_fields):
             raise ArtifactValidationError("package reference text fields are invalid")
         profile = RegistryProfile(
-            alias="reference", endpoint=self.authority, protocol="palimpsest",
-            api_base=self.api_base, namespace=self.namespace,
+            alias="reference",
+            endpoint=self.authority,
+            protocol="palimpsest",
+            api_base=self.api_base,
+            namespace=self.namespace,
         )
         if profile.endpoint != self.authority or profile.api_base != self.api_base:
             raise ArtifactValidationError("package reference authority/API base is not canonical")

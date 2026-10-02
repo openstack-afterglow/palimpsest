@@ -3,6 +3,7 @@
 No extraction uses archive paths. A private operation directory holds verified
 original bytes; only that directory is removed on failure (or after cache checks).
 """
+
 from __future__ import annotations
 
 import gzip
@@ -202,9 +203,9 @@ def _pax(payload: bytes) -> dict[str, str]:
         if not length_text.isdigit():
             raise PackageContentError("invalid PAX record length")
         end = offset + int(length_text)
-        if end > len(payload) or end <= separator + 1 or payload[end - 1:end] != b"\n":
+        if end > len(payload) or end <= separator + 1 or payload[end - 1 : end] != b"\n":
             raise PackageContentError("truncated PAX record")
-        key, equal, value = payload[separator + 1:end - 1].partition(b"=")
+        key, equal, value = payload[separator + 1 : end - 1].partition(b"=")
         if not equal:
             raise PackageContentError("invalid PAX record")
         try:
@@ -287,7 +288,9 @@ def _scan(plain: Path, *, max_blob: int, max_expanded: int, cache: bool) -> dict
                 allowed = {"cache", "blobs", "blobs/sha256", "ingest"} if cache else {"blobs", "blobs/sha256"}
                 if not valid or member_size or local_name not in allowed:
                     raise PackageContentError("unexpected archive directory")
-            elif not valid or not (local_name in {"oci-layout", "index.json", "palimpsest-cache.json"} or _BLOB_NAME.fullmatch(local_name)):
+            elif not valid or not (
+                local_name in {"oci-layout", "index.json", "palimpsest-cache.json"} or _BLOB_NAME.fullmatch(local_name)
+            ):
                 raise PackageContentError("unexpected archive member")
             elif member_size > max_blob:
                 raise PackageContentLimitError("archive member exceeds blob byte limit")
@@ -412,7 +415,17 @@ class _Slice(io.RawIOBase):
 class _Graph:
     """Selected-graph walker. ``copy`` stages verified original bytes; cache checks hash in place."""
 
-    def __init__(self, plain: Path, members: dict[str, _Member], work: Path, max_blob: int, max_expanded: int, *, prefix: str = "", copy: bool = True):
+    def __init__(
+        self,
+        plain: Path,
+        members: dict[str, _Member],
+        work: Path,
+        max_blob: int,
+        max_expanded: int,
+        *,
+        prefix: str = "",
+        copy: bool = True,
+    ):
         self.plain, self.members, self.work = plain, members, work
         self.max_blob, self.max_expanded, self.prefix, self.copy = max_blob, max_expanded, prefix, copy
         self.graph: dict[str, dict] = {}
@@ -555,13 +568,22 @@ class _Graph:
                     source.seek(member.offset)
                     candidate = _json(source.read(member.size), "layout root candidate")
                 layers = candidate.get("layers")
-                if isinstance(layers, list) and layers and isinstance(layers[-1], dict) and isinstance(layers[-1].get("digest"), str):
+                if (
+                    isinstance(layers, list)
+                    and layers
+                    and isinstance(layers[-1], dict)
+                    and isinstance(layers[-1].get("digest"), str)
+                ):
                     roots.setdefault(layers[-1]["digest"], []).append((descriptor, candidate))
             self._layout_roots = roots
         return self._layout_roots
 
     def root(self, index: dict, digest: str) -> dict:
-        matches = [self.descriptor(item) for item in index["manifests"] if isinstance(item, dict) and item.get("digest") == digest]
+        matches = [
+            self.descriptor(item)
+            for item in index["manifests"]
+            if isinstance(item, dict) and item.get("digest") == digest
+        ]
         if not matches:
             # An explicitly chosen layout index is itself a legitimate root.
             member = self.members[self.prefix + "index.json"]
@@ -653,17 +675,32 @@ class _Graph:
             document = self.document(descriptor)
             self.schema(document, media)
             if media in INDEX_TYPES:
-                children = [self.descriptor(child) for child in self.array(document.get("manifests"), "index manifests", nonempty=True)]
-                siblings = {child["digest"] for child in children if child.get("annotations", {}).get(ATTESTATION_REFERENCE) != "attestation-manifest"}
+                children = [
+                    self.descriptor(child)
+                    for child in self.array(document.get("manifests"), "index manifests", nonempty=True)
+                ]
+                siblings = {
+                    child["digest"]
+                    for child in children
+                    if child.get("annotations", {}).get(ATTESTATION_REFERENCE) != "attestation-manifest"
+                }
                 for child in children:
                     if child.get("annotations", {}).get(ATTESTATION_REFERENCE) == "attestation-manifest":
                         platform = child.get("platform")
-                        if platform is not None and (not isinstance(platform, dict) or platform.get("os") != "unknown" or platform.get("architecture") != "unknown"):
+                        if platform is not None and (
+                            not isinstance(platform, dict)
+                            or platform.get("os") != "unknown"
+                            or platform.get("architecture") != "unknown"
+                        ):
                             raise PackageContentError("attestation manifest must use unknown/unknown platform")
                         self.attestation(child, siblings)
                         continue
                     platform = _platform_constraint(child["platform"]) if "platform" in child else expected_platform
-                    if expected_platform is not None and platform is not None and any(platform.get(key) != value for key, value in expected_platform.items()):
+                    if (
+                        expected_platform is not None
+                        and platform is not None
+                        and any(platform.get(key) != value for key, value in expected_platform.items())
+                    ):
                         raise PackageContentError("nested index platform mismatch")
                     self.image(child, platform, depth + 1)
                 return
@@ -699,7 +736,9 @@ class _Graph:
             if history is not None:
                 history = self.array(history, "config history")
                 for entry in history:
-                    if not isinstance(entry, dict) or ("empty_layer" in entry and type(entry["empty_layer"]) is not bool):
+                    if not isinstance(entry, dict) or (
+                        "empty_layer" in entry and type(entry["empty_layer"]) is not bool
+                    ):
                         raise PackageContentError("invalid config history entry")
                     for key in ("created", "created_by", "author", "comment"):
                         if key in entry and not isinstance(entry[key], str):
@@ -825,6 +864,7 @@ def _runtime_ancestor_config(graph: _Graph, layout: dict, prefix: list[dict]) ->
 def _write_projection(graph: _Graph, path: Path, json_members: dict[str, bytes], opaque: list[str]) -> None:
     """PAX tar for parse_bundle: JSON copied, large blobs as sparse holes (sizes/offsets only)."""
     with path.open("xb") as output:
+
         def header(name: str, size: int) -> None:
             info = tarfile.TarInfo(name)
             info.size = size
@@ -847,7 +887,9 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
         descriptor = graph.descriptor(descriptor)
         if "platform" in descriptor:
             platform = _platform_constraint(descriptor["platform"])
-            if expected_platform is not None and any(platform.get(key) != value for key, value in expected_platform.items()):
+            if expected_platform is not None and any(
+                platform.get(key) != value for key, value in expected_platform.items()
+            ):
                 raise PackageContentError("nested runtime index platform mismatch")
             expected_platform = platform
         digest = descriptor["digest"]
@@ -895,13 +937,19 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
             graph.blob(descriptor)
             annotation = descriptor.get("annotations", {}).get(ANNOTATION_CONFIG_DIGEST)
             if annotation is None:
-                config = leaf if ordinal == len(layers) - 1 else _runtime_ancestor_config(graph, layout, layers[:ordinal + 1])
+                config = (
+                    leaf
+                    if ordinal == len(layers) - 1
+                    else _runtime_ancestor_config(graph, layout, layers[: ordinal + 1])
+                )
             else:
                 config_digest = _digest(annotation)
                 member = graph._member(config_digest)
                 if member is None:
                     raise PackageContentError("missing runtime annotated config")
-                config = graph.document({"digest": config_digest, "size": member.size, "mediaType": MEDIA_TYPE_LAYER_CONFIG})
+                config = graph.document(
+                    {"digest": config_digest, "size": member.size, "mediaType": MEDIA_TYPE_LAYER_CONFIG}
+                )
             _runtime_config(config, digest, media)
             if digest in configs and configs[digest] != config:
                 raise PackageContentError("inconsistent shared runtime config")
@@ -909,7 +957,10 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
             if media in DISK_FORMAT_MEDIA_TYPES.values():
                 if chain or ordinal != 0:
                     raise PackageContentError("runtime cloud base must precede all layers")
-                if config.get("kind") != "cloud-image" or DISK_FORMAT_MEDIA_TYPES.get(config.get("disk_format")) != media:
+                if (
+                    config.get("kind") != "cloud-image"
+                    or DISK_FORMAT_MEDIA_TYPES.get(config.get("disk_format")) != media
+                ):
                     raise PackageContentError("runtime cloud base kind/disk format mismatch")
                 if any(config.get(key) for key in ("parent_digest", "chain_id", "base_image_digest")):
                     raise PackageContentError("runtime cloud base cannot have parent/chain/base")
@@ -930,7 +981,9 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
 
     # base_image_digest is a real graph edge: find its root in the layout, but
     # do not include unrelated runtime roots.
-    needed_bases = {config["base_image_digest"] for config in configs.values() if config.get("base_image_digest") is not None}
+    needed_bases = {
+        config["base_image_digest"] for config in configs.values() if config.get("base_image_digest") is not None
+    }
     for base_digest in needed_bases - bases.keys():
         candidates = [item for item in graph.layout_roots(layout).get(base_digest, []) if len(item[1]["layers"]) == 1]
         if len({descriptor["digest"] for descriptor, _ in candidates}) != 1:
@@ -939,7 +992,9 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
         # Discovery bytes confer no identity. Re-read only through the
         # digest/size-verified staged descriptor before following edges.
         verified = graph.document(descriptor)
-        verified_layers = [graph.descriptor(item) for item in graph.array(verified.get("layers"), "base root layers", nonempty=True)]
+        verified_layers = [
+            graph.descriptor(item) for item in graph.array(verified.get("layers"), "base root layers", nonempty=True)
+        ]
         if len(verified_layers) != 1 or verified_layers[0]["digest"] != base_digest:
             raise PackageContentError("runtime base discovery differs from verified root")
         if verified_layers[0]["mediaType"] not in DISK_FORMAT_MEDIA_TYPES.values():
@@ -955,7 +1010,9 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
         if arch is None and leaf.get("base_image_digest") in bases:
             arch = bases[leaf["base_image_digest"]][1].get("arch")
         if arch is None:
-            arch = next((bases[item["digest"]][1].get("arch") for item in manifest["layers"] if item["digest"] in bases), None)
+            arch = next(
+                (bases[item["digest"]][1].get("arch") for item in manifest["layers"] if item["digest"] in bases), None
+            )
         if expected_platform["os"] != "linux" or expected_platform["architecture"] != _ARCHITECTURES.get(arch):
             raise PackageContentError("runtime index/config platform mismatch")
 
@@ -985,7 +1042,11 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
                 if expected_base is not None and declared_base != expected_base:
                     raise PackageContentError("runtime layers disagree on cloud base")
                 expected_base = declared_base
-            chain_id = digest if previous_chain is None else "sha256:" + hashlib.sha256(f"{previous_chain} {digest}".encode()).hexdigest()
+            chain_id = (
+                digest
+                if previous_chain is None
+                else "sha256:" + hashlib.sha256(f"{previous_chain} {digest}".encode()).hexdigest()
+            )
             if config.get("chain_id") is not None and config["chain_id"] != chain_id:
                 raise PackageContentError("runtime chain_id mismatch")
             arch = config.get("arch")
@@ -1020,7 +1081,15 @@ def _runtime(graph: _Graph, root: dict, layout: dict) -> None:
         projection.unlink(missing_ok=True)
 
 
-def validate_package_archive(archive_path: Path, staging_dir: Path, *, package_type: str, root_digest: str, max_blob_bytes: int, max_expanded_bytes: int) -> ValidatedPackage:
+def validate_package_archive(
+    archive_path: Path,
+    staging_dir: Path,
+    *,
+    package_type: str,
+    root_digest: str,
+    max_blob_bytes: int,
+    max_expanded_bytes: int,
+) -> ValidatedPackage:
     """Validate and stage exactly the original selected reachable package graph."""
     _limits(max_blob_bytes, max_expanded_bytes)
     _digest(root_digest)
@@ -1041,7 +1110,15 @@ def validate_package_archive(archive_path: Path, staging_dir: Path, *, package_t
                 _runtime(graph, root, layout)
         if plain != archive_path:
             plain.unlink()
-        return ValidatedPackage(root_digest, root["mediaType"], graph.graph, graph.platforms, graph.paths, sum(item["size_bytes"] for item in graph.graph.values()), package_type)
+        return ValidatedPackage(
+            root_digest,
+            root["mediaType"],
+            graph.graph,
+            graph.platforms,
+            graph.paths,
+            sum(item["size_bytes"] for item in graph.graph.values()),
+            package_type,
+        )
     except BaseException:
         shutil.rmtree(work)
         raise
@@ -1094,7 +1171,9 @@ def _cache_config(graph: _Graph, config: dict, layer_descriptors: dict[str, dict
         if annotations is not None:
             if not isinstance(annotations, dict):
                 raise PackageContentError("invalid cache layer annotations")
-            if "size" in annotations and (type(annotations["size"]) is not int or annotations["size"] != descriptor["size"]):
+            if "size" in annotations and (
+                type(annotations["size"]) is not int or annotations["size"] != descriptor["size"]
+            ):
                 raise PackageContentError("cache layer annotation size mismatch")
             if "mediaType" in annotations and annotations["mediaType"] != descriptor["mediaType"]:
                 raise PackageContentError("cache layer annotation media type mismatch")
@@ -1110,7 +1189,11 @@ def _cache_config(graph: _Graph, config: dict, layer_descriptors: dict[str, dict
         links: list[int] = []
         for inputs in graph.array(record.get("inputs", []), "cache inputs"):
             for item in graph.array(inputs, "cache input group", nonempty=True):
-                if not isinstance(item, dict) or type(item.get("link")) is not int or not isinstance(item.get("selector", ""), str):
+                if (
+                    not isinstance(item, dict)
+                    or type(item.get("link")) is not int
+                    or not isinstance(item.get("selector", ""), str)
+                ):
                     raise PackageContentError("invalid cache input binding")
                 links.append(item["link"])
         edge_count += len(links)
@@ -1131,11 +1214,20 @@ def _cache_config(graph: _Graph, config: dict, layer_descriptors: dict[str, dict
     _acyclic(record_edges, "cache record")
 
 
-def validate_cache_archive(archive_path: Path, staging_dir: Path, *, expected_binding: dict[str, str], max_blob_bytes: int, max_expanded_bytes: int) -> None:
+def validate_cache_archive(
+    archive_path: Path,
+    staging_dir: Path,
+    *,
+    expected_binding: dict[str, str],
+    max_blob_bytes: int,
+    max_expanded_bytes: int,
+) -> None:
     """Verify a key-bound cache wrapper and its complete local OCI cache graph."""
     fields = {"project_id", "namespace", "package", "build_key", "cache_scope", "platform", "builder_fingerprint"}
     _limits(max_blob_bytes, max_expanded_bytes)
-    if set(expected_binding) != fields or any(not isinstance(value, str) or not value for value in expected_binding.values()):
+    if set(expected_binding) != fields or any(
+        not isinstance(value, str) or not value for value in expected_binding.values()
+    ):
         raise PackageContentError("expected cache binding must contain exactly seven nonempty fields")
     if _KEYSTONE_ID.fullmatch(expected_binding["project_id"]) is None:
         raise PackageContentError("cache project_id must be an exact bounded Keystone identifier")
@@ -1174,7 +1266,10 @@ def validate_cache_archive(archive_path: Path, staging_dir: Path, *, expected_bi
                 config_descriptor = graph.descriptor(root_document.get("config"))
                 layer_entries = graph.array(root_document.get("layers"), "cache manifest layers")
             elif root["mediaType"] in INDEX_TYPES:
-                entries = [graph.descriptor(entry) for entry in graph.array(root_document.get("manifests"), "cache index entries", nonempty=True)]
+                entries = [
+                    graph.descriptor(entry)
+                    for entry in graph.array(root_document.get("manifests"), "cache index entries", nonempty=True)
+                ]
                 configs = [entry for entry in entries if entry["mediaType"] == CACHE_CONFIG]
                 if len(configs) != 1:
                     raise PackageContentError("cache index requires exactly one cache config")

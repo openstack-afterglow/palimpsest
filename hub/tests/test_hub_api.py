@@ -905,7 +905,13 @@ def test_hub_log_configuration_limits_debug_to_hub_namespace(monkeypatch):
     hub_logger = logging.getLogger("palimpsest_hub")
     access_logger = logging.getLogger("uvicorn.access")
     sql_logger = logging.getLogger("sqlalchemy.engine")
-    previous = (hub_logger.level, hub_logger.propagate, list(hub_logger.handlers), access_logger.disabled, sql_logger.level)
+    previous = (
+        hub_logger.level,
+        hub_logger.propagate,
+        list(hub_logger.handlers),
+        access_logger.disabled,
+        sql_logger.level,
+    )
     try:
         monkeypatch.setenv("PALIMPSEST_HUB_LOG_LEVEL", "DEBUG")
         configure_logging()
@@ -966,9 +972,11 @@ def test_hub_request_logs_template_status_duration_without_secrets(level):
         for secret in ("secret-query-value", "secret-header-value", "secret-path-value", "password", "token=")
     )
 
+
 @pytest.mark.asyncio
 async def test_hub_request_internal_error_does_not_log_exception_or_query():
-    from palimpsest_hub.main import log_request, logger as request_logger
+    from palimpsest_hub.main import log_request
+    from palimpsest_hub.main import logger as request_logger
 
     records = []
 
@@ -985,7 +993,15 @@ async def test_hub_request_internal_error_does_not_log_exception_or_query():
         raise RuntimeError("SQL bind=secret-bind-value; OpenStack token=secret-token-value")
 
     try:
-        request = Request({"type": "http", "method": "POST", "path": "/hidden", "query_string": b"key=secret-query-value", "headers": []})
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/hidden",
+                "query_string": b"key=secret-query-value",
+                "headers": [],
+            }
+        )
         response = await log_request(request, fail)
     finally:
         request_logger.removeHandler(handler)
@@ -1018,8 +1034,6 @@ def test_cloud_image_meta_resolves_media_type_by_disk_format():
     )
 
 
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -1047,7 +1061,9 @@ def test_unqualified_buildkit_cache_registration_is_retired(media_type: str | No
     # Mandatory BuildKit cache now has only project/package/key-bound uploads;
     # the retired cache media type itself is no longer an accepted legacy type.
     with pytest.raises(ValueError, match="legacy cache registration is retired|media_type"):
-        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id="sha256:" + "d" * 64, media_type=media_type)
+        HubLayerMeta(
+            name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id="sha256:" + "d" * 64, media_type=media_type
+        )
 
 
 def test_cloud_image_requires_disk_format():
@@ -1108,8 +1124,6 @@ def test_buildkit_cache_download_filename_uses_tar_extension():
     )
 
     assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
-
-
 
 
 @pytest.mark.asyncio
@@ -1543,9 +1557,19 @@ async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_s
     payload = b"case-bound private bytes"
     digest = _put_blob(store, payload)
     async with factory() as session:
-        session.add(PalimpsestHubLayer(blob_digest=digest, size_bytes=len(payload),
-            media_type=MEDIA_TYPE_LAYER_SQUASHFS, config_digest=_sha256(b"config"),
-            name="private", kind="squashfs", config_json={}, project_id="Project-A", is_published=False))
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=digest,
+                size_bytes=len(payload),
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                config_digest=_sha256(b"config"),
+                name="private",
+                kind="squashfs",
+                config_json={},
+                project_id="Project-A",
+                is_published=False,
+            )
+        )
         session.add(PalimpsestHubLayerAccess(blob_digest=digest, project_id="Granted-A"))
         await session.commit()
     monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
@@ -1571,8 +1595,12 @@ async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_s
 
 def test_package_error_request_identity_is_server_generated_and_no_store():
     client = TestClient(app)
-    response = client.post("/v1/projects/alpha/uploads", params={"package": "test"},
-        json={}, headers={"X-Request-Id": "untrusted-request-value"})
+    response = client.post(
+        "/v1/projects/alpha/uploads",
+        params={"package": "test"},
+        json={},
+        headers={"X-Request-Id": "untrusted-request-value"},
+    )
     assert response.status_code == 401
     identity = response.json()["error"]["request_id"]
     assert UUID(identity).hex == identity and identity != "untrusted-request-value"

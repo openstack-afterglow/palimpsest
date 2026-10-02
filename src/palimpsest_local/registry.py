@@ -247,7 +247,9 @@ class RegistryProfile:
             api_base = normalize_native_api_base(self.api_base, endpoint)
             namespace = "" if self.namespace == "" else normalize_native_namespace(self.namespace)
             if self.mirrors or self.plain_http or self.tls_skip_verify or self.cache_from or self.cache_to:
-                raise RegistryError("native profiles do not support Docker mirrors, insecure transport, or cache exporters")
+                raise RegistryError(
+                    "native profiles do not support Docker mirrors, insecure transport, or cache exporters"
+                )
         else:
             if self.api_base != "":
                 raise RegistryError("oci profiles must not declare native api_base")
@@ -594,9 +596,7 @@ def _has_explicit_registry(name: str) -> bool:
     return "." in first or ":" in first or first.lower() == "localhost" or first.startswith("[")
 
 
-def _profile_alias_for_endpoint(
-    config: RegistryConfig, endpoint: str, explicit_alias: str | None = None
-) -> str | None:
+def _profile_alias_for_endpoint(config: RegistryConfig, endpoint: str, explicit_alias: str | None = None) -> str | None:
     matches = sorted(profile.alias for profile in config.registries.values() if profile.endpoint == endpoint)
     if explicit_alias is not None and inspect_profile(config, explicit_alias).endpoint != endpoint:
         raise RegistryError("explicit registry alias does not match reference authority")

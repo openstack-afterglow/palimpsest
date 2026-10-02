@@ -390,7 +390,8 @@ def _platform_constraint(value: Any) -> dict[str, Any]:
                 raise ArtifactValidationError("index platform field is invalid")
             result[key] = item
     if "os.features" in value and (
-        not isinstance(value["os.features"], list) or any(not isinstance(item, str) or not item for item in value["os.features"])
+        not isinstance(value["os.features"], list)
+        or any(not isinstance(item, str) or not item for item in value["os.features"])
     ):
         raise ArtifactValidationError("index platform os.features is invalid")
     return {**result, "os.features": value.get("os.features", [])}
@@ -409,7 +410,9 @@ def _image_platform(config: dict[str, Any], constraint: dict[str, Any] | None) -
     for key in ("variant", "os.version"):
         value = config.get(key)
         declared = None if constraint is None else constraint.get(key)
-        if value is not None and (not isinstance(value, str) or not value or "\0" in value or len(value.encode("utf-8")) > 256):
+        if value is not None and (
+            not isinstance(value, str) or not value or "\0" in value or len(value.encode("utf-8")) > 256
+        ):
             raise ArtifactValidationError(f"OCI config {key} is invalid")
         if value is not None and declared is not None and value != declared:
             raise ArtifactValidationError("index platform disagrees with image config")
@@ -541,7 +544,10 @@ class _Graph:
         if descriptor["digest"] not in self.verified:
             if _hash_file(path) != (descriptor["digest"], descriptor["size"]):
                 raise ArtifactValidationError("package graph blob digest mismatch")
-            self.verified[descriptor["digest"]] = {"media_type": descriptor["mediaType"], "size_bytes": descriptor["size"]}
+            self.verified[descriptor["digest"]] = {
+                "media_type": descriptor["mediaType"],
+                "size_bytes": descriptor["size"],
+            }
             self.paths[descriptor["digest"]] = path
         return path
 
@@ -575,7 +581,9 @@ class _Graph:
         if media_type not in _LAYER_TYPES:
             raise ArtifactValidationError("unsupported OCI image layer media type")
         if media_type in _ZSTD_LAYERS and _zstd is None:
-            raise ArtifactValidationError("zstd OCI layers require Python 3.14 compression.zstd for DiffID verification")
+            raise ArtifactValidationError(
+                "zstd OCI layers require Python 3.14 compression.zstd for DiffID verification"
+            )
         path = self._path(descriptor)
         compressed, uncompressed = hashlib.sha256(), hashlib.sha256()
         with path.open("rb") as raw_file:
@@ -667,7 +675,10 @@ class _Graph:
             document = self.document(descriptor)
             self.schema(document, media_type)
             if media_type in _INDEX_TYPES:
-                children = [self.descriptor(child) for child in self.array(document.get("manifests"), "index manifests", nonempty=True)]
+                children = [
+                    self.descriptor(child)
+                    for child in self.array(document.get("manifests"), "index manifests", nonempty=True)
+                ]
                 siblings = {
                     child["digest"]
                     for child in children
@@ -703,7 +714,9 @@ class _Graph:
                 self.package_types.add("runtime-bundle")
                 leaf = self.document(config_descriptor)
                 annotations = _string_map(document.get("annotations", {}), "runtime manifest annotations")
-                if annotations.get(ANNOTATION_CHAIN_ID) is not None and annotations[ANNOTATION_CHAIN_ID] != leaf.get("chain_id"):
+                if annotations.get(ANNOTATION_CHAIN_ID) is not None and annotations[ANNOTATION_CHAIN_ID] != leaf.get(
+                    "chain_id"
+                ):
                     raise ArtifactValidationError("runtime root chain-id annotation contradicts leaf config")
                 self.runtime(layers, leaf, depth, constraint)
                 return
@@ -725,9 +738,14 @@ class _Graph:
             if history is not None:
                 entries = self.array(history, "OCI config history")
                 for entry in entries:
-                    if not isinstance(entry, dict) or ("empty_layer" in entry and type(entry["empty_layer"]) is not bool):
+                    if not isinstance(entry, dict) or (
+                        "empty_layer" in entry and type(entry["empty_layer"]) is not bool
+                    ):
                         raise ArtifactValidationError("invalid OCI config history entry")
-                    if any(key in entry and not isinstance(entry[key], str) for key in ("created", "created_by", "author", "comment")):
+                    if any(
+                        key in entry and not isinstance(entry[key], str)
+                        for key in ("created", "created_by", "author", "comment")
+                    ):
                         raise ArtifactValidationError("invalid OCI config history metadata")
                 if sum(not entry.get("empty_layer", False) for entry in entries) != len(layers):
                     raise ArtifactValidationError("OCI history nonempty layer count differs from rootfs")
@@ -750,16 +768,22 @@ class _Graph:
             layers = strict_json_object(path.read_bytes(), "runtime candidate root").get("layers")
         except (ArtifactValidationError, OSError, RecursionError):
             return None
-        return layers if isinstance(layers, list) and layers and all(isinstance(item, dict) for item in layers) else None
+        return (
+            layers if isinstance(layers, list) and layers and all(isinstance(item, dict) for item in layers) else None
+        )
 
-    def _layer_config(self, layer: dict[str, Any], leaf: dict[str, Any] | None, prefix: list[dict[str, Any]]) -> dict[str, Any]:
+    def _layer_config(
+        self, layer: dict[str, Any], leaf: dict[str, Any] | None, prefix: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         annotation = layer.get("annotations", {}).get(_CONFIG_DIGEST_ANNOTATION)
         if annotation is not None:
             pin = Descriptor(media_type=MEDIA_TYPE_LAYER_CONFIG, digest=annotation, size=0)
             path = self.layout / "blobs" / "sha256" / pin.digest.split(":", 1)[1]
             if not path.is_file():
                 raise ArtifactValidationError("runtime annotated layer config is missing")
-            config = self.document({"mediaType": MEDIA_TYPE_LAYER_CONFIG, "digest": pin.digest, "size": path.stat().st_size})
+            config = self.document(
+                {"mediaType": MEDIA_TYPE_LAYER_CONFIG, "digest": pin.digest, "size": path.stat().st_size}
+            )
             if leaf is not None and config != leaf:
                 raise ArtifactValidationError("runtime leaf config contradicts its annotation")
             return config
@@ -789,7 +813,10 @@ class _Graph:
         return found[0]
 
     def runtime(
-        self, layers: list[dict[str, Any]], leaf: dict[str, Any], depth: int,
+        self,
+        layers: list[dict[str, Any]],
+        leaf: dict[str, Any],
+        depth: int,
         constraint: dict[str, Any] | None = None,
     ) -> None:
         if not layers or len({layer["digest"] for layer in layers}) != len(layers):
@@ -802,7 +829,10 @@ class _Graph:
             prefix = layers[: ordinal + 1]
             config = self._layer_config(layer, leaf if ordinal == len(layers) - 1 else None, prefix)
             digest, media_type = layer["digest"], layer["mediaType"]
-            if config.get("blob_digest", digest) != digest or config.get("media_type", media_type) not in (None, media_type):
+            if config.get("blob_digest", digest) != digest or config.get("media_type", media_type) not in (
+                None,
+                media_type,
+            ):
                 raise ArtifactValidationError("runtime config blob identity mismatch")
             arch = config.get("arch")
             if arch is not None:
@@ -859,7 +889,9 @@ class _Graph:
                         raise ArtifactValidationError("runtime base_image_digest lacks one complete base graph")
                     self.visit(candidates[0], depth + 1)
                 base_config = self.runtime_configs.get(base, {})
-                if base_config.get("kind") != "cloud-image" or config.get("arch", base_config.get("arch")) != base_config.get("arch"):
+                if base_config.get("kind") != "cloud-image" or config.get(
+                    "arch", base_config.get("arch")
+                ) != base_config.get("arch"):
                     raise ArtifactValidationError("runtime layer and cloud base architectures differ")
                 cloud_base = base
             previous, previous_chain = digest, chain

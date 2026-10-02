@@ -67,10 +67,18 @@ def _image(layout, architecture="amd64", config_extra=None):
         tar.addfile(entry, io.BytesIO(architecture.encode()))
     layer_bytes = payload.getvalue()
     layer = _blob(layout, _LAYER, layer_bytes)
-    config = {"os": "linux", "architecture": architecture, "rootfs": {"type": "layers", "diff_ids": [_digest(layer_bytes)]}}
+    config = {
+        "os": "linux",
+        "architecture": architecture,
+        "rootfs": {"type": "layers", "diff_ids": [_digest(layer_bytes)]},
+    }
     config.update(config_extra or {})
     config_descriptor = _blob(layout, _CONFIG, _json(config))
-    return _blob(layout, _MANIFEST, _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": config_descriptor, "layers": [layer]}))
+    return _blob(
+        layout,
+        _MANIFEST,
+        _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": config_descriptor, "layers": [layer]}),
+    )
 
 
 def _layout(path):
@@ -256,8 +264,20 @@ def test_buildkit_attestation_child_is_verified_but_not_a_platform(tmp_path, sub
     _new_layout(layout)
     image = _image(layout)
     statement = _blob(layout, "application/vnd.in-toto+json", b'{"_type":"https://in-toto.io/Statement/v0.1"}')
-    config = _blob(layout, _CONFIG, _json({"architecture": "unknown", "os": "unknown", "rootfs": {"type": "layers", "diff_ids": [statement["digest"]]}}))
-    attestation = _blob(layout, _MANIFEST, _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": config, "layers": [statement]}))
+    config = _blob(
+        layout,
+        _CONFIG,
+        _json(
+            {
+                "architecture": "unknown",
+                "os": "unknown",
+                "rootfs": {"type": "layers", "diff_ids": [statement["digest"]]},
+            }
+        ),
+    )
+    attestation = _blob(
+        layout, _MANIFEST, _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": config, "layers": [statement]})
+    )
     subject = image["digest"] if subject_is_sibling else "sha256:" + "7" * 64
     index = _blob(
         layout,
@@ -271,7 +291,10 @@ def test_buildkit_attestation_child_is_verified_but_not_a_platform(tmp_path, sub
                     {
                         **attestation,
                         "platform": {"os": "unknown", "architecture": "unknown"},
-                        "annotations": {"vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": subject},
+                        "annotations": {
+                            "vnd.docker.reference.type": "attestation-manifest",
+                            "vnd.docker.reference.digest": subject,
+                        },
                     },
                 ],
             }
@@ -295,7 +318,13 @@ def test_index_platform_contradicting_config_is_rejected(tmp_path):
     index = _blob(
         layout,
         _INDEX,
-        _json({"schemaVersion": 2, "mediaType": _INDEX, "manifests": [{**arm, "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}]}),
+        _json(
+            {
+                "schemaVersion": 2,
+                "mediaType": _INDEX,
+                "manifests": [{**arm, "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}],
+            }
+        ),
     )
     _set_roots(layout, [index])
     with pytest.raises(ArtifactValidationError, match="disagrees"):
@@ -312,12 +341,21 @@ def test_runtime_bundle_resolves_ancestor_configs_from_other_roots(tmp_path):
 
     def root(layers, config):
         descriptor = _blob(layout, _RUNTIME_CONFIG, _json(config))
-        return _blob(layout, _MANIFEST, _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": descriptor, "layers": layers}))
+        return _blob(
+            layout,
+            _MANIFEST,
+            _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": descriptor, "layers": layers}),
+        )
 
     base_root = root([base], {"kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64"})
     first_root = root([base, first], {"kind": "squashfs", "parent_digest": None, "base_image_digest": base["digest"]})
     chain = "sha256:" + hashlib.sha256(f"{first['digest']} {second['digest']}".encode()).hexdigest()
-    leaf_config = {"kind": "squashfs", "parent_digest": first["digest"], "base_image_digest": base["digest"], "chain_id": chain}
+    leaf_config = {
+        "kind": "squashfs",
+        "parent_digest": first["digest"],
+        "base_image_digest": base["digest"],
+        "chain_id": chain,
+    }
     leaf_root = root([base, first, second], leaf_config)
     _set_roots(layout, [base_root, first_root, leaf_root])
     with snapshot_package(layout, manifest=leaf_root["digest"]) as snapshot:
@@ -332,7 +370,15 @@ def test_runtime_bundle_resolves_ancestor_configs_from_other_roots(tmp_path):
             pass
 
 
-@pytest.mark.parametrize("name,kind", [("../outside", "file"), ("blobs/sha256/" + "0" * 64, "symlink"), ("index.json", "duplicate"), ("./oci-layout", "file")])
+@pytest.mark.parametrize(
+    "name,kind",
+    [
+        ("../outside", "file"),
+        ("blobs/sha256/" + "0" * 64, "symlink"),
+        ("index.json", "duplicate"),
+        ("./oci-layout", "file"),
+    ],
+)
 def test_archive_rejects_traversal_links_duplicates_and_dot_paths(tmp_path, name, kind):
     archive = tmp_path / "bad.tar"
     with tarfile.open(archive, "w", format=tarfile.USTAR_FORMAT) as tar:
@@ -418,7 +464,10 @@ def test_redirect_is_not_followed_and_key_reaches_only_configured_authority(monk
     assert opened == ["example.test"]
 
 
-@pytest.mark.parametrize("status,body", [(404, b"<html>gateway</html>"), (403, _json({"error": {"code": "PACKAGE_SCOPE_DENIED"}})), (503, b"")])
+@pytest.mark.parametrize(
+    "status,body",
+    [(404, b"<html>gateway</html>"), (403, _json({"error": {"code": "PACKAGE_SCOPE_DENIED"}})), (503, b"")],
+)
 def test_only_enveloped_404_is_an_authoritative_miss(status, body):
     hub = _Hub()
     hub.routes[("GET", "/projects/team/resolve")] = lambda request: _error(request, status, body)
@@ -427,7 +476,9 @@ def test_only_enveloped_404_is_an_authoritative_miss(status, body):
     with pytest.raises(PackageHTTPError):
         client.resolve("app", "v1")
     with pytest.raises(PackageHTTPError):
-        client.resolve_cache("app", build_key="sha256:" + "4" * 64, cache_scope="main", platform="linux/amd64", builder_fingerprint="bk")
+        client.resolve_cache(
+            "app", build_key="sha256:" + "4" * 64, cache_scope="main", platform="linux/amd64", builder_fingerprint="bk"
+        )
     hub.routes.clear()
     assert client.resolve("app", "v1") is None
 
@@ -462,14 +513,29 @@ def test_push_streams_frozen_bytes_with_tag_cas_and_accepts_shared_version_recei
     previous = "sha256:" + "9" * 64
     hub = _Hub()
     with snapshot_package(layout) as snapshot:
-        hub.routes[("GET", "/projects/team/resolve")] = lambda request: {**_version(snapshot), "root_digest": previous, "digest": previous, "tag": "v1", "package_type": "oci-image"}
+        hub.routes[("GET", "/projects/team/resolve")] = lambda request: {
+            **_version(snapshot),
+            "root_digest": previous,
+            "digest": previous,
+            "tag": "v1",
+            "package_type": "oci-image",
+        }
         publish = {
-            "project_id": _PROJECT, "namespace": "team", "package": "app", "tag": "v1",
-            "digest": snapshot.root_digest, "package_type": "oci-image", "visibility": "project",
-            "platforms": [{"os": "linux", "architecture": "amd64"}], "already_published": False,
+            "project_id": _PROJECT,
+            "namespace": "team",
+            "package": "app",
+            "tag": "v1",
+            "digest": snapshot.root_digest,
+            "package_type": "oci-image",
+            "visibility": "project",
+            "platforms": [{"os": "linux", "architecture": "amd64"}],
+            "already_published": False,
             # Another member first published this immutable root.
-            "pushed_by": "Other.Member", "pushed_key_id": str(uuid.uuid4()),
-            "archive_digest": "sha256:" + "8" * 64, "archive_size_bytes": 10, "web_url": "https://example.test/p",
+            "pushed_by": "Other.Member",
+            "pushed_key_id": str(uuid.uuid4()),
+            "archive_digest": "sha256:" + "8" * 64,
+            "archive_size_bytes": 10,
+            "web_url": "https://example.test/p",
         }
         _upload_routes(hub, lambda request: publish)
         receipt = _client(hub).push("app", "v1", snapshot, provenance={"build_id": "b1"})
@@ -478,7 +544,10 @@ def test_push_streams_frozen_bytes_with_tag_cas_and_accepts_shared_version_recei
     assert hub.starts[0]["expected_tag_digest"] == previous
     assert hub.starts[0]["provenance"] == {"build_id": "b1"}
     assert receipt["digest"] == snapshot.root_digest
-    assert (receipt["upload_archive_digest"], receipt["upload_archive_size_bytes"]) == (snapshot.archive_digest, len(frozen))
+    assert (receipt["upload_archive_digest"], receipt["upload_archive_size_bytes"]) == (
+        snapshot.archive_digest,
+        len(frozen),
+    )
 
 
 def test_push_wrong_offset_ack_aborts_session_without_finalizing(tmp_path):
@@ -513,9 +582,13 @@ def test_pull_verifies_graph_before_replacing_destination(tmp_path):
     with snapshot_package(archive) as snapshot:
         payload = snapshot.archive.read_bytes()
         with pytest.raises(PackageError, match="digest/size"):
-            _client(_pull_hub(snapshot, payload[:-1] + b"x")).pull("app", digest=snapshot.root_digest, destination=destination)
+            _client(_pull_hub(snapshot, payload[:-1] + b"x")).pull(
+                "app", digest=snapshot.root_digest, destination=destination
+            )
         assert destination.read_bytes() == b"previous valid archive"
-        receipt = _client(_pull_hub(snapshot, payload)).pull("app", digest=snapshot.root_digest, destination=destination)
+        receipt = _client(_pull_hub(snapshot, payload)).pull(
+            "app", digest=snapshot.root_digest, destination=destination
+        )
     assert destination.read_bytes() == payload
     assert (receipt["digest"], receipt["archive_digest"]) == (snapshot.root_digest, _digest(payload))
     assert sorted(path.name for path in destination.parent.iterdir()) == ["image.tar"]
@@ -537,20 +610,24 @@ def test_pull_rejects_inexact_graph_without_replacing_destination(tmp_path, muta
         else:
             graph[snapshot.root_digest] = {"media_type": _MANIFEST, "size_bytes": 1}
         hub.routes[("GET", f"/projects/team/versions/{snapshot.root_digest}")] = lambda request: {
-            **_version(snapshot), "graph": graph,
+            **_version(snapshot),
+            "graph": graph,
         }
         with pytest.raises(PackageError):
             _client(hub).pull("app", digest=snapshot.root_digest, destination=destination)
     assert destination.read_bytes() == b"previous verified package"
 
 
-@pytest.mark.parametrize("config_extra", [
-    {"os.features": "not-an-array"},
-    {"os.features": [""]},
-    {"history": [{"empty_layer": True}]},
-    {"history": [{"empty_layer": 1}]},
-    {"history": [{"created_by": 7}]},
-])
+@pytest.mark.parametrize(
+    "config_extra",
+    [
+        {"os.features": "not-an-array"},
+        {"os.features": [""]},
+        {"history": [{"empty_layer": True}]},
+        {"history": [{"empty_layer": 1}]},
+        {"history": [{"created_by": 7}]},
+    ],
+)
 def test_source_rejects_invalid_features_and_history_before_upload(tmp_path, config_extra):
     layout = tmp_path / "layout"
     _new_layout(layout)
@@ -561,16 +638,24 @@ def test_source_rejects_invalid_features_and_history_before_upload(tmp_path, con
             pytest.fail("invalid image metadata was admitted")
 
 
-
 # Build cache -----------------------------------------------------------------
 
 
 def _cache_receipt(payload, **changes):
     return {
-        "project_id": _PROJECT, "namespace": "team", "package": "app", "build_key": "sha256:" + "5" * 64,
-        "cache_scope": "main", "platform": "linux/amd64", "builder_fingerprint": "bk",
-        "archive_digest": _digest(payload), "archive_size_bytes": len(payload),
-        "created_at": "2026-01-01T00:00:00Z", "created_by": _OWNER, "resolution": "scope", **changes,
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "package": "app",
+        "build_key": "sha256:" + "5" * 64,
+        "cache_scope": "main",
+        "platform": "linux/amd64",
+        "builder_fingerprint": "bk",
+        "archive_digest": _digest(payload),
+        "archive_size_bytes": len(payload),
+        "created_at": "2026-01-01T00:00:00Z",
+        "created_by": _OWNER,
+        "resolution": "scope",
+        **changes,
     }
 
 
@@ -578,9 +663,13 @@ def test_cache_scope_hit_pulls_only_the_resolved_bounded_archive(tmp_path):
     payload = b"cache-archive"
     hub = _Hub()
     hub.routes[("GET", "/projects/team/cache/resolve")] = lambda request: _cache_receipt(payload)
-    hub.routes[("GET", "/projects/team/cache/archives/" + _digest(payload))] = lambda request: _Response(payload, request.full_url)
+    hub.routes[("GET", "/projects/team/cache/archives/" + _digest(payload))] = lambda request: _Response(
+        payload, request.full_url
+    )
     client = _client(hub)
-    receipt = client.resolve_cache("app", build_key="sha256:" + "4" * 64, cache_scope="main", platform="linux/amd64", builder_fingerprint="bk")
+    receipt = client.resolve_cache(
+        "app", build_key="sha256:" + "4" * 64, cache_scope="main", platform="linux/amd64", builder_fingerprint="bk"
+    )
     forged = {**receipt, "archive_size_bytes": receipt["archive_size_bytes"] + 1}
     with pytest.raises(PackageError, match="resolve_cache"):
         client.pull_cache("app", forged, tmp_path / "forged.part")
@@ -594,9 +683,15 @@ def test_push_cache_rejects_descriptor_bound_to_another_project_before_upload(tm
     archive.write_bytes(b"cache")
     hub = _Hub()
     descriptor = {
-        "schema": "palimpsest-buildkit-cache-archive-v1", "project_id": "another-project", "namespace": "team",
-        "package": "app", "build_key": "sha256:" + "5" * 64, "cache_scope": "main", "platform": "linux/amd64",
-        "builder_fingerprint": "bk", "oci_manifest_digest": "sha256:" + "6" * 64,
+        "schema": "palimpsest-buildkit-cache-archive-v1",
+        "project_id": "another-project",
+        "namespace": "team",
+        "package": "app",
+        "build_key": "sha256:" + "5" * 64,
+        "cache_scope": "main",
+        "platform": "linux/amd64",
+        "builder_fingerprint": "bk",
+        "oci_manifest_digest": "sha256:" + "6" * 64,
     }
     with pytest.raises(PackageError, match="another project"):
         _client(hub).push_cache("app", archive, descriptor)
@@ -607,10 +702,17 @@ def test_source_rejects_config_features_not_declared_by_index(tmp_path):
     layout = tmp_path / "layout"
     _new_layout(layout)
     root = _image(layout, config_extra={"os.features": ["win32k"]})
-    index = _blob(layout, _INDEX, _json({
-        "schemaVersion": 2, "mediaType": _INDEX,
-        "manifests": [{**root, "platform": {"os": "linux", "architecture": "amd64"}}],
-    }))
+    index = _blob(
+        layout,
+        _INDEX,
+        _json(
+            {
+                "schemaVersion": 2,
+                "mediaType": _INDEX,
+                "manifests": [{**root, "platform": {"os": "linux", "architecture": "amd64"}}],
+            }
+        ),
+    )
     _set_roots(layout, [index])
     with pytest.raises(ArtifactValidationError):
         with snapshot_package(layout):
@@ -631,24 +733,42 @@ def test_source_rejects_raw_layers_under_docker_manifest(tmp_path):
             pytest.fail("Docker manifest with a raw OCI layer was admitted")
 
 
-
 @pytest.mark.parametrize("mutation", [None, "platform", "chain_annotation", "arch_type"])
 def test_runtime_index_checks_original_platform_and_chain_metadata(tmp_path, mutation):
     layout = tmp_path / "layout"
     _new_layout(layout)
     base = _blob(layout, _QCOW2, b"original cloud base bytes")
-    config = _blob(layout, _RUNTIME_CONFIG, _json({
-        "kind": "cloud-image", "disk_format": "qcow2",
-        "arch": [] if mutation == "arch_type" else "x86_64",
-    }))
+    config = _blob(
+        layout,
+        _RUNTIME_CONFIG,
+        _json(
+            {
+                "kind": "cloud-image",
+                "disk_format": "qcow2",
+                "arch": [] if mutation == "arch_type" else "x86_64",
+            }
+        ),
+    )
     manifest = {"schemaVersion": 2, "mediaType": _MANIFEST, "config": config, "layers": [base]}
     if mutation == "chain_annotation":
         manifest["annotations"] = {"dev.afterglow.palimpsest.chain-id": "sha256:" + "7" * 64}
     root = _blob(layout, _MANIFEST, _json(manifest))
-    index = _blob(layout, _INDEX, _json({
-        "schemaVersion": 2, "mediaType": _INDEX,
-        "manifests": [{**root, "platform": {"os": "linux", "architecture": "arm64" if mutation == "platform" else "amd64"}}],
-    }))
+    index = _blob(
+        layout,
+        _INDEX,
+        _json(
+            {
+                "schemaVersion": 2,
+                "mediaType": _INDEX,
+                "manifests": [
+                    {
+                        **root,
+                        "platform": {"os": "linux", "architecture": "arm64" if mutation == "platform" else "amd64"},
+                    }
+                ],
+            }
+        ),
+    )
     _set_roots(layout, [index])
     if mutation is not None:
         with pytest.raises(ArtifactValidationError):
@@ -661,16 +781,22 @@ def test_runtime_index_checks_original_platform_and_chain_metadata(tmp_path, mut
             assert snapshot.platforms == ({"os": "linux", "architecture": "amd64"},)
 
 
-
 @pytest.mark.parametrize("version", ["Windows Server 2022 build " + "2" * 150, "2" * 257])
 def test_platform_version_uses_hub_byte_bound_not_repository_grammar(tmp_path, version):
     layout = tmp_path / "layout"
     _new_layout(layout)
     root = _image(layout, config_extra={"os": "windows", "os.version": version})
-    index = _blob(layout, _INDEX, _json({
-        "schemaVersion": 2, "mediaType": _INDEX,
-        "manifests": [{**root, "platform": {"os": "windows", "architecture": "amd64", "os.version": version}}],
-    }))
+    index = _blob(
+        layout,
+        _INDEX,
+        _json(
+            {
+                "schemaVersion": 2,
+                "mediaType": _INDEX,
+                "manifests": [{**root, "platform": {"os": "windows", "architecture": "amd64", "os.version": version}}],
+            }
+        ),
+    )
     _set_roots(layout, [index])
     if len(version.encode("utf-8")) > 256:
         with pytest.raises(ArtifactValidationError):

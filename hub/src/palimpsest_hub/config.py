@@ -78,7 +78,9 @@ class Settings(DatabaseSettings):
             if len(namespace) > 63 or re.fullmatch(r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*", namespace) is None:
                 raise ValueError("package namespace must be a canonical lower-case repository component")
             project = validate_keystone_id(project_id)
-            if re.fullmatch(r"p-[0-9a-f]{32}|p-h-[0-9a-f]{56}", namespace) and namespace != default_project_namespace(project):
+            if re.fullmatch(r"p-[0-9a-f]{32}|p-h-[0-9a-f]{56}", namespace) and namespace != default_project_namespace(
+                project
+            ):
                 raise ValueError("Reserved namespace cannot be bound to a different project")
             if project in projects:
                 raise ValueError("a project can have only one configured package namespace")

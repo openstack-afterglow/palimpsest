@@ -12,7 +12,12 @@ _ACTIONS = {"packages:read", "packages:write", "cache:read", "cache:write"}
 
 
 def canonical_package(value: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 253 or any(_COMPONENT.fullmatch(p) is None for p in value.split("/")):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 253
+        or any(_COMPONENT.fullmatch(p) is None for p in value.split("/"))
+    ):
         raise ValueError("package must contain canonical lower-case repository components")
     return value
 

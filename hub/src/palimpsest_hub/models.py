@@ -211,10 +211,12 @@ class PackageBlobReference(Base):
     package_id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
     root_digest: Mapped[str] = mapped_column(CHAR(71), primary_key=True)
     blob_digest: Mapped[str] = mapped_column(CHAR(71), primary_key=True, index=True)
-    __table_args__ = (ForeignKeyConstraint(
-        ["package_id", "root_digest"],
-        ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
-    ),)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["package_id", "root_digest"],
+            ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
+        ),
+    )
 
 
 class PackageTag(Base):
@@ -225,16 +227,20 @@ class PackageTag(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
     updated_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
     revision: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
-    __table_args__ = (ForeignKeyConstraint(
-        ["package_id", "root_digest"],
-        ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
-    ),)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["package_id", "root_digest"],
+            ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
+        ),
+    )
 
 
 class PackageUpload(Base):
     __tablename__ = "palimpsest_package_uploads"
     id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
-    project_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False, index=True
+    )
     package: Mapped[str] = mapped_column(_binary_name(255), nullable=False)
     key_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=False)
     owner_user_id: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
@@ -261,4 +267,6 @@ class PackageCache(Base):
     archive_size_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
     created_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
-    __table_args__ = (Index("idx_package_cache_partition", "project_id", "package", "cache_scope", "platform", "builder_fingerprint"),)
+    __table_args__ = (
+        Index("idx_package_cache_partition", "project_id", "package", "cache_scope", "platform", "builder_fingerprint"),
+    )

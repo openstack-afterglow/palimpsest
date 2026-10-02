@@ -1065,7 +1065,9 @@ def _registry_server(config: RegistryConfig, server: str | None, registry_alias:
 
 
 def _registry_operation_profile(
-    config: RegistryConfig, server: str | None, registry_alias: str | None,
+    config: RegistryConfig,
+    server: str | None,
+    registry_alias: str | None,
 ) -> RegistryProfile | None:
     """Return the configured login/logout profile; None is an unconfigured Docker authority."""
     if server is not None and registry_alias is not None:
@@ -1128,21 +1130,35 @@ def _retain_package_archive(roots: StatePaths, snapshot: PackageSnapshot) -> Pat
 
 
 def _local_package_record(
-    profile: RegistryProfile, resolved: ResolvedImageReference, snapshot: PackageSnapshot, archive: Path,
-    *, project_id: str | None = None, build_id: str | None = None,
+    profile: RegistryProfile,
+    resolved: ResolvedImageReference,
+    snapshot: PackageSnapshot,
+    archive: Path,
+    *,
+    project_id: str | None = None,
+    build_id: str | None = None,
 ) -> LocalPackageReference:
     namespace, package = _native_target(resolved)
     return LocalPackageReference(
-        reference=resolved.canonical, authority=profile.endpoint, api_base=profile.api_base,
-        namespace=namespace, package=package, archive=str(archive.expanduser().absolute()),
-        archive_digest=snapshot.archive_digest, archive_size_bytes=snapshot.archive_size_bytes,
-        root_digest=snapshot.root_digest, package_type=snapshot.package_type,
-        project_id=project_id, build_id=build_id,
+        reference=resolved.canonical,
+        authority=profile.endpoint,
+        api_base=profile.api_base,
+        namespace=namespace,
+        package=package,
+        archive=str(archive.expanduser().absolute()),
+        archive_digest=snapshot.archive_digest,
+        archive_size_bytes=snapshot.archive_size_bytes,
+        root_digest=snapshot.root_digest,
+        package_type=snapshot.package_type,
+        project_id=project_id,
+        build_id=build_id,
     )
 
 
 def _dispatch_native_registry(
-    args: argparse.Namespace, roots: StatePaths, config: RegistryConfig,
+    args: argparse.Namespace,
+    roots: StatePaths,
+    config: RegistryConfig,
 ) -> int | None:
     """Route native profiles before any Docker command is constructed."""
     op = args.operation
@@ -1184,7 +1200,10 @@ def _dispatch_native_registry(
     if op not in {"push", "pull"}:
         return None
     resolved = resolve_image_reference(
-        args.reference, config, registry_alias=args.registry, default_tag=not args.all_tags,
+        args.reference,
+        config,
+        registry_alias=args.registry,
+        default_tag=not args.all_tags,
     )
     profile = _reference_profile(config, resolved)
     if not _is_native(profile):
@@ -1204,20 +1223,29 @@ def _dispatch_native_registry(
     client.authorize(package, ("packages:read", "packages:write") if op == "push" else ("packages:read",))
     init_resolved_roots(roots)
     if op == "pull":
-        output = args.output or (roots.state / "package-artifacts" / (
-            hashlib.sha256(resolved.canonical.encode()).hexdigest() + ".oci.tar"
-        ))
+        output = args.output or (
+            roots.state / "package-artifacts" / (hashlib.sha256(resolved.canonical.encode()).hexdigest() + ".oci.tar")
+        )
         receipt = client.pull(package, tag=resolved.tag, digest=resolved.digest, destination=output)
         immutable = replace(resolved, tag=None, digest=receipt["digest"])
         with snapshot_package(output, manifest=receipt["digest"]) as snapshot:
             record = _local_package_record(profile, immutable, snapshot, output, project_id=client.project_id)
         record_path = write_package_reference(roots, replace(record, published_digest=record.root_digest))
-        print(json.dumps({"reference": immutable.canonical, "digest": record.root_digest,
-                          "output": str(output), "receipt": str(record_path)}))
+        print(
+            json.dumps(
+                {
+                    "reference": immutable.canonical,
+                    "digest": record.root_digest,
+                    "output": str(output),
+                    "receipt": str(record_path),
+                }
+            )
+        )
         return 0
     existing = None if args.input is not None else read_package_reference(roots, resolved.canonical)
     if existing is not None and (
-        existing.api_base != profile.api_base or existing.namespace != namespace
+        existing.api_base != profile.api_base
+        or existing.namespace != namespace
         or (existing.project_id is not None and existing.project_id != client.project_id)
     ):
         raise PalimpsestError("local package reference does not match the authenticated native target")
@@ -1225,16 +1253,24 @@ def _dispatch_native_registry(
     manifest = args.manifest if args.manifest is not None else (existing.root_digest if existing else None)
     with snapshot_package(source, manifest=manifest) as snapshot:
         if existing is not None and (
-            snapshot.root_digest != existing.root_digest or snapshot.archive_digest != existing.archive_digest
+            snapshot.root_digest != existing.root_digest
+            or snapshot.archive_digest != existing.archive_digest
             or snapshot.archive_size_bytes != existing.archive_size_bytes
         ):
             raise PalimpsestError("local package source changed since its typed reference was recorded")
         archive = _retain_package_archive(roots, snapshot)
-        record = _local_package_record(profile, resolved, snapshot, archive, project_id=client.project_id,
-                                       build_id=existing.build_id if existing else None)
+        record = _local_package_record(
+            profile,
+            resolved,
+            snapshot,
+            archive,
+            project_id=client.project_id,
+            build_id=existing.build_id if existing else None,
+        )
         write_package_reference(roots, record)
-        receipt = client.push(package, resolved.tag, snapshot,
-                              provenance={"build_id": record.build_id} if record.build_id else None)
+        receipt = client.push(
+            package, resolved.tag, snapshot, provenance={"build_id": record.build_id} if record.build_id else None
+        )
     path = write_package_reference(roots, replace(record, published_digest=receipt["digest"]))
     print(json.dumps({**receipt, "receipt": str(path)}))
     return 0
@@ -1709,7 +1745,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
     )
     roots = (
         resolve_roots()
-        if deferred_package_state or op in read_only_root_operations or (op == "oci" and args.oci_operation in read_only_oci_operations)
+        if deferred_package_state
+        or op in read_only_root_operations
+        or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
     )
 
@@ -2307,15 +2345,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
             if not args.offline:
                 registry_config = load_registry_config(roots)
                 resolved_tags = tuple(
-                    resolve_image_reference(tag, registry_config, registry_alias=args.registry)
-                    for tag in args.tag
+                    resolve_image_reference(tag, registry_config, registry_alias=args.registry) for tag in args.tag
                 )
                 tag_profiles = {_reference_profile(registry_config, tag) for tag in resolved_tags}
                 native_build = any(_is_native(profile) for profile in tag_profiles)
                 if native_build and len(tag_profiles) != 1:
                     raise PalimpsestError("one build cannot mix registry profiles or protocols")
                 selected_registry = (
-                    next(iter(tag_profiles)) if native_build
+                    next(iter(tag_profiles))
+                    if native_build
                     else select_registry_profile(registry_config, explicit_alias=args.registry)
                 )
                 selected_registry_digest = registry_config_digest(registry_config)
@@ -2335,19 +2373,29 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     if args.push:
                         package_client.authorize(native_package, ("packages:read", "packages:write"))
                 elif args.cache_registry is None or args.cache_package is None:
-                    raise PalimpsestError("online OCI build requires --cache-registry and --cache-package namespace/package")
-                cache_profile = inspect_profile(registry_config, args.cache_registry) if args.cache_registry else selected_registry
+                    raise PalimpsestError(
+                        "online OCI build requires --cache-registry and --cache-package namespace/package"
+                    )
+                cache_profile = (
+                    inspect_profile(registry_config, args.cache_registry) if args.cache_registry else selected_registry
+                )
                 if cache_profile.protocol != "palimpsest":
                     raise PalimpsestError("mandatory Hub cache requires a native registry profile")
                 partition = args.cache_package or f"{native_namespace}/{native_package}"
                 cache_ref = resolve_image_reference(
-                    f"{cache_profile.endpoint}/{partition}", registry_config,
-                    registry_alias=cache_profile.alias, default_tag=False,
+                    f"{cache_profile.endpoint}/{partition}",
+                    registry_config,
+                    registry_alias=cache_profile.alias,
+                    default_tag=False,
                 )
                 if cache_ref.tag is not None or cache_ref.digest is not None:
                     raise PalimpsestError("--cache-package must be an exact namespace/package, not a tag or digest")
                 cache_namespace, cache_package = _native_target(cache_ref)
-                if package_client is not None and cache_profile == selected_registry and cache_namespace == native_namespace:
+                if (
+                    package_client is not None
+                    and cache_profile == selected_registry
+                    and cache_namespace == native_namespace
+                ):
                     cache_client = package_client
                 else:
                     cache_client = NativePackageClient(cache_profile, namespace=cache_namespace)
@@ -2360,8 +2408,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             local_images = tuple(NamedOCIContext.parse(value) for value in args.local_image)
             init_resolved_roots(roots)
             runtime_client = (
-                HubClient(resolve_url(args.url), resolve_token())
-                if not args.offline and args.runtime_tag else None
+                HubClient(resolve_url(args.url), resolve_token()) if not args.offline and args.runtime_tag else None
             )
             if args.runtime_base:
                 if args.offline:
@@ -2381,9 +2428,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     archive = _retain_package_archive(roots, snapshot)
                     for resolved in resolved_tags:
                         record = _local_package_record(
-                            selected_registry, resolved, snapshot, archive,
-                            project_id=cache_client.project_id if cache_client is not None
-                            and cache_client.namespace == native_namespace and cache_client.profile == selected_registry else None,
+                            selected_registry,
+                            resolved,
+                            snapshot,
+                            archive,
+                            project_id=cache_client.project_id
+                            if cache_client is not None
+                            and cache_client.namespace == native_namespace
+                            and cache_client.profile == selected_registry
+                            else None,
                             build_id=build_id,
                         )
                         write_package_reference(roots, record)
@@ -2450,11 +2503,17 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         for resolved in resolved_tags:
                             record = read_package_reference(roots, resolved.canonical)
                             receipt = package_client.push(
-                                native_package, resolved.tag, snapshot,
+                                native_package,
+                                resolved.tag,
+                                snapshot,
                                 provenance={"build_id": build_record["build_id"]},
                             )
-                            write_package_reference(roots, replace(record, project_id=package_client.project_id,
-                                                                  published_digest=receipt["digest"]))
+                            write_package_reference(
+                                roots,
+                                replace(
+                                    record, project_id=package_client.project_id, published_digest=receipt["digest"]
+                                ),
+                            )
             result_digest = (
                 build_record.get("runtime_block_digest")
                 or build_record.get("output_oci_manifest_digest")

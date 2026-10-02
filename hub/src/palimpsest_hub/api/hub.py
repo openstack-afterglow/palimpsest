@@ -984,7 +984,8 @@ async def _expire_project_uploads(factory, store: LocalPathBlobStore, project_id
             (
                 await session.execute(
                     select(PalimpsestHubUpload.id).where(
-                        exact_identity(PalimpsestHubUpload.project_id, project_id), PalimpsestHubUpload.updated_at < cutoff
+                        exact_identity(PalimpsestHubUpload.project_id, project_id),
+                        PalimpsestHubUpload.updated_at < cutoff,
                     )
                 )
             )
@@ -1043,9 +1044,15 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(_l
                 .select_from(PalimpsestHubUpload)
                 .where(exact_identity(PalimpsestHubUpload.project_id, project_id))
             )
-            active += await session.scalar(select(func.count()).select_from(PackageUpload).where(
-                PackageUpload.project_id == project_id, PackageUpload.status.in_(("uploading", "validating")),
-                PackageUpload.expires_at > datetime.now(UTC).replace(tzinfo=None)))
+            active += await session.scalar(
+                select(func.count())
+                .select_from(PackageUpload)
+                .where(
+                    PackageUpload.project_id == project_id,
+                    PackageUpload.status.in_(("uploading", "validating")),
+                    PackageUpload.expires_at > datetime.now(UTC).replace(tzinfo=None),
+                )
+            )
             if active >= _MAX_ACTIVE_UPLOADS:
                 raise HTTPException(status_code=429, detail="project upload session limit reached")
             store.start_upload(session_id)
@@ -1134,6 +1141,7 @@ async def _discard_unregistered_blob(store: LocalPathBlobStore, factory, digest:
             ).scalar_one_or_none()
             # Native graphs and cache archives share CAS with legacy records.
             from palimpsest_hub.services.blob_references import blob_referenced
+
             if await blob_referenced(session, digest):
                 return
     except Exception:

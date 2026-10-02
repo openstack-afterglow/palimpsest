@@ -100,7 +100,9 @@ def require_credential_helper(
         raise RegistryError("invalid Docker credHelpers configuration")
     helper = helpers[server_url] if server_url in helpers else config.get("credsStore")
     if not isinstance(helper, str) or _HELPER_RE.fullmatch(helper) is None:
-        raise RegistryError("native credentials require a configured Docker credential helper for the exact namespace key")
+        raise RegistryError(
+            "native credentials require a configured Docker credential helper for the exact namespace key"
+        )
     executable = shutil.which("docker-credential-" + helper, path=env.get("PATH", os.defpath))
     if executable is None:
         raise RegistryError("configured Docker credential helper is not installed or executable")

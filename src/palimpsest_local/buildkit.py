@@ -682,7 +682,10 @@ def preflight_buildx_oci_exporter(
     )
     try:
         result = runner(
-            command, capture_output=True, text=True, check=False,
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
             env=credential_free_subprocess_environment(),
         )
     except FileNotFoundError as exc:
@@ -1045,9 +1048,7 @@ def extract_cache_tar(
                 if wrapped is None:
                     wrapped = member.name == "palimpsest-cache.json"
                     if binding_required and not wrapped:
-                        raise ArtifactValidationError(
-                            "a Hub cache hit must begin with a cache-key binding descriptor"
-                        )
+                        raise ArtifactValidationError("a Hub cache hit must begin with a cache-key binding descriptor")
                 if member.name == "palimpsest-cache.json":
                     if descriptor_seen or not wrapped or not member.isreg() or member.size > 64 * 1024:
                         raise ArtifactValidationError("cache archive must contain one valid leading descriptor")
@@ -1383,7 +1384,10 @@ def build_runtime_pack_command(rootfs_tar: Path, output: Path, *, block_size: in
 def _run_checked(runner: Callable[..., Any], command: list[str], *, operation: str) -> Any:
     try:
         result = runner(
-            command, capture_output=True, text=True, check=False,
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
             env=credential_free_subprocess_environment(),
         )
     except FileNotFoundError as exc:
@@ -1415,7 +1419,11 @@ def pack_runtime_block(
     try:
         with normalized_tar.open("rb") as source:
             result = runner(
-                command, stdin=source, capture_output=True, text=False, check=False,
+                command,
+                stdin=source,
+                capture_output=True,
+                text=False,
+                check=False,
                 env=credential_free_subprocess_environment(),
             )
     except FileNotFoundError as exc:
@@ -1445,8 +1453,13 @@ def pack_runtime_block(
 
 
 def _cache_partition(
-    api_base: str, namespace: str, project_id: str, package: str,
-    scope: str, platform: str, builder_fingerprint: str,
+    api_base: str,
+    namespace: str,
+    project_id: str,
+    package: str,
+    scope: str,
+    platform: str,
+    builder_fingerprint: str,
 ) -> str:
     """Fence online local generations and archives by verified package ownership."""
     return hashlib.sha256(
@@ -1704,7 +1717,9 @@ def _verify_runtime_block(
     if runner is subprocess.run:
         try:
             process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 env=credential_free_subprocess_environment(),
             )
         except FileNotFoundError as exc:
@@ -1725,7 +1740,10 @@ def _verify_runtime_block(
         # tests. Production subprocesses always take the bounded pipe path.
         try:
             result = runner(
-                command, capture_output=True, text=False, check=False,
+                command,
+                capture_output=True,
+                text=False,
+                check=False,
                 env=credential_free_subprocess_environment(),
             )
         except FileNotFoundError as exc:
@@ -1895,8 +1913,13 @@ def build_with_buildkit(
         cache_blob_root = roots.build_cache / "blobs"
     else:
         partition = _cache_partition(
-            hub_client.api_base, hub_client.namespace, project_id, cache_package,
-            spec.cache_scope, spec.platform, builder_environment["fingerprint"]
+            hub_client.api_base,
+            hub_client.namespace,
+            project_id,
+            cache_package,
+            spec.cache_scope,
+            spec.platform,
+            builder_environment["fingerprint"],
         )
         partition_root = roots.build_cache / "_packages" / partition
         scope_root = partition_root / "scope"
@@ -1984,8 +2007,13 @@ def build_with_buildkit(
             expected_receipt = {
                 field: cache_descriptor[field]
                 for field in (
-                    "project_id", "namespace", "package", "build_key", "cache_scope",
-                    "platform", "builder_fingerprint",
+                    "project_id",
+                    "namespace",
+                    "package",
+                    "build_key",
+                    "cache_scope",
+                    "platform",
+                    "builder_fingerprint",
                 )
             }
             expected_receipt.update(

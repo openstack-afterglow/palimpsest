@@ -215,8 +215,14 @@ class NativePackageClient:
             code = "REQUEST_FAILED"
             try:
                 payload = exc.read(_MAX_RESPONSE + 1)
-                error = strict_json_object(payload, "native error").get("error") if len(payload) <= _MAX_RESPONSE else None
-                if isinstance(error, dict) and isinstance(error.get("code"), str) and _ERROR_CODE.fullmatch(error["code"]):
+                error = (
+                    strict_json_object(payload, "native error").get("error") if len(payload) <= _MAX_RESPONSE else None
+                )
+                if (
+                    isinstance(error, dict)
+                    and isinstance(error.get("code"), str)
+                    and _ERROR_CODE.fullmatch(error["code"])
+                ):
                     code = error["code"]
             except (ArtifactValidationError, OSError, RecursionError, ValueError):
                 pass
@@ -353,7 +359,9 @@ class NativePackageClient:
                         "Content-Length": str(length),
                         "Upload-Offset": str(offset),
                     }
-                    with self._open("PATCH", path, query={"package": package}, body=window, headers=headers) as response:
+                    with self._open(
+                        "PATCH", path, query={"package": package}, body=window, headers=headers
+                    ) as response:
                         acknowledged = response.headers.get("Upload-Offset")
                         if response.status != 204 or window.remaining or acknowledged != str(offset + length):
                             raise PackageError("native upload acknowledged an invalid byte offset")
@@ -537,7 +545,9 @@ class NativePackageClient:
             raise PackageError("invalid native cache partition")
         return partition
 
-    def _cache_receipt(self, receipt: dict[str, Any], package: str, partition: dict[str, str], *, exact_key: bool) -> None:
+    def _cache_receipt(
+        self, receipt: dict[str, Any], package: str, partition: dict[str, str], *, exact_key: bool
+    ) -> None:
         self._bound(receipt, package)
         _digest(receipt.get("archive_digest"), "cache archive digest")
         _size(receipt.get("archive_size_bytes"), self.limits.max_archive_bytes)
@@ -605,7 +615,11 @@ class NativePackageClient:
             with _open_absolute_regular_file(source.parent.resolve(strict=True) / source.name) as (fd, _metadata):
                 _copy_fd(fd, frozen, self.limits.max_archive_bytes)
             digest, size = _hash_file(frozen)
-            body = {**partition, "archive_digest": digest, "archive_size_bytes": _size(size, self.limits.max_archive_bytes)}
+            body = {
+                **partition,
+                "archive_digest": digest,
+                "archive_size_bytes": _size(size, self.limits.max_archive_bytes),
+            }
             receipt = self._upload(package, frozen, body, cache=True)
         self._cache_receipt(receipt, package, partition, exact_key=True)
         if (

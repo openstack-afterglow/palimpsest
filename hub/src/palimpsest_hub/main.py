@@ -88,7 +88,9 @@ def _package_path(request: Request) -> bool:
     return path == "/v1/auth/me" or path == "/v1/projects" or path.startswith("/v1/projects/")
 
 
-def _package_error(status: int, code: str, message: str, headers=None, *, request_id: str | None = None) -> JSONResponse:
+def _package_error(
+    status: int, code: str, message: str, headers=None, *, request_id: str | None = None
+) -> JSONResponse:
     return JSONResponse(
         {"error": {"code": code, "message": message, "request_id": request_id or uuid4().hex}},
         status_code=status,
@@ -100,7 +102,17 @@ def _package_error(status: int, code: str, message: str, headers=None, *, reques
 async def handle_http_error(request: Request, exc: StarletteHTTPException):
     if not _package_path(request):
         return await http_exception_handler(request, exc)
-    fallback = {401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 409: "CONFLICT", 412: "TAG_CONFLICT", 413: "LIMIT_EXCEEDED", 422: "INVALID_REQUEST", 429: "RATE_LIMITED", 503: "IDENTITY_UNAVAILABLE"}
+    fallback = {
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        412: "TAG_CONFLICT",
+        413: "LIMIT_EXCEEDED",
+        422: "INVALID_REQUEST",
+        429: "RATE_LIMITED",
+        503: "IDENTITY_UNAVAILABLE",
+    }
     detail = exc.detail
     if isinstance(detail, dict):
         code = detail.get("code", fallback.get(exc.status_code, "REQUEST_FAILED"))
@@ -115,7 +127,9 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
     if not _package_path(request):
         return await request_validation_exception_handler(request, exc)
     # Validation inputs can contain credentials/provenance; never echo them.
-    return _package_error(422, "INVALID_REQUEST", "Package request validation failed", request_id=request.state.request_id)
+    return _package_error(
+        422, "INVALID_REQUEST", "Package request validation failed", request_id=request.state.request_id
+    )
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -123,8 +137,12 @@ async def handle_rate_limit(request: Request, exc: RateLimitExceeded):
     response = _rate_limit_exceeded_handler(request, exc)
     if not _package_path(request):
         return response
-    headers = {key: value for key, value in response.headers.items() if key.lower() not in {"content-type", "content-length"}}
-    return _package_error(429, "RATE_LIMITED", "Package request rate limit exceeded", headers, request_id=request.state.request_id)
+    headers = {
+        key: value for key, value in response.headers.items() if key.lower() not in {"content-type", "content-length"}
+    }
+    return _package_error(
+        429, "RATE_LIMITED", "Package request rate limit exceeded", headers, request_id=request.state.request_id
+    )
 
 
 @app.middleware("http")
@@ -149,12 +167,16 @@ async def log_request(request: Request, call_next):
     template = getattr(route, "path", "<unmatched>")
     logger.info(
         "hub request method=%s route=%s status=%d duration_ms=%.1f",
-        method, template, response.status_code, (perf_counter() - start) * 1000,
+        method,
+        template,
+        response.status_code,
+        (perf_counter() - start) * 1000,
     )
     if logger.isEnabledFor(logging.DEBUG):
         query = request.scope.get("query_string", b"")
         logger.debug("hub request query_present=%s query_bytes_bounded=%d", bool(query), min(len(query), 4096))
     return response
+
 
 _APP_FILES = Path(__file__).parent / "static"
 _APP_HEADERS = {

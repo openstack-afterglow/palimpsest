@@ -144,7 +144,6 @@ _CLI_EXISTING_RUN_OPERATIONS: tuple[tuple[str, str, list[str], dict[str, object]
 )
 
 
-
 def test_digest_file_streams_hash(tmp_path: Path):
     payload = b"palimpsest layer bytes" * 100
     path = tmp_path / "layer.squashfs"
@@ -499,12 +498,17 @@ def test_buildkit_offline_dispatch_reads_no_registry_profile_or_hub_client(
     assert cli.main(["build", str(context), "-f", str(dockerfile), "-t", "demo", "--offline"]) == 0
     assert len(captured) == 1
     spec, hub_client, cache_package, runtime_hub_client, on_oci_export = captured[0]
-    assert (spec.offline, spec.network, spec.push_cache, spec.push_image, spec.push) == (True, "none", False, False, False)
+    assert (spec.offline, spec.network, spec.push_cache, spec.push_image, spec.push) == (
+        True,
+        "none",
+        False,
+        False,
+        False,
+    )
     assert (spec.tag, spec.registry_profile, spec.registry_config_digest) == ("demo", None, None)
     assert (spec.external_cache_from, spec.external_cache_to) == ((), ())
     assert (hub_client, cache_package, runtime_hub_client, on_oci_export) == (None, None, None, None)
     assert capsys.readouterr().out.strip() == "sha256:" + "c" * 64
-
 
 
 def test_buildkit_runtime_base_arch_mismatch_fails_before_build(

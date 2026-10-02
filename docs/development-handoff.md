@@ -24,7 +24,7 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
-**Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image default remains `0.2.0`. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
+**Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image-tag candidate is also `0.3.0` and its source default is the reviewed immutable candidate SHA. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
 
 **2026-09-19 기록 안내:** 아래 `현재 스냅샷`과 frontmatter의
 2026-09-14 값은 당시 기록이다. 당시 작업트리의 source 상태와 승인 대기는
@@ -2890,8 +2890,11 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   contracts and docs are included in the authorized candidate preparation.
   Root `palimpsest-client` and independent `palimpsest-hub` metadata/module
   versions/lockfiles agree at **0.3.0**, a minor for the native registry and
-  dashboard additions, not a claim of publication. The Kolla default image
-  remains separately pinned at 0.2.0 pending owner release integration.
+  dashboard additions, not a claim of publication. Kolla's image-tag candidate
+  also prepares 0.3.0, and source-build pins reviewed commit
+  `a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b`; image availability must be verified
+  before rollout. The source-build contract requires an immutable full SHA,
+  not a mutable branch or an unresolved release tag.
 - Review fixes: native authority/alias routing, completed-reference bounds,
   API-base/namespace local-cache isolation, mandatory online cache refresh,
   malformed actor/graph handling and OCI/runtime client/Hub validation parity;
@@ -2909,6 +2912,10 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   rerun. `cd hub && uv run --frozen pytest -q` passed **215**. Skips do not
   constitute native proof. The generated CLI reference was regenerated and
   covered by the portable contract gate.
+- Final style gates passed in both environments: root Ruff checked all 371
+  files and Hub checked all 37. Three import-spacing/order findings and
+  formatting in 34 candidate files were corrected without changing CI
+  exclusions or functional contracts; both functional suites were rerun.
 - Real source boundary proof: normal CLI plus source Uvicorn/CAS/package APIs
   over loopback HTTPS with a trusted temporary certificate, scratch SQLite
   and a synthetic system-reader/member Keystone endpoint. An existing running
@@ -2945,7 +2952,7 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   service/migration readiness proof. Build caches were not pruned.
 - Architecture was stamped only after source review and corrected-test review;
   the final source fingerprint is
-  `46bee367eed4f8bd2dbd8c121c1fcfc9b9a90a27a4bd7480d6148861cf1d7815`
+  `a3027cbe25dbcb259f81e539cc19aade6bcf84bf0afbf408d2806fd49e124916`
   over 441 source files. Staged guard and secret scanning are commit barriers.
 - Publication/integration boundaries: no main-target PR was created/edited,
   no main merge, tag, release, GHCR push, private helper transfer, remote

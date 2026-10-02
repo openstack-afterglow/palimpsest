@@ -41,14 +41,14 @@ Use the same reviewed Git ref for Local and Hub to prevent source skew.
 The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
 under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
 Kolla-Ansible, Ansible, Hub, or their runtime dependencies; deployments pin
-Kolla-Ansible independently. This source role defaults to Hub image tag `0.2.0`,
-while source builds bind to the configured checkout commit SHA. Verify both
-`0.2.0` Hub images before deploying this default; source metadata
+Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.0`,
+while source builds bind to the configured reviewed checkout commit SHA. Verify both
+`0.3.0` Hub images are published before deploying this default; source metadata
 alone does not establish image availability.
 
-The role default remains older than the Hub 0.3.0 source. Operators deploying
-the package registry or closed-connection fix must pin reviewed API and worker image digests in
-Kolla globals; a Python version bump alone does not change running containers.
+The role's release candidate matches the Hub 0.3.0 source. Operators deploying
+the package registry or closed-connection fix must verify reviewed API/worker
+image digests in Kolla globals; a Python update does not change running containers.
 
 On deploy and upgrade, each Palimpsest host pulls the API image and sets the
 root of its own named Hub volume to the image's runtime user before containers

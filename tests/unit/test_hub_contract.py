@@ -67,7 +67,9 @@ def test_generic_hub_cache_upload_is_rejected_before_transport(tmp_path: Path, m
     client = HubClient("http://hub.invalid", "original-project-token")
     source = tmp_path / "cache.tar"
     source.write_bytes(b"cache bytes")
-    monkeypatch.setattr(client, "_json_request", lambda *_args, **_kwargs: pytest.fail("legacy cache transport accessed"))
+    monkeypatch.setattr(
+        client, "_json_request", lambda *_args, **_kwargs: pytest.fail("legacy cache transport accessed")
+    )
     with pytest.raises(HubError):
         client.push_blob(source, metadata, resume=False)
     assert source.read_bytes() == b"cache bytes"

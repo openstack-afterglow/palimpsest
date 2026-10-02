@@ -36,7 +36,6 @@ from palimpsest_hub.models import PalimpsestHubBuild, PalimpsestHubLayer
 from palimpsest_hub.services.digest import compute_config_digest, normalize_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, get_blob_store
 
-
 _logger = logging.getLogger(__name__)
 
 
@@ -473,6 +472,8 @@ async def process_one_hub_build(owner: str) -> bool:
             _logger.info("Build task ended status=%s", outcome)
             _logger.debug(
                 "Build task result status=%s output_bytes=%d elapsed_ms=%d",
-                outcome, result_size, int((time.monotonic() - started) * 1000),
+                outcome,
+                result_size,
+                int((time.monotonic() - started) * 1000),
             )
     return True

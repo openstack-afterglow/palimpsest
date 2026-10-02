@@ -110,7 +110,10 @@ async def create_hub_build(
         queued = await session.scalar(
             select(func.count())
             .select_from(PalimpsestHubBuild)
-            .where(exact_identity(PalimpsestHubBuild.project_id, project_id), PalimpsestHubBuild.status.in_(("queued", "building")))
+            .where(
+                exact_identity(PalimpsestHubBuild.project_id, project_id),
+                PalimpsestHubBuild.status.in_(("queued", "building")),
+            )
         )
         if queued and queued >= 4:
             raise HTTPException(status_code=429, detail="project build queue is full")

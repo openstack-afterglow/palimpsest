@@ -35,36 +35,52 @@ def _environment(tmp_path: Path, config: dict[str, object], *, installed: bool =
 
 def test_exact_namespace_helper_overrides_store_and_host_auth_is_not_read(tmp_path: Path) -> None:
     server_url = "https://cloud.example.com/api/v1/hub/projects/team"
-    environment = _environment(tmp_path, {
-        "credHelpers": {server_url: "safe", "cloud.example.com": "unavailable"},
-        "credsStore": "unavailable",
-        "auths": {"cloud.example.com": {"auth": "plaintext-not-a-package-key"}},
-    })
+    environment = _environment(
+        tmp_path,
+        {
+            "credHelpers": {server_url: "safe", "cloud.example.com": "unavailable"},
+            "credsStore": "unavailable",
+            "auths": {"cloud.example.com": {"auth": "plaintext-not-a-package-key"}},
+        },
+    )
     helper = credentials.require_credential_helper(_profile(), "team", environment=environment)
     assert helper.server_url == server_url
     assert helper.executable == str(tmp_path / "bin" / "docker-credential-safe")
     with pytest.raises(RegistryError):
         credentials.require_credential_helper(_profile(), "other", environment=environment)
     with pytest.raises(RegistryError):
-        credentials.require_credential_helper(_profile("https://cloud.example.com/another/v1"), "team", environment=environment)
+        credentials.require_credential_helper(
+            _profile("https://cloud.example.com/another/v1"), "team", environment=environment
+        )
 
 
 def test_only_configured_global_store_is_a_fallback(tmp_path: Path) -> None:
-    environment = _environment(tmp_path, {
-        "credHelpers": {"cloud.example.com": "missing"}, "credsStore": "safe",
-        "auths": {"cloud.example.com": {"auth": "do-not-use"}},
-    })
-    assert credentials.require_credential_helper(_profile(), "other", environment=environment).server_url.endswith("/projects/other")
+    environment = _environment(
+        tmp_path,
+        {
+            "credHelpers": {"cloud.example.com": "missing"},
+            "credsStore": "safe",
+            "auths": {"cloud.example.com": {"auth": "do-not-use"}},
+        },
+    )
+    assert credentials.require_credential_helper(_profile(), "other", environment=environment).server_url.endswith(
+        "/projects/other"
+    )
 
 
-@pytest.mark.parametrize("config", [
-    {"auths": {"cloud.example.com": {"auth": "aWdub3Jl"}}},
-    {"credHelpers": {"cloud.example.com": "safe"}},
-    {"credHelpers": {"https://cloud.example.com/api/v1/hub/projects/team": ""}, "credsStore": "safe"},
-    {"credsStore": "safe;echo secret"},
-    {"credsStore": "../safe"},
-])
-def test_unconfigured_or_invalid_helper_cannot_fall_back_to_plaintext(tmp_path: Path, config: dict[str, object]) -> None:
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"auths": {"cloud.example.com": {"auth": "aWdub3Jl"}}},
+        {"credHelpers": {"cloud.example.com": "safe"}},
+        {"credHelpers": {"https://cloud.example.com/api/v1/hub/projects/team": ""}, "credsStore": "safe"},
+        {"credsStore": "safe;echo secret"},
+        {"credsStore": "../safe"},
+    ],
+)
+def test_unconfigured_or_invalid_helper_cannot_fall_back_to_plaintext(
+    tmp_path: Path, config: dict[str, object]
+) -> None:
     environment = _environment(tmp_path, config)
     environment["PALIMPSEST_TOKEN"] = KEY
     environment["PALIMPSEST_PACKAGE_KEY"] = KEY
@@ -115,9 +131,17 @@ def test_helper_store_get_and_erase_keep_secret_on_stdin_and_namespace_isolated(
     credentials.erase_package_key(_profile(), "team", environment=environment, runner=runner)
     with pytest.raises(RegistryError):
         credentials.get_package_key(_profile(), "team", environment=environment, runner=runner)
-    assert calls[0][1]["input"] == json.dumps({
-        "ServerURL": "https://cloud.example.com/api/v1/hub/projects/team", "Username": PUBLIC_ID, "Secret": KEY,
-    }) + "\n"
+    assert (
+        calls[0][1]["input"]
+        == json.dumps(
+            {
+                "ServerURL": "https://cloud.example.com/api/v1/hub/projects/team",
+                "Username": PUBLIC_ID,
+                "Secret": KEY,
+            }
+        )
+        + "\n"
+    )
 
 
 @pytest.mark.parametrize("username", ["someone", "22222222222242228222222222222222", None])
@@ -133,7 +157,10 @@ def test_helper_response_cannot_substitute_another_public_identity(tmp_path: Pat
         credentials.store_package_key(_profile(), "team", KEY, username, environment=environment, runner=runner)
 
 
-@pytest.mark.parametrize("credential", ["raw-keystone-token", KEY + "\n", KEY[:-1] + "B", KEY.replace(PUBLIC_ID, PUBLIC_ID.upper() + "f"), None])
+@pytest.mark.parametrize(
+    "credential",
+    ["raw-keystone-token", KEY + "\n", KEY[:-1] + "B", KEY.replace(PUBLIC_ID, PUBLIC_ID.upper() + "f"), None],
+)
 def test_wire_key_requires_canonical_public_id_and_exact_32_byte_secret(credential: object) -> None:
     with pytest.raises(RegistryError, match="key format"):
         credentials.validate_package_key(credential)
@@ -160,4 +187,6 @@ def test_namespace_and_protocol_are_required_before_helper_access(tmp_path: Path
         with pytest.raises(RegistryError):
             credentials.require_credential_helper(_profile(), namespace, environment=environment)
     with pytest.raises(RegistryError, match="palimpsest profile"):
-        credentials.require_credential_helper(RegistryProfile("oci", "cloud.example.com", "team"), "team", environment=environment)
+        credentials.require_credential_helper(
+            RegistryProfile("oci", "cloud.example.com", "team"), "team", environment=environment
+        )

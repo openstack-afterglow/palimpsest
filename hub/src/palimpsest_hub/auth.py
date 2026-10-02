@@ -32,9 +32,7 @@ keystone_token_header = APIKeyHeader(
 
 
 @lru_cache(maxsize=1)
-def _reader_client_for(
-    auth_url: str, username: str, password: SecretStr, user_domain_name: str, verify: bool
-):
+def _reader_client_for(auth_url: str, username: str, password: SecretStr, user_domain_name: str, verify: bool):
     from keystoneclient.v3 import client as ks_client
 
     auth = v3.Password(
@@ -120,7 +118,12 @@ def validate_token(token: str, project_id: str = "") -> dict[str, Any]:
     client = _get_reader_ks_client()
     try:
         access = client.tokens.validate(token, include_catalog=True)
-    except (ks_exceptions.Unauthorized, ks_exceptions.NotFound, ks_auth_exceptions.Unauthorized, ks_auth_exceptions.NotFound):
+    except (
+        ks_exceptions.Unauthorized,
+        ks_exceptions.NotFound,
+        ks_auth_exceptions.Unauthorized,
+        ks_auth_exceptions.NotFound,
+    ):
         raise HTTPException(status_code=401, detail="Invalid or expired Keystone token") from None
     except Exception:
         raise HTTPException(status_code=503, detail="Keystone token validation is unavailable") from None
@@ -131,7 +134,13 @@ def validate_token(token: str, project_id: str = "") -> dict[str, Any]:
         if access.expires is None or access.expires <= datetime.now(UTC):
             raise HTTPException(status_code=401, detail="Invalid or expired Keystone token")
         if expected_project and original_project != expected_project:
-            raise HTTPException(status_code=403, detail={"code": "PROJECT_SCOPE_MISMATCH", "message": "Project header does not match the original token scope"})
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PROJECT_SCOPE_MISMATCH",
+                    "message": "Project header does not match the original token scope",
+                },
+            )
         auth_ref = ks_access.create(auth_token=token, body={"token": dict(access)})
         return {
             "token": token,
@@ -181,17 +190,32 @@ def get_token_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[
 def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
     """Recheck current owner authority; neither a token nor cached membership is minted."""
     settings = get_settings()
-    if not settings.palimpsest_hub_package_forbidden_project_ids or not settings.palimpsest_hub_package_forbidden_user_ids:
+    if (
+        not settings.palimpsest_hub_package_forbidden_project_ids
+        or not settings.palimpsest_hub_package_forbidden_user_ids
+    ):
         raise HTTPException(status_code=503, detail="Protected project and principal policy is required")
     try:
         user_id, project_id = validate_keystone_id(user_id), validate_keystone_id(project_id)
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(status_code=403, detail="A verified project member is required") from None
-    if user_id in settings.palimpsest_hub_package_forbidden_user_ids or project_id in settings.palimpsest_hub_package_forbidden_project_ids:
-        raise HTTPException(status_code=403, detail={"code": "ADMIN_CREDENTIAL_FORBIDDEN", "message": "Protected identities cannot authorize package access"})
+    if (
+        user_id in settings.palimpsest_hub_package_forbidden_user_ids
+        or project_id in settings.palimpsest_hub_package_forbidden_project_ids
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ADMIN_CREDENTIAL_FORBIDDEN",
+                "message": "Protected identities cannot authorize package access",
+            },
+        )
     client = _get_reader_ks_client()
     if user_id == client._palimpsest_reader_user_id:
-        raise HTTPException(status_code=403, detail={"code": "ADMIN_CREDENTIAL_FORBIDDEN", "message": "The validator identity cannot own package keys"})
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ADMIN_CREDENTIAL_FORBIDDEN", "message": "The validator identity cannot own package keys"},
+        )
     try:
         user = client.users.get(user_id)
         project = client.projects.get(project_id)
@@ -205,7 +229,13 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
                 continue
             role = _assignment_role(assignment)
             if role in {"admin", "service"}:
-                raise HTTPException(status_code=403, detail={"code": "ADMIN_CREDENTIAL_FORBIDDEN", "message": "Administrative or service identities cannot authorize package access"})
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "ADMIN_CREDENTIAL_FORBIDDEN",
+                        "message": "Administrative or service identities cannot authorize package access",
+                    },
+                )
             scope = _value(assignment, "scope")
             target = scope.get("project", {}).get("id") if isinstance(scope, dict) else None
             if target == project_id:
@@ -237,7 +267,13 @@ async def get_package_member_info(token_info: dict[str, Any] = Depends(require_t
         or token_info.get("system_scope")
         or token_info.get("domain_scope")
     ):
-        raise HTTPException(status_code=403, detail={"code": "ADMIN_CREDENTIAL_FORBIDDEN", "message": "Administrative or service tokens cannot authorize package access"})
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ADMIN_CREDENTIAL_FORBIDDEN",
+                "message": "Administrative or service tokens cannot authorize package access",
+            },
+        )
     if not roles & {"member", "reader"}:
         raise HTTPException(status_code=403, detail="A project member or reader token is required")
     owner = await asyncio.to_thread(validate_package_owner, token_info["user_id"], token_info["project_id"])
@@ -261,11 +297,7 @@ async def get_os_conn(
     project_id = token_info["project_id"]
     scoped_token = token_info["token"]
     auth_ref = token_info.get("auth_ref")
-    if (
-        auth_ref is None
-        or auth_ref.auth_token != scoped_token
-        or auth_ref.project_id != project_id
-    ):
+    if auth_ref is None or auth_ref.auth_token != scoped_token or auth_ref.project_id != project_id:
         raise HTTPException(status_code=401, detail="Validated original Keystone token is required")
     try:
         session = ks_session.Session(

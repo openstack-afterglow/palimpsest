@@ -1,4 +1,5 @@
 """Project/key boundaries with real bounded archives, SQL transactions and filesystem CAS."""
+
 from __future__ import annotations
 
 import asyncio
@@ -58,34 +59,78 @@ def tar_bytes(files):
 
 def image_archive(marker=b"first image"):
     layer = tar_bytes([("marker", marker)])
-    config = encoded({"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": [digest(layer)]}, "config": {"Cmd": ["/bin/sh"]}})
+    config = encoded(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [digest(layer)]},
+            "config": {"Cmd": ["/bin/sh"]},
+        }
+    )
     blobs = {digest(layer): layer, digest(config): config}
     config_descriptor = {"digest": digest(config), "size": len(config), "mediaType": CONFIG}
-    root = encoded({"schemaVersion": 2, "mediaType": MANIFEST, "config": config_descriptor,
-        "layers": [{"digest": digest(layer), "size": len(layer), "mediaType": LAYER}]})
+    root = encoded(
+        {
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": config_descriptor,
+            "layers": [{"digest": digest(layer), "size": len(layer), "mediaType": LAYER}],
+        }
+    )
     blobs[digest(root)] = root
-    index = encoded({"schemaVersion": 2, "manifests": [{"digest": digest(root), "size": len(root), "mediaType": MANIFEST}]})
-    archive = tar_bytes([("oci-layout", encoded({"imageLayoutVersion": "1.0.0"})), ("index.json", index),
-                         *[("blobs/sha256/" + key[7:], value) for key, value in blobs.items()]])
-    body = {"package_type": "oci-image", "tag": "v1", "root_digest": digest(root),
-        "archive_digest": digest(archive), "archive_size_bytes": len(archive), "expected_tag_digest": None,
-        "provenance": {"source_revision": "fixture-revision"}}
+    index = encoded(
+        {"schemaVersion": 2, "manifests": [{"digest": digest(root), "size": len(root), "mediaType": MANIFEST}]}
+    )
+    archive = tar_bytes(
+        [
+            ("oci-layout", encoded({"imageLayoutVersion": "1.0.0"})),
+            ("index.json", index),
+            *[("blobs/sha256/" + key[7:], value) for key, value in blobs.items()],
+        ]
+    )
+    body = {
+        "package_type": "oci-image",
+        "tag": "v1",
+        "root_digest": digest(root),
+        "archive_digest": digest(archive),
+        "archive_size_bytes": len(archive),
+        "expected_tag_digest": None,
+        "provenance": {"source_revision": "fixture-revision"},
+    }
     return archive, body, blobs
 
 
 def cache_archive(binding):
     layer = tar_bytes([("cache-data", b"cached result")])
-    config = encoded({"layers": [{"blob": digest(layer), "parent": -1}],
-                      "records": [{"digest": digest(b"recipe"), "layers": [{"layer": 0}]}]})
-    root = encoded({"schemaVersion": 2, "mediaType": MANIFEST,
-        "config": {"digest": digest(config), "size": len(config), "mediaType": "application/vnd.buildkit.cacheconfig.v0"},
-        "layers": [{"digest": digest(layer), "size": len(layer), "mediaType": LAYER}]})
+    config = encoded(
+        {
+            "layers": [{"blob": digest(layer), "parent": -1}],
+            "records": [{"digest": digest(b"recipe"), "layers": [{"layer": 0}]}],
+        }
+    )
+    root = encoded(
+        {
+            "schemaVersion": 2,
+            "mediaType": MANIFEST,
+            "config": {
+                "digest": digest(config),
+                "size": len(config),
+                "mediaType": "application/vnd.buildkit.cacheconfig.v0",
+            },
+            "layers": [{"digest": digest(layer), "size": len(layer), "mediaType": LAYER}],
+        }
+    )
     descriptor = {"digest": digest(root), "size": len(root), "mediaType": MANIFEST}
     index = encoded({"schemaVersion": 2, "manifests": [descriptor]})
     wrapper = {"schema": "palimpsest-buildkit-cache-archive-v1", **binding, "oci_manifest_digest": None}
-    return tar_bytes([("palimpsest-cache.json", encoded(wrapper)),
-        ("cache/oci-layout", encoded({"imageLayoutVersion": "1.0.0"})), ("cache/index.json", index),
-        *[("cache/blobs/sha256/" + digest(value)[7:], value) for value in (layer, config, root)]])
+    return tar_bytes(
+        [
+            ("palimpsest-cache.json", encoded(wrapper)),
+            ("cache/oci-layout", encoded({"imageLayoutVersion": "1.0.0"})),
+            ("cache/index.json", index),
+            *[("cache/blobs/sha256/" + digest(value)[7:], value) for value in (layer, config, root)],
+        ]
+    )
 
 
 @pytest.fixture
@@ -95,17 +140,50 @@ async def hub(tmp_path, monkeypatch):
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     blob_store = LocalPathBlobStore(tmp_path / "cas")
-    settings = SimpleNamespace(palimpsest_hub_package_forbidden_project_ids=("ProtectedProject",),
+    settings = SimpleNamespace(
+        palimpsest_hub_package_forbidden_project_ids=("ProtectedProject",),
         palimpsest_hub_package_forbidden_user_ids=("ProtectedUser",),
         palimpsest_hub_package_namespace_bindings={"alpha": "Project-A", "beta": "Project-B"},
-        palimpsest_hub_package_public_origin="https://registry.example", palimpsest_hub_max_blob_bytes=4 * 1024 * 1024,
-        palimpsest_hub_max_bundle_expanded_bytes=8 * 1024 * 1024)
+        palimpsest_hub_package_public_origin="https://registry.example",
+        palimpsest_hub_max_blob_bytes=4 * 1024 * 1024,
+        palimpsest_hub_max_bundle_expanded_bytes=8 * 1024 * 1024,
+    )
     people = {
-        "one": {"user_id": "f" * 64, "project_id": "Project-A", "project_name": "Renamable project", "roles": ["member"], "can_write": True},
-        "two": {"user_id": "OtherMember", "project_id": "Project-A", "project_name": "Renamable project", "roles": ["member"], "can_write": True},
-        "foreign": {"user_id": "ForeignMember", "project_id": "Project-B", "project_name": "Renamable project", "roles": ["member"], "can_write": True},
-        "admin": {"user_id": "AdminRole", "project_id": "Project-A", "project_name": "Renamable project", "roles": ["admin", "member"], "can_write": True},
-        "protected": {"user_id": "ProtectedUser", "project_id": "Project-A", "project_name": "Renamable project", "roles": ["member"], "can_write": True},
+        "one": {
+            "user_id": "f" * 64,
+            "project_id": "Project-A",
+            "project_name": "Renamable project",
+            "roles": ["member"],
+            "can_write": True,
+        },
+        "two": {
+            "user_id": "OtherMember",
+            "project_id": "Project-A",
+            "project_name": "Renamable project",
+            "roles": ["member"],
+            "can_write": True,
+        },
+        "foreign": {
+            "user_id": "ForeignMember",
+            "project_id": "Project-B",
+            "project_name": "Renamable project",
+            "roles": ["member"],
+            "can_write": True,
+        },
+        "admin": {
+            "user_id": "AdminRole",
+            "project_id": "Project-A",
+            "project_name": "Renamable project",
+            "roles": ["admin", "member"],
+            "can_write": True,
+        },
+        "protected": {
+            "user_id": "ProtectedUser",
+            "project_id": "Project-A",
+            "project_name": "Renamable project",
+            "roles": ["member"],
+            "can_write": True,
+        },
     }
 
     async def original_token(request, x_auth_token=None, x_project_id=None):
@@ -151,8 +229,9 @@ async def hub(tmp_path, monkeypatch):
     app.include_router(legacy.router, prefix="/v1")
     app.dependency_overrides[get_package_member_info] = member_dependency
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
-        yield SimpleNamespace(client=client, store=blob_store, factory=factory, settings=settings,
-                              people=people, disabled=disabled)
+        yield SimpleNamespace(
+            client=client, store=blob_store, factory=factory, settings=settings, people=people, disabled=disabled
+        )
     await engine.dispose()
 
 
@@ -162,9 +241,16 @@ async def key(hub, person="one", package="test", actions=None):
     context = await hub.client.put(f"/v1/projects/{member['project_id']}/namespace", headers=token, json={})
     assert context.status_code in {200, 201}
     namespace = context.json()["namespace"]
-    response = await hub.client.post(f"/v1/projects/{namespace}/keys", headers=token, json={
-        "name": "behavioral test", "scope": {"packages": [package]},
-        "actions": actions or ["packages:read", "packages:write"], "expires_in_days": 1})
+    response = await hub.client.post(
+        f"/v1/projects/{namespace}/keys",
+        headers=token,
+        json={
+            "name": "behavioral test",
+            "scope": {"packages": [package]},
+            "actions": actions or ["packages:read", "packages:write"],
+            "expires_in_days": 1,
+        },
+    )
     assert response.status_code == 201
     assert response.headers["cache-control"] == "no-store"
     return namespace, response.json(), {"Authorization": "Bearer " + response.json()["secret"]}
@@ -177,8 +263,12 @@ async def staged(hub, namespace, credential, payload, body, *, package="test", r
     assert started.status_code == 201
     upload = started.json()
     path += "/" + upload["upload_id"]
-    appended = await hub.client.patch(path, params={"package": package}, headers={**credential,
-        "Upload-Offset": "0", "Content-Type": "application/octet-stream"}, content=payload)
+    appended = await hub.client.patch(
+        path,
+        params={"package": package},
+        headers={**credential, "Upload-Offset": "0", "Content-Type": "application/octet-stream"},
+        content=payload,
+    )
     assert appended.status_code == 204
     assert appended.headers["upload-offset"] == str(len(payload))
     return path, upload
@@ -212,9 +302,15 @@ async def test_private_complete_image_preserves_federated_owner_and_graph(hub):
     assert downloaded.content == archive
     assert downloaded.headers["cache-control"] == "private, no-store"
     layer_digest = next(iter(graph))
-    ranged = await hub.client.get(version_path + "/blobs/" + layer_digest, params={"package": "test"}, headers={**credential, "Range": "bytes=0-2"})
+    ranged = await hub.client.get(
+        version_path + "/blobs/" + layer_digest,
+        params={"package": "test"},
+        headers={**credential, "Range": "bytes=0-2"},
+    )
     assert ranged.status_code == 206 and ranged.content == graph[layer_digest][:3]
-    hidden = await hub.client.get(version_path + "/blobs/" + digest(b"unreachable"), params={"package": "test"}, headers=credential)
+    hidden = await hub.client.get(
+        version_path + "/blobs/" + digest(b"unreachable"), params={"package": "test"}, headers=credential
+    )
     assert hidden.status_code == 404
     repeated = await hub.client.put(path, params={"package": "test"}, headers=credential, json={})
     assert repeated.status_code == 200 and repeated.json()["digest"] == result["digest"]
@@ -233,12 +329,25 @@ async def test_scope_project_and_owner_key_sessions_are_exact(hub):
     path, upload = await staged(hub, namespace, first, archive, body)
     for credential in (second, foreign):
         for method in ("get", "put", "delete"):
-            response = await getattr(hub.client, method)(path, params={"package": "test"}, headers=credential,
-                **({"json": {}} if method == "put" else {}))
+            response = await getattr(hub.client, method)(
+                path, params={"package": "test"}, headers=credential, **({"json": {}} if method == "put" else {})
+            )
             assert response.status_code in {403, 404}
-    assert (await hub.client.post(f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers=other_scope, json=body)).status_code == 403
-    assert (await hub.client.post(f"/v1/projects/{foreign_namespace}/uploads", params={"package": "test"}, headers=first, json=body)).status_code == 403
-    assert (await hub.client.post(f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers={"X-Auth-Token": "one"}, json=body)).status_code == 401
+    assert (
+        await hub.client.post(
+            f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers=other_scope, json=body
+        )
+    ).status_code == 403
+    assert (
+        await hub.client.post(
+            f"/v1/projects/{foreign_namespace}/uploads", params={"package": "test"}, headers=first, json=body
+        )
+    ).status_code == 403
+    assert (
+        await hub.client.post(
+            f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers={"X-Auth-Token": "one"}, json=body
+        )
+    ).status_code == 401
     assert (await hub.client.get("/v1/auth/me", headers={**first, "X-Project-Id": "project-a"})).status_code == 403
     assert (await hub.client.get("/v1/auth/me", headers={**first, "X-Auth-Token": "one"})).status_code == 401
     async with hub.factory() as session:
@@ -256,7 +365,11 @@ async def test_authority_removed_during_transfer_prevents_publication(hub, chang
     archive, body, _ = image_archive()
     path, _ = await staged(hub, namespace, credential, archive, body)
     if change == "revoke":
-        assert (await hub.client.delete(f"/v1/projects/{namespace}/keys/{issued['key']['key_id']}", headers={"X-Auth-Token": "one"})).status_code == 204
+        assert (
+            await hub.client.delete(
+                f"/v1/projects/{namespace}/keys/{issued['key']['key_id']}", headers={"X-Auth-Token": "one"}
+            )
+        ).status_code == 204
     elif change == "membership":
         hub.disabled.add(hub.people["one"]["user_id"])
     elif change == "role":
@@ -292,8 +405,9 @@ async def test_key_expiring_during_keystone_lookup_cannot_start_upload(hub, monk
 
     monkeypatch.setattr(registry, "validate_package_owner", slow_identity)
     _, body, _ = image_archive()
-    response = await hub.client.post(f"/v1/projects/{namespace}/uploads", params={"package": "test"},
-        headers=credential, json=body)
+    response = await hub.client.post(
+        f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers=credential, json=body
+    )
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "KEY_EXPIRED"
     async with hub.factory() as session:
@@ -339,12 +453,21 @@ async def test_tag_compare_and_set_retains_winner_and_immutable_history(hub):
     one["expected_tag_digest"] = two["expected_tag_digest"] = first["root_digest"]
     one_path, _ = await staged(hub, namespace, credential, one_archive, one)
     two_path, _ = await staged(hub, namespace, credential, two_archive, two)
-    results = await asyncio.gather(*[hub.client.put(path, params={"package": "test"}, headers=credential, json={}) for path in (one_path, two_path)])
+    results = await asyncio.gather(
+        *[
+            hub.client.put(path, params={"package": "test"}, headers=credential, json={})
+            for path in (one_path, two_path)
+        ]
+    )
     assert sorted(result.status_code for result in results) == [201, 412]
     winner = next(result.json()["digest"] for result in results if result.status_code == 201)
-    resolved = await hub.client.get(f"/v1/projects/{namespace}/resolve", params={"package": "test", "tag": "v1"}, headers=credential)
+    resolved = await hub.client.get(
+        f"/v1/projects/{namespace}/resolve", params={"package": "test", "tag": "v1"}, headers=credential
+    )
     assert resolved.json()["digest"] == winner and resolved.headers["etag"] == '"' + winner + '"'
-    history = (await hub.client.get(f"/v1/projects/{namespace}/versions", params={"package": "test"}, headers=credential)).json()["items"]
+    history = (
+        await hub.client.get(f"/v1/projects/{namespace}/versions", params={"package": "test"}, headers=credential)
+    ).json()["items"]
     assert {row["root_digest"] for row in history} == {first["root_digest"], winner}
 
 
@@ -357,10 +480,27 @@ async def test_equal_bytes_require_independent_publication_and_survive_legacy_gc
     remote = f"/v1/projects/{other_namespace}/versions/{body['root_digest']}"
     assert (await hub.client.get(remote, params={"package": "test"}, headers=other)).status_code == 404
     # Existing equal bytes in global CAS cannot fill a graph missing from this upload.
-    incomplete = tar_bytes([("oci-layout", encoded({"imageLayoutVersion": "1.0.0"})),
-        ("index.json", encoded({"schemaVersion": 2, "manifests": [{"digest": body["root_digest"],
-            "size": len(graph[body["root_digest"]]), "mediaType": MANIFEST}]})),
-        ("blobs/sha256/" + body["root_digest"][7:], graph[body["root_digest"]])])
+    incomplete = tar_bytes(
+        [
+            ("oci-layout", encoded({"imageLayoutVersion": "1.0.0"})),
+            (
+                "index.json",
+                encoded(
+                    {
+                        "schemaVersion": 2,
+                        "manifests": [
+                            {
+                                "digest": body["root_digest"],
+                                "size": len(graph[body["root_digest"]]),
+                                "mediaType": MANIFEST,
+                            }
+                        ],
+                    }
+                ),
+            ),
+            ("blobs/sha256/" + body["root_digest"][7:], graph[body["root_digest"]]),
+        ]
+    )
     incomplete_body = {**body, "archive_digest": digest(incomplete), "archive_size_bytes": len(incomplete)}
     denied, _, _ = await publish(hub, other_namespace, other, incomplete, incomplete_body)
     assert denied.status_code == 422
@@ -381,19 +521,34 @@ async def test_equal_bytes_require_independent_publication_and_survive_legacy_gc
 async def test_package_only_key_cannot_cache_and_valid_cache_has_no_inventory_side_effect(hub):
     namespace, _, only_package = await key(hub)
     _, _, cache_key = await key(hub, actions=["packages:read", "cache:read", "cache:write"])
-    binding = {"project_id": "Project-A", "namespace": namespace, "package": "test", "build_key": digest(b"build"),
-        "cache_scope": "default", "platform": "linux/amd64", "builder_fingerprint": digest(b"builder")}
+    binding = {
+        "project_id": "Project-A",
+        "namespace": namespace,
+        "package": "test",
+        "build_key": digest(b"build"),
+        "cache_scope": "default",
+        "platform": "linux/amd64",
+        "builder_fingerprint": digest(b"builder"),
+    }
     archive = cache_archive(binding)
     body = {key: value for key, value in binding.items() if key not in {"project_id", "namespace", "package"}}
     body.update(archive_digest=digest(archive), archive_size_bytes=len(archive))
-    assert (await hub.client.post(f"/v1/projects/{namespace}/cache/uploads", params={"package": "test"}, headers=only_package, json=body)).status_code == 403
+    assert (
+        await hub.client.post(
+            f"/v1/projects/{namespace}/cache/uploads", params={"package": "test"}, headers=only_package, json=body
+        )
+    ).status_code == 403
     path, _ = await staged(hub, namespace, cache_key, archive, body, resource="cache")
     assert (await hub.client.put(path, params={"package": "test"}, headers=cache_key, json={})).status_code == 201
     lookup = {key: value for key, value in body.items() if key not in {"archive_digest", "archive_size_bytes"}}
-    resolved = await hub.client.get(f"/v1/projects/{namespace}/cache/resolve", params={"package": "test", **lookup}, headers=cache_key)
+    resolved = await hub.client.get(
+        f"/v1/projects/{namespace}/cache/resolve", params={"package": "test", **lookup}, headers=cache_key
+    )
     assert resolved.json()["resolution"] == "exact"
     lookup["build_key"] = digest(b"other build")
-    fallback = await hub.client.get(f"/v1/projects/{namespace}/cache/resolve", params={"package": "test", **lookup}, headers=cache_key)
+    fallback = await hub.client.get(
+        f"/v1/projects/{namespace}/cache/resolve", params={"package": "test", **lookup}, headers=cache_key
+    )
     assert fallback.json()["resolution"] == "scope" and fallback.json()["build_key"] == binding["build_key"]
     inventory = await hub.client.get(f"/v1/projects/{namespace}/packages", headers=only_package)
     assert inventory.json()["items"] == []
@@ -422,9 +577,14 @@ async def test_key_inventory_scope_and_explicit_whole_project_are_distinct(hub):
     assert (await publish(hub, namespace, other, archive, body, package="other"))[0].status_code == 201
     own = (await hub.client.get(f"/v1/projects/{namespace}/packages", headers=exact)).json()
     assert [item["name"] for item in own["items"]] == ["test"]
-    assert (await hub.client.get(f"/v1/projects/{namespace}/package", params={"package": "other"}, headers=exact)).status_code == 403
-    issued = await hub.client.post(f"/v1/projects/{namespace}/keys", headers={"X-Auth-Token": "one"}, json={
-        "name": "explicit whole project", "scope": {"all_packages": True}, "actions": ["packages:read"]})
+    assert (
+        await hub.client.get(f"/v1/projects/{namespace}/package", params={"package": "other"}, headers=exact)
+    ).status_code == 403
+    issued = await hub.client.post(
+        f"/v1/projects/{namespace}/keys",
+        headers={"X-Auth-Token": "one"},
+        json={"name": "explicit whole project", "scope": {"all_packages": True}, "actions": ["packages:read"]},
+    )
     assert issued.status_code == 201
     whole = {"Authorization": "Bearer " + issued.json()["secret"]}
     inventory = (await hub.client.get(f"/v1/projects/{namespace}/packages", headers=whole)).json()
@@ -437,8 +597,15 @@ async def test_key_inventory_scope_and_explicit_whole_project_are_distinct(hub):
         {"expires_in_days": 91},
     ]
     for override in malformed:
-        request = {"name": "invalid delegation", "scope": {"packages": ["test"]}, "actions": ["packages:read"], **override}
-        assert (await hub.client.post(f"/v1/projects/{namespace}/keys", headers={"X-Auth-Token": "one"}, json=request)).status_code == 422
+        request = {
+            "name": "invalid delegation",
+            "scope": {"packages": ["test"]},
+            "actions": ["packages:read"],
+            **override,
+        }
+        assert (
+            await hub.client.post(f"/v1/projects/{namespace}/keys", headers={"X-Auth-Token": "one"}, json=request)
+        ).status_code == 422
     own_keys = (await hub.client.get(f"/v1/projects/{namespace}/keys", headers={"X-Auth-Token": "one"})).json()["items"]
     assert {item["name"] for item in own_keys} == {"behavioral test", "explicit whole project"}
 
@@ -448,21 +615,35 @@ async def test_offset_acknowledgment_discards_unacknowledged_residue_and_new_key
     namespace, _, credential = await key(hub)
     _, _, replacement = await key(hub)
     archive, body, _ = image_archive()
-    started = await hub.client.post(f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers=credential, json=body)
+    started = await hub.client.post(
+        f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers=credential, json=body
+    )
     upload = started.json()
     path = f"/v1/projects/{namespace}/uploads/{upload['upload_id']}"
     midpoint = len(archive) // 2
-    first = await hub.client.patch(path, params={"package": "test"}, headers={**credential,
-        "Upload-Offset": "0", "Content-Type": "application/octet-stream"}, content=archive[:midpoint])
+    first = await hub.client.patch(
+        path,
+        params={"package": "test"},
+        headers={**credential, "Upload-Offset": "0", "Content-Type": "application/octet-stream"},
+        content=archive[:midpoint],
+    )
     assert first.status_code == 204 and first.headers["upload-offset"] == str(midpoint)
-    conflict = await hub.client.patch(path, params={"package": "test"}, headers={**credential,
-        "Upload-Offset": "0", "Content-Type": "application/octet-stream"}, content=b"wrong offset")
+    conflict = await hub.client.patch(
+        path,
+        params={"package": "test"},
+        headers={**credential, "Upload-Offset": "0", "Content-Type": "application/octet-stream"},
+        content=b"wrong offset",
+    )
     assert conflict.status_code == 409 and conflict.headers["upload-offset"] == str(midpoint)
     assert (await hub.client.get(path, params={"package": "test"}, headers=replacement)).status_code == 404
     with hub.store.upload_path(upload["upload_id"]).open("ab") as handle:
         handle.write(b"unacknowledged crash residue")
-    second = await hub.client.patch(path, params={"package": "test"}, headers={**credential,
-        "Upload-Offset": str(midpoint), "Content-Type": "application/octet-stream"}, content=archive[midpoint:])
+    second = await hub.client.patch(
+        path,
+        params={"package": "test"},
+        headers={**credential, "Upload-Offset": str(midpoint), "Content-Type": "application/octet-stream"},
+        content=archive[midpoint:],
+    )
     assert second.status_code == 204 and second.headers["upload-offset"] == str(len(archive))
     assert hub.store.upload_path(upload["upload_id"]).read_bytes() == archive
     assert (await hub.client.put(path, params={"package": "test"}, headers=credential, json={})).status_code == 201
@@ -477,13 +658,21 @@ async def test_same_root_repush_retains_immutable_archive_and_acknowledges_curre
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
         files = [(member.name, source.extractfile(member).read()) for member in source.getmembers()]
     repacked = tar_bytes(reversed(files))
-    result, _, _ = await publish(hub, namespace, second, repacked, {**body,
-        "archive_digest": digest(repacked), "archive_size_bytes": len(repacked)})
+    result, _, _ = await publish(
+        hub,
+        namespace,
+        second,
+        repacked,
+        {**body, "archive_digest": digest(repacked), "archive_size_bytes": len(repacked)},
+    )
     assert result.status_code == 200 and result.json()["already_published"] is True
     assert result.json()["pushed_by"] == "OtherMember"
     assert result.json()["pushed_key_id"] == issued["key"]["key_id"]
-    metadata = (await hub.client.get(f"/v1/projects/{namespace}/versions/{body['root_digest']}",
-        params={"package": "test"}, headers=second)).json()
+    metadata = (
+        await hub.client.get(
+            f"/v1/projects/{namespace}/versions/{body['root_digest']}", params={"package": "test"}, headers=second
+        )
+    ).json()
     assert metadata["pushed_by"] == "f" * 64 and metadata["archive_digest"] == digest(archive)
     assert not hub.store.exists(digest(repacked))
 
@@ -496,8 +685,9 @@ async def test_namespace_registration_is_explicit_immutable_and_not_a_display_na
     context = await hub.client.get("/v1/projects/current", headers=token)
     assert context.json()["namespace"] is None
     assert (await hub.client.get(f"/v1/projects/p-{project}/packages", headers=token)).status_code == 404
-    assert (await hub.client.put(f"/v1/projects/{project}/namespace", headers=token,
-        json={"namespace": "arbitrary-alias"})).status_code == 422
+    assert (
+        await hub.client.put(f"/v1/projects/{project}/namespace", headers=token, json={"namespace": "arbitrary-alias"})
+    ).status_code == 422
     registered = await hub.client.put(f"/v1/projects/{project}/namespace", headers=token, json={})
     assert registered.status_code == 201 and registered.json()["namespace"] == "p-" + project
     hub.people["one"]["project_name"] = "Changed display name"

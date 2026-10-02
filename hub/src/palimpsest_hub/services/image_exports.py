@@ -291,7 +291,9 @@ async def enqueue_image_export(
             # Lock the project's indexed key range so concurrent requests for
             # different artifacts cannot both create nonterminal work.
             await session.execute(
-                select(PalimpsestImageExport.id).where(exact_identity(PalimpsestImageExport.project_id, project_id)).with_for_update()
+                select(PalimpsestImageExport.id)
+                .where(exact_identity(PalimpsestImageExport.project_id, project_id))
+                .with_for_update()
             )
             # 1. Enforce at most one nonterminal job per project
             stmt_active = select(PalimpsestImageExport).where(
@@ -442,7 +444,9 @@ async def enqueue_image_export(
             same_race = (await session.execute(stmt_same)).scalar_one_or_none()
 
         if same_race is None:
-            raise ImageExportError(409, "Legacy export ownership conflicts with exact project identity", code="project_identity_conflict") from None
+            raise ImageExportError(
+                409, "Legacy export ownership conflicts with exact project identity", code="project_identity_conflict"
+            ) from None
 
         race_digest = same_race.result_blob_digest if same_race.status == STATUS_COMPLETE else None
         race_present = blob_store.exists(race_digest) if race_digest else False
@@ -815,7 +819,6 @@ async def process_one_image_export(*, owner: str) -> bool:
     factory = get_session_factory()
     blob_store = get_blob_store()
     scratch_dir = _scratch_dir_for(blob_store.exports_dir, job, owner)
-
 
     heartbeat_stop = asyncio.Event()
     lease_lost = asyncio.Event()
@@ -1238,7 +1241,11 @@ async def process_one_image_export(*, owner: str) -> bool:
             _logger.info("Export task ended status=%s", outcome)
             _logger.debug(
                 "Export task result status=%s attempts=%d downloaded_bytes=%d output_bytes=%d elapsed_ms=%d",
-                outcome, job.attempts, total_downloaded, output_size, int((time.monotonic() - started) * 1000),
+                outcome,
+                job.attempts,
+                total_downloaded,
+                output_size,
+                int((time.monotonic() - started) * 1000),
             )
 
 

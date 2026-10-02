@@ -427,30 +427,38 @@ def test_registry_profile_cli_forwards_namespace_and_cache_options(tmp_path: Pat
     assert registry.registry_config_path(cli.init_roots()).is_relative_to(tmp_path)
 
 
-
-
 def _native_profile() -> RegistryProfile:
-    return RegistryProfile(alias="cloud", endpoint="hub.example.test", protocol="palimpsest",
-                           api_base="https://hub.example.test/v1", namespace="p-" + "1" * 32)
+    return RegistryProfile(
+        alias="cloud",
+        endpoint="hub.example.test",
+        protocol="palimpsest",
+        api_base="https://hub.example.test/v1",
+        namespace="p-" + "1" * 32,
+    )
 
 
 @pytest.mark.parametrize("option", [["--load"], ["--cache-to", "type=registry,ref=hub.example.test/cache"]])
 def test_native_build_rejects_docker_side_effects_before_credential_or_builder_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    option: list[str],
 ) -> None:
     roots = cli.init_roots()
     registry.save_registry_config(roots, registry.add_profile(registry.default_registry_config(), _native_profile()))
     monkeypatch.setattr(cli, "NativePackageClient", lambda *_args, **_kwargs: pytest.fail("credentials read"))
     monkeypatch.setattr(cli, "build_with_buildkit", lambda *_args, **_kwargs: pytest.fail("builder started"))
     output = tmp_path / "output.oci.tar"
-    assert cli.main(["build", str(tmp_path), "--registry", "cloud", "-t", "test:v1",
-                     "--output", str(output), *option]) == 1
+    assert (
+        cli.main(["build", str(tmp_path), "--registry", "cloud", "-t", "test:v1", "--output", str(output), *option])
+        == 1
+    )
     assert not output.exists()
     assert not tuple(roots.builds.glob("bk-*"))
 
 
 def test_oci_online_build_requires_explicit_native_cache_authority_before_builder_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     roots = cli.init_roots()
     monkeypatch.setenv("PALIMPSEST_TOKEN", "unqualified-token-must-not-authorize-cache")
@@ -464,7 +472,8 @@ def test_oci_online_build_requires_explicit_native_cache_authority_before_builde
 
 @pytest.mark.parametrize("operation", ["push", "pull"])
 def test_native_all_tags_never_falls_back_to_docker_or_requests_credentials(
-    monkeypatch: pytest.MonkeyPatch, operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     roots = cli.init_roots()
     registry.save_registry_config(roots, registry.add_profile(registry.default_registry_config(), _native_profile()))
@@ -488,10 +497,19 @@ def test_native_reference_roundtrip_rejects_identity_changes_and_shared_files(tm
     reference = profile.endpoint + "/" + profile.namespace + "/test:v1"
     with pytest.raises(ArtifactValidationError, match="build first or supply --input"):
         read_package_reference(roots, reference)
-    record = LocalPackageReference(reference=reference, authority=profile.endpoint, api_base=profile.api_base,
-                                   namespace=profile.namespace, package="test", archive=str(tmp_path / "image.tar"),
-                                   archive_digest="sha256:" + "b" * 64, archive_size_bytes=1024,
-                                   root_digest="sha256:" + "c" * 64, package_type="oci-image", project_id="F" * 64)
+    record = LocalPackageReference(
+        reference=reference,
+        authority=profile.endpoint,
+        api_base=profile.api_base,
+        namespace=profile.namespace,
+        package="test",
+        archive=str(tmp_path / "image.tar"),
+        archive_digest="sha256:" + "b" * 64,
+        archive_size_bytes=1024,
+        root_digest="sha256:" + "c" * 64,
+        package_type="oci-image",
+        project_id="F" * 64,
+    )
     path = write_package_reference(roots, record)
     assert read_package_reference(roots, reference) == record
     with pytest.raises(ArtifactValidationError):

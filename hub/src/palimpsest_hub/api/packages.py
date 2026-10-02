@@ -1,4 +1,5 @@
 """Native /v1 project packages; never a Docker Distribution or legacy-token write alias."""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -66,8 +67,9 @@ async def project_context(member: dict = Depends(control_member)):
 
 
 @router.put("/projects/{project_id}/namespace")
-async def register_namespace(project_id: str, response: Response, body: EmptyBody | None = None,
-                             member: dict = Depends(control_member)):
+async def register_namespace(
+    project_id: str, response: Response, body: EmptyBody | None = None, member: dict = Depends(control_member)
+):
     _, created = await registry.register_namespace(project_id, member)
     response.status_code = 201 if created else 200
     return await registry.project_context(member)
@@ -97,9 +99,13 @@ async def auth_me(actor: registry.Actor = Depends(key_actor)):
 
 
 @router.get("/projects/{namespace}/packages")
-async def inventory(namespace: str, limit: int = Query(50, ge=1, le=100), cursor: str | None = None,
-                    package_type: Literal["oci-image", "runtime-bundle"] | None = None,
-                    actor: registry.Actor = Depends(read_actor)):
+async def inventory(
+    namespace: str,
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = None,
+    package_type: Literal["oci-image", "runtime-bundle"] | None = None,
+    actor: registry.Actor = Depends(read_actor),
+):
     return await registry.inventory(actor, namespace, limit, cursor, package_type)
 
 
@@ -109,14 +115,24 @@ async def package_detail(namespace: str, package: str = Query(...), actor: regis
 
 
 @router.get("/projects/{namespace}/versions")
-async def versions(namespace: str, package: str = Query(...), limit: int = Query(50, ge=1, le=100),
-                   cursor: str | None = None, actor: registry.Actor = Depends(read_actor)):
+async def versions(
+    namespace: str,
+    package: str = Query(...),
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = None,
+    actor: registry.Actor = Depends(read_actor),
+):
     return await registry.versions(actor, namespace, package, limit, cursor)
 
 
 @router.get("/projects/{namespace}/resolve")
-async def resolve(namespace: str, response: Response, package: str = Query(...), tag: str = Query(...),
-                  actor: registry.Actor = Depends(read_actor)):
+async def resolve(
+    namespace: str,
+    response: Response,
+    package: str = Query(...),
+    tag: str = Query(...),
+    actor: registry.Actor = Depends(read_actor),
+):
     try:
         canonical_tag(tag)
     except ValueError:
@@ -138,20 +154,40 @@ def private_blob(request, digest, total, media_type, filename):
             raise registry.RegistryError(503, "HUB_UNAVAILABLE", "published blob size mismatch")
     except registry.HubStoreError:
         raise registry.RegistryError(503, "HUB_UNAVAILABLE", "published bytes unavailable") from None
-    return _blob_response(blob_store, digest, total=total, media_type=media_type,
-                          filename=filename, range_header=request.headers.get("range"), cache_control="private, no-store")
+    return _blob_response(
+        blob_store,
+        digest,
+        total=total,
+        media_type=media_type,
+        filename=filename,
+        range_header=request.headers.get("range"),
+        cache_control="private, no-store",
+    )
 
 
 @router.get("/projects/{namespace}/versions/{digest}/download")
-async def download(namespace: str, digest: str, request: Request, package: str = Query(...),
-                   actor: registry.Actor = Depends(read_actor)):
+async def download(
+    namespace: str,
+    digest: str,
+    request: Request,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(read_actor),
+):
     value = await registry.version(actor, namespace, package, digest=digest)
-    return private_blob(request, value["archive_digest"], value["archive_size_bytes"], "application/x-tar", "package.oci.tar")
+    return private_blob(
+        request, value["archive_digest"], value["archive_size_bytes"], "application/x-tar", "package.oci.tar"
+    )
 
 
 @router.get("/projects/{namespace}/versions/{digest}/blobs/{blob_digest}")
-async def version_blob(namespace: str, digest: str, blob_digest: str, request: Request,
-                       package: str = Query(...), actor: registry.Actor = Depends(read_actor)):
+async def version_blob(
+    namespace: str,
+    digest: str,
+    blob_digest: str,
+    request: Request,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(read_actor),
+):
     value = await registry.version(actor, namespace, package, digest=digest)
     blob_digest = registry.checked_digest(blob_digest)
     descriptor = value["graph"].get(blob_digest)
@@ -161,87 +197,123 @@ async def version_blob(namespace: str, digest: str, blob_digest: str, request: R
 
 
 @router.post("/projects/{namespace}/uploads", status_code=201)
-async def start_upload(namespace: str, body: PackageUploadStart, package: str = Query(...),
-                       actor: registry.Actor = Depends(key_actor)):
+async def start_upload(
+    namespace: str, body: PackageUploadStart, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     return await registry.start_upload(actor, namespace, package, body, "package")
 
 
 @router.get("/projects/{namespace}/uploads/{upload_id}")
-async def upload_status(namespace: str, upload_id: str, package: str = Query(...),
-                        actor: registry.Actor = Depends(key_actor)):
+async def upload_status(
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     return await registry.upload_status(actor, namespace, package, upload_id, "package")
 
 
 @router.patch("/projects/{namespace}/uploads/{upload_id}", status_code=204)
-async def append_upload(namespace: str, upload_id: str, request: Request, package: str = Query(...),
-                        actor: registry.Actor = Depends(key_actor)):
+async def append_upload(
+    namespace: str,
+    upload_id: str,
+    request: Request,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(key_actor),
+):
     offset = await registry.append_upload(actor, namespace, package, upload_id, "package", request)
     return Response(status_code=204, headers={"Upload-Offset": str(offset)})
 
 
 @router.put("/projects/{namespace}/uploads/{upload_id}")
-async def finalize_upload(namespace: str, upload_id: str, response: Response, body: EmptyBody,
-                          package: str = Query(...), actor: registry.Actor = Depends(key_actor)):
+async def finalize_upload(
+    namespace: str,
+    upload_id: str,
+    response: Response,
+    body: EmptyBody,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(key_actor),
+):
     result, changed = await registry.finalize_upload(actor, namespace, package, upload_id, "package")
     response.status_code = 201 if changed else 200
     return result
 
 
 @router.delete("/projects/{namespace}/uploads/{upload_id}", status_code=204)
-async def abort_upload(namespace: str, upload_id: str, package: str = Query(...),
-                       actor: registry.Actor = Depends(key_actor)):
+async def abort_upload(
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     await registry.abort_upload(actor, namespace, package, upload_id, "package")
     return Response(status_code=204)
 
 
 @router.get("/projects/{namespace}/cache/resolve")
-async def resolve_cache(namespace: str, package: str = Query(...), build_key: str = Query(...),
-                        cache_scope: str = Query(...), platform: str = Query(...), builder_fingerprint: str = Query(...),
-                        actor: registry.Actor = Depends(key_actor)):
+async def resolve_cache(
+    namespace: str,
+    package: str = Query(...),
+    build_key: str = Query(...),
+    cache_scope: str = Query(...),
+    platform: str = Query(...),
+    builder_fingerprint: str = Query(...),
+    actor: registry.Actor = Depends(key_actor),
+):
     try:
-        partition = CachePartition(build_key=build_key, cache_scope=cache_scope, platform=platform,
-                                   builder_fingerprint=builder_fingerprint)
+        partition = CachePartition(
+            build_key=build_key, cache_scope=cache_scope, platform=platform, builder_fingerprint=builder_fingerprint
+        )
     except ValidationError:
         raise registry.RegistryError(422, "INVALID_CACHE_BINDING", "invalid cache partition") from None
     return await registry.resolve_cache(actor, namespace, package, partition)
 
 
 @router.get("/projects/{namespace}/cache/archives/{digest}")
-async def cache_archive(namespace: str, digest: str, request: Request, package: str = Query(...),
-                        actor: registry.Actor = Depends(key_actor)):
+async def cache_archive(
+    namespace: str, digest: str, request: Request, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     size = await registry.cache_archive(actor, namespace, package, digest)
     return private_blob(request, digest, size, "application/x-tar", "buildkit-cache.tar")
 
 
 @router.post("/projects/{namespace}/cache/uploads", status_code=201)
-async def start_cache_upload(namespace: str, body: CacheUploadStart, package: str = Query(...),
-                             actor: registry.Actor = Depends(key_actor)):
+async def start_cache_upload(
+    namespace: str, body: CacheUploadStart, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     return await registry.start_upload(actor, namespace, package, body, "cache")
 
 
 @router.get("/projects/{namespace}/cache/uploads/{upload_id}")
-async def cache_upload_status(namespace: str, upload_id: str, package: str = Query(...),
-                              actor: registry.Actor = Depends(key_actor)):
+async def cache_upload_status(
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     return await registry.upload_status(actor, namespace, package, upload_id, "cache")
 
 
 @router.patch("/projects/{namespace}/cache/uploads/{upload_id}", status_code=204)
-async def append_cache_upload(namespace: str, upload_id: str, request: Request, package: str = Query(...),
-                              actor: registry.Actor = Depends(key_actor)):
+async def append_cache_upload(
+    namespace: str,
+    upload_id: str,
+    request: Request,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(key_actor),
+):
     offset = await registry.append_upload(actor, namespace, package, upload_id, "cache", request)
     return Response(status_code=204, headers={"Upload-Offset": str(offset)})
 
 
 @router.put("/projects/{namespace}/cache/uploads/{upload_id}")
-async def finalize_cache_upload(namespace: str, upload_id: str, response: Response, body: EmptyBody,
-                                package: str = Query(...), actor: registry.Actor = Depends(key_actor)):
+async def finalize_cache_upload(
+    namespace: str,
+    upload_id: str,
+    response: Response,
+    body: EmptyBody,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(key_actor),
+):
     result, changed = await registry.finalize_upload(actor, namespace, package, upload_id, "cache")
     response.status_code = 201 if changed else 200
     return result
 
 
 @router.delete("/projects/{namespace}/cache/uploads/{upload_id}", status_code=204)
-async def abort_cache_upload(namespace: str, upload_id: str, package: str = Query(...),
-                             actor: registry.Actor = Depends(key_actor)):
+async def abort_cache_upload(
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+):
     await registry.abort_upload(actor, namespace, package, upload_id, "cache")
     return Response(status_code=204)

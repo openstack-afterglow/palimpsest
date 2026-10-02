@@ -1,4 +1,5 @@
 """Reference proofs for the CAS shared by native and legacy artifact transports."""
+
 from sqlalchemy import select
 
 from palimpsest_hub.models import (
