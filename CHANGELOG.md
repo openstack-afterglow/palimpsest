@@ -2,17 +2,33 @@
 
 All notable changes to Palimpsest Local are documented here.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-02 (candidate, unpublished)
 
-### Root 0.2.4 (prepared, not published)
+Root `palimpsest-client` and independently packaged `palimpsest-hub` both prepare 0.3.0 for the native project-package registry. This supersedes the unpublished root 0.2.4 preparation; the Kolla image default stays 0.2.0. No tag, PyPI release, GHCR publication or deployment is claimed.
 
-- Prepare the `palimpsest-client` patch version in the root metadata, CLI version, and lockfile. The separate Hub 0.2.1 source already contains the closed-transport pool fix; it is not installed or deployed by a root package update. The packaged Kolla role still defaults to Hub image tag 0.2.0, so operators must explicitly pin reviewed fixed API and worker images. No PyPI, GitHub release, or image publication is claimed.
-- Correct the Hub module's version to match its separate 0.2.1 package without coupling it to the Kolla image default. During deploy/upgrade, pull the API image and initialize the local Hub volume root on each Palimpsest host before starting its API/worker containers; keep the database bootstrap single-host and do not recursively change existing blobs.
+### Project-scoped native packages
+
+- Add native `palimpsest` registry profiles with a same-authority HTTPS `api_base`, verified CA trust and redirect refusal. A configured authority must map to one protocol, and an explicit `--registry` must match a qualified reference's authority. Unconfigured fully qualified authorities stay ordinary Docker/OCI, as before, including login/logout. OCI-profile Docker/Buildx operations are unchanged.
+- Add secret-once expiring keys bound to owner, project, package and actions. Add helper-backed native login/logout and validated OCI-image/runtime-bundle publication with compare-and-set tags. Uploads use offset-acknowledged chunked sessions, and the client starts a fresh session for each push. Add verified original-archive pull. Native `push --input/--manifest`, `pull --output` and typed owner-only local references keep native packages separate from Docker images and SquashFS runtime-layer tags.
+- Cut mandatory online BuildKit cache transfer over to exact project/package keys with seven-field binding and API-base/namespace/project/package/scope/platform/builder-fingerprint local partitioning. OCI output requires `--cache-registry` and `--cache-package`; native output defaults to its own profile/package. Package-only keys and legacy `PALIMPSEST_TOKEN` cannot authorize cache writes. Native exports/receipts survive later cache or publication failure; the original-token runtime path remains separate.
+- Validate original Keystone subject tokens with a dedicated system reader instead of default-project re-scope. Require protected project/principal sets, immutable operator namespace bindings, trusted public HTTPS origin and fresh effective key-owner membership (including federated identity prerequisites). Native keys do not grant privileged server-build authority.
+- Document source-defined options and operator prerequisites without changing deployment, production policy or namespace bindings. Strict `--offline` builds never load registry profiles and reject `--registry`; publish their archives later with native `push --input`. The DMS Lab example depends on the separately deployed Afterglow key gateway. Fresh candidate verification and unavailable native/production gates are recorded in the development handoff, separately from earlier isolated package proof.
+
+### Dashboard and Hub observability
+
+- Extend the existing loopback `palimpsest ui` with VM, volume, network, artifact and build views, bounded BuildKit log tails, polling/pause and search. Controls are disabled by default; opt in with `--allow-control`. Inventory is a durable projection, not an OpenStack adapter or native execution proof.
+- Keep long-running control requests busy until their response instead of aborting them on the polling timeout. Reset VM volume-deletion choices between drawers, and preserve the current view when activating the keyboard skip link.
+- Add shared Hub API/export/build-worker logging with INFO default, explicit Hub-only DEBUG, safe route-template/status/timing records and bounded worker lifecycle metadata without credential-bearing exception text.
+- Verify the bytes copied into CAS before publication; preserve existing targets on failed repairs, and hold publication locks through database commits. Bind legacy uploads to their creating user, enforce case-exact legacy project ownership, recheck key expiry/revocation after reader lookups, and correlate package errors with server-owned request IDs.
+
+### Retained release and deployment fixes
+
+- Keep metadata, module versions and lockfiles consistent at 0.3.0 in both distributions without coupling Python versions to the older Kolla image default. During deploy/upgrade, pull the reviewed API image and initialize the local Hub volume root on each Palimpsest host before starting its API/worker containers; keep the database bootstrap single-host and do not recursively change existing blobs.
 - Move native CI orchestration to GitHub-hosted Ubuntu with a protected environment and disposable, member-project-only OpenStack VMs. PRs require hosted checks; trusted dev/main pushes and release tags retain strict native success gates. The helper validates source/kernel evidence and refuses foreign ownership during bounded failure/signal cleanup. The existing persistent runner remains stopped.
 - Restrict release permissions to read-only by default, granting OIDC only to PyPI publication and contents-write only to formal GitHub release publication. Existing development-package/GHCR publication paths still require separate approval; this unpushed cutover does not claim a GitHub native pass or production promotion.
 - Document the persistent loopback/SSH-only candidate environment, actual authenticated artifact and two-layer build proofs, timeout/restart/reboot recovery, and explicit backup/restore and promotion boundaries. The isolated manual native proof passed all 43 boots/44 QEMU invocations and exact-owned cleanup after replacing transient KVM device ACLs with standard guest group membership. Exact closed-transport signature, GitHub CI execution, and production multi-host readiness remain separate evidence gates.
 
-### Hub 0.2.1 (not independently published to PyPI)
+### Retained Hub connection-pool fix
 
 - Recover stale pooled asyncmy connections whose closed uvloop transport raises a non-DBAPI `RuntimeError` during SQLAlchemy pre-ping. Only the closed-transport signature is treated as a disconnect; unrelated runtime errors and interrupted transactions still propagate. At the time of the Hub fix the published root `palimpsest-client` was 0.2.3.
 

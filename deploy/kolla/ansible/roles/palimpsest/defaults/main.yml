@@ -38,6 +38,13 @@ palimpsest_keystone_user: "palimpsest"
 palimpsest_keystone_auth_url: "{{ keystone_internal_url }}"
 palimpsest_keystone_project_domain_name: "{{ default_project_domain_name }}"
 palimpsest_keystone_user_domain_name: "{{ default_user_domain_name }}"
+palimpsest_reader_user: "palimpsest-reader"
+palimpsest_reader_user_domain_name: "{{ default_user_domain_name }}"
+# Exact immutable Keystone IDs; operators must supply both protected sets.
+palimpsest_package_forbidden_project_ids: []
+palimpsest_package_forbidden_user_ids: []
+palimpsest_package_namespace_bindings: {}
+palimpsest_package_public_origin: ""
 palimpsest_keystone_region_name: "{{ openstack_region_name }}"
 palimpsest_keystone_interface: "{{ openstack_interface | default('internal') }}"
 palimpsest_service_project_name: "palimpsest-service"
@@ -63,7 +70,7 @@ palimpsest_services:
     enabled: "{{ enable_palimpsest_hub_api | bool }}"
     image: "{{ palimpsest_api_image_ref }}"
     network_mode: host
-    command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers"]
+    command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
     restart_policy: unless-stopped
     volumes:
       - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
@@ -73,6 +80,13 @@ palimpsest_services:
       DATABASE_URL: "{{ palimpsest_database_url }}"
       REDIS_URL: "{{ palimpsest_redis_url }}"
       OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+      OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
+      OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
+      OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
+      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
+      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
+      PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS: "{{ palimpsest_package_namespace_bindings | to_json }}"
+      PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN: "{{ palimpsest_package_public_origin }}"
       PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
       PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
       PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"

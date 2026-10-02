@@ -6,11 +6,11 @@ is published on PyPI; install it with
 `python3.12 -m pip install "palimpsest-client==0.2.3"` and verify with
 `palimpsest --version`. Git and outbound HTTPS access to GitHub are required
 only for the VCS installation examples below. The independent Hub Python
-package (`palimpsest-hub`) is `0.2.1` in this source tree; the root release
+package (`palimpsest-hub`) prepares `0.3.0` in this source tree; the root release
 tag does not publish that wheel.
 
-The current checkout prepares root `palimpsest-client 0.2.4`; the published
-commands above still install 0.2.3. Hub 0.2.1 source contains the pooled
+The current checkout prepares root `palimpsest-client 0.3.0`; the published
+commands above still install 0.2.3. Hub 0.3.0 adds the project-package registry and retains
 closed-transport recovery, but the Kolla role still defaults to Hub image
 tag 0.2.0. Deploy reviewed API and worker image digests explicitly; a root
 package update does not roll out the Hub fix.

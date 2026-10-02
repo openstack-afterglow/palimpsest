@@ -84,6 +84,7 @@ Profile mirrors, CA files, plain-HTTP, and TLS-skip settings are inputs to `pali
 - When pushing a blob, `HubClient` checks Hub upload short-circuit APIs (`already_present` or `registered`). Existing verified blobs bypass payload transfer only when the returned canonical descriptor is compatible; a conflicting name/kind/media/chain/base/architecture fails explicitly.
 - For active uploads, transfer progress is recorded in `<state>/transfers/<digest_hex>.json` storing `{session_id, declared_digest, acknowledged_offset, path_fingerprint}`.
 - If interrupted, the client queries `GET /v1/uploads/{session_id}` to retrieve server-acknowledged `received_bytes`, seeks to that exact offset, and resumes streaming via `PATCH` with `Upload-Offset: <offset>`.
+- Session status, append, finalize and abort require the exact original project and creating user. Another user in the same project cannot resume the session; historical sessions lacking a creating user fail closed. Legacy project comparisons remain byte-exact even when the database uses a case-insensitive collation.
 - **Hub Fallback:** If the remote Hub returns `HTTP 404` or `HTTP 405` for the upload offset query (indicating an older Hub without offset resumption), `palimpsest-local` deletes the local checkpoint and creates a fresh upload session. It never blindly replays chunks against an unverified offset.
 
 ---
@@ -140,7 +141,7 @@ Profile mirrors, CA files, plain-HTTP, and TLS-skip settings are inputs to `pali
 | Project networking | **One default/external network** | Managed custom networks, multi-NIC, aliases, and service DNS are not implemented. |
 | Project cloud-init | **Typed subset** | `packages`, `write_files`, and argv-form `runcmd`; raw MIME/user-data and runtime-owned paths are rejected. |
 | OCI `/v2` Registry API | **Supported through external registries** | Docker-compatible commands and Buildx outputs use the installed Docker CLI. Palimpsest Hub itself remains `/v1` only and is not an OCI registry server. |
-| Native registry implementation | **Unsupported** | Palimpsest does not yet implement its own `/v2` server or independent OCI registry client/CAS; registry commands depend on Docker. |
+| Native registry implementation | **Native `/v1` packages only** | Project-scoped `namespace/package:tag` publication/pull uses Palimpsest Hub `/v1` with package keys ([contract](project-package-registry.md)). There is no `/v2` server; genuine OCI registry commands still depend on Docker. |
 | Mutable remote Dockerfile inputs | **Unsupported** | Remote `FROM`, frontend, and external-stage identities must be fully qualified and digest-pinned; profiles do not rewrite Dockerfiles. |
 
 The project schema, lifecycle state, interpolation rules, and backend-specific limitations are specified in [Declarative multi-VM projects](projects.md).

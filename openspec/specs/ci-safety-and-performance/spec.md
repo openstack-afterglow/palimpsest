@@ -1,6 +1,23 @@
 # CI safety and performance requirements
 
+## Purpose
+
 This specification carries the 2026-09-27 Nova cutover and the detailed CI obligations from the root guidance. Earlier CI and self-hosted-runner checkpoints in [the handoff](../../../docs/development-handoff.md) describe their dated states; the trusted-ref, hosted-only policy below governs current changes.
+
+## Requirements
+
+### Requirement: Preserve measured CI and protected execution boundaries
+CI changes MUST retain the active rules below: comparable measured critical paths, hosted-only untrusted PR jobs, fail-closed native evidence, verified shard execution, and publication gates. Dated timings describe their original population, not proof of a new run. Separate owner approval MUST precede changes to native runner exposure, release bypasses, or remote resource mutation.
+
+#### Scenario: Untrusted PR requests native proof
+- **WHEN** a fork or other untrusted PR reaches the test workflow
+- **THEN** it runs only hosted validation, with no privileged runner or publication credential exposure
+
+#### Scenario: CI improvement is proposed
+- **WHEN** a workflow change claims a shorter critical path
+- **THEN** before/after comparable runs are measured and the actual median, p90 and sample size are recorded rather than a projection claimed as a result
+
+## Reference
 
 ## CI 파이프라인 성능 규정
 

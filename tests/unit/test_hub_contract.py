@@ -56,43 +56,21 @@ def test_hub_client_constructor_validation_and_repr():
         HubClient("http://localhost:8080", "token", timeout_seconds=0)
 
 
-def test_buildkit_cache_contract_constants():
-    assert hub.KIND_BUILDKIT_CACHE == "buildkit-cache"
-    assert hub.MEDIA_TYPE_BUILDKIT_CACHE == "application/vnd.afterglow.palimpsest.buildkit.cache.v1.tar"
-
-
-def test_list_layers_forwards_normalized_chain_id(monkeypatch: pytest.MonkeyPatch):
-    chain_id = "sha256:" + "A" * 64
-    captured: dict[str, object] = {}
-
-    def fake_json_request(method, path, payload=None, *, query=None):
-        captured.update(method=method, path=path, payload=payload, query=query)
-        return []
-
-    client = HubClient("http://hub.invalid", "token")
-    monkeypatch.setattr(client, "_json_request", fake_json_request)
-
-    assert (
-        client.list_layers(
-            name="dockerfile-cache",
-            kind=hub.KIND_BUILDKIT_CACHE,
-            chain_id=chain_id,
-            limit=7,
-        )
-        == []
-    )
-    assert captured == {
-        "method": "GET",
-        "path": "/layers",
-        "payload": None,
-        "query": {
-            "name": "dockerfile-cache",
-            "kind": "buildkit-cache",
-            "chain_id": "sha256:" + "a" * 64,
-            "parent_digest": None,
-            "limit": 7,
-        },
-    }
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"kind": "buildkit-cache"},
+        {"media_type": "application/vnd.afterglow.palimpsest.buildkit.cache.v1.tar"},
+    ],
+)
+def test_generic_hub_cache_upload_is_rejected_before_transport(tmp_path: Path, metadata: dict, monkeypatch):
+    client = HubClient("http://hub.invalid", "original-project-token")
+    source = tmp_path / "cache.tar"
+    source.write_bytes(b"cache bytes")
+    monkeypatch.setattr(client, "_json_request", lambda *_args, **_kwargs: pytest.fail("legacy cache transport accessed"))
+    with pytest.raises(HubError):
+        client.push_blob(source, metadata, resume=False)
+    assert source.read_bytes() == b"cache bytes"
 
 
 class MockHubHandler(BaseHTTPRequestHandler):

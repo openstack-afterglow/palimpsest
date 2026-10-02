@@ -1,10 +1,10 @@
 # Contributor workflow specification
 
-## Scope and authority
+## Purpose
 
-This specification migrates the operating obligations previously in root `AGENTS.md` (resume, architecture maintenance, verification, protected material). `AGENTS.md` and `agent.md` are entrypoints, not independent approvals. Consult [`README.md` Development](../../../README.md#development), the dated [`development-handoff.md`](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md), affected detailed documents, and the [CI safety/performance specification](../ci-safety-and-performance/spec.md). Historical checkpoints describe their own date and source snapshot, not current server state or new authorization. The approved Nova cutover documented in this repository is not permission for another ref, resource or remote action.
+This specification migrates the operating obligations previously in root `AGENTS.md` (resume, architecture maintenance, verification, protected material). `AGENTS.md` and `agent.md` are entrypoints, not independent approvals. Consult [`README.md` Development](../../../README.md#development), the dated [`development-handoff.md`](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md), affected detailed documents, and the [CI safety/performance specification](../ci-safety-and-performance/spec.md). Historical checkpoints describe their own date and source snapshot, not current server state or new authorization. Reconcile these obligations with the current checkout ref and source before acting; the documented Nova cutover is not permission for another ref, resource or remote action.
 
-## Requirements
+## Reference
 
 ### Resume and authority boundaries
 
@@ -28,3 +28,21 @@ This specification migrates the operating obligations previously in root `AGENTS
 ## Historical resume boundary from `agent.md`
 
 The 2026-09-14 PCI preflight checkpoint recorded local implementation, review and selective tests only: no commit/push, server inspection, GPU passthrough or CUDA success was established there. Consult later handoff checkpoints before treating any of those states as current. While remote transfer is blocked, do not retry it through another path; work locally within authorization. After separate approval, inspect the server's current PCI/IOMMU/driver/in-use inventory before deciding any GPU reassignment scope. The chosen long-term topology has the Nova GPU instance itself boot the OCI-root workload, not nested L2 passthrough; local KVM PCI experiments do not grant approval for Nova host manipulation.
+
+## Requirements
+
+### Requirement: Preserve scoped authority
+Contributors SHALL preserve the resume and authorization boundaries above.
+
+#### Scenario: Resume with blocked remote work
+- **WHEN** a session resumes with a documentation or continuation request
+- **THEN** read the entry documents and latest dated checkpoints, compare Git/source state and separate staged/unstaged ownership before choosing local work
+- **AND** do not publish, transfer the helper, run native proofs or mutate GPUs/VMs without specific current approval.
+
+### Requirement: Maintain architecture and evidence honestly
+Contributors SHALL apply the architecture procedure and retain evidence scope.
+
+#### Scenario: Source changes without new live proof
+- **WHEN** source changes but only local checks were run
+- **THEN** update affected architecture contracts and the maintenance summary, stamp only after actual review, and record only executed checks
+- **AND** retain historical failures and do not promote plans, portable success or CPU-only proof into live GPU or deployment verification.

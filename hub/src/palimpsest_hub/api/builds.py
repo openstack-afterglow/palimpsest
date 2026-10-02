@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from palimpsest_hub.api.hub import _factory_or_503, _load_visible, _locked_file, _store_or_503
 from palimpsest_hub.auth import require_admin
 from palimpsest_hub.config import get_settings
-from palimpsest_hub.models import PalimpsestHubBuild
+from palimpsest_hub.models import PalimpsestHubBuild, exact_identity
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.hub_store import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
@@ -110,7 +110,7 @@ async def create_hub_build(
         queued = await session.scalar(
             select(func.count())
             .select_from(PalimpsestHubBuild)
-            .where(PalimpsestHubBuild.project_id == project_id, PalimpsestHubBuild.status.in_(("queued", "building")))
+            .where(exact_identity(PalimpsestHubBuild.project_id, project_id), PalimpsestHubBuild.status.in_(("queued", "building")))
         )
         if queued and queued >= 4:
             raise HTTPException(status_code=429, detail="project build queue is full")
@@ -157,7 +157,7 @@ async def list_hub_builds(
             (
                 await session.execute(
                     select(PalimpsestHubBuild)
-                    .where(PalimpsestHubBuild.project_id == token_info["project_id"])
+                    .where(exact_identity(PalimpsestHubBuild.project_id, token_info["project_id"]))
                     .order_by(PalimpsestHubBuild.created_at.desc(), PalimpsestHubBuild.id.desc())
                     .limit(limit)
                 )

@@ -59,8 +59,6 @@ def _expected_media_type(metadata: dict[str, Any]) -> str:
         if disk_format not in DISK_FORMAT_MEDIA_TYPES:
             raise HubError("cloud-image upload metadata requires a supported disk_format")
         return DISK_FORMAT_MEDIA_TYPES[disk_format]
-    if metadata.get("kind") == KIND_BUILDKIT_CACHE:
-        return MEDIA_TYPE_BUILDKIT_CACHE
     return MEDIA_TYPE_LAYER_SQUASHFS
 
 
@@ -406,6 +404,8 @@ class HubClient:
         to). When ``resume`` is True, an interrupted upload persists state and a later
         call reconciles via :meth:`_probe_upload_offset` before resuming.
         """
+        if metadata.get("kind") == KIND_BUILDKIT_CACHE or metadata.get("media_type") == MEDIA_TYPE_BUILDKIT_CACHE:
+            raise HubError("BuildKit cache writes require NativePackageClient.push_cache with an explicit package")
         source = Path(path)
         if not source.is_file():
             raise HubError(f"upload source is not a file: {source}")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +76,13 @@ def docker_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Re
             ["tag", "local-worker:v1", "worker:v2", "--registry", "corp"],
             ["tag", "local-worker:v1", "registry.example.com:5000/team/worker:v2"],
         ),
+        # Unconfigured authorities remain ordinary Docker/OCI; only configured profiles can be native.
+        (
+            ["login", "ghcr.io", "--username", "alice", "--password-stdin"],
+            ["login", "--username", "alice", "--password-stdin", "ghcr.io"],
+        ),
+        (["pull", "ghcr.io/acme/api:v1"], ["pull", "ghcr.io/acme/api:v1"]),
+        (["push", "ghcr.io/acme/api:v1"], ["push", "ghcr.io/acme/api:v1"]),
         (
             [
                 "images",
@@ -421,115 +427,77 @@ def test_registry_profile_cli_forwards_namespace_and_cache_options(tmp_path: Pat
     assert registry.registry_config_path(cli.init_roots()).is_relative_to(tmp_path)
 
 
-def _stub_online_build_dependencies(
-    monkeypatch: pytest.MonkeyPatch,
-    config: RegistryConfig,
-    captured: list[tuple[object, object]],
+
+
+def _native_profile() -> RegistryProfile:
+    return RegistryProfile(alias="cloud", endpoint="hub.example.test", protocol="palimpsest",
+                           api_base="https://hub.example.test/v1", namespace="p-" + "1" * 32)
+
+
+@pytest.mark.parametrize("option", [["--load"], ["--cache-to", "type=registry,ref=hub.example.test/cache"]])
+def test_native_build_rejects_docker_side_effects_before_credential_or_builder_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: list[str],
 ) -> None:
-    monkeypatch.setattr(cli, "load_registry_config", lambda _roots: config)
-    monkeypatch.setattr(cli, "resolve_url", lambda _explicit: "https://hub.example.test")
-    monkeypatch.setattr(cli, "resolve_token", lambda: "hub-token")
-    hub_client = object()
-    monkeypatch.setattr(cli, "HubClient", lambda *_args: hub_client)
-
-    def fake_build(spec: object, _roots: object, *, hub_client: object | None = None) -> dict[str, object]:
-        captured.append((spec, hub_client))
-        return {
-            "runtime_block_digest": None,
-            "output_oci_manifest_digest": "sha256:" + "c" * 64,
-            "output_oci_archive_digest": "sha256:" + "d" * 64,
-        }
-
-    monkeypatch.setattr(cli, "build_with_buildkit", fake_build)
+    roots = cli.init_roots()
+    registry.save_registry_config(roots, registry.add_profile(registry.default_registry_config(), _native_profile()))
+    monkeypatch.setattr(cli, "NativePackageClient", lambda *_args, **_kwargs: pytest.fail("credentials read"))
+    monkeypatch.setattr(cli, "build_with_buildkit", lambda *_args, **_kwargs: pytest.fail("builder started"))
+    output = tmp_path / "output.oci.tar"
+    assert cli.main(["build", str(tmp_path), "--registry", "cloud", "-t", "test:v1",
+                     "--output", str(output), *option]) == 1
+    assert not output.exists()
+    assert not tuple(roots.builds.glob("bk-*"))
 
 
-def test_build_repeated_tags_registry_profile_and_caches_reach_buildkit_spec(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_oci_online_build_requires_explicit_native_cache_authority_before_builder_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    context = tmp_path / "context"
-    context.mkdir()
-    dockerfile = context / "Dockerfile"
-    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
-    config = _private_registry_config()
-    captured: list[tuple[object, object]] = []
-    _stub_online_build_dependencies(monkeypatch, config, captured)
-    cli_cache_from = "type=registry,ref=registry.example.com:5000/cache/cli-from"
-    cli_cache_to = "type=registry,ref=registry.example.com:5000/cache/cli-to,mode=max"
+    roots = cli.init_roots()
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "unqualified-token-must-not-authorize-cache")
+    monkeypatch.setattr(cli, "HubClient", lambda *_args, **_kwargs: pytest.fail("legacy authority accessed"))
+    monkeypatch.setattr(cli, "build_with_buildkit", lambda *_args, **_kwargs: pytest.fail("builder started"))
+    output = tmp_path / "output.oci.tar"
+    assert cli.main(["build", str(tmp_path), "-t", "test:v1", "--output", str(output)]) == 1
+    assert not output.exists()
+    assert not tuple(roots.builds.glob("bk-*"))
 
-    assert (
-        cli.main(
-            [
-                "build",
-                str(context),
-                "--file",
-                str(dockerfile),
-                "-t",
-                "worker:v1",
-                "-t",
-                "worker:latest",
-                "--registry",
-                "corp",
-                "--cache-from",
-                cli_cache_from,
-                "--cache-to",
-                cli_cache_to,
-                "--push",
-            ]
-        )
-        == 0
+
+@pytest.mark.parametrize("operation", ["push", "pull"])
+def test_native_all_tags_never_falls_back_to_docker_or_requests_credentials(
+    monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    roots = cli.init_roots()
+    registry.save_registry_config(roots, registry.add_profile(registry.default_registry_config(), _native_profile()))
+    monkeypatch.setattr(cli, "NativePackageClient", lambda *_args, **_kwargs: pytest.fail("credentials read"))
+    monkeypatch.setattr(cli, "run_docker_passthrough", lambda *_args, **_kwargs: pytest.fail("Docker invoked"))
+    assert cli.main([operation, "test", "--registry", "cloud", "--all-tags"]) == 1
+
+
+def test_native_reference_roundtrip_rejects_identity_changes_and_shared_files(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from palimpsest_local.errors import ArtifactValidationError
+    from palimpsest_local.package_reference import (
+        LocalPackageReference,
+        read_package_reference,
+        write_package_reference,
     )
 
-    assert len(captured) == 1
-    spec, hub_client = captured[0]
-    assert spec.tag == "registry.example.com:5000/team/worker:v1"
-    assert spec.additional_tags == ("registry.example.com:5000/team/worker:latest",)
-    assert spec.push_image is True
-    assert spec.push is False
-    assert spec.registry_profile == "corp"
-    assert spec.registry_config_digest == registry.registry_config_digest(config)
-    assert spec.external_cache_from == (cli_cache_from, *config.registries["corp"].cache_from)
-    assert spec.external_cache_to == (cli_cache_to, *config.registries["corp"].cache_to)
-    assert spec.push_cache is True
-    assert hub_client is not None
-
-
-def test_runtime_push_is_independent_from_oci_image_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    context = tmp_path / "context"
-    context.mkdir()
-    dockerfile = context / "Dockerfile"
-    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
-    config = _private_registry_config()
-    captured: list[tuple[object, object]] = []
-    _stub_online_build_dependencies(monkeypatch, config, captured)
-    runtime_base = "sha256:" + "b" * 64
-    monkeypatch.setattr(
-        cli,
-        "_resolve_image_ref",
-        lambda _store, digest, _url: SimpleNamespace(digest=digest, arch="x86_64"),
-    )
-
-    assert (
-        cli.main(
-            [
-                "build",
-                str(context),
-                "--file",
-                str(dockerfile),
-                "-t",
-                "worker:v1",
-                "--runtime-base",
-                runtime_base,
-                "--runtime-tag",
-                "worker-runtime",
-                "--runtime-push",
-            ]
-        )
-        == 0
-    )
-
-    assert len(captured) == 1
-    spec, _hub_client = captured[0]
-    assert spec.push is True
-    assert spec.push_image is False
-    assert spec.runtime_base_digest == runtime_base
-    assert spec.runtime_tag == "worker-runtime"
+    roots = cli.init_roots()
+    profile = _native_profile()
+    reference = profile.endpoint + "/" + profile.namespace + "/test:v1"
+    with pytest.raises(ArtifactValidationError, match="build first or supply --input"):
+        read_package_reference(roots, reference)
+    record = LocalPackageReference(reference=reference, authority=profile.endpoint, api_base=profile.api_base,
+                                   namespace=profile.namespace, package="test", archive=str(tmp_path / "image.tar"),
+                                   archive_digest="sha256:" + "b" * 64, archive_size_bytes=1024,
+                                   root_digest="sha256:" + "c" * 64, package_type="oci-image", project_id="F" * 64)
+    path = write_package_reference(roots, record)
+    assert read_package_reference(roots, reference) == record
+    with pytest.raises(ArtifactValidationError):
+        replace(record, namespace="other")
+    with pytest.raises(ArtifactValidationError):
+        replace(record, published_digest="sha256:" + "d" * 64)
+    path.chmod(0o644)
+    with pytest.raises(ArtifactValidationError):
+        read_package_reference(roots, reference)

@@ -30,15 +30,17 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 
-from palimpsest_hub.auth import get_os_conn, get_token_info, require_admin
+from palimpsest_hub.auth import get_os_conn, get_package_member_info, get_token_info, require_admin
 from palimpsest_hub.cache import get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import get_session_factory
 from palimpsest_hub.models import (
+    PackageUpload,
     PalimpsestHubLayer,
     PalimpsestHubLayerAccess,
     PalimpsestHubUpload,
     PalimpsestImageExport,
+    exact_identity,
 )
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.digest import (
@@ -61,7 +63,6 @@ from palimpsest_hub.services.hub_store import (
     IMAGE_FORMAT_SPECS,
     KIND_BUILDKIT_CACHE,
     KIND_CLOUD_IMAGE,
-    MEDIA_TYPE_BUILDKIT_CACHE,
     MEDIA_TYPE_LAYER_SQUASHFS,
     HubDigestMismatch,
     HubStoreError,
@@ -101,7 +102,6 @@ _EXPORT_TOKEN_TTL_SECONDS = 60
 _EXPORT_TOKEN_PREFIX = "afterglow:export-dl-token:"
 _SUPPORTED_UPLOAD_MEDIA_TYPES = {
     MEDIA_TYPE_LAYER_SQUASHFS,
-    MEDIA_TYPE_BUILDKIT_CACHE,
     *DISK_FORMAT_MEDIA_TYPES.values(),
 }
 
@@ -228,16 +228,7 @@ class HubLayerMeta(BaseModel):
             if self.media_type is not None and self.media_type != expected_media_type:
                 raise ValueError("cloud-image media_type 이 disk_format 과 일치하지 않습니다")
         elif self.kind == KIND_BUILDKIT_CACHE:
-            if self.disk_format:
-                raise ValueError("disk_format 은 kind='cloud-image' 에서만 사용합니다")
-            if self.chain_id is None:
-                raise ValueError("buildkit-cache 는 build key를 chain_id 로 선언해야 합니다")
-            if self.parent_digest or self.base_image_digest:
-                raise ValueError("buildkit-cache 는 runtime parent/base 체인을 가질 수 없습니다")
-            if self.media_type is not None and self.media_type != MEDIA_TYPE_BUILDKIT_CACHE:
-                raise ValueError("buildkit-cache 는 BuildKit cache media_type 을 사용해야 합니다")
-            if self.arch is not None:
-                raise ValueError("buildkit-cache 는 runtime architecture를 가질 수 없습니다")
+            raise ValueError("legacy cache registration is retired; use native package-bound cache uploads")
         elif self.disk_format:
             raise ValueError("disk_format 은 kind='cloud-image' 에서만 사용합니다")
         elif self.media_type is not None and self.media_type != MEDIA_TYPE_LAYER_SQUASHFS:
@@ -249,8 +240,6 @@ class HubLayerMeta(BaseModel):
             return self.media_type
         if self.kind == KIND_CLOUD_IMAGE and self.disk_format:
             return DISK_FORMAT_MEDIA_TYPES[self.disk_format]
-        if self.kind == KIND_BUILDKIT_CACHE:
-            return MEDIA_TYPE_BUILDKIT_CACHE
         return MEDIA_TYPE_LAYER_SQUASHFS
 
     @field_validator("name")
@@ -407,6 +396,13 @@ class HubBundleImportResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+async def _legacy_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
+    """Separate legacy artifact authority; never accept a key or admin/service principal."""
+    if not token_info.get("can_write"):
+        raise HTTPException(status_code=403, detail="ordinary project member write authority required")
+    return token_info
+
+
 def _factory_or_503():
     factory = get_session_factory()
     if factory is None:
@@ -457,14 +453,14 @@ def _visible_filter(stmt, token_info: dict):
         select(PalimpsestHubLayerAccess.blob_digest)
         .where(
             PalimpsestHubLayerAccess.blob_digest == PalimpsestHubLayer.blob_digest,
-            PalimpsestHubLayerAccess.project_id == project_id,
+            exact_identity(PalimpsestHubLayerAccess.project_id, project_id),
         )
         .exists()
     )
     return stmt.where(
         (PalimpsestHubLayer.is_published.is_(True))
         | (PalimpsestHubLayer.project_id.is_(None))
-        | (PalimpsestHubLayer.project_id == project_id)
+        | exact_identity(PalimpsestHubLayer.project_id, project_id)
         | shared_access
     )
 
@@ -472,6 +468,8 @@ def _visible_filter(stmt, token_info: dict):
 async def _grant_layer_access(session, digest: str, token_info: dict) -> None:
     project_id = _required_project_id(token_info)
     access = await session.get(PalimpsestHubLayerAccess, (digest, project_id))
+    if access is not None and access.project_id != project_id:
+        raise HTTPException(status_code=409, detail="Legacy project grant collation conflicts with exact identity")
     if access is None:
         session.add(
             PalimpsestHubLayerAccess(
@@ -757,7 +755,7 @@ async def create_image_export(
     request: Request,
     req: HubImageExportRequest,
     conn: Any = Depends(get_os_conn),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_writer),
 ) -> dict[str, Any]:
     _store_or_503()
     try:
@@ -849,7 +847,7 @@ async def create_image_export_download_token(
         redis = await get_redis()
         await redis.setex(f"{_EXPORT_TOKEN_PREFIX}{token}", _EXPORT_TOKEN_TTL_SECONDS, payload)
     except Exception as exc:
-        _logger.warning("이미지 내보내기 다운로드 토큰 저장 실패", exc_info=True)
+        _logger.warning("이미지 내보내기 다운로드 토큰 저장 실패")
         raise HTTPException(status_code=503, detail="다운로드 토큰을 만들 수 없습니다") from exc
     # The body carries a bearer-equivalent URL; no cache may retain it.
     response.headers["Cache-Control"] = "no-store"
@@ -870,7 +868,7 @@ async def download_image_export_with_token(
         redis = await get_redis()
         raw_payload = await redis.get(token_key)
     except Exception as exc:
-        _logger.warning("이미지 내보내기 다운로드 토큰 확인 실패", exc_info=True)
+        _logger.warning("이미지 내보내기 다운로드 토큰 확인 실패")
         raise HTTPException(status_code=503, detail="다운로드 토큰을 확인할 수 없습니다") from exc
     if raw_payload is None:
         raise HTTPException(status_code=404, detail="다운로드 토큰이 없거나 만료되었습니다")
@@ -986,7 +984,7 @@ async def _expire_project_uploads(factory, store: LocalPathBlobStore, project_id
             (
                 await session.execute(
                     select(PalimpsestHubUpload.id).where(
-                        PalimpsestHubUpload.project_id == project_id, PalimpsestHubUpload.updated_at < cutoff
+                        exact_identity(PalimpsestHubUpload.project_id, project_id), PalimpsestHubUpload.updated_at < cutoff
                     )
                 )
             )
@@ -998,7 +996,7 @@ async def _expire_project_uploads(factory, store: LocalPathBlobStore, project_id
             row = await session.scalar(
                 select(PalimpsestHubUpload).where(
                     PalimpsestHubUpload.id == session_id,
-                    PalimpsestHubUpload.project_id == project_id,
+                    exact_identity(PalimpsestHubUpload.project_id, project_id),
                     PalimpsestHubUpload.updated_at < cutoff,
                 )
             )
@@ -1009,7 +1007,7 @@ async def _expire_project_uploads(factory, store: LocalPathBlobStore, project_id
 
 
 @router.post("/uploads", response_model=HubUploadStartResponse, operation_id="start_upload")
-async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
+async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(_legacy_writer)) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
     project_id = _required_project_id(token_info)
@@ -1025,6 +1023,8 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(ge
                 )
             ).scalar_one_or_none()
         if existing is not None:
+            if existing.kind == KIND_BUILDKIT_CACHE:
+                raise HTTPException(status_code=422, detail="legacy cache registration is retired")
             return {
                 "session_id": None,
                 "completed": True,
@@ -1041,8 +1041,11 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(ge
             active = await session.scalar(
                 select(func.count())
                 .select_from(PalimpsestHubUpload)
-                .where(PalimpsestHubUpload.project_id == project_id)
+                .where(exact_identity(PalimpsestHubUpload.project_id, project_id))
             )
+            active += await session.scalar(select(func.count()).select_from(PackageUpload).where(
+                PackageUpload.project_id == project_id, PackageUpload.status.in_(("uploading", "validating")),
+                PackageUpload.expires_at > datetime.now(UTC).replace(tzinfo=None)))
             if active >= _MAX_ACTIVE_UPLOADS:
                 raise HTTPException(status_code=429, detail="project upload session limit reached")
             store.start_upload(session_id)
@@ -1068,6 +1071,8 @@ async def _owned_upload(session, session_id: str, token_info: dict) -> Palimpses
     if upload is None:
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
     if upload.project_id != _required_project_id(token_info):
+        raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
+    if upload.created_by is None or upload.created_by != token_info.get("user_id"):
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다")
     return upload
 
@@ -1127,19 +1132,23 @@ async def _discard_unregistered_blob(store: LocalPathBlobStore, factory, digest:
                     select(PalimpsestHubLayer.blob_digest).where(PalimpsestHubLayer.blob_digest == digest)
                 )
             ).scalar_one_or_none()
+            # Native graphs and cache archives share CAS with legacy records.
+            from palimpsest_hub.services.blob_references import blob_referenced
+            if await blob_referenced(session, digest):
+                return
     except Exception:
-        _logger.warning("rolled-back blob retained: registration state unverified", exc_info=True)
+        _logger.warning("rolled-back blob retained: registration state unverified")
         return
     if registered is not None:
         return
     try:
         await _run_blocking(store.delete, digest)
     except OSError:
-        _logger.warning("rolled-back blob could not be removed", exc_info=True)
+        _logger.warning("rolled-back blob could not be removed")
 
 
 @router.get("/uploads/{session_id}", response_model=HubUploadStatusResponse, operation_id="get_upload_status")
-async def get_upload_status(session_id: str, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
+async def get_upload_status(session_id: str, token_info: dict = Depends(_legacy_writer)) -> dict[str, Any]:
     factory = _factory_or_503()
     async with factory() as session:
         upload = await _owned_upload(session, session_id, token_info)
@@ -1155,7 +1164,7 @@ async def get_upload_status(session_id: str, token_info: dict = Depends(get_toke
 @router.patch("/uploads/{session_id}", response_model=HubUploadAppendResponse, operation_id="append_upload")
 @_serialize_upload
 async def append_upload(
-    session_id: str, request: Request, response: Response, token_info: dict = Depends(get_token_info)
+    session_id: str, request: Request, response: Response, token_info: dict = Depends(_legacy_writer)
 ) -> dict[str, Any]:
     factory = _factory_or_503()
     store = _store_or_503()
@@ -1214,7 +1223,7 @@ async def append_upload(
 
 @router.put("/uploads/{session_id}", response_model=HubUploadFinalizeResponse, operation_id="finalize_upload")
 async def finalize_upload(
-    session_id: str, meta: HubLayerMeta, request: Request, token_info: dict = Depends(get_token_info)
+    session_id: str, meta: HubLayerMeta, request: Request, token_info: dict = Depends(_legacy_writer)
 ) -> dict[str, Any]:
     """수신 바이트의 digest 를 재계산해 검증하고 레이어로 등록한다."""
     if meta.is_published and not token_info.get("is_system_admin"):
@@ -1364,7 +1373,7 @@ async def _finalize_upload_locked(
 
 @router.delete("/uploads/{session_id}", status_code=204, operation_id="abort_upload")
 @_serialize_upload
-async def abort_upload(session_id: str, token_info: dict = Depends(get_token_info)) -> None:
+async def abort_upload(session_id: str, token_info: dict = Depends(_legacy_writer)) -> None:
     factory = _factory_or_503()
     store = _store_or_503()
     async with factory() as session:
@@ -1523,7 +1532,7 @@ def _publish_staged_bundle(
 
 
 @router.post("/bundles/import", response_model=HubBundleImportResponse, operation_id="import_bundle")
-async def import_bundle(file: UploadFile, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
+async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_writer)) -> dict[str, Any]:
     """Import a bounded OCI bundle without publishing bytes before validation."""
     factory = _factory_or_503()
     store = _store_or_503()

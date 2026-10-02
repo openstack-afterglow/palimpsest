@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import getpass
+import hashlib
 import json
 import os
 import re
@@ -41,6 +43,15 @@ from .oci_run_cleanup import OCIRunRemovalResult
 from .oci_run_request import resolve_local_oci_run_request
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS
 from .oci_store import OCIStore
+from .package_credentials import (
+    erase_package_key,
+    require_credential_helper,
+    store_package_key,
+    validate_package_key,
+    validate_package_username,
+)
+from .package_reference import LocalPackageReference, read_package_reference, write_package_reference
+from .packages import NativePackageClient, PackageSnapshot, snapshot_package
 from .project import (
     DEFAULT_PROJECT_FILE,
     Project,
@@ -66,6 +77,7 @@ from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
 from .registry import (
     RegistryConfig,
     RegistryProfile,
+    ResolvedImageReference,
     add_profile,
     docker_command_argv,
     docker_history_argv,
@@ -82,6 +94,7 @@ from .registry import (
     inspect_profile,
     list_profiles,
     load_registry_config,
+    normalize_endpoint,
     registry_config_digest,
     remove_profile,
     render_buildkitd_toml,
@@ -116,6 +129,7 @@ from .state import (
     StatePaths,
     TagRecord,
     fsync_directory,
+    init_resolved_roots,
     init_roots,
     read_tag_record,
     resolve_roots,
@@ -687,6 +701,8 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--local-image", action="append", default=[])
     build.add_argument("--cache-scope")
     build.add_argument("--registry")
+    build.add_argument("--cache-registry", help="native profile authorizing mandatory online BuildKit cache transfer")
+    build.add_argument("--cache-package", help="exact namespace/package cache partition")
     build.add_argument("--cache-from", action="append", default=[])
     build.add_argument("--cache-to", action="append", default=[])
     build.add_argument("--no-cache", action="store_true")
@@ -708,6 +724,8 @@ def build_parser() -> argparse.ArgumentParser:
     registry_add = registry_commands.add_parser("add")
     registry_add.add_argument("name")
     registry_add.add_argument("endpoint")
+    registry_add.add_argument("--protocol", choices=("oci", "palimpsest"), default="oci")
+    registry_add.add_argument("--api-base", help="HTTPS native API base, including its gateway path")
     registry_add.add_argument("--namespace")
     registry_add.add_argument("--mirror", action="append", default=[])
     registry_add.add_argument("--ca", action="append", type=Path, default=[])
@@ -732,9 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("-u", "--username")
     login.add_argument("--password-stdin", action="store_true")
     login.add_argument("--registry")
+    login.add_argument("--namespace", help="native credential namespace (defaults to profile namespace)")
     logout = commands.add_parser("logout")
     logout.add_argument("server", nargs="?")
     logout.add_argument("--registry")
+    logout.add_argument("--namespace", help="native credential namespace (defaults to profile namespace)")
 
     pull = commands.add_parser("pull")
     pull.add_argument("reference")
@@ -742,6 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull.add_argument("--platform")
     pull.add_argument("-q", "--quiet", action="store_true")
     pull.add_argument("--registry")
+    pull.add_argument("--output", type=Path, help="native OCI-layout archive destination; never loads Docker")
 
     push = commands.add_parser("push")
     push.add_argument("reference")
@@ -749,6 +770,8 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--platform")
     push.add_argument("-q", "--quiet", action="store_true")
     push.add_argument("--registry")
+    push.add_argument("--input", type=Path, help="native OCI layout directory or archive")
+    push.add_argument("--manifest", help="native selected root SHA-256 (required for multiple roots)")
 
     tag = commands.add_parser("tag")
     tag.add_argument("source")
@@ -881,6 +904,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui = commands.add_parser("ui")
     ui.add_argument("--port", type=int, default=0)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument("--allow-control", action="store_true")
 
     store = commands.add_parser("store")
     store_commands = store.add_subparsers(dest="store_operation", required=True)
@@ -951,6 +975,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                     ("--local-image", bool(args.local_image)),
                     ("--cache-scope", args.cache_scope is not None),
                     ("--registry", args.registry is not None),
+                    ("--cache-registry", args.cache_registry is not None),
+                    ("--cache-package", args.cache_package is not None),
                     ("--cache-from", bool(args.cache_from)),
                     ("--cache-to", bool(args.cache_to)),
                     ("--no-cache", args.no_cache),
@@ -986,6 +1012,8 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                 parser.error("--offline cannot use external --cache-from/--cache-to backends")
             if args.offline and args.registry:
                 parser.error("--offline cannot select an external registry")
+            if args.offline and (args.cache_registry is not None or args.cache_package is not None):
+                parser.error("--offline cannot select an online cache authority")
             if args.no_cache and not args.offline:
                 parser.error("--no-cache is allowed only in offline mode; online builds must reuse Hub cache")
             if bool(args.runtime_tag) != bool(args.runtime_base):
@@ -1010,6 +1038,8 @@ def _profile_payload(profile: RegistryProfile, *, is_default: bool) -> dict[str,
     return {
         "name": profile.alias,
         "endpoint": profile.endpoint,
+        "protocol": profile.protocol,
+        "api_base": profile.api_base,
         "namespace": profile.namespace,
         "default": is_default,
         "mirrors": list(profile.mirrors),
@@ -1032,6 +1062,182 @@ def _registry_server(config: RegistryConfig, server: str | None, registry_alias:
             return registries[server].endpoint
         return server
     return select_registry_profile(config).endpoint
+
+
+def _registry_operation_profile(
+    config: RegistryConfig, server: str | None, registry_alias: str | None,
+) -> RegistryProfile | None:
+    """Return the configured login/logout profile; None is an unconfigured Docker authority."""
+    if server is not None and registry_alias is not None:
+        raise PalimpsestError("specify either a registry server or --registry, not both")
+    if server is None:
+        return select_registry_profile(config, explicit_alias=registry_alias)
+    if server is not None and server in config.registries:
+        return select_registry_profile(config, explicit_alias=server)
+    endpoint = _registry_server(config, server, registry_alias)
+    try:
+        endpoint = normalize_endpoint(endpoint)
+    except PalimpsestError:
+        raise PalimpsestError("login server must be a configured registry authority or profile name") from None
+    matches = [profile for profile in config.registries.values() if profile.endpoint == endpoint]
+    if not matches:
+        return None
+    if len({(profile.protocol, profile.api_base) for profile in matches}) != 1:
+        raise PalimpsestError("registry authority is ambiguous; select --registry explicitly")
+    return next((profile for profile in matches if profile.alias == config.default), matches[0])
+
+
+def _reference_profile(config: RegistryConfig, resolved: ResolvedImageReference) -> RegistryProfile | None:
+    """Return the configured profile; None is an unconfigured ordinary OCI authority."""
+    return None if resolved.registry_alias is None else inspect_profile(config, resolved.registry_alias)
+
+
+def _is_native(profile: RegistryProfile | None) -> bool:
+    return profile is not None and profile.protocol == "palimpsest"
+
+
+def _native_target(resolved: ResolvedImageReference) -> tuple[str, str]:
+    namespace, separator, package = resolved.repository.partition("/")
+    if not separator or not namespace or not package:
+        raise PalimpsestError("native reference requires namespace/package")
+    return namespace, package
+
+
+def _retain_package_archive(roots: StatePaths, snapshot: PackageSnapshot) -> Path:
+    """Keep the verified frozen transport for --input, including directory sources."""
+    digest = require_digest(snapshot.archive_digest)
+    destination = roots.state / "package-artifacts" / (digest_hex(digest) + ".oci.tar")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if destination.exists():
+        if destination.is_symlink() or digest_file(destination) != digest:
+            raise PalimpsestError("existing native package archive does not match its identity")
+        return destination
+    fd, temporary = tempfile.mkstemp(prefix=".package-", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as target, snapshot.archive.open("rb") as source:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        if digest_file(Path(temporary)) != digest:
+            raise PalimpsestError("native package snapshot changed while retaining its bytes")
+        os.replace(temporary, destination)
+        fsync_directory(destination.parent)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return destination
+
+
+def _local_package_record(
+    profile: RegistryProfile, resolved: ResolvedImageReference, snapshot: PackageSnapshot, archive: Path,
+    *, project_id: str | None = None, build_id: str | None = None,
+) -> LocalPackageReference:
+    namespace, package = _native_target(resolved)
+    return LocalPackageReference(
+        reference=resolved.canonical, authority=profile.endpoint, api_base=profile.api_base,
+        namespace=namespace, package=package, archive=str(archive.expanduser().absolute()),
+        archive_digest=snapshot.archive_digest, archive_size_bytes=snapshot.archive_size_bytes,
+        root_digest=snapshot.root_digest, package_type=snapshot.package_type,
+        project_id=project_id, build_id=build_id,
+    )
+
+
+def _dispatch_native_registry(
+    args: argparse.Namespace, roots: StatePaths, config: RegistryConfig,
+) -> int | None:
+    """Route native profiles before any Docker command is constructed."""
+    op = args.operation
+    if op in {"login", "logout"}:
+        profile = _registry_operation_profile(config, args.server, args.registry)
+        if not _is_native(profile):
+            if args.namespace is not None:
+                raise PalimpsestError("--namespace is supported only for native credentials")
+            return None
+        namespace = args.namespace or profile.namespace
+        require_credential_helper(profile, namespace)
+        if op == "logout":
+            erase_package_key(profile, namespace)
+            print("Native credential erased")
+            return 0
+        if args.password_stdin:
+            credential = sys.stdin.read(512)
+            if credential.endswith("\n"):
+                credential = credential[:-1]
+        else:
+            if not sys.stdin.isatty():
+                raise PalimpsestError("native login requires --password-stdin or an interactive terminal")
+            credential = getpass.getpass("Package key: ")
+        key_id = validate_package_key(credential)
+        validate_package_username(args.username, key_id)
+        client = NativePackageClient(profile, namespace=namespace, credential=credential)
+        client.authenticate()
+        store_package_key(profile, namespace, credential, args.username)
+        print("Native login succeeded")
+        return 0
+    if op == "tag":
+        target = resolve_image_reference(args.target, config, registry_alias=args.registry)
+        if _is_native(_reference_profile(config, target)):
+            raise PalimpsestError("native package tags are published with push, not Docker tag")
+        source = resolve_image_reference(args.source, config)
+        if _is_native(_reference_profile(config, source)):
+            raise PalimpsestError("native packages cannot be tagged through Docker")
+        return None
+    if op not in {"push", "pull"}:
+        return None
+    resolved = resolve_image_reference(
+        args.reference, config, registry_alias=args.registry, default_tag=not args.all_tags,
+    )
+    profile = _reference_profile(config, resolved)
+    if not _is_native(profile):
+        if op == "push" and (args.input is not None or args.manifest is not None):
+            raise PalimpsestError("--input/--manifest are native package options")
+        if op == "pull" and args.output is not None:
+            raise PalimpsestError("--output is a native package pull option")
+        return None
+    if args.all_tags:
+        raise PalimpsestError("native package transport does not support --all-tags")
+    if args.platform is not None:
+        raise PalimpsestError("native transfer preserves the complete selected graph; --platform is unsupported")
+    namespace, package = _native_target(resolved)
+    if op == "push" and (resolved.tag is None or resolved.digest is not None):
+        raise PalimpsestError("native push requires a tag reference")
+    client = NativePackageClient(profile, namespace=namespace)
+    client.authorize(package, ("packages:read", "packages:write") if op == "push" else ("packages:read",))
+    init_resolved_roots(roots)
+    if op == "pull":
+        output = args.output or (roots.state / "package-artifacts" / (
+            hashlib.sha256(resolved.canonical.encode()).hexdigest() + ".oci.tar"
+        ))
+        receipt = client.pull(package, tag=resolved.tag, digest=resolved.digest, destination=output)
+        immutable = replace(resolved, tag=None, digest=receipt["digest"])
+        with snapshot_package(output, manifest=receipt["digest"]) as snapshot:
+            record = _local_package_record(profile, immutable, snapshot, output, project_id=client.project_id)
+        record_path = write_package_reference(roots, replace(record, published_digest=record.root_digest))
+        print(json.dumps({"reference": immutable.canonical, "digest": record.root_digest,
+                          "output": str(output), "receipt": str(record_path)}))
+        return 0
+    existing = None if args.input is not None else read_package_reference(roots, resolved.canonical)
+    if existing is not None and (
+        existing.api_base != profile.api_base or existing.namespace != namespace
+        or (existing.project_id is not None and existing.project_id != client.project_id)
+    ):
+        raise PalimpsestError("local package reference does not match the authenticated native target")
+    source = args.input if existing is None else Path(existing.archive)
+    manifest = args.manifest if args.manifest is not None else (existing.root_digest if existing else None)
+    with snapshot_package(source, manifest=manifest) as snapshot:
+        if existing is not None and (
+            snapshot.root_digest != existing.root_digest or snapshot.archive_digest != existing.archive_digest
+            or snapshot.archive_size_bytes != existing.archive_size_bytes
+        ):
+            raise PalimpsestError("local package source changed since its typed reference was recorded")
+        archive = _retain_package_archive(roots, snapshot)
+        record = _local_package_record(profile, resolved, snapshot, archive, project_id=client.project_id,
+                                       build_id=existing.build_id if existing else None)
+        write_package_reference(roots, record)
+        receipt = client.push(package, resolved.tag, snapshot,
+                              provenance={"build_id": record.build_id} if record.build_id else None)
+    path = write_package_reference(roots, replace(record, published_digest=receipt["digest"]))
+    print(json.dumps({**receipt, "receipt": str(path)}))
+    return 0
 
 
 def _write_generated_config(path: Path, content: str, *, force: bool) -> None:
@@ -1065,7 +1271,10 @@ def _resolve_docker_inspect_reference(
 ) -> str:
     if _DOCKER_IMAGE_ID_RE.fullmatch(reference):
         return reference
-    return resolve_image_reference(reference, config, registry_alias=registry_alias).canonical
+    resolved = resolve_image_reference(reference, config, registry_alias=registry_alias)
+    if _is_native(_reference_profile(config, resolved)):
+        raise PalimpsestError("native packages are not Docker-local images; use native pull --output")
+    return resolved.canonical
 
 
 def _resolve_runtime_stack(
@@ -1495,9 +1704,12 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return 0
     read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
     read_only_oci_operations = {"root-proof", "exec-status", "network"}
+    deferred_package_state = op in {"login", "logout", "push", "pull", "tag"} or (
+        op == "build" and _selected_build_frontend(args) == "dockerfile"
+    )
     roots = (
         resolve_roots()
-        if op in read_only_root_operations or (op == "oci" and args.oci_operation in read_only_oci_operations)
+        if deferred_package_state or op in read_only_root_operations or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
     )
 
@@ -1615,6 +1827,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
             profile = RegistryProfile(
                 alias=args.name,
                 endpoint=args.endpoint,
+                protocol=args.protocol,
+                api_base=args.api_base or "",
                 namespace=namespace,
                 mirrors=tuple(args.mirror),
                 ca=tuple(os.fspath(path.expanduser().resolve(strict=False)) for path in args.ca),
@@ -1654,6 +1868,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
     elif op in {"login", "logout", "pull", "push", "tag", "images", "history", "rmi", "save", "load"}:
         docker_config = resolve_docker_config_dir()
         config = load_registry_config(roots) if op in {"login", "logout", "pull", "push", "tag"} else None
+        if config is not None:
+            native_result = _dispatch_native_registry(args, roots, config)
+            if native_result is not None:
+                return native_result
         if op == "login":
             assert config is not None
             server = _registry_server(config, args.server, args.registry)
@@ -2074,29 +2292,77 @@ def dispatch_args(args: argparse.Namespace) -> int:
             platform = args.platform if args.platform is not None else "linux/amd64"
             cache_scope = args.cache_scope if args.cache_scope is not None else "default"
             runtime_block_size = args.runtime_block_size if args.runtime_block_size is not None else 131072
+            selected_registry = None
+            selected_registry_digest = None
+            native_build = False
+            resolved_tags: tuple[ResolvedImageReference, ...] = ()
             build_tags = tuple(args.tag)
-            selected_registry: RegistryProfile | None = None
-            selected_registry_digest: str | None = None
             external_cache_from = tuple(args.cache_from)
             external_cache_to = tuple(args.cache_to)
+            native_namespace = native_package = None
+            package_client = None
+            cache_client = None
+            cache_package = None
+            # Strict offline builds never read registry profiles; publish later with push --input.
             if not args.offline:
                 registry_config = load_registry_config(roots)
-                selected_registry = select_registry_profile(registry_config, explicit_alias=args.registry)
+                resolved_tags = tuple(
+                    resolve_image_reference(tag, registry_config, registry_alias=args.registry)
+                    for tag in args.tag
+                )
+                tag_profiles = {_reference_profile(registry_config, tag) for tag in resolved_tags}
+                native_build = any(_is_native(profile) for profile in tag_profiles)
+                if native_build and len(tag_profiles) != 1:
+                    raise PalimpsestError("one build cannot mix registry profiles or protocols")
+                selected_registry = (
+                    next(iter(tag_profiles)) if native_build
+                    else select_registry_profile(registry_config, explicit_alias=args.registry)
+                )
                 selected_registry_digest = registry_config_digest(registry_config)
                 external_cache_from = _merge_unique(external_cache_from, selected_registry.cache_from)
                 external_cache_to = _merge_unique(external_cache_to, selected_registry.cache_to)
-                if args.push or args.registry:
-                    build_tags = tuple(
-                        resolve_image_reference(tag, registry_config, registry_alias=args.registry).canonical
-                        for tag in build_tags
-                    )
+                if native_build or args.push or args.registry:
+                    build_tags = tuple(tag.canonical for tag in resolved_tags)
+                if native_build:
+                    native_namespace, native_package = _native_target(resolved_tags[0])
+                    if any(_native_target(tag) != (native_namespace, native_package) for tag in resolved_tags):
+                        raise PalimpsestError("native build tags must target one exact namespace/package")
+                    if any(tag.digest is not None or tag.tag is None for tag in resolved_tags):
+                        raise PalimpsestError("native build requires tag references")
+                    if args.load or external_cache_from or external_cache_to:
+                        raise PalimpsestError("native builds reject Docker --load and external cache exporters")
+                    package_client = NativePackageClient(selected_registry, namespace=native_namespace)
+                    if args.push:
+                        package_client.authorize(native_package, ("packages:read", "packages:write"))
+                elif args.cache_registry is None or args.cache_package is None:
+                    raise PalimpsestError("online OCI build requires --cache-registry and --cache-package namespace/package")
+                cache_profile = inspect_profile(registry_config, args.cache_registry) if args.cache_registry else selected_registry
+                if cache_profile.protocol != "palimpsest":
+                    raise PalimpsestError("mandatory Hub cache requires a native registry profile")
+                partition = args.cache_package or f"{native_namespace}/{native_package}"
+                cache_ref = resolve_image_reference(
+                    f"{cache_profile.endpoint}/{partition}", registry_config,
+                    registry_alias=cache_profile.alias, default_tag=False,
+                )
+                if cache_ref.tag is not None or cache_ref.digest is not None:
+                    raise PalimpsestError("--cache-package must be an exact namespace/package, not a tag or digest")
+                cache_namespace, cache_package = _native_target(cache_ref)
+                if package_client is not None and cache_profile == selected_registry and cache_namespace == native_namespace:
+                    cache_client = package_client
+                else:
+                    cache_client = NativePackageClient(cache_profile, namespace=cache_namespace)
+                cache_client.authorize(cache_package, ("cache:read", "cache:write"))
             primary_tag = build_tags[0]
             safe_tag = "".join(char if char.isalnum() or char in ".-" else "-" for char in primary_tag).strip("-.")
             safe_tag = safe_tag[:48] or "image"
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
             output = args.output or (roots.builds / "outputs" / f"{safe_tag}-{timestamp}.oci.tar")
             local_images = tuple(NamedOCIContext.parse(value) for value in args.local_image)
-            client = None if args.offline else HubClient(resolve_url(args.url), resolve_token())
+            init_resolved_roots(roots)
+            runtime_client = (
+                HubClient(resolve_url(args.url), resolve_token())
+                if not args.offline and args.runtime_tag else None
+            )
             if args.runtime_base:
                 if args.offline:
                     runtime_base_ref = _image_ref_from_store(store, args.runtime_base)
@@ -2108,6 +2374,19 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         f"--platform {platform} targets {target_arch}, but --runtime-base "
                         f"{runtime_base_ref.digest} is {runtime_base_ref.arch}"
                     )
+
+            def retain_native_export(build_id: str, manifest: str | None) -> None:
+                """Freeze package bytes and receipts before later cache/publication failures."""
+                with snapshot_package(output, manifest=manifest) as snapshot:
+                    archive = _retain_package_archive(roots, snapshot)
+                    for resolved in resolved_tags:
+                        record = _local_package_record(
+                            selected_registry, resolved, snapshot, archive,
+                            project_id=cache_client.project_id if cache_client is not None
+                            and cache_client.namespace == native_namespace and cache_client.profile == selected_registry else None,
+                            build_id=build_id,
+                        )
+                        write_package_reference(roots, record)
 
             def execute_build(
                 rootfs_output: Path | None,
@@ -2136,8 +2415,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         registry_profile=selected_registry.alias if selected_registry is not None else None,
                         registry_config_digest=selected_registry_digest,
                         pull=args.pull,
-                        load=args.load,
-                        push_image=args.push,
+                        load=args.load if not native_build else False,
+                        push_image=args.push if not native_build else False,
                         progress=args.progress,
                         runtime_tag=args.runtime_tag,
                         runtime_base_digest=args.runtime_base,
@@ -2145,7 +2424,10 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         push=args.runtime_push,
                     ),
                     roots,
-                    hub_client=client,
+                    hub_client=cache_client,
+                    cache_package=cache_package,
+                    runtime_hub_client=runtime_client,
+                    on_oci_export=retain_native_export if native_build else None,
                 )
 
             if args.runtime_tag:
@@ -2153,6 +2435,26 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     build_record = execute_build(args.rootfs_output, Path(tmpdir) / "rootfs.tar")
             else:
                 build_record = execute_build(args.rootfs_output, None)
+            if native_build:
+                retained = read_package_reference(roots, resolved_tags[0].canonical)
+                with snapshot_package(Path(retained.archive), manifest=retained.root_digest) as snapshot:
+                    if (
+                        retained.build_id != build_record["build_id"]
+                        or snapshot.archive_digest != retained.archive_digest
+                        or snapshot.root_digest != retained.root_digest
+                    ):
+                        raise PalimpsestError("native export bytes changed after its receipt was recorded")
+                    build_record["output_oci_manifest_digest"] = snapshot.root_digest
+                    # All valid local references survive a failed publication.
+                    if args.push:
+                        for resolved in resolved_tags:
+                            record = read_package_reference(roots, resolved.canonical)
+                            receipt = package_client.push(
+                                native_package, resolved.tag, snapshot,
+                                provenance={"build_id": build_record["build_id"]},
+                            )
+                            write_package_reference(roots, replace(record, project_id=package_client.project_id,
+                                                                  published_digest=receipt["digest"]))
             result_digest = (
                 build_record.get("runtime_block_digest")
                 or build_record.get("output_oci_manifest_digest")
@@ -2333,7 +2635,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         result = runtime_dispatch.commit(args.name, args.tag, roots=roots)
         print(result.digest)
     elif op == "ui":
-        ui.serve(roots, port=args.port, open_browser=not args.no_browser)
+        ui.serve(roots, port=args.port, open_browser=not args.no_browser, read_only=not args.allow_control)
         return 0
     elif op == "store":
         sub = args.store_operation

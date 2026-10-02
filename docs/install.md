@@ -8,7 +8,7 @@ It does not use a repository checkout as the user installation mechanism.
 Palimpsest Local requires Python 3.11 or newer. The root distribution
 [`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
 is published on PyPI. The independently versioned Hub distribution is
-`palimpsest-hub 0.2.1` in this tree; this source version is not a PyPI release.
+`palimpsest-hub 0.3.0` in this tree; this source version is not a PyPI release.
 Git and outbound HTTPS access to GitHub
 are required only for the direct VCS installation examples below.
 
@@ -17,8 +17,8 @@ then run `palimpsest --version`. The isolated invocation
 `uvx --from palimpsest-client==0.2.3 palimpsest --version` was verified against
 the published wheel and reports `0.2.3`.
 
-The current checkout prepares root `palimpsest-client 0.2.4`, which is not
-published by these commands. The Hub 0.2.1 closed-transport pool recovery is
+The current checkout prepares root `palimpsest-client 0.3.0`, which is not
+published by these commands. The Hub 0.3.0 package registry and retained closed-transport pool recovery are
 separate source; update both reviewed Kolla API and worker image digests to
 deploy it, rather than assuming a root wheel upgrade updates running services.
 
@@ -46,8 +46,8 @@ while source builds bind to the configured checkout commit SHA. Verify both
 `0.2.0` Hub images before deploying this default; source metadata
 alone does not establish image availability.
 
-The role default remains older than the Hub 0.2.1 source. Operators deploying
-the closed-connection fix must pin reviewed API and worker image digests in
+The role default remains older than the Hub 0.3.0 source. Operators deploying
+the package registry or closed-connection fix must pin reviewed API and worker image digests in
 Kolla globals; a Python version bump alone does not change running containers.
 
 On deploy and upgrade, each Palimpsest host pulls the API image and sets the
@@ -197,6 +197,21 @@ worker only reads `DATABASE_URL`, the database pool settings,
 `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS`, and
 `PALIMPSEST_HUB_BUILDER_PYTHON`; it does not require Redis or `OS_*` credentials.
 
+### Hub API and worker logs
+
+The API, Glance export worker, and separate build worker emit Hub-owned INFO
+events by default. API events contain the HTTP method, **matched route
+template** (or `<unmatched>`), status and elapsed milliseconds, not the URL.
+Claimed export/build jobs emit start and terminal status; idle polling does not
+emit a per-poll event. Set `PALIMPSEST_HUB_LOG_LEVEL=DEBUG` on the individual
+process to opt in to bounded query presence/length and numeric job state/result
+summaries. Other values retain INFO. DEBUG never includes query values, headers,
+bearer/download tokens, SQL binds, recipe, disk bytes, paths, OpenStack payloads
+or exception text. Hub disables Uvicorn's raw-target access logger at startup,
+including when launched through the direct `uvicorn palimpsest_hub.main:app`
+command. Do not enable third-party HTTP/SQL trace logging or an independent
+server access logger that emits raw targets in production.
+
 On a reused asyncmy connection whose uvloop TCP transport was already closed,
 Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connection
 before the request's SQL operation. It does not retry transactions that lose
@@ -304,10 +319,10 @@ per-VM network contract. This is separate from Compose project publication.
 
 ### Docker/OCI and Dockerfile builds
 
-- An installed Docker CLI for `login`, `pull`, `push`, `tag`, `images`,
-  `history`, `rmi`, `save`, `load`, image aliases, and `docker` pass-through.
-- A separately managed Buildx builder with an OCI exporter for Dockerfile
-  builds. The default `docker` driver does not provide the required exporter.
+- An installed Docker CLI for OCI-profile `login`, `pull`, `push`, `tag` and Docker inventory/history/save/load/remove/passthrough. Native package push/pull do not use Docker's image store.
+- An installed Docker credential helper and exact API-base/namespace `credHelpers` entry (or `credsStore`) for native login. Host-only Docker credentials, `auths` and plaintext fallback are not accepted. The native client also supports an ephemeral `PALIMPSEST_PACKAGE_KEY`, not a legacy Keystone token.
+- A separately managed Buildx builder with an OCI exporter for Dockerfile builds. The default `docker` driver does not provide the required exporter.
+- Every online build requires a project-scoped key with both `cache:read` and `cache:write`; OCI output must pass `--cache-registry NATIVE_ALIAS --cache-package NAMESPACE/PACKAGE`, while native output defaults to its own profile/package. Package publication additionally requires `packages:read` and `packages:write`.
 - Strict offline Dockerfile builds require preloaded pinned inputs and a
   separately bootstrapped single-node `docker-container` builder using
   `--driver-opt network=none`.
@@ -355,9 +370,7 @@ Hub URL precedence is:
 2. `PALIMPSEST_URL`.
 3. `url` or `[hub].url` in `config.toml`.
 
-Hub commands require `PALIMPSEST_TOKEN`. Keep the token in a secret manager or
-process environment; never persist it in `config.toml`, documentation, shell
-history, or the local state store.
+Legacy Hub artifact commands require the original project-scoped `PALIMPSEST_TOKEN`; keep it in approved secret handling, never `config.toml`, documentation, history or local state. Native package/cache profiles use their own HTTPS API base and package key, not `PALIMPSEST_URL`/`PALIMPSEST_TOKEN`. Package keys cannot queue privileged `/v1/builds`; those remain system-administrator operations. Legacy tokens cannot authorize BuildKit-cache writes.
 
 ```sh
 export PALIMPSEST_URL="https://hub.example.invalid"
@@ -367,17 +380,11 @@ palimpsest image ls --limit 10
 
 ### Registry profiles and credentials
 
-Registry profiles live at
-`${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml` and contain no
-credentials. For unqualified references, selection order is:
+Profiles live at `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`, schema version 1, and contain no credentials. `registry add --protocol oci|palimpsest` defaults to OCI, as do old profiles with no protocol. For unqualified references, selection is `--registry`, `PALIMPSEST_REGISTRY`, then default. A fully qualified authority with no configured profile stays ordinary Docker/OCI, as before; this includes login/logout. A configured authority must map to one protocol, and an explicit `--registry` must match a qualified reference's authority. Strict offline builds never read this file.
 
-1. Registry written in the image reference.
-2. Command `--registry PROFILE`.
-3. `PALIMPSEST_REGISTRY`.
-4. Configured default profile.
+Native profiles require `--api-base HTTPS_URL` on exactly the `endpoint` authority and optionally a one-component namespace. Native HTTPS verifies system trust plus absolute `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are rejected. The helper entry is exactly `api_base.rstrip('/') + '/projects/' + namespace`; lookup checks that `credHelpers` entry then `credsStore`, never host-only entries or `auths`. Configure/install `docker-credential-HELPER` first. Native login verifies `/auth/me` before storing anything, uses the key's public UUID as `--username`, and accepts the secret only through stdin/prompt. Native `--namespace` selects the credential namespace. OCI profiles retain Docker's `DOCKER_CONFIG`/`~/.docker` credentials.
 
-Credentials remain in Docker's `DOCKER_CONFIG` directory or `$HOME/.docker`.
-Use `login --password-stdin` for non-interactive authentication.
+An ordinary member first registers the operator-bound namespace and issues a secret-once exact-package/action-bound key through the native control API. Follow the complete [registry flow](registries.md#native-authentication-build-and-transfer), including conditional `cloud.dmslab.re.kr/openstack-afterglow/test:v1` usage only after binding the alias to the actual immutable project UUID. Native `push --input`/`--manifest` and `pull --output` transfer verified OCI-layout archives without loading Docker; local typed receipts and frozen exports live under `state/package-references/` and `state/package-artifacts/`, separate from runtime-layer tags. These new source paths and written tests are not deployment or executed acceptance evidence.
 
 ### Compose project identity
 
@@ -398,6 +405,9 @@ The required settings are:
 | `OS_AUTH_URL` | Keystone authentication endpoint |
 | `OS_USERNAME` / `OS_PASSWORD` | Service identity credentials |
 | `OS_PROJECT_NAME` | Service project |
+| `OS_READER_USERNAME` / `OS_READER_PASSWORD` | Separate read-only Keystone validation identity. It must authenticate system-scoped (`all`) with the `reader` role and neither `admin` nor `service`. Token validation returns 503 if it is absent, unavailable or holds other roles. |
+| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. If empty, every package endpoint returns 503. |
+| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. If empty, every package endpoint returns 503. |
 
 Optional settings and defaults:
 
@@ -413,10 +423,38 @@ Optional settings and defaults:
 | `PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` | `2`, valid 1–16; process-wide concurrent hash/copy/parse workers |
 | `PALIMPSEST_HUB_BUILDER_PYTHON` | Empty: build requests return 503. For build service, absolute path to the **separate** `palimpsest-client[kvm]` interpreter on the KVM worker; set the same path string on API and worker. |
 | `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; guest teardown is attempted on timeout. |
+| `PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS` | `{}`; JSON object mapping canonical namespace aliases to exact immutable Keystone project IDs, for example `'{"openstack-afterglow":"<project-uuid>"}'`. One configured alias per project; an existing SQL namespace is never rebound. |
+| `PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN` | Empty. Trusted HTTPS origin in canonical lower-case host/port form, with no credentials, path, query or fragment; other forms are rejected at startup. It is never inferred from the request Host. If empty, no package authority is advertised, and every native push fails closed with `503 HUB_UNAVAILABLE` before its tag is published. |
+| `OS_READER_USER_DOMAIN_NAME` | `Default`; domain of the separate validation identity |
 | `OS_USER_DOMAIN_NAME` / `OS_PROJECT_DOMAIN_NAME` | `Default` |
 | `OS_REGION_NAME` | `RegionOne` |
 | `OS_INTERFACE` | `internal` |
 | `SSL_VERIFY` | `true` |
+
+### Original token and package-owner prerequisites
+
+The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
+
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including the system-role check that keeps privileged server builds administrator-only. On every package-key use the implementation checks that the user and project are currently enabled, and lists `role_assignments.list(user=OWNER, effective=True, include_names=True)`. It does not rely on the token or a cached membership. The owner needs a `member` or `reader` assignment on the target project, and an `admin` or `service` assignment on any scope makes the owner forbidden. Protected user/project IDs and the validator identity itself are also refused. Read-only members cannot delegate write actions. Configure both protected sets with every relevant administrative/service project and principal; empty sets are not an allow-all default. Do not grant package upload authority to an administrator to work around a missing prerequisite.
+
+Keystone user/project IDs are exact bounded ASCII identifiers (up to 64 characters), including federated 64-hex user IDs. Do not parse them as UUIDs, case-fold or strip them. UUID formatting applies only to Hub-generated key/upload IDs. Protected sets and namespace binding values must preserve exact identity bytes. For a conventional project UUID, the conditional operator configuration is:
+
+```text
+PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS='["<protected-project-id>"]'
+PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS='["<protected-user-id>"]'
+PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS='{"openstack-afterglow":"<project-uuid>"}'
+PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN=https://cloud.dmslab.re.kr
+```
+
+Replace each `<...>` marker with the operator-observed exact ID. A marker is not a display name, credential or authorization to change production. An ordinary member then registers the namespace for that original project. Without an alias, canonical lower-case 32-hex projects use `p-<project-id>`; other valid opaque IDs use `p-h-<56 hex characters of SHA-256(project-id)>`. Reserved deterministic names cannot bind another project. The SQL binding stays fixed even if configuration later changes. The native CLI reaches this Hub through the separate Afterglow key gateway at `https://cloud.dmslab.re.kr/api/v1/palimpsest/hub`; that gateway has not been deployed.
+
+For federated owners, the reader must be able to see the owner's membership through a fresh effective role-assignment listing. That means a persistent direct user assignment or a currently persisted expiring group membership. [Keystone federation mapping combinations](https://docs.openstack.org/keystone/latest/admin/federation/mapping_combinations.html) distinguishes project mappings, which persist direct assignments, from group mappings, whose membership may be ephemeral. A user whose project role comes only from an ephemeral mapping group may not appear in that listing and then needs a persistent or direct assignment. A token-only ephemeral grant cannot stand in for fresh key-owner authority, because key use carries no caller Keystone token. If the cloud cannot expose that membership, key use fails closed. There is no automatic policy change or admin fallback, and no production mapping was changed here. This is an operator prerequisite, not a verified result.
+
+These are operator prerequisites for a separately approved rollout, not a claim that Keystone policy, HTTPS origin, alias binding or package acceptance has been verified on the deployed service. The [2026-10-02 candidate checkpoint](development-handoff.md#candidate-integration--2026-10-02) records passed portable/Hub source gates and isolated HTTPS/BuildKit acceptance, with its identity/database limits.
+
+The canonical Kolla role maps these inputs explicitly: `palimpsest_reader_user`, secret `palimpsest_reader_password` and `palimpsest_reader_user_domain_name` become `OS_READER_*`; `palimpsest_package_forbidden_project_ids` / `palimpsest_package_forbidden_user_ids` become the required protected JSON arrays; `palimpsest_package_namespace_bindings` becomes the alias map; and `palimpsest_package_public_origin` becomes the trusted HTTPS origin. The role precheck requires a separate reader username/password and both nonempty exact-ID protected sets. Secrets belong in approved private Kolla secret inputs, never globals/examples/logs. Rendering these settings is not evidence of Keystone policy or membership readiness.
+
+Reader provisioning uses `openstack.cloud.role_assignment` with `system: all`. The [reviewed 2.6.0 module schema](https://docs.ansible.com/projects/ansible/latest/collections/openstack/cloud/role_assignment_module.html) supports that argument; verify the operator-installed collection supports it before rollout. Provision a dedicated reader identity and inspect its actual effective grants: `state: present` does not remove pre-existing elevated assignments, and the Hub rejects a validator token holding administrator/service roles. No collection installation or cloud role mutation is implied.
 
 After provisioning dependencies and injecting secrets, initialize the schema
 with `palimpsest-hub-bootstrap`, then run `palimpsest-hub` and
@@ -686,7 +724,7 @@ Repository contributors can build the sdist/wheel and run the isolated package
 smoke from a trusted checkout:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.2.4
+uv run python scripts/build_package.py --out-dir dist/package-0.3.0
 ```
 
 This maintainer workflow is not the user installation path. Its local package
