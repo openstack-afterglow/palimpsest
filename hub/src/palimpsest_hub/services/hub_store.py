@@ -24,7 +24,6 @@ import hmac
 import logging
 import os
 import re
-import shutil
 import stat
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -135,15 +134,27 @@ class LocalPathBlobStore:
             os.close(fd)
         self._sync_blob_dir()
 
-    def _copy_into_blob(self, source: Path, target: Path) -> None:
+    def _copy_into_blob(self, source: Path, target: Path, finalized: FinalizedBlob) -> None:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".upload-", delete=False) as temporary:
             temporary_path = Path(temporary.name)
             try:
-                with source.open("rb") as input_stream:
-                    shutil.copyfileobj(input_stream, temporary, length=_READ_CHUNK)
+                sha = hashlib.sha256()
+                size = 0
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                with os.fdopen(os.open(source, flags), "rb") as input_stream:
+                    if not stat.S_ISREG(os.fstat(input_stream.fileno()).st_mode):
+                        raise HubStoreError("publication source is not a regular file")
+                    while chunk := input_stream.read(_READ_CHUNK):
+                        size += len(chunk)
+                        if size > finalized.size_bytes:
+                            raise HubDigestMismatch("publication source changed after inspection")
+                        sha.update(chunk)
+                        temporary.write(chunk)
+                if size != finalized.size_bytes or "sha256:" + sha.hexdigest() != finalized.blob_digest:
+                    raise HubDigestMismatch("publication source changed after inspection")
                 temporary.flush()
                 os.fsync(temporary.fileno())
-            except Exception:
+            except BaseException:
                 temporary_path.unlink(missing_ok=True)
                 raise
         try:
@@ -221,6 +232,11 @@ class LocalPathBlobStore:
         name = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
         return self._acquire_lock_file(f"project-{kind}-{name}.lock", blocking=blocking)
 
+    def acquire_package_lock(self, binding: str, *, blocking: bool = True) -> int | None:
+        """Serialize native package/tag/cache commits for one project and exact name."""
+        name = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+        return self._acquire_lock_file(f"package-{name}.lock", blocking=blocking)
+
     def reconcile_upload(self, session_id: str, expected_size: int) -> None:
         """Discard unacknowledged bytes left by an interrupted PATCH."""
         path = self.upload_path(session_id)
@@ -279,9 +295,22 @@ class LocalPathBlobStore:
     # ── 업로드 세션 ─────────────────────────────────────────────────────
     def start_upload(self, session_id: str) -> None:
         path = self.upload_path(session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("xb"):
-            pass
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fsync(fd)
+            for directory in (path.parent, self.root):
+                directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(fd)
 
     def append_upload(self, session_id: str, chunk: bytes) -> int:
         path = self.upload_path(session_id)
@@ -335,11 +364,7 @@ class LocalPathBlobStore:
                 os.utime(target, None, follow_symlinks=False)
                 needs_copy = False
         if needs_copy:
-            try:
-                self._copy_into_blob(source, target)
-            except Exception:
-                target.unlink(missing_ok=True)
-                raise
+            self._copy_into_blob(source, target, finalized)
             return True
         return False
 
@@ -382,40 +407,14 @@ class LocalPathBlobStore:
         if source.is_symlink() or not resolved.is_relative_to(root) or not resolved.is_file():
             raise HubStoreError("승격할 파일은 허브 루트 안의 일반 파일이어야 합니다")
 
-        initial_size = resolved.stat().st_size
-        if initial_size > max_bytes:
-            raise HubStoreError("승격할 파일이 허용 크기를 초과합니다")
-
-        sha = hashlib.sha256()
-        md5 = hashlib.md5()  # noqa: S324 — 보조 검색 키. 무결성 권위는 sha256
-        size = 0
-        with resolved.open("rb") as handle:
-            while chunk := handle.read(_READ_CHUNK):
-                size += len(chunk)
-                if size > max_bytes:
-                    raise HubStoreError("승격할 파일이 허용 크기를 초과합니다")
-                sha.update(chunk)
-                md5.update(chunk)
-            os.fsync(handle.fileno())
-
-        if size != initial_size or resolved.stat().st_size != initial_size:
-            raise HubStoreError("승격 중 파일 크기가 변경되었습니다")
-
-        actual = f"sha256:{sha.hexdigest()}"
-        target = self.blob_path(actual)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = self.acquire_blob_lock(actual)
+        finalized = self.inspect_file(resolved, max_bytes=max_bytes)
+        lock_fd = self.acquire_blob_lock(finalized.blob_digest)
         try:
-            if target.exists() or target.is_symlink():
-                self._sync_existing_blob(target)
-                os.utime(target, None, follow_symlinks=False)
-                resolved.unlink(missing_ok=True)
-            else:
-                os.replace(resolved, target)
-                self._sync_blob_dir()
+            self.publish_verified(resolved, finalized)
+            resolved.unlink(missing_ok=True)
         finally:
             self.release_blob_lock(lock_fd)
-        return FinalizedBlob(blob_digest=actual, blob_md5=md5.hexdigest(), size_bytes=size)
+        return finalized
 
     def delete(self, digest: str) -> None:
         self.blob_path(digest).unlink(missing_ok=True)

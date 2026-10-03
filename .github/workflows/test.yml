@@ -193,34 +193,99 @@ jobs:
 
   kvm:
     name: Native KVM stage-1 proof
-    if: vars.PALIMPSEST_KVM_ENABLED == 'true'
-    runs-on: [self-hosted, linux, x64, kvm]
+    if: github.repository == 'openstack-afterglow/palimpsest' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && vars.PALIMPSEST_KVM_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: palimpsest-native-kvm
+    concurrency:
+      group: palimpsest-native-kvm
+      cancel-in-progress: false
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: test -c /dev/kvm
       - run: uv sync --frozen --extra dev
-      - name: Create private stage-1 evidence directory
-        run: install -d -m 0700 "$RUNNER_TEMP/stage1-kvm-evidence"
-      - name: Prove retained root, root transition, PID 1 supervision, and rejection matrices
+      - name: Export exact revision and record source digest
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          install -d -m 0700 "$RUNNER_TEMP/native-kvm-evidence"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/native-kvm-evidence/source.tar"
+          sha256sum "$RUNNER_TEMP/native-kvm-evidence/source.tar" > "$RUNNER_TEMP/native-kvm-evidence/source.tar.sha256"
+          sha256sum --check "$RUNNER_TEMP/native-kvm-evidence/source.tar.sha256"
+      - name: Acquire pinned guest kernel and config over HTTPS
+        env:
+          KERNEL_URL: ${{ vars.PALIMPSEST_NATIVE_KERNEL_URL }}
+          CONFIG_URL: ${{ vars.PALIMPSEST_NATIVE_KERNEL_CONFIG_URL }}
+        run: |
+          [[ "$KERNEL_URL" == https://* && "$CONFIG_URL" == https://* ]] || { echo 'Kernel and config require HTTPS URLs' >&2; exit 1; }
+          printf '%s  %s\n' '89f7d4f31f6ef77d0f8d45810de9e19e3f8dededf3dd6ebf89bb540d26d8c0fd' "$RUNNER_TEMP/native-kvm-evidence/vmlinuz" '4d4aaaed367bd2fb6ed1238b94ea9bb095a5e5a0d0cc67d1cb70595643cc795a' "$RUNNER_TEMP/native-kvm-evidence/config" > "$RUNNER_TEMP/native-kvm-evidence/kernel-config.sha256"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$KERNEL_URL" --output "$RUNNER_TEMP/native-kvm-evidence/vmlinuz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$CONFIG_URL" --output "$RUNNER_TEMP/native-kvm-evidence/config"
+          sha256sum --check "$RUNNER_TEMP/native-kvm-evidence/kernel-config.sha256"
+      - name: Prove native stage-1 on disposable OpenStack instance
         timeout-minutes: 45
         env:
-          PALIMPSEST_REQUIRE_STAGE1_KVM: "1"
-          PALIMPSEST_KVM_EVIDENCE_DIR: ${{ runner.temp }}/stage1-kvm-evidence
-        run: uv run python -m pytest -m stage1_kvm tests/kvm -vv
+          OS_AUTH_TYPE: v3applicationcredential
+          OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+          OS_APPLICATION_CREDENTIAL_ID: ${{ secrets.OS_APPLICATION_CREDENTIAL_ID }}
+          OS_APPLICATION_CREDENTIAL_SECRET: ${{ secrets.OS_APPLICATION_CREDENTIAL_SECRET }}
+          OS_REGION_NAME: RegionOne
+          OS_INTERFACE: public
+          PALIMPSEST_NATIVE_PROJECT_ID: ${{ vars.PALIMPSEST_NATIVE_PROJECT_ID }}
+          PALIMPSEST_NATIVE_IMAGE_ID: ${{ vars.PALIMPSEST_NATIVE_IMAGE_ID }}
+          PALIMPSEST_NATIVE_FLAVOR_ID: ${{ vars.PALIMPSEST_NATIVE_FLAVOR_ID }}
+          PALIMPSEST_NATIVE_NETWORK_ID: ${{ vars.PALIMPSEST_NATIVE_NETWORK_ID }}
+          PALIMPSEST_KVM_KERNEL: ${{ runner.temp }}/native-kvm-evidence/vmlinuz
+          PALIMPSEST_KVM_KERNEL_CONFIG: ${{ runner.temp }}/native-kvm-evidence/config
+        run: |
+          SOURCE_SHA256="$(sha256sum "$RUNNER_TEMP/native-kvm-evidence/source.tar")"
+          SOURCE_SHA256="${SOURCE_SHA256%% *}"
+          uv run --with 'openstacksdk==3.3.0' python scripts/run_native_kvm_openstack.py prove \
+            --repository "$GITHUB_REPOSITORY" --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --sha "$GITHUB_SHA" \
+            --source-tar "$RUNNER_TEMP/native-kvm-evidence/source.tar" --source-sha256 "$SOURCE_SHA256" \
+            --project-id "$PALIMPSEST_NATIVE_PROJECT_ID" --image-id "$PALIMPSEST_NATIVE_IMAGE_ID" \
+            --flavor-id "$PALIMPSEST_NATIVE_FLAVOR_ID" --network-id "$PALIMPSEST_NATIVE_NETWORK_ID" \
+            --evidence-dir "$RUNNER_TEMP/native-kvm-evidence" --deadline-seconds 2700
+      - name: Clean up disposable instance from the same manifest
+        if: always()
+        env:
+          OS_AUTH_TYPE: v3applicationcredential
+          OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+          OS_APPLICATION_CREDENTIAL_ID: ${{ secrets.OS_APPLICATION_CREDENTIAL_ID }}
+          OS_APPLICATION_CREDENTIAL_SECRET: ${{ secrets.OS_APPLICATION_CREDENTIAL_SECRET }}
+          OS_REGION_NAME: RegionOne
+          OS_INTERFACE: public
+        run: uv run --with 'openstacksdk==3.3.0' python scripts/run_native_kvm_openstack.py cleanup --manifest "$RUNNER_TEMP/native-kvm-evidence/resource-manifest.json"
+      - name: Require native proof and cleanup receipts
+        run: |
+          test -s "$RUNNER_TEMP/native-kvm-evidence/resource-manifest.json"
+          test -s "$RUNNER_TEMP/native-kvm-evidence/native-proof-receipt.json"
+          test -s "$RUNNER_TEMP/native-kvm-evidence/oci-fs-evidence/squashfs.json"
+          test -s "$RUNNER_TEMP/native-kvm-evidence/oci-fs-evidence/squashfs-replay.json"
+          test -s "$RUNNER_TEMP/native-kvm-evidence/oci-fs-evidence/erofs.json"
+          test -s "$RUNNER_TEMP/native-kvm-evidence/stage1-kvm-evidence/receipt.json"
+          python -c 'import json, sys; assert json.load(open(sys.argv[1], encoding="utf-8"))["cleanup_verified"] is True' "$RUNNER_TEMP/native-kvm-evidence/resource-manifest.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: stage1-native-kvm-proof
-          path: ${{ runner.temp }}/stage1-kvm-evidence
+          path: |
+            ${{ runner.temp }}/native-kvm-evidence/resource-manifest.json
+            ${{ runner.temp }}/native-kvm-evidence/resource-manifest.json.creation-intent.json
+            ${{ runner.temp }}/native-kvm-evidence/native-proof-receipt.json
+            ${{ runner.temp }}/native-kvm-evidence/oci-fs-evidence/
+            ${{ runner.temp }}/native-kvm-evidence/stage1-kvm-evidence/
+            ${{ runner.temp }}/native-kvm-evidence/source.tar.sha256
+            ${{ runner.temp }}/native-kvm-evidence/kernel-config.sha256
           if-no-files-found: error
 
   kvm-required:
     name: Required native KVM proof
-    if: always()
+    if: always() && github.repository == 'openstack-afterglow/palimpsest' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [kvm]
     runs-on: ubuntu-24.04
     steps:

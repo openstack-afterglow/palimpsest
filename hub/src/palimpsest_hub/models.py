@@ -2,13 +2,35 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import BIGINT, BOOLEAN, CHAR, INT, JSON, TEXT, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import (
+    BIGINT,
+    BOOLEAN,
+    CHAR,
+    INT,
+    JSON,
+    TEXT,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    cast,
+    false,
+)
 from sqlalchemy.dialects.mysql import DATETIME, VARCHAR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def exact_identity(column, value: str | None):
+    """Retain indexed narrowing while enforcing bytes on legacy CI-collated SQL."""
+    if value is None:
+        return false()
+    return (column == value) & (cast(column, LargeBinary) == value.encode("ascii"))
 
 
 class Base(DeclarativeBase):
@@ -129,3 +151,122 @@ class PalimpsestHubBuild(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
 
     __table_args__ = (Index("idx_palimpsest_builds_project_created", "project_id", "created_at"),)
+
+
+def _binary_name(length: int):
+    return String(length).with_variant(VARCHAR(length, collation="utf8mb4_bin"), "mysql")
+
+
+class PackageNamespace(Base):
+    __tablename__ = "palimpsest_package_namespaces"
+    project_id: Mapped[str] = mapped_column(_binary_name(64), primary_key=True)
+    namespace: Mapped[str] = mapped_column(_binary_name(63), nullable=False, unique=True)
+    project_name: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
+class RegistryPackage(Base):
+    __tablename__ = "palimpsest_packages"
+    id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False)
+    name: Mapped[str] = mapped_column(_binary_name(255), nullable=False)
+    package_type: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    __table_args__ = (UniqueConstraint("project_id", "name"),)
+
+
+class PackageKey(Base):
+    __tablename__ = "palimpsest_package_keys"
+    id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(_binary_name(64), nullable=False, index=True)
+    secret_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    scope: Mapped[dict] = mapped_column(JSON, nullable=False)
+    actions: Mapped[list] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+
+
+class PackageVersion(Base):
+    __tablename__ = "palimpsest_package_versions"
+    package_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_packages.id"), primary_key=True)
+    root_digest: Mapped[str] = mapped_column(CHAR(71), primary_key=True)
+    root_media_type: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    graph: Mapped[dict] = mapped_column(JSON, nullable=False)
+    platforms: Mapped[list] = mapped_column(JSON, nullable=False)
+    archive_digest: Mapped[str] = mapped_column(CHAR(71), nullable=False)
+    archive_size_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    provenance: Mapped[dict] = mapped_column(JSON, nullable=False)
+    pushed_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
+    pushed_key_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=False)
+    pushed_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
+class PackageBlobReference(Base):
+    __tablename__ = "palimpsest_package_blob_references"
+    package_id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    root_digest: Mapped[str] = mapped_column(CHAR(71), primary_key=True)
+    blob_digest: Mapped[str] = mapped_column(CHAR(71), primary_key=True, index=True)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["package_id", "root_digest"],
+            ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
+        ),
+    )
+
+
+class PackageTag(Base):
+    __tablename__ = "palimpsest_package_tags"
+    package_id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    tag: Mapped[str] = mapped_column(_binary_name(128), primary_key=True)
+    root_digest: Mapped[str] = mapped_column(CHAR(71), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    updated_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
+    revision: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["package_id", "root_digest"],
+            ["palimpsest_package_versions.package_id", "palimpsest_package_versions.root_digest"],
+        ),
+    )
+
+
+class PackageUpload(Base):
+    __tablename__ = "palimpsest_package_uploads"
+    id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False, index=True
+    )
+    package: Mapped[str] = mapped_column(_binary_name(255), nullable=False)
+    key_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
+    resource: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+    request: Mapped[dict] = mapped_column(JSON, nullable=False)
+    received_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="uploading")
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
+class PackageCache(Base):
+    __tablename__ = "palimpsest_package_caches"
+    id: Mapped[str] = mapped_column(CHAR(32), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False)
+    package: Mapped[str] = mapped_column(_binary_name(255), nullable=False)
+    build_key: Mapped[str] = mapped_column(CHAR(71), nullable=False)
+    cache_scope: Mapped[str] = mapped_column(VARCHAR(48), nullable=False)
+    platform: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    builder_fingerprint: Mapped[str] = mapped_column(_binary_name(128), nullable=False)
+    archive_digest: Mapped[str] = mapped_column(CHAR(71), nullable=False, index=True)
+    archive_size_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    created_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
+    __table_args__ = (
+        Index("idx_package_cache_partition", "project_id", "package", "cache_scope", "platform", "builder_fingerprint"),
+    )

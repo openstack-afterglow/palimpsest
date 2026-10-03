@@ -21,6 +21,7 @@ from pathlib import Path
 
 from palimpsest_hub.config import get_build_worker_settings
 from palimpsest_hub.database import close_db, init_db
+from palimpsest_hub.logging import configure_logging
 from palimpsest_hub.services.builds import fail_interrupted_builds, process_one_hub_build
 from palimpsest_hub.services.hub_store import get_blob_store
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    configure_logging()
     settings = get_build_worker_settings()
     if sys.platform != "linux" or not os.access("/dev/kvm", os.R_OK | os.W_OK):
         raise RuntimeError("server-side builds require a Linux host with accessible /dev/kvm")

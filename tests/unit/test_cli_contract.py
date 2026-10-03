@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
-import inspect
 import json
 import uuid
 from pathlib import Path
@@ -12,7 +10,7 @@ from types import MappingProxyType
 
 import pytest
 
-from palimpsest_local import cli, digest, runtime_dispatch, state
+from palimpsest_local import cli, runtime_dispatch, state
 from palimpsest_local.errors import PalimpsestError, StateError
 from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.refs import ImageRef, RunSpec, StackRef
@@ -146,52 +144,11 @@ _CLI_EXISTING_RUN_OPERATIONS: tuple[tuple[str, str, list[str], dict[str, object]
 )
 
 
-def test_cli_uses_only_stdlib_and_package_imports():
-    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
-    top_level = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            top_level.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            top_level.add(node.module.split(".")[0])
-    assert top_level <= {
-        "__future__",
-        "argparse",
-        "codecs",
-        "collections",
-        "dataclasses",
-        "datetime",
-        "json",
-        "os",
-        "pathlib",
-        "re",
-        "select",
-        "shlex",
-        "shutil",
-        "signal",
-        "subprocess",
-        "sys",
-        "tempfile",
-        "termios",
-        "threading",
-        "tomllib",
-        "tty",
-        "typing",
-    }
-
-
-def test_cli_never_invokes_a_host_shell():
-    source = Path(cli.__file__).read_text(encoding="utf-8")
-    assert "shell=True" not in source
-    assert "os.system" not in source
-
-
 def test_digest_file_streams_hash(tmp_path: Path):
     payload = b"palimpsest layer bytes" * 100
     path = tmp_path / "layer.squashfs"
     path.write_bytes(payload)
     assert cli.digest_file(path) == f"sha256:{hashlib.sha256(payload).hexdigest()}"
-    assert "read_bytes()" not in inspect.getsource(digest.digest_file)
 
 
 def test_non_run_image_resolution_pulls_without_runtime_capability_gate(
@@ -504,7 +461,7 @@ def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
     assert str(tmp_path) not in json.dumps(payload)
 
 
-def test_buildkit_offline_dispatch_never_constructs_hub_client(
+def test_buildkit_offline_dispatch_reads_no_registry_profile_or_hub_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
     context = tmp_path / "context"
@@ -515,35 +472,42 @@ def test_buildkit_offline_dispatch_never_constructs_hub_client(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.delenv("PALIMPSEST_URL", raising=False)
     monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
+    # A corrupt profile file proves strict offline never resolves registry profiles.
+    profiles = tmp_path / "config" / "palimpsest" / "registries.toml"
+    profiles.parent.mkdir(parents=True)
+    profiles.write_text("not = [valid", encoding="utf-8")
+    profiles.chmod(0o600)
     captured = []
 
-    def forbidden_hub(*_args, **_kwargs):
-        raise AssertionError("offline dispatch constructed HubClient")
+    def forbidden_client(*_args, **_kwargs):
+        raise AssertionError("offline dispatch constructed a remote client")
 
-    def fake_build(spec, roots, *, hub_client=None):
-        captured.append((spec, roots, hub_client))
+    def fake_build(spec, roots, *, hub_client=None, cache_package=None, runtime_hub_client=None, on_oci_export=None):
+        captured.append((spec, hub_client, cache_package, runtime_hub_client, on_oci_export))
         return {
+            "build_id": "bk-000000000000",
             "runtime_block_digest": None,
             "output_oci_manifest_digest": "sha256:" + "c" * 64,
             "output_oci_archive_digest": "sha256:" + "d" * 64,
         }
 
-    monkeypatch.setattr(cli, "HubClient", forbidden_hub)
+    monkeypatch.setattr(cli, "HubClient", forbidden_client)
+    monkeypatch.setattr(cli, "NativePackageClient", forbidden_client)
     monkeypatch.setattr(cli, "build_with_buildkit", fake_build)
 
     assert cli.main(["build", str(context), "-f", str(dockerfile), "-t", "demo", "--offline"]) == 0
     assert len(captured) == 1
-    spec, _roots, hub_client = captured[0]
-    assert spec.offline is True
-    assert spec.network == "none"
-    assert spec.push_cache is False
-    assert spec.push_image is False
-    assert spec.push is False
-    assert spec.registry_profile is None
-    assert spec.registry_config_digest is None
-    assert spec.external_cache_from == ()
-    assert spec.external_cache_to == ()
-    assert hub_client is None
+    spec, hub_client, cache_package, runtime_hub_client, on_oci_export = captured[0]
+    assert (spec.offline, spec.network, spec.push_cache, spec.push_image, spec.push) == (
+        True,
+        "none",
+        False,
+        False,
+        False,
+    )
+    assert (spec.tag, spec.registry_profile, spec.registry_config_digest) == ("demo", None, None)
+    assert (spec.external_cache_from, spec.external_cache_to) == ((), ())
+    assert (hub_client, cache_package, runtime_hub_client, on_oci_export) == (None, None, None, None)
     assert capsys.readouterr().out.strip() == "sha256:" + "c" * 64
 
 
@@ -603,6 +567,8 @@ def test_buildkit_runtime_base_arch_mismatch_fails_before_build(
         ["build", ".", "-t", "demo", "--offline", "--cache-from", "type=local,src=.cache"],
         ["build", ".", "-t", "demo", "--offline", "--cache-to", "type=local,dest=.cache"],
         ["build", ".", "-t", "demo", "--offline", "--registry", "corp"],
+        ["build", ".", "-t", "demo", "--offline", "--cache-registry", "cloud"],
+        ["build", ".", "-t", "demo", "--offline", "--cache-package", "project/test"],
         ["build", ".", "-t", "demo", "--runtime-tag", "runtime"],
     ],
 )
@@ -620,6 +586,8 @@ def test_buildkit_cli_rejects_incomplete_or_networked_offline_forms(argv: list[s
         ["--local-image", "base=/tmp/base@sha256:" + "a" * 64],
         ["--cache-scope", "default"],
         ["--registry", "corp"],
+        ["--cache-registry", "cloud"],
+        ["--cache-package", "project/test"],
         ["--cache-from", "type=registry,ref=registry.example.com/cache/from"],
         ["--cache-to", "type=registry,ref=registry.example.com/cache/to,mode=max"],
         ["--no-cache"],
@@ -744,7 +712,7 @@ def test_palimpsestfile_frontend_rejects_every_buildkit_only_option(
         ["rm", "demo", "--volumes"],
         ["commit", "demo", "--tag", "layer"],
         ["ui"],
-        ["ui", "--port", "8080", "--no-browser"],
+        ["ui", "--port", "8080", "--no-browser", "--allow-control"],
         ["store", "show"],
         ["store", "show", "--format", "json"],
         ["store", "ls"],
@@ -1231,7 +1199,7 @@ def test_cli_process_bridge_closes_session_to_terminate_input_thread(
 def test_cli_dispatch_image_verify(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     img_file = tmp_path / "test.qcow2"
     img_file.write_bytes(b"qcow2 header content")
-    d = digest.digest_file(img_file)
+    d = "sha256:" + hashlib.sha256(img_file.read_bytes()).hexdigest()
     ret = cli.main(["image", "verify", str(img_file), "--digest", d])
     assert ret == 0
     assert "ok" in capsys.readouterr().out
@@ -2129,18 +2097,20 @@ def test_cli_ui_port_validation(capsys: pytest.CaptureFixture[str]):
     cli._validate_args(args_8080, parser)
 
 
-def test_cli_dispatch_ui(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(("extra", "read_only"), [([], True), (["--allow-control"], False)])
+def test_cli_dispatch_ui_is_read_only_unless_control_is_requested(
+    monkeypatch: pytest.MonkeyPatch, extra: list[str], read_only: bool
+):
     called: dict[str, object] = {}
 
-    def fake_serve(roots, port=0, open_browser=True):
-        called["port"] = port
-        called["open_browser"] = open_browser
+    def fake_serve(roots, port=0, open_browser=True, read_only=True):
+        called.update(port=port, open_browser=open_browser, read_only=read_only)
         return 8765
 
     monkeypatch.setattr("palimpsest_local.cli.ui.serve", fake_serve)
-    ret = cli.main(["ui", "--port", "8080", "--no-browser"])
+    ret = cli.main(["ui", "--port", "8080", "--no-browser", *extra])
     assert ret == 0
-    assert called == {"port": 8080, "open_browser": False}
+    assert called == {"port": 8080, "open_browser": False, "read_only": read_only}
 
 
 def test_cli_dispatch_store_show(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):

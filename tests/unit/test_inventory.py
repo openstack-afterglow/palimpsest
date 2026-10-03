@@ -637,7 +637,8 @@ def test_list_builds_and_get_build_and_log(tmp_path: Path):
     b2_id = "bk-000000000002"
     b2_dir = roots.builds / b2_id
     b2_dir.mkdir(parents=True, exist_ok=True)
-    (b2_dir / "console.log").write_text("buildkit log\n", encoding="utf-8")
+    (b2_dir / "buildkit.log").write_text("buildkit step 1\nbuildkit done\n", encoding="utf-8")
+    (b2_dir / "console.log").write_text("not the BuildKit engine log\n", encoding="utf-8")
     state.atomic_write_json(
         b2_dir / "record.json",
         {
@@ -656,6 +657,9 @@ def test_list_builds_and_get_build_and_log(tmp_path: Path):
     assert builds[0]["build_id"] == b2_id
     assert builds[0]["engine"] == "buildkit"
     assert builds[0]["duration_ms"] == 17250
+    assert builds[0]["log_available"] is True
+    assert inventory.build_log(roots, b2_id) == "buildkit step 1\nbuildkit done\n"
+    assert inventory.build_log(roots, b2_id, tail=1) == "buildkit done\n"
 
     assert builds[1]["build_id"] == b1_id
     assert builds[1]["engine"] == "palimpsestfile"
@@ -904,3 +908,412 @@ def test_list_vms_reconcile_fallbacks_and_failure_warning(tmp_path: Path, monkey
     vms = {v["name"]: v for v in res["vms"]}
     assert vms["legacy-hvf"]["stale"] is True
     assert vms["legacy-kvm"]["stale"] is False
+
+
+def _resource_run(roots, name, *, backend="lima-vz", runtime_kind="cloud-image", **fields):
+    import uuid
+
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "inventory-test:" + name))
+    run = roots.runs / name
+    run.mkdir(mode=0o700)
+    state.atomic_write_json(run / "owner.json", {"schema_version": 1, "name": name, "run_id": run_id})
+    state.atomic_write_json(
+        run / "state.json",
+        {
+            "schema_version": 2,
+            "runtime_kind": runtime_kind,
+            "backend": backend,
+            "name": name,
+            "run_id": run_id,
+            "status": "stopped",
+            **fields,
+        },
+    )
+    return run_id
+
+
+def _resource_project(roots, name, *, service=None, run_id=None, backend="lima-vz"):
+    from palimpsest_local.project import deterministic_service_name
+
+    services = (
+        []
+        if service is None
+        else [
+            {
+                "service": service,
+                "run_name": deterministic_service_name(name, service),
+                "run_id": run_id,
+                "backend": backend,
+                "config_digest": "sha256:" + "a" * 64,
+            }
+        ]
+    )
+    project = roots.projects / name
+    project.mkdir(mode=0o700)
+    state.atomic_write_json(
+        project / "state.json",
+        {
+            "schema_version": 2,
+            "project": name,
+            "config_digest": "sha256:" + "a" * 64,
+            "services": services,
+            "order": [] if service is None else [service],
+            "volumes": [{"name": "data", "backend": backend, "size_bytes": 32 * 1024**2}],
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-01T00:00:00Z",
+        },
+    )
+    return project / "state.json"
+
+
+def test_resource_volumes_keep_project_and_standalone_identity_boundaries(tmp_path):
+    from palimpsest_local.project import deterministic_service_name
+
+    roots = _setup_roots(tmp_path)
+    mount = {
+        "name": "data",
+        "mount_path": "/srv/data",
+        "read_only": False,
+        "host_path": "/private/SENSITIVE_VOLUME_PATH/data.raw",
+    }
+    for project in ("alpha", "beta"):
+        name = deterministic_service_name(project, "web")
+        run_id = _resource_run(roots, name, volumes=[mount])
+        _resource_project(roots, project, service="web", run_id=run_id)
+    _resource_project(roots, "preserved")
+    first = _resource_run(roots, "standalone-one", volumes=[mount])
+    second = _resource_run(roots, "standalone-two", volumes=[mount])
+    supplied = inventory.list_vms(roots, live=False)
+    before = json.dumps(supplied, sort_keys=True)
+
+    result = inventory.list_volumes(roots, vms_result=supplied)
+
+    rows = {row["id"]: row for row in result["volumes"] if row["kind"] == "project"}
+    assert list(rows) == sorted(rows)
+    assert set(rows) == {
+        "project:alpha:lima-vz:data",
+        "project:beta:lima-vz:data",
+        "project:preserved:lima-vz:data",
+        f"run-volume:{first}:data",
+        f"run-volume:{second}:data",
+    }
+    for project in ("alpha", "beta"):
+        row = rows[f"project:{project}:lima-vz:data"]
+        assert row["project"] == project and row["size_bytes"] == 32 * 1024**2
+        assert row["source"] == "project-ledger" and row["status"] == "declared-attached"
+        assert [item["name"] for item in row["attachments"]] == [deterministic_service_name(project, "web")]
+    preserved = rows["project:preserved:lima-vz:data"]
+    assert preserved["attachments"] == [] and preserved["status"] == "declared"
+    for run_id in (first, second):
+        row = rows[f"run-volume:{run_id}:data"]
+        assert row["project"] is None and row["size_bytes"] is None
+        assert row["attachments"][0]["run_id"] == run_id
+    assert "SENSITIVE_VOLUME_PATH" not in repr(result)
+    assert json.dumps(supplied, sort_keys=True) == before
+
+
+def test_resource_volumes_do_not_attach_replaced_project_run(tmp_path):
+    from palimpsest_local.project import deterministic_service_name
+
+    roots = _setup_roots(tmp_path)
+    name = deterministic_service_name("alpha", "web")
+    run_id = _resource_run(roots, name, volumes=[{"name": "data", "mount_path": "/data", "read_only": True}])
+    _resource_project(roots, "alpha", service="web", run_id="11111111-1111-4111-8111-111111111111")
+
+    result = inventory.list_volumes(roots)
+
+    rows = {row["id"]: row for row in result["volumes"]}
+    assert rows["project:alpha:lima-vz:data"]["attachments"] == []
+    assert rows[f"run-volume:{run_id}:data"]["project"] is None
+    assert rows[f"run-volume:{run_id}:data"]["attachments"][0]["read_only"] is True
+
+
+def test_resource_volumes_include_retained_unattached_oci_roots(tmp_path):
+    from palimpsest_local import oci_root_volume
+
+    roots = _setup_roots(tmp_path)
+    for volume_id, status, run_id, run_name in (
+        ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "retained", None, None),
+        ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "attached", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "absent-run"),
+    ):
+        record = oci_root_volume.OCIRootVolumeRecord(
+            volume_id,
+            16 * 1024**2,
+            "sha256:" + "a" * 64,
+            "retain",
+            status,
+            run_id,
+            run_name,
+            3,
+        )
+        stem = volume_id.replace("-", "")
+        (roots.oci_root_volumes / f"{stem}.raw").touch(mode=0o600)
+        state.atomic_write_json(roots.oci_root_volumes / f"{stem}.json", record.to_dict())
+
+    result = inventory.list_volumes(roots)
+
+    retained, attached = result["volumes"]
+    assert retained["id"] == "oci-root:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert retained["status"] == "retained" and retained["attachments"] == []
+    assert retained["size_bytes"] == 16 * 1024**2 and retained["retention_policy"] == "retain"
+    assert attached["status"] == "attached" and attached["source"] == "oci-root-volume-ledger"
+    assert attached["attachments"] == [
+        {"name": "absent-run", "run_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "mount_path": "/", "read_only": False}
+    ]
+    assert result["warnings"] == []
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "symlink-file", "symlink-directory", "owner-mismatch"])
+def test_resource_project_metadata_refusals_are_fixed_and_path_free(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    ledger = _resource_project(roots, "invalid")
+    _resource_project(roots, "valid")
+    sensitive = tmp_path / "SENSITIVE_VALUE"
+    if damage == "corrupt":
+        ledger.write_text('{"host_path":"/private/SENSITIVE_VALUE",', encoding="utf-8")
+    elif damage == "owner-mismatch":
+        payload = json.loads(ledger.read_text())
+        payload["project"] = "wrong-project"
+        state.atomic_write_json(ledger, payload)
+    elif damage == "symlink-file":
+        ledger.rename(sensitive)
+        ledger.symlink_to(sensitive)
+    else:
+        ledger.parent.rename(sensitive)
+        ledger.parent.symlink_to(sensitive, target_is_directory=True)
+
+    result = inventory.list_volumes(roots, vms_result={"vms": [], "warnings": []})
+
+    assert [row["id"] for row in result["volumes"]] == ["project:valid:lima-vz:data"]
+    assert result["warnings"] == ["Project volume metadata is unavailable or inconsistent"]
+    assert "SENSITIVE_VALUE" not in repr(result) and str(tmp_path) not in repr(result)
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "symlink"])
+def test_resource_oci_metadata_failure_is_not_a_clean_empty_inventory(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    ledger = roots.oci_root_volumes / ("a" * 32 + ".json")
+    if damage == "corrupt":
+        ledger.write_text('{"private_path":"/private/SENSITIVE_VALUE",', encoding="utf-8")
+    else:
+        sensitive = tmp_path / "SENSITIVE_VALUE"
+        sensitive.write_text("{}", encoding="utf-8")
+        ledger.symlink_to(sensitive)
+
+    result = inventory.list_volumes(roots)
+
+    assert result["volumes"] == []
+    assert result["warnings"] == ["OCI root-volume metadata is unavailable or inconsistent"]
+    assert "SENSITIVE_VALUE" not in repr(result) and str(tmp_path) not in repr(result)
+
+
+def test_resource_vm_disk_observation_is_not_virtual_capacity(tmp_path):
+    roots = _setup_roots(tmp_path)
+    observed_id = _resource_run(roots, "observed", backend="kvm")
+    rejected_id = _resource_run(roots, "rejected", backend="kvm")
+    external = tmp_path / "SENSITIVE_DISK"
+    external.write_bytes(b"outside-authority")
+    (roots.runs / "observed" / "overlay.qcow2").write_bytes(b"fixed-managed-file")
+    (roots.runs / "rejected" / "overlay.qcow2").symlink_to(external)
+
+    result = inventory.list_volumes(roots)
+
+    rows = {row["id"]: row for row in result["volumes"]}
+    observed = rows[f"vm-disk:{observed_id}"]
+    assert observed["status"] == "observed-file" and observed["source"] == "managed-overlay-stat"
+    assert observed["size_bytes"] is None and observed["file_size_bytes"] == len(b"fixed-managed-file")
+    rejected = rows[f"vm-disk:{rejected_id}"]
+    assert rejected["status"] == "unavailable" and rejected["size_bytes"] is None
+    assert rejected["file_size_bytes"] is None
+    assert result["warnings"] == ["Some managed VM disk observations are unavailable or inconsistent"]
+    assert "SENSITIVE_DISK" not in repr(result)
+
+
+def test_resource_vm_disk_written_during_observation_stays_observed(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "busy", backend="kvm")
+    overlay = roots.runs / "busy" / "overlay.qcow2"
+    overlay.write_bytes(b"guest-disk")
+    read_payloads = inventory.state._read_pinned_run_payloads
+
+    def guest_writes_between_stats(*args, **kwargs):
+        with overlay.open("ab") as stream:
+            stream.write(b"-more-guest-data")
+        return read_payloads(*args, **kwargs)
+
+    monkeypatch.setattr(inventory.state, "_read_pinned_run_payloads", guest_writes_between_stats)
+
+    result = inventory.list_volumes(roots)
+
+    row = {row["id"]: row for row in result["volumes"]}[f"vm-disk:{run_id}"]
+    assert row["status"] == "observed-file"
+    assert row["file_size_bytes"] == overlay.stat().st_size
+    assert result["warnings"] == []
+
+
+def test_resource_networks_share_only_conventional_networks_and_keep_unknown_rows(tmp_path):
+    roots = _setup_roots(tmp_path)
+    port = {"host_ip": "127.0.0.1", "host_port": 18080, "guest_port": 80, "protocol": "tcp"}
+    _resource_run(roots, "lima-one", network="default", ports=[port], guest_ip="192.168.5.2")
+    _resource_run(roots, "lima-two", network="vzNAT", ports=[], guest_ip="192.168.5.3")
+    _resource_run(roots, "kvm-one", backend="kvm", network="default")
+    _resource_run(roots, "kvm-two", backend="kvm", network="default")
+    no_nic = _resource_run(roots, "no-nic", backend="kvm", network="none")
+    missing = _resource_run(roots, "missing", backend="kvm")
+    malformed = _resource_run(roots, "malformed", backend="kvm", network="/private/SENSITIVE_VALUE")
+    supplied = inventory.list_vms(roots, live=False)
+    before = json.dumps(supplied, sort_keys=True)
+
+    result = inventory.list_networks(roots, vms_result=supplied)
+
+    rows = {row["id"]: row for row in result["networks"]}
+    assert list(rows) == sorted(rows)
+    lima = rows["network:lima-vz:vzNAT"]
+    assert lima["kind"] == "lima" and lima["status"] == "configured"
+    assert lima["subnet"] is None and lima["gateway"] is None and lima["external"] is None
+    assert [attachment["name"] for attachment in lima["attachments"]] == ["lima-one", "lima-two"]
+    assert lima["attachments"][0]["ports"] == [port]
+    # Lima records the first global guest address (user-mode eth0), which is not an address on vzNAT.
+    assert [attachment["guest_ip"] for attachment in lima["attachments"]] == [None, None]
+    assert [attachment["name"] for attachment in rows["network:kvm:default"]["attachments"]] == ["kvm-one", "kvm-two"]
+    assert rows[f"network:kvm:{no_nic}"]["status"] == "isolated"
+    for run_id in (missing, malformed):
+        row = rows[f"network-unavailable:{run_id}"]
+        assert row["status"] == "unavailable" and row["attachments"] == [] and row["external"] is None
+    assert result["warnings"] == [
+        "Some VM resource metadata is unavailable or inconsistent",
+        "Some configured network metadata is unavailable or inconsistent",
+    ]
+    assert "SENSITIVE_VALUE" not in repr(result)
+    assert json.dumps(supplied, sort_keys=True) == before
+
+
+@pytest.mark.parametrize(
+    "plan", [None, {"digest": "sha256:" + "a" * 64, "plan": {"host_path": "/private/SENSITIVE_VALUE"}}]
+)
+def test_resource_oci_network_plan_refusal_never_becomes_empty_exposure(tmp_path, plan):
+    roots = _setup_roots(tmp_path)
+    fields = {} if plan is None else {"oci_root_domain": plan}
+    run_id = _resource_run(roots, "oci-invalid", backend="kvm", runtime_kind="oci-root", **fields)
+
+    result = inventory.list_networks(roots)
+
+    assert result["networks"] == [
+        {
+            "id": f"oci-network:{run_id}",
+            "name": "oci-invalid",
+            "kind": "oci-root",
+            "backend": "kvm",
+            "mode": None,
+            "subnet": None,
+            "gateway": None,
+            "status": "unavailable",
+            "source": "committed-domain-plan",
+            "external": None,
+            "attachments": [],
+        }
+    ]
+    assert (
+        "OCI network status is unavailable; the exact run has no committed domain plan or its plan is invalid"
+        in result["warnings"]
+    )
+    assert "SENSITIVE_VALUE" not in repr(result) and str(tmp_path) not in repr(result)
+
+
+def test_resource_oci_networks_keep_equal_subnets_per_vm_and_exact_exposure(tmp_path):
+    import test_oci_store as oci_fixtures
+
+    from palimpsest_local.oci_network import OCINetworkConfig
+
+    roots, store, tools, boot, profile, _prepared, first_plan = oci_fixtures._committed_oci_domain(
+        tmp_path,
+        "oci-first",
+        network=OCINetworkConfig.resolve("nat", ["127.0.0.1:18080:80"]),
+    )
+    plans = [first_plan]
+    for name, network in (
+        ("oci-second", OCINetworkConfig.resolve("nat", ["0.0.0.0:18443:443/udp"])),
+        ("oci-none", OCINetworkConfig.resolve("none")),
+    ):
+        with state.reserve_new_run(roots, name, oci_fixtures._oci_dispatch()) as reservation:
+            prepared = oci_fixtures.prepare_oci_root_run(
+                reservation,
+                oci_fixtures._image_materialization(store),
+                store,
+                root_volume_size_bytes=oci_fixtures._ROOT_VOLUME_SIZE,
+                runner=tools,
+            )
+        preview = oci_fixtures.build_oci_root_domain_plan(
+            roots,
+            prepared,
+            store,
+            boot,
+            profile,
+            network=network,
+            runner=tools,
+        )
+        plans.append(oci_fixtures.commit_oci_root_domain_plan(roots, preview, store, runner=tools))
+    ledgers_before = {plan.run_name: (roots.runs / plan.run_name / "state.json").read_bytes() for plan in plans}
+
+    result = inventory.list_networks(roots)
+
+    rows = {row["name"]: row for row in result["networks"]}
+    assert set(rows) == {"oci-first", "oci-second", "oci-none"}
+    assert rows["oci-first"]["id"] != rows["oci-second"]["id"]
+    assert rows["oci-first"]["subnet"] == rows["oci-second"]["subnet"] == "10.0.2.0/24"
+    assert rows["oci-first"]["gateway"] == "10.0.2.2"
+    assert rows["oci-first"]["external"] is False and rows["oci-second"]["external"] is True
+    assert rows["oci-first"]["attachments"][0]["ports"] == [
+        {"host_ip": "127.0.0.1", "host_port": 18080, "guest_port": 80, "protocol": "tcp"}
+    ]
+    assert rows["oci-second"]["attachments"][0]["ports"] == [
+        {"host_ip": "0.0.0.0", "host_port": 18443, "guest_port": 443, "protocol": "udp"}
+    ]
+    assert rows["oci-none"]["mode"] == "none" and rows["oci-none"]["status"] == "isolated"
+    assert rows["oci-none"]["attachments"][0]["guest_ip"] is None
+    assert rows["oci-none"]["attachments"][0]["ports"] == []
+    assert result["warnings"] == []
+    for plan in plans:
+        assert rows[plan.run_name]["attachments"][0]["run_id"] == plan.run_id
+        assert (roots.runs / plan.run_name / "state.json").read_bytes() == ledgers_before[plan.run_name]
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "symlink"])
+def test_resource_run_metadata_refusals_are_visible_and_path_free(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    _resource_run(roots, "invalid", network="default", volumes=[{"name": "data"}])
+    ledger = roots.runs / "invalid" / "state.json"
+    if damage == "corrupt":
+        ledger.write_text('{"private_path":"/private/SENSITIVE_VALUE",', encoding="utf-8")
+    else:
+        sensitive = tmp_path / "SENSITIVE_VALUE"
+        ledger.rename(sensitive)
+        ledger.symlink_to(sensitive)
+
+    volumes = inventory.list_volumes(roots)
+    networks = inventory.list_networks(roots)
+
+    assert volumes["volumes"] == [] and networks["networks"] == []
+    assert volumes["warnings"] == ["Some VM resource metadata is unavailable or inconsistent"]
+    assert networks["warnings"] == ["Some VM resource metadata is unavailable or inconsistent"]
+    assert "SENSITIVE_VALUE" not in repr((volumes, networks))
+    assert str(tmp_path) not in repr((volumes, networks))
+
+
+def test_resource_hvf_user_networks_are_not_shared_by_conventional_name(tmp_path):
+    roots = _setup_roots(tmp_path)
+    ssh = {"host": "127.0.0.1", "port": 60022}
+    first = _resource_run(roots, "hvf-first", backend="libvirt-hvf", network="default", ssh=ssh)
+    second = _resource_run(roots, "hvf-second", backend="libvirt-hvf", network="default", ssh=ssh)
+
+    result = inventory.list_networks(roots)
+
+    rows = {row["id"]: row for row in result["networks"]}
+    assert set(rows) == {f"network:libvirt-hvf:{first}", f"network:libvirt-hvf:{second}"}
+    assert rows[f"network:libvirt-hvf:{first}"]["kind"] == "user-hostfwd"
+    assert rows[f"network:libvirt-hvf:{first}"]["attachments"][0]["name"] == "hvf-first"
+    assert rows[f"network:libvirt-hvf:{second}"]["attachments"][0]["name"] == "hvf-second"
+    # The host-loopback SSH forward is not a guest address on the user-mode network.
+    assert [row["attachments"][0]["guest_ip"] for row in rows.values()] == [None, None]
+    assert [vm["guest_ip"] for vm in inventory.list_vms(roots, live=False)["vms"]] == [None, None]
+    assert result["warnings"] == []

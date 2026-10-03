@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -26,6 +27,7 @@ from palimpsest_hub.api.hub import (
     _grant_layer_access,
     _locked_blob,
     _registration_conflicts,
+    _run_blocking,
     _visible_filter,
 )
 from palimpsest_hub.config import get_build_worker_settings
@@ -33,6 +35,12 @@ from palimpsest_hub.database import get_session_factory
 from palimpsest_hub.models import PalimpsestHubBuild, PalimpsestHubLayer
 from palimpsest_hub.services.digest import compute_config_digest, normalize_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, get_blob_store
+
+_logger = logging.getLogger(__name__)
+
+
+class BuildLeaseLost(RuntimeError):
+    """The claimed build changed owner before its output could be published."""
 
 
 class BuildCleanupError(RuntimeError):
@@ -316,22 +324,17 @@ async def _publish_output(build_id: str, owner: str, job_dir: Path, result: dict
         raise RuntimeError("build output is not a stable regular file")
     if staged.stat().st_size > get_build_worker_settings().palimpsest_hub_max_blob_bytes:
         raise RuntimeError("build output exceeds blob limit")
-    with staged.open("rb") as handle:
-        staged_digest = "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
-    if staged_digest != expected:
+    finalized = await _run_blocking(
+        store.inspect_file, staged, max_bytes=get_build_worker_settings().palimpsest_hub_max_blob_bytes
+    )
+    if finalized.blob_digest != expected or finalized.size_bytes != result["size_bytes"]:
         raise RuntimeError("build output digest mismatch")
-    finalized = store.promote_file(staged, max_bytes=get_build_worker_settings().palimpsest_hub_max_blob_bytes)
-    if finalized.blob_digest != expected:
-        raise RuntimeError("build output digest mismatch")
-    # The store is content-addressed; verify a reused target before granting access.
-    with store.open_read(expected) as handle:
-        actual = "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
-    if actual != expected or finalized.size_bytes != result["size_bytes"]:
-        raise RuntimeError("build output target is not the verified result")
+    # Keep the digest lock from verified publication until the SQL reference commits.
     async with _locked_blob(store, expected), factory() as session:
+        await _run_blocking(store.publish_verified, staged, finalized)
         job = await session.get(PalimpsestHubBuild, build_id, with_for_update=True)
         if job is None or job.status != "building" or job.lease_owner != owner:
-            raise RuntimeError("build claim was lost")
+            raise BuildLeaseLost("build claim was lost")
         parent = job.layer_digests[-1] if job.layer_digests else None
         meta = HubLayerMeta(
             name=job.name,
@@ -388,6 +391,10 @@ async def process_one_hub_build(owner: str) -> bool:
     build_id = await _claim(owner)
     if build_id is None:
         return False
+    started = time.monotonic()
+    _logger.info("Build task started status=building")
+    outcome = "error"
+    result_size = 0
     job_dir: Path | None = None
     created = False
     cleanup_verified = False
@@ -407,10 +414,12 @@ async def process_one_hub_build(owner: str) -> bool:
             job_dir,
             get_build_worker_settings().palimpsest_hub_build_timeout_seconds,
         )
+        result_size = result["size_bytes"] if type(result.get("size_bytes")) is int and result["size_bytes"] >= 0 else 0
         await _publish_output(build_id, owner, job_dir, result)
         await asyncio.to_thread(_stop_interrupted_builder, job_dir)
         await asyncio.to_thread(_cleanup_guest, get_build_worker_settings().palimpsest_hub_builder_python, job_dir)
         cleanup_verified = True
+        outcome = "complete"
     except Exception as exc:
         cleanup_failed = isinstance(exc, BuildCleanupError)
         if created and job_dir is not None and not cleanup_failed:
@@ -434,23 +443,37 @@ async def process_one_hub_build(owner: str) -> bool:
                     job.lease_owner = None
                     job.completed_at = _now()
                 job.error_code = "cleanup_failed" if cleanup_failed else "build_failed"
+                outcome = "complete" if job.status == "complete" else "error"
                 await session.commit()
+            else:
+                outcome = "lease_lost"
         if cleanup_failed:
             raise BuildCleanupError("builder cleanup could not be verified") from exc
         cleanup_verified = True
     finally:
-        if created and job_dir is not None and cleanup_verified:
-            try:
-                shutil.rmtree(job_dir)
-            except OSError as exc:
-                factory = get_session_factory()
-                if factory is not None:
-                    async with factory() as session:
-                        job = await session.get(PalimpsestHubBuild, build_id, with_for_update=True)
-                        if job is not None:
-                            job.error_code = "cleanup_failed"
-                            if job.status != "complete":
-                                job.status = "error"
-                            await session.commit()
-                raise BuildCleanupError("private build scratch cleanup failed") from exc
+        try:
+            if created and job_dir is not None and cleanup_verified:
+                try:
+                    shutil.rmtree(job_dir)
+                except OSError as exc:
+                    factory = get_session_factory()
+                    if factory is not None:
+                        async with factory() as session:
+                            job = await session.get(PalimpsestHubBuild, build_id, with_for_update=True)
+                            if job is not None:
+                                job.error_code = "cleanup_failed"
+                                if job.status != "complete":
+                                    job.status = "error"
+                                await session.commit()
+                    if outcome != "complete":
+                        outcome = "error"
+                    raise BuildCleanupError("private build scratch cleanup failed") from exc
+        finally:
+            _logger.info("Build task ended status=%s", outcome)
+            _logger.debug(
+                "Build task result status=%s output_bytes=%d elapsed_ms=%d",
+                outcome,
+                result_size,
+                int((time.monotonic() - started) * 1000),
+            )
     return True

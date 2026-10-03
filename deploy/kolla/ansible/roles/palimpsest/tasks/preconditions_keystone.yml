@@ -22,3 +22,30 @@
         password: "{{ palimpsest_keystone_password }}"
         role: admin
   no_log: true
+
+- name: Keystone | Register dedicated read-only token validator
+  openstack.cloud.identity_user:
+    auth: "{{ openstack_auth }}"
+    name: "{{ palimpsest_reader_user }}"
+    password: "{{ palimpsest_reader_password }}"
+    domain: "{{ palimpsest_reader_user_domain_name }}"
+    enabled: true
+    update_password: always
+    state: present
+    interface: "{{ openstack_interface | default('internal') }}"
+    validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  register: palimpsest_reader_identity
+  no_log: true
+  run_once: true
+
+- name: Keystone | Assign validator system reader role only
+  openstack.cloud.role_assignment:
+    auth: "{{ openstack_auth }}"
+    user: "{{ palimpsest_reader_identity.user.id }}"
+    role: reader
+    system: all
+    state: present
+    interface: "{{ openstack_interface | default('internal') }}"
+    validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  no_log: true
+  run_once: true

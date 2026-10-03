@@ -2,13 +2,13 @@
 
 This document defines the target Dockerfile workflow for Palimpsest. It separates BuildKit's logical build cache from the SquashFS artifact attached to a VM, specifies online and strict-offline resolution rules, and defines the evidence required before the workflow is treated as production-ready.
 
-> **Implementation status:** the local Buildx solve, mandatory Hub cache archive, additive external cache backends, Docker/OCI image publication, strict-offline OCI-layout input, metadata-preserving rootfs export, SquashFS pack path, and local/Hub runtime conversion cache are implemented. The existing `Palimpsestfile` form remains supported. Clean-host Linux KVM, high-concurrency, and macOS native block attachment remain acceptance gates.
+> **Source status:** local Buildx solve, scoped mandatory native cache archives, native project-package export/publication, OCI-profile Docker/Buildx publication, strict-offline inputs, rootfs export and SquashFS runtime packing are present in source. Portable and Hub gates passed; isolated loopback HTTPS acceptance exercised real native build → deferred push → byte-identical pull and remote exact-cache reuse. See the [dated candidate checkpoint](development-handoff.md#candidate-integration--2026-10-02) for synthetic-identity/SQLite and deployment limits. Existing `Palimpsestfile` builds remain a separate VM frontend. Clean-host Linux KVM, high-concurrency and macOS native block attachment remain distinct gates.
 
 The two frontends have intentionally separate option contracts. Selecting `--frontend palimpsestfile` rejects every Dockerfile/BuildKit-only flag, including explicit default-valued flags such as `--platform linux/amd64`, instead of silently ignoring them.
 
 ## Selected Buildx builder preflight
 
-Every Dockerfile build first runs `docker buildx inspect` against the builder already selected by Buildx or `BUILDX_BUILDER`. The inspected name is then pinned into the solve as `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. The inspection is read-only: Palimpsest does not run `docker buildx create`, `docker buildx use`, or `docker buildx inspect --bootstrap`, so Docker Desktop and CLI builder selection are left unchanged.
+Online Dockerfile builds first authorize `cache:read` and `cache:write` for the exact native cache package, then inspect the builder already selected by Buildx or `BUILDX_BUILDER`. The inspected name is pinned into `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. Inspection is read-only: Palimpsest does not create, select or bootstrap a builder. Unauthorized package-only keys fail before inspection or build-directory creation.
 
 The OCI output required by this workflow is supported by the `docker-container`, `kubernetes`, and `remote` drivers. The default `docker` driver is rejected before Hub cache resolution or the Buildx solve because it cannot export `type=oci`. The successful build receipt records the inspected `buildx_driver`.
 
@@ -20,10 +20,11 @@ docker buildx inspect --builder palimpsest --bootstrap
 BUILDX_BUILDER=palimpsest palimpsest build . \
   --frontend dockerfile \
   -f Dockerfile \
-  --tag demo
+  --tag demo \
+  --cache-registry hub --cache-package project-apps/demo
 ```
 
-The same environment override can name an existing `kubernetes` or `remote` builder. If inspection fails, the error includes the selected-driver requirement and this non-disruptive setup path.
+The online example assumes a native `hub` profile, registered `project-apps` namespace and a key authorizing cache read/write for exact package `demo`, as described in [registry profiles](registries.md); a published runnable package is not required to write its cache. The same builder environment override can name an existing `kubernetes` or `remote` builder. If inspection fails, the error includes the selected-driver requirement and this non-disruptive setup path.
 
 Strict offline mode has a narrower builder contract. It accepts only an already-bootstrapped, single-node local `docker-container` builder whose sole endpoint matches the current local Unix/named-pipe Docker context and whose sole BuildKit container is attached to Docker network mode `none`; multi-node, remote, and Kubernetes builders cannot provide client-verifiable air-gap evidence. Provision that builder before disconnecting the host:
 
@@ -44,7 +45,7 @@ A Dockerfile build produces two different kinds of reusable data and can publish
 
 1. **BuildKit cache records** preserve fine-grained build work. They let a later solve skip unchanged Dockerfile vertices.
 2. **A runtime block** is one deterministic, read-only SquashFS filesystem image. KVM attaches it as a single `virtio-blk` disk.
-3. **An OCI image output** can be loaded into Docker or pushed to a Docker/OCI registry. It is not the runtime block attached to the VM.
+3. **An OCI output** is a verified archive. A native profile retains immutable-byte-bound local references and publishes through the project-package API; it never loads Docker. An OCI profile can additionally load Docker or export to a Distribution registry. This is not the runtime block attached to the VM.
 
 These artifacts may refer to the same source files, but they are not interchangeable and do not share an identity.
 
@@ -59,7 +60,7 @@ Dockerfile + context + local/Hub cache + optional registry cache
              OCI output
              /          \
             v            v
- Docker load/registry   deterministic compaction
+ native package / OCI registry   deterministic compaction
                               |
                               v
                   one verified SquashFS block
@@ -72,18 +73,19 @@ Keeping these representations separate gives BuildKit enough detail to reuse ind
 
 ## Remote service boundaries
 
-Palimpsest Hub and a Docker/OCI registry are separate services:
+Native packages/cache, legacy Hub artifacts and Docker/OCI registries use distinct authority and credentials:
 
 | Service | Protocol | Stores | Configuration |
 |---|---|---|---|
-| Palimpsest Hub | Native `/v1` | qcow2/raw boot images, SquashFS runtime blocks, bundles, mandatory BuildKit cache archives | `PALIMPSEST_URL`, `PALIMPSEST_TOKEN` |
-| Docker/OCI registry | Distribution `/v2` through Docker/Buildx | OCI images and optional BuildKit registry-cache exports | Registry profiles plus Docker credential store |
+| Native project registry | HTTPS `api_base`, `/v1/projects/{namespace}/...` | Verified `oci-image` / `runtime-bundle` versions, tags and separately scoped mandatory cache archives | `protocol = "palimpsest"` profile; package key through exact API-base/project helper entry or ephemeral `PALIMPSEST_PACKAGE_KEY` |
+| Legacy Palimpsest Hub | Native `/v1/images`, `/layers`, `/bundles` | Boot images, SquashFS runtime blocks and bundles | `PALIMPSEST_URL`; original `PALIMPSEST_TOKEN` |
+| Docker/OCI registry | Distribution `/v2` via Docker/Buildx | OCI images and optional external BuildKit registry caches | `protocol = "oci"` profile; Docker credentials |
 
-The current Hub is not a `/v2` registry and a registry profile does not redirect Hub requests. Conversely, a Docker registry does not replace the mandatory Hub cache lookup/upload in online mode.
+Hub is not a `/v2` registry. Every online solve uses explicit native package-key cache authority; the old `HubClient.push_blob` rejects BuildKit-cache writes, so a legacy token cannot supply an unqualified cache upload. Runtime SquashFS lookup/upload uses a separate original-token `runtime_hub_client`, never the native key. This does not grant native package keys privileged server-build authority; `/v1/builds` remains system-admin-only.
 
-Registry profiles live in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. An explicit registry in an image reference wins, then `--registry`, `PALIMPSEST_REGISTRY`, and the configured default. Palimpsest uses Docker's existing `DOCKER_CONFIG` or `~/.docker` credential helpers and never stores registry credentials in its profile or receipt. See [Docker/OCI Registry Profiles](registries.md).
+Profiles live in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Unqualified selection is `--registry`, then `PALIMPSEST_REGISTRY`, then default. A fully qualified tag whose authority has no configured profile stays an ordinary OCI reference, as before. A configured authority must map to one protocol, and an explicit alias must match the authority. OCI builds canonicalize tags against the selected profile only with `--push` or `--registry`; native builds always do. Native HTTPS requires the same authority as `endpoint`, verifies system/profile CAs and refuses redirects. Its helper key is `api_base.rstrip('/') + '/projects/' + namespace`, not the host-only Docker credential entry. See [registry profiles](registries.md) for secret-once issuance, login and binding prerequisites.
 
-Mirror, CA, plain-HTTP, and TLS-skip profile fields affect BuildKit only through the generated `buildkitd.toml`, after it is applied to an explicitly configured builder. They do not mutate Docker Engine/Desktop's pull/push trust store, insecure-registry list, or daemon mirrors.
+OCI mirror/CA/plain-HTTP/TLS-skip settings affect BuildKit only through the generated daemon config after it is applied to a separately configured builder. Native profiles reject mirrors/insecure transport/Docker exporters, are omitted from this daemon config, and apply their CAs directly to native HTTPS.
 
 ## Identity and cache contract
 
@@ -101,7 +103,9 @@ Palimpsest uses distinct digests for distinct questions:
 
 A BuildKit cache key is not a layer blob hash. Palimpsest's canonical pre-build key locates a portable local-exporter archive; its SHA-256 verifies the transported bytes, and BuildKit remains the authority that validates and consumes the cache records inside it.
 
-The canonical BuildKit key includes the complete local context, Dockerfile, platform, target, network policy, build-argument digest, pinned local-image descriptors, builder fingerprint, and `cache_scope`. It deliberately excludes output tags and the downstream VM base/SquashFS policy, which must not invalidate reusable Dockerfile vertices. Consequently, two cache scopes cannot collide on the Hub exact-key lookup and the same solve can publish multiple tags without duplicating build work. Online Dockerfiles must pin every fully qualified remote `FROM` and external `# syntax=` frontend as `@sha256:<64hex>`; moving tags and ARG-expanded image sources are rejected before builder inspection or Hub access. A selected registry profile never rewrites these Dockerfile inputs.
+The canonical BuildKit key includes the complete local context, Dockerfile, platform, target, network policy, build-argument digest, pinned local-image descriptors, builder fingerprint and `cache_scope`. It excludes output tags and downstream VM base/SquashFS policy so those do not invalidate reusable vertices. Online Dockerfiles must pin every fully qualified remote `FROM` and external `# syntax=` frontend as `@sha256:<64hex>`; mutable tags and ARG-expanded image sources are rejected before the solve and builder inspection. Cache-key and scope fallback remain bound to the authenticated project/package partition. Profiles never rewrite Dockerfile inputs.
+
+The native cache descriptor remains `palimpsest-buildkit-cache-archive-v1` and requires seven binding fields: `project_id`, `namespace`, `package`, `build_key`, `cache_scope`, `platform`, `builder_fingerprint`. `oci_manifest_digest` is optional provenance, not cache authority. Download, upload receipt and wrapper validation compare all binding fields. Keystone project/user IDs are exact opaque bounded ASCII strings (up to 64 characters, including federated 64-hex identities), not UUID-normalized or case-folded values; UUID normalization is only for Hub-generated key/session IDs.
 
 The initial implementation transports one deterministic tar per exported cache. This preserves instruction-level execution reuse after import, but it does not yet deduplicate transfer bytes across two different cache archives. The next storage-efficiency milestone is to publish the BuildKit cache manifest and referenced OCI blobs separately (or expose an OCI registry cache endpoint) so Hub transfers fetch only missing digests. Benchmark reports must distinguish “vertices reused” from “bytes avoided”; they are not the same result in the archive-based implementation.
 
@@ -121,9 +125,9 @@ When a runtime block is requested, the CLI resolves the immutable runtime base b
 
 The online default is Hub-first cache resolution. "Hub-first" means the Hub cache index is consulted before Palimpsest permits BuildKit to solve. An exact-key hit, or the latest same-scope archive used for partial reuse, is downloaded and SHA-256 verified even when an older local scope cache exists. Only an authoritative Hub miss permits fallback to the local scope cache or a cold solve.
 
-Each cache scope is single-flight from context hashing through Hub resolution, the BuildKit solve, cache upload, and local promotion. Hub scope-fallback names are additionally partitioned by platform and the Buildx/BuildKit fingerprint, so an exact-key miss never selects an incompatible newer cache merely because it shares a human cache scope. A completed exporter directory is first moved to `generations/<build-id>/`; only then is `current.json` atomically replaced. A crash or pointer-write failure therefore leaves the previous generation authoritative rather than exposing a partially replaced `current/` directory.
+Each online local cache partition is single-flight from context hashing through remote resolution, solve, upload and promotion. It is keyed by the selected native API base, namespace, authenticated project, exact package, scope, platform and builder fingerprint. Different native services sharing a host cannot reuse each other's local generations; a scope label alone is not project isolation. Exported caches move into `generations/<build-id>/` before atomic replacement of `current.json`; a crash preserves the previous authoritative generation.
 
-Registry-profile and repeated command-line `--cache-from`/`--cache-to` definitions use standard Buildx cache syntax. They are appended to the Hub-imported local cache and local cache exporter. An external cache hit can reduce solve work, but it cannot bypass Hub resolution, verification, fail-closed errors, or the refreshed Hub cache upload.
+For native output, cache profile/package default to the output profile and namespace/package; explicit `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE` can select another authorized cache partition. Online OCI output requires **both flags** and never uses `PALIMPSEST_TOKEN` as cache fallback. A key must have both `cache:read` and `cache:write`, even without `--push`. Native builds reject Docker cache exporters; OCI-profile and command-line exporters remain additive to the native imported cache and local exporter, never bypassing resolution or refresh.
 
 ```bash
 RUNTIME_BASE=sha256:<boot-image-digest>
@@ -132,6 +136,7 @@ palimpsest build . \
   --frontend dockerfile \
   -f Dockerfile \
   --registry corp \
+  --cache-registry hub --cache-package project-apps/demo \
   --tag demo:v1 \
   --tag demo:stable \
   --platform linux/amd64 \
@@ -143,17 +148,16 @@ palimpsest build . \
   --runtime-push
 ```
 
-The target execution order is:
+The source execution order is:
 
-1. Canonicalize the Dockerfile, context, platform, frontend, build arguments, and input image descriptors; resolve the runtime base and reject an architecture mismatch.
-2. Compute the BuildKit cache query key.
-3. Query the Hub cache index before executing the solve.
-4. On a Hub hit, download the selected archive, verify its SHA-256 and embedded key binding, and safely extract it before import.
-5. Permit local execution only after the Hub returns an authoritative cache miss.
-6. Export the OCI result, derive its runtime conversion key, reuse a verified local/Hub block hit or create the deterministic SquashFS runtime block, and verify it locally.
-7. Promote the exported cache under the local cache scope and the verified runtime block into the content-addressed artifact store.
-8. Upload the refreshed mandatory BuildKit cache to Hub in online mode and export any configured external cache backends.
-9. If `--push` is present, publish every resolved OCI image tag through Buildx. If `--runtime-push` is present, upload the runtime block to Hub after local verification.
+1. Resolve output protocol and exact cache authority; authorize cache actions (and package actions when native `--push` is requested) before local build state or builder activity.
+2. Resolve/check a requested runtime base, validate immutable Dockerfile inputs, inspect/pin the Buildx builder and compute the canonical build key.
+3. Query native exact-key cache, then compatible same-partition scope fallback. Download/verify any hit before import; only an authoritative remote miss permits local fallback or cold execution.
+4. Solve and export OCI plus local cache. For OCI output, Docker `--load` and Distribution `--push` exporters are part of this solve, not delayed native publication.
+5. For native output, freeze the verified archive and write typed local references immediately after export, before later cache upload can fail.
+6. Wrap the exported cache with its seven-field binding, upload through the native cache API, verify the receipt and promote the local generation.
+7. If requested, reuse/create and verify the SquashFS runtime pack, store its runtime tag, and upload it through the separate original-token Hub client for `--runtime-push`.
+8. For native `--push`, re-snapshot the retained export and publish each tag for the one exact namespace/package via package API compare-and-set. Cache or publication failure does not erase an already-valid native archive/reference.
 
 The online resolver is fail-closed:
 
@@ -164,7 +168,7 @@ The online resolver is fail-closed:
 
 This rule prevents a transient Hub problem from triggering an expensive or nondeterministic rebuild that looks like a valid cache miss.
 
-Hub SHA-256 verification proves byte integrity, not publisher intent. Every account allowed to publish cache records within a cache scope is therefore part of that scope's trust domain. Production deployments should restrict cache-write permission to trusted CI identities; signed provenance/attestation is a follow-up control, not a property claimed by this implementation.
+SHA-256 proves byte integrity, not publisher intent. Cache-write keys and their currently verified owners are part of that exact project/package's trust domain; keep those actions restricted to trusted build identities. Package-read/write actions alone cannot authorize caches, and caches are not runnable packages or package-inventory success. Signed provenance is not claimed by this implementation.
 
 ### Publish outputs after a local build
 
@@ -179,11 +183,11 @@ For a BuildKit runtime tag, this deferred path reads the verified CAS sidecar an
 
 An upload declares the SHA-256 digest first. If the Hub already has the registered blob, the payload transfer is skipped only after the client verifies that its name, kind, media type, chain/base identity, and architecture are compatible with the requested descriptor. Incompatible reuse fails explicitly instead of reporting a false successful registration. Otherwise, the client resumes at the Hub-confirmed byte offset and finalizes metadata only after the Hub rehashes the complete content. The current Hub schema still permits one canonical descriptor per blob digest; first-class multi-tag/ref aliases remain a follow-up schema change.
 
-OCI tags follow Docker-style registry semantics and are separate from immutable local runtime-layer tags. A build can also use `--load` to load a Docker-format output into the local Docker image store. `--push` and `--load` affect the OCI result; neither substitutes for `--runtime-push`.
+Native tags have typed local references under `state/package-references/<sha256(canonical-reference)>.json` (schema `palimpsest-local-package-reference-v1`, mode `0600`); retained exports are `state/package-artifacts/<archive-digest-hex>.oci.tar`. Each pins root and archive identities plus authority/API base, namespace/package and available project/build/publication metadata. A later native `push` uses that reference, or explicit `--input LAYOUT_OR_ARCHIVE` with `--manifest` for ambiguous roots. Native `pull --output ARCHIVE` verifies and returns original transport bytes, not Docker loading. Native builds reject `--load` and keep these references separate from runtime-layer tags. On OCI profiles, `--load` still loads Docker-format output. Neither native nor Docker image publication substitutes for `--runtime-push`.
 
 ## Strict offline build
 
-Offline mode is an execution policy, not merely a missing Hub URL. It must run with no Hub or registry resolution and with BuildKit `RUN` networking disabled.
+Offline mode is an execution policy, not merely a missing Hub URL. It runs with no Hub or registry resolution, never loads `registries.toml` and never looks up credentials, and BuildKit `RUN` networking is disabled. An offline build therefore records no typed native package reference. To publish its archive later, use native `push --input ARCHIVE --manifest sha256:...`.
 
 Prepare a verified OCI layout on local storage and pin the image identity in the argument itself:
 
@@ -222,7 +226,7 @@ Strict offline mode requires all of the following:
 - the selected local `docker-container` BuildKit daemon is already bootstrapped with Docker network mode `none`;
 - Palimpsest registry profiles are not loaded and registry authentication is not invoked; Docker may still read its selected `DOCKER_CONFIG` to locate the already-configured local context and builder;
 - the Hub client, remote registry resolver, and remote cache exporter are not constructed;
-- `--registry`, `--pull`, `--push`, `--runtime-push`, external `--cache-from`/`--cache-to`, and network-enabled build steps are rejected before solving.
+- `--registry`, `--cache-registry`, `--cache-package`, `--pull`, `--push`, `--runtime-push`, external `--cache-from`/`--cache-to`, and network-enabled build steps are rejected before solving.
 
 Missing local input is an error that names the unresolved alias or digest. Offline mode never reaches out to make the build succeed.
 
@@ -346,13 +350,15 @@ The workflow is complete only when all applicable gates pass.
 - A corrupt or partial blob is never promoted, imported, attached, or uploaded as complete.
 - Identical source inputs and pack policy produce the same runtime-block digest.
 - Concurrent builds of the same cache key use single-flight locking rather than duplicate work.
+- Package-only keys cannot authorize mandatory online caches; protected identities and unbound/mismatched project/package partitions fail closed before build effects.
+- Native cache descriptor/receipt bindings match all seven fields, and identical scope labels in different projects/packages cannot reuse each other's local generations.
 
 ### Offline isolation
 
 - A strict-offline acceptance test succeeds from a local OCI layout and local cache while outbound TCP and DNS are denied.
 - The test proves that no Hub client or remote registry resolver was constructed.
 - A missing local base, OCI blob, or cache input fails before BuildKit execution or VM creation.
-- `--offline` rejects `--registry`, `--pull`, both push flags, remote cache definitions, and network-enabled build steps.
+- `--offline` rejects `--registry`, `--cache-registry`, `--cache-package`, `--pull`, both push flags, remote cache definitions and network-enabled build steps; it never loads registry profiles.
 
 ### Block runtime
 
@@ -370,6 +376,7 @@ The workflow is complete only when all applicable gates pass.
 - Cache/output metadata becomes visible only after all referenced blobs exist and verify.
 - After clearing the local store, the same online build imports the Hub cache, executes no covered build vertex, attaches the runtime block, and passes the workload check.
 - A separately exported local OCI layout reproduces the build, attach, and workload check under strict offline conditions.
+- A real Dockerfile native build → deferred push → pull retains the selected root identity and exact original exported archive bytes, without Docker load/registry exporters or administrator write fallback. The 2026-10-02 isolated local proof exercised this path with synthetic identity; deployed-cloud acceptance remains separate.
 
 ### Performance release gate
 
@@ -409,5 +416,5 @@ The initial workflow activates application/toolchain content at `/opt/layers/mer
 - [Installation](install.md)
 - [Quickstart](quickstart.md)
 - [Compatibility and integration contract](compatibility.md)
-- [Docker/OCI registry profiles](registries.md)
+- [Native package and Docker/OCI registry profiles](registries.md)
 - [Implementation plan](../IMPLEMENTATION_PLAN.md)

@@ -33,14 +33,17 @@ from palimpsest_local.buildkit import (
 )
 from palimpsest_local.digest import digest_file
 from palimpsest_local.errors import DigestMismatchError, HubError, PalimpsestError, StateError
-from palimpsest_local.hub import KIND_BUILDKIT_CACHE, MEDIA_TYPE_BUILDKIT_CACHE
 from palimpsest_local.oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
-from palimpsest_local.state import StatePaths, init_roots, read_tag_record
+from palimpsest_local.package_reference import LocalPackageReference, read_package_reference, write_package_reference
+from palimpsest_local.package_source import snapshot_package
+from palimpsest_local.state import init_roots, read_tag_record
 
 D_IMAGE = "sha256:" + "a" * 64
 D_OTHER_IMAGE = "sha256:" + "b" * 64
 BUILDX_VERSION = "github.com/docker/buildx v0.30.1"
 BUILDKIT_VERSION = "v0.32.2"
+PROJECT_ID = "1" * 32
+CACHE_PACKAGE = "example/app"
 
 
 def _test_builder_fingerprint() -> str:
@@ -797,6 +800,11 @@ def test_offline_spec_rejects_registry_network_controls(tmp_path: Path, override
         _spec(tmp_path, offline=True, network="none", **overrides)
 
 
+def test_online_build_cannot_disable_mandatory_native_cache_refresh(tmp_path: Path):
+    with pytest.raises(PalimpsestError):
+        _spec(tmp_path, push_cache=False)
+
+
 def test_external_cache_spec_rejects_inline_secret_shaped_options(tmp_path: Path):
     with pytest.raises(PalimpsestError, match="credential"):
         _spec(
@@ -1017,6 +1025,26 @@ def test_cache_tar_round_trip_and_traversal_rejection(tmp_path: Path):
     assert not (tmp_path / "escaped").exists()
 
 
+@pytest.mark.parametrize("empty", [False, True])
+def test_bound_cache_rejects_plain_or_empty_archive(tmp_path: Path, empty: bool):
+    source = tmp_path / "cache"
+    source.mkdir()
+    if not empty:
+        (source / "index.json").write_text('{"schemaVersion":2}\n', encoding="utf-8")
+    archive = create_deterministic_tar(source, tmp_path / "cache.tar")
+    destination = tmp_path / "expanded"
+    with pytest.raises(PalimpsestError, match="descriptor"):
+        extract_cache_tar(
+            archive,
+            destination,
+            expected_build_key=D_IMAGE,
+            expected_project_id=PROJECT_ID,
+            expected_package=CACHE_PACKAGE,
+            expected_namespace="example-project",
+        )
+    assert not destination.exists()
+
+
 def _option_values(argv: list[str], option: str) -> list[str]:
     values: list[str] = []
     for index, argument in enumerate(argv):
@@ -1168,50 +1196,83 @@ def test_scope_cache_generation_sync_failure_does_not_advance_pointer(tmp_path: 
     assert (scope_root / "generations" / second_id / "index.json").is_file()
 
 
-class _OnlineCacheHub:
-    def __init__(self, cache_tar: Path, build_key: str):
-        self.cache_tar = cache_tar
-        self.build_key = build_key
-        self.calls: list[tuple[str, object]] = []
+class _NativeCache:
+    """Package-scoped cache fixture with independent archive and receipt state."""
 
-    def list_layers(self, **query):
-        self.calls.append(("list_layers", query))
-        assert query == {"kind": KIND_BUILDKIT_CACHE, "chain_id": self.build_key, "limit": 2}
-        return [
-            {
-                "blob_digest": digest_file(self.cache_tar),
-                "kind": KIND_BUILDKIT_CACHE,
-                "media_type": MEDIA_TYPE_BUILDKIT_CACHE,
-                "chain_id": self.build_key,
-            }
-        ]
+    def __init__(
+        self,
+        archive: Path | None = None,
+        *,
+        build_key: str = D_IMAGE,
+        resolution: str = "exact",
+        project_id: str = PROJECT_ID,
+        package: str = CACHE_PACKAGE,
+        api_base: str = "https://cache.example/v1",
+        namespace: str = "example-project",
+        actions: tuple[str, ...] = ("cache:read", "cache:write"),
+    ):
+        self.archive = archive
+        self.project_id = project_id
+        self.package = package
+        self.api_base = api_base
+        self.namespace = namespace
+        self.actions = actions
+        self.receipt = {
+            "project_id": project_id,
+            "package": package,
+            "namespace": self.namespace,
+            "build_key": build_key,
+            "cache_scope": "example-app",
+            "platform": "linux/amd64",
+            "builder_fingerprint": _test_builder_fingerprint(),
+            "resolution": resolution,
+            "archive_digest": digest_file(archive) if archive is not None else D_IMAGE,
+            "archive_size_bytes": archive.stat().st_size if archive is not None else 0,
+        }
+        self.upload: Path | None = None
 
-    def pull_blob(self, digest: str, destination: Path):
-        self.calls.append(("pull_blob", digest))
-        assert digest == digest_file(self.cache_tar)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(self.cache_tar.read_bytes())
+    def authorize(self, package: str, actions: tuple[str, ...]):
+        if package != self.package or not set(actions).issubset(self.actions):
+            raise HubError("cache scope or action denied")
+        return {"project_id": self.project_id}
+
+    def resolve_cache(self, package: str, **query):
+        self.authorize(package, ("cache:read",))
+        return self.receipt if self.archive is not None else None
+
+    def pull_cache(self, package: str, receipt: dict, destination: Path):
+        self.authorize(package, ("cache:read",))
+        if self.archive is None or digest_file(self.archive) != receipt["archive_digest"]:
+            raise HubError("archive not owned")
+        shutil.copyfile(self.archive, destination)
         return destination
 
-    def push_blob(self, path: Path, metadata: dict[str, object]):
-        self.calls.append(("push_blob", metadata))
-        assert path.is_file()
-        assert metadata["kind"] == KIND_BUILDKIT_CACHE
-        assert metadata["chain_id"] == self.build_key
-        assert metadata["media_type"] == MEDIA_TYPE_BUILDKIT_CACHE
-        return {"blob_digest": digest_file(path)}
+    def push_cache(self, package: str, archive: Path, descriptor: dict[str, object]):
+        self.authorize(package, ("cache:write",))
+        self.upload = archive
+        with tarfile.open(archive) as stream:
+            binding = json.load(stream.extractfile("palimpsest-cache.json"))
+        return {
+            **binding,
+            "archive_digest": digest_file(archive),
+            "archive_size_bytes": archive.stat().st_size,
+        }
 
 
-def _remote_cache_tar(tmp_path: Path, build_key: str) -> Path:
+def _remote_cache_tar(tmp_path: Path, key: str, **binding: object) -> Path:
     archive = tmp_path / "remote-cache.tar"
     descriptor = (
         json.dumps(
             {
                 "schema": CACHE_ARCHIVE_SCHEMA,
-                "build_key": build_key,
+                "build_key": key,
                 "cache_scope": "example-app",
                 "platform": "linux/amd64",
                 "builder_fingerprint": _test_builder_fingerprint(),
+                "project_id": PROJECT_ID,
+                "package": CACHE_PACKAGE,
+                "namespace": "example-project",
+                **binding,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1234,69 +1295,244 @@ def _remote_cache_tar(tmp_path: Path, build_key: str) -> Path:
     return archive
 
 
-def test_hub_scope_fallback_is_partitioned_by_platform_and_builder(tmp_path: Path):
-    spec = _spec(tmp_path)
-    fingerprint = _test_builder_fingerprint()
-    build_key = compute_build_key(spec, builder_fingerprint=fingerprint)
-
-    class EmptyHub:
-        def __init__(self):
-            self.calls: list[dict[str, object]] = []
-
-        def list_layers(self, **query):
-            self.calls.append(query)
-            return []
-
-    hub = EmptyHub()
-    cache, source = buildkit._resolve_hub_cache(
-        hub,
-        spec,
-        build_key,
-        tmp_path / "build",
-        tmp_path / "cache-blobs",
-        fingerprint,
-    )
-
-    compatible_name = buildkit._cache_name(spec.cache_scope, spec.platform, fingerprint)
-    assert cache is None
-    assert source == "none"
-    assert hub.calls == [
-        {"kind": KIND_BUILDKIT_CACHE, "chain_id": build_key, "limit": 2},
-        {"name": compatible_name, "kind": KIND_BUILDKIT_CACHE, "limit": 1},
-    ]
-    assert len(compatible_name) <= 64
-    assert compatible_name != buildkit._cache_name(spec.cache_scope, "linux/arm64", fingerprint)
-    assert compatible_name != buildkit._cache_name(spec.cache_scope, spec.platform, f"sha256:{'f' * 64}")
-
-
-def test_online_hub_hit_is_pulled_and_imported_into_buildkit(tmp_path: Path):
-    roots: StatePaths = init_roots(
-        {"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")}
-    )
+@pytest.mark.parametrize("resolution", ["exact", "scope"])
+def test_online_package_cache_is_imported_and_refreshed_with_owned_archive(tmp_path: Path, resolution: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     spec = _spec(tmp_path)
     build_key = compute_build_key(spec, builder_fingerprint=_test_builder_fingerprint())
-    hub = _OnlineCacheHub(_remote_cache_tar(tmp_path, build_key), build_key)
+    selected_key = build_key if resolution == "exact" else D_OTHER_IMAGE
+    cache = _NativeCache(_remote_cache_tar(tmp_path, selected_key), build_key=selected_key, resolution=resolution)
     runner = _SuccessfulBuildxRunner(spec, require_imported_cache=True)
 
-    build_with_buildkit(spec, roots, hub_client=hub, runner=runner)
+    record = build_with_buildkit(spec, roots, hub_client=cache, cache_package=CACHE_PACKAGE, runner=runner)
 
-    assert runner.calls
-    assert [name for name, _ in hub.calls][:2] == ["list_layers", "pull_blob"]
-    assert "push_blob" in [name for name, _ in hub.calls]
+    assert record["cache_source"] == f"hub-{resolution}"
+    assert record["cache_project_id"] == PROJECT_ID
+    assert record["cache_package"] == CACHE_PACKAGE
+    exported = extract_cache_tar(
+        cache.upload,
+        tmp_path / "uploaded-cache",
+        expected_build_key=build_key,
+        expected_project_id=PROJECT_ID,
+        expected_package=CACHE_PACKAGE,
+        expected_namespace="example-project",
+        expected_scope=spec.cache_scope,
+        expected_platform=spec.platform,
+        expected_builder_fingerprint=_test_builder_fingerprint(),
+    )
+    assert (exported / "cache-blob").read_bytes() == b"new-buildkit-cache"
 
 
-def test_online_hub_errors_propagate_without_running_buildkit(tmp_path: Path):
+@pytest.mark.parametrize("resolution", ["exact", "scope"])
+@pytest.mark.parametrize(
+    "binding",
+    [
+        {"project_id": "2" * 32},
+        {"package": "foreign"},
+        {"namespace": "other-project"},
+        {"build_key": D_OTHER_IMAGE},
+        {"cache_scope": "other"},
+        {"platform": "linux/arm64"},
+        {"builder_fingerprint": D_OTHER_IMAGE},
+        {"project_id": None},
+        {"package": None},
+        {"namespace": None},
+    ],
+)
+def test_online_cache_rejects_archive_binding_before_solve(tmp_path: Path, resolution: str, binding: dict):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+    build_key = compute_build_key(spec, builder_fingerprint=_test_builder_fingerprint())
+    cache = _NativeCache(_remote_cache_tar(tmp_path, build_key, **binding), build_key=build_key, resolution=resolution)
+    runner = _SuccessfulBuildxRunner(spec)
+
+    with pytest.raises(PalimpsestError, match="mismatch"):
+        build_with_buildkit(spec, roots, hub_client=cache, cache_package=CACHE_PACKAGE, runner=runner)
+    assert not spec.output.exists()
+    assert all(command[:3] != ["docker", "buildx", "build"] for command in runner.calls)
+
+
+@pytest.mark.parametrize("actions", [("cache:read",), ("packages:read", "packages:write")])
+def test_cache_authorization_denies_before_preflight_or_writes(tmp_path: Path, actions: tuple[str, ...]):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path, output=tmp_path / "new-output" / "image.tar")
+    cache = _NativeCache(actions=actions)
+    runner = _SuccessfulBuildxRunner(spec)
+    before_builds = set(roots.builds.iterdir())
+    before_cache = set(roots.build_cache.iterdir())
+
+    with pytest.raises(HubError, match="denied"):
+        build_with_buildkit(spec, roots, hub_client=cache, cache_package=CACHE_PACKAGE, runner=runner)
+
+    assert runner.calls == []
+    assert set(roots.builds.iterdir()) == before_builds
+    assert set(roots.build_cache.iterdir()) == before_cache
+    assert not spec.output.parent.exists()
+
+
+def test_online_cache_requires_explicit_package_even_with_legacy_token(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "original-member-token")
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+    runner = _SuccessfulBuildxRunner(spec)
+    with pytest.raises(PalimpsestError, match="explicit native cache"):
+        build_with_buildkit(spec, roots, hub_client=_NativeCache(), runner=runner)
+    assert runner.calls == []
+    assert not spec.output.exists()
+
+
+def test_online_hub_errors_propagate_without_local_fallback(tmp_path: Path):
     roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     spec = _spec(tmp_path)
 
-    class BrokenHub:
-        def list_layers(self, **_query):
+    class BrokenCache(_NativeCache):
+        def resolve_cache(self, package: str, **query):
             raise HubError("hub unavailable")
 
     runner = _SuccessfulBuildxRunner(spec)
     with pytest.raises(HubError, match="hub unavailable"):
-        build_with_buildkit(spec, roots, hub_client=BrokenHub(), runner=runner)
-    assert runner.calls == [["docker", "buildx", "inspect"], ["docker", "buildx", "version"]]
+        build_with_buildkit(spec, roots, hub_client=BrokenCache(), cache_package=CACHE_PACKAGE, runner=runner)
+    assert not spec.output.exists()
+    assert all(command[:3] != ["docker", "buildx", "build"] for command in runner.calls)
+
+
+def test_online_local_cache_fallback_is_partitioned_by_service_namespace_project_and_package(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    initial = _spec(tmp_path)
+    buildkit._promote_scope_cache(
+        _write_cache_export(tmp_path / "legacy-export", "unqualified-cache"),
+        roots.build_cache / initial.cache_scope,
+        "bk-333333333333",
+    )
+    cases = [
+        ("https://cache.example/v1", "example-project", PROJECT_ID, CACHE_PACKAGE, "none"),
+        ("https://cache.example/v1", "example-project", PROJECT_ID, "other/app", "none"),
+        ("https://cache.example/v1", "example-project", "2" * 32, CACHE_PACKAGE, "none"),
+        ("https://other.example/v1", "example-project", PROJECT_ID, CACHE_PACKAGE, "none"),
+        ("https://cache.example/other", "example-project", PROJECT_ID, CACHE_PACKAGE, "none"),
+        ("https://cache.example/v1", "other-project", PROJECT_ID, CACHE_PACKAGE, "none"),
+        ("https://cache.example/v1", "example-project", PROJECT_ID, CACHE_PACKAGE, "local"),
+    ]
+    for number, (api_base, namespace, project, package, expected_source) in enumerate(cases):
+        spec = replace(initial, output=tmp_path / f"output-{number}.tar")
+        cache = _NativeCache(api_base=api_base, namespace=namespace, project_id=project, package=package)
+        runner = _SuccessfulBuildxRunner(spec)
+        record = build_with_buildkit(spec, roots, hub_client=cache, cache_package=package, runner=runner)
+        assert record["cache_source"] == expected_source
+        solve = next(command for command in runner.calls if command[:3] == ["docker", "buildx", "build"])
+        assert bool(_option_values(solve, "--cache-from")) == (expected_source == "local")
+
+
+@pytest.mark.parametrize("project_id", ["a" * 64, "Federated.Project_A-7"])
+def test_cache_partition_preserves_authorized_project_identity(tmp_path: Path, project_id: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+    cache = _NativeCache(project_id=project_id)
+    record = build_with_buildkit(
+        spec, roots, hub_client=cache, cache_package=CACHE_PACKAGE, runner=_SuccessfulBuildxRunner(spec)
+    )
+    with tarfile.open(cache.upload) as archive:
+        descriptor = json.load(archive.extractfile("palimpsest-cache.json"))
+    assert record["cache_project_id"] == project_id
+    assert descriptor["project_id"] == project_id
+
+
+def test_native_export_callback_retains_verified_reference_when_cache_finalize_fails(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    reference = "cloud.example/example-project/example/app:test"
+    spec = _spec(tmp_path, tag=reference)
+    layout = _write_minimal_oci_layout(tmp_path / "export-layout")
+    layer_stream = io.BytesIO()
+    with tarfile.open(fileobj=layer_stream, mode="w") as archive:
+        payload = b"retained application bytes"
+        member = tarfile.TarInfo("app")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    layer = layer_stream.getvalue()
+    layer_digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+        }
+    ).encode()
+    manifest = _add_oci_descriptor(layout, layer, config=config)
+    manifest_path = layout / "blobs" / "sha256" / manifest.split(":", 1)[1]
+    (layout / "index.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": manifest,
+                        "size": manifest_path.stat().st_size,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    buildx = _SuccessfulBuildxRunner(spec)
+
+    def runner(argv, **kwargs):
+        result = buildx(argv, **kwargs)
+        if list(argv)[:3] == ["docker", "buildx", "build"]:
+            create_deterministic_tar(layout, spec.output)
+            metadata = Path(_option_values(list(argv), "--metadata-file")[0])
+            metadata.write_text(json.dumps({"containerimage.digest": manifest}), encoding="utf-8")
+        return result
+
+    def retain_export(build_id: str, selected_manifest: str | None):
+        with snapshot_package(spec.output, manifest=selected_manifest) as snapshot:
+            retained = roots.state / "package-artifacts" / (snapshot.archive_digest.split(":", 1)[1] + ".oci.tar")
+            retained.parent.mkdir(parents=True)
+            shutil.copyfile(snapshot.archive, retained)
+            write_package_reference(
+                roots,
+                LocalPackageReference(
+                    reference=reference,
+                    authority="cloud.example",
+                    api_base="https://cloud.example/v1",
+                    namespace="example-project",
+                    package=CACHE_PACKAGE,
+                    archive=str(retained),
+                    archive_digest=snapshot.archive_digest,
+                    archive_size_bytes=snapshot.archive_size_bytes,
+                    root_digest=snapshot.root_digest,
+                    package_type=snapshot.package_type,
+                    project_id=PROJECT_ID,
+                    build_id=build_id,
+                ),
+            )
+
+    class RevokedDuringFinalize(_NativeCache):
+        def push_cache(self, package: str, archive: Path, descriptor: dict[str, object]):
+            raise HubError("key revoked during cache finalization")
+
+    with pytest.raises(HubError, match="revoked"):
+        build_with_buildkit(
+            spec,
+            roots,
+            hub_client=RevokedDuringFinalize(),
+            cache_package=CACHE_PACKAGE,
+            on_oci_export=retain_export,
+            runner=runner,
+        )
+
+    spec.output.write_bytes(b"mutable exporter output replaced after failure")
+    local = read_package_reference(roots, reference)
+    retained = Path(local.archive)
+    assert digest_file(retained) == local.archive_digest
+    with snapshot_package(retained, manifest=local.root_digest) as snapshot:
+        assert snapshot.root_digest == manifest
+        assert snapshot.package_type == "oci-image"
+    with tarfile.open(retained) as archive:
+        original_layer = archive.extractfile("blobs/sha256/" + layer_digest.split(":", 1)[1]).read()
+    with tarfile.open(fileobj=io.BytesIO(original_layer)) as layer_archive:
+        assert layer_archive.extractfile("app").read() == b"retained application bytes"
 
 
 def test_offline_build_never_calls_hub(tmp_path: Path):
@@ -1647,8 +1883,6 @@ def test_runtime_manifest_reader_kills_unsquashfs_at_bounded_output(tmp_path: Pa
     process = OversizedProcess()
 
     def fake_popen(command, **kwargs):
-        assert command[:2] == ["unsquashfs", "-cat"]
-        assert kwargs == {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
         return process
 
     monkeypatch.setattr(buildkit.subprocess, "Popen", fake_popen)
@@ -1691,38 +1925,29 @@ def test_online_runtime_pack_hub_hit_skips_compaction_and_materializes_local_sta
         push=True,
     )
     buildx = _SuccessfulBuildxRunner(spec)
-    hub_calls: list[tuple[str, object]] = []
+    uploaded_runtime: list[tuple[bytes, dict[str, object]]] = []
+    cache = _NativeCache()
 
     class RuntimeHitHub:
         def list_layers(self, **query):
-            hub_calls.append(("list_layers", query))
-            if query.get("kind") == KIND_BUILDKIT_CACHE:
-                return []
             assert query["kind"] == "squashfs"
             return [
                 {
                     "blob_digest": runtime_digest,
                     "kind": "squashfs",
                     "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
-                    "chain_id": query["chain_id"],
+                    "chain_id": f"sha256:{hashlib.sha256(expected_manifest_bytes()).hexdigest()}",
                     "base_image_digest": runtime_base,
                     "arch": "x86_64",
                 }
             ]
 
         def pull_blob(self, digest: str, destination: Path):
-            hub_calls.append(("pull_blob", digest))
             assert digest == runtime_digest
             destination.write_bytes(runtime_blob)
 
         def push_blob(self, path: Path, metadata: dict[str, object]):
-            hub_calls.append(("push_blob", metadata))
-            if metadata["kind"] == "squashfs":
-                assert metadata["name"] == "hub-runtime"
-                assert metadata["chain_id"].startswith("sha256:")
-                assert digest_file(path) == runtime_digest
-            else:
-                assert metadata["kind"] == KIND_BUILDKIT_CACHE
+            uploaded_runtime.append((path.read_bytes(), metadata))
             return {"blob_digest": digest_file(path)}
 
     def expected_manifest_bytes() -> bytes:
@@ -1760,12 +1985,36 @@ def test_online_runtime_pack_hub_hit_skips_compaction_and_materializes_local_sta
             return subprocess.CompletedProcess(command, 0, stdout=expected_manifest_bytes(), stderr=b"")
         return buildx(argv, **kwargs)
 
-    record = build_with_buildkit(spec, roots, hub_client=RuntimeHitHub(), runner=runner)
+    record = build_with_buildkit(
+        spec,
+        roots,
+        hub_client=cache,
+        cache_package=CACHE_PACKAGE,
+        runtime_hub_client=RuntimeHitHub(),
+        runner=runner,
+    )
 
     assert record["runtime_cache_source"] == "hub"
     assert record["runtime_block_digest"] == runtime_digest
     assert read_tag_record(roots, "hub-runtime").digest == runtime_digest
     metadata = ContentStore(roots.store).read_metadata(runtime_digest)
     assert metadata["runtime_pack_manifest_digest"] == record["runtime_pack_manifest_digest"]
-    assert [name for name, _ in hub_calls].count("pull_blob") == 1
-    assert [name for name, _ in hub_calls].count("push_blob") == 2
+    assert uploaded_runtime == [
+        (
+            runtime_blob,
+            {
+                "name": "hub-runtime",
+                "kind": "squashfs",
+                "parent_digest": None,
+                "chain_id": record["runtime_pack_manifest_digest"],
+                "base_image_digest": runtime_base,
+                "arch": "x86_64",
+                "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                "is_published": False,
+            },
+        ),
+    ]
+    with tarfile.open(cache.upload) as archive:
+        descriptor = json.load(archive.extractfile("palimpsest-cache.json"))
+    assert descriptor["project_id"] == PROJECT_ID
+    assert descriptor["package"] == CACHE_PACKAGE

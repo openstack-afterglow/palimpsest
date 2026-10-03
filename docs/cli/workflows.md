@@ -468,8 +468,16 @@ palimpsest ui --port 8080 --no-browser
 ```
 
 The default `--port 0` chooses an available loopback port; explicit ports are
-1024–65535. The dashboard reads and mutates through the same Local inventory
-layer as CLI commands.
+1024–65535. Open the printed `http://127.0.0.1:PORT/?token=...` URL; the
+process stays in the foreground until interrupted. The dashboard reads through
+the same Local inventory layer as CLI commands and shows overview, VM, volume,
+layer/image, network, build, and storage views with five-second refresh.
+
+It is read-only unless started with `--allow-control`, which enables the
+existing VM lifecycle, image import, artifact removal, and state-root controls.
+Volume and network rows are stored metadata or committed configuration, not
+live attachment or listener proof; see the
+[usage guide](usage.md#local-store-and-ui) for each view's source.
 
 ### Install shell completion
 

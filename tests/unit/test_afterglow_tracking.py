@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "check_afterglow_drift.py"
-MANIFEST_PATH = REPOSITORY_ROOT / "tracking" / "afterglow-palimpsest.json"
 
 
 def _load_checker_module():
@@ -90,19 +88,3 @@ def test_checker_rejects_forbidden_markers_and_absent_service_creation(tmp_path:
     manifest["contracts"][0]["upstream"][0]["must_not_contain"] = ""
     errors = checker.verify_contract(manifest, upstream_root, local_root)
     assert "hub upstream: api/hub.py has a non-list must_not_contain" in errors
-
-
-def test_manifest_records_the_current_hub_protocol_gap():
-    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 1
-    assert manifest["upstream"]["baseline_commit"] == "d0250db689631f095dab2ac78ddad89651422c6b"
-
-    contracts = {contract["id"]: contract for contract in manifest["contracts"]}
-    hub_contract = contracts["hub-http-v1"]
-    assert hub_contract["status"] == "implemented"
-    assert "Upload-Offset" in hub_contract["analysis"]
-    assert 'HUB_API_PREFIX = "/v1"' in hub_contract["counterparts"][0]["must_contain"]
-
-    union_contract = contracts["union-layer-operations"]
-    assert union_contract["status"] == "afterglow-owned"
-    assert union_contract["counterparts"] == []

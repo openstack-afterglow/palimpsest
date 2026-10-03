@@ -24,7 +24,7 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
-**현재 인계 (2026-09-25):** 이 작업트리는 PR #4 merge commit `5f33eb7`을 포함한 로컬 `dev`이며 root `palimpsest-local`과 Hub `palimpsest-hub` 버전은 모두 `0.2.0`이다. 현재 릴리스 판단과 병합 후 native 검증 공백은 [아래 릴리스 인계](#현재-릴리스-인계-2026-09-25)를 따른다. 아래의 2026-09-14 snapshot 및 이후 날짜별 branch·SHA·실기 영수증은 당시 기록이지 현재 버전이나 게시 상태가 아니다.
+**Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image-tag candidate is also `0.3.0` and its source default is the reviewed immutable candidate SHA. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
 
 **2026-09-19 기록 안내:** 아래 `현재 스냅샷`과 frontmatter의
 2026-09-14 값은 당시 기록이다. 당시 작업트리의 source 상태와 승인 대기는
@@ -2266,6 +2266,175 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 - `hub/src/palimpsest_hub/database.py`의 asyncmy engine ping에서 이 닫힌 transport signature에 한해 disconnect를 반환하고, unrelated `RuntimeError`와 이미 시작된 SQL transaction은 재시도하지 않는다. 독립 SQLAlchemy stale-ping 재현은 변경 전 예외 전파를 보였고 `hub/tests/test_database_pool.py`는 변경 후 checkout 복구·무관한 예외 전파를 확인했다. Hub source version 0.2.1, root client 0.2.3. 운영 새 image의 양쪽 architecture build, CI, exact digest pin, Kolla 배포, 실제 업로드 검증은 이 문단 작성 시점의 다음 작업이며 완료 증거로 취급하지 않는다.
 - Local Docker daemon builder에서 Hub API/worker를 각각 linux/amd64·linux/arm64로 빌드하고, 네 image 모두 `--network none` 실행 시 `palimpsest-hub 0.2.1` import가 성공했다. Docker-container builder의 Docker Hub DNS 단절은 daemon-backed build로 처리했다. 최초 dev push `53e47b4`의 CI portable/development-package 공통 실패는 새 `hub/tests/test_database_pool.py`가 `scripts/test_lanes.py` 정본에 빠진 것이 원인이었다. 누락을 Hub lane에 추가한 뒤 canonical `list --check`가 통과했다. CI green과 main 발행, immutable digest, Kolla 재배포 및 실제 업로드 재검증은 별도 완료 증거가 필요하다.
 
+## dev patch preparation — 2026-09-27 (local, unpublished)
+
+- Created `/Users/pieroot/code/palimpsest-dev` as a separate clean worktree from `origin/dev` at `cf541223cd2a43fa4125652554ce18b8dffa83d1`; the missing `/tmp/palimpsest-root-package` registration alone was removed. The `codex/oci-root-phase1` worktree and other stale registrations were left untouched. Root source/lock now prepare `palimpsest-client 0.2.4`; old PyPI 0.2.3 proof above remains historical, not proof of a 0.2.4 release.
+- The dev Hub pool regression was already present at starting commit `53e47b4`, and `cf54122` classified its test in the canonical Hub lane. Independent review found the Hub module identity at 0.2.0 despite Hub package metadata 0.2.1, a test coupling that module identity to the older Kolla default image tag, and first-host-only Hub volume initialization despite per-host containers. The local follow-up now reports Hub `__version__` 0.2.1, removes that coupling, and pulls the reviewed API image and initializes the local named volume root on every Palimpsest host; DB bootstrap still runs once on the first host. The Kolla default image tag remains 0.2.0. A root wheel bump does not deploy Hub source: reviewed fixed API/worker image digests must be pinned separately.
+- Astra planning/approval remains unavailable. An independent reviewer inspected the absolute checkout, initially blocked on the three findings above, then approved their corrected working-tree source in a second read-only review; this code verdict does not authorize publication. Do not commit, push, tag, publish, alter runner settings, send helpers or operate shared infrastructure without the applicable explicit approvals. Before release, stage the reviewed correction together with the root patch; recheck frozen lock, CLI/version and wheel/sdist role payload, Hub pool regression and canonical lanes, architecture freshness, then the required native KVM proof and release/image workflows on the exact authorized tag. The persistent self-hosted KVM PR exposure remains an inherited owner decision, not a fix in this patch.
+- Pre-review local verification for the earlier 0.2.4 candidate snapshot: root pytest 5,696 passed and 209 skipped; Hub pytest 100 passed; root and Hub Ruff checks and formatting passed; canonical lane manifest validated; `uv build --wheel` and `scripts/build_package.py` produced a wheel/sdist whose installed CLI reports 0.2.4 and whose Kolla role payload is present. Hub API/worker were built from that checkout for linux/amd64 and linux/arm64; all four images imported the 0.2.1 Hub distribution without network and reported the expected guest architecture. The earlier staged architecture freshness guard passed. These results do not validate the subsequent reviewer-driven source/role edits. No 0.2.4 native KVM proof, GitHub workflow, PyPI publication, immutable image digest, production role upgrade or authenticated Hub upload has been observed.
+- Follow-up local checks on the corrected worktree: the isolated root `tests/` suite passed 5,913 with 260 skipped; 18 focused Kolla/package tests and all 100 isolated Hub tests passed. Root/Hub frozen locks, canonical lane manifest, Ruff checks and formatting passed; Hub module and installed distribution both report 0.2.1. `scripts/build_package.py` built the root 0.2.4 wheel and sdist, installed the sdist-built wheel in isolation and exercised the CLI. The root wheel contains per-host image-pull/volume tasks and a single-host database bootstrap. Rebuilt Hub API/worker linux/amd64 and linux/arm64 images all ran offline, imported the matching 0.2.1 module/distribution and reported the expected guest architecture. The production volume-owner command changed two distinct disposable named volume roots to 1000:1000 before they were removed. This same-daemon proxy is not a real multi-host Ansible run, native KVM proof, authenticated upload, remote publication or deployment. Architecture working/staged freshness checks apply only to the final reviewed index.
+
+## 격리 Hub 후보 운영 인계 — 2026-09-27 (production 미승격)
+
+이 절은 위 날짜별 기록을 고치지 않는다. 근거는 private workdir
+`/Users/pieroot/.local/share/palimpsest-candidate-024/`의 **비밀이 아닌**
+`candidate-resources.json`, `artifact-receipt.json`, `base-receipt.json`,
+`transport-receipt.json`, `http-receipt.json`, `cli-receipt.json`,
+`normal-build-receipt.json`, `recovery-receipt.json`, `reboot-receipt.json`과
+`browser-receipt.json`이다. 이들은 시점별 관찰이지 현재 상태의 자동 보증이
+아니다. `api.env`, `build-worker.env`, `compose.env`, private SSH key와
+Keystone 입력은 출력·문서화하지 않는다. 기존 `palimpsest-dev` 소스는 미게시
+root client `0.2.4` / Hub `0.2.1`; Kolla 기본 Hub tag는 `0.2.0`이며
+published root `0.2.3`과 다르다.
+
+- 격리 자원: owner `palimpsest-candidate-024`, Nova server
+  `38cadbb8-6f1c-45ab-a7ec-d11339d78f7a` (`172.30.104.11` private),
+  boot volume `61cfa349-e14f-4e33-be7d-1302590223e6`, 40 GiB data volume
+  `fc4f7e9e-ff25-473a-a610-376ecd9c6492`. 원본 Glance base image
+  `4da46b06-1e48-4bf8-adac-4c0ed5424797`는 3,758,096,384 bytes,
+  SHA-256 `08d3b10e89e6d1d0d089b09302794e2949e0deb731c3fd240ec6b445d535a3df`.
+  설치 스크립트 `install_host.py`는 data disk serial/size/blankness를 확인한
+  뒤 ext4로 만들고 UUID fstab mount `/srv/h`(UID/GID 2001, 0700)을 설정한다.
+  **이미 설치된 disk에 이 일회성 스크립트를 재실행하지 않는다.** Hub API,
+  export worker와 bootstrap은 container UID/GID `2001:2001`로 `/srv/h:/srv/h`를
+  mount하고, 별도 KVM build worker는 UID 2001의 systemd process다. Local
+  interpreter `/opt/palimpsest/local/bin/python`, Hub interpreter
+  `/opt/palimpsest/hub/bin/python`, config `/etc/palimpsest-candidate/`(0700;
+  env/compose 파일 0600), Compose project `palimpsest-candidate-024`이다.
+- Source transfer `source.tar` SHA-256
+  `88cd80c29c7bcba6a338df2bb3c2eebc5b452cea653a41885cd16d3a9ba0d30d`,
+  amd64 image archive `hub-amd64.tar` SHA-256
+  `3ba68c8eb37ef5d2141f9e660bc38f5998fdbd1b312c24403701f142427a28e4`.
+  Source archive hash binds the copied candidate bytes (including the
+  worktree's local changes), **not** a published Git commit or production
+  reproducibility receipt; `source-manifest.json` is private audit input.
+  Candidate **local Docker image IDs** (not registry digests): API amd64
+  `sha256:4641f6f90bc8e44fd12c3650c560757262d9278654ca9739684100cb9cac82e3`,
+  API arm64 `sha256:4cf67d6412599106d02f32e32f1c84e8f604787e05c5149bfe322d9441a2dbb6`,
+  worker amd64 `sha256:066df451b348a70daf61ce67f2c1a8da4404f17ba32e3a983b4307a3ecf9fce8`,
+  worker arm64 `sha256:6eb51f9a94094ac68479ac3f2670aefdc99f8bf6c6e3e21af147414323c656a7`.
+  Wheel receipts: client 0.2.4 `4e1ae84ce2dfff9936a4e97449ba81ebf49fc60e6b90c67346d89d5949246b29`,
+  Hub 0.2.1 `2629a8539991fdcc1e20a1ade54baaecdd69b3adb0f088ef630e8aab7ed37abd`.
+  These do not establish published immutable GHCR digests or production image pins.
+- Access is deliberately loopback-only: Compose publishes API
+  `127.0.0.1:8020` and MariaDB `127.0.0.1:3306` on the candidate host, with no
+  Redis host port. Use the private SSH config and candidate alias with local
+  forwarding (see [install guide](install.md#isolated-hub-candidate-access-and-data-safety));
+  browser/API URL `http://127.0.0.1:18020` is localhost at the **client** end
+  of SSH, not an unauthenticated public HTTP listener. Stop the tunnel by ending
+  its SSH foreground process; it does not stop services. For services, inspect
+  `systemctl status palimpsest-candidate.service palimpsest-build-worker.service`
+  and `docker compose --env-file compose.env -f compose.yml ps` from
+  `/etc/palimpsest-candidate` on the candidate host. The two enabled units
+  start Compose API/export worker and the separate build worker, require the
+  `/srv/h` mount, and reboot through systemd. A `systemctl stop` of the oneshot
+  Compose unit alone **does not stop its containers** (no `ExecStop`); follow
+  the explicit safe stop procedure in the install guide before backup.
+- `/v1/health` returning `{"status":"ok"}` only confirms an API process. The
+  separate `verify_readiness.py` checks active units, successful bootstrap,
+  running UID 2001 API/export containers, no privileged devices/host PID,
+  exact mount and loopback bindings, isolated build-worker environment, SQL
+  `SELECT 1`, Redis `PING`, `/srv/h` space and health. It is a script contract,
+  not a claim that health implies SQL/Redis/authenticated writes or guest boot.
+  `transport-receipt.json` records uvloop 0.22.1, asyncmy 0.2.13,
+  SQLAlchemy 2.0.51, closed TCP connection pre-ping classified as
+  `OperationalError`, renewed connection and `SELECT 1` both protected and
+  unprotected; exact upstream `uvloop RuntimeError` was **not reproduced**.
+- Authenticated HTTP `http-receipt.json` includes unauthorized layers 401,
+  authorized list 200, resumable upload start/PATCH/query, offset-conflict
+  409 and recovery, finalized layer blob 200 and range 206, metadata/ancestor
+  reads. `cli-receipt.json` records `image ls --arch x86_64 --disk-format raw`,
+  `layer ls --name candidate-024-layer-one`, `layer pull` (all exit 0) and
+  byte-matched 3,758,096,384-byte base; the CLI pull output path is a
+  **directory**, not a regular file. The earlier command journal warning was
+  fixed by creating a private log directory. The ordinary two-layer/two-RUN
+  KVM build `41f491a9-a11b-45f6-a0ae-b43b8924bc91` advanced
+  queued→building→complete, returned the 4,096-byte SquashFS
+  `sha256:1007b6e2eb16daa752fdce76ef737ab22cf871babc1383e3e6c39f8435b88df6`,
+  recorded exact two RUN files and absent owned domain/scratch. A restricted
+  application credential received 401 for build status; separately, an actual
+  project member password token received build 403 (`nonadmin-build-receipt.json`).
+- Timeout build `1ad5444e-24c2-4391-bec1-ea09e15302c1` ended
+  `error/build_failed`; killed-main-worker restart build
+  `0e807e8e-6d3e-434b-b799-0fc3e3716c03` ended
+  `error/worker_interrupted`, with owned guest/domain/scratch absent and the
+  temporary build deadline returned to 3600 seconds. Reboot receipt has
+  different boot IDs `8199f365-ab55-425a-a0f7-7c71504d56c0` →
+  `f97beedf-059d-495f-a9e5-c7ad327e3c2b`, zero active jobs, authenticated
+  layer checks, full base SHA-256 on mounted CAS and a fresh post-reboot layer
+  upload `sha256:26ddc4a177769b0226458adfc20c5ba84c32a05180e47ad1e634377bc5be1c3b`.
+  This is candidate single-host durability, not production restart/failover.
+  Earlier `browser-receipt.json` shows the layer/build lists and a 4,096-byte
+  authenticated layer download with matching digest. Later
+  `c6-browser-receipt.json` records a **real browser UI submission** of build
+  `ff672fef-f991-436d-b8d5-0ee074b39ff0`: queued→building→complete,
+  output 4,096 bytes at
+  `sha256:21c85bbe39bd85170cd27c4c24ff450d395d58cbf43308d85890da928ab73044`,
+  saved-file SHA-256 equal, and exact `ran-one`/`ran-two` files in the output.
+  The real Chrome download used the supported anchor fallback after launching
+  Chrome with FileSystemAccess disabled; the default native macOS file picker
+  was not automatable and no saved-file claim is made for that earlier attempt.
+  The Hub console has no detail button: authenticated build/layer/ancestor
+  details were read in actual `/docs` Swagger UI (chain complete), not by
+  inventing an app detail view. No console errors were observed in this flow.
+  Candidate native-CI Glance input image `4217de09-9771-40af-8d01-964f09566cf0`
+  is active in `ci-image-receipt.json` with SHA-512 matching the base receipt;
+  protected CI environment and helper are separate from Hub user credentials.
+  The initial helper rejected an internal HTTP Keystone URL before creation.
+  Actual HTTPS attempts then exposed QEMU `/dev/kvm` permission denial behind
+  a lifecycle socket reset. The helper now adds only the disposable guest user
+  to `kvm` and starts native proof with refreshed supplementary groups instead
+  of relying on a one-time device ACL.
+- **Manual native proof passed**, owner `openstack-afterglow/palimpsest/202609271/6`.
+  `native-openstack-evidence-6/native-proof-receipt.json` binds the original
+  candidate tar SHA-256
+  `88cd80c29c7bcba6a338df2bb3c2eebc5b452cea653a41885cd16d3a9ba0d30d`,
+  pinned kernel/config, **43 boots / 44 QEMU invocations**, exact 45-file stage-1
+  evidence and matching mounted SquashFS/replay receipts plus EROFS evidence.
+  Stage-1 receipt SHA-256 is
+  `6e9ec697c8802cd9cefb9a3dc4f2a7180c276af101aefe34f78259eafc163e94`.
+  Server `91ab2a05-7f11-4694-b3ae-7a0d8279a312`, volume
+  `37c41b83-98da-4aa5-9e91-9f68a0b884b6`, port
+  `e7286606-95e9-455a-9010-e5e820bd6c18`, SG
+  `021bf145-721b-42fe-9ea8-60abc3e06e8e` and run key were reclaimed;
+  manifest requires `cleanup_verified=true`. Failed and diagnostic attempts
+  retain their separate receipts; diagnostic archives do not qualify the candidate.
+  Focused helper/workflow/architecture contracts: **188 passed**, Ruff and lane
+  classification passed. **No GitHub push, GitHub native CI run, publication or
+  production release is claimed.** Protected environment kernel/config HTTPS
+  URL variables are still unset and fail closed; configure reviewed URLs for
+  the pinned bytes before an approved trusted-ref CI execution.
+  The current restricted CI application credential expires at
+  `2026-10-27T16:01:38Z`; renew it with the same member-only project/role and
+  protected environment policy before expiry. `final-resource-receipt.json`
+  confirms candidate VM ACTIVE and both data/boot volumes attached, plus exact
+  server/volume/port/SG absence for all six created native attempts. Per-attempt
+  cleanup manifests also verify run-key absence. Diagnostic source instrumentation
+  and temporary diagnostic archives were removed; original source and all run
+  receipts/logs remain private.
+- Outstanding production promotion gates: source-based candidate IDs are not
+  current production image digests; recover the **actual** previous production
+  API/worker immutable digests before any rollback plan or promotion. Confirm
+  source review, image provenance, deploy-specific backups and restore drill,
+  production credential/account separation, resource/retention policies,
+  external authorization and exact release/CI gates. Source review found direct
+  Hub build of an uploaded QCOW2 with an external data file is not rejected at
+  the build boundary (the export path rejects it; this proof used pinned raw),
+  and multipart UploadFile body can spool before authentication/size gating;
+  bound ingress/temp storage before public exposure. Nonexistent upload IDs can
+  allocate persistent locks before ownership; authenticated blob responses use
+  long-lived immutable cache headers without `Vary` authorization/project.
+  Candidate loopback+SSH mitigates exposure of its HTTP listener; these findings
+  remain production review gates, not observed candidate exploitation. Do not
+  claim production readiness from a candidate health check, historical tests,
+  or an unreviewed image tag.
+
+### Documentation guidance migration (2026-09-28; no new verification)
+
+이 작업 브랜치 `codex/oci-root-phase1`에서 root `AGENTS.md`·`agent.md`를 짧은 진입점으로 바꾸고 [contributor workflow spec](../openspec/specs/contributor-workflow/spec.md)과 [CI safeguards spec](../openspec/specs/ci-safety-and-performance/spec.md)으로 상세 의무를 이관했다. 위 날짜별 기록과 승인 대기 1–4는 그대로 유지한다. 이 문서의 과거 `AGENTS.md` 규칙 1–12 참조는 이제 CI spec의 같은 번호를 가리킨다. 특히 runner PR event gate/required KVM verdict/계약 충돌, 발행 gate 예외, shard 실행 수 미검사 및 dev/main 중복 push는 여전히 소유자 결정 대기다. 이 이관은 다른 저장소의 Nova cutover 구현이나 승인, 새로운 원격/GPU/CI 실측의 근거가 아니다. 코드·테스트·workflow·저장소 설정을 바꾸지 않았고 이번 문서 변경에서 architecture review marker stamp 또는 검증을 실행하지 않았다. 명시적 승인 전 remote helper 전송·추가 게시·shared runner/VM 조작은 차단한다.
+
+통합 주석: 위 문단은 source branch의 문서 이관 시점 기록이다. 승인된 dev 병합에서는 같은 저장소의 최신 Nova cutover와 수동 proof를 유지하고 CI spec을 `ci-safety-and-performance/spec.md`로 통합했다. 이전 persistent-runner 충돌 설명을 현재 정책으로 되돌리지 않는다.
+
 ## 빠른 링크 맵
 
 | 질문 | 먼저 읽을 곳 |
@@ -2283,3 +2452,526 @@ push한 뒤 15초 안에 `pull_request` 이벤트로 `Test`
 | retained root와 shared volume 구분 | [oci-retained-root-inventory.md](oci-retained-root-inventory.md) |
 | 사용자 설치와 패키지 선택 | [`../install.md`](../install.md), [install.md](install.md) |
 | 명령별 실행 순서와 diagram | [cli/workflows.md](cli/workflows.md), `docs/diagrams/` |
+
+## Guidance migration (after the 2026-09-27 checkpoint)
+
+The detailed root `AGENTS.md` obligations were moved without changing their approval or evidence boundaries to [contributor workflow](../openspec/specs/contributor-workflow/spec.md) and [CI safety/performance](../openspec/specs/ci-safety-and-performance/spec.md). Read both via [AGENTS.md](../AGENTS.md) or [agent.md](../agent.md) before resuming. Older references in this handoff to AGENTS rules 1–12 (including the 2026-09-24 CI checkpoint's rule 10) now refer to rules 1–12 in the CI spec; their descriptions remain dated evidence, not today's permission. The 2026-09-25 note that there was no OpenSpec was true of that checkpoint; this later docs-only migration supersedes that choice without revising the earlier entry. No code, workflow, runner, credential, remote CI, native proof or publication was changed or verified by this note; preserve the 2026-09-27 source/manual-proof evidence and separate pending approvals.
+
+## Local dev continuation — 2026-09-27
+
+- The user explicitly approved committing all current changes and continuing on
+  `dev`. `/Users/pieroot/code/palimpsest-dev` already checks out that branch;
+  there is no separate feature-branch merge to perform. The original staged
+  release/Hub-volume preparation is commit `37a6639`; the subsequent commit
+  contains isolated native CI, operational evidence and the OpenSpec guidance
+  migration. This approval supersedes the earlier local commit hold only.
+- Continue from this `dev` worktree, not the older
+  `/Users/pieroot/code/palimpsest` (`codex/oci-root-phase1`) checkout. Existing
+  native proof binds its recorded candidate tar, not an invented post-commit
+  GitHub run. The actual 188-pass contract result and manual 43-boot/44-QEMU
+  proof remain the evidence above; committing does not rerun or expand them.
+- Remote push/tag, automatic GHCR/development-package publication and production
+  replacement are not authorized by this local integration. Next remote gates:
+  reviewed pinned kernel/config HTTPS URLs, publication-path approval, then
+  trusted-ref CI and before/after timing measurements. Production backup/restore,
+  immutable rollback inputs and security/isolation findings remain separate.
+
+## Current-workspace dev integration
+
+- 사용자가 현재 작업공간의 미커밋 변경까지 dev에 병합하고 현재 작업공간을 dev로 전환하도록 승인했다. 원본 변경은 `codex/oci-root-phase1`의 `2d1882f`에 보존했으며, `f14d77d` 기준 dev와 문서 충돌을 해결해 통합한다.
+- Contributor 권한·GPU 경계·재개 절차와 README/testing 탐색 개선을 반영했다. 중복 CI spec은 최신 `ci-safety-and-performance/spec.md`로 통합하고 hosted-only PR, protected Nova native, offline runner21과 기존 live receipt를 보존했다. Runtime/workflow/test source는 dev 기준 그대로다.
+- 이어서 작업할 위치는 `/Users/pieroot/code/palimpsest`의 `dev`다. 보조 `/Users/pieroot/code/palimpsest-dev` 작업트리는 같은 병합 commit을 detached HEAD로 보존하여 dev의 중복 checkout을 피한다. 기존 branch와 작업트리를 삭제하지 않는다.
+- 이번 승인은 로컬 commit/merge/branch 전환 범위다. 원격 push, 발행, 후보 또는 운영 자원 변경은 수행하지 않는다.
+- 로컬 검증: architecture working guard는 427개 source file digest를 확인했고, `uv run pytest -q tests/unit/test_architecture_guard.py`는 14 passed, `uv run palimpsest --version`은 0.2.4였다. 병합 변경은 Markdown 8개뿐이며 관련 spec/navigation link 28개가 해석되고 conflict marker·폐기된 CI spec 링크가 없음을 확인했다. 최초 stamp 시도는 index의 unmerged entry 때문에 중단됐고, 해결 파일을 stage한 뒤 stamp와 working guard가 통과했다. 병합 commit 전 staged guard도 확인한다. Native/GitHub/원격 검증은 추가 실행하지 않았다.
+
+## Hub logging contract — 2026-10-01 (local `dev`, unpublished)
+
+- Baseline: `dev` HEAD `dc8a164fd7ad4243f0e01bf7e48e613608674ccb`, ahead of `origin/dev` by four commits. The pre-existing unstaged `AGENTS.md`, `openspec/specs/contributor-workflow/spec.md` and `openspec/specs/ci-safety-and-performance/spec.md` changes remain outside this Hub task; no commit, remote action, native/GPU proof or privileged action is authorized here.
+- Source change: API and two workers share INFO default / explicit Hub-only DEBUG logging; API records matched route template, HTTP status and elapsed time without raw target, and claimed export/build work records start/terminal state with bounded safe metadata. Existing exception-bearing Hub messages in the affected paths are sanitized. See [Hub log operations](install.md#hub-api-and-worker-logs) and [architecture](../ARCHITECTURE.md#code-map). No schema, credential ownership, external request, guest execution or SQL bind contract changes are intended.
+- Verification is local-only and must be reported as actually exercised, not inferred from the historical native proof. At the source-review checkpoint the new regressions are test-defined, not test-passed; tests/build/lint are held until the parent integration gate. Publication/deployment/production credentials and native KVM remain separately blocked.
+
+## Local Dockerfile, registry and multi-VM verification — 2026-10-02
+
+- Source baseline: `dev` HEAD `dc8a164fd7ad4243f0e01bf7e48e613608674ccb`.
+  Existing unstaged Hub/guidance changes and the untracked Hub logging module
+  were preserved. No runtime source, tests, CI, credentials or deployment
+  configuration in either repository was changed for this verification.
+  Astra was unavailable in the session; no new development/review approval is
+  claimed. There was no commit, push, publication, remote installation or cloud
+  mutation.
+- Secret-free CLI evidence is under
+  `/Users/pieroot/.local/share/palimpsest-proofs/cli-806ea4b0/`.
+  Actual `uv run --frozen palimpsest build --frontend dockerfile --offline
+  --network none` used a dedicated local `docker-container` builder,
+  `palimpsest-cli-806ea4b0`, with Docker network mode `none` and a verified
+  Alpine named OCI input. The multi-stage Dockerfile exercised RUN, COPY,
+  WORKDIR, numeric USER and CMD. Cold solve took 0.961 s, identical warm solve
+  0.633 s, and changed RUN input 0.678 s. Cold/warm manifest was
+  `sha256:527e7f6bce3198454d4d867329970af749484ca71e08dd94d030167289de2d15`;
+  changed input produced
+  `sha256:ad69c5d151798f4d2310ab6276288eb8c50352af2f5f4597c1e0f2b349be04b0`.
+  BuildKit logs show the first/changed RUN executing and the warm RUN cached.
+  LocalArchiveSource/SourceCAS accepted all three outputs; streaming gunzip
+  hashes matched every declared DiffID. This is a controlled Dockerfile proof,
+  not a new full Afterglow Dockerfile build. Runtime-block bytes were zero.
+  Buildx returned exit 0 but its saved logs also contain cache-ref RPC
+  `Unavailable` messages; do not describe the logs as error-free.
+- Running the newly built archive through public `palimpsest run` exited 1
+  with `OCI host configuration is missing PALIMPSEST_OCI_KERNEL`. The host is
+  macOS arm64; OCI materialization/root execution remains Linux amd64 KVM-only.
+  No guest workload/actual OCI root was verified. A native Palimpsestfile to
+  SquashFS build on Lima was not exercised by this task either.
+- Direct registry acquisitions already completed in this continuation were
+  reused, not downloaded again. Evidence:
+  `/Users/pieroot/.local/share/palimpsest-proofs/registry-20261002011025-95251/receipt.json`.
+  Actual `oci pull docker.io/library/alpine:3.24.2` and
+  `oci pull ghcr.io/nginx/nginx-unprivileged:stable-alpine-slim` both exited 0,
+  selecting verified linux/amd64 manifests/configs/layers and publishing 0600
+  archives. Alpine manifest `d56c381f...` was used as the local build input;
+  GHCR manifest is `939bb73e...`. Source compressed digests and gunzipped
+  DiffIDs were independently distinguished. Native Skopeo 1.24.1 was installed
+  once; Homebrew also updated ca-certificates. Anonymous TLS and digest checks
+  are not publisher-signature proof; private-registry authentication and VM
+  execution of the acquired images remain unqualified here.
+- Project `multi-806ea4b0` booted two new ARM64 VZ cloud-image VMs,
+  `multi-806ea4b0-a-1` and `multi-806ea4b0-b-1`, each 2 vCPU/2 GiB (actual Lima
+  inventory, not inferred from inspect). Both independently served identity
+  JSON over host ports 13181/13182 with HTTP 200 while the older Afterglow VM
+  remained running. `ps`, `compose ps --format json`, `inspect`, `compose port`,
+  idempotent up/noop, stop of A without stopping B, and compose restart of A
+  were exercised. A restarted in 8.152 s; both host endpoints returned 200
+  afterward. This proves simultaneous conventional VM operation, not
+  concurrent startup, a large-node qualification or OCI-root multi-VM.
+- VM-to-VM HTTP over their real VZ addresses `192.168.64.14/15` failed both
+  directions with `No route to host`. Read-only evidence shows an on-link
+  route but peer neighbor `FAILED`; root cause remains unestablished. Do not
+  call this a working shared service network. Palimpsest inventory reports the
+  per-VM user-network address `192.168.5.15`, not those distinct VZ peer IPs.
+  `ps`/`inspect` project durable state, not live backend status; inspect still
+  reports null CPU/memory, logs exited 0 with no output, and public `stats` is
+  absent. Existing intentional Lima exec/shell rejection was not patched.
+- OpenStack parity is not implemented/verified by the CLI: its local backends
+  and block-volume receipts have no Nova/Cinder/Manila adapter. Hub is `/v1`
+  local_path CAS, not an OCI Distribution `/v2` registry or Manila adapter.
+  Afterglow's `services/layer_build.py` creates Manila RW shares, attempts RW
+  revocation on build success, grants RO consumer access, and creates Cinder
+  upper volumes; those are different orchestration/bootstrap boundaries.
+  Identical OCI digests alone do not prove equivalent root, privilege,
+  single-writer, reboot, retention or revocation behavior. The selected
+  Nova-owned OCI root still needs its reviewed boot-disk/bootstrap integration.
+- Fresh Linux KVM installation/proof, online Hub cache writes, and actual
+  Cinder/Manila resource operations require exact ref/action/resource approval.
+  CI project `53ec2dd9a1f7471fb6a2b174595fa232` is a helper allowlist, not
+  standing authorization; its one-VM/one-20-GiB-volume quota cannot cover a
+  multi-volume/Manila proof. At this checkpoint the existing candidate
+  project/VM/volumes, runner21, old domains and production were untouched.
+  For the candidate Hub DB/CAS this is superseded by the later approved-scope
+  run; see the Hub cache project-attribution finding below. No new test suite
+  was run.
+  The working architecture guard exited 1 because the pre-existing source
+  snapshot is stale; it was not stamped without reviewing the unrelated work.
+- New VMs are left running in the same isolated state/config roots as the
+  Afterglow proof. Run management from the Palimpsest checkout with
+  `PALIMPSEST_STATE_HOME=/Users/pieroot/.local/share/palimpsest-proofs/ag-f1823ba8/state`
+  and `XDG_CONFIG_HOME=/Users/pieroot/.local/share/palimpsest-proofs/ag-f1823ba8/config`.
+  Exact project file:
+  `/Users/pieroot/.local/share/palimpsest-proofs/cli-806ea4b0/palimpsest.yml`.
+  `uv run --frozen palimpsest compose -f` that file `stop` stops only the new
+  project; `down` removes only its owned VMs if the user chooses cleanup.
+  Do not use `limactl delete` or unscoped cleanup. Afterglow backend health was
+  rechecked at HTTP 200; the original application was not stopped/recreated.
+
+### Approved continuation and Darwin runtime-layer correction
+
+- The user separately approved the exact `dc8a164` CI-project one-VM/one-20-GiB
+  native scope and the isolated candidate Hub cache scope
+  `cli-806ea4b0-online`; receipt is `cli-806ea4b0/approved-scopes.json` under
+  the proof root above. This does not authorize CI credential changes, admin
+  bypass, private-helper transfer/execution, runner/GPU changes, publication or
+  Cinder/Manila parity operations. The earlier approval blocker is superseded
+  only for those two selected scopes.
+- Correction to the earlier execution blocker: only OCI-root is Linux amd64
+  KVM-only. Dockerfile `--runtime-base`/`--runtime-tag` packing works on Darwin,
+  and Lima copies, loop-mounts SquashFS read-only and creates the per-VM overlay
+  at `/opt/layers/merged`. Installed `mksquashfs`/`unsquashfs` 4.7.5 were reused.
+  A new ARM64 Alpine input (manifest `260479a1...`) was acquired via Skopeo,
+  because public `palimpsest oci pull --help` admits only `linux/amd64`.
+- Actual ARM64 offline Dockerfile runtime packing exited 0, and public
+  `palimpsest run <base> --layer <digest> --memory 1024 --vcpus 1` created a
+  new Lima VM. Guest mount evidence showed a read-only SquashFS loop lower and
+  writable overlay. RUN/COPY files were present, and image binaries executed
+  as aarch64. The initial Alpine fixture CMD failed honestly because its
+  BusyBox lacks the httpd applet. Only the generated fixture was corrected to
+  `cat /srv/identity.json; exec sleep 300`, rebuilt, and launched in a new VM;
+  its actual process ran at UID/GID 1000. OCI manifest is `a48b6794...`, runtime
+  block `3c4f2082...`. No repository runtime source was patched.
+- A newly acquired ARM64 GHCR Nginx input (manifest `8946550a...`, eight
+  gzip layers, configured UID 101) was used by an offline Dockerfile-derived
+  runtime layer. The separate pure-FROM case exited 1:
+  `BuildKit local cache exporter did not create index.json`; this remains an
+  unfixed consumer-visible failure, not a success reclassified by adding COPY.
+  The separately reported derived case copies an explicit 0644 identity asset.
+  Runtime block is `b9d9bad8...`, derived OCI manifest `cf638d55...`.
+  Its unchanged `/docker-entrypoint.sh nginx -g 'daemon off;'` executed at
+  observed UID/GID 101, Nginx 1.30.5, and served both the original welcome page
+  and exact identity JSON with HTTP 200. Diagnostic log-path/asset-mode/shell
+  failures are retained; they were not suppressed or counted as passing.
+- These image commands were started by diagnostic Lima guest chroot with
+  device/stdio setup, not by public `palimpsest exec` or the OCI-root runner.
+  The VM, layer transport and mount were created by public Palimpsest commands.
+  This is VM payload/application proof, not automatic OCI CMD invocation,
+  unchanged upstream-image execution, PID-1/security equivalence or Nova boot.
+  Independent descriptor-size/SHA-256 and gunzipped DiffID checks passed for
+  both ARM source layouts and both final derived OCI exports. Evidence is in
+  `cli-806ea4b0/arm64/` (`valid-cmd-verification.json`,
+  `ghcr-http-verification.json`, `oci-integrity-verification.json`).
+- Durability boundary: an unsynced upper file was absent after stop/start.
+  Source `lima.py:889` uses `limactl stop --force`. A separate upper file with
+  explicit guest `sync` survived stop/start and was read from the restored
+  merged mount. Do not claim the upper is reset on every restart or that
+  default stop is graceful/data-loss-free. The lower refused writes with
+  `Read-only file system`. This is not a Cinder retain/multi-attach proof.
+- Approved native preparation remains blocked before authentication/creation:
+  existing current member-only CI application-credential ID/secret was
+  unreachable through bounded private metadata, OpenStack/shell inputs,
+  targeted keychain metadata and protected GitHub secret metadata. GitHub
+  metadata cannot return secret values; historical credential ID cannot
+  authenticate. This native lane reset no credential, used no admin identity
+  and installed no remote host.
+  Exact source archive hash and kernel/config pins were verified locally,
+  not treated as native execution. No cloud resources were created and no
+  cloud cleanup is required. Secret-free evidence and an empty resource
+  manifest are under
+  `/Users/pieroot/.local/share/palimpsest-proofs/native-cli-20261001T170218Z-aee46fafca/`.
+- All four newly created ARM layer/command/GHCR diagnostic VMs are stopped,
+  not deleted; the parent-owned offline builder is stopped. The original
+  Afterglow and earlier two-node project were not changed in this continuation.
+  Incomplete or superseded Afterglow input exports must not be consumed as
+  successful complete images.
+- Hub cache project-attribution finding (possible approval-scope breach; owner
+  decision pending). The full Afterglow online run used the existing private
+  input credential of Keystone user `admin` (`18d4e5da...`); each runner token
+  was asserted scoped to project `service` (`aa65ed83...`), roles
+  admin/manager/member/reader. The Hub receipt names only URL and cache scope;
+  it records no credential, project or approval for an admin-role identity.
+  Six cache uploads resulted. The four final rows (frontend/backend x
+  amd64/arm64, 2,274,570,240 bytes) were observed `is_published=false`, named
+  `cache-cli-806ea4b0-online-*`, `created_by` the admin user and owned by
+  `project_id` `e4f1487023f047b59901f28a91876e7b` (Keystone project `admin`),
+  which `scripts/run_native_kvm_openstack.py:51` lists in
+  `FORBIDDEN_PROJECT_HEX`. The scope listing was empty before the run and each
+  final row's `created_at` (17:25:06-17:34:44 UTC, 2026-10-01) lies within its
+  own solve interval, so this run wrote them; they are not pre-existing rows
+  readable across projects. Exact HTTP push times were not logged;
+  phase-summed upload intervals are derived. The two uploads from superseded
+  backend-input solves (blobs `9cd332b6...` amd64 and `93e9e1de...` arm64,
+  1,358,141,440 bytes) used the same CLI/Hub path, but their name, `created_at`
+  and owner project were never recorded and were not fetched after the pause:
+  their `admin`-project ownership is inferred, not observed. Do not describe any
+  of these as registered within the approved isolated scope: the cache-scope
+  name matched, but the effective Hub project was established only after the
+  writes and no before-write isolation was verified.
+- Root cause, source-reviewed and not fixed:
+  `hub/src/palimpsest_hub/auth.py:76-94` `validate_token` re-authenticates the
+  presented token with keystoneauth `v3.Token` and no scope unless
+  `X-Project-Id` is sent, so Keystone default-scopes the new token to the
+  user's default project. Hub ownership (`project_id=` in `api/hub.py`) and
+  `get_os_conn` (`auth.py:133-142`) use that re-scoped project and token. The
+  public CLI never sends a project: every `HubClient(resolve_url(...),
+  resolve_token())` in `cli.py` (e.g. 343, 1964, 2099) omits `project_id`, so
+  `X-Project-Id` (`hub.py:185-187`) is unused. Consumer impact: CLI writes land
+  in the caller's default project regardless of the presented token's scope,
+  and Hub-side OpenStack calls run there too. This contradicts the
+  project-scoped-token contract in `ARCHITECTURE.md:564` and
+  `docs/compatibility.md:11-16`. A Keystone token-method exchange without scope,
+  run read-only before the pause, reproduced default scoping to `admin`; it
+  minted an admin-project token that was not persisted.
+- After detection no Hub row, blob or grant was deleted, altered, re-registered
+  or retried, and no further Keystone authentication was performed. The agent
+  reports candidate VM/volumes/services unchanged; this was not independently
+  re-observed. Removing the four observed rows and the two unobserved
+  superseded uploads needs separate exact approval and would itself require an
+  admin-project identity. The session-owned candidate tunnel was stopped after
+  the pause. Evidence is in `cli-806ea4b0/online/`:
+  `scope-isolation-evidence.json`, `cache-ownership-timing-evidence.json`,
+  `auth-role-scope-evidence.json`, `auth-exchange-scope-evidence.json`,
+  `hub-cache-upload-evidence.json`, `superseded-cache-rows-evidence.json`.
+- Full Afterglow online solves of the canonical
+  `/Users/pieroot/code/afterglow/Dockerfile` (no source edits; context
+  `sha256:bb1086b5...`; immutable base pins in `online/pins.json`) all exited 0
+  through the public Palimpsest CLI on a dedicated `docker-container` builder,
+  `afterglow-online-806ea4b0-170417` (bridge network, 8 GiB, 4 CPU). Frontend
+  `RUN bun run build` and backend `COPY` plus `RUN python -m compileall` ran on
+  both platforms. Each official structural validation exited 0: frontend
+  amd64 `df777c61...` (9 layers, 1001:1001), backend amd64 `fc7cb3c1...` (15,
+  1000:1000), frontend arm64 `c0d8a0ce...` (9, 1001:1001), backend arm64
+  `38ed2871...` (15, 1000:1000). Validation covered descriptors, reachable
+  blobs, streamed gzip DiffIDs, tar numeric metadata and process/config
+  metadata. The images were not executed on any VM or host, not loaded into
+  Docker, not pushed and not transferred; no Linux recipient exists because
+  the native lane is blocked. The first round over-excluded public `config` and
+  `secrets` module directories: its frontend solves failed, and its backend
+  archives under `superseded-round1/` are invalid proof. Only the proof copy of
+  the context was corrected (12 public modules restored;
+  `context-correction.json`). Index: `cli-806ea4b0/online/artifacts.json`.
+  The builder is stopped and retained, not removed or pruned.
+
+## Project-scoped package publication specification — 2026-10-02
+
+- Scope: API/CLI/security/UI specification and Afterglow integration plan only.
+  No runtime source/schema/config change, key/token issuance, package upload,
+  production request, helper transfer, deployment, commit or resource cleanup
+  was performed for this request. Pre-existing dirty work remains preserved.
+- Inspected baselines: Palimpsest `dev`
+  `dc8a164fd7ad4243f0e01bf7e48e613608674ccb`; Afterglow `dev`
+  `0f59e0ee8e7cea6d36db33f1d4e2380fe4fac2b7`. Both source maps include their
+  existing working-tree changes; a HEAD identifier alone is not a clean-tree
+  or deployment claim. Astra was unavailable; no Astra approval or new
+  architecture source-review stamp is claimed.
+- Contract: [project-package-registry.md](project-package-registry.md),
+  `palimpsest.project-packages.v1`, explicitly proposed/not implemented.
+  [registries.md](registries.md) links it without changing current Docker
+  wrapper behavior. Reference syntax is
+  `cloud.dmslab.re.kr/openstack-afterglow/test:v1`; a SQL namespace binds one
+  immutable Keystone project UUID, not a display name or client header.
+- Keys are secret-once, hashed, expiring, owner/project/exact-package/action
+  bound and helper-backed. Original member tokens control issuance/read;
+  native writes require package keys. Admin/service/system authority,
+  protected administrative principals with member-only scope and default-
+  project token re-scope cannot authorize publication. The original-token
+  defect above must be fixed before enabling package writes. Token/owner/
+  membership validation requires separately approved bounded read policy,
+  never an admin upload fallback.
+- API specification includes namespace/key lifecycle, scoped package/version/
+  tag reads, complete OCI/runtime-bundle graph validation, resumable uploads,
+  atomic compare-and-set tag publication and separately scoped mandatory
+  BuildKit cache APIs. Cache is not a runnable package or inventory success.
+- Afterglow plan lives in the separate repository's
+  `openspec/changes/project-scoped-palimpsest-packages/` (`rapid` metadata,
+  proposal and tasks). It adds member `/palimpsest/packages`, browser
+  read/control APIs and an allowlisted key gateway. Hub is the single
+  package/tag/key database. The screenshot `/admin/libraries` gets a link;
+  its administrator-only build controls and local legacy layer records are
+  not reused as project registry inventory. Project switching fences old
+  responses/secrets; no automatic VM/Glance/Manila/Cinder import is planned.
+- Actual checks: `palimpsest push --help` and `login --help` through
+  `uv run --frozen` exited 0 and confirmed current Docker-wrapper options,
+  not the proposed native workflow. All three JSON examples parsed; all six
+  relative link targets across the contract/registry guide existed.
+  `openspec new change ... --schema rapid --json` succeeded, and
+  `openspec status --change project-scoped-palimpsest-packages --json`
+  recognized both planning artifacts. Its complete status means artifact
+  presence, not implemented behavior. Generic strict `openspec validate`
+  failed on missing specs delta; Afterglow deliberately has no specs layer
+  (`docs/agent-development-guide.md:123-128`), so no artificial delta was
+  added. Runtime package/API/browser acceptance remains unexercised; no
+  implementation/full-suite/native/live-production proof is claimed.
+- Next implementation order: original identity validation → Hub metadata/
+  keys/validator/publication → native CLI/cache cutover → Afterglow BFF/UI →
+  isolated ordinary-member build/push/list/browser/pull proof. Production
+  rollout needs separate exact-ref/project/identity/key/migration approval.
+  The four observed admin-project cache rows and two superseded uploads
+  above were neither republished, transferred, altered nor deleted.
+
+## Local monitoring dashboard prototype — 2026-10-02 (local, uncommitted)
+
+- Baseline: `dev` `dc8a164fd7ad4243f0e01bf7e48e613608674ccb` with the pre-existing
+  dirty Hub/docs work preserved. A separate actor edited the package-registry
+  files concurrently in this worktree (`cli.py` package hunks, `buildkit.py`,
+  `hub/*`, `package_*.py`, `packages.py`, `tests/unit/test_cli_contract.py`
+  offline-build hunk). Those changes are not part of this work and were not
+  reviewed. Astra/Sol role selection was unavailable. Planning was done in-session;
+  two task subagents implemented the inventory and frontend slices, and a separate
+  reviewer agent reviewed the result. No role-based approval is claimed.
+- Scope: extended the existing `palimpsest ui` (no new daemon, server or
+  framework). `ui.py`, `inventory.py`, `webui/{index.html,app.css,app.js}`, the
+  `cli.py` `ui --allow-control` parser/dispatch lines, `scripts/generate_cli_reference.py`
+  (`allow_control` text), the `palimpsest ui` rows of `docs/cli/reference.md`
+  (the concurrent actor has since regenerated the whole file with its own
+  options; `generate_cli_reference.py --check` now reports current), `docs/cli/usage.md`,
+  `docs/cli/workflows.md`, `README.md`, `ARCHITECTURE.md` code map, change guide
+  and summary, plus `tests/unit/test_{ui,inventory,cli_contract}.py`.
+- Behavior: loopback-only foreground server. The static shell is served
+  without credentials so a token-stripped tab can reload; assets and `/api/v1`
+  accept only the per-process bearer token. Read-only is the default, and every
+  `POST`/`DELETE` returns 403 before any side effect; `--allow-control` re-enables
+  the existing controls. New `GET /api/v1/volumes` and `/api/v1/networks` come
+  from `inventory.list_volumes`/`list_networks`, which are durable,
+  backend-free projections; `/api/v1/summary` no longer embeds the storage walk.
+  The VM view still live-reconciles, so a status that changed outside
+  Palimpsest is written to that run's ledger. BuildKit build logs now read
+  `buildkit.log`, with a tail capped at 4 MiB. Lima and HVF attachments no
+  longer present user-mode or SSH-forward addresses as network addresses.
+- Checks run: `pytest tests/unit/test_inventory.py tests/unit/test_ui.py
+  tests/unit/test_cli_contract.py tests/unit/test_cli_reference.py`: 230 passed,
+  with 1 deselected. The deselected
+  `test_cli_uses_only_stdlib_and_package_imports` fails on the concurrent
+  `getpass`/`hashlib` imports. Ruff format and lint pass on the changed Python
+  files except the concurrent hunk at `test_cli_contract.py:520`, and
+  `node --check app.js` passes. `test_lanes.py list --check` fails only on four
+  unclassified concurrent package test files. `check_architecture.py` reports
+  stale; it was deliberately not stamped because unreviewed concurrent source is
+  present.
+- Live smoke, using the real CLI and headless Chrome, read-only unless noted:
+  - Default state root: 0 VMs, volumes and networks; 3 artifacts; 1 build;
+    empty states; search and no-match.
+  - APFS clone of `~/.local/share/palimpsest-proofs/ag-f1823ba8/state`: live
+    reconcile showed 3 running and 4 stopped real Lima VMs. Its
+    `runs/*/{state,owner}.json` and `projects/*/state.json` hashes (16 files)
+    matched the originals afterwards, and the original root was never served.
+    This smoke also covered BuildKit log content, 5 s polling with 30 s
+    summary/storage, pause/resume (0 requests while paused), clean-URL reload,
+    failure retention after the server stopped, a 390 px layout and no console
+    errors.
+  - Synthetic `/tmp` fixture: OCI-root NAT/none plans and root volumes,
+    preserved project volume, malformed-network unavailable row and KVM stale
+    rows. In `--allow-control`, an unaccepted confirm changed nothing, an
+    unreferenced fixture layer was removed, and a referenced layer was refused.
+  - No VM lifecycle action ran against real resources. All servers, the
+    session browser and the `/tmp` fixtures were stopped or removed.
+- Not done: no commit, push, publication or packaging. No Linux KVM/OCI-root
+  live dashboard run happened: the OCI rows use test fixtures. The pre-existing
+  `inventory._build_project_index` symlink-following read is unchanged. Packaging
+  this as an offline desktop application is a later step.
+
+## Project-scoped package registry — 2026-10-02 (local, uncommitted)
+
+- Baselines: Palimpsest `dev` `dc8a164fd7ad4243f0e01bf7e48e613608674ccb`, Afterglow
+  `dev` `0f59e0ee8e7cea6d36db33f1d4e2380fe4fac2b7`; both dirty, nothing staged.
+  Pre-existing changes (dashboard prototype, Hub observability, docs/openspec edits)
+  were preserved and not reviewed as part of this work.
+- Implemented per [project-package-registry.md](project-package-registry.md):
+  original-subject Keystone validation by a dedicated system reader (no
+  `v3.Token` exchange), exact opaque project/user IDs (64-hex federated
+  supported), native `/v1/projects/...` namespace/package/version/tag/key/upload
+  and project/package-bound BuildKit cache, bounded OCI/runtime graph validation,
+  retirement of unqualified cache registration, native CLI profiles/login/build/
+  push/pull, Afterglow package BFF/key gateway and `/palimpsest/packages` page,
+  Kolla reader/protection inputs.
+- Integration fixes found by the live proof: Hub accepted no BuildKit OCI layout
+  directory entries (`blobs/`, `blobs/sha256/`) and rejected every real export
+  with 422; unconfigured qualified authorities had stopped routing to Docker;
+  strict offline builds had started reading `registries.toml`; Afterglow namespace
+  grammar rejected Hub-valid `__`/`--`; desktop inventory clipped row actions.
+- Checks: Hub 208 passed; Hub ruff clean except 3 findings in pre-existing
+  observability edits (`services/builds.py`, `tests/test_hub_api.py:971`,
+  `tests/test_image_exports.py`). Root portable lanes 6112 passed / 217 skipped
+  (`umask 022`; the tool shell's `umask 0077` fails three permission tests that pass
+  under 022), manifest valid, CLI reference regenerated, changed-file ruff clean.
+  Afterglow backend documented unit command 3455 passed, contracts 135 passed,
+  frontend vitest 1893 passed, `svelte-check` 0 errors/warnings. Hub arm64 and amd64
+  images built; arm64 ran against the local stack, amd64 only an import smoke.
+- Live local proof `pkg-d642b179` (evidence
+  `~/.local/share/palimpsest-proofs/pkg-d642b179/verification.json`): genuine
+  local Keystone/MariaDB/Redis, source Hub, Afterglow BFF and TLS key gateway,
+  production frontend build, real Dockerfile build → mandatory scoped cache →
+  native push → API/browser inventory → pull with byte-identical archive, plus
+  reader/sibling/cache/foreign-namespace/mixed-credential/revocation/membership-
+  removal/admin denials, 409 offset, 412 tag conflict and UI project switching.
+  All proof processes, containers, builder, images and scratch secrets were removed.
+- Incident: an unscoped `pytest -n 8` in Afterglow `backend/` (stopped at ~93%)
+  collected `tests/integration/`. With `../afterglow.conf` and
+  `tests/integration/credentials.toml` present, its fixtures likely sent real
+  password logins for the configured admin/user accounts to
+  `keystone.dmslab.re.kr`; the configured Redis host `redis` does not resolve
+  here, so its cache-key cleanup could not reach a real Redis. `slow` resource
+  tests require unset env vars and skip. Which integration nodes ran is not
+  recoverable from the cancelled output. Use `backend/tests/TESTING.md` commands only.
+- Not done/pending approval: no commit, push, image publication, Kolla deploy,
+  production reader account or protected-ID configuration, or cloud.dmslab
+  acceptance. `ARCHITECTURE.md` content was updated but not stamped because the
+  working tree contains unreviewed foreign changes.
+
+## Candidate integration — 2026-10-02
+
+- Scope: the basic `/Users/pieroot/code/palimpsest` checkout on local `dev`,
+  source baseline `dc8a164fd7ad4243f0e01bf7e48e613608674ccb`. Separate worktrees
+  were not read or changed. All current tracked/nonignored source, tests,
+  contracts and docs are included in the authorized candidate preparation.
+  Root `palimpsest-client` and independent `palimpsest-hub` metadata/module
+  versions/lockfiles agree at **0.3.0**, a minor for the native registry and
+  dashboard additions, not a claim of publication. Kolla's image-tag candidate
+  also prepares 0.3.0, and source-build pins reviewed commit
+  `c4887f7806608e98f215abbd377d2eafe159ff76`; image availability must be verified
+  before rollout. The source-build contract requires an immutable full SHA,
+  not a mutable branch or an unresolved release tag.
+  This immutable application-source commit includes every final source/style
+  change and the 0.3.0 metadata. The later source-pin/stamp documentation
+  commit deliberately references it, avoiding a circular self-referential SHA.
+- Review fixes: native authority/alias routing, completed-reference bounds,
+  API-base/namespace local-cache isolation, mandatory online cache refresh,
+  malformed actor/graph handling and OCI/runtime client/Hub validation parity;
+  CAS copied-byte verification and repair preservation, publication-lock/SQL
+  lifetime, key expiry/revocation across reader waits, case-exact legacy project
+  ownership, creator-bound uploads, correlated package errors and safe Kolla
+  access logging. Dashboard polling no longer aborts long controls, destructive
+  volume choices reset between drawers, and the skip link preserves the view.
+- Final functional gates: `scripts/test_lanes.py list --check` passed;
+  `plan --changed HEAD` selected all portable lanes plus the separate Hub
+  environment. `uv run --frozen python scripts/test_lanes.py run portable`
+  passed **6131**, skipped **217**. The initial run found one missing `digest`
+  reference in the existing CLI verify test; its expected SHA-256 now comes
+  independently from `hashlib`, and the changed node passed before the full
+  rerun. `cd hub && uv run --frozen pytest -q` passed **215**. Skips do not
+  constitute native proof. The generated CLI reference was regenerated and
+  covered by the portable contract gate.
+- Final style gates passed in both environments: root Ruff checked all 371
+  files and Hub checked all 37. Three import-spacing/order findings and
+  formatting in 34 candidate files were corrected without changing CI
+  exclusions or functional contracts; both functional suites were rerun.
+- The metadata-only final source-pin follow-up passed all **24** Kolla asset,
+  immutable image-ref and role contracts. Local commits prepared the complete
+  candidate and then its application-source pin; dev push remains withheld
+  pending the owner's explicit decision on workflow side effects.
+- Real source boundary proof: normal CLI plus source Uvicorn/CAS/package APIs
+  over loopback HTTPS with a trusted temporary certificate, scratch SQLite
+  and a synthetic system-reader/member Keystone endpoint. An existing running
+  `palimpsest-e2e` BuildKit builder was explicitly selected, not reconfigured.
+  A real `FROM scratch`/`COPY` solve exported native OCI, mandatory cache
+  refreshed without `--push`, deferred typed-reference push succeeded, and
+  pull returned byte-identical exported bytes. A second build with fresh local
+  state imported **hub-exact**, following the first **none** result; both had
+  build key `sha256:5566669e0f1c0c3dec0b28d9a3fbd976e7d5740db3414b6f1cadaa701e81a8df`.
+  Its built root was
+  `sha256:66d26ed3025000569d98cbe5a63c756f9e58f92c4ba055215c270db7bd274b8a`.
+  Original-project assertion/admin/foreign-namespace/mixed-auth denials,
+  offset conflict, idempotent finalize, cache transfer, membership removal,
+  revocation and absence of plaintext key in local state were observed.
+  SQLite engine/session setup was injected by the throwaway lifespan wrapper
+  because unchanged production `init_db` is MariaDB-oriented; all application
+  auth/routes/storage methods remained real. This is not live Keystone or
+  production MariaDB policy/migration qualification.
+- Chromium proof: actual packaged UI on loopback, isolated tab, synthetic VM
+  responses only (no VM mutation). Before repair, another drawer inherited
+  volume deletion, the skip link switched to Overview, and a held 18-second
+  mutation failed at fifteen seconds. After repair, deletion was unchecked,
+  the VM panel stayed active, controls remained disabled at 16.5 seconds and
+  one request completed successfully. Read-only API denial, bearer auth and
+  URL-token removal were also observed. Screenshot evidence:
+  `/tmp/palimpsest-controls-030-after.png`. Local servers/tabs/scratch credentials
+  were stopped or removed; shared runtime volumes/containers were preserved.
+- Canonical local artifacts: client wheel/sdist plus isolated install/CLI
+  version/packaged stage-1 asset checks passed via `scripts/build_package.py`;
+  Hub wheel/sdist built. `docker/hub/Dockerfile` API **and** export-worker
+  targets built for **linux/arm64 and linux/amd64**. Network-disabled runs
+  reported `aarch64`/`x86_64`, Hub version 0.3.0 and successful API/worker imports.
+  These are image build/execution checks, not a canonical Kolla rollout or
+  service/migration readiness proof. Build caches were not pruned.
+- Architecture was stamped only after source review and corrected-test review;
+  the final source fingerprint is
+  `8f64dbde7852dca6d04ab613050929505a71c5f5f971d64e17bad63d6f1caa16`
+  over 441 source files. Staged guard and secret scanning are commit barriers.
+- Publication/integration boundaries: no main-target PR was created/edited,
+  no main merge, tag, release, GHCR push, private helper transfer, remote
+  installation, Kolla/cloud/native/GPU command or role mutation was performed
+  in this checkpoint. A normal `dev` push triggers existing package/GHCR
+  publication workflows; that automation requires the owner's scoped decision.
+  Parent owns release/main/deployment integration. Astra/Sol roles were
+  unavailable; independent source review is not named-role approval.
+- Deployment prerequisites remain: reviewed published API/worker ref/digests,
+  operator-installed system-supporting `openstack.cloud` collection, dedicated
+  reader principal and verified effective grants/policy, immutable protected
+  IDs and namespace binding, trusted HTTPS origin, approved database rollout,
+  protected native CI success and the real Afterglow gateway/UI acceptance.
+  Official openstack.cloud 2.6.0 supports `role_assignment(system=all)`;
+  no installed-collection or live operator proof is claimed.

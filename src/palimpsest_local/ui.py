@@ -79,8 +79,10 @@ def _lifecycle_projection(result: LifecycleResult) -> dict[str, Any]:
     }
 
 
-def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[BaseHTTPRequestHandler]:
-    """Factory creating a request handler bound to state paths, auth token, and origin."""
+def build_handler(
+    roots: state.StatePaths, *, token: str, origin: str, read_only: bool = True
+) -> type[BaseHTTPRequestHandler]:
+    """Bind the authenticated dashboard to local state; mutations require opt-in."""
 
     active_roots = {"current": roots}
 
@@ -95,6 +97,8 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
 
@@ -107,6 +111,8 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(content)
 
@@ -115,12 +121,6 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
             if auth_hdr.startswith("Bearer "):
                 bearer_token = auth_hdr[7:].strip()
                 if secrets.compare_digest(bearer_token, token):
-                    return True
-            parsed = urllib.parse.urlparse(self.path)
-            if self.command == "GET" and parsed.path in ("/", "/index.html"):
-                qs = urllib.parse.parse_qs(parsed.query)
-                q_token = qs.get("token", [None])[0]
-                if q_token and secrets.compare_digest(q_token, token):
                     return True
             self._send_json({"error": "Unauthorized"}, status=401)
             return False
@@ -133,6 +133,14 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
             fetch_site = self.headers.get("Sec-Fetch-Site")
             if fetch_site is not None and fetch_site != "same-origin":
                 self._send_json({"error": "Forbidden: Sec-Fetch-Site must be same-origin"}, status=403)
+                return False
+            return True
+
+        def _check_writable(self) -> bool:
+            if read_only:
+                self._send_json(
+                    {"error": "Dashboard is read-only; restart with --allow-control to enable changes"}, status=403
+                )
                 return False
             return True
 
@@ -170,14 +178,15 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
 
         def do_GET(self) -> None:
             roots = active_roots["current"]
-            if not self._authenticate():
-                return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             qs = urllib.parse.parse_qs(parsed.query)
 
+            # The shell is static and credential-free; it bootstraps the tab-scoped token, and every asset/API needs it.
             if path in ("/", "/index.html"):
                 self._send_file(WEBUI_DIR / "index.html", "text/html; charset=utf-8")
+                return
+            if not self._authenticate():
                 return
             if path == "/app.js":
                 self._send_file(WEBUI_DIR / "app.js", "application/javascript; charset=utf-8")
@@ -201,12 +210,11 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                             }
                         except PalimpsestError as e:
                             backends_info[b] = {"available": False, "reason": str(e), "profile": None}
-                    storage = inventory.storage_report(roots)
                     self._send_json(
                         {
                             "host": {"system": host_info.system, "machine": host_info.machine},
                             "backends": backends_info,
-                            "storage": storage,
+                            "read_only": read_only,
                         }
                     )
                     return
@@ -214,6 +222,14 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
                 if path == "/api/v1/vms":
                     res = inventory.list_vms(roots)
                     self._send_json(res)
+                    return
+
+                if path == "/api/v1/volumes":
+                    self._send_json(inventory.list_volumes(roots))
+                    return
+
+                if path == "/api/v1/networks":
+                    self._send_json(inventory.list_networks(roots))
                     return
 
                 if path.startswith("/api/v1/vms/"):
@@ -299,7 +315,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
 
         def do_POST(self) -> None:
             roots = active_roots["current"]
-            if not self._authenticate() or not self._check_csrf():
+            if not self._authenticate() or not self._check_csrf() or not self._check_writable():
                 return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
@@ -381,7 +397,7 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
 
         def do_DELETE(self) -> None:
             roots = active_roots["current"]
-            if not self._authenticate() or not self._check_csrf():
+            if not self._authenticate() or not self._check_csrf() or not self._check_writable():
                 return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
@@ -418,18 +434,27 @@ def build_handler(roots: state.StatePaths, *, token: str, origin: str) -> type[B
     return DashboardHandler
 
 
-def serve(roots: state.StatePaths, *, host: str = "127.0.0.1", port: int = 0, open_browser: bool = True) -> int:
-    """Serve the local dashboard on loopback only and open a browser window."""
+def serve(
+    roots: state.StatePaths,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    open_browser: bool = True,
+    read_only: bool = True,
+) -> int:
+    """Serve an offline, read-only-by-default dashboard on IPv4 loopback only."""
     token = secrets.token_urlsafe(32)
     # Server binds loopback 127.0.0.1 only regardless of caller host input
     server = ThreadingHTTPServer(
-        ("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}")
+        ("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}", read_only=read_only)
     )
     server.daemon_threads = True
     actual_port = server.server_address[1]
 
     if port == 0:
-        server.RequestHandlerClass = build_handler(roots, token=token, origin=f"http://127.0.0.1:{actual_port}")
+        server.RequestHandlerClass = build_handler(
+            roots, token=token, origin=f"http://127.0.0.1:{actual_port}", read_only=read_only
+        )
 
     url = f"http://127.0.0.1:{actual_port}/?token={token}"
     print(url)

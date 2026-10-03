@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from collections.abc import Sequence
 
-from sqlalchemy import MetaData, Table, func, select
+from sqlalchemy import MetaData, Table, func, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -15,6 +15,14 @@ _TABLES = (
     "palimpsest_hub_uploads",
     "palimpsest_image_exports",
     "palimpsest_hub_builds",
+    "palimpsest_package_namespaces",
+    "palimpsest_packages",
+    "palimpsest_package_keys",
+    "palimpsest_package_versions",
+    "palimpsest_package_blob_references",
+    "palimpsest_package_tags",
+    "palimpsest_package_uploads",
+    "palimpsest_package_caches",
 )
 
 
@@ -43,18 +51,26 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
     copied: dict[str, int] = {}
     try:
         async with source_engine.connect() as source, destination_engine.begin() as destination:
+            source_names = set(await source.run_sync(lambda connection: inspect(connection).get_table_names()))
+            native_names = {name for name in _TABLES if name.startswith(("palimpsest_package_", "palimpsest_packages"))}
+            present_native = source_names & native_names
+            if present_native and present_native != native_names:
+                raise MigrationError("source native package schema is incomplete")
             for table_name in _TABLES:
-                try:
-                    source_table = await _reflect(source, table_name)
-                except NoSuchTableError:
-                    if table_name not in {"palimpsest_hub_layer_access", "palimpsest_hub_builds"}:
-                        raise
-                    copied[table_name] = 0
-                    continue
                 destination_table = await _reflect(destination, table_name)
                 destination_count = await _row_count(destination, destination_table)
                 if destination_count:
                     raise MigrationError(f"destination table {table_name!r} is not empty")
+                try:
+                    source_table = await _reflect(source, table_name)
+                except NoSuchTableError:
+                    if table_name not in {
+                        "palimpsest_hub_layer_access",
+                        "palimpsest_hub_builds",
+                    } and not table_name.startswith(("palimpsest_package_", "palimpsest_packages")):
+                        raise
+                    copied[table_name] = 0
+                    continue
                 rows = [dict(row) for row in (await source.execute(select(source_table))).mappings()]
                 copied[table_name] = len(rows)
                 if rows and not dry_run:

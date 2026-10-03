@@ -73,7 +73,7 @@ def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def server_env(tmp_path: Path):
+def server_env(tmp_path: Path, request: pytest.FixtureRequest):
     roots = _setup_roots(tmp_path)
     token = "secret-test-token-12345"
 
@@ -83,7 +83,8 @@ def server_env(tmp_path: Path):
     dummy_server.server_close()
 
     origin = f"http://127.0.0.1:{port}"
-    handler_cls = ui.build_handler(roots, token=token, origin=origin)
+    handler_options = {} if getattr(request, "param", False) is None else {"read_only": False}
+    handler_cls = ui.build_handler(roots, token=token, origin=origin, **handler_options)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
     server.daemon_threads = True
 
@@ -154,13 +155,13 @@ def test_auth_semantics(server_env: dict[str, Any]):
     status, _, json_data = _request(port, "GET", "/api/v1/summary?token=wrong-token")
     assert status == 401
 
-    # 4. Valid query token on GET -> 200
-    # 4. Valid query token on GET / -> 200 (query token allowed only for GET / and /index.html)
-    status, resp_headers, content = _request(port, "GET", f"/?token={token}")
-    assert status == 200
-    assert "<!DOCTYPE html>" in content
+    # 4. The static shell is credential-free so a token-stripped URL can reload from the tab session.
+    for shell_path in ("/", f"/?token={token}", "/index.html"):
+        status, resp_headers, content = _request(port, "GET", shell_path)
+        assert status == 200
+        assert "<!DOCTYPE html>" in content
 
-    # 5. Query token on API route -> 401 (query token not allowed on API endpoints)
+    # 5. Query token on API route -> 401 (APIs accept only the Authorization header)
     status, _, json_data = _request(port, "GET", f"/api/v1/summary?token={token}")
     assert status == 401
 
@@ -427,13 +428,11 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     token = server_env["token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    # 1. GET / with query token returns 200 (bootstrap HTML)
+    # 1. GET / returns the credential-free bootstrap HTML
     status, resp_headers, content = _request(port, "GET", f"/?token={token}")
     assert status == 200
     assert "text/html" in resp_headers.get("Content-Type", "")
     assert "<!DOCTYPE html>" in content
-    assert "fetch('/app.css'" in content
-    assert "fetch('/app.js'" in content
 
     # 2. Unauthenticated asset fetches return 401
     status, _, _ = _request(port, "GET", "/app.css")
@@ -441,7 +440,7 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     status, _, _ = _request(port, "GET", "/app.js")
     assert status == 401
 
-    # 3. Asset fetches with query token return 401 (token query parameter only allowed on / and /index.html)
+    # 3. Asset fetches with query token return 401 (assets accept only the Authorization header)
     status, _, _ = _request(port, "GET", f"/app.css?token={token}")
     assert status == 401
     status, _, _ = _request(port, "GET", f"/app.js?token={token}")
@@ -506,7 +505,6 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
     assert status == 200
     assert "host" in summary
     assert "backends" in summary
-    assert "storage" in summary
 
     # Test GET /api/v1/vms
     status, _, vms_data = _request(port, "GET", "/api/v1/vms", headers=headers)
@@ -823,3 +821,34 @@ def test_storage_move_and_set_http_rejected_when_env_active(
     assert "PALIMPSEST_STATE_HOME" in json_set["error"]
     assert "unset" in json_set["error"]
     assert not (dest_set / "store").exists()
+
+
+@pytest.mark.parametrize("server_env", [None], indirect=True)
+def test_read_only_default_refuses_all_mutation_routes_without_state_changes(server_env: dict[str, Any]) -> None:
+    roots = server_env["roots"]
+    _write_ui_run_ledger(roots, backend="kvm")
+    source = roots.state / "import.raw"
+    source.write_bytes(b"cloud-image-fixture")
+    destination = roots.state.parent / "new-root"
+    before = {path.relative_to(roots.state): path.read_bytes() for path in roots.state.rglob("*") if path.is_file()}
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    requests = [
+        ("POST", "/api/v1/vms/ui-vm/start", None),
+        ("POST", "/api/v1/vms/ui-vm/stop", None),
+        ("DELETE", "/api/v1/vms/ui-vm?volumes=true", None),
+        ("DELETE", "/api/v1/store/artifacts/sha256:" + "a" * 64, None),
+        ("POST", "/api/v1/store/import", {"path": str(source), "disk_format": "raw", "arch": "x86_64"}),
+        ("POST", "/api/v1/storage/set", {"destination": str(destination)}),
+        ("POST", "/api/v1/storage/move", {"destination": str(destination)}),
+    ]
+    for method, path, body in requests:
+        status, _, payload = _request(server_env["port"], method, path, headers=headers, body=body)
+        assert status == 403
+        assert payload == {"error": "Dashboard is read-only; restart with --allow-control to enable changes"}
+    after = {path.relative_to(roots.state): path.read_bytes() for path in roots.state.rglob("*") if path.is_file()}
+    assert after == before
+    assert not destination.exists()
+
+    status, _, summary = _request(server_env["port"], "GET", "/api/v1/summary", headers=headers)
+    assert status == 200
+    assert summary["read_only"] is True

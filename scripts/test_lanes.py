@@ -32,7 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
-        development_package_workflow publish_development_package
+        development_package_workflow native_kvm_openstack publish_development_package
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake sandbox_policy state test_lanes ui
     """)
@@ -48,7 +48,7 @@ PORTABLE_FILES = {
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
-    "build-registry": _units("build buildkit hub_builder hub_contract registry"),
+    "build-registry": _units("build buildkit hub_builder hub_contract registry packages package_credentials"),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
         oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff
@@ -105,7 +105,17 @@ SPECIAL_FILES = {
     "gate2": ("tests/e2e/test_local_oci_build_run.py",),
     "hub": tuple(
         f"hub/tests/test_{name}.py"
-        for name in ("auth", "builds", "database_pool", "hub_api", "image_exports", "migrate", "upload_limits")
+        for name in (
+            "auth",
+            "builds",
+            "database_pool",
+            "hub_api",
+            "image_exports",
+            "migrate",
+            "upload_limits",
+            "packages",
+            "package_contents",
+        )
     ),
 }
 SPECIAL_NOTES = {
@@ -275,7 +285,7 @@ DEPENDENCIES = (
         ("native-live", "gate2"),
     ),
     (
-        "build buildkit hub hub_builder registry refs",
+        "build buildkit hub hub_builder registry refs packages package_source package_credentials package_reference",
         ("build-registry", "core-cli", "host-runtime", "oci-store"),
         ("gate1", "hub"),
     ),
@@ -406,6 +416,8 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
             "scripts/test_lanes.py",
             ".github/workflows/test.yml",
             ".github/workflows/development-package.yml",
+            ".github/workflows/release.yml",
+            "scripts/run_native_kvm_openstack.py",
         }:
             selected.update(("core-cli", "qualification"))
             reasons.append(

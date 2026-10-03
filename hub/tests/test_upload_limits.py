@@ -14,7 +14,6 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.api import hub as hub_api
-from palimpsest_hub.auth import get_token_info
 from palimpsest_hub.main import app
 from palimpsest_hub.models import Base, PalimpsestHubLayer, PalimpsestHubUpload
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
@@ -240,7 +239,7 @@ async def test_upload_sessions_are_project_bounded_and_released_on_abort(tmp_pat
     async def identity(request: Request):
         return {"project_id": request.headers.get("x-project-id", "alpha"), "user_id": "member"}
 
-    app.dependency_overrides[get_token_info] = identity
+    app.dependency_overrides[hub_api._legacy_writer] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             uploads = []

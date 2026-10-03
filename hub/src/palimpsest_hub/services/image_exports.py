@@ -30,8 +30,9 @@ if TYPE_CHECKING:
 
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import get_session_factory
-from palimpsest_hub.models import PalimpsestHubLayer, PalimpsestImageExport
+from palimpsest_hub.models import PalimpsestHubLayer, PalimpsestImageExport, exact_identity
 from palimpsest_hub.openstack import get_admin_connection_for_project, get_image
+from palimpsest_hub.services.blob_references import package_blob_referenced
 from palimpsest_hub.services.hub_store import (
     IMAGE_FORMAT_SPECS,
     acquire_lock_by_polling,
@@ -253,7 +254,7 @@ async def enqueue_image_export(
 
     async with factory() as session:
         stmt_same = select(PalimpsestImageExport).where(
-            PalimpsestImageExport.project_id == project_id,
+            exact_identity(PalimpsestImageExport.project_id, project_id),
             PalimpsestImageExport.artifact_key == artifact_key,
         )
         same_pre = (await session.execute(stmt_same)).scalar_one_or_none()
@@ -290,11 +291,13 @@ async def enqueue_image_export(
             # Lock the project's indexed key range so concurrent requests for
             # different artifacts cannot both create nonterminal work.
             await session.execute(
-                select(PalimpsestImageExport.id).where(PalimpsestImageExport.project_id == project_id).with_for_update()
+                select(PalimpsestImageExport.id)
+                .where(exact_identity(PalimpsestImageExport.project_id, project_id))
+                .with_for_update()
             )
             # 1. Enforce at most one nonterminal job per project
             stmt_active = select(PalimpsestImageExport).where(
-                PalimpsestImageExport.project_id == project_id,
+                exact_identity(PalimpsestImageExport.project_id, project_id),
                 PalimpsestImageExport.deleted_at.is_(None),
                 PalimpsestImageExport.status.notin_([STATUS_COMPLETE, STATUS_ERROR]),
             )
@@ -308,7 +311,7 @@ async def enqueue_image_export(
 
             # 2. Check for existing same-project job for (project_id, artifact_key)
             stmt_same = select(PalimpsestImageExport).where(
-                PalimpsestImageExport.project_id == project_id,
+                exact_identity(PalimpsestImageExport.project_id, project_id),
                 PalimpsestImageExport.artifact_key == artifact_key,
             )
             same_row = (await session.execute(stmt_same)).scalar_one_or_none()
@@ -435,13 +438,15 @@ async def enqueue_image_export(
         # Explicit race recovery preflight outside transaction
         async with factory() as session:
             stmt_same = select(PalimpsestImageExport).where(
-                PalimpsestImageExport.project_id == project_id,
+                exact_identity(PalimpsestImageExport.project_id, project_id),
                 PalimpsestImageExport.artifact_key == artifact_key,
             )
             same_race = (await session.execute(stmt_same)).scalar_one_or_none()
 
         if same_race is None:
-            raise
+            raise ImageExportError(
+                409, "Legacy export ownership conflicts with exact project identity", code="project_identity_conflict"
+            ) from None
 
         race_digest = same_race.result_blob_digest if same_race.status == STATUS_COMPLETE else None
         race_present = blob_store.exists(race_digest) if race_digest else False
@@ -504,7 +509,7 @@ async def list_project_exports(
         raise ImageExportError(status_code=503, detail="Database connection unavailable", code="db_unavailable")
     async with factory() as session:
         stmt = select(PalimpsestImageExport).where(
-            PalimpsestImageExport.project_id == project_id,
+            exact_identity(PalimpsestImageExport.project_id, project_id),
             PalimpsestImageExport.deleted_at.is_(None),
         )
         if source_image_id:
@@ -523,7 +528,7 @@ async def get_project_export(project_id: str, export_id: str) -> PalimpsestImage
         raise ImageExportError(status_code=503, detail="Database connection unavailable", code="db_unavailable")
     async with factory() as session:
         stmt = select(PalimpsestImageExport).where(
-            PalimpsestImageExport.project_id == project_id,
+            exact_identity(PalimpsestImageExport.project_id, project_id),
             PalimpsestImageExport.id == export_id,
             PalimpsestImageExport.deleted_at.is_(None),
         )
@@ -542,7 +547,7 @@ async def soft_delete_project_export(project_id: str, export_id: str) -> Palimps
         stmt = (
             select(PalimpsestImageExport)
             .where(
-                PalimpsestImageExport.project_id == project_id,
+                exact_identity(PalimpsestImageExport.project_id, project_id),
                 PalimpsestImageExport.id == export_id,
                 PalimpsestImageExport.deleted_at.is_(None),
             )
@@ -804,15 +809,16 @@ async def process_one_image_export(*, owner: str) -> bool:
     job = await claim_next_image_export(owner=owner)
     if job is None:
         return False
+    started = time.monotonic()
+    _logger.info("Export task started status=downloading")
+    outcome = "error"
+    total_downloaded = 0
+    output_size = 0
 
     settings = get_settings()
     factory = get_session_factory()
     blob_store = get_blob_store()
     scratch_dir = _scratch_dir_for(blob_store.exports_dir, job, owner)
-
-    # Every claim gets an owner/attempt-specific directory. A worker that loses
-    # its lease may clean only its own files, never the reclaimer's active work.
-    await asyncio.to_thread(_prepare_scratch_dir, scratch_dir, blob_store.exports_dir)
 
     heartbeat_stop = asyncio.Event()
     lease_lost = asyncio.Event()
@@ -829,11 +835,11 @@ async def process_one_image_export(*, owner: str) -> bool:
                 async with factory() as session, session.begin():
                     ok = await _update_job_cas(session, job.id, owner, extend_lease_seconds=120)
                     if not ok:
-                        _logger.warning("Heartbeat CAS lost lease for export %s", job.id)
+                        _logger.warning("Export heartbeat lost lease")
                         lease_lost.set()
                         break
             except Exception:
-                _logger.warning("Heartbeat failed for export %s", job.id, exc_info=True)
+                _logger.warning("Export heartbeat failed")
                 lease_lost.set()
                 break
 
@@ -844,6 +850,7 @@ async def process_one_image_export(*, owner: str) -> bool:
     err_msg = "An unexpected error occurred during image export"
 
     try:
+        await asyncio.to_thread(_prepare_scratch_dir, scratch_dir, blob_store.exports_dir)
         # 1. Obtain project-scoped OpenStack connection & recheck Glance image authorization/revision
         try:
             admin_conn = await asyncio.to_thread(get_admin_connection_for_project, job.project_id)
@@ -881,7 +888,7 @@ async def process_one_image_export(*, owner: str) -> bool:
                         authorized = True
                         break
             except Exception:
-                _logger.warning("Failed to verify Glance image membership for export %s", job.id, exc_info=True)
+                _logger.warning("Export image membership verification failed")
 
         if not authorized:
             err_code = "access_denied"
@@ -906,12 +913,7 @@ async def process_one_image_export(*, owner: str) -> bool:
         free_bytes = shutil.disk_usage(scratch_dir).free
         required_download_space = job.source_size_bytes + (1 * 1024 * 1024 * 1024)
         if free_bytes < required_download_space:
-            _logger.warning(
-                "Insufficient export download storage for %s (free=%s required=%s)",
-                job.id,
-                free_bytes,
-                required_download_space,
-            )
+            _logger.warning("Insufficient export download storage")
             err_code = "insufficient_disk_space"
             err_msg = "Insufficient storage capacity for image export"
             raise ImageExportError(507, err_msg, code=err_code)
@@ -923,7 +925,6 @@ async def process_one_image_export(*, owner: str) -> bool:
         sha256 = hashlib.sha256()
         sha512 = hashlib.sha512()
         md5 = hashlib.md5()  # noqa: S324 — Glance MD5 checksum verification
-        total_downloaded = 0
         max_allowed = settings.palimpsest_hub_max_blob_bytes
 
         def _do_download():
@@ -990,7 +991,7 @@ async def process_one_image_export(*, owner: str) -> bool:
             err_msg = "Source image inspection timed out"
             raise ImageExportError(504, err_msg, code=err_code) from exc
         if code != 0:
-            _logger.warning("qemu-img source inspection failed for export %s: %s", job.id, stderr_str[-1000:])
+            _logger.warning("Export source inspection failed")
             err_code = "invalid_image_format"
             err_msg = "Source image format inspection failed"
             raise ImageExportError(400, err_msg, code=err_code)
@@ -1043,7 +1044,7 @@ async def process_one_image_export(*, owner: str) -> bool:
                 err_msg = "Conversion storage measurement timed out"
                 raise ImageExportError(504, err_msg, code=err_code) from exc
             if code != 0:
-                _logger.warning("qemu-img measure failed for export %s: %s", job.id, stderr_str[-1000:])
+                _logger.warning("Export storage measurement failed")
                 err_code = "measurement_failed"
                 err_msg = "Unable to measure required conversion storage"
                 raise ImageExportError(400, err_msg, code=err_code)
@@ -1067,12 +1068,7 @@ async def process_one_image_export(*, owner: str) -> bool:
         free_bytes = shutil.disk_usage(scratch_dir).free
         required_space = required_val + (1 * 1024 * 1024 * 1024)
         if free_bytes < required_space:
-            _logger.warning(
-                "Insufficient export conversion storage for %s (free=%s required=%s)",
-                job.id,
-                free_bytes,
-                required_space,
-            )
+            _logger.warning("Insufficient export conversion storage")
             err_code = "insufficient_disk_space"
             err_msg = "Insufficient storage capacity for image export"
             raise ImageExportError(507, err_msg, code=err_code)
@@ -1099,7 +1095,7 @@ async def process_one_image_export(*, owner: str) -> bool:
                     cmd_convert, timeout=3600.0, scratch_dir=scratch_dir, lease_lost=lease_lost
                 )
                 if code != 0:
-                    _logger.warning("qemu-img conversion failed for export %s: %s", job.id, stderr_str[-1000:])
+                    _logger.warning("Export conversion failed")
                     err_code = "conversion_failed"
                     err_msg = "Image conversion failed"
                     raise ImageExportError(500, err_msg, code=err_code)
@@ -1128,7 +1124,7 @@ async def process_one_image_export(*, owner: str) -> bool:
             err_msg = "Converted image inspection timed out"
             raise ImageExportError(504, err_msg, code=err_code) from exc
         if code != 0:
-            _logger.warning("qemu-img output inspection failed for export %s: %s", job.id, stderr_str[-1000:])
+            _logger.warning("Export output inspection failed")
             err_code = "conversion_failed"
             err_msg = "Converted image validation failed"
             raise ImageExportError(500, err_msg, code=err_code)
@@ -1173,34 +1169,40 @@ async def process_one_image_export(*, owner: str) -> bool:
                     lease_lost.set()
                     raise ImageExportLeaseLost
 
-        finalized = await asyncio.to_thread(
-            blob_store.promote_file, target_file, max_bytes=settings.palimpsest_hub_max_blob_bytes
+        # Import lazily: legacy API imports this service before defining its locks.
+        from palimpsest_hub.api.hub import _locked_blob, _run_blocking
+
+        finalized = await _run_blocking(
+            blob_store.inspect_file, target_file, max_bytes=settings.palimpsest_hub_max_blob_bytes
         )
-
-        if factory:
-            async with factory() as session, session.begin():
-                ok = await _update_job_cas(
-                    session,
-                    job.id,
-                    owner,
-                    status=STATUS_COMPLETE,
-                    progress_pct=PROGRESS_COMPLETE,
-                    result_blob_digest=finalized.blob_digest,
-                    result_size_bytes=finalized.size_bytes,
-                    completed_at=_now(),
-                    clear_lease=True,
-                )
-                if not ok:
-                    _logger.error("Final CAS failed to publish completion for export %s", job.id)
-
+        async with _locked_blob(blob_store, finalized.blob_digest):
+            await _run_blocking(blob_store.publish_verified, target_file, finalized)
+            if factory:
+                async with factory() as session, session.begin():
+                    ok = await _update_job_cas(
+                        session,
+                        job.id,
+                        owner,
+                        status=STATUS_COMPLETE,
+                        progress_pct=PROGRESS_COMPLETE,
+                        result_blob_digest=finalized.blob_digest,
+                        result_size_bytes=finalized.size_bytes,
+                        completed_at=_now(),
+                        clear_lease=True,
+                    )
+                    if not ok:
+                        _logger.warning("Export completion lost lease")
+                        outcome = "lease_lost"
+        if outcome != "lease_lost":
+            outcome = "complete"
         return True
 
     except ImageExportLeaseLost:
-        _logger.warning("Palimpsest export job %s lost its lease; leaving it for reclaim", job.id)
+        outcome = "lease_lost"
         return True
 
     except Exception as exc:
-        _logger.warning("Palimpsest export job %s failed: %s", job.id, exc, exc_info=True)
+        _logger.warning("Export task failed")
         if isinstance(exc, ImageExportError):
             err_code = exc.code
             err_msg = exc.detail
@@ -1208,8 +1210,7 @@ async def process_one_image_export(*, owner: str) -> bool:
         if factory:
             try:
                 async with factory() as session, session.begin():
-                    # Retain prior progress_pct on error
-                    await _update_job_cas(
+                    if not await _update_job_cas(
                         session,
                         job.id,
                         owner,
@@ -1217,9 +1218,10 @@ async def process_one_image_export(*, owner: str) -> bool:
                         error_code=err_code,
                         error_message=err_msg,
                         clear_lease=True,
-                    )
+                    ):
+                        outcome = "lease_lost"
             except Exception:
-                _logger.error("Failed to write error status for job %s", job.id, exc_info=True)
+                _logger.error("Export error status update failed")
 
         return True
 
@@ -1232,8 +1234,19 @@ async def process_one_image_export(*, owner: str) -> bool:
             try:
                 await asyncio.to_thread(admin_conn.close)
             except Exception:
-                _logger.debug("Failed to close export OpenStack connection", exc_info=True)
-        await asyncio.to_thread(_remove_scratch_dir, scratch_dir)
+                _logger.debug("Export connection close failed")
+        try:
+            await asyncio.to_thread(_remove_scratch_dir, scratch_dir)
+        finally:
+            _logger.info("Export task ended status=%s", outcome)
+            _logger.debug(
+                "Export task result status=%s attempts=%d downloaded_bytes=%d output_bytes=%d elapsed_ms=%d",
+                outcome,
+                job.attempts,
+                total_downloaded,
+                output_size,
+                int((time.monotonic() - started) * 1000),
+            )
 
 
 async def validate_qemu_img_support() -> None:
@@ -1332,10 +1345,12 @@ async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
                 ).scalar_one_or_none()
                 if layer_ref is not None:
                     continue
+                if await package_blob_referenced(session, digest):
+                    continue
 
             entry.unlink(missing_ok=True)
         except Exception:
-            _logger.warning("Failed Palimpsest blob GC for %s", digest, exc_info=True)
+            _logger.warning("Export blob GC failed")
         finally:
             if lock_fd is not None:
                 blob_store.release_blob_lock(lock_fd)
