@@ -116,6 +116,58 @@ override for extraction and a sparse 8 GiB+1 byte member for offset and
 limit checks. Neither test reads or allocates an 8 GiB payload; an actual
 large-blob end-to-end import and crash-durability proof remain separate.
 
+## Extracted Hub tracking checklist
+
+For changes to `tracking/afterglow-palimpsest.json`, validate the real upstream
+checkout **and** existing executable consumer contracts. The reviewed baseline
+is Afterglow `main` commit `2862565c1f59eac0ef0904b97c905b177f12b335`; the
+scheduled workflow still follows moving `main`. `AFTERGLOW_MAIN_CHECKOUT` below
+must be the intended upstream `main` checkout, not the shared Afterglow `dev`
+worktree. Record its actual SHA in the validation receipt.
+
+From the Palimpsest repository root:
+
+```sh
+uv sync --frozen --extra dev
+uv run python scripts/check_afterglow_drift.py \
+  --upstream-root "$AFTERGLOW_MAIN_CHECKOUT" --local-root .
+uv run pytest -q tests/unit/test_afterglow_tracking.py \
+  tests/unit/test_hub_contract.py tests/unit/test_oci_layout.py
+```
+
+The first suite retains independent hash, required/forbidden-marker and
+absence-rule checker regressions. The preceding command checks the real
+manifest against the actual upstream and local source; it is not replaced by
+fixtures generated from the manifest's own expected markers. The obsolete
+`test_manifest_records_the_current_hub_protocol_gap` source-copy assertion is
+deleted, not repinned. Checker fixture inputs prove no HTTP or authentication
+behavior.
+
+In the separate Hub environment:
+
+```sh
+cd hub
+uv sync --frozen --extra dev
+uv run pytest -q tests/test_auth.py tests/test_upload_limits.py \
+  tests/test_hub_api.py
+```
+
+Existing behavioral selectors to retain include:
+
+- Client offset/range and transport: `tests/unit/test_hub_contract.py::test_push_reconciles_offset_conflict_and_finalizes_with_exact_offset`, `::test_pull_blob_resumes_only_from_exact_content_range`, `::test_hub_client_blocks_redirects`, and `::test_hub_client_redacts_tokens_on_error`.
+- Local strict importer: `tests/unit/test_oci_layout.py::test_extract_and_verify_bundle` and `::test_extract_bundle_security_rejections`.
+- Hub scope and creating user (paths below are relative to `hub/`): `tests/test_auth.py::test_require_token_missing_header_raises_401`, `::test_require_token_rejects_missing_project_scope`, `::test_project_header_is_assertion_not_rescope`; `tests/test_upload_limits.py::test_upload_sessions_are_project_bounded_and_released_on_abort`; `tests/test_hub_api.py::test_legacy_upload_remains_private_to_its_original_member` and `::test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_schema`.
+- Hub received-byte/parent chain: `tests/test_hub_api.py::test_finalize_rejects_declared_digest_mismatch_and_discards_bytes`, `::test_bundle_digest_mismatch_rejects_before_cas_publication`, `::test_parse_bundle_reconstructs_parent_chain_from_manifest_order`, `::test_parse_bundle_rejects_annotated_config_parent_that_contradicts_manifest_order`, and `::test_import_registers_the_whole_chain_with_its_declared_parents`.
+
+These HTTP/store/client fixtures do not authenticate against deployed Keystone
+or prove crash durability, native guest execution or production rollout.
+Afterglow BFF authentication and header-forwarding tests belong to Afterglow's
+own gate. Retain all existing full/package/image/native release requirements;
+this focused checklist does not replace them. The initial ownership-cutover
+edit did not dispatch CI or run native/deployment operations. Parent validation
+against actual Afterglow `main` and the retained client/Hub suites is recorded
+in `ARCHITECTURE.md`; hosted publication remains a separate gate.
+
 ## CLI reference and distribution checks
 
 For command documentation and packaging-only edits, use the focused contracts:

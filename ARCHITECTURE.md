@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 기본 checkout의 현재 source는 root `palimpsest-client 0.3.0`과 별도 `palimpsest-hub 0.3.0` native project-package registry 후보를 준비한다. 두 package metadata/lock/module version 및 Kolla image-tag 후보는 0.3.0으로 일치하지만 게시·배포 증거는 아니다. Kolla source-build 기본 ref는 검토·검증된 후보 commit `a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b`이며 운영자는 게시된 API/worker image와 검토된 digest를 별도로 확인·pin해야 한다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 기본 checkout의 현재 source는 root `palimpsest-client 0.3.0`과 별도 `palimpsest-hub 0.3.0` native project-package registry 후보를 준비한다. 두 package metadata/lock/module version 및 Kolla image-tag 후보는 0.3.0으로 일치하지만 게시·배포 증거는 아니다. Kolla source-build 기본 ref는 검토·검증된 후보 commit `c4887f7806608e98f215abbd377d2eafe159ff76`이며 운영자는 게시된 API/worker image와 검토된 digest를 별도로 확인·pin해야 한다.
 
 Multi-host Kolla deployments prepare each host's local Hub volume with its reviewed API image before starting API/worker containers; only the database bootstrap is delegated to the first host.
 
@@ -222,7 +222,7 @@ Buildx 출력 열 간격 가정 때문에 Gate 1 전에 실패했고 그 evidenc
 
 후속 `d9b3593`의 로컬·exact-SHA 서버 집중 검사 각209건과 전용 native43 boots /44QEMU proof가 통과했다. 원본 Redis는 공개 `run -d`와 실제 `/` 전환·workload 시작까지 진행했으나 entrypoint의 `setpriv` capability 유지 요청이 거부돼 status1로 종료했다. 서비스 readiness 및 이후 service exec/root/PID1 비교 검사는 미통과다. 실패 domain 이름이 남아 기존 cold exec의 empty-domain preflight를 중단했지만, 추가 조회에서 guest는 이미 `shut off`이고 inactive 등록만 남았음을 확인했다. 독립 승인된 대체 계획으로 해당 등록의 UUID·shut-off·autostart 비활성·활성 VM 없음·원본 해시를 전후 확인했고, 동일 SHA의 별도 기존 빌드 이미지 cold 공개 run/exec/root/PID1 refusal/stop/rm이 통과했다(21.07초). 실패 Redis의 등록·자료는 보존했고 수동 stop/삭제나 PID1/workload 권한 추가는 하지 않았다.
 
-`IMPLEMENTATION_PLAN.md`, [`docs/oci-public-runtime-roadmap.md`](docs/oci-public-runtime-roadmap.md), [`docs/oci-docker-hub-compatibility.md`](docs/oci-docker-hub-compatibility.md), 그리고 [`tracking/afterglow-palimpsest.json`](tracking/afterglow-palimpsest.json)은 각각 역사적 계획/qualification 기록 또는 Afterglow baseline 계약이다. 이 문서는 해당 파일의 완료 주장이나 hash를 재작성하지 않으며, 현재 소스와 테스트 정의가 우선한다.
+`IMPLEMENTATION_PLAN.md`와 [`docs/oci-public-runtime-roadmap.md`](docs/oci-public-runtime-roadmap.md), [`docs/oci-docker-hub-compatibility.md`](docs/oci-docker-hub-compatibility.md)는 역사적 계획/qualification 기록이다. [`tracking/afterglow-palimpsest.json`](tracking/afterglow-palimpsest.json)은 Afterglow `main`과 standalone Hub/client 사이의 현재 구조적 소유권 계약이며, 완료·runtime/authentication/native 증거가 아니다. 현재 소스와 behavioral 테스트 정의가 우선한다.
 
 ## System context
 
@@ -778,6 +778,10 @@ Architecture maintenance는 다음 순서로 수행한다.
 
 문서 진입점 이관: root [`AGENTS.md`](AGENTS.md)·[`agent.md`](agent.md)의 상세 의무는 [contributor workflow spec](openspec/specs/contributor-workflow/spec.md)과 [CI safety/performance spec](openspec/specs/ci-safety-and-performance/spec.md)(옛 AGENTS 규칙 1–12)으로 이동했다. 기존 Maintenance 및 아래 날짜별 증거는 유지한다. 문서 이관 자체는 source/CI/원격 상태를 변경하거나 새 승인·검증을 주장하지 않는다. 후속 승인된 dev 통합의 marker와 검사는 별도 기록한다.
 
+Tracking ownership cutover — 2026-10-04: Afterglow `main` baseline `2862565c1f59eac0ef0904b97c905b177f12b335`의 추출 경계를 반영했다. `hub-http-v1`, `layer-metadata-and-digest-v1`, `oci-bundle-v1`의 정본은 `hub/src/palimpsest_hub/`의 `/v1` router, models, digest 및 bundle services다. Afterglow의 Hub facade와 `service_proxy.py`는 인증된 BFF consumer이며 caller token/project와 `Upload-Offset` 전달만 맡는다. 제거된 Afterglow Hub models/bundle service의 재도입은 drift다. Local build/runtime와 Union의 admin-only/Manila 소유권은 그대로 유지한다.
+
+추출된 facade와 진화하는 client/runtime counterpart의 incidental whole-file pins는 검토한 public-boundary/소유권 marker로 대체했다. 별도 digest/lineage upstream hash 계약은 유지하며 일괄 repin하지 않았다. Marker checker는 호출 실행·HTTP status·Keystone identity·SQL visibility·실제 bytes를 증명하지 않는다. Upload status/offset, project/creator ownership, digest/parent-chain 및 더 엄격한 local bundle importer는 기존 behavioral suites로 별도 검사한다. 실제 Afterglow `main` 입력의 checker, 최종 checker/client/importer26건과 독립 Hub215건이 통과했다. Root wheel/sdist의 isolated install·CLI와 API/worker의 amd64·arm64 canonical build를 실행했고, 두 API의 실제 loopback HTTP에서 health200·discovery와 missing-token/project-header-only401, worker import를 확인했다. Manifest의 기대 marker를 그대로 복사하는 fixture는 독립 증거가 아니므로 삭제했다. [상세 계약](docs/compatibility.md)과 [로컬 체크리스트](docs/testing.md)를 함께 갱신했다. 이 로컬 증거는 deployed Keystone·DB readiness·native KVM·CI publication·운영 rollout의 통과가 아니다.
+
 `3f8e79e` synthetic readback 실패의 source review 결과, production converter나
 packer가 아니라 검증 도구의 기본 wildcard selector가 literal backslash를
 escape한 테스트 경계 문제였다. 정확한 readback argv에 `-no-wildcards`를 더하는
@@ -1083,9 +1087,9 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8f64dbde7852dca6d04ab613050929505a71c5f5f971d64e17bad63d6f1caa16",
-  "reviewed_at": "2026-10-02T06:30:36Z",
-  "summary": "Final 0.3.0 application source and both functional gates verified; Kolla source pin targets c4887f7806608e98f215abbd377d2eafe159ff76 containing all final application changes. Source-pin-only metadata follow-up passes Kolla contracts; main/tag/publication/cloud remain owner-gated."
+  "source_sha256": "6304aa849560a1790d040f747461964b37dfcf8f2b864947e01ade9d66d5d45d",
+  "reviewed_at": "2026-10-03T16:04:06Z",
+  "summary": "Extracted Hub tracking cutover: tracking/afterglow-palimpsest.json follows hub/src/palimpsest_hub /v1 authority and the authenticated Afterglow BFF consumer at main 2862565c; manifest-copied test fixtures removed. Actual-main checker, tracking/client/importer 26, full 6165 passed/260 skipped, Hub 215, root package and both-architecture Hub HTTP/auth-denial smokes passed; source-pin docs now match c4887f7. No runtime or Hub source change; hosted CI, native KVM and publication remain gated."
 }
 ```
 <!-- architecture-review:end -->

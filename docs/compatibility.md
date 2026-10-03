@@ -1,8 +1,36 @@
 # Palimpsest Local Compatibility & Integration Contract
 
-`palimpsest-local` provides an independently versioned Python library and CLI (`palimpsest`) that integrates with Afterglow Hub while enforcing strict artifact verification and local KVM runtime invariants. The current architecture map is [the root `ARCHITECTURE.md`](../ARCHITECTURE.md).
+`palimpsest-local` provides an independently versioned Python library and CLI (`palimpsest`) that integrates with standalone Palimpsest Hub while enforcing strict artifact verification and local KVM runtime invariants. Afterglow is a separate authenticated BFF consumer. The current architecture map is [the root `ARCHITECTURE.md`](../ARCHITECTURE.md).
 
 Palimpsest Hub's native `/v1` artifact API and external Docker/OCI `/v2` registries are distinct protocols and storage domains. The client does not reinterpret one as the other.
+
+## Tracked ownership and evidence boundary
+
+The [tracking manifest](../tracking/afterglow-palimpsest.json) follows Afterglow
+`main`, with reviewed extraction baseline
+`2862565c1f59eac0ef0904b97c905b177f12b335`. It does not pin a deployment or
+redirect the scheduled workflow to a feature branch.
+
+| Contract | Authority | Afterglow boundary |
+| --- | --- | --- |
+| Hub HTTP `/v1` | `hub/src/palimpsest_hub/main.py` and `api/hub.py`; `HubClient` is the native consumer | `backend/app/api/palimpsest/hub.py` and `services/service_proxy.py` authenticate the caller and forward token/project scope and `Upload-Offset`; not an embedded artifact API |
+| Hub metadata and digest | Hub models/digest services, client canonical digest/reference verification | Separate Afterglow LayerArtifact/admin lineage and digest helpers remain; Hub layer/upload/export models must not return to Afterglow |
+| OCI bundle export/import | Hub bundle service and client verified layout importer | BFF forwarding only; removed `palimpsest_hub_bundle.py` must not return |
+| Local build/runtime and Union | Existing local client/runtime and Afterglow admin-only Union/Manila paths | Ownership unchanged by extraction tracking |
+
+Reviewed boundary markers replace incidental implementation-file hashes for
+the extracted facade and evolving client/runtime counterparts. Hash tracking
+of the separate upstream digest/lineage helpers remains. Marker checks detect
+missing files, removed required boundaries and reintroduced embedded ownership;
+they are **structural**, not executable authentication or transfer proof.
+The fixture regressions are synthetic marker inputs, not a simulated Hub.
+
+The upload status route and exact `Upload-Offset` resume/finalize behavior,
+project/creating-user visibility, received-byte digests, complete parent chains,
+and the local importer's stricter media-type/member/descriptor validation
+remain mandatory behavioral contracts. No runtime, protocol, storage or auth
+implementation is changed here, and no fresh test, CI, Keystone, native KVM or
+deployment result is claimed. See the [local checklist](testing.md).
 
 ---
 

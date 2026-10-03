@@ -6,6 +6,12 @@ All notable changes to Palimpsest Local are documented here.
 
 Root `palimpsest-client` and independently packaged `palimpsest-hub` both prepare 0.3.0 for the native project-package registry. This supersedes the unpublished root 0.2.4 preparation; the Kolla image-tag candidate also becomes 0.3.0 and its immutable source default points at the reviewed candidate commit. Verify both image publications before deployment. No tag, PyPI release, GHCR publication or deployment is claimed.
 
+### Extracted Hub tracking-contract cutover
+
+- Retain Afterglow `main` tracking and review baseline `2862565c1f59eac0ef0904b97c905b177f12b335`; track standalone Hub `/v1` routes, models and bundle services as authority and Afterglow's authenticated BFF as consumer. Local build/runtime and Union ownership do not change.
+- Replace incidental facade/client/runtime file pins with reviewed structural boundaries while retaining separate upstream digest/lineage hash checks. Require upload status/offset and caller scope, reject reintroduced embedded Hub ownership, and preserve digest/parent-chain and stricter local importer contracts.
+- Remove the obsolete source-copy protocol-gap test rather than repinning it. Retain independent hash, required/forbidden-marker and absence-rule checker regressions; do not generate test fixtures from the manifest's own expected markers. Actual checkout validation and existing client/Hub behavioral gates remain separate from authentication/native/deployment proof.
+
 ### Project-scoped native packages
 
 - Add native `palimpsest` registry profiles with a same-authority HTTPS `api_base`, verified CA trust and redirect refusal. A configured authority must map to one protocol, and an explicit `--registry` must match a qualified reference's authority. Unconfigured fully qualified authorities stay ordinary Docker/OCI, as before, including login/logout. OCI-profile Docker/Buildx operations are unchanged.
@@ -23,7 +29,7 @@ Root `palimpsest-client` and independently packaged `palimpsest-hub` both prepar
 
 ### Retained release and deployment fixes
 
-- Keep metadata, module versions and lockfiles consistent at 0.3.0 in both distributions; synchronize the Kolla image candidate and replace its obsolete source default with reviewed commit `a509e2f4f242a1b21ba9be7171db5d5ccbf8d30b`. During deploy/upgrade, verify/pull the reviewed API image and initialize the local Hub volume root on each Palimpsest host before starting its API/worker containers; keep the database bootstrap single-host and do not recursively change existing blobs.
+- Keep metadata, module versions and lockfiles consistent at 0.3.0 in both distributions; synchronize the Kolla image candidate and replace its obsolete source default with reviewed commit `c4887f7806608e98f215abbd377d2eafe159ff76`. During deploy/upgrade, verify/pull the reviewed API image and initialize the local Hub volume root on each Palimpsest host before starting its API/worker containers; keep the database bootstrap single-host and do not recursively change existing blobs.
 - Move native CI orchestration to GitHub-hosted Ubuntu with a protected environment and disposable, member-project-only OpenStack VMs. PRs require hosted checks; trusted dev/main pushes and release tags retain strict native success gates. The helper validates source/kernel evidence and refuses foreign ownership during bounded failure/signal cleanup. The existing persistent runner remains stopped.
 - Restrict release permissions to read-only by default, granting OIDC only to PyPI publication and contents-write only to formal GitHub release publication. Existing development-package/GHCR publication paths still require separate approval; this unpushed cutover does not claim a GitHub native pass or production promotion.
 - Document the persistent loopback/SSH-only candidate environment, actual authenticated artifact and two-layer build proofs, timeout/restart/reboot recovery, and explicit backup/restore and promotion boundaries. The isolated manual native proof passed all 43 boots/44 QEMU invocations and exact-owned cleanup after replacing transient KVM device ACLs with standard guest group membership. Exact closed-transport signature, GitHub CI execution, and production multi-host readiness remain separate evidence gates.
