@@ -1088,8 +1088,8 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 {
   "schema_version": 1,
   "source_sha256": "6304aa849560a1790d040f747461964b37dfcf8f2b864947e01ade9d66d5d45d",
-  "reviewed_at": "2026-10-03T16:04:06Z",
-  "summary": "Extracted Hub tracking cutover: tracking/afterglow-palimpsest.json follows hub/src/palimpsest_hub /v1 authority and the authenticated Afterglow BFF consumer at main 2862565c; manifest-copied test fixtures removed. Actual-main checker, tracking/client/importer 26, full 6165 passed/260 skipped, Hub 215, root package and both-architecture Hub HTTP/auth-denial smokes passed; source-pin docs now match c4887f7. No runtime or Hub source change; hosted CI, native KVM and publication remain gated."
+  "reviewed_at": "2026-10-03T21:05:09Z",
+  "summary": "PR #11 history integration: ordinary main e7c0fd6 into dev d76d77d; all nine conflicted files retain reviewed dev content and the resolved tree equals the prior dev tree. Hub asyncmy recovery and regression are identical in both heads; 0.3.0 metadata, package test lanes, runtime, dependencies and CI policy are unchanged. Actual CLI reports 0.3.0 and the canonical manifest validates all test files. Only this architecture review marker is refreshed; prior full-suite/build evidence remains historical, and new hosted publication/native approval are pending."
 }
 ```
 <!-- architecture-review:end -->
