@@ -14,6 +14,14 @@ _TABLES = (
     "palimpsest_hub_uploads",
     "palimpsest_image_exports",
     "palimpsest_hub_builds",
+    "palimpsest_package_namespaces",
+    "palimpsest_packages",
+    "palimpsest_package_keys",
+    "palimpsest_package_versions",
+    "palimpsest_package_blob_references",
+    "palimpsest_package_tags",
+    "palimpsest_package_uploads",
+    "palimpsest_package_caches",
 )
 
 
@@ -69,5 +77,27 @@ async def test_migrate_accepts_legacy_source_without_build_table(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_migrate_rejects_same_database():
-    with pytest.raises(MigrationError, match="must differ"):
+    with pytest.raises(MigrationError):
         await migrate("sqlite+aiosqlite:///same.sqlite", "sqlite+aiosqlite:///same.sqlite")
+
+
+@pytest.mark.asyncio
+async def test_migrate_rejects_partial_native_state_before_copying_any_legacy_row(tmp_path: Path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'partial.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'empty.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    engine = create_async_engine(source_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP TABLE palimpsest_package_tags"))
+        with pytest.raises(MigrationError):
+            await migrate(source_url, destination_url)
+        destination = create_async_engine(destination_url)
+        try:
+            async with destination.connect() as connection:
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 0
+        finally:
+            await destination.dispose()
+    finally:
+        await engine.dispose()

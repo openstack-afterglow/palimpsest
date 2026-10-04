@@ -1,9 +1,10 @@
 # Palimpsest Local
 
-`palimpsest-client` 0.2.3 is the root Python 3.11+ distribution for managing
-Palimpsest boot images, SquashFS layers, OCI-layout bundles, and local layered
-virtual machines. The Python module remains `palimpsest_local` and the CLI
-remains `palimpsest`. Local artifacts, tags, run state, and build records live
+`palimpsest-client` 0.3.0 is the prepared, unpublished root Python 3.11+
+distribution for managing Palimpsest boot images, SquashFS layers, OCI-layout
+bundles, and local layered virtual machines. The Python module remains
+`palimpsest_local` and the CLI remains `palimpsest`. Local artifacts, tags,
+run state, and build records live
 under XDG state directories. The base package has no required Python runtime
 dependencies; Linux KVM support is an opt-in extra.
 
@@ -12,7 +13,7 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The independently versioned `palimpsest-hub` Python distribution remains 0.2.0.
+- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The 0.3.0 client/package-registry candidate is not yet published; the independently versioned Hub source and Kolla image-tag candidate both prepare 0.3.0. Verify release image publication before deployment. A root wheel update never deploys the Hub.
 
 ## Install from PyPI
 
@@ -24,6 +25,11 @@ palimpsest --version
 ```
 
 For an isolated one-off invocation, `uvx --from palimpsest-client==0.2.3 palimpsest --version` also reports `0.2.3`.
+
+The published commands above install 0.2.3, not the untagged 0.3.0 checkout.
+The Hub 0.3.0 package registry and retained closed-transport pool fix are separate source and must
+be deployed as reviewed API and worker images; updating the root wheel alone
+does not update running Kolla containers.
 
 ## Install directly from GitHub
 
@@ -120,9 +126,9 @@ the end-user installation path.
 The root wheel also ships the `palimpsest` Kolla-Ansible role at
 `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
 Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
-Kolla-Ansible independently. This source role defaults to Hub image tag `0.2.0`,
-while source builds use the configured checkout SHA. Verify both Hub images
-before deploying this default; the root package version does not automatically
+Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.0`,
+while source builds use the configured reviewed immutable checkout SHA. Verify
+both Hub images are published before deployment; the root package version does not automatically
 set the independent Hub Python distribution version.
 
 A repository tag labels both `ghcr.io/openstack-afterglow/palimpsest-hub-api`
@@ -139,7 +145,7 @@ establish that an operator has deployed those images.
 
 Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`). Open `/app` for its same-origin web console: use a project-scoped token to upload, search, and download artifacts; server-side Palimpsestfile builds additionally require a Keystone system administrator.
 
-Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks, bundles, and BuildKit cache archives. `POST /v1/builds` queues an isolated VM build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. A separate Linux KVM host worker consumes jobs and registers successful outputs as private layers. The API container does not execute recipes. Hub is not a Docker/OCI `/v2` registry; ordinary OCI image commands use a separately configured registry profile.
+Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, and now has separate project-scoped package and BuildKit-cache APIs. Native package keys authorize those package/cache operations; legacy artifact commands still use the original Keystone token. `POST /v1/builds` queues an isolated VM build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. A separate Linux KVM host worker consumes jobs and registers successful outputs as private layers. The API container does not execute recipes. Hub is not a Docker/OCI `/v2` registry: profiles explicitly select native `palimpsest` or Docker/OCI `oci` transport.
 
 ### Entrypoints & Docker Targets
 
@@ -158,7 +164,7 @@ docker build --file docker/hub/Dockerfile --target palimpsest-hub-worker .
 
 ### Client Hub Configuration
 
-Hub CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and a Keystone token from `PALIMPSEST_TOKEN` to call native `/v1` Hub endpoints over `X-Auth-Token`. Keep the token in a secret manager or process environment; do not paste a token into documentation, shell history, or state files.
+Legacy Hub artifact CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and the original Keystone token from `PALIMPSEST_TOKEN` over `X-Auth-Token`. This token is separate from native package/cache keys and cannot authorize BuildKit-cache writes. Keep credentials in approved secret handling, not documentation, shell history or state files. Hub token validation requires a separate read-only Keystone validator identity; package access additionally requires protected project/principal policy and fresh owner membership checks. See [Hub service settings](docs/install.md#hub-service-settings).
 
 ```sh
 export PALIMPSEST_URL="http://hub.example:8020"
@@ -170,9 +176,9 @@ palimpsest --url http://another-hub.example:8020 image ls
 
 `PALIMPSEST_URL` overrides the URL in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/config.toml`; an explicit `--url` takes precedence over both.
 
-## Docker/OCI registry configuration
+## Native package and Docker/OCI registry configuration
 
-The built-in `docker` profile resolves unqualified references through `docker.io`; external registries can be configured independently:
+The built-in `docker` profile resolves unqualified references through `docker.io`. Profiles default to `protocol = "oci"` (including older files without the field); these examples retain Docker-backed behavior:
 
 ```sh
 palimpsest registry add corp registry.example.com \
@@ -191,9 +197,21 @@ palimpsest image save registry.example.com/platform/api:v1 -o ./api.tar
 palimpsest image load -i ./api.tar
 ```
 
-Profiles are stored without secrets in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Selection order for an unqualified reference is: a registry written in the reference, `--registry`, `PALIMPSEST_REGISTRY`, then the configured default. Palimpsest reuses the existing Docker credential store from `DOCKER_CONFIG` or `~/.docker`; use `login --password-stdin` for non-interactive authentication. `palimpsest docker ...` provides a generic Docker passthrough for commands without a first-class wrapper while blocking Docker-global `--config` overrides before the subcommand and password-bearing login arguments.
+Profiles contain no secrets and live in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Unqualified references select `--registry`, then `PALIMPSEST_REGISTRY`, then the configured default. A fully qualified reference whose authority has no configured profile stays an ordinary Docker/OCI reference, as before; this includes pull, push, tag, inspect, login, logout and build tags. A configured authority must map to exactly one protocol, and an explicit `--registry` must match a qualified reference's authority. OCI profiles reuse Docker's credential store in `DOCKER_CONFIG` or `~/.docker`; the generic `palimpsest docker ...` passthrough remains Docker-only and blocks global `--config` overrides and password-bearing login arguments.
 
-See [Docker/OCI registry profiles](docs/registries.md) for cache settings, private CAs/mirrors, Docker-compatible command coverage, and offline restrictions.
+For native packages, add an HTTPS profile with an API base on the same authority:
+
+```sh
+palimpsest registry add hub packages.example.invalid \
+  --protocol palimpsest --api-base https://packages.example.invalid/v1 \
+  --namespace project-apps
+```
+
+Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. An ordinary member uses the original project-scoped token to register the operator-bound namespace and issue a secret-once key scoped to exact packages/actions. Native login checks `/auth/me` before saving that key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, with no host-only/plaintext fallback). `--username` must match the key's public UUID; secrets enter through `--password-stdin` or a prompt. An ephemeral `PALIMPSEST_PACKAGE_KEY` can instead serve the native client, never the legacy runtime client.
+
+Native `build --output ARCHIVE` produces a verified OCI export and typed, immutable-byte-bound local reference, not a Docker image. Deferred `push` reads that reference; `push --input LAYOUT_OR_ARCHIVE --manifest sha256:...` can supply another source (manifest required for multiple roots). Native `pull --output ARCHIVE` downloads and verifies original bytes without `docker load`. Receipts are owner-only under `state/package-references/`; frozen exports are under `state/package-artifacts/`, separate from SquashFS runtime tags. Native transfers reject `--all-tags`/`--platform`; native builds reject `--load`/external Docker caches and native `tag` is not supported.
+
+See [registry profiles](docs/registries.md) for the complete secret-once login → build → push → pull flow. Its `cloud.dmslab.re.kr/openstack-afterglow/test:v1` example is conditional. It needs an operator binding to the actual immutable Keystone project UUID and the separate Afterglow key gateway, which has not been deployed. The source changes have not been exercised or deployed, and the tests written for them have not been run to a pass.
 See also the source-based [Docker Hub intake analysis](docs/docker-hub-intake-analysis.md)
 for the current local-archive boundary and unqualified gaps.
 
@@ -306,6 +324,7 @@ palimpsest build . \
   --frontend dockerfile \
   -f Dockerfile \
   --registry corp \
+  --cache-registry hub --cache-package project-apps/demo \
   --tag demo:v1 \
   --runtime-base sha256:<boot-image-digest> \
   --runtime-tag demo-runtime \
@@ -313,9 +332,9 @@ palimpsest build . \
   --runtime-push
 ```
 
-Online mode requires digest-pinned remote `FROM` and external Dockerfile frontend references, resolves and downloads a digest-verified cache archive through Hub before executing an authoritative miss, uploads the refreshed Hub cache automatically, and fails closed when Hub cannot answer. Repeated external `--cache-from`/`--cache-to` definitions and profile caches are additive; they never replace the mandatory Hub cache. Same-scope builds serialize cache resolution, solving, and crash-safe generation promotion. `--push` publishes the OCI image through Buildx, while `--runtime-push` uploads the generated SquashFS runtime block to Hub.
+Online builds require digest-pinned remote bases/frontends and mandatory native cache authorization for `cache:read` **and** `cache:write` on an exact package before builder preflight. Native output defaults cache selection to its profile and namespace/package. OCI output, as above, requires both `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE`, even when `PALIMPSEST_TOKEN` is set. The cache is Hub-first, digest-verified and fail-closed; every online build refreshes it. Local generations and remote fallback are partitioned by project/package, cache scope, platform and builder fingerprint. OCI external cache definitions are additive only. `--push` uses Buildx for OCI profiles and the native package API for native profiles; `--runtime-push` uses the separate original-token legacy Hub path for SquashFS. No unqualified cache writes are allowed.
 
-Strict `--offline` mode uses only verified local OCI layouts, local cache, and `--network none`. It does not load Palimpsest registry profiles, invoke registry authentication, construct a Hub/registry client, or permit `--registry`, `--pull`, either push flag, or external cache backends. Docker may still read its selected `DOCKER_CONFIG` to locate the local context and Buildx builder. Remote inputs remain immutable: registry profiles do not rewrite Dockerfile `FROM` lines, and remote images must be fully qualified and digest-pinned. See [BuildKit cache and block runtime workflow](docs/buildkit-block-workflow.md) for the local run/upload flow, performance matrix, and remaining KVM acceptance gates.
+Strict `--offline` uses only verified local OCI layouts and local cache with `--network none`. It never loads `registries.toml` or resolves profiles, never authenticates and never constructs a Hub or registry client, so it writes no typed native package references. It rejects `--registry` ("--offline cannot select an external registry"), `--cache-registry`, `--cache-package`, `--pull`, both push flags and external caches. To publish an offline result, run a native `push --input ARCHIVE --manifest sha256:...` afterwards. Docker may still read `DOCKER_CONFIG` to locate the existing local builder. Profiles do not rewrite Dockerfile `FROM` lines. See [BuildKit cache and block runtime workflow](docs/buildkit-block-workflow.md) for cache bindings, runtime upload and remaining acceptance gates.
 
 ## macOS Apple Silicon
 
@@ -510,7 +529,7 @@ palimpsest run
 palimpsest start
 palimpsest compose config|up|down|ps|logs|exec|stop|port
 palimpsest ps|inspect|logs|shell|exec|stop|rm|commit
-palimpsest ui                                # web management dashboard
+palimpsest ui                                # read-only local monitoring dashboard (--allow-control for changes)
 palimpsest store show|ls|rm|move|set         # storage state & artifact management
 palimpsest completion zsh|bash|fish          # shell completion generator
 ```
@@ -575,6 +594,12 @@ tasks. Read [AGENTS.md](AGENTS.md) for contributor rules and
 [agent.md](agent.md) is a short entrypoint to those documents, not a separate
 policy.
 
+The concise [AGENTS.md](AGENTS.md) and [agent.md](agent.md) now link to the
+[contributor workflow](openspec/specs/contributor-workflow/spec.md) and
+[CI safety/performance (former AGENTS rules 1–12)](openspec/specs/ci-safety-and-performance/spec.md).
+This documentation migration adds no CI, native, remote, or GPU verification
+and grants no new publication or shared-resource approval.
+
 The 2026-09-23 Hub hardening commit is published at
 `60fa42febfb8acd9af04e87c9905a4e2a1841d13`; the handoff records CI and
 package evidence. Publication occurred without the explicit approval required
@@ -614,5 +639,5 @@ opt-in lanes, not substitutes for portable tests. See the
 - [Installation details](docs/install.md)
 - [Quickstart](docs/quickstart.md)
 - [Compatibility notes](docs/compatibility.md)
-- [Docker/OCI registry profiles](docs/registries.md)
+- [Native package and Docker/OCI registry profiles](docs/registries.md)
 - [BuildKit cache and block runtime workflow](docs/buildkit-block-workflow.md)

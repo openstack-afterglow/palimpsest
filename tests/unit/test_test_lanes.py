@@ -1,7 +1,9 @@
 """Selection is explicit, conservative, disjoint and never an implicit proof run."""
 
+import ast
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -388,9 +390,7 @@ _AGGREGATORS = {
     "kvm-required": "Required native KVM proof",
 }
 
-# An `if: always()` aggregator is fail-closed only while its single verdict step names every
-# dependency, reads each exact result and accepts nothing but success. The two-line KVM script
-# also relies on the default `bash -e` shell, so no `shell`, `defaults` or `continue-on-error`.
+# Verdict scripts execute under bash -e; test their exit status across outcomes.
 _AGGREGATOR_VERDICTS = {
     "pure": (
         ["checks", "portable-linux"],
@@ -411,7 +411,7 @@ _AGGREGATOR_VERDICTS = {
             "PALIMPSEST_KVM_ENABLED": "${{ vars.PALIMPSEST_KVM_ENABLED }}",
             "PALIMPSEST_KVM_RESULT": "${{ needs.kvm.result }}",
         },
-        'test "$PALIMPSEST_KVM_ENABLED" = "true"\ntest "$PALIMPSEST_KVM_RESULT" = "success"\n',
+        None,
     ),
 }
 
@@ -420,21 +420,13 @@ def test_ci_test_jobs_start_without_a_gate_job_in_front():
     jobs = _test_workflow_jobs()
     assert {job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in _AGGREGATORS} == {}
     assert {job_id: jobs[job_id]["name"] for job_id in _AGGREGATORS} == _AGGREGATORS
-    assert all(jobs[job_id]["if"] == "always()" for job_id in _AGGREGATORS)
-    # Only the opt-in native proof may be conditional; any other job-level `if:` could skip a
-    # shard or gate that an aggregator then reads as its dependency result.
-    conditional = {job_id: job["if"] for job_id, job in jobs.items() if "if" in job and job_id not in _AGGREGATORS}
-    # This exact pin also rejects a `github.event_name != 'pull_request'` gate on `kvm`, the
-    # YAML layer of AGENTS.md rule 10. Adding that gate would make `Required native KVM proof`
-    # fail on every PR unless its verdict changes too, so the gate, this pin and the rule-10
-    # "no skip" clause change together, and only after the owner decides (handoff checkpoint).
-    assert conditional == {"kvm": "vars.PALIMPSEST_KVM_ENABLED == 'true'"}
+    assert jobs["pure"]["if"] == jobs["unit-macos"]["if"] == "always()"
+    assert {job_id for job_id, job_config in jobs.items() if "if" in job_config and job_id not in _AGGREGATORS} == {
+        "kvm"
+    }
 
 
-# Exact job-level keys of every test.yml job. A job-level `env` (PYTEST_ADDOPTS),
-# `defaults.run.shell`, `permissions`, `if` or `continue-on-error` could turn a job green
-# without running its checks, or hand a write token to the self-hosted `kvm` job. Outside the
-# aggregates, only `kvm` carries its opt-in `if`. A new job must be added here with its keys.
+# Exact job keys keep portable jobs unconditionally runnable and native credentials scoped.
 _TEST_JOB_KEYS = {
     "checks": {"name", "runs-on", "steps"},
     "portable-linux": {"name", "runs-on", "strategy", "steps"},
@@ -445,15 +437,14 @@ _TEST_JOB_KEYS = {
     "portable-macos": {"name", "runs-on", "strategy", "steps"},
     "unit-macos": {"name", "if", "needs", "runs-on", "steps"},
     "hub": {"name", "runs-on", "defaults", "steps"},
-    "kvm": {"name", "if", "runs-on", "steps"},
+    "kvm": {"name", "if", "runs-on", "environment", "concurrency", "timeout-minutes", "steps"},
     "kvm-required": {"name", "if", "needs", "runs-on", "steps"},
 }
 
 
 def test_ci_test_workflow_jobs_and_token_are_pinned():
     workflow = _load_workflow(_TEST_WORKFLOW)
-    # Top level: no workflow `env`/`defaults`/`concurrency`, and a read-only token. PyYAML
-    # (YAML 1.1) reads the `on:` key as True.
+    # Workflow-level tokens stay read-only; no workflow-wide environment or shell overrides.
     assert set(workflow) == {"name", True, "permissions", "jobs"}
     assert workflow["permissions"] == {"contents": "read"}
     jobs = workflow["jobs"]
@@ -475,9 +466,85 @@ def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
     (step,) = job["steps"]
     assert set(step) == {"name", "env", "run"}
     assert step["env"] == env
-    assert step["run"] == script
+    if job_id != "kvm-required":
+        assert job["if"] == "always()"
+    if script is not None:
+        assert step["run"] == script
     for dependency in needs:
         assert set(workflow["jobs"][dependency]) == _TEST_JOB_KEYS[dependency], dependency
+
+
+def _github_condition(expression: str, values: dict[str, str]) -> bool:
+    """Evaluate the restricted GitHub boolean expression shape used by native jobs."""
+    substituted = re.sub(
+        r"\b(?:github|vars|needs)\.[\w.-]+", lambda match: repr(values.get(match.group(), "")), expression
+    )
+    tree = ast.parse(substituted.replace("&&", " and ").replace("||", " or "), mode="eval")
+
+    def evaluate(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+            results = [bool(evaluate(value)) for value in node.values]
+            return all(results) if isinstance(node.op, ast.And) else any(results)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+            return evaluate(node.left) == evaluate(node.comparators[0])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            if node.func.id == "always" and not node.args:
+                return True
+            if node.func.id == "startsWith" and len(node.args) == 2:
+                return evaluate(node.args[0]).startswith(evaluate(node.args[1]))
+        raise AssertionError(f"unsupported GitHub expression: {ast.dump(node)}")
+
+    return bool(evaluate(tree.body))
+
+
+@pytest.mark.parametrize(
+    ("event", "ref", "repository", "enabled", "test_proof", "test_verdict", "release_proof"),
+    [
+        ("push", "refs/heads/main", "openstack-afterglow/palimpsest", "true", True, True, False),
+        ("push", "refs/heads/dev", "openstack-afterglow/palimpsest", "true", True, True, False),
+        ("push", "refs/heads/main", "openstack-afterglow/palimpsest", "false", False, True, False),
+        ("pull_request", "refs/pull/5/merge", "openstack-afterglow/palimpsest", "true", False, False, False),
+        ("workflow_call", "refs/heads/main", "openstack-afterglow/palimpsest", "true", False, False, False),
+        ("push", "refs/heads/feature", "openstack-afterglow/palimpsest", "true", False, False, False),
+        ("push", "refs/heads/main", "some-fork/palimpsest", "true", False, False, False),
+        ("push", "refs/tags/v1.2", "openstack-afterglow/palimpsest", "true", False, False, True),
+        ("push", "refs/tags/v1.2", "openstack-afterglow/palimpsest", "false", False, False, False),
+        ("push", "refs/tags/v1.2", "some-fork/palimpsest", "true", False, False, False),
+    ],
+)
+def test_native_jobs_use_positive_repository_event_ref_allowlist(
+    event, ref, repository, enabled, test_proof, test_verdict, release_proof
+):
+    values = {
+        "github.event_name": event,
+        "github.ref": ref,
+        "github.repository": repository,
+        "vars.PALIMPSEST_KVM_ENABLED": enabled,
+    }
+    test_jobs = _test_workflow_jobs()
+    release_jobs = _load_workflow(_WORKFLOWS / "release.yml")["jobs"]
+    assert _github_condition(test_jobs["kvm"]["if"], values) is test_proof
+    assert _github_condition(test_jobs["kvm-required"]["if"], values) is test_verdict
+    assert _github_condition(release_jobs["kvm-proof"]["if"], values) is release_proof
+
+
+@pytest.mark.parametrize("enabled", ["true", "false", "", "TRUE"])
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped", ""])
+def test_native_verdict_runs_actual_shell_and_accepts_only_enabled_success(enabled, result):
+    job = _test_workflow_jobs()["kvm-required"]
+    (step,) = job["steps"]
+    values = {"vars.PALIMPSEST_KVM_ENABLED": enabled, "needs.kvm.result": result}
+    environment = {}
+    for key, expression in step["env"].items():
+        reference = re.fullmatch(r"\$\{\{\s*([\w.-]+)\s*}}", expression)
+        assert reference is not None
+        environment[key] = values.get(reference.group(1), "")
+    completed = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], env=environment, check=False
+    )
+    assert (completed.returncode == 0) is (enabled == "true" and result == "success")
 
 
 def test_ci_test_steps_cannot_be_skipped_or_neutered():
@@ -490,12 +557,9 @@ def test_ci_test_steps_cannot_be_skipped_or_neutered():
             assert step.get("if", "always()") == "always()", (job_id, step)
 
 
-# The exact GitHub-hosted image labels this repository uses. A self-hosted runner can carry
-# any custom label (`ubuntu-kvm` included), so a prefix pattern is not a hosted check. Anything
-# else (a custom label, `self-hosted`, an expression, or a runner `group`) may route a job onto
-# a persistent host. Adopt a new hosted image by adding its exact label here.
+# Only explicitly listed GitHub-hosted images may execute repository code.
 _HOSTED_RUNNER_LABELS = {"ubuntu-latest", "ubuntu-24.04", "macos-15"}
-_NON_HOSTED_ALLOWLIST = {"test.yml": {"kvm"}, "release.yml": {"kvm-proof"}}
+_NON_HOSTED_ALLOWLIST: dict[str, set[str]] = {}
 
 
 def _runner_target(runs_on):
@@ -506,7 +570,7 @@ def _runner_target(runs_on):
     return group, [labels] if isinstance(labels, str) else list(labels)
 
 
-def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
+def test_ci_no_job_targets_a_non_hosted_runner():
     non_hosted, callers = {}, {}
     for path in sorted(_WORKFLOWS.glob("*.y*ml")):
         for job_id, job in _load_workflow(path)["jobs"].items():
@@ -516,25 +580,15 @@ def test_ci_only_the_native_kvm_proofs_target_a_non_hosted_runner():
             group, labels = _runner_target(job.get("runs-on"))
             if group is not None or not labels or not set(map(str, labels)) <= _HOSTED_RUNNER_LABELS:
                 non_hosted.setdefault(path.name, set()).add(job_id)
-    # A reusable-workflow caller has no `runs-on` of its own; the called workflow picks the
-    # runner under the caller's triggers. A caller of test.yml would inherit the self-hosted
-    # `kvm` job, so none is allowed until its triggers are pinned here as well.
-    assert callers == {}, (
-        "reusable-workflow caller found; a caller of test.yml would inherit the self-hosted kvm job",
-        callers,
-    )
-    # This pins the workflow shape only. `kvm` has no event gate today, so pull_request runs
-    # still reach the runner. AGENTS.md rule 10 layers a YAML event gate (which a PR can edit,
-    # because a pull_request run uses the PR's workflow file) over settings as the backstop.
+    assert callers == {}, ("reusable workflow caller found", callers)
     assert non_hosted == _NON_HOSTED_ALLOWLIST
-    # The kvm exposure analysis in AGENTS.md rule 10 assumes exactly these triggers: no
-    # `pull_request_target`, no extra branches. PyYAML (YAML 1.1) reads the `on:` key as True.
+    # Trigger shape remains pinned independently of the job's positive allowlist.
     assert _load_workflow(_TEST_WORKFLOW)[True] == {
         "workflow_call": None,
         "push": {"branches": ["main", "dev"]},
         "pull_request": {"branches": ["main", "dev"]},
     }
-    # release.yml's kvm-proof has no pull_request exposure only while it is tag-push only.
+    # Release runs only on version tag pushes.
     assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["v*"]}}
 
 

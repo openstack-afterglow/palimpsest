@@ -12,6 +12,7 @@ from contextlib import suppress
 
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, init_db
+from palimpsest_hub.logging import configure_logging
 from palimpsest_hub.services.image_exports import (
     process_one_image_export,
     run_export_maintenance,
@@ -22,10 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_logging()
     settings = get_settings()
     if not settings.database_url:
         logger.error("palimpsest_worker requires database_url to be configured")
@@ -45,7 +43,7 @@ async def main() -> None:
     logger.info("Palimpsest worker initialized database connection pool")
 
     worker_id = f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
-    logger.info("Palimpsest worker starting (owner=%s)", worker_id)
+    logger.info("Palimpsest worker starting")
 
     stop_event = asyncio.Event()
 
@@ -67,7 +65,7 @@ async def main() -> None:
             try:
                 processed = await process_one_image_export(owner=worker_id)
             except Exception:
-                logger.error("Unexpected error in process_one_image_export", exc_info=True)
+                logger.error("Image export worker iteration failed")
 
             now = loop.time()
             if now - last_maint > maint_interval:
@@ -75,7 +73,7 @@ async def main() -> None:
                     await run_export_maintenance()
                     last_maint = now
                 except Exception:
-                    logger.warning("Error running export maintenance", exc_info=True)
+                    logger.warning("Export maintenance failed")
 
             if not processed and not stop_event.is_set():
                 with suppress(TimeoutError):

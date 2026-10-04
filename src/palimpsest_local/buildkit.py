@@ -32,16 +32,19 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import state
 from .digest import digest_file, require_digest, require_file_digest
 from .errors import ArtifactValidationError, BuildError, DigestMismatchError, HubError
-from .hub import KIND_BUILDKIT_CACHE, MEDIA_TYPE_BUILDKIT_CACHE
 from .oci_image import verify_blob_chunks
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
-from .registry import RegistryError, validate_cache_spec
+from .registry import RegistryError, credential_free_subprocess_environment, validate_cache_spec
 from .state import TagRecord, validate_tag, write_tag_record
+
+if TYPE_CHECKING:
+    from .hub import HubClient
+    from .packages import NativePackageClient
 
 BUILD_KEY_SCHEMA = "palimpsest-buildkit-cache-v1"
 CACHE_ARCHIVE_SCHEMA = "palimpsest-buildkit-cache-archive-v1"
@@ -292,6 +295,8 @@ class BuildKitSpec:
             object.__setattr__(self, "registry_config_digest", require_digest(self.registry_config_digest))
         if self.no_cache and not self.offline:
             raise ArtifactValidationError("--no-cache is incompatible with mandatory online Hub cache reuse")
+        if not self.offline and not self.push_cache:
+            raise ArtifactValidationError("online builds require mandatory native cache refresh")
         if self.runtime_block_size < 4096 or self.runtime_block_size > 1024 * 1024:
             raise ArtifactValidationError("runtime block size must be between 4096 and 1048576 bytes")
         if self.runtime_block_size & (self.runtime_block_size - 1):
@@ -676,7 +681,13 @@ def preflight_buildx_oci_exporter(
         "`BUILDX_BUILDER=palimpsest palimpsest build ...`; Palimpsest will not change the selected builder."
     )
     try:
-        result = runner(command, capture_output=True, text=True, check=False)
+        result = runner(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=credential_free_subprocess_environment(),
+        )
     except FileNotFoundError as exc:
         raise BuildError("Docker CLI with the Buildx plugin is required for Dockerfile builds. " + setup_hint) from exc
     if getattr(result, "returncode", 0) != 0:
@@ -992,6 +1003,9 @@ def extract_cache_tar(
     expected_scope: str | None = None,
     expected_platform: str | None = None,
     expected_builder_fingerprint: str | None = None,
+    expected_project_id: str | None = None,
+    expected_package: str | None = None,
+    expected_namespace: str | None = None,
 ) -> Path:
     """Stream-extract a plain or key-bound cache without loading its TOC into RAM."""
     archive_path = archive_path.expanduser().resolve()
@@ -1000,6 +1014,21 @@ def extract_cache_tar(
         raise ArtifactValidationError(f"cache archive does not exist: {archive_path}")
     if expected_build_key is not None:
         expected_build_key = require_digest(expected_build_key)
+    ownership = (expected_project_id, expected_namespace, expected_package)
+    if any(value is not None for value in ownership) and any(value is None for value in ownership):
+        raise ArtifactValidationError("cache extraction requires project_id, namespace and package binding")
+    binding_required = any(
+        value is not None
+        for value in (
+            expected_build_key,
+            expected_scope,
+            expected_platform,
+            expected_builder_fingerprint,
+            expected_project_id,
+            expected_package,
+            expected_namespace,
+        )
+    )
     if destination.exists():
         if not destination.is_dir() or any(destination.iterdir()):
             raise ArtifactValidationError(f"cache extraction target must be an empty directory: {destination}")
@@ -1018,10 +1047,8 @@ def extract_cache_tar(
                     raise ArtifactValidationError("cache archive has too many members")
                 if wrapped is None:
                     wrapped = member.name == "palimpsest-cache.json"
-                    if expected_build_key is not None and not wrapped:
-                        raise ArtifactValidationError(
-                            "an exact Hub cache hit must begin with a cache-key binding descriptor"
-                        )
+                    if binding_required and not wrapped:
+                        raise ArtifactValidationError("a Hub cache hit must begin with a cache-key binding descriptor")
                 if member.name == "palimpsest-cache.json":
                     if descriptor_seen or not wrapped or not member.isreg() or member.size > 64 * 1024:
                         raise ArtifactValidationError("cache archive must contain one valid leading descriptor")
@@ -1033,6 +1060,8 @@ def extract_cache_tar(
                         descriptor = json.load(descriptor_stream)
                     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                         raise ArtifactValidationError("invalid cache archive descriptor JSON") from exc
+                    if not isinstance(descriptor, dict):
+                        raise ArtifactValidationError("cache archive descriptor must be an object")
                     if descriptor.get("schema") != CACHE_ARCHIVE_SCHEMA:
                         raise ArtifactValidationError("unsupported cache archive schema")
                     archive_key = require_digest(descriptor.get("build_key", ""))
@@ -1044,6 +1073,9 @@ def extract_cache_tar(
                         "cache_scope": expected_scope,
                         "platform": expected_platform,
                         "builder_fingerprint": expected_builder_fingerprint,
+                        "project_id": expected_project_id,
+                        "package": expected_package,
+                        "namespace": expected_namespace,
                     }
                     for field, expected in expected_fields.items():
                         if expected is not None and descriptor.get(field) != expected:
@@ -1091,8 +1123,8 @@ def extract_cache_tar(
                 with target.open("xb") as output:
                     shutil.copyfileobj(source, output, _READ_CHUNK)
                 os.chmod(target, member.mode & 0o777)
-        if wrapped and not descriptor_seen:
-            raise ArtifactValidationError("wrapped cache archive is missing its descriptor")
+        if (wrapped or binding_required) and not descriptor_seen:
+            raise ArtifactValidationError("cache archive is missing its binding descriptor")
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
         raise
@@ -1351,7 +1383,13 @@ def build_runtime_pack_command(rootfs_tar: Path, output: Path, *, block_size: in
 
 def _run_checked(runner: Callable[..., Any], command: list[str], *, operation: str) -> Any:
     try:
-        result = runner(command, capture_output=True, text=True, check=False)
+        result = runner(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=credential_free_subprocess_environment(),
+        )
     except FileNotFoundError as exc:
         raise BuildError(f"{operation} executable not found: {command[0]}") from exc
     if getattr(result, "returncode", 0) != 0:
@@ -1380,7 +1418,14 @@ def pack_runtime_block(
     command = build_runtime_pack_command(normalized_tar, output, block_size=block_size)
     try:
         with normalized_tar.open("rb") as source:
-            result = runner(command, stdin=source, capture_output=True, text=False, check=False)
+            result = runner(
+                command,
+                stdin=source,
+                capture_output=True,
+                text=False,
+                check=False,
+                env=credential_free_subprocess_environment(),
+            )
     except FileNotFoundError as exc:
         raise BuildError("mksquashfs executable not found: mksquashfs") from exc
     if getattr(result, "returncode", 0) != 0:
@@ -1407,18 +1452,29 @@ def pack_runtime_block(
     )
 
 
-def _cache_name(scope: str, platform: str, builder_fingerprint: str) -> str:
-    """Partition mutable scope fallbacks by BuildKit compatibility contract."""
-    partition = hashlib.sha256(
+def _cache_partition(
+    api_base: str,
+    namespace: str,
+    project_id: str,
+    package: str,
+    scope: str,
+    platform: str,
+    builder_fingerprint: str,
+) -> str:
+    """Fence online local generations and archives by verified package ownership."""
+    return hashlib.sha256(
         _canonical_json(
             {
+                "api_base": api_base,
+                "namespace": namespace,
+                "project_id": project_id,
+                "package": package,
                 "scope": scope,
                 "platform": platform,
                 "builder_fingerprint": builder_fingerprint,
             }
         )
-    ).hexdigest()[:16]
-    return f"cache-{scope[:32]}-{partition}"
+    ).hexdigest()
 
 
 def _metadata_digest(item: dict[str, Any]) -> str:
@@ -1428,41 +1484,43 @@ def _metadata_digest(item: dict[str, Any]) -> str:
     return require_digest(value)
 
 
-def _validate_cache_metadata(item: dict[str, Any]) -> None:
-    if item.get("kind") != KIND_BUILDKIT_CACHE:
-        raise HubError(f"Hub cache result has unexpected kind: {item.get('kind')!r}")
-    if item.get("media_type") != MEDIA_TYPE_BUILDKIT_CACHE:
-        raise HubError(f"Hub cache result has unexpected media_type: {item.get('media_type')!r}")
-
-
 def _resolve_hub_cache(
-    hub_client: Any,
+    hub_client: NativePackageClient,
     spec: BuildKitSpec,
     build_key: str,
     build_dir: Path,
     cache_blob_root: Path,
     builder_fingerprint: str,
+    *,
+    project_id: str,
+    cache_package: str,
 ) -> tuple[Path | None, str]:
-    exact = hub_client.list_layers(kind=KIND_BUILDKIT_CACHE, chain_id=build_key, limit=2)
-    distinct = {_metadata_digest(item) for item in exact}
-    if len(distinct) > 1:
-        raise HubError(f"Hub returned conflicting cache blobs for {build_key}")
-    selected: dict[str, Any] | None = exact[0] if exact else None
-    source = "hub-exact" if selected is not None else "none"
-    expected_key: str | None = build_key if selected is not None else None
+    selected = hub_client.resolve_cache(
+        cache_package,
+        build_key=build_key,
+        cache_scope=spec.cache_scope,
+        platform=spec.platform,
+        builder_fingerprint=builder_fingerprint,
+    )
     if selected is None:
-        scoped = hub_client.list_layers(
-            name=_cache_name(spec.cache_scope, spec.platform, builder_fingerprint),
-            kind=KIND_BUILDKIT_CACHE,
-            limit=1,
-        )
-        if scoped:
-            selected = scoped[0]
-            source = "hub-scope"
-    if selected is None:
-        return None, source
-    _validate_cache_metadata(selected)
-    digest = _metadata_digest(selected)
+        return None, "none"
+    if not isinstance(selected, dict) or selected.get("resolution") not in {"exact", "scope"}:
+        raise HubError("Hub cache result has an invalid resolution")
+    for field, expected in {
+        "project_id": project_id,
+        "package": cache_package,
+        "namespace": hub_client.namespace,
+        "cache_scope": spec.cache_scope,
+        "platform": spec.platform,
+        "builder_fingerprint": builder_fingerprint,
+    }.items():
+        if selected.get(field) != expected:
+            raise HubError(f"Hub cache result has mismatched {field}")
+    expected_key = require_digest(selected.get("build_key", ""))
+    if selected["resolution"] == "exact" and expected_key != build_key:
+        raise HubError("Hub exact cache result has mismatched build_key")
+    source = f"hub-{selected['resolution']}"
+    digest = require_digest(selected.get("archive_digest", ""))
     digest_hex = digest.split(":", 1)[1]
     archive = cache_blob_root / "sha256" / f"{digest_hex}.tar"
     archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1478,7 +1536,7 @@ def _resolve_hub_cache(
     if not archive.is_file():
         temporary = archive.parent / f".{digest_hex}.{uuid.uuid4().hex}.part"
         try:
-            hub_client.pull_blob(digest, temporary)
+            hub_client.pull_cache(cache_package, selected, temporary)
             require_file_digest(temporary, digest)
             os.replace(temporary, archive)
         except BaseException:
@@ -1492,6 +1550,9 @@ def _resolve_hub_cache(
         expected_scope=spec.cache_scope,
         expected_platform=spec.platform,
         expected_builder_fingerprint=builder_fingerprint,
+        expected_project_id=project_id,
+        expected_package=cache_package,
+        expected_namespace=hub_client.namespace,
     )
     return extracted, source
 
@@ -1655,7 +1716,12 @@ def _verify_runtime_block(
     command = ["unsquashfs", "-cat", str(path), RUNTIME_MANIFEST_PATH]
     if runner is subprocess.run:
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=credential_free_subprocess_environment(),
+            )
         except FileNotFoundError as exc:
             raise BuildError("unsquashfs is required to verify runtime block images") from exc
         if process.stdout is None:  # pragma: no cover - guaranteed by stdout=PIPE
@@ -1673,7 +1739,13 @@ def _verify_runtime_block(
         # The injectable runner exists for deterministic unit/host-contract
         # tests. Production subprocesses always take the bounded pipe path.
         try:
-            result = runner(command, capture_output=True, text=False, check=False)
+            result = runner(
+                command,
+                capture_output=True,
+                text=False,
+                check=False,
+                env=credential_free_subprocess_environment(),
+            )
         except FileNotFoundError as exc:
             raise BuildError("unsquashfs is required to verify runtime block images") from exc
         returncode = getattr(result, "returncode", 0)
@@ -1785,16 +1857,29 @@ def build_with_buildkit(
     spec: BuildKitSpec,
     roots: state.StatePaths,
     *,
-    hub_client: Any | None = None,
+    hub_client: NativePackageClient | None = None,
+    cache_package: str | None = None,
+    runtime_hub_client: HubClient | None = None,
+    on_oci_export: Callable[[str, str | None], None] | None = None,
     runner: Callable[..., Any] = subprocess.run,
 ) -> dict[str, Any]:
     """Build, cache, optionally pack, and optionally upload one Dockerfile."""
+    project_id: str | None = None
     if spec.offline:
         validate_offline_dockerfile(spec)
     else:
         validate_online_dockerfile(spec)
-        if hub_client is None:
-            raise BuildError("online BuildKit builds require a Hub client; use --offline for an air-gapped build")
+        if hub_client is None or not cache_package:
+            raise BuildError(
+                "online BuildKit builds require an explicit native cache client and cache_package; "
+                "use --cache-registry and --cache-package or --offline"
+            )
+        actor = hub_client.authorize(cache_package, ("cache:read", "cache:write"))
+        project_id = actor.get("project_id") if isinstance(actor, dict) else None
+        if not isinstance(project_id, str) or not project_id:
+            raise HubError("native cache authorization returned an invalid project_id")
+        if spec.push and runtime_hub_client is None:
+            raise BuildError("runtime upload requires a separate original-token runtime Hub client")
 
     started_at = state.utc_now_iso()
     started = time.monotonic()
@@ -1822,8 +1907,24 @@ def build_with_buildkit(
             raise BuildError(f"runtime rootfs archive output already exists: {spec.runtime_rootfs_archive}")
         spec.runtime_rootfs_archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    scope_root = roots.build_cache / spec.cache_scope
-    scope_lock = roots.locks / f"build-cache-{spec.cache_scope}.lock"
+    if spec.offline:
+        scope_root = roots.build_cache / spec.cache_scope
+        scope_lock = roots.locks / f"build-cache-{spec.cache_scope}.lock"
+        cache_blob_root = roots.build_cache / "blobs"
+    else:
+        partition = _cache_partition(
+            hub_client.api_base,
+            hub_client.namespace,
+            project_id,
+            cache_package,
+            spec.cache_scope,
+            spec.platform,
+            builder_environment["fingerprint"],
+        )
+        partition_root = roots.build_cache / "_packages" / partition
+        scope_root = partition_root / "scope"
+        scope_lock = roots.locks / f"build-cache-{partition}.lock"
+        cache_blob_root = partition_root / "blobs"
     with state.file_lock(scope_lock):
         phase = time.monotonic()
         build_key = compute_build_key(spec, builder_fingerprint=builder_environment["fingerprint"])
@@ -1839,8 +1940,10 @@ def build_with_buildkit(
                     spec,
                     build_key,
                     build_dir,
-                    roots.build_cache / "blobs",
+                    cache_blob_root,
                     builder_environment["fingerprint"],
+                    project_id=project_id,
+                    cache_package=cache_package,
                 )
                 timings["hub_cache_resolve_pull_verify"] = round((time.monotonic() - phase) * 1000)
             if cache_from is None:
@@ -1877,6 +1980,8 @@ def build_with_buildkit(
             oci_manifest_digest = require_digest(oci_manifest_digest)
         else:
             oci_manifest_digest = None
+        if on_oci_export is not None:
+            on_oci_export(build_id, oci_manifest_digest)
 
         phase = time.monotonic()
         cache_archive = build_dir / "buildkit-cache.tar"
@@ -1888,26 +1993,35 @@ def build_with_buildkit(
             "builder_fingerprint": builder_environment["fingerprint"],
             "oci_manifest_digest": oci_manifest_digest,
         }
+        if not spec.offline:
+            cache_descriptor.update(project_id=project_id, namespace=hub_client.namespace, package=cache_package)
         _create_cache_archive(cache_export, cache_archive, cache_descriptor)
         cache_archive_digest = digest_file(cache_archive)
         timings["cache_archive"] = round((time.monotonic() - phase) * 1000)
 
         if not spec.offline and spec.push_cache:
             phase = time.monotonic()
-            hub_client.push_blob(
-                cache_archive,
-                {
-                    "name": _cache_name(
-                        spec.cache_scope,
-                        spec.platform,
-                        builder_environment["fingerprint"],
-                    ),
-                    "kind": KIND_BUILDKIT_CACHE,
-                    "chain_id": build_key,
-                    "media_type": MEDIA_TYPE_BUILDKIT_CACHE,
-                    "is_published": False,
-                },
+            uploaded = hub_client.push_cache(cache_package, cache_archive, cache_descriptor)
+            if not isinstance(uploaded, dict):
+                raise HubError("Hub cache upload did not return a receipt")
+            expected_receipt = {
+                field: cache_descriptor[field]
+                for field in (
+                    "project_id",
+                    "namespace",
+                    "package",
+                    "build_key",
+                    "cache_scope",
+                    "platform",
+                    "builder_fingerprint",
+                )
+            }
+            expected_receipt.update(
+                archive_digest=cache_archive_digest, archive_size_bytes=cache_archive.stat().st_size
             )
+            for field, expected in expected_receipt.items():
+                if uploaded.get(field) != expected:
+                    raise HubError(f"Hub cache upload receipt has mismatched {field}")
             timings["hub_cache_upload"] = round((time.monotonic() - phase) * 1000)
 
         _promote_scope_cache(cache_export, scope_root, build_id)
@@ -1961,9 +2075,9 @@ def build_with_buildkit(
             )
             if runtime_digest is not None:
                 runtime_cache_source = "local"
-            elif not spec.offline:
+            elif not spec.offline and runtime_hub_client is not None:
                 runtime_digest = _pull_hub_runtime_pack(
-                    hub_client,
+                    runtime_hub_client,
                     store,
                     build_dir,
                     pack_key=runtime_pack_key,
@@ -2025,7 +2139,7 @@ def build_with_buildkit(
             ),
         )
         if spec.push:
-            hub_client.push_blob(
+            runtime_hub_client.push_blob(
                 store.blob_path(runtime_digest),
                 {
                     "name": spec.runtime_tag,
@@ -2056,6 +2170,8 @@ def build_with_buildkit(
         "cache_source": cache_source,
         "cache_archive_digest": cache_archive_digest,
         "cache_scope": spec.cache_scope,
+        "cache_project_id": project_id,
+        "cache_package": cache_package if not spec.offline else None,
         "output_tag": spec.tag,
         "output_tags": [spec.tag, *spec.additional_tags],
         "registry_image_pushed": spec.push_image,

@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 from .digest import normalize_digest
 from .errors import PalimpsestError
@@ -51,6 +52,8 @@ _SECRET_VALUE_RE = re.compile(
 )
 _PROFILE_FIELDS = {
     "endpoint",
+    "protocol",
+    "api_base",
     "namespace",
     "mirrors",
     "ca",
@@ -159,6 +162,34 @@ def _normalize_repository_path(value: object, field: str) -> str:
     return path
 
 
+def normalize_native_namespace(value: object) -> str:
+    """Validate one canonical native project namespace (1–63 ASCII characters)."""
+    namespace = _require_text(value, "native namespace", maximum=63)
+    if _REPOSITORY_COMPONENT_RE.fullmatch(namespace) is None:
+        raise RegistryError("native namespace must be one lower-case repository component, 1–63 characters")
+    return namespace
+
+
+def normalize_native_api_base(value: object, endpoint: str) -> str:
+    """Validate an HTTPS API base bound to exactly the configured authority."""
+    base = _require_text(value, "native api_base", maximum=2048)
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in base):
+        raise RegistryError("invalid native api_base")
+    try:
+        parsed = urlsplit(base)
+        authority = normalize_endpoint(parsed.netloc)
+    except (ValueError, RegistryError):
+        raise RegistryError("native api_base must be an HTTPS URL without credentials") from None
+    if not base.startswith("https://") or parsed.scheme != "https" or "?" in base or "#" in base:
+        raise RegistryError("native api_base must use HTTPS without query or fragment")
+    if authority != endpoint:
+        raise RegistryError("native api_base authority must exactly match registry endpoint")
+    path = parsed.path.rstrip("/")
+    if "\\" in base or "%" in path or "//" in parsed.path or any(part in {".", ".."} for part in path.split("/")):
+        raise RegistryError("native api_base must use an unambiguous absolute path")
+    return f"https://{authority}{path}"
+
+
 def _normalize_string_tuple(value: object, field: str) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, (tuple, list)):
         raise RegistryError(f"{field} must be an array of strings")
@@ -204,11 +235,26 @@ class RegistryProfile:
     tls_skip_verify: bool = False
     cache_from: tuple[str, ...] = ()
     cache_to: tuple[str, ...] = ()
+    protocol: str = "oci"
+    api_base: str = ""
 
     def __post_init__(self) -> None:
         alias = _normalize_alias(self.alias)
         endpoint = normalize_endpoint(self.endpoint)
-        namespace = "" if self.namespace == "" else _normalize_repository_path(self.namespace, "registry namespace")
+        if not isinstance(self.protocol, str) or self.protocol not in {"oci", "palimpsest"}:
+            raise RegistryError("registry protocol must be oci or palimpsest")
+        if self.protocol == "palimpsest":
+            api_base = normalize_native_api_base(self.api_base, endpoint)
+            namespace = "" if self.namespace == "" else normalize_native_namespace(self.namespace)
+            if self.mirrors or self.plain_http or self.tls_skip_verify or self.cache_from or self.cache_to:
+                raise RegistryError(
+                    "native profiles do not support Docker mirrors, insecure transport, or cache exporters"
+                )
+        else:
+            if self.api_base != "":
+                raise RegistryError("oci profiles must not declare native api_base")
+            api_base = ""
+            namespace = "" if self.namespace == "" else _normalize_repository_path(self.namespace, "registry namespace")
         mirrors = tuple(_normalize_mirror(item) for item in _normalize_string_tuple(self.mirrors, "mirrors"))
         ca = _normalize_string_tuple(self.ca, "ca")
         normalized_ca: list[str] = []
@@ -232,6 +278,7 @@ class RegistryProfile:
         object.__setattr__(self, "alias", alias)
         object.__setattr__(self, "endpoint", endpoint)
         object.__setattr__(self, "namespace", namespace)
+        object.__setattr__(self, "api_base", api_base)
         object.__setattr__(self, "mirrors", mirrors)
         object.__setattr__(self, "ca", tuple(normalized_ca))
         object.__setattr__(self, "cache_from", cache_from)
@@ -261,7 +308,7 @@ class RegistryConfig:
         builtin = profiles.get(BUILTIN_ALIAS)
         if builtin is None:
             raise RegistryError("the built-in docker registry profile cannot be removed")
-        if builtin.endpoint != BUILTIN_ENDPOINT or builtin.namespace != BUILTIN_NAMESPACE:
+        if builtin.protocol != "oci" or builtin.endpoint != BUILTIN_ENDPOINT or builtin.namespace != BUILTIN_NAMESPACE:
             raise RegistryError("the built-in docker profile must use docker.io and namespace library")
         if default not in profiles:
             raise RegistryError(f"default registry profile does not exist: {default!r}")
@@ -337,7 +384,9 @@ def select_registry_profile(
     explicit_alias: str | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> RegistryProfile:
-    return config.registries[select_registry_alias(config, explicit_alias=explicit_alias, environment=environment)]
+    profile = config.registries[select_registry_alias(config, explicit_alias=explicit_alias, environment=environment)]
+    _profile_alias_for_endpoint(config, profile.endpoint, profile.alias)
+    return profile
 
 
 def registry_config_path(roots: StatePaths) -> Path:
@@ -416,6 +465,8 @@ def render_registry_config(config: RegistryConfig) -> str:
             [
                 f"[registries.{profile.alias}]",
                 f"endpoint = {_toml_string(profile.endpoint)}",
+                f"protocol = {_toml_string(profile.protocol)}",
+                *([f"api_base = {_toml_string(profile.api_base)}"] if profile.protocol == "palimpsest" else []),
                 f"namespace = {_toml_string(profile.namespace)}",
                 f"mirrors = [{', '.join(_toml_string(item) for item in profile.mirrors)}]",
                 f"ca = [{', '.join(_toml_string(item) for item in profile.ca)}]",
@@ -545,11 +596,22 @@ def _has_explicit_registry(name: str) -> bool:
     return "." in first or ":" in first or first.lower() == "localhost" or first.startswith("[")
 
 
-def _profile_alias_for_endpoint(config: RegistryConfig, endpoint: str) -> str | None:
+def _profile_alias_for_endpoint(config: RegistryConfig, endpoint: str, explicit_alias: str | None = None) -> str | None:
     matches = sorted(profile.alias for profile in config.registries.values() if profile.endpoint == endpoint)
+    if explicit_alias is not None and inspect_profile(config, explicit_alias).endpoint != endpoint:
+        raise RegistryError("explicit registry alias does not match reference authority")
+    if not matches:
+        # Native transport needs a configured API base; other authorities stay ordinary OCI.
+        return None
+    if len({config.registries[alias].protocol for alias in matches}) != 1:
+        raise RegistryError(f"reference authority {endpoint!r} has ambiguous configured protocols")
+    if explicit_alias is not None:
+        return inspect_profile(config, explicit_alias).alias
+    if len({config.registries[alias].api_base for alias in matches}) != 1:
+        raise RegistryError(f"reference authority {endpoint!r} has ambiguous native API bases; select an alias")
     if config.default in matches:
         return config.default
-    return matches[0] if matches else None
+    return matches[0]
 
 
 def resolve_image_reference(
@@ -563,9 +625,9 @@ def resolve_image_reference(
 ) -> ResolvedImageReference:
     """Resolve a Docker-compatible image reference to an explicit registry.
 
-    An explicit registry in ``reference`` wins over ``registry_alias``, the
-    environment, and the configured default.  Otherwise selection order is
-    explicit alias, ``PALIMPSEST_REGISTRY``, then ``config.default``.
+    A configured authority must map to one protocol and an explicit alias must
+    match it; an unconfigured authority remains ordinary OCI. Otherwise
+    selection order is explicit alias, ``PALIMPSEST_REGISTRY``, then ``config.default``.
     """
     original = _require_text(reference, "image reference", maximum=512)
     if original.count("@") > 1:
@@ -594,7 +656,7 @@ def resolve_image_reference(
         endpoint_text, repository = name.split("/", 1)
         endpoint = normalize_endpoint(endpoint_text)
         repository = _normalize_repository_path(repository, "image repository")
-        selected_alias = _profile_alias_for_endpoint(config, endpoint)
+        selected_alias = _profile_alias_for_endpoint(config, endpoint, registry_alias)
         if endpoint == BUILTIN_ENDPOINT and "/" not in repository:
             repository = f"{BUILTIN_NAMESPACE}/{repository}"
     else:
@@ -608,6 +670,16 @@ def resolve_image_reference(
         if "/" not in repository and profile.namespace:
             repository = f"{profile.namespace}/{repository}"
         selected_alias = profile.alias
+
+    repository = _normalize_repository_path(repository, "image repository")
+    profile = config.registries[selected_alias] if selected_alias is not None else None
+    if profile is not None and profile.protocol == "palimpsest":
+        if tag is not None and digest is not None:
+            raise RegistryError("native references cannot combine a tag and digest")
+        namespace, separator, package = repository.partition("/")
+        if not separator or not package:
+            raise RegistryError("native references require namespace/package or a configured default namespace")
+        normalize_native_namespace(namespace)
 
     if tag is None and digest is None and default_tag:
         tag = "latest"
@@ -862,6 +934,18 @@ def docker_load_argv(
     return docker_command_argv(config_dir, *arguments)
 
 
+def credential_free_subprocess_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Keep tool configuration while withholding Palimpsest API credentials.
+
+    Package keys belong only in the native HTTPS client or helper stdin. The
+    separate legacy token must likewise not leak into Docker, BuildKit or packers.
+    """
+    child_environment = dict(os.environ if environment is None else environment)
+    child_environment.pop("PALIMPSEST_PACKAGE_KEY", None)
+    child_environment.pop("PALIMPSEST_TOKEN", None)
+    return child_environment
+
+
 def run_docker_command(
     argv: Sequence[str],
     *,
@@ -879,6 +963,7 @@ def run_docker_command(
         "text": True,
         "check": False,
         "shell": False,
+        "env": credential_free_subprocess_environment(),
     }
     if stdin_text is not None:
         if not isinstance(stdin_text, str):
@@ -916,7 +1001,7 @@ def run_docker_passthrough(
     if len(command) < 4 or command[0] != "docker" or command[1] != "--config":
         raise RegistryError("Docker argv must start with 'docker --config DIR'")
     _reject_docker_login_password_argv(command)
-    kwargs: dict[str, Any] = {"shell": False, "check": False}
+    kwargs: dict[str, Any] = {"shell": False, "check": False, "env": credential_free_subprocess_environment()}
     if timeout_seconds is not None:
         if timeout_seconds <= 0:
             raise RegistryError("Docker command timeout must be positive")
@@ -947,6 +1032,8 @@ def render_buildkitd_toml(config: RegistryConfig) -> str:
     """Render deterministic BuildKit registry mirror and TLS configuration."""
     endpoints: dict[str, tuple[tuple[str, ...], tuple[str, ...], bool, bool]] = {}
     for profile in list_profiles(config):
+        if profile.protocol != "oci":
+            continue
         settings = (profile.mirrors, profile.ca, profile.plain_http, profile.tls_skip_verify)
         existing = endpoints.get(profile.endpoint)
         if existing is not None and existing != settings:

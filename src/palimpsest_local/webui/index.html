@@ -1,324 +1,96 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Palimpsest Local Manager</title>
-  <!-- Authenticated asset bootstrap -->
+  <meta name="referrer" content="no-referrer">
+  <title>Palimpsest · 로컬 모니터</title>
+  <style>[hidden]{display:none!important}</style>
 </head>
 <body>
-  <div class="app-container">
-    <header class="app-header">
-      <div class="header-brand">
-        <h1>Palimpsest Local Manager</h1>
-        <span class="version-tag">v0.1.0</span>
-      </div>
-      <div id="summary-banner" class="summary-banner">
-        <div class="stat-pill"><span class="label">Host:</span> <span id="host-info">Loading...</span></div>
-        <div class="stat-pill"><span class="label">Backends:</span> <span id="backends-info">Loading...</span></div>
-        <div class="stat-pill"><span class="label">Storage:</span> <span id="storage-info">Loading...</span></div>
-      </div>
-    </header>
-
-    <div id="global-error" class="alert alert-danger hidden" role="alert"></div>
-
-    <nav class="nav-tabs" role="tablist" aria-label="Dashboard views">
-      <button class="tab-button active" role="tab" id="tab-vms" aria-selected="true" aria-controls="panel-vms" data-tab="vms">Virtual Machines</button>
-      <button class="tab-button" role="tab" id="tab-artifacts" aria-selected="false" aria-controls="panel-artifacts" data-tab="artifacts">Artifacts</button>
-      <button class="tab-button" role="tab" id="tab-builds" aria-selected="false" aria-controls="panel-builds" data-tab="builds">Builds</button>
-      <button class="tab-button" role="tab" id="tab-storage" aria-selected="false" aria-controls="panel-storage" data-tab="storage">Storage</button>
-    </nav>
-
-    <main class="tab-content">
-      <!-- VMs Tab -->
-      <section id="panel-vms" class="tab-panel active" role="tabpanel" aria-labelledby="tab-vms">
-        <div class="panel-header">
-          <h2>Virtual Machines</h2>
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-vms">Refresh</button>
-        </div>
-        <div id="vms-warnings" class="warnings-container"></div>
-        <div class="table-responsive">
-          <table class="data-table" id="table-vms">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Backend</th>
-                <th>Status</th>
-                <th>Base Digest</th>
-                <th>Layers</th>
-                <th>Spec</th>
-                <th>SSH Endpoint</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="vms-tbody">
-              <tr><td colspan="9" class="loading-cell">Loading virtual machines...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- Artifacts Tab -->
-      <section id="panel-artifacts" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-artifacts">
-        <div class="panel-header">
-          <h2>Artifact Store</h2>
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-artifacts">Refresh</button>
-        </div>
-
-        <details class="card form-card">
-          <summary class="form-card-title">Import Cloud Image...</summary>
-          <form id="form-import" class="inline-form">
-            <div class="form-group">
-              <label for="import-path">File Path:</label>
-              <input type="text" id="import-path" required placeholder="/path/to/image.qcow2">
-            </div>
-            <div class="form-group">
-              <label for="import-format">Disk Format:</label>
-              <select id="import-format" required>
-                <option value="qcow2">qcow2</option>
-                <option value="raw">raw</option>
-                <option value="vmdk">vmdk</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="import-arch">Arch:</label>
-              <select id="import-arch" required>
-                <option value="x86_64">x86_64</option>
-                <option value="aarch64">aarch64</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="import-variant">OS Variant:</label>
-              <input type="text" id="import-variant" placeholder="ubuntu-24.04">
-            </div>
-            <button type="submit" class="btn btn-primary">Import Image</button>
-          </form>
-          <div id="import-feedback" class="feedback-msg hidden"></div>
-        </details>
-
-        <div id="artifacts-feedback" class="feedback-msg hidden"></div>
-
-        <div class="section-title">
-          <h3>Cloud Images</h3>
-        </div>
-        <div class="table-responsive">
-          <table class="data-table" id="table-images">
-            <thead>
-              <tr>
-                <th>Digest</th>
-                <th>Name / Tags</th>
-                <th>Arch</th>
-                <th>Format</th>
-                <th>Size</th>
-                <th>References</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="images-tbody">
-              <tr><td colspan="8" class="loading-cell">Loading images...</td></tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="section-title">
-          <h3>Layers</h3>
-        </div>
-        <div class="table-responsive">
-          <table class="data-table" id="table-layers">
-            <thead>
-              <tr>
-                <th>Digest</th>
-                <th>Media Type / Parent</th>
-                <th>Size</th>
-                <th>References</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="layers-tbody">
-              <tr><td colspan="6" class="loading-cell">Loading layers...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- Builds Tab -->
-      <section id="panel-builds" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-builds">
-        <div class="panel-header">
-          <h2>Build History</h2>
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-builds">Refresh</button>
-        </div>
-        <div class="table-responsive">
-          <table class="data-table" id="table-builds">
-            <thead>
-              <tr>
-                <th>Build ID</th>
-                <th>Engine</th>
-                <th>Status</th>
-                <th>Tags</th>
-                <th>Duration</th>
-                <th>Started</th>
-                <th>Base Digest</th>
-                <th>Cache</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody id="builds-tbody">
-              <tr><td colspan="9" class="loading-cell">Loading builds...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- Storage Tab -->
-      <section id="panel-storage" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-storage">
-        <div class="panel-header">
-          <h2>Storage Configuration</h2>
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-storage">Refresh</button>
-        </div>
-
-        <div class="notice-box">
-          <strong>Notice:</strong> Lima VM disks live in Lima's state directory (<code>~/.lima</code>) and are not relocated by Palimpsest storage moves.
-        </div>
-
-        <div class="grid-2col">
-          <div class="card">
-            <h3>State Root Info</h3>
-            <dl class="info-list">
-              <dt>Current Root:</dt>
-              <dd id="storage-root-path">Loading...</dd>
-              <dt>Config Source:</dt>
-              <dd id="storage-root-source">Loading...</dd>
-              <dt>Total Usage:</dt>
-              <dd id="storage-total-bytes">Loading...</dd>
-              <dt>Available Disk Space:</dt>
-              <dd id="storage-free-bytes">Loading...</dd>
-            </dl>
+  <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
+  <div id="app-shell" class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="Palimpsest 개요"><span class="brand-mark" aria-hidden="true">P</span><span>Palimpsest<small>LOCAL MONITOR</small></span></a>
+      <p class="sidebar-label">로컬 작업 공간</p>
+      <nav id="navigation" aria-label="리소스 탐색">
+        <button id="nav-overview" data-view="overview" aria-current="page">개요<span data-count="overview">↗</span></button>
+        <button id="nav-vms" data-view="vms">가상 머신<span data-count="vms">—</span></button>
+        <button id="nav-volumes" data-view="volumes">볼륨<span data-count="volumes">—</span></button>
+        <button id="nav-artifacts" data-view="artifacts">레이어 · 이미지<span data-count="artifacts">—</span></button>
+        <button id="nav-networks" data-view="networks">네트워크<span data-count="networks">—</span></button>
+        <button id="nav-builds" data-view="builds">빌드<span data-count="builds">—</span></button>
+        <button id="nav-storage" data-view="storage">스토리지<span data-count="storage">↗</span></button>
+      </nav>
+      <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span> 이 호스트의 관리 리소스만 표시<p>외부 서비스 없이 로컬 API에서 읽습니다.</p></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <span id="access-mode" class="badge">읽기 전용</span>
+        <div class="refresh-tools"><span id="refresh-state" role="status">연결 준비 중</span><button id="btn-pause" aria-pressed="false" disabled>자동 갱신 일시 정지</button><button id="btn-refresh" disabled>지금 갱신</button></div>
+      </header>
+      <main id="main-content" tabindex="-1">
+        <div class="page-heading"><div><p class="eyebrow">PALIMPSEST / LOCAL</p><h1 id="view-title">개요</h1><p id="view-description">이 호스트의 실제 리소스와 최근 관찰을 확인합니다.</p></div><div class="updated"><span>마지막 전체 갱신 성공</span><time id="last-success">아직 없음</time></div></div>
+        <div id="global-error" class="notice danger" role="alert" hidden></div>
+        <div id="action-feedback" class="notice" role="status" hidden></div>
+        <section id="panel-overview" aria-labelledby="view-title"><div id="overview-content"><p class="empty-state">로컬 리소스를 불러오는 중입니다.</p></div></section>
+        <section id="panel-vms" hidden aria-labelledby="view-title"></section>
+        <section id="panel-volumes" hidden aria-labelledby="view-title"></section>
+        <section id="panel-artifacts" hidden aria-labelledby="view-title">
+          <div id="artifacts-list"></div>
+          <details id="import-controls" class="card management" hidden><summary>클라우드 이미지 가져오기</summary><p class="muted">호스트의 기존 파일을 로컬 저장소에 가져옵니다.</p>
+            <form id="form-import" class="form-grid"><label>파일 경로<input id="import-path" required autocomplete="off"></label><label>디스크 형식<select id="import-format"><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label><label>아키텍처<select id="import-arch"><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>OS 변형 (선택)<input id="import-variant" autocomplete="off"></label><button class="primary" type="submit">이미지 가져오기</button></form>
+          </details>
+        </section>
+        <section id="panel-networks" hidden aria-labelledby="view-title"></section>
+        <section id="panel-builds" hidden aria-labelledby="view-title"></section>
+        <section id="panel-storage" hidden aria-labelledby="view-title">
+          <div id="storage-content"><p class="empty-state">스토리지 보고서를 불러오는 중입니다.</p></div>
+          <div class="notice">Lima VM 디스크는 Lima의 상태 디렉터리 (~/.lima)에 있습니다. Palimpsest 스토리지 이동에 포함되지 않습니다.</div>
+          <div id="storage-controls" class="two-columns management" hidden>
+            <div class="card"><h2>상태 루트 이동</h2><p class="muted">파일을 새 위치로 옮기고 상태 루트를 변경합니다.</p><form id="form-move-storage"><label>새 대상 경로<input id="move-dest" required autocomplete="off"></label><label class="check-label"><input type="checkbox" id="move-keep-source">원본 디렉터리 유지</label><button type="submit" class="danger-button">스토리지 이동</button></form></div>
+            <div class="card"><h2>기존 상태 루트 지정</h2><p class="muted">파일 이동 없이 사용할 상태 디렉터리를 변경합니다.</p><form id="form-set-storage"><label>기존 스토리지 경로<input id="set-dest" required autocomplete="off"></label><button type="submit">상태 루트 지정</button></form></div>
           </div>
-
-          <div class="card">
-            <h3>Directory Breakdown</h3>
-            <ul id="storage-breakdown" class="breakdown-list">
-              <li>Loading breakdown...</li>
-            </ul>
-          </div>
-        </div>
-
-        <div class="grid-2col margin-top">
-          <div class="card">
-            <h3>Move State Root</h3>
-            <form id="form-move-storage">
-              <div class="form-group">
-                <label for="move-dest">New Destination Path:</label>
-                <input type="text" id="move-dest" required placeholder="/new/path/to/palimpsest">
-              </div>
-              <div class="form-group checkbox-group">
-                <label>
-                  <input type="checkbox" id="move-keep-source">
-                  Keep source directory (do not remove old files)
-                </label>
-              </div>
-              <button type="submit" class="btn btn-primary">Move Storage Root</button>
-            </form>
-            <div id="move-feedback" class="feedback-msg hidden"></div>
-          </div>
-
-          <div class="card">
-            <h3>Point-To (Set) State Root</h3>
-            <form id="form-set-storage">
-              <div class="form-group">
-                <label for="set-dest">Existing Storage Path:</label>
-                <input type="text" id="set-dest" required placeholder="/path/to/existing/palimpsest">
-              </div>
-              <button type="submit" class="btn btn-secondary">Set Storage Root</button>
-            </form>
-            <div id="set-feedback" class="feedback-msg hidden"></div>
-          </div>
-        </div>
-      </section>
-    </main>
-
-    <!-- Console Log Drawer -->
-    <div id="log-drawer" class="drawer hidden" role="dialog" aria-labelledby="drawer-title" aria-modal="true">
-      <div class="drawer-header">
-        <h3 id="drawer-title">Console Logs</h3>
-        <div class="drawer-controls">
-          <label for="log-tail-select">Tail lines:</label>
-          <select id="log-tail-select">
-            <option value="100">100</option>
-            <option value="400" selected>400</option>
-            <option value="1000">1000</option>
-          </select>
-          <button class="btn btn-secondary btn-sm" id="btn-refresh-log">Refresh</button>
-          <button class="btn-close" id="btn-close-drawer" aria-label="Close logs">&times;</button>
-        </div>
-      </div>
-      <div class="drawer-body">
-        <pre id="log-content" class="log-viewer">Select a VM or Build to view logs.</pre>
-      </div>
+        </section>
+        <footer class="page-footer">로컬 관찰 · VM은 런타임 관찰, 볼륨은 메타데이터, 네트워크는 구성 기준입니다. <span>자동 갱신 5초</span></footer>
+      </main>
     </div>
-    <div id="drawer-overlay" class="drawer-overlay hidden"></div>
   </div>
-
+  <dialog id="detail-drawer" aria-labelledby="drawer-title" aria-describedby="drawer-description">
+    <header class="drawer-header"><div><p id="drawer-kind" class="eyebrow">리소스 상세</p><h2 id="drawer-title">상세</h2></div><button id="btn-close-drawer" aria-label="상세 닫기">닫기 <kbd>Esc</kbd></button></header>
+    <div class="drawer-body"><p id="drawer-description" class="muted"></p><div id="detail-state" class="notice" role="status" hidden></div><div id="detail-content"></div><div id="detail-actions" class="management" hidden></div>
+      <section id="log-section" hidden aria-labelledby="log-title"><div class="log-toolbar"><h3 id="log-title">콘솔 로그</h3><label for="log-tail-select">최근 줄 수</label><select id="log-tail-select"><option value="100">100</option><option value="400" selected>400</option><option value="1000">1000</option></select><button id="btn-refresh-log">로그 갱신</button></div><p id="log-state" class="muted" role="status"></p><pre id="log-content" tabindex="0" aria-label="콘솔 로그 내용"></pre></section>
+    </div>
+  </dialog>
   <script>
-    (function() {
-      const urlParams = new URLSearchParams(window.location.search);
-      let token = urlParams.get('token');
-      if (token) {
-        sessionStorage.setItem('palimpsest_token', token);
-        const cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
-        window.history.replaceState({}, document.title, cleanUrl);
-      } else {
-        token = sessionStorage.getItem('palimpsest_token');
+    (async function () {
+      const url = new URL(window.location.href);
+      let token = url.searchParams.get('token');
+      if (url.searchParams.has('token')) {
+        url.searchParams.delete('token');
+        window.history.replaceState({}, '', url.pathname + url.search + url.hash);
       }
-
-      if (!token) {
-        document.addEventListener('DOMContentLoaded', function() {
-          const err = document.getElementById('global-error');
-          if (err) {
-            err.textContent = 'Authentication token missing. Please open the dashboard via the CLI link.';
-            err.classList.remove('hidden');
-          }
-        });
-        return;
-      }
-
-      const headers = { 'Authorization': 'Bearer ' + token };
-
-      fetch('/app.css', { headers: headers })
-        .then(res => {
-          if (!res.ok) throw new Error('CSS fetch failed (' + res.status + ')');
-          return res.text();
-        })
-        .then(css => {
-          const style = document.createElement('style');
-          style.textContent = css;
-          document.head.appendChild(style);
-        })
-        .catch(err => console.error('Failed to load CSS:', err));
-
-      fetch('/app.js', { headers: headers })
-        .then(res => {
-          if (!res.ok) throw new Error('JS fetch failed (' + res.status + ')');
-          return res.text();
-        })
-        .then(jsText => {
-          const script = document.createElement('script');
-          script.textContent = jsText;
-          document.body.appendChild(script);
-        })
-        .catch(err => {
-          console.error('Failed to load JS:', err);
-          document.addEventListener('DOMContentLoaded', function() {
-            const errDiv = document.getElementById('global-error');
-            if (errDiv) {
-              errDiv.textContent = 'Failed to load application scripts: ' + err.message;
-              errDiv.classList.remove('hidden');
-            }
-          });
-        });
+      try {
+        if (token) sessionStorage.setItem('palimpsest_token', token);
+        else token = sessionStorage.getItem('palimpsest_token');
+      } catch (_) { /* The current CLI link can still bootstrap without persistent storage. */ }
+      const fail = message => {
+        document.getElementById('global-error').textContent = message;
+        document.getElementById('global-error').hidden = false;
+        document.getElementById('refresh-state').textContent = '연결되지 않음';
+      };
+      if (!token) { fail('인증 토큰이 없습니다. CLI에서 제공한 대시보드 링크를 다시 여세요.'); return; }
+      window.palimpsestSessionToken = token;
+      const headers = { Authorization: 'Bearer ' + token };
+      try {
+        const assets = await Promise.all(['/app.css', '/app.js'].map(async path => {
+          const response = await fetch(path, { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' });
+          if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? '인증이 만료되었습니다. CLI 링크를 다시 여세요.' : '로컬 화면 파일을 불러오지 못했습니다 (HTTP ' + response.status + '). 다시 로드하세요.');
+          return response.text();
+        }));
+        const style = document.createElement('style'); style.textContent = assets[0]; document.head.appendChild(style);
+        const script = document.createElement('script'); script.textContent = assets[1]; document.body.appendChild(script);
+      } catch (error) { fail(error.message); }
     })();
   </script>
 </body>

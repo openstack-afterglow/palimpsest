@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
-from palimpsest_hub.models import PalimpsestImageExport
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from palimpsest_hub.models import Base, PalimpsestImageExport
+from palimpsest_hub.services import image_exports
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.image_exports import (
     CONVERTER_CONTRACT,
@@ -158,3 +164,100 @@ def test_promote_file_refreshes_existing_blob_gc_age(tmp_path: Path):
 
     assert promoted1.blob_digest == promoted2.blob_digest
     assert not second_file.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["complete", "error", "lease_lost"])
+async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, monkeypatch, caplog, outcome):
+    secret = "sensitive-openstack-token-and-stderr"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hub.sqlite'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "store")
+    source = b"image content"
+    checksum = hashlib.sha256(source).hexdigest()
+    job = PalimpsestImageExport(
+        id="export-secret-id",
+        project_id="project-secret-id",
+        source_image_id="image-secret-id",
+        source_name=secret,
+        source_disk_format="raw",
+        source_size_bytes=len(source),
+        source_virtual_size_bytes=len(source),
+        source_hash_algo="sha256",
+        source_hash_value=checksum,
+        source_fingerprint="a" * 64,
+        artifact_key="b" * 64,
+        target_disk_format="raw",
+        status="queued",
+        progress_pct=0,
+    )
+    async with factory() as session:
+        session.add(job)
+        await session.commit()
+
+    class Response:
+        def iter_content(self, chunk_size):
+            yield source
+
+        def close(self):
+            pass
+
+    openstack_image = SimpleNamespace(
+        status="active",
+        owner=job.project_id,
+        disk_format="raw",
+        size=len(source),
+        virtual_size=len(source),
+        checksum=None,
+        os_hash_algo="sha256",
+        os_hash_value=checksum,
+        updated_at=None,
+    )
+    admin_conn = SimpleNamespace(
+        image=SimpleNamespace(download_image=lambda *args, **kwargs: Response()), close=lambda: None
+    )
+    monkeypatch.setattr(image_exports, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(image_exports, "get_blob_store", lambda: store)
+    monkeypatch.setattr(image_exports, "get_settings", lambda: SimpleNamespace(palimpsest_hub_max_blob_bytes=1024))
+    monkeypatch.setattr(image_exports, "get_admin_connection_for_project", lambda _project: admin_conn)
+    monkeypatch.setattr(image_exports, "get_image", lambda *_args: openstack_image)
+
+    async def subprocess_result(argv, **kwargs):
+        if outcome == "error":
+            raise RuntimeError(secret + " /private/secret/path")
+        if outcome == "lease_lost":
+            raise image_exports.ImageExportLeaseLost(secret)
+        if argv[1] == "measure":
+            return 0, json.dumps({"required": len(source)}), ""
+        return 0, json.dumps({"format": "raw", "virtual-size": len(source)}), ""
+
+    monkeypatch.setattr(image_exports, "_run_subprocess", subprocess_result)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="palimpsest_hub.services.image_exports"):
+            assert await image_exports.process_one_image_export(owner="worker-secret-id") is True
+        async with factory() as session:
+            stored = await session.get(PalimpsestImageExport, job.id)
+            expected = "downloading" if outcome == "lease_lost" else outcome
+            assert stored.status == expected
+            if outcome == "complete":
+                assert stored.result_size_bytes == len(source)
+            elif outcome == "error":
+                assert stored.error_code == "export_failed"
+            else:
+                assert stored.lease_owner == "worker-secret-id"
+        records = [r for r in caplog.records if r.name == image_exports.__name__]
+        info = [r.getMessage() for r in records if r.levelno == logging.INFO]
+        assert info == ["Export task started status=downloading", f"Export task ended status={outcome}"]
+        debug = [r.getMessage() for r in records if r.levelno == logging.DEBUG]
+        assert len(debug) == 1
+        assert f"status={outcome}" in debug[0] and "elapsed_ms=" in debug[0]
+        assert "downloaded_bytes=" in debug[0] and "output_bytes=" in debug[0]
+        for record in records:
+            assert record.exc_info is None
+        emitted = "\n".join(r.getMessage() for r in records)
+        for forbidden in (secret, "secret-id", "/private/secret/path", checksum):
+            assert forbidden not in emitted
+    finally:
+        await engine.dispose()

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 import threading
 import tomllib
 from pathlib import Path
@@ -243,16 +246,21 @@ def test_docker_hub_short_reference_resolution() -> None:
     assert pinned.source_id == f"digest:{DIGEST}"
 
 
-def test_external_registry_in_reference_overrides_all_profile_selection() -> None:
+def test_qualified_registry_keeps_unconfigured_authority_oci_and_rejects_mismatched_alias() -> None:
     config = _config_with_private()
+    # Only a configured native profile can select native transport; others stay Docker/OCI.
+    unconfigured = registry.resolve_image_reference("quay.io/acme/app:stable", config, environment={})
+    assert (unconfigured.canonical, unconfigured.registry_alias) == ("quay.io/acme/app:stable", None)
+    with pytest.raises(RegistryError, match="does not match"):
+        registry.resolve_image_reference("quay.io/acme/app:stable", config, registry_alias="corp", environment={})
+    config = registry.add_profile(config, RegistryProfile("quay", "quay.io"))
     resolved = registry.resolve_image_reference(
-        "quay.io/acme/app:stable",
-        config,
-        registry_alias="not-a-real-profile",
-        environment={"PALIMPSEST_REGISTRY": "also-invalid"},
+        "quay.io/acme/app:stable", config, environment={"PALIMPSEST_REGISTRY": "also-invalid"}
     )
     assert resolved.canonical == "quay.io/acme/app:stable"
-    assert resolved.registry_alias is None
+    assert resolved.registry_alias == "quay"
+    with pytest.raises(RegistryError, match="does not match"):
+        registry.resolve_image_reference("quay.io/acme/app:stable", config, registry_alias="corp", environment={})
 
 
 def test_selected_profile_applies_endpoint_and_single_name_namespace() -> None:
@@ -441,21 +449,6 @@ def test_generic_docker_runner_never_uses_shell_and_login_password_stays_off_arg
     ]
 
 
-def test_passthrough_runner_inherits_stdio_and_preserves_docker_exit_code(tmp_path: Path) -> None:
-    calls: list[tuple[list[str], dict[str, object]]] = []
-    argv = registry.docker_login_argv(tmp_path / "docker", "docker.io")
-
-    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[None]:
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 17, None, None)
-
-    result = registry.run_docker_passthrough(argv, runner=runner)
-
-    assert result.returncode == 17
-    assert calls == [(argv, {"shell": False, "check": False})]
-    assert all(name not in calls[0][1] for name in ("stdin", "stdout", "stderr", "input", "capture_output"))
-
-
 def test_all_requested_docker_command_families_have_shell_free_argv(tmp_path: Path) -> None:
     images = registry.docker_images_argv(
         tmp_path,
@@ -523,3 +516,202 @@ def test_buildkitd_renderer_rejects_conflicting_transport_for_same_endpoint() ->
     )
     with pytest.raises(RegistryError, match="conflicting"):
         registry.render_buildkitd_toml(config)
+
+
+def test_native_profile_round_trip_preserves_api_base_and_legacy_profiles_are_oci(tmp_path: Path) -> None:
+    roots = _roots(tmp_path)
+    path = registry.registry_config_path(roots)
+    path.write_text(
+        'schema_version = 1\ndefault = "docker"\n[registries.docker]\nendpoint = "docker.io"\nnamespace = "library"\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    config = registry.load_registry_config(roots)
+    assert config.registries["docker"].protocol == "oci"
+    native = RegistryProfile(
+        "cloud",
+        "cloud.example.com",
+        "team",
+        protocol="palimpsest",
+        api_base="https://cloud.example.com/api/v1/palimpsest/hub/",
+    )
+    config = registry.add_profile(config, native)
+    registry.save_registry_config(roots, config)
+    loaded = registry.load_registry_config(roots)
+    assert loaded == config
+    assert loaded.registries["cloud"].api_base == "https://cloud.example.com/api/v1/palimpsest/hub"
+    assert permission_bits(path) == 0o600
+    assert "cloud.example.com" not in tomllib.loads(registry.render_buildkitd_toml(loaded))["registry"]
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "http://cloud.example.com/v1",
+        "https://other.example.com/v1",
+        "https://cloud.example.com:443/v1",
+        "https://user:password@cloud.example.com/v1",
+        "https://cloud.example.com/v1?token=secret",
+        "https://cloud.example.com/v1#fragment",
+        "https://cloud.example.com/a/../v1",
+        "https://cloud.example.com/a%2fv1",
+        "https://cloud.example.com/a//v1",
+    ],
+)
+def test_native_api_base_cannot_change_authority_or_transport(api_base: str) -> None:
+    with pytest.raises(RegistryError):
+        RegistryProfile("cloud", "cloud.example.com", protocol="palimpsest", api_base=api_base)
+
+
+@pytest.mark.parametrize("namespace", ["team/other", "A", ".", "..", "a" * 64, "é", "team%2fother"])
+def test_native_namespace_rejects_noncanonical_project_components(namespace: str) -> None:
+    with pytest.raises(RegistryError):
+        RegistryProfile(
+            "cloud", "cloud.example.com", namespace, protocol="palimpsest", api_base="https://cloud.example.com/v1"
+        )
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"mirrors": ("mirror.example.com",)},
+        {"plain_http": True},
+        {"tls_skip_verify": True},
+        {"cache_from": ("type=registry,ref=cloud.example.com/cache",)},
+        {"cache_to": ("type=registry,ref=cloud.example.com/cache",)},
+    ],
+)
+def test_native_profiles_cannot_enable_docker_transport(settings: dict[str, object]) -> None:
+    with pytest.raises(RegistryError, match="native profiles"):
+        RegistryProfile(
+            "cloud", "cloud.example.com", protocol="palimpsest", api_base="https://cloud.example.com/v1", **settings
+        )
+
+
+def test_native_reference_never_misroutes_to_oci_or_another_authority() -> None:
+    native = RegistryProfile(
+        "cloud", "cloud.example.com", "team", protocol="palimpsest", api_base="https://cloud.example.com/v1"
+    )
+    config = registry.add_profile(registry.default_registry_config(), native)
+    resolved = registry.resolve_image_reference("app:v1", config, registry_alias="cloud", environment={})
+    assert resolved.canonical == "cloud.example.com/team/app:v1"
+    assert resolved.registry_alias == "cloud"
+    with pytest.raises(RegistryError, match="does not match"):
+        registry.resolve_image_reference("docker.io/team/app:v1", config, registry_alias="cloud", environment={})
+    config = registry.add_profile(config, RegistryProfile("legacy", "cloud.example.com"))
+    with pytest.raises(RegistryError, match="ambiguous"):
+        registry.resolve_image_reference(
+            "cloud.example.com/team/app:v1", config, registry_alias="cloud", environment={}
+        )
+
+
+def test_native_default_namespace_is_optional_but_short_names_require_it() -> None:
+    native = RegistryProfile(
+        "cloud", "cloud.example.com", protocol="palimpsest", api_base="https://cloud.example.com/v1"
+    )
+    config = registry.add_profile(registry.default_registry_config(), native)
+    with pytest.raises(RegistryError, match="namespace/package"):
+        registry.resolve_image_reference("app:v1", config, registry_alias="cloud", environment={})
+    assert (
+        registry.resolve_image_reference("cloud.example.com/team/app:v1", config, environment={}).registry_alias
+        == "cloud"
+    )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "docker-capture",
+        "docker-passthrough",
+        "buildx-preflight",
+        "packer-command",
+        "credential-helper",
+    ],
+)
+def test_real_tool_children_cannot_read_palimpsest_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    from palimpsest_local import buildkit, package_credentials
+
+    public_id = "11111111111141118111111111111111"
+    package_key = "ppk_v1_" + public_id + "." + "A" * 43
+    configuration = {
+        "DOCKER_CONFIG": str(tmp_path / "docker-config"),
+        "DOCKER_CONTEXT": "selected-context",
+        "BUILDX_BUILDER": "selected-builder",
+    }
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    report = tmp_path / "child.json"
+    probe_source = (
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "names = ('PALIMPSEST_PACKAGE_KEY', 'PALIMPSEST_TOKEN', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'BUILDX_BUILDER')\n"
+        "observed = {name: os.environ[name] for name in names if name in os.environ}\n"
+        "Path(os.environ['PALIMPSEST_TEST_CHILD_REPORT']).write_text(json.dumps({'environment': observed, 'argv': sys.argv[1:]}))\n"
+        "if sys.argv[1:3] == ['buildx', 'inspect']:\n"
+        "    print('Name: selected-builder\\nDriver: docker-container')\n"
+        "if sys.argv[1:2] == ['store']:\n"
+        "    supplied = json.loads(sys.stdin.read())\n"
+        "    assert supplied['Secret'].startswith('ppk_v1_')\n"
+        "sys.exit(17 if os.environ['PALIMPSEST_TEST_CHILD_OPERATION'] == 'docker-passthrough' else 0)\n"
+    )
+    for executable in ("docker", "docker-credential-probe", "packer-probe"):
+        path = binary / executable
+        path.write_text(probe_source)
+        path.chmod(0o700)
+    for name, value in configuration.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ.get("PATH", os.defpath))
+    monkeypatch.setenv("PALIMPSEST_PACKAGE_KEY", package_key)
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "legacy-credential-never-for-tool-children")
+    monkeypatch.setenv("PALIMPSEST_TEST_CHILD_REPORT", str(report))
+    monkeypatch.setenv("PALIMPSEST_TEST_CHILD_OPERATION", operation)
+
+    if operation == "docker-capture":
+        registry.run_docker_command(registry.docker_command_argv(tmp_path / "docker-config", "version"))
+    elif operation == "docker-passthrough":
+        result = registry.run_docker_passthrough(registry.docker_command_argv(tmp_path / "docker-config", "version"))
+        assert result.returncode == 17
+    elif operation == "buildx-preflight":
+        assert buildkit.preflight_buildx_oci_exporter() == "docker-container"
+    elif operation == "packer-command":
+        buildkit._run_checked(subprocess.run, [str(binary / "packer-probe")], operation="packer environment probe")
+    else:
+        docker = tmp_path / "docker-config"
+        docker.mkdir()
+        (docker / "config.json").write_text(json.dumps({"credsStore": "probe"}))
+        profile = RegistryProfile(
+            "cloud", "cloud.example.test", "team", protocol="palimpsest", api_base="https://cloud.example.test/v1"
+        )
+        package_credentials.store_package_key(profile, "team", package_key, public_id)
+
+    child = json.loads(report.read_text())
+    assert child["environment"] == configuration
+    assert package_key not in json.dumps(child)
+    assert "legacy-credential-never-for-tool-children" not in json.dumps(child)
+
+
+def test_short_native_reference_cannot_bypass_mixed_protocol_authority():
+    native = RegistryProfile(
+        "cloud", "cloud.example.com", "team", protocol="palimpsest", api_base="https://cloud.example.com/v1"
+    )
+    config = registry.add_profile(registry.default_registry_config(), native)
+    config = registry.add_profile(config, RegistryProfile("oci", "cloud.example.com"))
+    for alias in ("cloud", "oci"):
+        with pytest.raises(RegistryError):
+            registry.resolve_image_reference("app:v1", config, registry_alias=alias, environment={})
+
+
+def test_completed_native_reference_enforces_combined_repository_length():
+    native = RegistryProfile(
+        "cloud", "cloud.example.com", "a" * 63, protocol="palimpsest", api_base="https://cloud.example.com/v1"
+    )
+    config = registry.add_profile(registry.default_registry_config(), native)
+    accepted = registry.resolve_image_reference("b" * 191, config, registry_alias="cloud", environment={})
+    assert len(accepted.repository) == 255
+    with pytest.raises(RegistryError):
+        registry.resolve_image_reference("b" * 192, config, registry_alias="cloud", environment={})

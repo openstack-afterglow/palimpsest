@@ -23,8 +23,23 @@
     that:
       - palimpsest_database_password is defined and palimpsest_database_password | length > 0
       - palimpsest_keystone_password is defined and palimpsest_keystone_password | length > 0
+      - palimpsest_reader_password is defined and palimpsest_reader_password | length > 0
+      - palimpsest_reader_user != palimpsest_keystone_user
+      - palimpsest_package_forbidden_project_ids | length > 0
+      - palimpsest_package_forbidden_user_ids | length > 0
       - palimpsest_redis_db_index == 9
-    fail_msg: "Palimpsest DB/Keystone secrets must be set, and palimpsest_redis_db_index must equal 9"
+    fail_msg: "Separate DB/export/reader secrets and immutable protected project/user IDs are required; Redis index must equal 9"
+  tags: precheck
+  when: enable_palimpsest | bool
+
+- name: Precheck | Validate exact package protection IDs
+  ansible.builtin.assert:
+    that:
+      - item is string
+      - item is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
+    fail_msg: "Package protection IDs must be exact immutable Keystone identifiers, not display names"
+  loop: "{{ palimpsest_package_forbidden_project_ids + palimpsest_package_forbidden_user_ids }}"
+  run_once: true
   tags: precheck
   when: enable_palimpsest | bool
 

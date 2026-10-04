@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub import build_worker
 from palimpsest_hub.api.builds import BuildRequest, create_hub_build
+from palimpsest_hub.api.hub import _legacy_writer
 from palimpsest_hub.auth import get_token_info, require_admin
 from palimpsest_hub.config import BuildWorkerSettings
 from palimpsest_hub.main import app
@@ -85,6 +86,7 @@ async def test_project_build_consumes_uploaded_base_and_publishes_private_layer(
         return await identity(request)
 
     app.dependency_overrides[get_token_info] = identity
+    app.dependency_overrides[_legacy_writer] = identity
     app.dependency_overrides[require_admin] = admin
     output = b"hsqs\x00\x00test-layer"
     output_digest = digest(output)

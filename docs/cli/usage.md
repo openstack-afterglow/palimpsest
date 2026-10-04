@@ -163,6 +163,25 @@ palimpsest store show --format json
 palimpsest store ls --kind layer
 palimpsest store move --to /srv/palimpsest/store --keep-source
 palimpsest ui --port 8080 --no-browser
+palimpsest ui --allow-control
 ```
 
 `ui --port 0` (the default) chooses an available port. Explicit ports must be 1024–65535. State roots are owner-only; Linux's default is `/var/lib/palimpsest` only when no env/config/XDG override is present. Existing legacy state is not silently migrated.
+
+`ui` is a foreground process, not a background daemon: it serves the packaged, offline dashboard on `127.0.0.1` only until interrupted, and prints a URL carrying a per-process token. The page removes that token from the address bar and keeps it in the tab session, so reloading the tab works while the process runs; a restarted process needs its new URL. Assets and `/api/v1` require the token as a bearer header. Run it as the UID that owns the selected state root. For a remote host, keep the loopback bind and forward it, for example `ssh -L 8080:127.0.0.1:8080 HOST`.
+
+The dashboard is read-only by default: every `POST`/`DELETE` returns `403` before any side effect, and the page hides management controls. Read-only does not mean the VM view is a static snapshot: it live-reconciles each run against its backend, and when the observed status differs (for example, a Lima instance stopped outside Palimpsest) the reconciliation records that status in the run ledger, as the runtime does elsewhere. `--allow-control` enables the existing VM start/stop/remove, cloud-image import, unreferenced artifact removal, and state-root move/set actions with confirmations.
+
+Polling reads time out after fifteen seconds; control requests instead remain busy until the server returns, because VM starts and storage moves can outlive a polling interval. Closing a VM drawer clears its optional volume-deletion choice before inspecting another VM. The keyboard skip link reaches the active view's main content without changing the resource view.
+
+While the tab is visible it refreshes resource views every five seconds without overlapping requests, and the host summary and state-directory usage every thirty seconds (and on manual refresh); it pauses when hidden or on request, and a failed refresh keeps the last successful data marked as stale. Views and their provenance:
+
+| View | Source | Not a claim of |
+| --- | --- | --- |
+| VMs | live backend reconciliation; durable ledger values marked stale when reconciliation fails | guest health or service readiness |
+| Volumes | project volume ledgers (including preserved volumes without a VM), OCI root-volume records, run volume attachments, and the managed KVM/HVF overlay file length | verified ext4 contents, current block attachment, or virtual disk capacity (shown as unavailable) |
+| Layers and images | the local content store, tags, and run/project references | Hub or registry state |
+| Networks | run ledgers (conventional runs grouped by backend network) and each OCI-root run's committed domain plan; Lima attachments omit the recorded guest address because it belongs to the user-mode interface | an existing bridge, NAT, or open listener |
+| Builds and storage | local build records, the engine's console file (`console.log` for Palimpsestfile, `buildkit.log` for BuildKit; tails read at most 4 MiB), and state-directory usage | — |
+
+Only resources managed in the selected Palimpsest state are listed; unrelated Lima, libvirt, or Docker resources are not discovered. Unknown or malformed metadata appears as an unavailable row or warning rather than an empty inventory.

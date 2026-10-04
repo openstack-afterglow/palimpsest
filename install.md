@@ -5,9 +5,15 @@ Palimpsest requires Python 3.11 or newer. The root
 is published on PyPI; install it with
 `python3.12 -m pip install "palimpsest-client==0.2.3"` and verify with
 `palimpsest --version`. Git and outbound HTTPS access to GitHub are required
-only for the VCS installation examples below. Hub's independent Python package
-(`palimpsest-hub`) remains `0.2.0` in this source tree; the root release tag
-does not publish that wheel.
+only for the VCS installation examples below. The independent Hub Python
+package (`palimpsest-hub`) prepares `0.3.0` in this source tree; the root release
+tag does not publish that wheel.
+
+The current checkout prepares root `palimpsest-client 0.3.0`; the published
+commands above still install 0.2.3. Hub 0.3.0 adds the project-package registry and retains
+closed-transport recovery. The candidate Kolla role defaults to Hub image
+tag 0.3.0; verify that both reviewed images have been published before deployment.
+Pin their image digests explicitly; a root package update does not roll out the Hub.
 
 ## 1. Install the Local CLI
 
@@ -96,7 +102,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. The Kolla role in
-this source tree defaults to Hub image tag `0.2.0`; verify both images before
+this candidate source tree defaults to Hub image tag `0.3.0`; verify both images are published before
 deployment. Root PyPI publishing requires tag-triggered artifact checks,
 a successful native stage-1 proof on an enabled self-hosted Linux x86_64 KVM
 runner, and a GitHub trusted publisher registered for PyPI project

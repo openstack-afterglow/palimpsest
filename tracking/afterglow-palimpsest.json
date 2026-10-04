@@ -1,50 +1,91 @@
 {
   "schema_version": 1,
-  "scope": "Palimpsest standalone package only; Lumen and Waygate are explicitly out of scope for this repository.",
+  "scope": "Structural ownership and public-boundary tracking for standalone Palimpsest Hub and Afterglow's BFF consumer; not runtime, authentication, deployment, or native proof. Lumen and Waygate are out of scope.",
   "upstream": {
     "repository": "https://github.com/openstack-afterglow/openstack-afterglow.git",
     "ref": "main",
-    "baseline_commit": "d0250db689631f095dab2ac78ddad89651422c6b"
+    "baseline_commit": "2862565c1f59eac0ef0904b97c905b177f12b335"
   },
   "absence_rules": [
     {
       "glob": "services/palimpsest*",
       "expected_matches": 0,
-      "analysis": "A dedicated Palimpsest service does not exist at the baseline. Creation of one requires an explicit ownership and API review."
+      "analysis": "The extracted Hub authority lives in this repository's hub/ package, not an embedded Afterglow services/palimpsest tree. Reintroducing that owner requires review."
+    },
+    {
+      "glob": "backend/app/services/palimpsest_hub_bundle.py",
+      "expected_matches": 0,
+      "analysis": "Bundle parsing and export belong to the extracted Hub; Afterglow must not restore its removed embedded implementation."
     }
   ],
   "contracts": [
     {
       "id": "hub-http-v1",
       "status": "implemented",
-      "analysis": "The standalone Palimpsest Hub API and HubClient support native /v1 routes, Keystone token authentication, resumable uploads using Upload-Offset validation, and GET /v1/uploads/{session_id} status queries.",
+      "analysis": "Palimpsest Hub owns native /v1 artifact routes and project/creator-bound upload sessions. Afterglow main is an authenticated BFF consumer forwarding caller-scoped Keystone identity and Upload-Offset, not the Hub implementation. HubClient retains authoritative GET upload status and exact offset resumption. Boundary markers require review when removed but do not prove authentication or HTTP behavior; existing Hub/client behavioral suites remain required.",
       "upstream": [
         {
           "path": "backend/app/api/palimpsest/hub.py",
-          "sha256": "51a31d6f5974743c823f825ac8b8fb9cabe4c332be6aabd37e0112b253ec5cc0",
           "must_contain": [
-            "@router.get(\"/layers\")",
-            "@router.get(\"/images\")",
-            "@router.get(\"/layers/{digest}/blob\")",
-            "@router.post(\"/uploads\")",
-            "@router.patch(\"/uploads/{session_id}\")",
-            "@router.put(\"/uploads/{session_id}\")",
-            "@router.delete(\"/uploads/{session_id}\",",
-            "@router.post(\"/bundles\")"
+            "async def proxy_palimpsest_hub",
+            "get_token_info",
+            "_require_palimpsest_enabled",
+            "f\"/v1/{path}\"",
+            "return await proxy(\"palimpsest\", request, upstream_path)"
           ],
           "must_not_contain": [
-            "@router.get(\"/uploads/{session_id}\")",
-            "request.headers.get(\"upload-offset\")"
+            "@router.get(\"/layers\"",
+            "@router.post(\"/uploads\"",
+            "@router.post(\"/bundles/import\"",
+            "from app.models.db import PalimpsestHub",
+            "iter_bundle_tar",
+            "parse_bundle"
+          ]
+        },
+        {
+          "path": "backend/app/services/service_proxy.py",
+          "must_contain": [
+            "async def proxy(",
+            "getattr(request.state, \"token_info\", None)",
+            "headers[\"x-auth-token\"] = token",
+            "headers[\"x-project-id\"] = connection_project_id",
+            "\"upload-offset\""
           ]
         }
       ],
       "counterparts": [
         {
+          "path": "hub/src/palimpsest_hub/main.py",
+          "must_contain": [
+            "app.include_router(hub_router, prefix=\"/v1\""
+          ]
+        },
+        {
+          "path": "hub/src/palimpsest_hub/api/hub.py",
+          "must_contain": [
+            "operation_id=\"search_hub_layers\"",
+            "operation_id=\"list_hub_images\"",
+            "operation_id=\"download_hub_blob\"",
+            "operation_id=\"start_upload\"",
+            "operation_id=\"get_upload_status\"",
+            "operation_id=\"append_upload\"",
+            "operation_id=\"finalize_upload\"",
+            "operation_id=\"abort_upload\"",
+            "Depends(get_token_info)",
+            "Depends(_legacy_writer)",
+            "async def _owned_upload",
+            "request.headers.get(\"Upload-Offset\")",
+            "if upload.project_id != _required_project_id(token_info):",
+            "upload.created_by != token_info.get(\"user_id\")",
+            "\"Upload-Offset mismatch\""
+          ]
+        },
+        {
           "path": "src/palimpsest_local/hub.py",
-          "sha256": "424dcdd5c8295619db7b5bf995fb2bc7dd2f62944a3ccb4e366adefef44297a1",
           "must_contain": [
             "HUB_API_PREFIX = \"/v1\"",
-            "f\"/uploads/{session_id}\"",
+            "request_headers = {\"X-Auth-Token\": self._token}",
+            "request_headers[\"X-Project-Id\"] = self._project_id",
             "headers={\"Upload-Offset\": str(offset)}",
             "with self._open(\"GET\", f\"/uploads/{session_id}\")"
           ]
@@ -53,8 +94,8 @@
     },
     {
       "id": "layer-metadata-and-digest-v1",
-      "status": "partial",
-      "analysis": "Afterglow remains authoritative for layer metadata, visibility, persistence, and API routing. The standalone package owns digest normalization, OCI references, and client-side interpretation only.",
+      "status": "implemented",
+      "analysis": "The extracted Hub owns Hub metadata, visibility, SQL persistence and blob identity. Afterglow retains its separate LayerArtifact lineage/admin APIs and digest helpers, but no Hub layer/upload/export models. The client owns canonical digests, verified references and local OCI interpretation. These structural boundaries do not establish SQL visibility or digest-verification behavior.",
       "upstream": [
         {
           "path": "backend/app/api/palimpsest/layers.py",
@@ -62,7 +103,7 @@
         },
         {
           "path": "backend/app/models/db.py",
-          "must_contain": [
+          "must_not_contain": [
             "class PalimpsestHubLayer",
             "class PalimpsestHubUpload",
             "class PalimpsestImageExport"
@@ -75,49 +116,89 @@
       ],
       "counterparts": [
         {
-          "path": "src/palimpsest_local/digest.py",
-          "sha256": "87908323592e6e6474dc83b3cc85c4941743e6c34ae9b6fe23068a7df8064602",
+          "path": "hub/src/palimpsest_hub/models.py",
           "must_contain": [
-            "def normalize_digest"
+            "class PalimpsestHubLayer(Base)",
+            "class PalimpsestHubUpload(Base)",
+            "class PalimpsestImageExport(Base)"
+          ]
+        },
+        {
+          "path": "hub/src/palimpsest_hub/services/digest.py",
+          "must_contain": [
+            "def normalize_digest",
+            "def compute_config_digest",
+            "def compute_chain_id"
+          ]
+        },
+        {
+          "path": "src/palimpsest_local/digest.py",
+          "must_contain": [
+            "def normalize_digest",
+            "def require_file_digest"
           ]
         },
         {
           "path": "src/palimpsest_local/refs.py",
-          "sha256": "fba9ecd94e3185860ff81f462e0e8190ec7e13c83bba553809d9ed211f5d1b60"
+          "must_contain": [
+            "class ImageRef:",
+            "class LayerRef:",
+            "class StackRef:"
+          ]
         },
         {
           "path": "src/palimpsest_local/oci_layout.py",
-          "sha256": "b648f1e49842b019f6db8b16327206dc7481a44b1874f6fb1554f4148ac3cb15"
+          "must_contain": [
+            "OCI_LAYOUT_VERSION",
+            "def verify_layout_dir"
+          ]
         }
       ]
     },
     {
       "id": "oci-bundle-v1",
       "status": "diverged-stricter-local",
-      "analysis": "Both sides exchange OCI image-layout tar bundles. The standalone importer validates OCI layout and layer data more strictly; preserve that stricter boundary rather than weakening the local package to match an upstream import shortcut.",
+      "analysis": "Palimpsest Hub owns OCI bundle export/import and complete parent-chain reconstruction; Afterglow only forwards /v1 requests. Both Hub and client verify received blob digests and descriptor bounds. Preserve the client's stricter local importer compatibility constraints; this ownership cutover does not weaken either importer or prove a real transfer/crash-durability result.",
       "upstream": [
         {
           "path": "backend/app/api/palimpsest/hub.py",
-          "sha256": "51a31d6f5974743c823f825ac8b8fb9cabe4c332be6aabd37e0112b253ec5cc0",
           "must_contain": [
-            "@router.post(\"/bundles/import\")",
+            "async def proxy_palimpsest_hub",
+            "f\"/v1/{path}\""
+          ],
+          "must_not_contain": [
             "iter_bundle_tar",
             "parse_bundle"
           ]
-        },
-        {
-          "path": "backend/app/services/palimpsest_hub_bundle.py",
-          "sha256": "684ac66a8977a2cd332ba61ad89629b593faec592c207f370c4214475e861573"
         }
       ],
       "counterparts": [
         {
+          "path": "hub/src/palimpsest_hub/api/hub.py",
+          "must_contain": [
+            "operation_id=\"export_bundle\"",
+            "operation_id=\"import_bundle\"",
+            "if chain_rows[0].parent_digest is not None:",
+            "if finalized.blob_digest != declared"
+          ]
+        },
+        {
+          "path": "hub/src/palimpsest_hub/services/hub_bundle.py",
+          "must_contain": [
+            "def iter_bundle_tar",
+            "def parse_bundle",
+            "\"parent_digest\": previous_digest"
+          ]
+        },
+        {
           "path": "src/palimpsest_local/oci_layout.py",
-          "sha256": "b648f1e49842b019f6db8b16327206dc7481a44b1874f6fb1554f4148ac3cb15",
           "must_contain": [
             "OCI_LAYOUT_VERSION",
             "def extract_bundle_tar",
-            "def verify_layout_dir"
+            "def verify_layout_dir",
+            "if len(members) > MAX_BUNDLE_MEMBERS:",
+            "if index_data.get(\"mediaType\") != MEDIA_TYPE_INDEX:",
+            "if actual_digest != expected_digest:"
           ]
         }
       ]
@@ -129,7 +210,11 @@
       "upstream": [
         {
           "path": "backend/app/api/palimpsest/builds.py",
-          "sha256": "b29732e1b59621f33c642e0034a584ea6137e73c0a52ebb64e7456c583825462"
+          "must_contain": [
+            "@router.post(\"/dockerfile\", dependencies=[Depends(require_admin)])",
+            "prepare_inline_dockerfile_import",
+            "create_import_job"
+          ]
         },
         {
           "path": "backend/app/api/palimpsest/admin.py",
@@ -148,27 +233,45 @@
         {
           "path": "backend/app/config.py",
           "must_contain": [
-            "palimpsest_hub_local_path",
-            "palimpsest_hub_max_blob_bytes",
-            "palimpsest_hub_upload_ttl_seconds",
+            "service_palimpsest_enabled",
+            "service_palimpsest_internal_url",
             "palimpsest_kvm_uri",
             "palimpsest_kvm_layer_root",
             "palimpsest_kvm_state_dir"
+          ],
+          "must_not_contain": [
+            "palimpsest_hub_local_path",
+            "palimpsest_hub_max_blob_bytes",
+            "palimpsest_hub_upload_ttl_seconds"
           ]
         }
       ],
       "counterparts": [
         {
           "path": "src/palimpsest_local/cli.py",
-          "sha256": "213aff569323f4fd43fbb058d1afc3b9266ae22248b33b9617bdca54cfbb35d8"
+          "must_contain": [
+            "def main(",
+            "from .build import build_layer",
+            "runtime_dispatch.resolve_run_request"
+          ]
         },
         {
           "path": "src/palimpsest_local/runtime.py",
-          "sha256": "c7009078ceeb2ba6b6dc4b1355f317e6c177031539ac94fc6727df96c3cc8192"
+          "must_contain": [
+            "from .cloud_runtime import (",
+            "\"run\"",
+            "\"stop\"",
+            "\"create_and_validate_overlay\""
+          ]
         },
         {
           "path": "src/palimpsest_local/kvm.py",
-          "sha256": "2569ebb70abfd7ed716a9624a0147c41ef461ca4bbfc7e88b990939e0159babc"
+          "must_contain": [
+            "class DomainSpec:",
+            "class OCIRootDomainSpec:",
+            "def build_domain_xml",
+            "def define_and_start"
+          ]
         }
       ]
     },
@@ -179,7 +282,11 @@
       "upstream": [
         {
           "path": "backend/app/api/union/layer_ops.py",
-          "sha256": "678cb9b56e28e22166715b385498f3c71d34b55659a24fb18578c0d566ed3c78"
+          "must_contain": [
+            "@router.post(\"/build\", dependencies=[Depends(require_admin)])",
+            "@router.post(\"/consume\", dependencies=[Depends(require_admin)])",
+            "from app.services import manila"
+          ]
         }
       ],
       "counterparts": []

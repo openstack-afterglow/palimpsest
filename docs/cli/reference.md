@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **76 command paths**, **223 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **76 command paths**, **233 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -482,7 +482,7 @@ usage: palimpsest oci root-volume [-h] volume_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--registry REGISTRY] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
+usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--registry REGISTRY] [--cache-registry CACHE_REGISTRY] [--cache-package CACHE_PACKAGE] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -501,6 +501,8 @@ usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--ba
 | `--local-image` | string; repeatable | `[]` | Add &#96;ALIAS=/absolute/layout@sha256:DIGEST&#96; as a verified local OCI build context; repeatable. |
 | `--cache-scope` | string | `None` | Select the Palimpsest Hub cache scope. |
 | `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `--cache-registry` | string | `None` | native profile authorizing mandatory online BuildKit cache transfer |
+| `--cache-package` | string | `None` | exact namespace/package cache partition |
 | `--cache-from` | string; repeatable | `[]` | Add an external BuildKit cache source; repeatable. |
 | `--cache-to` | string; repeatable | `[]` | Add an external BuildKit cache destination; repeatable. |
 | `--no-cache` | flag | `False` | Disable cache reuse (offline builds only). |
@@ -548,13 +550,15 @@ usage: palimpsest registry ls [-h] [--format {table,json}]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest registry add [-h] [--namespace NAMESPACE] [--mirror MIRROR] [--ca CA] [--plain-http] [--tls-skip-verify] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--default] [--force] name endpoint
+usage: palimpsest registry add [-h] [--protocol {oci,palimpsest}] [--api-base API_BASE] [--namespace NAMESPACE] [--mirror MIRROR] [--ca CA] [--plain-http] [--tls-skip-verify] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--default] [--force] name endpoint
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `name` | string | required | Managed object, run, profile, or publication name. |
 | `endpoint` | string | required | Registry hostname/endpoint. |
+| `--protocol` | one of: `oci`, `palimpsest` | `'oci'` | Select Docker/OCI Distribution or native Palimpsest package transport. |
+| `--api-base` | string | `None` | HTTPS native API base, including its gateway path |
 | `--namespace` | string | `None` | Namespace prepended to short image references. |
 | `--mirror` | string; repeatable | `[]` | Add a registry mirror; repeatable. |
 | `--ca` | Path; repeatable | `[]` | Add a trusted registry CA file; repeatable. |
@@ -629,15 +633,16 @@ usage: palimpsest registry buildkit-config [-h] --output OUTPUT [--force]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest login [-h] [-u USERNAME] [--password-stdin] [--registry REGISTRY] [server]
+usage: palimpsest login [-h] [-u USERNAME] [--password-stdin] [--registry REGISTRY] [--namespace NAMESPACE] [server]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `server` | string (optional) | `None` | Docker registry server or configured profile name. |
-| `-u`, `--username` | string | `None` | Docker registry username. |
-| `--password-stdin` | flag | `False` | Read the registry password from stdin. |
+| `server` | string (optional) | `None` | Registry authority or configured profile name; native transport requires a profile. |
+| `-u`, `--username` | string | `None` | Docker username, or the native package key's public UUID. |
+| `--password-stdin` | flag | `False` | Read the Docker password or complete native package key from stdin. |
 | `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `--namespace` | string | `None` | native credential namespace (defaults to profile namespace) |
 
 ## `palimpsest logout`
 
@@ -646,13 +651,14 @@ usage: palimpsest login [-h] [-u USERNAME] [--password-stdin] [--registry REGIST
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest logout [-h] [--registry REGISTRY] [server]
+usage: palimpsest logout [-h] [--registry REGISTRY] [--namespace NAMESPACE] [server]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `server` | string (optional) | `None` | Docker registry server or configured profile name. |
+| `server` | string (optional) | `None` | Registry authority or configured profile name; native transport requires a profile. |
 | `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `--namespace` | string | `None` | native credential namespace (defaults to profile namespace) |
 
 ## `palimpsest pull`
 
@@ -661,16 +667,17 @@ usage: palimpsest logout [-h] [--registry REGISTRY] [server]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] reference
+usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] [--output OUTPUT] reference
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `reference` | string | required | Docker image reference or ID. |
-| `-a`, `--all-tags` | flag | `False` | Operate on every tag; reference must be an untagged repository. |
+| `reference` | string | required | Docker image reference or native namespace/package tag or digest reference. |
+| `-a`, `--all-tags` | flag | `False` | OCI only: pull every tag of an untagged repository; native packages reject this option. |
 | `--platform` | string | `None` | Select an OCI platform. |
 | `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
 | `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `--output` | Path | `None` | native OCI-layout archive destination; never loads Docker |
 
 ## `palimpsest push`
 
@@ -679,16 +686,18 @@ usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest push [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] reference
+usage: palimpsest push [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY] [--input INPUT] [--manifest MANIFEST] reference
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `reference` | string | required | Docker image reference or ID. |
-| `-a`, `--all-tags` | flag | `False` | Operate on every tag; reference must be an untagged repository. |
+| `reference` | string | required | Docker image reference or native namespace/package tag reference. |
+| `-a`, `--all-tags` | flag | `False` | OCI only: push every tag of an untagged repository; native packages reject this option. |
 | `--platform` | string | `None` | Select an OCI platform. |
 | `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
 | `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `--input` | Path | `None` | native OCI layout directory or archive |
+| `--manifest` | string | `None` | native selected root SHA-256 (required for multiple roots) |
 
 ## `palimpsest tag`
 
@@ -1113,13 +1122,14 @@ usage: palimpsest commit [-h] --tag TAG name
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest ui [-h] [--port PORT] [--no-browser]
+usage: palimpsest ui [-h] [--port PORT] [--no-browser] [--allow-control]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--port` | int | `0` | UI listen port; 0 selects an available port. |
 | `--no-browser` | flag | `False` | Do not open the UI in a browser. |
+| `--allow-control` | flag | `False` | Enable dashboard VM, artifact, and storage changes; the default is read-only. |
 
 ## `palimpsest store`
 

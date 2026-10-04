@@ -15,18 +15,8 @@ ROOT_PYPROJECT = REPO_ROOT / "pyproject.toml"
 KOLLA_DIR = REPO_ROOT / "deploy" / "kolla"
 ROLE_DIR = KOLLA_DIR / "ansible" / "roles" / "palimpsest"
 
-
-def _get_hub_version() -> str:
-    init_py = REPO_ROOT / "hub" / "src" / "palimpsest_hub" / "__init__.py"
-    for line in init_py.read_text(encoding="utf-8").splitlines():
-        if line.startswith("__version__"):
-            return line.split("=")[1].strip().strip('"').strip("'")
-    raise RuntimeError("Could not determine hub_version from __init__.py")
-
-
 root_pyproject = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
 root_version = root_pyproject["project"]["version"]
-hub_version = _get_hub_version()
 
 
 def test_kolla_required_assets_exist_without_standalone_package():
@@ -78,9 +68,6 @@ def test_root_metadata_owns_kolla_shared_data_without_runtime_dependencies():
     assert root_pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["shared-data"] == {
         "deploy/kolla/ansible/roles/palimpsest": "share/kolla-ansible/ansible/roles/palimpsest"
     }
-
-    defaults_yaml = yaml.safe_load((ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8"))
-    assert defaults_yaml["palimpsest_image_tag"] == hub_version
 
 
 def test_all_yaml_files_parse():

@@ -109,6 +109,7 @@ DESCRIPTIONS = {
     "completion_record": "Persist the OCI exec completion record at this path.",
     "port": "UI listen port; 0 selects an available port.",
     "no_browser": "Do not open the UI in a browser.",
+    "allow_control": "Enable dashboard VM, artifact, and storage changes; the default is read-only.",
     "destination": "New local store path.",
     "keep_source": "Keep source bytes after moving the store.",
     "shell": "Shell completion target.",
@@ -116,6 +117,15 @@ DESCRIPTIONS = {
 
 
 PATH_DESCRIPTIONS = {
+    (("registry", "add"), "protocol"): "Select Docker/OCI Distribution or native Palimpsest package transport.",
+    (("login",), "server"): "Registry authority or configured profile name; native transport requires a profile.",
+    (("logout",), "server"): "Registry authority or configured profile name; native transport requires a profile.",
+    (("login",), "username"): "Docker username, or the native package key's public UUID.",
+    (("login",), "password_stdin"): "Read the Docker password or complete native package key from stdin.",
+    (("push",), "reference"): "Docker image reference or native namespace/package tag reference.",
+    (("pull",), "reference"): "Docker image reference or native namespace/package tag or digest reference.",
+    (("push",), "all_tags"): "OCI only: push every tag of an untagged repository; native packages reject this option.",
+    (("pull",), "all_tags"): "OCI only: pull every tag of an untagged repository; native packages reject this option.",
     (("image", "verify"), "path"): "Local image file whose bytes must match `--digest`.",
     (("image", "push"), "path"): "Local qcow2/raw cloud-image file to upload to Hub `/v1`.",
     (("oci", "init-runtime"), "path"): "Parent directory in which to create secured OCI runtime state.",

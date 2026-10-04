@@ -116,6 +116,58 @@ override for extraction and a sparse 8 GiB+1 byte member for offset and
 limit checks. Neither test reads or allocates an 8 GiB payload; an actual
 large-blob end-to-end import and crash-durability proof remain separate.
 
+## Extracted Hub tracking checklist
+
+For changes to `tracking/afterglow-palimpsest.json`, validate the real upstream
+checkout **and** existing executable consumer contracts. The reviewed baseline
+is Afterglow `main` commit `2862565c1f59eac0ef0904b97c905b177f12b335`; the
+scheduled workflow still follows moving `main`. `AFTERGLOW_MAIN_CHECKOUT` below
+must be the intended upstream `main` checkout, not the shared Afterglow `dev`
+worktree. Record its actual SHA in the validation receipt.
+
+From the Palimpsest repository root:
+
+```sh
+uv sync --frozen --extra dev
+uv run python scripts/check_afterglow_drift.py \
+  --upstream-root "$AFTERGLOW_MAIN_CHECKOUT" --local-root .
+uv run pytest -q tests/unit/test_afterglow_tracking.py \
+  tests/unit/test_hub_contract.py tests/unit/test_oci_layout.py
+```
+
+The first suite retains independent hash, required/forbidden-marker and
+absence-rule checker regressions. The preceding command checks the real
+manifest against the actual upstream and local source; it is not replaced by
+fixtures generated from the manifest's own expected markers. The obsolete
+`test_manifest_records_the_current_hub_protocol_gap` source-copy assertion is
+deleted, not repinned. Checker fixture inputs prove no HTTP or authentication
+behavior.
+
+In the separate Hub environment:
+
+```sh
+cd hub
+uv sync --frozen --extra dev
+uv run pytest -q tests/test_auth.py tests/test_upload_limits.py \
+  tests/test_hub_api.py
+```
+
+Existing behavioral selectors to retain include:
+
+- Client offset/range and transport: `tests/unit/test_hub_contract.py::test_push_reconciles_offset_conflict_and_finalizes_with_exact_offset`, `::test_pull_blob_resumes_only_from_exact_content_range`, `::test_hub_client_blocks_redirects`, and `::test_hub_client_redacts_tokens_on_error`.
+- Local strict importer: `tests/unit/test_oci_layout.py::test_extract_and_verify_bundle` and `::test_extract_bundle_security_rejections`.
+- Hub scope and creating user (paths below are relative to `hub/`): `tests/test_auth.py::test_require_token_missing_header_raises_401`, `::test_require_token_rejects_missing_project_scope`, `::test_project_header_is_assertion_not_rescope`; `tests/test_upload_limits.py::test_upload_sessions_are_project_bounded_and_released_on_abort`; `tests/test_hub_api.py::test_legacy_upload_remains_private_to_its_original_member` and `::test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_schema`.
+- Hub received-byte/parent chain: `tests/test_hub_api.py::test_finalize_rejects_declared_digest_mismatch_and_discards_bytes`, `::test_bundle_digest_mismatch_rejects_before_cas_publication`, `::test_parse_bundle_reconstructs_parent_chain_from_manifest_order`, `::test_parse_bundle_rejects_annotated_config_parent_that_contradicts_manifest_order`, and `::test_import_registers_the_whole_chain_with_its_declared_parents`.
+
+These HTTP/store/client fixtures do not authenticate against deployed Keystone
+or prove crash durability, native guest execution or production rollout.
+Afterglow BFF authentication and header-forwarding tests belong to Afterglow's
+own gate. Retain all existing full/package/image/native release requirements;
+this focused checklist does not replace them. The initial ownership-cutover
+edit did not dispatch CI or run native/deployment operations. Parent validation
+against actual Afterglow `main` and the retained client/Hub suites is recorded
+in `ARCHITECTURE.md`; hosted publication remains a separate gate.
+
 ## CLI reference and distribution checks
 
 For command documentation and packaging-only edits, use the focused contracts:
@@ -230,14 +282,16 @@ wave.
   pool of 20 hosted jobs and 5 macOS jobs, shared with sibling repositories.
   The following counts come from the workflow definitions, not from
   measurement:
-  - a `Test` run starts 15 hosted jobs, 4 of them macOS; the 3 aggregates
-    start later, so a run uses 18 hosted jobs in total (`kvm` is self-hosted);
-  - a `main`/`dev` push also starts `hub-docker.yml` `test` and
-    `development-package.yml` `verify`, so 17 hosted jobs start at once;
-  - a PR also starts `hub-docker.yml` `test`, so 16 start at once.
+  - under the 2026-09-27 cutover, a PR starts 15 hosted `Test` jobs
+    (4 macOS), followed by two portable aggregates; native is not a PR check;
+  - a trusted `main`/`dev` push adds one hosted native orchestrator and its
+    aggregate; Hub and development-package verification bring the initial
+    hosted job count to 18;
+  - a PR also starts `hub-docker.yml` `test`, for 16 initial hosted jobs.
 
-  Same-SHA dev and main pushes (17 + 17 jobs, 4 + 4 macOS) therefore still
-  queue behind each other, especially on the single KVM runner.
+  Same-SHA dev/main pushes still compete for hosted capacity. Native jobs
+  additionally serialize through the repository-wide `palimpsest-native-kvm`
+  concurrency group; environment review time is part of observed latency.
 - **Contract test.** `tests/unit/test_test_lanes.py` pins:
   - each portable matrix job exactly:
     - its job keys are `name`, `runs-on`, `strategy` and `steps`, so there is
@@ -254,11 +308,11 @@ wave.
     `permissions` and `jobs`, and that `permissions` is exactly
     `{contents: read}`, so there is no workflow `env`, `defaults` or write
     token;
-  - the aggregate check names, `if: always()` and their exact `needs`;
-  - each aggregate's single verdict step: its `env` maps every dependency to
-    `needs.<dep>.result` (and, for KVM, `vars.PALIMPSEST_KVM_ENABLED`), and
-    its `run` is the exact success-only script; neither the step nor its job
-    sets `shell`, `defaults` or `continue-on-error`;
+  - the aggregate check names and exact `needs`; portable aggregates use
+    `always()`, while native also requires the trusted repository/event/ref;
+  - verdict dependency environments and failure-bypass prevention. Native
+    verdicts run as actual shell commands over enabled/result combinations;
+    only enabled=`true` and result=`success` pass;
   - the exact job keys of every `test.yml` job, and the exact set of job
     ids, so a new job needs its own table entry. No job sets job-level
     `env`, `permissions` or `continue-on-error`; only the aggregates and
@@ -268,17 +322,14 @@ wave.
   - that no step in `test.yml` sets `shell` or `continue-on-error`, and that
     the only step-level `if` is `always()`, which never skips a step and is
     used by upload and cleanup steps. The `kvm` proof step is covered too;
-  - that no gate job sits in front of the test jobs, and that the only
-    job-level `if:` outside the aggregates is the `kvm` opt-in variable;
-  - that across all workflows the only jobs whose `runs-on` (string, list or
-    `group`/`labels` mapping; a missing `runs-on` counts as non-hosted) is
-    not in the exact hosted label list `ubuntu-latest`, `ubuntu-24.04`,
-    `macos-15` are `kvm` in `test.yml` and `kvm-proof` in `release.yml`. A
-    self-hosted runner can carry any label, `ubuntu-kvm` included, so a
-    prefix pattern is not a hosted check; adopt a new hosted image by adding
-    its exact label;
-  - that no job calls a reusable workflow (`uses:`). A caller of `test.yml`
-    would inherit the self-hosted `kvm` job under the caller's triggers;
+  - that no gate job sits in front of the test jobs; native's positive
+    repository/event/ref allowlist rejects PRs, forks, arbitrary branches,
+    and reusable invocation;
+  - that every workflow uses exact hosted labels `ubuntu-latest`,
+    `ubuntu-24.04`, or `macos-15`. Non-hosted exceptions are empty; runner
+    groups and missing labels are rejected too;
+  - that no job calls a reusable workflow (`uses:`); any new caller requires
+    a separate review of its trigger and credential boundary;
   - the exact `test.yml` triggers (`workflow_call`, and `push` and
     `pull_request` for `main`/`dev`, with no `pull_request_target`), and that
     `release.yml` runs only on `v*` tag pushes;
@@ -287,13 +338,12 @@ wave.
     `on`. Both run with the base repository's token and secrets even when a
     fork PR triggers them.
 
-  These pin the workflow shape only. `kvm` has no event gate yet, so
-  `pull_request` runs still reach the self-hosted runner. AGENTS.md rule 10
-  requires two layers: a YAML event gate that keeps `pull_request` runs off
-  the runner, and repository or organization settings as the backstop
-  against a PR that edits that gate. Adding the gate waits for an owner
-  decision, because `Required native KVM proof` and the exact `kvm` `if`
-  pin must change with it.
+  The approved cutover uses GitHub-hosted orchestration and a protected
+  environment, not a YAML-only defense around a persistent self-hosted runner.
+  Runner 21 remains stopped. Six hosted PR required checks are strict; native
+  success is required only on trusted dev/main pushes and release tags.
+  Worktree policy and manual proof are not evidence that an unpushed workflow
+  has run on GitHub. Publication still requires separate approval.
 
   Not pinned:
   - step contents of the non-matrix jobs (`checks`, `hub` and the proof
@@ -312,8 +362,9 @@ wave.
   - `--test-lane-shard` passed without the plugin is a usage error (exit 4).
 
   CI does not check per-shard counts, or whether the shards add up to the
-  portable total. This is a documented deviation from the shared CI rule 5
-  (see AGENTS.md), which asks CI to verify per-shard counts. The pinned shard
+  portable total. This is a documented deviation from the shared rule 5
+  (migrated to the [CI safety/performance spec](../openspec/specs/ci-safety-and-performance/spec.md)),
+  which asks CI to verify per-shard counts. The pinned shard
   command, the `commands()` argv test, and the disjoint-and-complete
   assignment tests cover only the wrapper risk that rule names: a `--shard`
   dropped before `test_lanes.py` would run the full suite in every shard, and
@@ -323,8 +374,8 @@ wave.
   its `Lane shard` line for 24 selected nodes, ran none, and exited 0. A
   run-time check of executed against selected counts would catch that;
   whether to add one is an owner decision.
-- **Rules for future CI changes.** Measurement and change rules are in the
-  `CI 파이프라인 성능 규정` section of [AGENTS.md](../AGENTS.md).
+- **Rules for future CI changes.** Measurement and change rules 1–12 are in
+  the [CI safety/performance spec](../openspec/specs/ci-safety-and-performance/spec.md), formerly the `AGENTS.md` CI section.
 
 The existing aggregate check names remain, and require every shard to succeed;
 a skipped or cancelled shard cannot satisfy them. Lint, manifest checks and
@@ -365,34 +416,77 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/usr/lib/python3/dist-packages:src \
 
 ### Required stage-1 GitHub KVM gate
 
-The reusable `Native KVM stage-1 proof` job is enabled only when repository
-variable `PALIMPSEST_KVM_ENABLED` is exactly `true` and requires runner labels
-`self-hosted`, `linux`, `x64`, and `kvm`. `Required native KVM proof` fails when
-the native job is skipped or fails; do not replace it with a portable or TCG
-result.
+`Test.kvm` runs on `ubuntu-24.04` only for repository
+`openstack-afterglow/palimpsest`, event `push`, ref `refs/heads/dev` or
+`refs/heads/main`, and `PALIMPSEST_KVM_ENABLED=true`. Its aggregate rejects
+disabled, failed, cancelled, skipped, and missing native outcomes. Release
+uses the same isolated proof for `v*` tags; PyPI and formal GitHub release
+publication require native success. Portable/TCG results are not substitutes.
 
-The current dedicated repository runner is `pieroot-server-palimpsest-kvm`
-(runner id `21`). It runs Actions runner `2.337.0` in persistent container
-`palimpsest-gh-runner` with restart policy `unless-stopped`. The container is
-not privileged, drops all capabilities before adding only `CHOWN`,
-`DAC_OVERRIDE`, and `FOWNER`, sets `no-new-privileges`, and has no Docker socket
-or host-home mount. Its writable runner-state volume is separate from a
-read-only kernel volume; `/dev/kvm` is the only host device. The root-owned
-mode-`0400`, single-link kernel/config digests are respectively
-`sha256:89f7d4f31f6ef77d0f8d45810de9e19e3f8dededf3dd6ebf89bb540d26d8c0fd`
-and `sha256:4d4aaaed367bd2fb6ed1238b94ea9bb095a5e5a0d0cc67d1cb70595643cc795a`.
-Changing the runner registration, capabilities, volumes, device, kernel pins,
-or repository variable is infrastructure mutation, not test setup.
+Both jobs use protected environment `palimpsest-native-kvm`, reviewer
+`jung-geun`, no admin bypass, and deployment policies for dev/main branches
+and v* tags. Their shared concurrency group has `cancel-in-progress: false`.
+The old `pieroot-server-palimpsest-kvm` runner (id21) stays stopped; the new
+VM is never registered as an Actions runner.
 
-Commit `785cd02c638a339acfab9c9f1a6bcb7e97683a5e` is qualified by `Test` run
-`35029001178` attempt 4 and reusable run `35029003724` attempts 4/5. Their
-native artifacts `10448739883` and `10448829655` each contain the exact 45-file
-evidence set and a `palimpsest.oci-stage1-kvm-proof.v20` receipt covering 44
-QEMU invocations and 43 executed boots. The repository is public and its
-current fork-workflow approval policy is `first_time_contributors`; persistent
-runner isolation does not eliminate the `/dev/kvm` or cross-job state risk.
-Changing that approval policy, stopping the runner, or disabling the variable
-requires an explicit security/availability decision.
+`scripts/run_native_kvm_openstack.py` authenticates with a restricted,
+30-day member-only application credential in project
+`53ec2dd9a1f7471fb6a2b174595fa232`. Standard `OS_AUTH_TYPE=v3applicationcredential`,
+`OS_AUTH_URL`, `OS_APPLICATION_CREDENTIAL_ID`, and
+`OS_APPLICATION_CREDENTIAL_SECRET` are protected environment secrets, not
+command arguments. The script verifies the project-scoped Cinder catalog,
+private image SHA-512, pinned flavor/network, console host key and KVM API12.
+It creates at most one 2-vCPU/8-GiB VM and one 20-GiB boot volume, with TCP22
+ingress restricted to the orchestrator's public IPv4 /32. Cloud and GitHub
+credentials are not forwarded to the guest.
+
+The guest consumes a SHA-256-pinned source tar and kernel/config pair:
+kernel `89f7d4f31f6ef77d0f8d45810de9e19e3f8dededf3dd6ebf89bb540d26d8c0fd`,
+config `4d4aaaed367bd2fb6ed1238b94ea9bb095a5e5a0d0cc67d1cb70595643cc795a`.
+CI downloads them only from configured HTTPS URLs and verifies both hashes;
+missing URLs fail closed. Manual proof may use already verified local files.
+A manual staged-candidate tar must include the staged bytes: an archive of
+HEAD alone does not qualify that candidate.
+
+Before native execution, the helper runs the complete privileged mounted
+filesystem gate, replays SquashFS in another process, compares the receipts,
+and retains EROFS evidence. The canonical native command remains
+`PALIMPSEST_REQUIRE_STAGE1_KVM=1 uv run python -m pytest -m stage1_kvm tests/kvm -vv`
+with the pinned kernel/config and evidence-directory environment. The stage-1
+receipt must cover 43 boots/44 QEMU invocations and its exact 45-file evidence
+set. Historical CI run `35029001178` and artifacts `10448739883`/`10448829655`
+qualified their historical commit, not this new helper or candidate.
+
+The 2026-09-27 isolated manual run `202609271/6` passed against candidate tar
+SHA-256 `88cd80c29c7bcba6a338df2bb3c2eebc5b452cea653a41885cd16d3a9ba0d30d`:
+43 boots, 44 QEMU invocations, all 45 stage-1 evidence files, mounted SquashFS
+and byte-identical independent replay, plus EROFS. Its stage-1 receipt SHA-256
+is `6e9ec697c8802cd9cefb9a3dc4f2a7180c276af101aefe34f78259eafc163e94`.
+The disposable guest uses standard `kvm` group membership with a fresh
+supplementary-group session; a transient device ACL had allowed the ioctl
+preflight but later QEMU failed with permission denied. Owned cleanup was
+verified. This is not a GitHub run: reviewed HTTPS kernel/config URLs and an
+approved push/tag remain prerequisites for the protected hosted job.
+
+Every successful create records ownership in private, atomic
+`resource-manifest.json` before continuing. A separate durable
+`resource-manifest.json.creation-intent.json` precedes cloud creation: if the
+primary manifest disappears afterward, cleanup fails closed rather than
+claiming that no resources were created. Both are retained as workflow artifacts.
+SIGINT/SIGTERM and the workflow's `always()` cleanup use that same manifest.
+Signals during teardown allow reclamation to finish but still fail the gate.
+Recovery discovers accepted-but-unreturned creates by exact owner identity,
+refuses collisions/foreign IDs, and verifies server/volume/port/SG/keypair absence.
+Cleanup failure fails the gate. After forced runner loss, use the surviving
+manifest with `python scripts/run_native_kvm_openstack.py cleanup --manifest
+<private-manifest>` and the same restricted credentials; never delete by a broad
+name prefix. Loss of both ownership files requires manual exact-owner recovery,
+not a claimed cleanup success. `cleanup_verified=true` is required in addition
+to native/filesystem receipts. The helper's 2700-second proof deadline has
+separate bounded evidence recovery and cleanup intervals. Failed proofs retain
+safely allowlisted partial captures without a success receipt. Unit ownership/
+signal regressions are classified in `core-cli`; they do not prove real cloud
+reachability or KVM behavior.
 
 Ordinary server lanes use `env -u PYTHONPATH`, `PYTHONDONTWRITEBYTECODE=1` and
 `umask 022`, as the previous full baseline did. Never run fixture mutations

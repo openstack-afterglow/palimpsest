@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "palimpsest-hub"
-version = "0.2.1"
+version = "0.3.0"
 description = "Dedicated Palimpsest Hub API, Glance export worker, and isolated build queue"
 requires-python = ">=3.12"
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
     "slowapi>=0.1.9",
     "sqlalchemy[asyncio]>=2.0.0",
     "uvicorn[standard]==0.39.0",
+    "zstandard>=0.23.0",
 ]
 
 [project.optional-dependencies]

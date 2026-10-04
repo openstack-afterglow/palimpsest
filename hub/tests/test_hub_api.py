@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import tarfile
 import time
 from pathlib import Path
@@ -28,7 +29,6 @@ from palimpsest_hub.api.hub import (
     finalize_upload,
     start_upload,
 )
-from palimpsest_hub.auth import get_token_info
 from palimpsest_hub.main import app
 from palimpsest_hub.models import (
     Base,
@@ -628,7 +628,7 @@ async def _import_bundle_over_http(payload: bytes):
     async def identity(request: Request):
         return {"project_id": "alpha", "user_id": "member"}
 
-    app.dependency_overrides[get_token_info] = identity
+    app.dependency_overrides[hub_api._legacy_writer] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             return await client.post("/v1/bundles/import", files={"file": ("bundle.tar.gz", payload)})
@@ -899,6 +899,118 @@ def test_discovery_and_health_endpoints():
     assert h_resp.json() == {"status": "ok"}
 
 
+def test_hub_log_configuration_limits_debug_to_hub_namespace(monkeypatch):
+    from palimpsest_hub.logging import configure_logging
+
+    hub_logger = logging.getLogger("palimpsest_hub")
+    access_logger = logging.getLogger("uvicorn.access")
+    sql_logger = logging.getLogger("sqlalchemy.engine")
+    previous = (
+        hub_logger.level,
+        hub_logger.propagate,
+        list(hub_logger.handlers),
+        access_logger.disabled,
+        sql_logger.level,
+    )
+    try:
+        monkeypatch.setenv("PALIMPSEST_HUB_LOG_LEVEL", "DEBUG")
+        configure_logging()
+        assert hub_logger.level == logging.DEBUG
+        assert hub_logger.propagate is False
+        assert access_logger.disabled is True
+        assert sql_logger.level == previous[4]
+        monkeypatch.setenv("PALIMPSEST_HUB_LOG_LEVEL", "INFO")
+        configure_logging()
+        assert hub_logger.level == logging.INFO
+    finally:
+        hub_logger.handlers = previous[2]
+        hub_logger.setLevel(previous[0])
+        hub_logger.propagate = previous[1]
+        access_logger.disabled = previous[3]
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_hub_request_logs_template_status_duration_without_secrets(level):
+    from palimpsest_hub.main import logger as request_logger
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Capture()
+    old_level = request_logger.level
+    request_logger.addHandler(handler)
+    request_logger.setLevel(level)
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/app/hub.js?token=secret-query-value",
+            headers={"X-Auth-Token": "secret-header-value"},
+        )
+        assert response.status_code == 200
+        missing = client.get("/unmatched/secret-path-value?password=secret-query-value")
+        assert missing.status_code == 404
+    finally:
+        request_logger.removeHandler(handler)
+        request_logger.setLevel(old_level)
+
+    lines = [record.getMessage() for record in records]
+    assert any("method=GET route=/app/{asset} status=200 duration_ms=" in line for line in lines)
+    assert any("method=GET route=<unmatched> status=404 duration_ms=" in line for line in lines)
+    if level == logging.INFO:
+        assert all(record.levelno == logging.INFO for record in records)
+    else:
+        assert any(
+            record.levelno == logging.DEBUG and "query_present=True query_bytes_bounded=" in record.getMessage()
+            for record in records
+        )
+    assert not any(
+        secret in line
+        for line in lines
+        for secret in ("secret-query-value", "secret-header-value", "secret-path-value", "password", "token=")
+    )
+
+
+@pytest.mark.asyncio
+async def test_hub_request_internal_error_does_not_log_exception_or_query():
+    from palimpsest_hub.main import log_request
+    from palimpsest_hub.main import logger as request_logger
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    old_level = request_logger.level
+    request_logger.addHandler(handler)
+    request_logger.setLevel(logging.DEBUG)
+
+    async def fail(_request):
+        raise RuntimeError("SQL bind=secret-bind-value; OpenStack token=secret-token-value")
+
+    try:
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/hidden",
+                "query_string": b"key=secret-query-value",
+                "headers": [],
+            }
+        )
+        response = await log_request(request, fail)
+    finally:
+        request_logger.removeHandler(handler)
+        request_logger.setLevel(old_level)
+    assert response.status_code == 500
+    assert any("route=<unmatched> status=500 duration_ms=" in record for record in records)
+    assert not any("secret-" in record or "SQL bind" in record for record in records)
+
+
 # ---------------------------------------------------------------------------
 # 4. Schema Models & Validation
 # ---------------------------------------------------------------------------
@@ -922,44 +1034,9 @@ def test_cloud_image_meta_resolves_media_type_by_disk_format():
     )
 
 
-def test_buildkit_cache_meta_resolves_dedicated_media_type():
-    chain_id = "sha256:" + "d" * 64
-    assert (
-        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id=chain_id).resolved_media_type()
-        == MEDIA_TYPE_BUILDKIT_CACHE
-    )
-    assert (
-        HubLayerMeta(
-            name="dockerfile-cache",
-            kind=KIND_BUILDKIT_CACHE,
-            chain_id=chain_id,
-            media_type=MEDIA_TYPE_BUILDKIT_CACHE,
-        ).resolved_media_type()
-        == MEDIA_TYPE_BUILDKIT_CACHE
-    )
-
-
-def test_buildkit_cache_requires_key_and_rejects_runtime_chain_fields():
-    with pytest.raises(ValueError, match="chain_id"):
-        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE)
-    with pytest.raises(ValueError, match="runtime parent/base"):
-        HubLayerMeta(
-            name="dockerfile-cache",
-            kind=KIND_BUILDKIT_CACHE,
-            chain_id="sha256:" + "d" * 64,
-            base_image_digest="sha256:" + "e" * 64,
-        )
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {
-            "name": "dockerfile-cache",
-            "kind": KIND_BUILDKIT_CACHE,
-            "chain_id": "sha256:" + "d" * 64,
-            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
-        },
         {
             "name": "runtime-layer",
             "kind": "squashfs",
@@ -972,17 +1049,21 @@ def test_buildkit_cache_requires_key_and_rejects_runtime_chain_fields():
             "arch": "x86_64",
             "media_type": MEDIA_TYPE_BUILDKIT_CACHE,
         },
-        {
-            "name": "dockerfile-cache",
-            "kind": KIND_BUILDKIT_CACHE,
-            "chain_id": "sha256:" + "d" * 64,
-            "media_type": "application/octet-stream",
-        },
     ],
 )
 def test_layer_meta_rejects_unsupported_or_kind_inconsistent_media_type(kwargs: dict):
     with pytest.raises(ValueError, match="media_type"):
         HubLayerMeta(**kwargs)
+
+
+@pytest.mark.parametrize("media_type", [MEDIA_TYPE_BUILDKIT_CACHE, MEDIA_TYPE_LAYER_SQUASHFS, None])
+def test_unqualified_buildkit_cache_registration_is_retired(media_type: str | None):
+    # Mandatory BuildKit cache now has only project/package/key-bound uploads;
+    # the retired cache media type itself is no longer an accepted legacy type.
+    with pytest.raises(ValueError, match="legacy cache registration is retired|media_type"):
+        HubLayerMeta(
+            name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id="sha256:" + "d" * 64, media_type=media_type
+        )
 
 
 def test_cloud_image_requires_disk_format():
@@ -1043,61 +1124,6 @@ def test_buildkit_cache_download_filename_uses_tar_extension():
     )
 
     assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
-
-
-@pytest.mark.asyncio
-async def test_finalize_buildkit_cache_stores_dedicated_media_type(
-    store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch
-):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr("palimpsest_hub.api.hub.get_session_factory", lambda: factory)
-    monkeypatch.setattr("palimpsest_hub.api.hub.get_blob_store", lambda: store)
-
-    payload = b"portable buildkit local cache tar"
-    digest = _sha256(payload)
-    token_info = {
-        "project_id": "project-1",
-        "user_id": "user-1",
-        "is_system_admin": False,
-    }
-    started = await start_upload(HubUploadStartRequest(digest=digest), token_info)
-    session_id = started["session_id"]
-    assert session_id is not None
-
-    store.upload_path(session_id).write_bytes(payload)
-    async with factory() as session:
-        upload = await session.get(PalimpsestHubUpload, session_id)
-        assert upload is not None
-        upload.received_bytes = len(payload)
-        await session.commit()
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "PUT",
-            "path": f"/v1/uploads/{session_id}",
-            "headers": [(b"upload-offset", str(len(payload)).encode())],
-        }
-    )
-    chain_id = "sha256:" + "d" * 64
-    await finalize_upload(
-        session_id,
-        HubLayerMeta(name="dockerfile-cache", kind=KIND_BUILDKIT_CACHE, chain_id=chain_id),
-        request,
-        token_info,
-    )
-
-    async with factory() as session:
-        row = (await session.execute(select(PalimpsestHubLayer))).scalar_one()
-        assert row.kind == KIND_BUILDKIT_CACHE
-        assert row.media_type == MEDIA_TYPE_BUILDKIT_CACHE
-        assert row.chain_id == chain_id
-        assert row.config_json["kind"] == KIND_BUILDKIT_CACHE
-        assert hub_api._hub_blob_filename(row) == "dockerfile-cache.tar"
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1486,3 +1512,125 @@ async def test_export_ticket_records_original_absolute_deadline(monkeypatch: pyt
     assert issued.headers["cache-control"] == "no-store"
     assert captured["ttl"] == 60
     assert before + 60 <= captured["payload"]["expires_at"] <= int(time.time()) + 60
+
+
+def test_changed_publication_source_cannot_create_misaddressed_cas_bytes(store: LocalPathBlobStore):
+    source = store.root / "staged"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"original")
+    inspected = store.inspect_file(source, max_bytes=1024)
+    source.write_bytes(b"modified")
+    with pytest.raises(HubDigestMismatch):
+        store.publish_verified(source, inspected)
+    assert source.read_bytes() == b"modified"
+    assert not store.exists(inspected.blob_digest)
+
+
+def test_failed_shared_blob_repair_does_not_unlink_preexisting_bytes(store: LocalPathBlobStore):
+    source = store.root / "staged"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"verified original")
+    inspected = store.inspect_file(source, max_bytes=1024)
+    target = store.blob_path(inspected.blob_digest)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"preexisting bytes retained for diagnosis")
+    source.unlink()
+    with pytest.raises(FileNotFoundError):
+        store.publish_verified(source, inspected)
+    assert target.read_bytes() == b"preexisting bytes retained for diagnosis"
+
+
+@pytest.mark.asyncio
+async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_schema(tmp_path: Path, monkeypatch):
+    from sqlalchemy import MetaData, String
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy-case.sqlite'}")
+    metadata = MetaData()
+    for table in Base.metadata.sorted_tables:
+        table.to_metadata(metadata)
+    for name in ("palimpsest_hub_layers", "palimpsest_hub_layer_access"):
+        metadata.tables[name].c.project_id.type = String(64, collation="NOCASE")
+    async with engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "cas")
+    payload = b"case-bound private bytes"
+    digest = _put_blob(store, payload)
+    async with factory() as session:
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=digest,
+                size_bytes=len(payload),
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                config_digest=_sha256(b"config"),
+                name="private",
+                kind="squashfs",
+                config_json={},
+                project_id="Project-A",
+                is_published=False,
+            )
+        )
+        session.add(PalimpsestHubLayerAccess(blob_digest=digest, project_id="Granted-A"))
+        await session.commit()
+    monkeypatch.setattr(hub_api, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(hub_api, "get_blob_store", lambda: store)
+
+    async def identity(request: Request):
+        return {"project_id": request.headers["x-project-id"], "user_id": "member"}
+
+    app.dependency_overrides[hub_api.get_token_info] = identity
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for project in ("Project-A", "Granted-A"):
+                allowed = await client.get(f"/v1/layers/{digest}/blob", headers={"X-Project-Id": project})
+                assert allowed.status_code == 200 and allowed.content == payload
+            for project in ("project-a", "granted-a"):
+                headers = {"X-Project-Id": project}
+                assert (await client.get("/v1/layers", headers=headers)).json() == []
+                assert (await client.get(f"/v1/layers/{digest}/blob", headers=headers)).status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+def test_package_error_request_identity_is_server_generated_and_no_store():
+    client = TestClient(app)
+    response = client.post(
+        "/v1/projects/alpha/uploads",
+        params={"package": "test"},
+        json={},
+        headers={"X-Request-Id": "untrusted-request-value"},
+    )
+    assert response.status_code == 401
+    identity = response.json()["error"]["request_id"]
+    assert UUID(identity).hex == identity and identity != "untrusted-request-value"
+    assert response.headers["x-request-id"] == identity
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_legacy_upload_remains_private_to_its_original_member(tmp_path: Path, store, monkeypatch):
+    engine, factory = await _prepared_hub(tmp_path, "upload-owner.sqlite", store, monkeypatch)
+    upload_id = "f" * 32
+    store.start_upload(upload_id)
+    async with factory() as session:
+        session.add(PalimpsestHubUpload(id=upload_id, project_id="shared-project", created_by="owner"))
+        await session.commit()
+
+    async def identity(request: Request):
+        return {"project_id": "shared-project", "user_id": request.headers["x-owner"]}
+
+    app.dependency_overrides[hub_api._legacy_writer] = identity
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            owner = await client.get(f"/v1/uploads/{upload_id}", headers={"X-Owner": "owner"})
+            assert owner.status_code == 200 and owner.json()["session_id"] == upload_id
+            other = {"X-Owner": "another-member"}
+            assert (await client.get(f"/v1/uploads/{upload_id}", headers=other)).status_code == 404
+            assert (await client.delete(f"/v1/uploads/{upload_id}", headers=other)).status_code == 404
+            assert store.upload_path(upload_id).exists()
+            async with factory() as session:
+                assert (await session.get(PalimpsestHubUpload, upload_id)).created_by == "owner"
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()

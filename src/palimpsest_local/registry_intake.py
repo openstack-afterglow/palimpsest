@@ -15,7 +15,7 @@ from pathlib import Path
 from .errors import PalimpsestError
 from .oci_image import OCIImageRef
 from .oci_source import LocalArchiveSource, SourceCAS
-from .registry import default_registry_config, resolve_image_reference
+from .registry import RegistryProfile, add_profile, default_registry_config, normalize_endpoint, resolve_image_reference
 from .state import StatePaths
 
 SUPPORTED_PLATFORM = "linux/amd64"
@@ -63,7 +63,13 @@ def resolve_anonymous_reference(reference: str):
     if not isinstance(reference, str) or not _has_explicit_registry(reference):
         raise RegistryIntakeError("OCI registry pull requires a fully qualified registry/repository reference")
     try:
-        return resolve_image_reference(reference, default_registry_config())
+        # Anonymous intake is genuine OCI /v2 transport only; bind its explicit
+        # authority as an ephemeral OCI profile rather than consulting native profiles.
+        config = default_registry_config()
+        authority = normalize_endpoint(reference.partition("@")[0].split("/", 1)[0])
+        if all(profile.endpoint != authority for profile in config.registries.values()):
+            config = add_profile(config, RegistryProfile(alias="anonymous", endpoint=authority))
+        return resolve_image_reference(reference, config)
     except PalimpsestError as exc:
         raise RegistryIntakeError(str(exc)) from None
 

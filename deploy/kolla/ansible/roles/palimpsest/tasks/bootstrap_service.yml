@@ -5,9 +5,9 @@
     name: "{{ palimpsest_api_image_ref }}"
     source: pull
     force_source: "{{ palimpsest_image_tag == 'latest' }}"
-  run_once: true
-  delegate_to: "{{ groups['palimpsest'] | first }}"
-  when: not (palimpsest_source_mode | default(false) | bool)
+  when:
+    - inventory_hostname in groups['palimpsest']
+    - not (palimpsest_source_mode | default(false) | bool)
 
 - name: Bootstrap | Set Hub volume owner to image runtime user
   become: true
@@ -23,8 +23,7 @@
     network_mode: none
     volumes:
       - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-  run_once: true
-  delegate_to: "{{ groups['palimpsest'] | first }}"
+  when: inventory_hostname in groups['palimpsest']
 
 - name: Bootstrap | Run Palimpsest Hub bootstrap
   become: true
