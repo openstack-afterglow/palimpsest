@@ -8,7 +8,7 @@ It does not use a repository checkout as the user installation mechanism.
 Palimpsest Local requires Python 3.11 or newer. The root distribution
 [`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
 is published on PyPI. The independently versioned Hub distribution is
-`palimpsest-hub 0.3.0` in this tree; this source version is not a PyPI release.
+`palimpsest-hub 0.3.1` in this tree; this source version is not a PyPI release.
 Git and outbound HTTPS access to GitHub
 are required only for the direct VCS installation examples below.
 
@@ -17,8 +17,8 @@ then run `palimpsest --version`. The isolated invocation
 `uvx --from palimpsest-client==0.2.3 palimpsest --version` was verified against
 the published wheel and reports `0.2.3`.
 
-The current checkout prepares root `palimpsest-client 0.3.0`, which is not
-published by these commands. The Hub 0.3.0 package registry and retained closed-transport pool recovery are
+The current checkout prepares root `palimpsest-client 0.3.1`, which is not
+published by these commands. The Hub 0.3.1 package registry and retained closed-transport pool recovery are
 separate source; update both reviewed Kolla API and worker image digests to
 deploy it, rather than assuming a root wheel upgrade updates running services.
 
@@ -41,12 +41,12 @@ Use the same reviewed Git ref for Local and Hub to prevent source skew.
 The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
 under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
 Kolla-Ansible, Ansible, Hub, or their runtime dependencies; deployments pin
-Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.0`,
+Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.1`,
 while source builds bind to the configured reviewed checkout commit SHA. Verify both
-`0.3.0` Hub images are published before deploying this default; source metadata
+`0.3.1` Hub images are published before deploying this default; source metadata
 alone does not establish image availability.
 
-The role's release candidate matches the Hub 0.3.0 source. Operators deploying
+The role's release candidate matches the Hub 0.3.1 source. Operators deploying
 the package registry or closed-connection fix must verify reviewed API/worker
 image digests in Kolla globals; a Python update does not change running containers.
 
@@ -724,7 +724,7 @@ Repository contributors can build the sdist/wheel and run the isolated package
 smoke from a trusted checkout:
 
 ```sh
-uv run python scripts/build_package.py --out-dir dist/package-0.3.0
+uv run python scripts/build_package.py --out-dir dist/package-0.3.1
 ```
 
 This maintainer workflow is not the user installation path. Its local package

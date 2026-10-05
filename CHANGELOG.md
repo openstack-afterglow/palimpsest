@@ -2,6 +2,14 @@
 
 All notable changes to Palimpsest Local are documented here.
 
+## [0.3.1] - 2026-10-05 (candidate, unpublished)
+
+- Prepare root `palimpsest-client`, independent `palimpsest-hub`, their module versions/lockfile entries and packaged Kolla image-tag default at 0.3.1. Preserve dependency resolution, native stage-1 binary/protocol, runtime and Afterglow tracking baseline. This patch preparation supersedes the 0.3.0 candidate metadata below; it does not claim a formal 0.3.0 release.
+- Fix the oversized partial-native-evidence test fixture to supply its declared regular-file payload to `TarFile.addfile`. Final Python 3.13 portable verification exposed the missing file object before the production archive validator was reached. The fixture now exercises the intended oversized rejection without changing acquisition, extraction policy or native receipts.
+- Diagnose actual main native run `37185453150`, job `111386304833`, step 7: both pinned acquisition URL inputs were empty and the HTTPS guard failed before either download. Read-only repository/environment inspection confirms the two URL variables are absent. No source defect or network/checksum failure is established. Exact pinned kernel/config hosting and owner-authorized variable configuration are blocked prerequisites; retain both hashes, HTTPS enforcement and required native gate without replacement/fallback.
+- Document effective strict dev required checks, separate release-native owner approval, root-only PyPI/GitHub publication, and separate Hub API/worker image publication. Stable semver tags also update `latest` through metadata-action defaults; GHCR's existing own-Hub-test-only gate is not native success. No push, tag, environment approval/configuration, publication or rollout is performed by this preparation.
+- Keep Kolla source mode pinned to separately reviewed immutable `c4887f7806608e98f215abbd377d2eafe159ff76` (Hub 0.3.0), not the uncommitted candidate. Source-mode 0.3.1 deployment requires the separately reviewed committed candidate SHA; image-mode deployment requires both published 0.3.1 image digests. See [release gates and failure evidence](docs/testing.md#release-preparation-and-publication-gates).
+
 ## [0.3.0] - 2026-10-02 (candidate, unpublished)
 
 Root `palimpsest-client` and independently packaged `palimpsest-hub` both prepare 0.3.0 for the native project-package registry. This supersedes the unpublished root 0.2.4 preparation; the Kolla image-tag candidate also becomes 0.3.0 and its immutable source default points at the reviewed candidate commit. Verify both image publications before deployment. No tag, PyPI release, GHCR publication or deployment is claimed.

@@ -1,6 +1,6 @@
 # Palimpsest Local
 
-`palimpsest-client` 0.3.0 is the prepared, unpublished root Python 3.11+
+`palimpsest-client` 0.3.1 is the prepared, unpublished root Python 3.11+
 distribution for managing Palimpsest boot images, SquashFS layers, OCI-layout
 bundles, and local layered virtual machines. The Python module remains
 `palimpsest_local` and the CLI remains `palimpsest`. Local artifacts, tags,
@@ -13,7 +13,7 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The 0.3.0 client/package-registry candidate is not yet published; the independently versioned Hub source and Kolla image-tag candidate both prepare 0.3.0. Verify release image publication before deployment. A root wheel update never deploys the Hub.
+- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The 0.3.1 client/package-registry candidate is not yet published; the independently versioned Hub source and Kolla image-tag candidate both prepare 0.3.1. SHA-specific 0.3.0 development packages are not a formal release. Verify release image publication before deployment. A root wheel update never deploys the Hub.
 
 ## Install from PyPI
 
@@ -26,8 +26,8 @@ palimpsest --version
 
 For an isolated one-off invocation, `uvx --from palimpsest-client==0.2.3 palimpsest --version` also reports `0.2.3`.
 
-The published commands above install 0.2.3, not the untagged 0.3.0 checkout.
-The Hub 0.3.0 package registry and retained closed-transport pool fix are separate source and must
+The published commands above install 0.2.3, not the untagged 0.3.1 checkout.
+The Hub 0.3.1 package registry and retained closed-transport pool fix are separate source and must
 be deployed as reviewed API and worker images; updating the root wheel alone
 does not update running Kolla containers.
 
@@ -126,7 +126,7 @@ the end-user installation path.
 The root wheel also ships the `palimpsest` Kolla-Ansible role at
 `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
 Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
-Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.0`,
+Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.1`,
 while source builds use the configured reviewed immutable checkout SHA. Verify
 both Hub images are published before deployment; the root package version does not automatically
 set the independent Hub Python distribution version.
