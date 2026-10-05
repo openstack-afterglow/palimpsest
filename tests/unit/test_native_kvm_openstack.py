@@ -1547,7 +1547,7 @@ def test_partial_evidence_rejects_unsafe_archive_before_publishing_captures(tmp_
             bad.size = 16 * 1024 * 1024 + 1
         else:
             bad.name = good.name
-        archive.addfile(bad)
+        archive.addfile(bad, io.BytesIO(b"\0" * bad.size))
     bundle = tmp_path / "bundle.tar"
     bundle.write_bytes(buffer.getvalue())
     evidence = tmp_path / "evidence"

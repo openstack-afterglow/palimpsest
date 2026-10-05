@@ -448,6 +448,7 @@ missing URLs fail closed. Manual proof may use already verified local files.
 A manual staged-candidate tar must include the staged bytes: an archive of
 HEAD alone does not qualify that candidate.
 
+
 Before native execution, the helper runs the complete privileged mounted
 filesystem gate, replays SquashFS in another process, compares the receipts,
 and retains EROFS evidence. The canonical native command remains
@@ -527,6 +528,123 @@ inactive domains and seven archives, with no active QEMU. See
 artifact digests, evidence paths, the preserved pre-Gate-1 wrapper failure and
 the explicit non-claims. This is executed product-gate evidence, not permission
 to implicitly enable either special lane in portable selection.
+
+### Release preparation and publication gates
+
+The 2026-10-05 patch candidate is root/Hub/Kolla image-tag **0.3.1**;
+`v0.3.1` was absent from origin at preparation. No push, tag, native approval,
+publication or deployment is authorized by local release preparation.
+
+Actual `Test` run [37185453150](https://github.com/openstack-afterglow/palimpsest/actions/runs/37185453150)
+at main `6f21ef56da17416021c74230302eba2dc4c9c360` failed native job
+`111386304833`, step 7, before either `curl`: **both `KERNEL_URL` and
+`CONFIG_URL` were empty**, then the HTTPS guard emitted `Kernel and config
+require HTTPS URLs` and exited 1. The required native aggregate also failed.
+This is missing acquisition configuration, not evidence of a network failure,
+checksum mismatch, or guest failure; the failed run was not rerun to confirm it.
+
+Read-only configuration inspection found repository variable
+`PALIMPSEST_KVM_ENABLED=true`, and only project/image/flavor/network variables
+in `palimpsest-native-kvm`. Both native workflows bind
+`vars.PALIMPSEST_NATIVE_KERNEL_URL` and
+`vars.PALIMPSEST_NATIVE_KERNEL_CONFIG_URL`; neither variable was configured.
+The historical verified pair is `kernel-6.6.71.bzImage` and
+`kernel-6.6.71.config` under `/home/pieroot/palimpsest-kvm-evidence`, with
+the hashes above. A paginated read-only release-asset search found no
+published matching kernel/config filenames or pinned digests. The reachable
+remediation is owner-authorized provision of HTTPS locations for those **exact
+verified bytes**, followed by configuration of those two variables. Recovering
+and publishing that pair and changing GitHub configuration remain prerequisites,
+not source fixes. Do not replace the kernel, weaken HTTPS/hash verification,
+add fallback/retries, or skip the native gate to conceal missing inputs.
+
+Additional read-only recovery on 2026-10-05 reached the configured
+`pieroot-server` SSH host (port 18209) and SHA-256-checked both current files
+at that exact directory: both **match the workflow pins above**. `stat`
+reports regular, single-link `pieroot:pieroot` files, mode `0400`, with
+kernel size 11,535,360 bytes and config size 136,357 bytes. This establishes
+the actual existing source pair, not an inferred filename-to-hash binding.
+No bytes were transferred/published and no remote configuration changed.
+The remaining prerequisite is explicit owner approval of an HTTPS serving
+location and the two GitHub variable writes; existing public release assets
+did not provide a matching serving URL.
+Read-only route inspection of the existing TLS ingress configuration found no
+Palimpsest/kernel/fixture route or backend; its mounted S3 certificate filenames
+alone do not establish a serving path. No approved matching HTTPS pair was
+located in the examined ingress or published release records. This is not
+permission to alter shared ingress, start a new server, or publish bytes.
+
+
+
+Before publication:
+
+- Follow the normal PR path to dev and satisfy its effective strict ruleset
+  (`24071416`): `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`,
+  `Hub tests, lint, and build`, `OCI filesystem proof (privileged Linux)`,
+  `Local OCI image product build`, and `Guest stage-1 binary (Linux x86_64)`.
+  Branch-protection API returned 404, but that does not remove ruleset checks;
+  do not bypass them. Keep portable/native skip receipts distinct.
+- A future release tag triggers its **own** protected `palimpsest-native-kvm`
+  job. It needs separate owner approval for that exact release workflow/ref;
+  a branch-run approval is not standing release approval. Never approve using
+  the logged-in reviewer account on the owner's behalf. Keep runner21 stopped.
+- `release.yml` publishes only the root wheel/sdist: rebuild/verify and native
+  proof must both succeed before PyPI (`pypi` trusted publisher), then formal
+  GitHub release. The independently versioned Hub wheel is not published there.
+- `hub-docker.yml` builds separate API and worker targets. A stable `v0.3.1`
+  tag selects `0.3.1`, `v0.3.1`, `sha-…` **and `latest`** for both images:
+  metadata-action's [default `latest=auto` semver flavor](https://github.com/docker/metadata-action/tree/v5#latest-tag)
+  adds `latest`, independently of the explicit main-branch `latest` rule.
+  Dev pushes select `dev`/`sha-…`; main selects `latest`/`sha-…`.
+  This workflow waits only for its own Hub tests, not the native release gate;
+  its existing publication exception is unchanged. Obtain explicit publication
+  approval before any push/tag and verify both image digests/revision/platforms
+  before deployment. Do not equate a tag-triggered GHCR upload with a passed
+  native proof or root release.
+- Kolla's source-build default remains the separately reviewed immutable
+  `c4887f7806608e98f215abbd377d2eafe159ff76` (Hub 0.3.0 source), not this
+  uncommitted 0.3.1 candidate. To deploy the candidate from source, pin its
+  separately reviewed committed SHA; do not invent a circular self-pin.
+  Root package installation alone does not replace running API/worker images.
+
+#### Local 0.3.1 verification evidence
+
+Final reviewed working source digest:
+`ea24a472d94ebbbad1e71262140a812a526ac91759b5c0260c6f0b109c19b3a0`
+(441 files). These receipts are local candidate verification, not new GitHub
+required-check results, publication, native proof or Kolla deployment.
+
+| Final command or exercised path | Observed result |
+| --- | --- |
+| `uv run python scripts/test_lanes.py run full` (Python 3.13.12) | 6,165 passed, 260 skipped, 7 warnings; 178.84 s |
+| `uv run python scripts/test_lanes.py run portable` (Python 3.13.12) | 6,130 passed, 217 skipped, 7 warnings; 162.02 s; 6,347 selected nodes |
+| Oversized partial-evidence fixture regression, all five unsafe cases | 5 passed; 0.14 s |
+| Hub separate Python 3.12 environment, `uv run python -m pytest -q` | 215 passed; 15.24 s |
+| Root and Hub `ruff check .` / `ruff format --check .` | Passed; 371 root and 37 Hub formatted files |
+| CLI version, generated reference, lane manifest, architecture guard | `0.3.1`; current reference; valid manifest; matching digest above |
+| Canonical `scripts/build_package.py` | Built root sdist, rebuilt wheel from it, verified packaged stage-1 bytes, isolated no-deps/no-index wheel and uv-tool installs; CLI version/help passed |
+| Root minimum Python 3.11.15 isolated wheel | Metadata/module/imports and CLI report `0.3.1` |
+| Hub wheel and sdist, separately installed into isolated Python 3.12 environments | Metadata/module `0.3.1`; API, export-worker and build-worker imports passed |
+| Canonical `docker/hub/Dockerfile` API and worker targets, `linux/arm64` and `linux/amd64` | Both built; changed frozen-sync stage executed; network-disabled runs report `aarch64` / `x86_64`, Hub `0.3.1`, successful imports |
+| Actual isolated-wheel Uvicorn HTTP | Health 200; root and `/v1/` discovery 200 (`v1.0`, `CURRENT`); missing-token and project-header-only legacy calls 401; package project-context header-only call 401 `UNAUTHORIZED` |
+| Actual built API HTTP, both image architectures | Startup complete; health/discovery 200; project-header-only 401 on both, missing-token 401 on amd64 |
+
+The earlier Python 3.13 portable run failed before archive validation:
+1 failed, 6,129 passed, 217 skipped, 7 warnings. Its oversized fixture declared
+16 MiB + 1 regular-file bytes but supplied no file object to `TarFile.addfile`.
+The one-line test-only correction supplies those bytes; extraction/acquisition
+policy and all native pins/binaries/receipts remain unchanged. Final lanes above
+were run after that correction, not merely rerun to confirm the known failure.
+
+Skipped native/platform/opt-in proofs remain **unqualified**, not native passes.
+The seven warnings in each root lane are Python fork-from-multithreaded-process
+deprecations; they were not suppressed. Runtime smokes used no replacement
+dependencies or auth mocks: DB/Redis/Keystone endpoints were deliberately
+unreachable loopback addresses, and these health/discovery/missing-token routes
+do not call them. Thus these observations do not establish backend health,
+authenticated cloud behavior, migrations, export execution or Kolla readiness.
+All exact-owned ephemeral API containers and the wheel smoke server were stopped;
+no shared fixtures, persistent data, production services or runner21 were touched.
 
 ## When to broaden verification
 
