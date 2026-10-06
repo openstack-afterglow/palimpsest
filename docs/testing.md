@@ -607,6 +607,20 @@ Before publication:
   separately reviewed committed SHA; do not invent a circular self-pin.
   Root package installation alone does not replace running API/worker images.
 
+#### Pending-change source review — 2026-10-06
+
+The source review includes the pending host-share lifecycle and SYSTEM direct-Nova operator scripts, not only release metadata. Regression coverage binds relocated projects to their absolute applied source policy, preflights the recorded virtiofsd before ordinary stopped-service starts, rejects writable exports of immutable attached artifacts, and preserves ownership/freshness/partial-cleanup receipts. Public endpoint tests run actual Ansible Core 2.19 playbooks against the role defaults and both real guard tasks. Folded `{{ }}` templates use one physical backslash in regex anchors/backreferences because Ansible pre-escapes those literals; ordinary assert expressions retain their separate conditional escaping rules. Existing explicit-hostname policy and exposure opt-in remain unchanged.
+
+The initial full run exposed five FQDN literal-escaping failures plus one applied-share fixture missing immutable artifact-path identities. Correcting those produced a local full regression of 6,385 passed/261 skipped; opt-in skips are not native qualification. Root and separate Hub lint/format, generated CLI/fixture and lane checks passed; the Hub suite passed 215 tests. Root isolated sdist-to-wheel and CLI installs passed. The final committed scope still requires the normal six strict PR contexts and separate protected exact-ref release-native approval; local receipts never replace them.
+
+Separate actual loopback TCP Hub package-router smoke passed five scenarios using real isolated SQLite/CAS and synthetic original-token/member/owner identity: complete OCI graph/archive/ranged download, exact project/package/key/session scope, key revocation and membership removal during transfer, and offset recovery with new-key resume refusal. This is authenticated package API behavior, not a live Keystone or KVM proof. Installed openstacksdk 3.3.0 `Port.existing` resource smoke separately accepted enabled security and rejected disabled/omitted API fields.
+
+Canonical API and worker Docker targets built for amd64/arm64; both workers reported Hub 0.3.1 and imported API/export/build-worker modules. Both actual API containers returned health/discovery 200 and missing-token/project-header-only 401 with synthetic required settings. No DB/Redis/Keystone connection was established, and exact-owned smoke containers were stopped. The isolated network-none BuildKit product proof passed two cases and its own builder was removed.
+
+Strict privileged Linux filesystem proof retained the first environment failures: Debian's EROFS CLI was incompatible with the pinned comparison and the isolated `-I` worker could not use a PYTHONPATH-only installation. Re-running with the actual installed root package and canonical Ubuntu 24.04 prerequisites, without relaxing `PALIMPSEST_REQUIRE_OCI_FS=1`, passed all four filesystem cases; a second process passed the selected SquashFS case and byte-identical evidence comparison. These container filesystem semantics do not establish native x86 KVM, guest compatibility or production acceptance.
+
+The exact pinned kernel/config HTTPS URL bindings and protected native approval remain separately required. No stable 0.3.1 tag, PyPI release, production mutation or native-gate bypass is implied by this candidate review.
+
 #### Local 0.3.1 verification evidence
 
 Final reviewed working source digest:

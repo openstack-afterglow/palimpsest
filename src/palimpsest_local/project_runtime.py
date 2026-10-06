@@ -18,7 +18,7 @@ import json
 import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -825,11 +825,12 @@ def _prepare_actions(
 ) -> tuple[PreparedService, ...]:
     prepared: list[PreparedService] = []
     for plan in plans:
-        if plan.action == "noop":
-            continue
         service = project.services[plan.service]
-        resolved = None if plan.preserve_config else callbacks.resolve(project, service, plan.run_name)
-        prepared.append(PreparedService(project, service, plan, resolved))
+        if plan.action == "noop":
+            prepared.append(PreparedService(project, service, replace(plan, preserve_config=True), None))
+        else:
+            resolved = None if plan.preserve_config else callbacks.resolve(project, service, plan.run_name)
+            prepared.append(PreparedService(project, service, plan, resolved))
     if not prepared:
         return ()
     current_inputs = [item for item in prepared if not item.plan.preserve_config]
@@ -847,7 +848,7 @@ def _prepare_actions(
                 f"{port.service!r} is unavailable"
             )
     callbacks.preflight(tuple(prepared))
-    return tuple(prepared)
+    return tuple(item for item in prepared if item.plan.action != "noop")
 
 
 def up_project(

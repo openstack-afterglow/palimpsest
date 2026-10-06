@@ -56,6 +56,35 @@ start. Database/bootstrap initialization remains a single operation on the
 first host; a local Docker volume is not shared across hosts. Existing blob
 subdirectories are not recursively changed.
 
+For an operator-owned public Hub URL, configure the HTTPS origin and explicitly
+enable public HAProxy exposure:
+
+```yaml
+palimpsest_public_endpoint_url: "https://palimpsest.dmslab.re.kr"
+palimpsest_public_haproxy_enabled: true
+```
+
+The role derives `palimpsest_public_haproxy_fqdn` only from an exact HTTPS
+hostname origin, with an optional single trailing slash. Ports (even `:443`),
+paths, queries, fragments, credentials, whitespace and non-HTTPS URLs derive
+an empty hostname and disable public routing, including in HAProxy-only plays.
+The default `https://<kolla_external_fqdn>:8020` cannot claim the main host.
+Explicit hostname overrides remain supported and must match the origin at
+precheck; they do not implicitly enable exposure. DNS and Kolla external
+TLS/certificate setup remain operator prerequisites. The internal VIP endpoint
+and private listen port are unchanged.
+
+With the corresponding updated Afterglow role, this explicit endpoint defaults
+`afterglow_service_palimpsest_internal_url` and is emitted as
+`[services] palimpsest_internal_url` in its generated configuration. A separate
+trusted HTTPS transport URL can override the Afterglow variable. Unset/empty
+values preserve detailed Afterglow operator TOML, not a catalog fallback.
+`palimpsest_package_public_origin` is still a separate package-key gateway origin
+(the Afterglow origin in the DMS Lab example), not the Hub routing URL. Apply the
+reviewed roles through normal `kolla-ansible reconfigure --tags palimpsest,afterglow`
+after preserving image pins and data. A correct HAProxy route does not install
+new package APIs; verify Hub version and authenticated `/v1/projects/current`.
+
 Repository tags label both
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` with tags derived from

@@ -8,6 +8,7 @@ import pytest
 from palimpsest_local.errors import ArtifactValidationError, DigestMismatchError
 from palimpsest_local.refs import (
     BuildSpec,
+    HostDirectoryShare,
     ImageRef,
     LayerRef,
     PortForward,
@@ -73,3 +74,51 @@ def test_project_runtime_resources_are_strict_and_collision_free(tmp_path: Path)
         RunSpec("demo", stack, environment=(("BAD", "one\ntwo"),))
     with pytest.raises(ArtifactValidationError, match="shadow"):
         VolumeAttachment("bad", "/proc/data", host_path=volume_path)
+
+
+def test_host_share_policy_is_structural_and_live_validation_is_explicit(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "absent-project"
+    share = HostDirectoryShare(root, "absent-source", "/srv/shared", True)
+    assert share.host_path == root / "absent-source"
+    assert share.guest_tag.startswith("ps-")
+    assert not root.exists()
+    with pytest.raises(ArtifactValidationError, match="missing"):
+        share.validate_source()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["", ".", "./data", "data/", "data//child", "../data", "/data", "data\\child", "data\nchild", "data\x00child"],
+)
+def test_host_share_policy_rejects_malformed_source_without_filesystem_access(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    with pytest.raises(ArtifactValidationError, match="project-relative"):
+        HostDirectoryShare(tmp_path.resolve(), source, "/srv/shared")
+
+
+@pytest.mark.parametrize(
+    "root", [Path("relative"), Path("/project/../other"), Path("//project"), Path("/project\nroot")]
+)
+def test_host_share_policy_rejects_ambiguous_root(root: Path) -> None:
+    with pytest.raises(ArtifactValidationError, match="normalized absolute"):
+        HostDirectoryShare(root, "data", "/srv/shared")
+
+
+@pytest.mark.parametrize("target", [None, "/srv/shared\nother", "/srv/shared\x00other"])
+def test_host_share_policy_rejects_malformed_target(tmp_path: Path, target: str | None) -> None:
+    with pytest.raises(ArtifactValidationError, match="single-line"):
+        HostDirectoryShare(tmp_path.resolve(), "data", target)
+
+
+def test_host_share_policy_rejects_unencodable_paths(tmp_path: Path) -> None:
+    with pytest.raises(ArtifactValidationError, match="UTF-8"):
+        HostDirectoryShare(tmp_path.resolve(), "data\ud800", "/srv/shared")
+
+
+@pytest.mark.parametrize("target", ["relative", "//srv/shared", "/srv//shared", "/srv/../shared", "/"])
+def test_host_share_policy_normalizes_guest_path_errors(tmp_path: Path, target: str) -> None:
+    with pytest.raises(ArtifactValidationError, match="host share target"):
+        HostDirectoryShare(tmp_path.resolve(), "data", target)

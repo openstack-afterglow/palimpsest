@@ -13,9 +13,13 @@ longer uses (see pyproject.toml's wheel shared-data target).
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -140,7 +144,7 @@ def test_precheck_requires_stock_valkey_with_no_plugin_redis_fallback():
 
 def test_haproxy_public_route_defaults_are_disabled_and_combine_into_services():
     assert defaults_yaml["palimpsest_public_haproxy_enabled"] is False
-    assert defaults_yaml["palimpsest_public_haproxy_fqdn"] == ""
+    assert "else ''" in defaults_yaml["palimpsest_public_haproxy_fqdn"]
     assert defaults_yaml["palimpsest_haproxy_services"] == (
         "{{ palimpsest_services | combine(palimpsest_public_haproxy_services, recursive=True) }}"
     )
@@ -160,3 +164,131 @@ def test_precheck_validates_public_hostname_matches_endpoint_url():
     assert (
         "(palimpsest_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ palimpsest_public_haproxy_fqdn)"
     ) in precheck_text
+
+
+def _execute_public_route(tmp_path, variables):
+    guards = []
+    for source in (precheck_text, loadbalancer_text):
+        task = next(task for task in yaml.safe_load(source) if "public route hostname" in task["name"])
+        guards.append({**task, "register": f"guard_{len(guards)}", "ignore_errors": True})
+    output = tmp_path / "rendered.json"
+    tasks = [
+        *guards,
+        {
+            "name": "Capture real Ansible role templating",
+            "ansible.builtin.copy": {
+                "dest": str(output),
+                "mode": "0600",
+                "content": "{{ {'fqdn': palimpsest_public_haproxy_fqdn, 'services': palimpsest_public_haproxy_services, 'guards_ok': [not (guard_0 is failed), not (guard_1 is failed)]} | to_json }}",
+            },
+        },
+    ]
+    playbook = tmp_path / "playbook.yml"
+    playbook.write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "hosts": "localhost",
+                    "gather_facts": False,
+                    "vars_files": [str(ROLE_DIR / "defaults" / "main.yml")],
+                    "tasks": tasks,
+                }
+            ]
+        )
+    )
+    extra = tmp_path / "variables.json"
+    extra.write_text(json.dumps(variables))
+    result = subprocess.run(
+        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(playbook), "-e", "@" + str(extra)],
+        env={
+            **os.environ,
+            "ANSIBLE_LOCAL_TEMP": str(tmp_path / "ansible-local"),
+            "ANSIBLE_REMOTE_TEMP": str(tmp_path / "ansible-remote"),
+            "ANSIBLE_NOCOLOR": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(output.read_text())
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        (None, ""),
+        ("", ""),
+        ("https://hub.example.test", "hub.example.test"),
+        ("https://hub.example.test/", "hub.example.test"),
+        ("https://Hub.Example.test", "Hub.Example.test"),
+        ("http://hub.example.test", ""),
+        ("https://hub.example.test:443", ""),
+        ("https://hub.example.test:8020", ""),
+        ("https://hub.example.test/path", ""),
+        ("https://hub.example.test//", ""),
+        ("https://hub.example.test?query=1", ""),
+        ("https://hub.example.test?", ""),
+        ("https://hub.example.test#fragment", ""),
+        ("https://hub.example.test#", ""),
+        ("https://user:password@hub.example.test", ""),
+        ("https://user@hub.example.test", ""),
+        ("https://[::1]", ""),
+        ("https://hub.example.test\n", ""),
+        (" https://hub.example.test", ""),
+        ("not a URL", ""),
+    ],
+)
+def test_ansible_public_route_derivation_fails_closed_without_precheck(tmp_path, endpoint, expected):
+    variables = {
+        "enable_palimpsest": True,
+        "enable_palimpsest_hub_api": True,
+        "palimpsest_public_haproxy_enabled": True,
+        "kolla_external_fqdn": "main.example.test",
+    }
+    if endpoint is not None:
+        variables["palimpsest_public_endpoint_url"] = endpoint
+    rendered = _execute_public_route(tmp_path, variables)
+    assert rendered["fqdn"] == expected
+    # Rendering consumes the real role defaults independently of rejected guards.
+    services = rendered["services"]
+    public = services["palimpsest-public"]
+    route = public["haproxy"]["palimpsest-public"]
+    assert public["enabled"] is bool(expected)
+    assert route["enabled"] is bool(expected)
+    assert route["external_fqdn"] == expected
+    assert rendered["guards_ok"] == [bool(expected), bool(expected)]
+
+
+@pytest.mark.parametrize("exposure", [True, False])
+@pytest.mark.parametrize("explicit", [None, "hub.example.test", "other.example.test"])
+def test_ansible_public_route_preserves_opt_in_and_explicit_override(tmp_path, exposure, explicit):
+    variables = {
+        "enable_palimpsest": True,
+        "enable_palimpsest_hub_api": True,
+        "palimpsest_public_endpoint_url": "https://hub.example.test/",
+        "palimpsest_public_haproxy_enabled": exposure,
+    }
+    if explicit is not None:
+        variables["palimpsest_public_haproxy_fqdn"] = explicit
+    rendered = _execute_public_route(tmp_path, variables)
+    public = rendered["services"]["palimpsest-public"]
+    assert public["enabled"] is exposure
+    assert public["haproxy"]["palimpsest-public"]["enabled"] is exposure
+    assert public["haproxy"]["palimpsest-public"]["external_fqdn"] == (explicit or "hub.example.test")
+    assert rendered["guards_ok"] == [not exposure or explicit != "other.example.test"] * 2
+
+
+def test_ansible_haproxy_only_guard_rejects_invalid_explicit_origin(tmp_path):
+    rendered = _execute_public_route(
+        tmp_path,
+        {
+            "enable_palimpsest": True,
+            "enable_palimpsest_hub_api": True,
+            "palimpsest_public_haproxy_enabled": True,
+            "palimpsest_public_endpoint_url": "https://hub.example.test:443/",
+            "palimpsest_public_haproxy_fqdn": "hub.example.test",
+            "kolla_external_fqdn": "hub.example.test",
+        },
+    )
+    assert rendered["guards_ok"] == [False, False]

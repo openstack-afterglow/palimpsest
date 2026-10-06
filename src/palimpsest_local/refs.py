@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -70,6 +72,86 @@ class VolumeAttachment:
 
 
 @dataclass(frozen=True)
+class HostDirectoryShare:
+    """Project-contained directory policy; live sources are validated explicitly."""
+
+    project_root: Path
+    source: str
+    mount_path: str
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        from .project import ProjectError, _guest_path, _reserved_guest_path
+
+        if (
+            not isinstance(self.project_root, Path)
+            or not self.project_root.is_absolute()
+            or ".." in self.project_root.parts
+            or str(self.project_root).startswith("//")
+            or any(character in str(self.project_root) for character in ("\\", "\x00", "\n", "\r"))
+        ):
+            raise ArtifactValidationError("host share project root must be a normalized absolute path")
+        if not isinstance(self.source, str):
+            raise ArtifactValidationError("host share source must be a normalized project-relative directory")
+        relative = PurePosixPath(self.source)
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or str(relative) != self.source
+            or "\\" in self.source
+            or any(character in self.source for character in ("\x00", "\n", "\r"))
+        ):
+            raise ArtifactValidationError("host share source must be a normalized project-relative directory")
+        try:
+            str(self.project_root).encode("utf-8")
+            self.source.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ArtifactValidationError("host share paths must contain valid UTF-8 text") from exc
+        if not isinstance(self.mount_path, str) or any(
+            character in self.mount_path for character in ("\x00", "\n", "\r")
+        ):
+            raise ArtifactValidationError("host share target must be a single-line guest path")
+        try:
+            canonical_target = _guest_path(self.mount_path, "host share target")
+        except ProjectError as exc:
+            raise ArtifactValidationError(str(exc)) from exc
+        if canonical_target != self.mount_path:
+            raise ArtifactValidationError("host share target must be a normalized absolute guest path")
+        if _reserved_guest_path(self.mount_path):
+            raise ArtifactValidationError("host share target overlaps a runtime-owned guest path")
+        if type(self.read_only) is not bool:
+            raise ArtifactValidationError("host share read_only must be a boolean")
+
+    @property
+    def host_path(self) -> Path:
+        return self.project_root / self.source
+
+    @property
+    def guest_tag(self) -> str:
+        identity = f"palimpsest-virtiofs-v1:{self.host_path}:{self.mount_path}"
+        return "ps-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+    def validate_source(self) -> None:
+        """Validate at launch/live retention, never while decoding cleanup policy."""
+        current = Path(self.host_path.anchor)
+        try:
+            for part in self.host_path.parts[1:]:
+                current /= part
+                metadata = current.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ArtifactValidationError("host share source cannot traverse a symlink")
+            self.host_path.resolve(strict=True).relative_to(self.project_root.resolve(strict=True))
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ArtifactValidationError(
+                    "virtiofs requires a host directory; host file binds are unsupported "
+                    "(share the containing directory instead)"
+                )
+        except (OSError, ValueError) as exc:
+            raise ArtifactValidationError("host share source is missing or escapes the project root") from exc
+
+
+@dataclass(frozen=True)
 class ImageRef:
     digest: str
     disk_format: Literal["qcow2", "raw"]
@@ -133,6 +215,7 @@ class RunSpec:
     volumes: tuple[VolumeAttachment, ...] = ()
     environment: tuple[tuple[str, str], ...] = ()
     cloud_init: object | None = None
+    host_shares: tuple[HostDirectoryShare, ...] = ()
 
     def __post_init__(self) -> None:
         if _DOMAIN_NAME_RE.fullmatch(self.name) is None:
@@ -148,6 +231,14 @@ class RunSpec:
             raise ArtifactValidationError("run cannot contain duplicate host port bindings")
         volume_names = [item.name for item in self.volumes]
         volume_targets = [item.mount_path for item in self.volumes]
+        if not isinstance(self.host_shares, tuple) or not all(
+            isinstance(share, HostDirectoryShare) for share in self.host_shares
+        ):
+            raise ArtifactValidationError("host shares must be immutable directory share policies")
+        volume_targets.extend(share.mount_path for share in self.host_shares)
+        tags = [share.guest_tag for share in self.host_shares]
+        if len(set(tags)) != len(tags):
+            raise ArtifactValidationError("run cannot attach duplicate host share tags")
         if len(set(volume_names)) != len(volume_names) or len(set(volume_targets)) != len(volume_targets):
             raise ArtifactValidationError("run cannot attach duplicate volume names or mount paths")
         environment_names: set[str] = set()

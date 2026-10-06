@@ -19,6 +19,7 @@ import shlex
 from pathlib import Path, PurePosixPath
 
 from .errors import LifecycleError as GuestError
+from .refs import HostDirectoryShare
 
 GUEST_USER = "ubuntu"
 EXEC_HELPER_PATH = "/usr/local/libexec/palimpsest-exec"
@@ -357,12 +358,16 @@ def build_user_data(
     environment: tuple[tuple[str, str], ...] = (),
     cloud_init: object | None = None,
     arch: str = "x86_64",
+    host_shares: tuple[HostDirectoryShare, ...] = (),
 ) -> str:
     """Render the full NoCloud ``user-data`` ``#cloud-config`` document for one run.
 
     ``client_public_key``/``host_private_key``/``host_public_key`` accept either the
     literal key text or a ``Path`` to read it from — callers may hold generated key
     material in memory or on disk under a run's ``ssh/`` directory.
+    First-boot project initialization checks the completed activation unit before
+    running user commands or marking the guest ready. Cloud-init's runcmd wrapper
+    does not stop when an earlier systemctl command fails.
     """
     if arch not in _SERIAL_CONSOLES:
         raise GuestError(f"unsupported guest serial console architecture: {arch}")
@@ -370,6 +375,14 @@ def build_user_data(
     client_key = read_public_key_line(client_public_key)
     host_public = read_public_key_line(host_public_key)
     host_private = read_key_material(host_private_key).rstrip("\n")
+    for share in host_shares:
+        if not activation_script.endswith("\n"):
+            activation_script += "\n"
+        options = "ro" if share.read_only else "rw"
+        activation_script += (
+            f"install -d -m 0755 -- {shlex.quote(share.mount_path)}\n"
+            f"mount -t virtiofs -o {options} {shlex.quote(share.guest_tag)} {shlex.quote(share.mount_path)}\n"
+        )
     helper_script, unit_text = build_activation_unit(activation_script, emit_ready=False, console_device=console_device)
     ready_script = f"#!/bin/bash\nset -euo pipefail\necho {READY_SENTINEL} >>{console_device}\n"
     ready_unit = (
@@ -422,7 +435,14 @@ def build_user_data(
     commands = tuple(getattr(cloud_init, "runcmd", ())) if cloud_init is not None else ()
     if not all(isinstance(package, str) and package and "\x00" not in package for package in packages):
         raise GuestError("cloud-init packages entries must be nonempty NUL-free strings")
-    project_script_lines = ["#!/bin/bash", "set -euo pipefail", f"exec >>{console_device} 2>&1"]
+    project_script_lines = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        f"exec >>{console_device} 2>&1",
+        # RemainAfterExit makes active mean all block/layer and host-share mounts
+        # completed successfully, including when cloud-init continued after failure.
+        f"systemctl is-active --quiet {ACTIVATION_UNIT_NAME}",
+    ]
     for command in commands:
         if not isinstance(command, tuple) or not command or not all(isinstance(argument, str) for argument in command):
             raise GuestError("cloud-init runcmd entries must be nonempty argv tuples")

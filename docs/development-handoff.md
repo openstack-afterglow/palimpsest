@@ -26,6 +26,18 @@ files_modified:
 
 **Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image-tag candidate is also `0.3.0` and its source default is the reviewed immutable candidate SHA. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
 
+**2026-10-06 local Hub endpoint wiring:** The `dev` working tree now derives the
+public HAProxy hostname from `palimpsest_public_endpoint_url`, retaining opt-in
+exposure and HTTPS-origin consistency checks. Corresponding Afterglow Kolla
+changes project the explicit URL into both generated services TOML layers while
+preserving detailed TOML when unset. Real Ansible exercised 11 configuration and
+rejection cases; stock Kolla template/map output ran in actual amd64/arm64
+HAProxy 3.2.25 containers with certificate-verified HTTPS routing to a synthetic
+HTTP upstream (200; unrelated hostname 404). No Hub API/image/schema, production
+configuration, persistent volume, native/cloud proof, commit or publication was
+changed. The older Hub's missing package API is a separate deployment prerequisite.
+
+
 **2026-09-19 기록 안내:** 아래 `현재 스냅샷`과 frontmatter의
 2026-09-14 값은 당시 기록이다. 당시 작업트리의 source 상태와 승인 대기는
 [Hub web API build checkpoint](#hub-web-api-build-2026-09-19) 및 그때의 Git 상태를
@@ -2975,3 +2987,119 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   protected native CI success and the real Afterglow gateway/UI acceptance.
   Official openstack.cloud 2.6.0 supports `role_assignment(system=all)`;
   no installed-collection or live operator proof is claimed.
+
+## Afterglow native OCI-root candidate — 2026-10-02 (local, uncommitted)
+
+- User selected Linux amd64/KVM OCI-root (not a baked conventional cloud image or Docker Compose inside a VM), then a separate OpenStack CI VM rather than `pieroot-server`. No cloud VM, volume, security group, remote helper transfer/installation, publication or commit/push occurred.
+- Baselines: Palimpsest `dev` `d0bda353636d0dcb226def293af2495297aae455`; Afterglow `dev` `27f2945`. Existing Afterglow release/Kolla documentation changes were preserved. Palimpsest source was not changed. Named Astra/Sol roles were unavailable; task-agent implementation and parent source review do not grant scoped native-operation approval.
+- Afterglow changes: separate root Dockerfile `native-vm` target; `backend/scripts/native_vm.py`; consumer-visible lifecycle regressions in `backend/tests/test_native_vm.py`; OpenSpec `afterglow-native-oci-vm`, architecture/changelog and Korean/English deployment contracts. Canonical uv worker dependencies, locked Bun frontend dependencies and glibc Node 22 are preinstalled alongside MariaDB/client/Redis. Existing Compose/Kolla/CI and sibling-service ownership remain unchanged.
+- Real local image smoke on arm64 and emulated amd64: UID 1000, all capabilities dropped/no-new-privileges; direct API/frontend HTTP 200, 37 SQL tables, Unix-socket SQL/no TCP, authenticated loopback Redis, direct Notion worker and Node, no Docker binary, SQL/Redis sentinel and credential persistence across stop/start and child-failure recovery. Redis exit failed supervisor with exit 1; final graceful stop exit 0 (arm64 1.07s, amd64 0.798s). This is image execution, **not** Palimpsest actual-root/KVM or authenticated OpenStack proof.
+- Build failures retained: the existing `palimpsest-e2e` builder has `network=none` and was not reconfigured. New-target npm installation without the authoritative lock failed with Arborist `edgesOut`; the new stage now uses `bun install --production --frozen-lockfile`. Docker Desktop built both platforms and exported the amd64 standard OCI archive. Temporary smoke SQL omitted required timestamps, used an unavailable Redis `aclose` API and assumed unmodified Redis/Node argv; those harness defects were corrected without changing application source or weakening readiness/persistence assertions.
+- Artifact: `~/.local/share/palimpsest-proofs/ag-native-8e42ddb6/afterglow-native-amd64.oci.tar`, 687704064 bytes, mode 0600, 22 layers; manifest `sha256:1802fa41a87f6c22e813a983afafbc87707483bba71d4e843709e924ef0d0bf0`, Linux amd64/appuser/direct native entrypoint. Descriptor/config hashes and platform/layer limit were checked; materialization and guest boot remain unverified. JSON evidence: `smoke-arm64.json`, `smoke-amd64.json`, `oci-summary.json`, `prerequisites.json`, `cleanup.json` in the same private directory.
+- Checks: focused pytest 15 passed; canonical safe `npm run test:unit:backend` 3538 passed (integration/contracts excluded); scoped Ruff check/format passed. Afterglow reviewed working source guard passed at `5bec7ca3404c3fbaf63b305c5ebb2c58f0bd750398d8906ba3433b0d494e7ae6` (2166 files). Staged check covered unchanged baseline only (2164 files), not this unstaged candidate. Full frontend/contract/functional gate and native acceptance are not claimed.
+- Cleanup: exact proof-labelled containers `ag-native-8e42ddb6-{arm64,amd64}` and their test-only state volumes were removed after exit-0 verification. Generated test credentials and temporary smoke scripts were removed; OCI artifact, built images and redacted JSON evidence remain. No shared project/volume or build cache was pruned.
+- Blocker: current host Darwin/arm64; no selected `OS_APPLICATION_CREDENTIAL_ID/SECRET`, `OS_CLOUD`, `OS_CLIENT_CONFIG_FILE`, standard clouds/secure YAML or qualified `PALIMPSEST_OCI_KERNEL/CONFIG/PACKER` inputs. Need a private path to the CI project's current member-only credential. Verify current project/permissions, available image/flavor/network and qualified kernel/config/packer read-only, then obtain exact VM/volume/security-group and transfer/installation/native-proof scope before provisioning. Do not substitute the admin project or another host. The OpenSpec change remains unarchived pending actual public-run/root-proof/browser/retained-root acceptance.
+
+
+## Afterglow native continuation preflight — 2026-10-02
+
+- User requested the next step. This authorizes continuation, not unspecified Nova provisioning, credential recreation, remote installation or private helper transfer. Current Palimpsest remains `d0bda353636d0dcb226def293af2495297aae455`; Afterglow HEAD advanced to `ff007edb6e4bf75f0c0a05107ca6340b593675ff` while the native candidate is still unstaged/uncommitted. Its reviewed working-source fingerprint remains `5bec7ca3404c3fbaf63b305c5ebb2c58f0bd750398d8906ba3433b0d494e7ae6`; current working guard passed. Other changes were preserved.
+- Fresh local OCI checks passed for all 22 layer descriptor sizes/SHA-256 and decompressed DiffIDs, manifest/config descriptors, Linux amd64 platform and ordered rootfs/runtime configuration equality with the previously smoked local image. Archive SHA-256: `09f4acf88f2320f061e8ff866abec0cf78e3a2612923980124c1cd8945285cdb`; config digest: `sha256:2ea7cf7b3fe45a00fb3c7e2c94e178446a094b5a77f738f24e3d7df2a6da48d4`. This closes image/archive linkage, not native VM acceptance.
+- Fresh credential presence-only check: no OS_AUTH_URL/OS_AUTH_TYPE/application-credential ID/secret in the process environment. The five previously documented private input files under `~/.local/share/palimpsest-candidate-024/` still have no application-credential secret field. `ci-resources.json` retains an ID field only; it cannot authenticate. Values were not printed, copied into evidence or used for authentication. Earlier protected GitHub/keychain metadata checks are historical; GitHub secret metadata cannot return secret values.
+- Secret-free current evidence: `~/.local/share/palimpsest-proofs/ag-native-8e42ddb6/continuation-preflight.json`. No cloud authentication, network/resource inventory, native boot, mutation or new test run occurred. Need the private current member-only CI credential input path before read-only project/image/flavor/network inspection. Canonical helper pins CI project `53ec2dd9a1f7471fb6a2b174595fa232`, at most one 2-vCPU/8-GiB VM and one 20-GiB boot volume, no Floating IP, restricted SSH ingress; these are limits, not approval for this Afterglow proof. Confirm current target and exact transfer/installation/boot/retained-root/cleanup approval before creating anything.
+
+
+## SYSTEM direct-Nova Afterglow proof and host-share lifecycle — 2026-10-06 (uncommitted)
+
+- Scope: user-approved SYSTEM project `944405f937c3410f9b4f082b20a22e10`, dedicated member/reader application-credential profile, `cpu.2c_8g`, at most 2 VMs, `ceph_hdd` 20+20+8 GiB, one 10 GiB CephFS share, one RGW bucket, one Glance image and owned keypair/SG/≤2 FIPs. Palimpsest `dev` `1acbe47c0da5307b4a96538e65993138100d3e4f` with unstaged changes; Afterglow checkout `34ec462f` was **not** transferred wholesale. No commit, push, publication, deployment, router/network/quota change or nested-KVM substitution occurred. Astra/Sol roles were unavailable; independent reviewer agents reviewed the exporter (twice) and runner. Reported issues were addressed, but the existing-user-SG and Manila endpoint changes made during the live run did not receive an independent re-review; later focused regressions cover their acceptance/rejection boundaries.
+- Source: `scripts/package_native_afterglow.py` bundled `git --no-replace-objects archive ff007edb6e4bf75f0c0a05107ca6340b593675ff` plus reviewed overlays (`Dockerfile`, `backend/scripts/native_vm.py`, `backend/scripts/native-cloud/*`, `scripts/export_native_cloud.py`). Bundle `8f28a7127069a4154832e5fae517306b3fb087d592a5cecbd7783d98a8b26557` (18369662 bytes, 3659 files), manifest `18f1e67fc5e871432ec2216356487c077fda0a31a1e9895e4753be1f917b4207`, parent-written source approval in the private evidence directory.
+- Live result, owner run `pal-system-1e151821`: the builder (Ubuntu 24.04 image pinned by SHA-512) produced a BuildKit `native-cloud-vm` linux/amd64 rootfs (gzip `8d2c8251…`, 742227704 bytes; build 3592 s after one interrupted attempt). The exporter produced BIOS raw `c8c33ab1d88bde9e2082e245478c476d627c393c2298691d5ee8b0194f8d667e` (8 GiB; Debian trixie, kernel 6.12.111, builder GRUB), uploaded as Glance `3f18befa…`. The consumer booted directly on Nova from a Cinder volume of that image. First boot and after reboot: `systemd-detect-virt` kvm, PID 1 systemd, `afterglow-native.service` active as appuser with 0 restarts, five supervisor children, no container engine binaries/processes, API 8000/frontend 3080 HTTP 200, 37 tables, SQL TCP closed, Redis loopback-only, DEFAULT_NETWORK_ENABLED=false, no admin credentials configured. MariaDB/Redis markers, Cinder data-volume ext4 marker (fstab) and CephFS builder/consumer markers survived the reboot. RGW 8 MiB payload and manifest checksum round trip passed. Dedicated member login: 200, password auth, SYSTEM, roles member/reader, not system admin, consumer listed ACTIVE, logout 200, SYSTEM network/router inventory unchanged. The Notion work queue was not exercised (it needs external Notion/admin credentials).
+- Cleanup: all 14 recorded resources (2 servers, 3 volumes, 2 ports, 2 FIPs, SG, keypair, share, image, bucket) were deleted with no refusals. An independent listing found no `pal-system-1e151821*` objects; the protected FIP 172.30.102.169 is still present; the active binding was released and the cephx key file removed. Evidence: `~/.local/share/palimpsest-proofs/ag-native-8e42ddb6/system/run/{prepare,build,run,run-login,cleanup,source-bundle-verification,system-run}.json`. The secret scan checked four profile credential values (excluding the private SSH key) and found no matches. It did not scan the CephX key before deletion; absence of all possible secrets in retained evidence is not proved.
+- Access deviation (user decision): builder SSH timed out with the approved 10.8.0.2/32 ingress while this Mac routed 172.30.0.0/16 through en0, not utun6. Source-CIDR mismatch is an inference from that route and timeout, not a packet-source measurement. The user then added TCP 22 and ICMP from 0.0.0.0/0 to the SYSTEM project's `default` security group `0bf5daef-0589-498a-9028-eecc3deb3cc1` and attached it to the builder port; SSH subsequently succeeded. The runner gained `--user-port-security-group UUID`: an exact project group that is accepted beside the owned 10.8.0.2/32 group and applied to new owned ports, and is never mutated or deleted. **Those user-made `default` SG rules remain**; the user decides whether to revert them. Runner fix found live: Manila's catalog endpoint is project-less `/v2`, so the runner appends the authenticated project id.
+- Boundary: this is a conventional raw cloud disk derived from the native OCI root plus declared bootability additions, booted directly on Nova. It does not prove protected OCI-root stage-1, untouched OCI execution, security parity, or a public Palimpsest OpenStack backend; Afterglow OpenSpec tasks 6/7 stay open.
+- Local compatibility (source + portable proof only): project `type: bind` virtiofs lifecycle fixes (structural parse vs. physical validation, restart bound to the recorded export set, activation-gated project-init, read-only retained no-op validation). File-backed managed block volumes satisfy the volume requirement; LVM was not added. RGW is user-scoped and Hub blobstore unchanged. Checks: `scripts/test_lanes.py run portable` 6292 passed/217 skipped; targeted 621 passed; mutation of the project-init guard failed 16 cases as expected; Ruff check/format and the lane manifest pass; Afterglow exporter suite 24 passed. **Not live-verified:** Linux KVM virtiofs mount/restart on a real host (this host is Darwin; no approved Linux KVM host was used).
+- Local actual CLI smoke: `palimpsest compose -f <temporary-project>/palimpsest.yml config --quiet` accepted an existing normalized `shared` bind source (exit 0), then rejected the removed directory (exit 1) without VM work. The initial documentation example used `./shared`, which the normalized-path contract correctly rejected; the example now uses `shared`. A throwaway assertion initially searched for singular `directory` instead of the observed `directories`; that harness assertion was corrected against the retained result. Temporary project files were removed. This is configuration-path proof, not a live virtiofs mount.
+- Final focused runner regressions: 49 passed, including invalid SG UUIDs, missing/foreign/owned-group rejection, unapproved extra port SGs, disabled port security and project-less/already-scoped/foreign Manila catalog URLs. Focused Ruff check/format passed. Palimpsest working architecture guard passed at `db92e4eaa3dd388cb9d3fbeafe8de7ec7429c6f590df8c46aecf550e3ec513eb` (445 files). Afterglow working guard is **stale**; its staged guard passed at `948ec0d9589738c81fb8d218793ff89c17c271910e997202845a08b15b8de60b` (2164 files), covering the staged baseline only, not native unstaged changes. No stamp was applied to the whole dirty Afterglow checkout because unrelated source was not reviewed and the guard offers no per-file scope. Exporter tests were run on Darwin, not as a root Linux test suite; the real Linux export is separate live evidence. gbrain sync is unavailable: the installed detector reports `gbrain_on_path=false`, `gbrain_local_status=no-cli`; no guidance/config changes or index sync occurred.
+- Current Afterglow supervisor selector: `AFTERGLOW_ALLOW_INSECURE=1 .venv/bin/python -m pytest tests/test_native_vm.py -q -p no:cacheprovider` passed 15 tests with five existing Pydantic/FastAPI deprecation warnings. Only this isolated selector ran; no unrestricted backend pytest or integration tests ran. The first background tool invocation lost its completion output (reported to tool QA); the reported result is the subsequent foreground run.
+- Next: the owner decides on reverting the `default` SG rules, routing 172.30.0.0/16 via the approved tunnel for future runs, committing both repositories' changes, and a separately approved Linux KVM host for live virtiofs and protected OCI-root acceptance.
+
+## Production Afterglow 1.30.1 Kolla redeploy — 2026-10-06
+
+- Approval: the user selected option 3, the existing production Kolla service,
+  preserving its data, keys, TLS and sibling services. This deployed **the
+  existing published 1.30.1 release**, not the dirty local Afterglow checkout or
+  the native-cloud-vm candidate. No build/publication, commit/push, new Nova
+  resource, GPU operation or native proof was performed in this rollout.
+- Operator: `wireguard-dmslab`, `/etc/kolla`, installed plugin
+  `/etc/kolla/plugins/openstack-afterglow-v1.30.1/`; controllers
+  `dms-controller1`, `dms-controller2`, `dms-controller3`. Existing immutable
+  image references and image IDs were retained on all three:
+  - API: `ghcr.io/openstack-afterglow/afterglow-api@sha256:382139131aea35ffbbba68a3f4c199b573cffd9f8cb2ae8f0e3ecf1f638ae15c`.
+  - Frontend: `ghcr.io/openstack-afterglow/afterglow@sha256:8bb64230d8e929898c2da146cf23d09b9f4eac98e56511a33ca427fc9e2f330a`.
+  - Worker: `ghcr.io/openstack-afterglow/afterglow-worker@sha256:e261cc2763b4a4e3ba04a907bf4154da8c226f25c7d6b0edf8f3639d1ff5d6fd`.
+- Canonical installed CLI, `/etc/kolla/.venv/bin/kolla-ansible`, with inventory
+  `multimode` and `--tags afterglow`: `prechecks`, `genconfig`, then sequential
+  `reconfigure --limit dms-controllerN -e afterglow_start_restart=true`.
+  All five invocations returned 0; each reconfigure recap was `ok=96 changed=7
+  unreachable=0 failed=0 skipped=26 rescued=0 ignored=0`. The existing role's
+  restart variable restarted backend, frontend and Notion worker on each node.
+  Controller 1 completed at 12:13 UTC, controller 2 at 12:16 UTC and controller 3
+  at 12:19 UTC. Other replicas/public HTTPS were checked before advancing.
+- Fresh owner-private backup directory (0700):
+  `/etc/kolla/afterglow-release-backups/pre-afterglow-redeploy-20261006T120225Z`.
+  It contains controller configuration archives, operator inventory/lock/config
+  archives, the consistent `db/afterglow_kolla.sql.gz` dump and CLI logs/receipts.
+  **These backups contain credentials and real database data; they are not
+  secret-free public evidence.** SQL/configuration archives were kept on the
+  approved operator host, not copied to the local screenshot directory.
+- Real rollback qualification: the MariaDB 10.11.19 dump restored successfully
+  into an exact-owned temporary `mariadb:10.11.19` container on controller 1,
+  with network disabled, no published ports/host binds, tmpfs data and CPU,
+  memory and PID bounds. All **89 tables / 1,517 rows** matched, including
+  per-table counts; restore return code 0. The labelled temporary container was
+  removed; the official restore image remains cached for offline rollback.
+  Receipt: `db/restore-verification.json`.
+- Final protection receipt at 12:39 UTC:
+  `protection-verification-final.json`, `verified=true`. All 9 operator source
+  files and 307 archived controller configuration files matched their original
+  content hashes. All **602 pre-existing non-Afterglow running containers**
+  retained their IDs, image references/IDs, start times, running states and
+  restart counts (232/225/145 by controller). Application image IDs, private
+  environment hashes and mount sets were unchanged; all 9 application start
+  times changed. HAProxy, ProxySQL and Keepalived were not restarted.
+- Live readiness: backend/frontend Docker health and configured HTTP probes
+  passed on all three controllers; public `https://cloud.dmslab.re.kr/` and
+  `/api/v1/health` returned HTTPS 200 with certificate verification enabled.
+  The backend still uses external `afterglow_kolla` SQL and Redis database 5;
+  no replacement persistent data volume was introduced. Workers are running;
+  Notion job processing was **not** exercised.
+- Real Chromium acceptance used the existing dedicated SYSTEM member/reader
+  principal, not a synthetic identity or admin session. Login, `/auth/me`,
+  dashboard/quotas, Cinder volumes, Manila file storage, object-storage buckets
+  and account statistics returned 200; 19 distinct captured API outcomes were
+  all 200, with no captured browser runtime errors. The UI displayed 16 existing
+  volumes, zero shares and zero buckets. No resource create/delete control was
+  used. Normal confirmed logout returned 200 and the owned browser was closed.
+- Login's default-network prewarm was checked before authentication: the SYSTEM
+  default-network database record referenced an existing valid project network.
+  Independent before/after SDK reads found the exact same 1 network and 1 router,
+  so this login did not provision a default network/router.
+- Verification harness corrections, not production fixes: backup setup resumed
+  after a permission/path prerequisite error; the isolated SQL readiness probe's
+  SSH argument quoting was corrected; Docker comparison was aligned to the
+  running-only baseline and mount ordering was canonicalized. The initial false
+  comparison is retained in `protection-verification.json`; the final receipt
+  passed. Controller 3's stopped OpenSearch container predates this rollout and
+  was excluded from both running-only snapshots; it was not removed or repaired.
+- Private local receipt/screenshots:
+  `~/.local/share/palimpsest-proofs/afterglow-kolla-redeploy-20261006T120225Z/`
+  (`deployment-verification.json`, `dashboard.webp`, `volumes.webp`,
+  `file-storage.webp`, `object-storage.webp`). Operator acceptance receipt:
+  `authenticated-acceptance.json` in the backup directory. This checkpoint only
+  updates this handoff; source/architecture markers were not restamped. Existing
+  native/virtiofs acceptance and owner decisions above remain separate.
+- Completion guard: `python3 scripts/check_architecture.py` passed against
+  working source `db92e4eaa3dd388cb9d3fbeafe8de7ec7429c6f590df8c46aecf550e3ec513eb`
+  (445 files). No source stamp was changed; no new application tests were run
+  for this unchanged-release operational redeployment.
+

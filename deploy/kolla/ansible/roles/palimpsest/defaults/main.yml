@@ -61,7 +61,12 @@ palimpsest_hub_max_bundle_expanded_bytes: 107374182400
 palimpsest_hub_max_blocking_operations: 2
 
 palimpsest_public_haproxy_enabled: false
-palimpsest_public_haproxy_fqdn: ""
+# HAProxy-only plays do not run this role's precheck. Never strip a port or
+# other URL components into a routable hostname (including the :8020 fallback).
+palimpsest_public_haproxy_fqdn: >-
+  {{ palimpsest_public_endpoint_url | regex_replace('^https://([^/]+)/?$', '\1')
+     if palimpsest_public_endpoint_url is match('^https://[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]/?\Z')
+     else '' }}
 
 palimpsest_services:
   palimpsest-hub-api:
@@ -148,10 +153,10 @@ palimpsest_services:
 palimpsest_public_haproxy_services:
   palimpsest-public:
     group: palimpsest
-    enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool }}"
+    enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool and palimpsest_public_haproxy_fqdn | length > 0 }}"
     haproxy:
       palimpsest-public:
-        enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool }}"
+        enabled: "{{ enable_palimpsest_hub_api | bool and palimpsest_public_haproxy_enabled | bool and palimpsest_public_haproxy_fqdn | length > 0 }}"
         external: true
         external_fqdn: "{{ palimpsest_public_haproxy_fqdn }}"
         mode: http

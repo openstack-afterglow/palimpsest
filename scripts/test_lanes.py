@@ -32,7 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
-        development_package_workflow native_kvm_openstack publish_development_package
+        development_package_workflow native_kvm_openstack openstack_system_runner package_native_afterglow publish_development_package
         host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake sandbox_policy state test_lanes ui
     """)
@@ -422,6 +422,11 @@ def select_changed(paths: tuple[str, ...]) -> Selection:
             selected.update(("core-cli", "qualification"))
             reasons.append(
                 f"{path}: runner/workflow contracts; all-portable CI collection and shard validation also recommended"
+            )
+        elif path in {"scripts/package_native_afterglow.py", "scripts/run_openstack_system.py"}:
+            selected.add("core-cli")
+            reasons.append(
+                f"{path}: portable SYSTEM proof/source-transfer contracts; direct Nova proof requires scoped cloud approval"
             )
         elif path == "tests/kvm/virsh_output.py":
             selected.add("oci-monitor")

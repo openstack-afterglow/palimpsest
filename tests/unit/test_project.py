@@ -737,21 +737,7 @@ def test_ports_default_to_loopback_and_validate_ip(tmp_path: Path) -> None:
         load_project(path, {})
 
 
-def test_v1_rejects_bind_mounts_udp_and_multiple_network_attachments(tmp_path: Path) -> None:
-    (tmp_path / "host-data").mkdir()
-    bind = _write_project(
-        tmp_path,
-        f"""services:
-  app:
-    image: {BASE}
-    volumes:
-      - type: bind
-        source: host-data
-        target: /srv/data
-""",
-    )
-    with pytest.raises(ProjectError, match="bind is unsupported"):
-        load_project(bind, {})
+def test_v1_rejects_udp_and_multiple_network_attachments(tmp_path: Path) -> None:
 
     udp = _write_project(
         tmp_path,
@@ -777,6 +763,183 @@ services:
     )
     with pytest.raises(ProjectError, match="exactly one attachment"):
         load_project(multiple_networks, {})
+
+
+def test_explicit_directory_bind_preserves_named_block_schema(tmp_path: Path) -> None:
+    (tmp_path / "host-data").mkdir()
+    path = _write_project(
+        tmp_path,
+        f"""volumes:
+  data: {{size: 1GiB}}
+services:
+  app:
+    image: {BASE}
+    volumes:
+      - data:/var/lib/data
+      - type: bind
+        source: host-data
+        target: /srv/shared
+        read_only: true
+""",
+    )
+    project = load_project(path, {})
+    block, share = project.services["app"].volumes
+    assert block.type == "volume"
+    assert share.type == "bind"
+    assert share.source_path == (tmp_path / "host-data").resolve()
+    assert share.read_only is True
+    assert project.volumes["data"].driver == "block"
+    assert canonical_project_payload(project)["services"]["app"]["volumes"][1] == {
+        "type": "bind",
+        "source": "host-data",
+        "target": "/srv/shared",
+        "read_only": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "source, target, extra, message",
+    [
+        ("missing", "/srv/data", "", "cannot access path"),
+        ("host-file", "/srv/data", "", "host file binds are unsupported"),
+        ("link", "/srv/data", "", "symlink"),
+        ("../outside", "/srv/data", "", "project-relative"),
+        ("/etc", "/srv/data", "", "project-relative"),
+        ("host-data", "/srv/../data", "", "normalized absolute"),
+        ("host-data", "/etc/palimpsest/data", "", "owned guest path"),
+        ("host-data", "/srv/data", "        create_host_path: true\n", "unsupported key"),
+        ("host-data", "/srv/data", "        read_only: 1\n", "must be a string"),
+    ],
+)
+def test_bind_rejects_unsafe_sources_targets_and_schema(
+    tmp_path: Path,
+    source: str,
+    target: str,
+    extra: str,
+    message: str,
+) -> None:
+    directory = tmp_path / "host-data"
+    directory.mkdir()
+    (tmp_path / "host-file").write_text("not a directory", encoding="utf-8")
+    (tmp_path / "link").symlink_to(directory, target_is_directory=True)
+    path = _write_project(
+        tmp_path,
+        f"""services:
+  app:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: {source}
+        target: {target}
+{extra}""",
+    )
+    with pytest.raises(ProjectError, match=message):
+        load_project(path, {})
+    assert not (tmp_path / "missing").exists()
+
+
+def test_short_form_cannot_infer_a_directory_bind(tmp_path: Path) -> None:
+    (tmp_path / "host-data").mkdir()
+    path = _write_project(tmp_path, f"services:\n  app:\n    image: {BASE}\n    volumes: [./host-data:/srv/data]\n")
+    with pytest.raises(ProjectError, match="explicit long form"):
+        load_project(path, {})
+
+
+@pytest.mark.parametrize("cross_service", [False, True])
+@pytest.mark.parametrize("second_source", ["tree", "tree/readonly"])
+def test_bind_sources_must_be_disjoint_even_across_services(
+    tmp_path: Path,
+    cross_service: bool,
+    second_source: str,
+) -> None:
+    (tmp_path / "tree" / "readonly").mkdir(parents=True)
+    second_service = f"  worker:\n    image: {BASE}\n    volumes:\n" if cross_service else ""
+    path = _write_project(
+        tmp_path,
+        f"""services:
+  app:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: tree
+        target: /srv/writable
+        read_only: false
+{second_service}      - type: bind
+        source: {second_source}
+        target: /srv/readonly
+        read_only: true
+""",
+    )
+    with pytest.raises(ProjectError, match="bind sources.*overlap"):
+        load_project(path, {})
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "file", "symlink"])
+def test_lifecycle_loader_parses_bind_policy_without_inspecting_source(
+    tmp_path: Path,
+    source_kind: str,
+) -> None:
+    source = tmp_path / "host-data"
+    if source_kind == "file":
+        source.write_text("not a directory", encoding="utf-8")
+    elif source_kind == "symlink":
+        source.symlink_to(tmp_path / "absent-target", target_is_directory=True)
+    path = _write_project(
+        tmp_path,
+        f"""services:
+  app:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: host-data
+        target: /srv/shared
+""",
+    )
+    project = load_project(path, {}, validate_bind_sources=False)
+    assert project.services["app"].volumes[0].source_path == tmp_path.resolve() / "host-data"
+    assert source.is_symlink() == (source_kind == "symlink")
+    with pytest.raises(ProjectError):
+        load_project(path, {})
+
+
+@pytest.mark.parametrize("source", ["../outside", "/etc", "./tree", "tree//child", "tree/"])
+def test_lifecycle_loader_still_rejects_malformed_bind_paths(tmp_path: Path, source: str) -> None:
+    path = _write_project(
+        tmp_path,
+        f"""services:
+  app:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: '{source}'
+        target: /srv/shared
+""",
+    )
+    with pytest.raises(ProjectError, match="project-relative"):
+        load_project(path, {}, validate_bind_sources=False)
+
+
+def test_lifecycle_loader_still_reserves_missing_bind_ancestors(tmp_path: Path) -> None:
+    path = _write_project(
+        tmp_path,
+        f"""services:
+  app:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: tree
+        target: /srv/writable
+  other:
+    image: {BASE}
+    volumes:
+      - type: bind
+        source: tree/child
+        target: /srv/readonly
+        read_only: true
+""",
+    )
+    with pytest.raises(ProjectError, match="bind sources.*overlap"):
+        load_project(path, {}, validate_bind_sources=False)
 
 
 def test_cloud_init_forbids_raw_text_shell_commands_and_unknown_keys(tmp_path: Path) -> None:

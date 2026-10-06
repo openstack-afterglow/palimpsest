@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from palimpsest_local import cloudinit, guest
 from palimpsest_local.errors import LifecycleError as GuestError
@@ -58,6 +64,193 @@ def test_user_data_structure():
     assert ud.count("exec >>/dev/ttyS0 2>&1") == 2
     assert "echo PALIMPSEST_READY=1 >>/dev/ttyS0" in ud
     assert "/dev/console" not in ud
+
+
+@pytest.fixture
+def generated_first_boot(tmp_path: Path):
+    """Install actual generated scripts under tmp_path; emulate only guest tools.
+
+    The mount executable records real argv and can fail without touching a host
+    mount. The systemctl executable runs the generated service's ExecStart and
+    keeps its success/failure state, rather than assuming activation succeeded.
+    """
+
+    def prepare(*, read_only: bool, with_commands: bool, failed_mount: str | None):
+        from palimpsest_local.refs import HostDirectoryShare
+
+        (tmp_path / "shared").mkdir()
+        share = HostDirectoryShare(tmp_path.resolve(), "shared", str(tmp_path / "guest-share"), read_only)
+        console = tmp_path / "console"
+        marker = tmp_path / "bootstrapped"
+        user_command = tmp_path / "user-command-ran"
+        mount_log = tmp_path / "mounts.jsonl"
+        active = tmp_path / "activation-active"
+        commands = (("touch", str(user_command)),) if with_commands else ()
+        config = yaml.safe_load(
+            cloudinit.build_user_data(
+                client_public_key="ssh-ed25519 AAAAClient client@host",
+                host_private_key="test-key",
+                host_public_key="ssh-ed25519 AAAAHost host@guest",
+                activation_script=shlex.join(
+                    ("mount", "-t", "squashfs", "-o", "ro", "/dev/vdb", str(tmp_path / "layer"))
+                ),
+                host_shares=(share,),
+                cloud_init=SimpleNamespace(runcmd=commands),
+            )
+        )
+        paths = {item["path"]: tmp_path / Path(item["path"]).name for item in config["write_files"]}
+        paths.update({cloudinit.CONSOLE_DEVICE: console, cloudinit.BOOTSTRAP_MARKER_PATH: marker})
+
+        def relocate(text: str) -> str:
+            for guest_path, local_path in sorted(paths.items(), key=lambda item: len(item[0]), reverse=True):
+                text = text.replace(guest_path, str(local_path))
+            return text
+
+        for item in config["write_files"]:
+            path = paths[item["path"]]
+            path.write_text(relocate(item["content"]))
+            path.chmod(int(item["permissions"], 8))
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+
+        def executable(name: str, body: str) -> None:
+            path = bin_dir / name
+            path.write_text(f"#!{sys.executable}\n" + body)
+            path.chmod(0o755)
+
+        executable(
+            "mount",
+            f"""import json, sys
+from pathlib import Path
+with Path({str(mount_log)!r}).open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+kind = sys.argv[sys.argv.index('-t') + 1]
+sys.exit(1 if kind == {failed_mount!r} else 0)
+""",
+        )
+        executable(
+            "systemctl",
+            f"""import configparser, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+active = Path({str(active)!r})
+if args == ['daemon-reload']:
+    sys.exit(0)
+if args == ['enable', '--now', {cloudinit.ACTIVATION_UNIT_NAME!r}]:
+    active.unlink(missing_ok=True)
+    unit = configparser.ConfigParser()
+    unit.read({str(paths[cloudinit.ACTIVATION_UNIT_PATH])!r})
+    result = subprocess.run([unit['Service']['ExecStart']], check=False)
+    if result.returncode == 0:
+        active.touch()
+    sys.exit(result.returncode)
+if args == ['is-active', '--quiet', {cloudinit.ACTIVATION_UNIT_NAME!r}]:
+    sys.exit(0 if active.exists() else 3)
+if args in ([ 'enable', {cloudinit.READY_UNIT_NAME!r}],
+            [ 'enable', {cloudinit.READY_FALLBACK_UNIT_NAME!r}]):
+    sys.exit(0)
+sys.exit(2)
+""",
+        )
+        # Support GNU install's -D on macOS too, retaining real file creation.
+        executable(
+            "install",
+            f"""import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if '-D' in args:
+    Path(args[-1]).parent.mkdir(parents=True, exist_ok=True)
+    args.remove('-D')
+os.execv({shutil.which("install")!r}, ['install', *args])
+""",
+        )
+        env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+
+        def run(entrypoint: str) -> subprocess.CompletedProcess[str]:
+            if entrypoint == "project-init":
+                # Simulate an independently completed (possibly failed) unit.
+                subprocess.run(
+                    [str(bin_dir / "systemctl"), "enable", "--now", cloudinit.ACTIVATION_UNIT_NAME],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                argv = [str(paths[cloudinit.PROJECT_INIT_PATH])]
+            else:
+                # cloud-init runs its generated runcmd shell WITHOUT errexit.
+                wrapper = tmp_path / "runcmd"
+                wrapper.write_text("#!/bin/sh\n" + "\n".join(relocate(command) for command in config["runcmd"]) + "\n")
+                argv = ["/bin/sh", str(wrapper)]
+            return subprocess.run(argv, env=env, capture_output=True, text=True, check=False, timeout=10)
+
+        return SimpleNamespace(
+            run=run,
+            console=console,
+            marker=marker,
+            user_command=user_command,
+            mount_log=mount_log,
+            active=active,
+            share=share,
+        )
+
+    return prepare
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("with_commands", [False, True])
+@pytest.mark.parametrize("entrypoint", ["runcmd", "project-init"])
+@pytest.mark.parametrize("failed_mount", ["squashfs", "virtiofs"])
+def test_generated_first_boot_mount_failure_blocks_commands_and_readiness(
+    generated_first_boot,
+    read_only: bool,
+    with_commands: bool,
+    entrypoint: str,
+    failed_mount: str,
+):
+    boot = generated_first_boot(read_only=read_only, with_commands=with_commands, failed_mount=failed_mount)
+
+    result = boot.run(entrypoint)
+
+    assert result.returncode != 0
+    mounts = [json.loads(line) for line in boot.mount_log.read_text().splitlines()]
+    assert any(args[args.index("-t") + 1] == failed_mount for args in mounts)
+    assert not boot.active.exists()
+    assert not boot.user_command.exists()
+    assert not boot.marker.exists()
+    assert cloudinit.READY_SENTINEL not in boot.console.read_text()
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("with_commands", [False, True])
+@pytest.mark.parametrize("entrypoint", ["runcmd", "project-init"])
+def test_generated_first_boot_success_runs_commands_and_writes_readiness(
+    generated_first_boot,
+    read_only: bool,
+    with_commands: bool,
+    entrypoint: str,
+):
+    boot = generated_first_boot(read_only=read_only, with_commands=with_commands, failed_mount=None)
+
+    result = boot.run(entrypoint)
+
+    assert result.returncode == 0, result.stderr
+    mounts = [json.loads(line) for line in boot.mount_log.read_text().splitlines()]
+    assert [args[args.index("-t") + 1] for args in mounts] == ["squashfs", "virtiofs"]
+    assert mounts[-1] == [
+        "-t",
+        "virtiofs",
+        "-o",
+        "ro" if read_only else "rw",
+        boot.share.guest_tag,
+        boot.share.mount_path,
+    ]
+    assert boot.active.exists()
+    assert boot.user_command.exists() == with_commands
+    assert boot.marker.is_file()
+    assert cloudinit.READY_SENTINEL in boot.console.read_text().splitlines()
 
 
 def test_arm_user_data_writes_readiness_to_virt_serial():

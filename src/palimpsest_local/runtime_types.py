@@ -1096,6 +1096,7 @@ def run_request_subject_digest(request: ResolvedRunRequest) -> str:
             "seed": spec.seed,
             "ports": spec.ports,
             "volume_intents": request.volume_intents,
+            "host_shares": spec.host_shares,
             "environment": spec.environment,
             "cloud_init": _cloud_init_binding_projection(spec.cloud_init),
         }
