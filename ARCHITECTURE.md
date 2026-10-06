@@ -814,6 +814,8 @@ Host share lifecycle and SYSTEM proof tooling — 2026-10-06: `refs.py`, `projec
 
 Release source review — 2026-10-06: absolute bind-source policies are part of the execution fingerprint (canonical project YAML remains relocatable); ordinary stopped-service starts preflight recorded virtiofsd before mixed-plan mutation. Writable shares cannot contain attached immutable base/layer files, including external bundle backing and applied restart artifacts. SYSTEM proofs retain public-key identity, normalized SDK port security, first-boot install identity, timestamped exact-share Cephx access and fail-closed RGW presence. Cleanup retains refused ambiguous objects and the active binding while independently deleting only ownership-verified resources; successful bucket creation is durable before tagging. Public endpoint guards execute in both role precheck and HAProxy-only paths, tested through actual Ansible playbook templating. These preserve storage/authority/backend ownership boundaries; local portable/package/container evidence remains distinct from protected exact-ref native qualification and production deployment.
 
+Hub dependency security review — 2026-10-06: all eight reported default-branch advisories map to the Hub lockfile's Starlette `0.50.0` and urllib3 `2.7.0`, not merely stale candidate metadata. Hub now pins FastAPI `0.133.0` (the first release supporting Starlette 1.x), Starlette `1.3.1` and urllib3 `2.8.0`; unrelated dependency versions, Python 3.12 minimum, SDK/identity/storage ownership and native binaries are unchanged. Fresh frozen Hub lint/format, 216 tests, wheel/sdist, both API/worker container architectures and worker imports passed. Both real API processes rejected 1,001 URL-encoded fields with HTTP 400 before identity, retained health/discovery 200 and unauthenticated/project-header-only 401. This covers the reported dependency ranges and current HTTP compatibility, not a comprehensive security audit or native/production proof; protected exact-ref release qualification remains independent.
+
 
 Tracking ownership cutover — 2026-10-04: Afterglow `main` baseline `2862565c1f59eac0ef0904b97c905b177f12b335`의 추출 경계를 반영했다. `hub-http-v1`, `layer-metadata-and-digest-v1`, `oci-bundle-v1`의 정본은 `hub/src/palimpsest_hub/`의 `/v1` router, models, digest 및 bundle services다. Afterglow의 Hub facade와 `service_proxy.py`는 인증된 BFF consumer이며 caller token/project와 `Upload-Offset` 전달만 맡는다. 제거된 Afterglow Hub models/bundle service의 재도입은 drift다. Local build/runtime와 Union의 admin-only/Manila 소유권은 그대로 유지한다.
 
@@ -1124,9 +1126,9 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e4c4ebc2ea4f8d3ed21a656234c280c052907e659671359ae49660f4569516ff",
-  "reviewed_at": "2026-10-06T16:06:38Z",
-  "summary": "Review pending0.3.1 host-share lifecycle and SYSTEM operator tooling; bind absolute sources, preflight recorded daemon, protect immutable artifacts, retain exact ownership/freshness and partial-cleanup receipts; enforce exact HTTPS hostname origin in both Kolla play modes with real Ansible coverage. Preserve Hub/storage/backend/native authority boundaries; local qualification is not protected release or production proof."
+  "source_sha256": "c00042c3365633c9c4560015f941374a18e5fc69b8c98443c7d11a72dd6f070f",
+  "reviewed_at": "2026-10-06T16:25:27Z",
+  "summary": "Retain reviewed0.3.1 host-share/SYSTEM/exact-origin cutover; patch current Hub advisory ranges with FastAPI0.133.0, Starlette1.3.1 and urllib3 2.8.0, preserving unrelated dependencies and identity/storage/native contracts. Fresh216 Hub tests/package and both API/worker architectures plus actual HTTP form-limit/auth behavior passed; no native or production qualification is implied."
 }
 ```
 <!-- architecture-review:end -->
