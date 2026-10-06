@@ -1,4 +1,17 @@
 ---
+- name: HAProxy | Validate Palimpsest public route hostname
+  ansible.builtin.assert:
+    that:
+      - palimpsest_public_haproxy_fqdn is match('^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$')
+      - palimpsest_public_endpoint_url is match('^https://[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]/?\\Z')
+      - (palimpsest_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ palimpsest_public_haproxy_fqdn)
+    fail_msg: "palimpsest_public_endpoint_url must be the HTTPS origin for palimpsest_public_haproxy_fqdn"
+  run_once: true
+  tags: always
+  when:
+    - enable_palimpsest | bool
+    - palimpsest_public_haproxy_enabled | bool
+
 - name: HAProxy | Remove disabled Palimpsest public route destination
   become: true
   ansible.builtin.file:

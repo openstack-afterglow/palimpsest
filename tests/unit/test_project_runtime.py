@@ -313,7 +313,8 @@ def test_same_config_running_is_a_true_noop(tmp_path: Path) -> None:
 
     assert not result.changed
     assert all(item.action == "noop" for item in result.actions)
-    assert {event[0] for event in runtime.events} == {"inspect"}
+    # Retained services are revalidated read-only; nothing is resolved, prepared or mutated.
+    assert {event[0] for event in runtime.events} == {"inspect", "preflight"}
     assert state.project_paths(roots, project.name).state.read_bytes() == before
 
 

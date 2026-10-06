@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import cli
+from palimpsest_local import cli, state
+from palimpsest_local import project as project_model
+from palimpsest_local.project_runtime import ManagedVolume, ProjectCallbacks, read_project_state
+from palimpsest_local.refs import HostDirectoryShare
 from palimpsest_local.runtime_types import (
     CloudImageInspectDetail,
     DispatchKey,
@@ -192,6 +196,143 @@ def test_compose_down_preserves_volumes_unless_requested(
     assert cli.main(["compose", "--project-directory", str(tmp_path), "down"]) == 0
     assert cli.main(["compose", "--project-directory", str(tmp_path), "down", "--volumes"]) == 0
     assert calls == [False, True]
+
+
+@pytest.mark.parametrize("command", [["stop"], ["down"], ["down", "--volumes"]])
+@pytest.mark.parametrize("source_kind", ["absent", "symlink", "file"])
+def test_public_compose_teardown_ignores_vanished_source_and_only_deletes_owned_volumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+    source_kind: str,
+) -> None:
+    source = tmp_path / "host-data"
+    source.mkdir()
+    project_file = tmp_path / "palimpsest.yml"
+    project_file.write_text(
+        f"""name: demo
+volumes:
+  data: {{size: 1GiB}}
+  foreign: {{external: true}}
+services:
+  api:
+    image: {_IMAGE}
+    volumes:
+      - data:/var/lib/data
+      - type: bind
+        source: host-data
+        target: /srv/shared
+""",
+        encoding="utf-8",
+    )
+    owned_volume = tmp_path / "owned-volume.raw"
+    foreign_volume = tmp_path / "foreign-volume.raw"
+    foreign_volume.write_bytes(b"foreign data")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_bytes(b"external data")
+    runs: dict[str, dict[str, object]] = {}
+    effects: list[tuple[str, str]] = []
+    loaded: list[object] = []
+
+    def prepare(items):
+        owned_volume.write_bytes(b"owned data")
+        return (ManagedVolume("data", "kvm", 1024**3),)
+
+    def start(item, *, expected_identity=None):
+        name = item.plan.run_name
+        runs[name] = {"owner": {"run_id": str(uuid.uuid4())}, "state": {"status": "running", "backend": "kvm"}}
+
+    def stop(name, *, expected_identity=None):
+        assert expected_identity.run_id == runs[name]["owner"]["run_id"]
+        effects.append(("stop", name))
+        runs[name]["state"]["status"] = "stopped"
+
+    def remove(name, *, expected_identity=None):
+        assert expected_identity.run_id == runs[name]["owner"]["run_id"]
+        effects.append(("remove", name))
+        del runs[name]
+
+    def remove_volume(project_name, volume_name, backend, size_bytes):
+        assert (project_name, volume_name, backend, size_bytes) == ("demo", "data", "kvm", 1024**3)
+        effects.append(("remove-volume", volume_name))
+        owned_volume.unlink()
+
+    callbacks = ProjectCallbacks(
+        inspect=runs.get,
+        resolve=lambda *_args: None,
+        start=start,
+        stop=stop,
+        remove=remove,
+        prepare=prepare,
+        remove_volume=remove_volume,
+    )
+
+    def build_callbacks(project, *_args):
+        loaded.append(project)
+        return callbacks
+
+    monkeypatch.setattr(cli, "_compose_callbacks", build_callbacks)
+    base = ["compose", "--project-directory", str(tmp_path)]
+    assert cli.main([*base, "up"]) == 0
+    source.rmdir()
+    if source_kind == "symlink":
+        source.symlink_to(outside, target_is_directory=True)
+    elif source_kind == "file":
+        source.write_bytes(b"not a directory")
+    monkeypatch.setattr(HostDirectoryShare, "validate_source", lambda *_args: pytest.fail("cleanup inspected source"))
+    monkeypatch.setattr(
+        project_model, "_safe_project_path", lambda *_args, **_kwargs: pytest.fail("cleanup followed source")
+    )
+
+    assert cli.main([*base, *command]) == 0
+    roots = state.resolve_roots()
+    ledger = read_project_state(loaded[-1], roots)
+    assert ledger is not None
+    if command == ["stop"]:
+        assert effects == [("stop", "demo-api-1")]
+        assert set(ledger.services) == {"api"}
+        assert runs["demo-api-1"]["state"]["status"] == "stopped"
+    else:
+        assert effects[:2] == [("stop", "demo-api-1"), ("remove", "demo-api-1")]
+        assert not ledger.services
+        assert not runs
+    if "--volumes" in command:
+        assert effects[-1] == ("remove-volume", "data")
+        assert not owned_volume.exists()
+        assert not ledger.volumes
+    else:
+        assert owned_volume.read_bytes() == b"owned data"
+        assert set(ledger.volumes) == {"data"}
+    assert foreign_volume.read_bytes() == b"foreign data"
+    assert sentinel.read_bytes() == b"external data"
+    if source_kind == "absent":
+        assert not source.exists()
+    elif source_kind == "symlink":
+        assert source.is_symlink()
+    else:
+        assert source.read_bytes() == b"not a directory"
+
+
+def test_public_compose_config_still_validates_live_bind_source(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "palimpsest.yml").write_text(
+        f"""services:
+  api:
+    image: {_IMAGE}
+    volumes:
+      - type: bind
+        source: missing
+        target: /srv/shared
+""",
+        encoding="utf-8",
+    )
+    assert cli.main(["compose", "--project-directory", str(tmp_path), "config", "--quiet"]) == 1
+    assert "cannot access path" in capsys.readouterr().err
+    assert not (tmp_path / "missing").exists()
 
 
 def test_compose_ps_json_uses_logical_service_names(

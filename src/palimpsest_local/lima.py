@@ -155,6 +155,8 @@ def validate_network(name: str) -> None:
 
 
 def _lima_config(spec: RunSpec, *, run_id: str | None = None) -> str:
+    if spec.host_shares:
+        raise ArtifactValidationError("host directory binds require the conventional Linux KVM cloud-image backend")
     image_uri = spec.stack.base.local_path.resolve().as_uri()
     lines = [
         'minimumLimaVersion: "2.0.0"',
@@ -556,6 +558,8 @@ def _guest_ipv4(name: str) -> str:
 
 def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: float = _TIMEOUT_SECONDS) -> dict[str, Any]:
     """Create and start a verified ARM64 Ubuntu cloud image through Lima VZ."""
+    if spec.host_shares:
+        raise ArtifactValidationError("host directory binds require the conventional Linux KVM cloud-image backend")
     if not available():
         raise LifecycleError("native Lima VZ runs require macOS on Apple Silicon")
     if spec.stack.base.arch != "aarch64":

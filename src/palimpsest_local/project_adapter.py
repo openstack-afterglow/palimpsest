@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import kvm, lima, runtime_dispatch, state
+from . import cloud_runtime, kvm, lima, runtime_dispatch, state
 from .digest import digest_file, require_file_digest
 from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
@@ -40,7 +40,7 @@ from .project_volumes import (
     verify_kvm_volume,
     verify_lima_volume,
 )
-from .refs import PortForward, RunSpec, StackRef, VolumeAttachment
+from .refs import HostDirectoryShare, PortForward, RunSpec, StackRef, VolumeAttachment
 from .runtime_types import ExpectedRunIdentity, PreflightReport, ResolvedRunRequest, RunVolumeIntent
 
 _MIB = 1024 * 1024
@@ -134,7 +134,9 @@ def _inspect_run(name: str, roots: state.StatePaths) -> object | None:
 
 
 def _volume_use_counts(project: Project) -> Counter[str]:
-    return Counter(mount.source for service in project.services.values() for mount in service.volumes)
+    return Counter(
+        mount.source for service in project.services.values() for mount in service.volumes if mount.type == "volume"
+    )
 
 
 def _applied_reservations(
@@ -345,6 +347,14 @@ def build_project_callbacks(
                 else None
             ),
         }
+        host_shares = [
+            {"host_path": str(mount.source_path), "mount_path": mount.target, "read_only": mount.read_only}
+            for mount in service.volumes
+            if mount.type == "bind"
+        ]
+        if host_shares:
+            # Absolute execution policy belongs in the hash, not canonical YAML.
+            fingerprint_payload["host_shares"] = host_shares
         encoded = json.dumps(
             fingerprint_payload,
             sort_keys=True,
@@ -388,11 +398,16 @@ def build_project_callbacks(
             ports=ports,
             environment=inputs.environment,
             cloud_init=inputs.cloud_init,
+            host_shares=tuple(
+                HostDirectoryShare(project.root, mount.source, mount.target, mount.read_only)
+                for mount in service.volumes
+                if mount.type == "bind"
+            ),
         )
         request = runtime_dispatch.resolve_run_request(
             logical_spec,
             requested_backend=provisional.dispatch_key.backend.value,
-            require_volume_binding=bool(service.volumes),
+            require_volume_binding=any(mount.type == "volume" for mount in service.volumes),
             volume_intents=tuple(
                 RunVolumeIntent(
                     project.volumes[mount.source].name,
@@ -401,6 +416,7 @@ def build_project_callbacks(
                     mount.read_only,
                 )
                 for mount in service.volumes
+                if mount.type == "volume"
             ),
         )
         if request.dispatch_key != provisional.dispatch_key:
@@ -484,7 +500,7 @@ def build_project_callbacks(
                     format=False,
                 )
                 for mount in item.service.volumes
-                if not project.volumes[mount.source].external
+                if mount.type == "volume" and not project.volumes[mount.source].external
             )
         spec = RunSpec(
             name=item.plan.run_name,
@@ -499,8 +515,27 @@ def build_project_callbacks(
         )
         if resolved.backend == "lima-vz":
             lima.validate_run_spec(spec)
-        elif len(resolved.stack.layers) + len(item.service.volumes) > kvm.MAX_LAYER_DISKS:
+        elif (
+            len(resolved.stack.layers) + sum(mount.type == "volume" for mount in item.service.volumes)
+            > kvm.MAX_LAYER_DISKS
+        ):
             raise ArtifactValidationError(f"combined layer and volume count exceeds limit {kvm.MAX_LAYER_DISKS}")
+
+    def _preflight_applied_host_shares(item: PreparedService, record: dict, backend: str) -> None:
+        shares = cloud_runtime._applied_host_shares(record)
+        cloud_runtime._validate_host_share_paths(
+            shares, roots, cloud_runtime._applied_host_artifact_paths(record, shares)
+        )
+        if shares:
+            if backend != "kvm":
+                raise StateError("preserved host binds require the conventional Linux KVM backend")
+            binary = record.get("virtiofsd")
+            if not isinstance(binary, str) or not Path(binary).is_absolute():
+                raise StateError("preserved run virtiofsd identity is malformed")
+            if item.plan.action != "noop":
+                kvm.preflight_host_share_support(
+                    read_only=any(share.read_only for share in shares), binary=Path(binary)
+                )
 
     def _preflight_preserved_service(
         item: PreparedService,
@@ -512,6 +547,11 @@ def build_project_callbacks(
         backend = record.get("backend", "kvm")
         if backend not in {"kvm", "lima-vz", "libvirt-hvf"}:
             raise StateError(f"owned run has unsupported backend {backend!r}")
+        _preflight_applied_host_shares(item, record, backend)
+        if item.plan.action == "noop":
+            # Retaining a running VM only requires its applied export policy;
+            # do not probe launch tools or unrelated restart prerequisites.
+            return
         network = record.get("network")
         if not isinstance(network, str) or not network:
             raise StateError("owned run is missing its preserved network binding")
@@ -579,6 +619,17 @@ def build_project_callbacks(
     ) -> None:
         volume_claims: dict[str, str] = {}
         port_claims: list[PublishedPort] = []
+        share_claims: list[tuple[Path, str]] = []
+
+        def reserve_share(source: Path, service_name: str) -> None:
+            for existing, owner in share_claims:
+                if owner != service_name and (
+                    source == existing or source in existing.parents or existing in source.parents
+                ):
+                    raise ArtifactValidationError(
+                        f"host bind for service {service_name!r} overlaps an applied bind for service {owner!r}"
+                    )
+            share_claims.append((source, service_name))
 
         def reserve_volume(name: str, service_name: str) -> None:
             owner = volume_claims.get(name)
@@ -616,6 +667,11 @@ def build_project_callbacks(
                 run_name=run_name,
                 backend=expected_backend,
             )
+            # Applied policies reserve lexical paths even after their sources
+            # disappear. Physical validation belongs to live retain/restart,
+            # not reservation decoding for replacement or cleanup.
+            for share in cloud_runtime._applied_host_shares(record):
+                reserve_share(share.host_path, service_name)
             for volume_name in applied_volumes:
                 managed_volume = ledger_volumes.get(volume_name)
                 if managed_volume is None or managed_volume.backend != expected_backend:
@@ -630,6 +686,12 @@ def build_project_callbacks(
             if item.plan.preserve_config:
                 continue
             for mount in item.service.volumes:
+                if mount.type == "bind":
+                    if mount.source_path is None:
+                        raise StateError("host bind source was not structurally parsed")
+                    reserve_share(mount.source_path, item.service.name)
+                if mount.type != "volume":
+                    continue
                 volume = project.volumes[mount.source]
                 if not volume.external:
                     reserve_volume(volume.name, item.service.name)
@@ -660,9 +722,17 @@ def build_project_callbacks(
             if item.plan.preserve_config:
                 _preflight_preserved_service(item, ledger_volumes, checked_networks)
                 continue
+            if item.plan.action == "start":
+                record = state.read_run_state(state.run_paths(roots, item.plan.run_name))
+                _preflight_applied_host_shares(item, record, record.get("backend", "kvm"))
             resolved = item.resolved
             if not isinstance(resolved, ResolvedProjectService):
                 raise LifecycleError("project resolver returned an invalid service payload")
+            cloud_runtime._validate_host_share_paths(
+                resolved.request.spec.host_shares,
+                roots,
+                (resolved.stack.base.local_path, *(layer.local_path for layer in resolved.stack.layers)),
+            )
             _verify_stack(item, resolved)
             _reject_lima_owned_paths(item, resolved)
             _reject_guest_path_overlaps(item, resolved)
@@ -675,13 +745,17 @@ def build_project_callbacks(
             if resolved.backend in {"kvm", "libvirt-hvf"} and item.plan.action == "create":
                 kvm.validate_domain_name_available(item.plan.run_name)
             if resolved.backend in {"kvm", "libvirt-hvf"}:
-                external = [mount.source for mount in item.service.volumes if project.volumes[mount.source].external]
+                external = [
+                    mount.source
+                    for mount in item.service.volumes
+                    if mount.type == "volume" and project.volumes[mount.source].external
+                ]
                 if external:
                     raise ArtifactValidationError(
                         "external KVM block-volume lookup is not implemented: " + ", ".join(sorted(external))
                     )
             if resolved.backend == "lima-vz" and any(
-                project.volumes[mount.source].external for mount in item.service.volumes
+                project.volumes[mount.source].external for mount in item.service.volumes if mount.type == "volume"
             ):
                 raise ArtifactValidationError(
                     "external Lima volumes are disabled in v1 because their filesystem/label contract cannot be "
@@ -697,6 +771,8 @@ def build_project_callbacks(
                     raise ArtifactValidationError(f"unsupported project backend: {resolved.backend!r}")
                 checked_networks.add(network_key)
             for mount in item.service.volumes:
+                if mount.type != "volume":
+                    continue
                 volume = project.volumes[mount.source]
                 if volume.external:
                     continue
@@ -776,6 +852,8 @@ def build_project_callbacks(
                 if not isinstance(resolved, ResolvedProjectService):
                     raise LifecycleError("project resolver returned an invalid service payload")
                 for mount in item.service.volumes:
+                    if mount.type != "volume":
+                        continue
                     volume = project.volumes[mount.source]
                     if volume.external:
                         continue
@@ -847,6 +925,8 @@ def build_project_callbacks(
             raise StateError("project volumes were not prepared before service start")
         result: list[VolumeAttachment] = []
         for mount in item.service.volumes:
+            if mount.type != "volume":
+                continue
             volume = project.volumes[mount.source]
             cached = attachment_cache.get((item.service.name, volume.name))
             if cached is None:
@@ -874,7 +954,7 @@ def build_project_callbacks(
         if logical_preflight is None or logical_preflight[0] is not resolved.request:
             raise StateError("project run request was not preflighted before volume preparation")
         logical_request, preflight = logical_preflight
-        if item.service.volumes:
+        if logical_request.volume_intents:
             spec = replace(logical_request.spec, volumes=attachments(item, resolved))
             binding_receipt = runtime_dispatch._issue_volume_binding_receipt(
                 logical_request,

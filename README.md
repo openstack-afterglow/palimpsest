@@ -131,6 +131,17 @@ while source builds use the configured reviewed immutable checkout SHA. Verify
 both Hub images are published before deployment; the root package version does not automatically
 set the independent Hub Python distribution version.
 
+For a dedicated public Hub hostname, set `palimpsest_public_endpoint_url` to its
+HTTPS origin and opt in with `palimpsest_public_haproxy_enabled: true`.
+`palimpsest_public_haproxy_fqdn` derives only from an exact HTTPS hostname origin
+(optional trailing slash, no port/path/query/fragment/credentials); otherwise
+the default is empty and public routing is disabled even in HAProxy-only plays.
+An explicit hostname override must still match the origin. Existing DNS and external TLS/certificate
+configuration are required. Updated Afterglow Kolla roles also project this
+explicit endpoint into `services.palimpsest_internal_url`; the separate Hub
+package public origin/reader/protection settings are unchanged. See
+[`docs/install.md`](docs/install.md) for the deployment boundary.
+
 A repository tag labels both `ghcr.io/openstack-afterglow/palimpsest-hub-api`
 and `ghcr.io/openstack-afterglow/palimpsest-hub-worker` with tags derived from
 that repository tag, not from the independent Hub wheel version. The

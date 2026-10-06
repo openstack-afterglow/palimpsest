@@ -6,7 +6,9 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ from .oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
 from .oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
 from .oci_network import OCINetworkConfig
 from .platforms import DomainProfile
+from .refs import HostDirectoryShare
 
 _logger = logging.getLogger(__name__)
 _DOMAIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -98,6 +101,8 @@ class DomainSpec:
     control_socket: Path | None = None
     ssh_host_port: int | None = None
     nvram: Path | None = None
+    host_shares: tuple[HostDirectoryShare, ...] = ()
+    virtiofsd: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,8 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
         raise KvmError("vcpus is outside the supported range")
     if len(spec.layers) + len(spec.volumes) > MAX_LAYER_DISKS:
         raise KvmError("layer and volume count exceeds disk limit")
+    if spec.host_shares and (profile.backend != "kvm" or profile.domain_type != "kvm"):
+        raise KvmError("host directory binds require the conventional Linux KVM cloud-image backend")
 
     domain_attrib = {"type": profile.domain_type}
     if profile.network_mode == "user-hostfwd":
@@ -203,6 +210,10 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
     ET.SubElement(domain, "name").text = spec.name
     ET.SubElement(domain, "memory", {"unit": "MiB"}).text = str(spec.memory_mib)
     ET.SubElement(domain, "vcpu").text = str(spec.vcpus)
+    if spec.host_shares:
+        backing = ET.SubElement(domain, "memoryBacking")
+        ET.SubElement(backing, "source", {"type": "memfd"})
+        ET.SubElement(backing, "access", {"mode": "shared"})
     os_attrib = {"firmware": "efi"} if profile.autoselect_firmware else {}
     os_element = ET.SubElement(domain, "os", os_attrib)
     ET.SubElement(os_element, "type", {"arch": profile.arch, "machine": profile.machine}).text = "hvm"
@@ -246,6 +257,20 @@ def build_domain_xml(spec: DomainSpec, profile: DomainProfile) -> str:
         seen_serials.add(volume.serial)
         disk = _disk(devices, volume.host_path, volume.target_dev, "raw", readonly=volume.read_only)
         ET.SubElement(disk, "serial").text = volume.serial
+    seen_tags: set[str] = set()
+    for share in spec.host_shares:
+        share.validate_source()
+        if share.guest_tag in seen_tags:
+            raise KvmError("duplicate virtiofs guest tag")
+        seen_tags.add(share.guest_tag)
+        filesystem = ET.SubElement(devices, "filesystem", {"type": "mount", "accessmode": "passthrough"})
+        ET.SubElement(filesystem, "driver", {"type": "virtiofs", "queue": "1024"})
+        if spec.virtiofsd is not None:
+            ET.SubElement(filesystem, "binary", {"path": str(spec.virtiofsd)})
+        ET.SubElement(filesystem, "source", {"dir": str(share.host_path)})
+        ET.SubElement(filesystem, "target", {"dir": share.guest_tag})
+        if share.read_only:
+            ET.SubElement(filesystem, "readonly")
     if profile.seed_bus == "scsi":
         ET.SubElement(devices, "controller", {"type": "scsi", "index": "0", "model": "virtio-scsi"})
     _disk(devices, spec.seed_iso, "sda", "raw", readonly=True, device="cdrom", bus=profile.seed_bus)
@@ -547,6 +572,40 @@ def run_hdiutil_seed_iso(seed_iso: Path, seed_dir: Path) -> None:
         raise KvmError("hdiutil is unavailable; macOS libvirt runs require hdiutil") from exc
     except subprocess.CalledProcessError as exc:
         raise KvmError(f"seed ISO creation failed: {exc.stderr.decode(errors='replace')[:200]}") from exc
+
+
+def preflight_host_share_support(*, read_only: bool = False, binary: Path | None = None) -> Path:
+    """Read-only host checks before any managed volume or run mutation."""
+    if sys.platform != "linux":
+        raise KvmUnavailable("host directory binds require Linux KVM, not Lima, HVF, or OCI-root")
+    candidates = (
+        [str(binary)]
+        if binary is not None
+        else [shutil.which("virtiofsd"), "/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd"]
+    )
+    binary = next(
+        (Path(path) for path in candidates if path and Path(path).is_file() and os.access(path, os.X_OK)), None
+    )
+    if binary is None or not binary.is_absolute():
+        raise KvmUnavailable("host directory binds require an installed executable virtiofsd")
+    connection = connect("qemu:///system")
+    try:
+        minimum = 11_000_000 if read_only else 6_009_000
+        if connection.getLibVersion() < minimum:
+            version = "11.0.0" if read_only else "6.9.0"
+            raise KvmUnavailable(f"host directory binds require libvirt >= {version}")
+        if connection.getVersion() < 5_000_000:
+            raise KvmUnavailable("host directory binds require QEMU >= 5.0.0 for shared memfd memory")
+    finally:
+        connection.close()
+    if read_only:
+        try:
+            result = subprocess.run([str(binary), "--help"], capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise KvmUnavailable("cannot verify virtiofsd read-only support") from exc
+        if result.returncode != 0 or "--readonly" not in result.stdout:
+            raise KvmUnavailable("read-only host binds require virtiofsd >= 1.13.0 with --readonly support")
+    return binary
 
 
 def _libvirt() -> Any:

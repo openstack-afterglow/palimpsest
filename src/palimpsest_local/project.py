@@ -28,7 +28,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from .digest import InvalidDigestError, require_digest
-from .errors import PalimpsestError
+from .errors import ArtifactValidationError, PalimpsestError
 
 DEFAULT_PROJECT_FILE = "palimpsest.yml"
 PROJECT_SCHEMA_VERSION = "1"
@@ -944,6 +944,8 @@ def _parse_mount(
     volumes: Mapping[str, VolumeSpec],
     context: str,
     environment: Mapping[str, str] | None,
+    *,
+    validate_bind_sources: bool,
 ) -> MountSpec:
     if isinstance(raw, str):
         resolved_mount = _resolved_string(raw, context, environment)
@@ -955,7 +957,9 @@ def _parse_mount(
         if mode not in {"ro", "rw"}:
             raise ProjectError(f"{context} mount mode must be ro or rw")
         read_only = mode == "ro"
-        mount_type = "bind" if source.startswith(".") else "volume"
+        if source.startswith(".") or "/" in source:
+            raise ProjectError(f"{context} host binds require explicit long form with type: bind")
+        mount_type = "volume"
     else:
         config = _mapping(raw, context)
         _only_keys(config, {"type", "source", "target", "read_only"}, context)
@@ -973,7 +977,20 @@ def _parse_mount(
         if volume_name not in volumes:
             raise ProjectError(f"{context} references undefined top-level volume {volume_name!r}")
         return MountSpec("volume", volume_name, guest_target, read_only)
-    raise ProjectError(f"{context}.type bind is unsupported; use a named top-level block volume")
+    from .refs import HostDirectoryShare
+
+    try:
+        share = HostDirectoryShare(root, source, guest_target, read_only)
+    except ArtifactValidationError as exc:
+        raise ProjectError(f"{context}.source: {exc}") from exc
+    if validate_bind_sources:
+        try:
+            _safe_project_path(root, source, f"{context}.source", kind="directory")
+        except ProjectError as exc:
+            raise ProjectError(
+                f"{exc}; virtiofs requires existing directories; dedicated host file binds are unsupported"
+            ) from exc
+    return MountSpec("bind", source, guest_target, read_only, share.host_path)
 
 
 def _port_number(value: Any, context: str) -> int:
@@ -1251,6 +1268,8 @@ def _parse_service(
     networks: Mapping[str, NetworkSpec],
     volumes: Mapping[str, VolumeSpec],
     environment: Mapping[str, str] | None,
+    *,
+    validate_bind_sources: bool,
 ) -> ServiceSpec:
     context = f"services.{name}"
     config = _mapping(raw, context)
@@ -1327,7 +1346,14 @@ def _parse_service(
     if not isinstance(raw_mounts, list):
         raise ProjectError(f"{context}.volumes must be a sequence")
     mounts = tuple(
-        _parse_mount(item, root, volumes, f"{context}.volumes[{index}]", environment)
+        _parse_mount(
+            item,
+            root,
+            volumes,
+            f"{context}.volumes[{index}]",
+            environment,
+            validate_bind_sources=validate_bind_sources,
+        )
         for index, item in enumerate(raw_mounts)
     )
     targets = [mount.target for mount in mounts]
@@ -1425,6 +1451,24 @@ def _validate_host_port_collisions(services: Mapping[str, ServiceSpec]) -> None:
             claimed.append((port, name))
 
 
+def _validate_bind_source_overlaps(services: Mapping[str, ServiceSpec]) -> None:
+    claimed: list[tuple[Path, str]] = []
+    for name in sorted(services):
+        for mount in services[name].volumes:
+            if mount.type != "bind":
+                continue
+            source = mount.source_path
+            if source is None:
+                raise ProjectError(f"service {name!r} bind source was not validated")
+            for existing, owner in claimed:
+                if source == existing or source in existing.parents or existing in source.parents:
+                    raise ProjectError(
+                        f"bind sources for services {owner!r} and {name!r} overlap; "
+                        "use disjoint directories so writable exports cannot alter a read-only source"
+                    )
+            claimed.append((source, name))
+
+
 def deterministic_project_name(
     project_file: Path,
     declared_name: str | None = None,
@@ -1475,6 +1519,7 @@ def parse_project_document(
     source: Path,
     environment: Mapping[str, str] | None = None,
     project_root: Path | None = None,
+    validate_bind_sources: bool = True,
 ) -> Project:
     """Validate a decoded project mapping and return the normalized model.
 
@@ -1482,6 +1527,11 @@ def parse_project_document(
     and typed cloud-init values intentionally remain templates for execution-time
     resolution so credentials never enter canonical project state.  Single-quoted
     YAML strings are literal.  Mapping keys are never interpolated.
+
+    Bind sources are structurally parsed in every mode. Configuration validation
+    also checks existing non-symlink directories by default; lifecycle callers
+    disable that check and validate only the sources they will use at preflight.
+    Other project-file validation is unaffected.
     """
 
     root_config = _mapping(document, "project")
@@ -1517,9 +1567,18 @@ def parse_project_document(
     services: dict[str, ServiceSpec] = {}
     for raw_name, raw_service in raw_services.items():
         name = _name(raw_name, f"service name {raw_name!r}")
-        services[name] = _parse_service(name, raw_service, root, networks, volumes, environment)
+        services[name] = _parse_service(
+            name,
+            raw_service,
+            root,
+            networks,
+            volumes,
+            environment,
+            validate_bind_sources=validate_bind_sources,
+        )
     _validate_dependencies(services)
     _validate_host_port_collisions(services)
+    _validate_bind_source_overlaps(services)
     return Project(
         version=version,
         name=project_name,
@@ -1537,14 +1596,16 @@ def parse_project_text(
     source: Path,
     environment: Mapping[str, str] | None = None,
     project_root: Path | None = None,
+    validate_bind_sources: bool = True,
 ) -> Project:
-    """Parse and normalize project YAML text."""
+    """Parse project YAML; bind-source physical validation defaults to enabled."""
 
     return parse_project_document(
         parse_yaml_subset(text),
         source=source,
         environment=environment,
         project_root=project_root,
+        validate_bind_sources=validate_bind_sources,
     )
 
 
@@ -1553,6 +1614,7 @@ def load_project(
     environment: Mapping[str, str] | None = None,
     *,
     project_root: Path | None = None,
+    validate_bind_sources: bool = True,
 ) -> Project:
     """Load a regular, non-symlink project file and normalize its structure.
 
@@ -1561,6 +1623,10 @@ def load_project(
     and typed cloud-init values remain validated templates; their required-variable
     checks happen only in :func:`resolve_service_environment` and
     :func:`resolve_cloud_init` immediately before ``up`` creates a runtime.
+
+    ``validate_bind_sources=False`` parses lexical bind policies without inspecting
+    their sources. Teardown and observation use that mode; ``up`` explicitly checks
+    desired or retained sources during its mutation-free preflight instead.
     """
 
     raw_path = Path(path).expanduser()
@@ -1586,6 +1652,7 @@ def load_project(
         source=resolved_path,
         environment=active_environment,
         project_root=project_root,
+        validate_bind_sources=validate_bind_sources,
     )
 
 

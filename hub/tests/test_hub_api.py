@@ -636,6 +636,25 @@ async def _import_bundle_over_http(payload: bytes):
         app.dependency_overrides.clear()
 
 
+@pytest.mark.asyncio
+async def test_bundle_import_rejects_excess_urlencoded_fields_before_identity():
+    identity_calls = []
+
+    async def identity(request: Request):
+        identity_calls.append(request)
+        return {"project_id": "alpha", "user_id": "member"}
+
+    app.dependency_overrides[hub_api._legacy_writer] = identity
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/bundles/import", data={f"field-{index}": "x" for index in range(1001)})
+        assert response.status_code == 400
+        assert "fields" in response.json()["detail"].lower()
+        assert identity_calls == []
+    finally:
+        app.dependency_overrides.clear()
+
+
 async def _prepared_hub(tmp_path: Path, name: str, store: LocalPathBlobStore, monkeypatch: pytest.MonkeyPatch):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / name}")
     async with engine.begin() as connection:

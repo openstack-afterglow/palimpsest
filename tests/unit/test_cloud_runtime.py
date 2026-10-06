@@ -43,7 +43,7 @@ from palimpsest_local.errors import (
     LifecycleError,
     StateError,
 )
-from palimpsest_local.refs import ImageRef, LayerRef, PortForward, RunSpec, StackRef
+from palimpsest_local.refs import HostDirectoryShare, ImageRef, LayerRef, PortForward, RunSpec, StackRef
 from palimpsest_local.runtime_types import ExecRequest
 
 
@@ -1400,7 +1400,8 @@ def test_commit_tag_conflict(tmp_path: Path):
         commit("conflict-run", "conflict-commit", roots=roots, conn=conn, runner=fake_runner)
 
 
-def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
+@pytest.mark.parametrize("share_mode", [None, False, True])
+def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path, share_mode: bool | None):
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
 
     base_file = roots.store / "base.qcow2"
@@ -1410,7 +1411,14 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
 
     base_ref = ImageRef(base_digest, "qcow2", "x86_64", None, base_file)
     stack = StackRef(base_ref, ())
-    spec = RunSpec(name="ledger-fields-run", stack=stack, memory_mib=2048, vcpus=4)
+    directory = tmp_path / "host-data"
+    directory.mkdir()
+    content = directory / "sentinel"
+    content.write_text("external data", encoding="utf-8")
+    shares = (
+        () if share_mode is None else (HostDirectoryShare(tmp_path.resolve(), "host-data", "/srv/data", share_mode),)
+    )
+    spec = RunSpec(name="ledger-fields-run", stack=stack, memory_mib=2048, vcpus=4, host_shares=shares)
 
     conn = FakeLibvirtConn()
 
@@ -1440,7 +1448,10 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
             return MagicMock(stdout="", stderr="", returncode=0)
         return MagicMock(stdout="", stderr="", returncode=0)
 
-    with patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run):
+    with (
+        patch("palimpsest_local.cloud_runtime.subprocess.run", side_effect=fake_subprocess_run),
+        patch("palimpsest_local.kvm.preflight_host_share_support", return_value=Path("/usr/libexec/virtiofsd")),
+    ):
         res = run(spec, roots=roots, conn=conn)
 
     assert res["backend"] == platforms.BACKEND_KVM
@@ -1448,6 +1459,35 @@ def test_run_writes_backend_memory_vcpus_and_ssh_ledger_fields(tmp_path: Path):
     assert res["vcpus"] == 4
     assert res["guest_ip"] == "192.168.122.100"
     assert res["ssh"] == {"host": "192.168.122.100", "port": 22}
+    persisted = state.read_run_state(state.run_paths(roots, spec.name))
+    assert persisted["host_shares"] == runtime._host_share_records(shares)
+    assert runtime._applied_host_shares(persisted) == shares
+    if shares:
+        assert persisted["host_shares"][0]["read_only"] is share_mode
+        assert persisted["host_shares"][0]["guest_tag"] == shares[0].guest_tag
+        assert persisted["virtiofsd"] == "/usr/libexec/virtiofsd"
+    rm(spec.name, roots=roots, conn=conn, volumes=True)
+    assert content.read_text(encoding="utf-8") == "external data"
+    assert directory.is_dir()
+
+
+def test_host_share_cannot_export_owned_state_tree(tmp_path: Path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    share = HostDirectoryShare(tmp_path.resolve(), str(roots.state.relative_to(tmp_path.resolve())), "/srv/shared")
+    with pytest.raises(ArtifactValidationError, match="owned state"):
+        runtime._validate_host_share_paths((share,), roots)
+
+
+@pytest.mark.parametrize(
+    "field, value", [("guest_tag", "wrong-tag"), ("host_path", "/other/source"), ("read_only", "true")]
+)
+def test_applied_host_share_identity_rejects_inconsistent_records(tmp_path: Path, field: str, value: str):
+    (tmp_path / "shared").mkdir()
+    share = HostDirectoryShare(tmp_path.resolve(), "shared", "/srv/shared", True)
+    record = runtime._host_share_records((share,))[0]
+    record[field] = value
+    with pytest.raises(StateError, match="host share identity"):
+        runtime._applied_host_shares({"host_shares": [record]})
 
 
 def _hvf_test_profile(tmp_path: Path, *, with_firmware: bool = True) -> platforms.DomainProfile:
@@ -2017,3 +2057,126 @@ def test_single_run_reconcile_does_not_swallow_state_write_failure(
 
     with pytest.raises(OSError, match="disk full"):
         runtime.reconcile_run("write-failure", roots=roots, conn=FakeLibvirtConn(), _expected_record=expected)
+
+
+@pytest.mark.parametrize("tamper", ["missing-policy", "empty-policy", "extra-device", "changed-daemon"])
+def test_restart_rejects_every_unrecorded_filesystem_before_mutation(tmp_path, monkeypatch, tamper):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    (tmp_path / "shared").mkdir()
+    share = HostDirectoryShare(tmp_path.resolve(), "shared", "/srv/shared")
+    rpaths = state.run_paths(roots, "share-restart")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    record = {
+        "backend": "kvm",
+        "base": {"arch": "x86_64", "local_path": str(tmp_path / "immutable.img")},
+        "layers": [],
+        "network": "none",
+        "host_shares": runtime._host_share_records((share,)),
+        "virtiofsd": "/usr/libexec/virtiofsd",
+    }
+    if tamper == "missing-policy":
+        record.pop("host_shares")
+    elif tamper == "empty-policy":
+        record["host_shares"] = []
+    state.write_run_state(rpaths, status="stopped", data=record)
+    rpaths.console.write_bytes(b"previous-boot-console\n")
+    daemon = "/unverified/virtiofsd" if tamper == "changed-daemon" else record["virtiofsd"]
+    filesystem = (
+        '<filesystem type="mount" accessmode="passthrough"><driver type="virtiofs"/>'
+        f'<binary path="{daemon}"/><source dir="{share.host_path}"/>'
+        f'<target dir="{share.guest_tag}"/></filesystem>'
+    )
+    if tamper == "extra-device":
+        filesystem += (
+            '<filesystem type="mount"><driver type="path"/><source dir="/etc"/><target dir="foreign"/></filesystem>'
+        )
+    marker = (
+        f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner.run_id}" '
+        f'schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    )
+    conn = FakeLibvirtConn()
+    domain = conn.defineXML(
+        f"<domain><name>share-restart</name><metadata>{marker}</metadata><devices>{filesystem}</devices></domain>"
+    )
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), rpaths.console.read_bytes())
+    monkeypatch.setattr(
+        kvm, "preflight_host_share_support", lambda **_kwargs: pytest.fail("unrecorded export reached daemon preflight")
+    )
+    monkeypatch.setattr(runtime, "_wait_for_readiness", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(StateError):
+        start("share-restart", roots=roots, conn=conn)
+
+    assert not domain.isActive()
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), rpaths.console.read_bytes()) == before
+
+
+@pytest.mark.parametrize("artifact_kind", ["base", "layer"])
+def test_writable_host_share_cannot_expose_attached_artifacts_before_run_mutation(tmp_path, monkeypatch, artifact_kind):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    shared = tmp_path / "runtime"
+    shared.mkdir()
+    base = (shared if artifact_kind == "base" else tmp_path) / "base.img"
+    base.write_bytes(b"base")
+    layer = (shared if artifact_kind == "layer" else tmp_path) / "layer.squashfs"
+    layer.write_bytes(b"hsqs-layer")
+    stack = StackRef(
+        ImageRef(_sha256_file(base), "raw", "x86_64", None, base),
+        (LayerRef(_sha256_file(layer), "application/vnd.palimpsest.layer.v1.squashfs", layer),),
+    )
+    spec = RunSpec(
+        "unsafe-share", stack, host_shares=(HostDirectoryShare(tmp_path.resolve(), "runtime", "/srv/runtime"),)
+    )
+    profile = platforms.resolve_domain_profile("kvm", "x86_64")
+    monkeypatch.setattr(runtime, "_resolve_new_run_profile", lambda *args, **kwargs: (profile, profile.uri))
+    monkeypatch.setattr(
+        kvm, "preflight_host_share_support", lambda **kwargs: pytest.fail("artifact guard must precede daemon probing")
+    )
+    monkeypatch.setattr(
+        runtime, "create_and_validate_overlay", lambda *args, **kwargs: pytest.fail("must not prepare VM disks")
+    )
+    with pytest.raises(ArtifactValidationError, match="attached immutable"):
+        run(spec, roots=roots)
+    assert not state.run_paths(roots, spec.name).root.exists()
+    assert base.read_bytes() == b"base" and layer.read_bytes() == b"hsqs-layer"
+    read_only = HostDirectoryShare(tmp_path.resolve(), "runtime", "/srv/runtime", True)
+    runtime._validate_host_share_paths((read_only,), roots, (base, layer))
+    (tmp_path / "disjoint").mkdir()
+    runtime._validate_host_share_paths(
+        (HostDirectoryShare(tmp_path.resolve(), "disjoint", "/srv/data"),), roots, (base, layer)
+    )
+
+
+def test_restart_rejects_writable_share_of_applied_backing_artifact_before_mutation(tmp_path, monkeypatch):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    (tmp_path / "runtime").mkdir()
+    base = tmp_path / "runtime" / "base.img"
+    base.write_bytes(b"immutable")
+    share = HostDirectoryShare(tmp_path.resolve(), "runtime", "/srv/runtime")
+    rpaths = state.run_paths(roots, "unsafe-restart")
+    rpaths.root.mkdir()
+    owner = state.write_owner_record(rpaths)
+    state.write_run_state(
+        rpaths,
+        status="stopped",
+        data={
+            "backend": "kvm",
+            "base": {"arch": "x86_64", "local_path": str(base)},
+            "layers": [],
+            "network": "none",
+            "host_shares": runtime._host_share_records((share,)),
+            "virtiofsd": "/usr/libexec/virtiofsd",
+        },
+    )
+    rpaths.console.write_bytes(b"old console")
+    marker = f'<palimpsest:run xmlns:palimpsest="{kvm.DOMAIN_MARKER_NAMESPACE}" id="{owner.run_id}" schema="1" version="{kvm.DOMAIN_MARKER_VERSION}"/>'
+    conn = FakeLibvirtConn()
+    domain = conn.defineXML(f"<domain><name>unsafe-restart</name><metadata>{marker}</metadata><devices/></domain>")
+    before = rpaths.state.read_bytes(), rpaths.console.read_bytes()
+    monkeypatch.setattr(kvm, "preflight_host_share_support", lambda **kwargs: pytest.fail("guard before daemon"))
+    with pytest.raises(ArtifactValidationError, match="attached immutable"):
+        start("unsafe-restart", roots=roots, conn=conn)
+    assert not domain.isActive()
+    assert before == (rpaths.state.read_bytes(), rpaths.console.read_bytes())
+    assert base.read_bytes() == b"immutable"

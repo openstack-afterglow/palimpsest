@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
-from . import cloud_runtime, lima, log_stream, platforms, state
+from . import cloud_runtime, kvm, lima, log_stream, platforms, state
 from .errors import StateError
 from .oci_network import OCI_NETWORK_GUEST_ADDRESS
 from .oci_run_request import LocalOCIRunRequest
@@ -339,6 +339,8 @@ def resolve_run_request(
     backend = RuntimeBackend(platforms.select_backend(resolved_spec.stack.base.arch, requested=requested_backend))
     dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
     _validate_resolved_run_network(dispatch_key, resolved_spec.network)
+    if resolved_spec.host_shares and backend is not RuntimeBackend.KVM:
+        raise StateError("host directory binds require the conventional Linux KVM cloud-image backend")
     request = ResolvedRunRequest(
         dispatch_key=dispatch_key,
         spec=resolved_spec,
@@ -361,6 +363,10 @@ def preflight_run_request(
         raise TypeError("run preflight requires a ResolvedRunRequest")
     _require_run_request_provenance(request)
     _validate_resolved_run_network(request.dispatch_key, request.spec.network)
+    if request.spec.host_shares:
+        for share in request.spec.host_shares:
+            share.validate_source()
+        kvm.preflight_host_share_support(read_only=any(share.read_only for share in request.spec.host_shares))
     profile = platforms.capability_profile(
         request.dispatch_key,
         RuntimeOperation.RUN,
@@ -498,6 +504,7 @@ def bind_run_request_volumes(
         and logical.writable_overlay == final_spec.writable_overlay
         and logical.seed == final_spec.seed
         and logical.ports == final_spec.ports
+        and logical.host_shares == final_spec.host_shares
         and logical.environment == final_spec.environment
         and logical.cloud_init is final_spec.cloud_init
     )
@@ -532,6 +539,13 @@ def run(
         raise StateError("run request volumes have not been prepared")
     resolved_roots = roots or state.resolve_roots()
     require_run_preflight(request, preflight)
+    if request.spec.host_shares:
+        cloud_runtime._validate_host_share_paths(
+            request.spec.host_shares,
+            resolved_roots,
+            (request.spec.stack.base.local_path, *(layer.local_path for layer in request.spec.stack.layers)),
+        )
+        kvm.preflight_host_share_support(read_only=any(share.read_only for share in request.spec.host_shares))
     resolved_roots = state.init_resolved_roots(resolved_roots)
     if request.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
         raw_result = lima.run(request.spec, roots=resolved_roots)

@@ -1461,7 +1461,14 @@ def _load_compose_project(args: argparse.Namespace) -> tuple[Project, dict[str, 
     project_file = _compose_project_path(args, invocation_directory=invocation)
     project_root = _compose_project_directory(args, project_file, invocation_directory=invocation)
     environment = _compose_environment(project_root, args.env_file, invocation_directory=invocation)
-    project = load_project(project_file, environment=environment, project_root=project_root)
+    # Only config validates every desired source at load time. Up preflights
+    # selected live policies; teardown/observation must not inspect bind sources.
+    project = load_project(
+        project_file,
+        environment=environment,
+        project_root=project_root,
+        validate_bind_sources=args.compose_operation == "config",
+    )
     name_override = (
         args.project_name or environment.get("PALIMPSEST_PROJECT_NAME") or environment.get("COMPOSE_PROJECT_NAME")
     )

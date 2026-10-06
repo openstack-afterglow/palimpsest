@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import platforms, project_adapter, state
+from palimpsest_local import cli, platforms, project_adapter, project_runtime, state
 from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
 from palimpsest_local.oci_run_cleanup import OCIRunRemovalError
 from palimpsest_local.project import Project, load_project
@@ -508,6 +508,307 @@ services:
     assert spec.environment == (("APP_MODE", "development"),)
     assert spec.volumes[0].host_path == volume_path
     assert spec.volumes[0].mount_path == "/var/lib/data"
+
+
+@pytest.mark.parametrize("backend", ["kvm", "lima-vz", "libvirt-hvf"])
+def test_directory_share_is_not_prepared_or_owned_as_block_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+) -> None:
+    (tmp_path / "data").mkdir()
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: data
+        target: /srv/shared
+        read_only: true
+""",
+    )
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: backend)
+    monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
+    monkeypatch.setattr(project_adapter.kvm, "validate_domain_name_available", lambda _name: None)
+    monkeypatch.setattr(
+        project_adapter.kvm, "preflight_host_share_support", lambda **_kw: Path("/usr/libexec/virtiofsd")
+    )
+    monkeypatch.setattr(project_adapter, "ensure_kvm_volume", lambda *_args, **_kw: pytest.fail("bind is not owned"))
+    arch = "x86_64" if backend == "kvm" else "aarch64"
+    callbacks = project_adapter.build_project_callbacks(
+        project, _roots(tmp_path), lambda _service: _stack(tmp_path, arch=arch)
+    )
+    service = project.services["api"]
+    if backend != "kvm":
+        with pytest.raises(StateError, match="conventional Linux KVM"):
+            callbacks.resolve(project, service, "demo-api-1")
+        return
+    resolved = callbacks.resolve(project, service, "demo-api-1")
+    request = resolved.request
+    assert request.volume_intents == ()
+    assert request.attachments_bound is True
+    assert request.spec.volumes == ()
+    assert request.spec.host_shares[0].read_only is True
+    prepared = PreparedService(
+        project,
+        service,
+        ServicePlan("api", "demo-api-1", "create", "sha256:" + "b" * 64, None),
+        resolved,
+    )
+    callbacks.preflight((prepared,))
+    assert callbacks.prepare((prepared,)) == ()
+    assert (tmp_path / "data").is_dir()
+    changed = replace(
+        request, spec=replace(request.spec, host_shares=(replace(request.spec.host_shares[0], read_only=False),))
+    )
+    assert run_request_subject_digest(request) != run_request_subject_digest(changed)
+
+
+def test_bind_source_substitution_is_rejected_before_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from palimpsest_local.refs import HostDirectoryShare
+
+    root = tmp_path.resolve()
+    (root / "data").mkdir()
+    (root / "other").mkdir()
+    share = HostDirectoryShare(root, "data", "/srv/shared")
+    (root / "data").rmdir()
+    (root / "data").symlink_to(root / "other", target_is_directory=True)
+    with pytest.raises(ArtifactValidationError, match="symlink"):
+        share.validate_source()
+
+
+@pytest.mark.parametrize("applied_source_present", [True, False])
+def test_desired_bind_cannot_alias_another_applied_service_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    applied_source_present: bool,
+) -> None:
+    from palimpsest_local.refs import HostDirectoryShare
+
+    (tmp_path / "tree" / "readonly").mkdir(parents=True)
+    project = _project(
+        tmp_path,
+        f"""services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: tree
+        target: /srv/writable
+""",
+    )
+    roots = _roots(tmp_path)
+    rpaths = _write_run_ledger(roots, "existing-worker", backend="kvm")
+    record = state.read_run_state(rpaths)
+    record["host_shares"] = project_adapter.cloud_runtime._host_share_records(
+        (HostDirectoryShare(tmp_path.resolve(), "tree/readonly", "/srv/readonly", True),)
+    )
+    state.atomic_write_json(rpaths.state, record)
+    if not applied_source_present:
+        (tmp_path / "tree" / "readonly").rmdir()
+    ledger = SimpleNamespace(
+        volumes={},
+        services={
+            "worker": SimpleNamespace(
+                run_name="existing-worker",
+                run_id=record["run_id"],
+                backend="kvm",
+            )
+        },
+    )
+    monkeypatch.setattr(project_adapter, "read_project_state", lambda *_args: ledger)
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
+    service = project.services["api"]
+    prepared = PreparedService(
+        project,
+        service,
+        ServicePlan("api", "demo-api-1", "create", "sha256:" + "b" * 64, None),
+        callbacks.resolve(project, service, "demo-api-1"),
+    )
+    before = rpaths.state.read_bytes()
+    with pytest.raises(ArtifactValidationError, match="overlaps an applied bind"):
+        callbacks.preflight((prepared,))
+    assert rpaths.state.read_bytes() == before
+    assert (tmp_path / "tree" / "readonly").exists() is applied_source_present
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("host_path", "/wrong/source"),
+        ("source", "../escape"),
+        ("project_root", "/project/../escape"),
+        ("mount_path", "/srv/shared\nother"),
+    ],
+)
+def test_missing_applied_source_does_not_hide_malformed_reservation_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    from palimpsest_local.refs import HostDirectoryShare
+
+    project = _project(tmp_path, f"services:\n  api:\n    image: sha256:{'a' * 64}\n")
+    roots = _roots(tmp_path)
+    rpaths = _write_run_ledger(roots, "existing-worker", backend="kvm", status="running")
+    record = state.read_run_state(rpaths)
+    shares = project_adapter.cloud_runtime._host_share_records(
+        (HostDirectoryShare(tmp_path.resolve(), "absent-data", "/srv/shared"),)
+    )
+    shares[0][field] = value
+    record["host_shares"] = shares
+    state.atomic_write_json(rpaths.state, record)
+    ledger = SimpleNamespace(
+        volumes={},
+        services={
+            "worker": SimpleNamespace(
+                run_name="existing-worker",
+                run_id=record["run_id"],
+                backend="kvm",
+            )
+        },
+    )
+    monkeypatch.setattr(project_adapter, "read_project_state", lambda *_args: ledger)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: pytest.fail("stack resolved"))
+    before = rpaths.state.read_bytes()
+    with pytest.raises((StateError, ArtifactValidationError), match="host share"):
+        callbacks.preflight(())
+    assert rpaths.state.read_bytes() == before
+    assert not (tmp_path / "absent-data").exists()
+
+
+@pytest.mark.parametrize("replacement_present", [True, False])
+def test_public_compose_force_recreate_replaces_absent_old_source_after_new_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_present: bool,
+) -> None:
+    from palimpsest_local.refs import HostDirectoryShare
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    old_source = tmp_path / "old-data"
+    old_source.mkdir()
+    original = _project(
+        tmp_path,
+        f"""name: demo
+services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: old-data
+        target: /srv/shared
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(original, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", status="running")
+    record = state.read_run_state(rpaths)
+    record["host_shares"] = project_adapter.cloud_runtime._host_share_records(
+        (HostDirectoryShare(tmp_path.resolve(), "old-data", "/srv/shared"),)
+    )
+    state.atomic_write_json(rpaths.state, record)
+    project_state = _write_project_service_ledger(original, roots, run_name=run_name, run_id=record["run_id"])
+    old_source.rmdir()
+    original.source.write_text(
+        original.source.read_text(encoding="utf-8").replace("old-data", "new-data"), encoding="utf-8"
+    )
+    new_source = tmp_path / "new-data"
+    if replacement_present:
+        new_source.mkdir()
+        (new_source / "keep").write_bytes(b"replacement contents")
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
+    monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda _name: None)
+    monkeypatch.setattr(
+        project_adapter.kvm, "preflight_host_share_support", lambda **_kw: Path("/usr/libexec/virtiofsd")
+    )
+    stack = _stack(tmp_path)
+    effects: list[str] = []
+
+    def inspect(name):
+        assert name == run_name
+        return {"owner": {"run_id": state.read_owner_record(rpaths).run_id}, "state": state.read_run_state(rpaths)}
+
+    def stop(name, *, expected_identity):
+        assert name == run_name
+        assert expected_identity.run_id == record["run_id"]
+        assert new_source.is_dir()
+        assert not old_source.exists()
+        effects.append("stop")
+
+    def remove(name, *, expected_identity):
+        assert name == run_name
+        assert expected_identity.run_id == record["run_id"]
+        effects.append("remove")
+
+    def start(item, *, expected_identity=None):
+        assert item.plan.action == "recreate"
+        assert expected_identity is None
+        assert item.resolved.request.spec.host_shares[0].source == "new-data"
+        effects.append("start")
+        fresh_paths = _write_run_ledger(roots, run_name, backend="kvm", status="running")
+        fresh = state.read_run_state(fresh_paths)
+        fresh["host_shares"] = project_adapter.cloud_runtime._host_share_records(item.resolved.request.spec.host_shares)
+        state.atomic_write_json(fresh_paths.state, fresh)
+
+    def callbacks(project, _environment, received_roots, _store, _url):
+        assert received_roots == roots
+        built = project_adapter.build_project_callbacks(project, roots, lambda _service: stack)
+        return replace(built, inspect=inspect, stop=stop, remove=remove, start=start)
+
+    monkeypatch.setattr(cli, "_compose_callbacks", callbacks)
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), project_state.read_bytes())
+    result = cli.main(["compose", "--project-directory", str(tmp_path), "up", "--force-recreate"])
+    if replacement_present:
+        assert result == 0
+        assert effects == ["stop", "remove", "start"]
+        assert state.read_run_state(rpaths)["host_shares"][0]["source"] == "new-data"
+        assert (new_source / "keep").read_bytes() == b"replacement contents"
+    else:
+        assert result == 1
+        assert effects == []
+        assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), project_state.read_bytes()) == before
+        assert not new_source.exists()
+    assert not old_source.exists()
+
+
+def test_preserved_service_still_requires_its_applied_source_before_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from palimpsest_local.refs import HostDirectoryShare
+
+    project = _project(tmp_path, f"services:\n  api:\n    image: sha256:{'a' * 64}\n")
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm")
+    record = state.read_run_state(rpaths)
+    record["host_shares"] = project_adapter.cloud_runtime._host_share_records(
+        (HostDirectoryShare(tmp_path.resolve(), "absent-data", "/srv/shared"),)
+    )
+    record["base"] = {"local_path": str(tmp_path / "immutable.img")}
+    record["layers"] = []
+    state.atomic_write_json(rpaths.state, record)
+    monkeypatch.setattr(project_adapter, "read_project_state", lambda *_args: None)
+    callbacks = project_adapter.build_project_callbacks(
+        project, roots, lambda _service: pytest.fail("preserved stack resolved")
+    )
+    item = PreparedService(
+        project,
+        project.services["api"],
+        ServicePlan("api", run_name, "start", "sha256:" + "b" * 64, "stopped", True),
+        None,
+    )
+    before = rpaths.state.read_bytes()
+    with pytest.raises(ArtifactValidationError, match="missing"):
+        callbacks.preflight((item,))
+    assert rpaths.state.read_bytes() == before
+    assert not (tmp_path / "absent-data").exists()
 
 
 def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
@@ -1836,3 +2137,210 @@ def test_kvm_volume_reference_check_allows_only_exact_owned_teardown_domain(
     project_adapter._validate_kvm_volume_references(path, {"demo-api-1": run_id})
     with pytest.raises(StateError, match="foreign or unexpected"):
         project_adapter._validate_kvm_volume_references(path, {})
+
+
+@pytest.mark.parametrize("retained_source_present", [True, False])
+@pytest.mark.parametrize("options", [[], ["--no-recreate"]])
+def test_public_compose_retained_noop_validates_applied_source_without_backend_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retained_source_present: bool,
+    options: list[str],
+) -> None:
+    from palimpsest_local.refs import HostDirectoryShare
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    project = _project(
+        tmp_path,
+        f"""name: demo
+services:
+  api:
+    image: sha256:{"a" * 64}
+""",
+    )
+    roots = _roots(tmp_path)
+    run_name = service_run_name(project, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", status="running")
+    applied_source = tmp_path / "applied-data"
+    if retained_source_present:
+        applied_source.mkdir()
+    record = state.read_run_state(rpaths)
+    record["host_shares"] = project_adapter.cloud_runtime._host_share_records(
+        (HostDirectoryShare(tmp_path.resolve(), "applied-data", "/srv/shared"),)
+    )
+    record["virtiofsd"] = "/unavailable/virtiofsd"
+    record["base"] = {"local_path": str(tmp_path / "immutable.img")}
+    record["layers"] = []
+    state.atomic_write_json(rpaths.state, record)
+    pstate = _write_project_service_ledger(project, roots, run_name=run_name, run_id=record["run_id"])
+    # Desired source differs and is absent. Retention validates applied policy,
+    # not this unused desired export; no launch metadata is needed for no-op.
+    project.source.write_text(
+        f"""name: demo
+services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: unused-desired-data
+        target: /srv/shared
+""",
+        encoding="utf-8",
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("retained no-op resolved or probed launch prerequisites")
+
+    monkeypatch.setattr(project_adapter.kvm, "preflight_host_share_support", forbidden)
+    monkeypatch.setattr(project_adapter.kvm, "validate_network", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "preflight_run_request", forbidden)
+
+    def callbacks(loaded, _environment, received_roots, _store, _url):
+        assert received_roots == roots
+        built = project_adapter.build_project_callbacks(loaded, roots, forbidden)
+        return replace(
+            built,
+            inspect=lambda _name: {"owner": {"run_id": record["run_id"]}, "state": record},
+            desired_digest=lambda *_args: "sha256:" + "b" * 64,
+            resolve=forbidden,
+            start=forbidden,
+            stop=forbidden,
+            remove=forbidden,
+            prepare=forbidden,
+        )
+
+    monkeypatch.setattr(cli, "_compose_callbacks", callbacks)
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), pstate.read_bytes())
+    result = cli.main(["compose", "--project-directory", str(tmp_path), "up", *options])
+    assert result == (0 if retained_source_present else 1)
+    assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), pstate.read_bytes()) == before
+    assert not (tmp_path / "unused-desired-data").exists()
+    assert applied_source.exists() is retained_source_present
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+def test_bind_project_relocation_changes_execution_digest_and_recreates(tmp_path, monkeypatch, status):
+    body = f"""name: demo
+services:
+  api:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: shared
+        target: /srv/shared
+"""
+    original_root, moved_root = tmp_path / "original", tmp_path / "moved"
+    for root in (original_root, moved_root):
+        root.mkdir()
+        (root / "shared").mkdir()
+    original, moved = _project(original_root, body), _project(moved_root, body)
+    roots, stack = _roots(tmp_path), _stack(tmp_path)
+    old = project_adapter.build_project_callbacks(original, roots, lambda service: stack)
+    new = project_adapter.build_project_callbacks(moved, roots, lambda service: stack)
+    assert service_config_digest(original, "api") == service_config_digest(moved, "api")
+    old_digest = old.desired_digest(original, original.services["api"])
+    assert old_digest != new.desired_digest(moved, moved.services["api"])
+    run_name = service_run_name(original, "api")
+    rpaths = _write_run_ledger(roots, run_name, backend="kvm", status=status)
+    record = state.read_run_state(rpaths)
+    managed = project_runtime.ManagedService("api", run_name, old_digest, record["run_id"], "kvm")
+    ledger = SimpleNamespace(services={"api": managed})
+    new = replace(new, inspect=lambda name: {"owner": {"run_id": record["run_id"]}, "state": record})
+    plans = project_runtime._build_up_plan(moved, ledger, new, None, no_recreate=False, force_recreate=False)
+    assert plans[0].action == "recreate"
+    if status == "running":
+        retained = project_runtime._build_up_plan(moved, ledger, new, None, no_recreate=True, force_recreate=False)
+        assert retained[0].action == "noop" and retained[0].preserve_config is True
+    else:
+        with pytest.raises(ProjectLifecycleError, match="restart is disabled"):
+            project_runtime._build_up_plan(moved, ledger, new, None, no_recreate=True, force_recreate=False)
+
+
+def test_ordinary_mixed_recreate_start_preflights_recorded_share_daemon_before_mutations(tmp_path, monkeypatch):
+    from palimpsest_local.refs import HostDirectoryShare
+
+    (tmp_path / "shared").mkdir()
+    project = _project(
+        tmp_path,
+        f"""name: demo
+services:
+  a:
+    image: sha256:{"a" * 64}
+  b:
+    image: sha256:{"a" * 64}
+    volumes:
+      - type: bind
+        source: shared
+        target: /srv/shared
+        read_only: true
+""",
+    )
+    roots, stack = _roots(tmp_path), _stack(tmp_path)
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda *args, **kwargs: "kvm")
+    monkeypatch.setattr(project_adapter.kvm, "validate_network", lambda *args: None)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda service: stack)
+    records, managed, before = {}, {}, {}
+    for name, status in (("a", "running"), ("b", "stopped")):
+        run_name = service_run_name(project, name)
+        rpaths = _write_run_ledger(roots, run_name, backend="kvm", status=status)
+        record = state.read_run_state(rpaths)
+        if name == "b":
+            record["host_shares"] = project_adapter.cloud_runtime._host_share_records(
+                (HostDirectoryShare(tmp_path.resolve(), "shared", "/srv/shared", True),)
+            )
+            record["virtiofsd"] = "/removed/virtiofsd"
+            state.atomic_write_json(rpaths.state, record)
+        records[run_name] = record
+        digest = callbacks.desired_digest(project, project.services[name]) if name == "b" else "sha256:" + "b" * 64
+        managed[name] = project_runtime.ManagedService(name, run_name, digest, record["run_id"], "kvm")
+        before[rpaths.state] = rpaths.state.read_bytes()
+    ledger = SimpleNamespace(services=managed, volumes={})
+    monkeypatch.setattr(project_adapter, "read_project_state", lambda *args: ledger)
+    callbacks = replace(
+        callbacks, inspect=lambda name: {"owner": {"run_id": records[name]["run_id"]}, "state": records[name]}
+    )
+    calls = []
+
+    def unavailable(**kwargs):
+        calls.append(kwargs)
+        raise ArtifactValidationError("recorded virtiofsd unavailable")
+
+    monkeypatch.setattr(project_adapter.kvm, "preflight_host_share_support", unavailable)
+    plans = project_runtime._build_up_plan(project, ledger, callbacks, None, no_recreate=False, force_recreate=False)
+    assert [(plan.action, plan.preserve_config) for plan in plans] == [("recreate", False), ("start", False)]
+    with pytest.raises(ArtifactValidationError, match="recorded virtiofsd unavailable"):
+        project_runtime._prepare_actions(project, plans, callbacks)
+    assert calls == [{"read_only": True, "binary": Path("/removed/virtiofsd")}]
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+
+
+def test_bundle_backed_writable_share_is_rejected_in_project_preflight(tmp_path, monkeypatch):
+    (tmp_path / "runtime").mkdir()
+    stack = _stack(tmp_path / "runtime")
+    project = _project(
+        tmp_path,
+        """name: demo
+services:
+  api:
+    bundle: runtime
+    volumes:
+      - type: bind
+        source: runtime
+        target: /srv/runtime
+""",
+    )
+    roots = _roots(tmp_path)
+    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda *args, **kwargs: "kvm")
+    monkeypatch.setattr(project_adapter, "ensure_kvm_volume", lambda *args: pytest.fail("must not prepare volumes"))
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda service: stack)
+    service = project.services["api"]
+    prepared = PreparedService(
+        project,
+        service,
+        ServicePlan("api", service_run_name(project, "api"), "create", "sha256:" + "a" * 64, None),
+        callbacks.resolve(project, service, service_run_name(project, "api")),
+    )
+    with pytest.raises(ArtifactValidationError, match="attached immutable"):
+        callbacks.preflight((prepared,))
+    assert not state.run_paths(roots, service_run_name(project, "api")).root.exists()

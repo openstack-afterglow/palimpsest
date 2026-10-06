@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -30,7 +31,7 @@ from .errors import (
 )
 from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .process_session import bind_process_session_context, spawn_process_session
-from .refs import ImageRef, RunSpec
+from .refs import HostDirectoryShare, ImageRef, RunSpec
 from .runtime_types import (
     DispatchKey,
     ExecRequest,
@@ -368,6 +369,7 @@ def _generate_seed_iso(
         environment=spec.environment,
         cloud_init=spec.cloud_init,
         arch=profile.arch,
+        host_shares=spec.host_shares,
     )
     _write_seed_iso(rpaths, profile, meta_data, user_data)
 
@@ -407,6 +409,89 @@ def _build_kvm_volume_disks(spec: RunSpec, layer_disks: list[kvm.LayerDisk]) -> 
             )
         )
     return disks
+
+
+def _validate_host_share_paths(
+    shares: tuple[HostDirectoryShare, ...], roots: StatePaths, artifact_paths: tuple[Path, ...] = ()
+) -> None:
+    claimed: list[Path] = []
+    for share in shares:
+        share.validate_source()
+        source = share.host_path.resolve(strict=True)
+        if any(source == existing or source in existing.parents or existing in source.parents for existing in claimed):
+            raise ArtifactValidationError("host bind sources overlap; use disjoint directories")
+        claimed.append(source)
+        for managed in (roots.state.resolve(), roots.config.resolve()):
+            if source == managed or source in managed.parents or managed in source.parents:
+                raise ArtifactValidationError("host shares cannot overlap Palimpsest-owned state or configuration")
+        if not share.read_only and any(
+            source == artifact or source in artifact.parents for artifact in (path.resolve() for path in artifact_paths)
+        ):
+            raise ArtifactValidationError(
+                "writable host shares cannot expose attached immutable base or layer artifacts"
+            )
+
+
+def _host_share_records(shares: tuple[HostDirectoryShare, ...]) -> list[dict[str, object]]:
+    return [
+        {
+            "project_root": str(share.project_root),
+            "source": share.source,
+            "host_path": str(share.host_path),
+            "mount_path": share.mount_path,
+            "guest_tag": share.guest_tag,
+            "read_only": share.read_only,
+        }
+        for share in shares
+    ]
+
+
+def _applied_host_shares(record: dict[str, Any]) -> tuple[HostDirectoryShare, ...]:
+    raw_shares = record.get("host_shares", [])
+    if not isinstance(raw_shares, list):
+        raise StateError("run host share identity is malformed")
+    shares: list[HostDirectoryShare] = []
+    keys = {"project_root", "source", "host_path", "mount_path", "guest_tag", "read_only"}
+    for raw in raw_shares:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != keys
+            or not all(isinstance(raw[key], str) for key in keys - {"read_only"})
+            or type(raw["read_only"]) is not bool
+        ):
+            raise StateError("run host share identity is malformed")
+        project_root = Path(raw["project_root"])
+        if str(project_root) != raw["project_root"]:
+            raise StateError("run host share project root is not canonical")
+        try:
+            share = HostDirectoryShare(project_root, raw["source"], raw["mount_path"], raw["read_only"])
+        except ArtifactValidationError as exc:
+            raise StateError("run host share identity is malformed") from exc
+        if str(share.host_path) != raw["host_path"] or share.guest_tag != raw["guest_tag"]:
+            raise StateError("run host share identity does not match its source and target")
+        shares.append(share)
+    if len({share.guest_tag for share in shares}) != len(shares) or len({share.mount_path for share in shares}) != len(
+        shares
+    ):
+        raise StateError("run has duplicate host share identities")
+    return tuple(shares)
+
+
+def _applied_host_artifact_paths(record: dict[str, Any], shares: tuple[HostDirectoryShare, ...]) -> tuple[Path, ...]:
+    if not any(not share.read_only for share in shares):
+        return ()
+    base, layers = record.get("base"), record.get("layers")
+    if not isinstance(base, dict) or not isinstance(layers, list):
+        raise StateError("writable host shares require applied base/layer path identities")
+    paths = []
+    for artifact in (base, *layers):
+        if not isinstance(artifact, dict):
+            raise StateError("applied artifact path identity is malformed")
+        raw_path = artifact.get("local_path")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise StateError("applied artifact path identity is malformed")
+        paths.append(Path(raw_path))
+    return tuple(paths)
 
 
 def _discover_guest_ip(domain: Any, timeout_seconds: float = 300.0) -> str:
@@ -493,6 +578,16 @@ def run(
             "KVM project port forwarding is unavailable for libvirt network interfaces; "
             "use a routed libvirt network or run this project with the Lima backend"
         )
+    virtiofsd = None
+    if spec.host_shares:
+        if profile.backend != "kvm":
+            raise ArtifactValidationError("host directory binds require the conventional Linux KVM cloud-image backend")
+        _validate_host_share_paths(
+            spec.host_shares,
+            roots or state.resolve_roots(),
+            (spec.stack.base.local_path, *(layer.local_path for layer in spec.stack.layers)),
+        )
+        virtiofsd = kvm.preflight_host_share_support(read_only=any(share.read_only for share in spec.host_shares))
     roots = roots or state.init_roots()
 
     for layer in spec.stack.layers:
@@ -565,6 +660,8 @@ def run(
                 }
                 for volume in volume_disks
             ],
+            "host_shares": _host_share_records(spec.host_shares),
+            "virtiofsd": str(virtiofsd) if virtiofsd is not None else None,
             "environment_names": [name for name, _value in spec.environment],
             "cloud_init": spec.cloud_init is not None,
             "domain_uuid": None,
@@ -611,6 +708,8 @@ def run(
                 seed_iso=rpaths.seed,
                 layers=layer_disks,
                 volumes=volume_disks,
+                host_shares=spec.host_shares,
+                virtiofsd=virtiofsd,
                 network=net_name,
                 console_log=rpaths.console,
                 run_id=run_id,
@@ -740,6 +839,48 @@ def start(
             raise LifecycleError(f"owned libvirt domain '{name}' is missing") from exc
         if domain is None or kvm.get_domain_run_id(domain) != mutation.record.run_id:
             raise LifecycleError(f"domain '{name}' is missing or is not owned by this run")
+        shares = _applied_host_shares(current)
+        _validate_host_share_paths(shares, roots, _applied_host_artifact_paths(current, shares))
+        if shares:
+            if resolved_profile.backend != "kvm":
+                raise StateError("host directory binds require the conventional Linux KVM cloud-image backend")
+            binary = current.get("virtiofsd")
+            if not isinstance(binary, str) or not Path(binary).is_absolute():
+                raise StateError("run virtiofsd identity is malformed")
+        xml = ET.fromstring(domain.XMLDesc())
+        actual = []
+        for filesystem in xml.findall("./devices/filesystem"):
+            driver = filesystem.find("driver")
+            source = filesystem.find("source")
+            target = filesystem.find("target")
+            daemon = filesystem.find("binary")
+            actual.append(
+                (
+                    filesystem.get("type"),
+                    filesystem.get("accessmode"),
+                    driver.get("type") if driver is not None else None,
+                    source.get("dir") if source is not None else None,
+                    target.get("dir") if target is not None else None,
+                    daemon.get("path") if daemon is not None else None,
+                    filesystem.find("readonly") is not None,
+                )
+            )
+        expected = [
+            (
+                "mount",
+                "passthrough",
+                "virtiofs",
+                str(share.host_path),
+                share.guest_tag,
+                current.get("virtiofsd"),
+                share.read_only,
+            )
+            for share in shares
+        ]
+        if len(actual) != len(expected) or set(actual) != set(expected):
+            raise StateError("libvirt host shares differ from durable applied run identity")
+        if shares:
+            kvm.preflight_host_share_support(read_only=any(share.read_only for share in shares), binary=Path(binary))
         legacy = mutation.is_legacy
         if not legacy:
             current = mutation.write_state("starting", {**current, "updated_at": state.utc_now_iso()})
@@ -820,6 +961,8 @@ def start_serial_builder(
     profile: platforms.DomainProfile | None = None,
 ) -> dict[str, Any]:
     """Start a credential-free builder whose only host channel is output streaming."""
+    if spec.host_shares:
+        raise ArtifactValidationError("serial builders do not provision host directory binds")
     profile, kvm_uri = _resolve_new_run_profile(spec.stack.base.arch, kvm_uri=kvm_uri, profile=profile, conn=conn)
     if spec.network not in {"none", "default"}:
         raise ArtifactValidationError("serial builder network must be 'none' or 'default'")

@@ -44,6 +44,7 @@ from palimpsest_local.kvm import (
 from palimpsest_local.oci_control_protocol import OCI_CONTROL_CHANNEL_NAME
 from palimpsest_local.oci_control_protocol_v2 import OCI_CONTROL_PROTOCOL_V2
 from palimpsest_local.oci_root_kvm import verify_host_boot_artifacts
+from palimpsest_local.refs import HostDirectoryShare
 
 _ROOT = Path("/var/lib/palimpsest/layers")
 _DIGESTS = [f"sha256:{chr(ord('a') + index) * 64}" for index in range(3)]
@@ -108,6 +109,50 @@ def _oci_root_spec() -> OCIRootDomainSpec:
         boot_contract_digest="sha256:" + "4" * 64,
         lifecycle_socket=Path("/var/lib/palimpsest/runs/oci-demo/lifecycle.sock"),
     )
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_host_share_xml_uses_shared_memfd_unique_tags_and_enforced_mode(tmp_path: Path, read_only: bool):
+    from dataclasses import replace
+
+    (tmp_path / "data").mkdir()
+    share = HostDirectoryShare(tmp_path.resolve(), "data", "/srv/shared", read_only)
+    second = HostDirectoryShare(tmp_path.resolve(), "data", "/srv/another", read_only)
+    xml = ET.fromstring(build_domain_xml(replace(_spec(), host_shares=(share, second)), _X86_PROFILE))
+    assert xml.find("./memoryBacking/source").attrib == {"type": "memfd"}
+    assert xml.find("./memoryBacking/access").attrib == {"mode": "shared"}
+    filesystems = xml.findall("./devices/filesystem")
+    assert len(filesystems) == 2
+    for fs, policy in zip(filesystems, (share, second), strict=True):
+        assert fs.attrib == {"type": "mount", "accessmode": "passthrough"}
+        assert fs.find("driver").get("type") == "virtiofs"
+        assert fs.find("source").get("dir") == str(policy.host_path)
+        assert fs.find("target").get("dir") == policy.guest_tag
+        assert (fs.find("readonly") is not None) is read_only
+    assert share.guest_tag != second.guest_tag
+    assert share.guest_tag == replace(share, read_only=not read_only).guest_tag
+    with pytest.raises(KvmError, match="Linux KVM"):
+        build_domain_xml(replace(_spec(), host_shares=(share,)), _HVF_PROFILE)
+
+
+def test_readonly_share_rejects_older_libvirt_and_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import palimpsest_local.kvm as kvm
+
+    binary = tmp_path / "virtiofsd"
+    binary.write_text("not executed", encoding="utf-8")
+    binary.chmod(0o700)
+    connection = MagicMock()
+    connection.getLibVersion.return_value = 10_010_000
+    connection.getVersion.return_value = 9_000_000
+    monkeypatch.setattr(kvm.sys, "platform", "linux")
+    monkeypatch.setattr(kvm, "connect", lambda _uri: connection)
+    with pytest.raises(KvmUnavailable, match="libvirt >= 11.0.0"):
+        kvm.preflight_host_share_support(read_only=True, binary=binary)
+    assert kvm.preflight_host_share_support(read_only=False, binary=binary) == binary
+    connection.getLibVersion.return_value = 11_000_000
+    monkeypatch.setattr(kvm.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=""))
+    with pytest.raises(KvmUnavailable, match="--readonly"):
+        kvm.preflight_host_share_support(read_only=True, binary=binary)
 
 
 def test_oci_root_optional_dac_policy_is_exact_static_and_preserves_legacy_projection():
