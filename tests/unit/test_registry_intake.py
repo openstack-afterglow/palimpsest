@@ -123,11 +123,11 @@ def test_real_subprocess_error_kills_spawned_descendant(tmp_path: Path, failure:
     archive = tmp_path / "image.oci.tar"
     pid_file = tmp_path / "child.pid"
     prefix = "pathlib.Path(sys.argv[1]).write_bytes(b'x'*2048);" if failure == "size" else ""
+    # Publish the descendant PID before the monitor can reject the oversized archive.
     program = (
         "import pathlib,subprocess,sys,time;"
-        + prefix
-        + "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
-        + "pathlib.Path(sys.argv[2]).write_text(str(child.pid));time.sleep(30)"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        "pathlib.Path(sys.argv[2]).write_text(str(child.pid));" + prefix + "time.sleep(30)"
     )
     with pytest.raises(RegistryIntakeError, match="size limit" if failure == "size" else "timed out"):
         registry_intake._run_bounded_copy(

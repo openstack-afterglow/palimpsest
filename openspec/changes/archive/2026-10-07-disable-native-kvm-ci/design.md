@@ -1,6 +1,6 @@
 ## Context
 
-The protected environment requires reviewer `jung-geun`; repository flag is `true`, but both pinned HTTPS kernel/config inputs are absent at repository and environment scope. Merely setting `false` also fails the current Test verdict and skips release publication. The owner explicitly permits disablement. Work in an isolated dev clone to preserve unrelated shared changes.
+Initial 2026-10-07 inspection: the protected environment requires reviewer `jung-geun`; repository flag was `true`, but both pinned HTTPS kernel/config inputs were absent at repository and environment scope. Merely setting `false` also failed the former Test verdict and skipped release publication. The owner explicitly permits disablement. Work in an isolated dev clone to preserve unrelated shared changes.
 
 ## Goals / Non-Goals
 
@@ -15,6 +15,7 @@ The protected environment requires reviewer `jung-geun`; repository flag is `tru
 3. Release publication explicitly checks `!cancelled()`, trusted repository, push/tag, successful verify, and those same two states. A status function is necessary to override GitHub's implicit `success()` after the intentionally skipped dependency. Keep both dependencies, least permissions and PyPI environment.
 4. Preserve native protection and implementation for opt-in. Native execution still requires `true`; failed, cancelled, missing or unexpectedly skipped enabled proof cannot authorize publication. Emit an explicit disabled/no-proof notice.
 5. Validate real shell verdicts plus actual workflow-condition boundary combinations. Observe a genuine trusted dev push and its pending deployments after strict PR checks; no native/release execution for test convenience.
+6. The first genuine dev run accepted native opt-out but exposed a separate macOS descendant-test setup race: its oversized archive was visible before the descendant PID existed. Correct only the existing fixture's causal order (spawn, record PID, then exceed size); retain production code, timeouts, limits and the real descendant-kill assertion. Preserve the observed failing run alongside corrected local and strict integration evidence.
 
 ## Risks / Trade-offs
 

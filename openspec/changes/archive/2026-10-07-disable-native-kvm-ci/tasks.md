@@ -7,5 +7,6 @@
 ## 2. Verification and application
 
 - [x] 2.1 Exercise real verdict shell and release condition boundaries; pass impacted lane, lint/format, manifest, OpenSpec and architecture guards.
-- [ ] 2.2 Follow the strict dev PR path and set only `PALIMPSEST_KVM_ENABLED=false`; preserve environment/secrets and all other protections.
-- [ ] 2.3 Observe trusted dev Test native skip, honest policy success and no pending native deployment; record actual run timing without performance claims from an insufficient after sample, and identify owner-managed main promotion.
+- [x] 2.2 Follow the strict dev PR path and set only `PALIMPSEST_KVM_ENABLED=false`; preserve environment/secrets and all other protections.
+- [x] 2.3 Observe trusted dev Test native skip, honest policy success and no pending native deployment; record actual run timing without performance claims from an insufficient after sample, and identify owner-managed main promotion.
+- [x] 2.4 Correct the observed macOS descendant size-case fixture ordering without product/timeout/check changes; exercise real subprocess cleanup and the portable contract lane.

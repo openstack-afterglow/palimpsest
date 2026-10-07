@@ -34,7 +34,7 @@ Before-policy measurements: latest20 completed non-cancelled Test runs (10 push/
 
 Repository variable mutation: API readback confirms canonical false at 2026-10-07T11:36:20Z. Native protected-environment/secret/resource settings were not changed.
 
-Final local reviewed source digest `f46e8aef961a9e3c290e5e5119ce92d9e27bd65f0359d0f055027abbb5b43272` (445 files): final workflow contract modules126 passed in4.04s; complete portable lane6366 passed/217 skipped/7 retained fork deprecation warnings in219.20s (6583 selected nodes). Actual Test verdict and Release notice shell paths exercised disabled/skipped, enabled/success and denied bad outcomes; Release notices bind actual native outcome, not flag spelling. Actionlint, changed-file Ruff lint/format, manifest, current CLI reference, strict OpenSpec and staged architecture guards passed. These are local policy/portable receipts, not GitHub native qualification or release publication.
+First local reviewed source digest `f46e8aef961a9e3c290e5e5119ce92d9e27bd65f0359d0f055027abbb5b43272` (445 files): workflow contract modules 126 passed in 4.04s; complete portable lane 6366 passed/217 skipped/7 retained fork deprecation warnings in 219.20s (6583 selected nodes). Actual Test verdict and Release notice shell paths exercised disabled/skipped, enabled/success and denied bad outcomes; Release notices bind actual native outcome, not flag spelling. Actionlint, changed-file Ruff lint/format, manifest, current CLI reference, strict OpenSpec and staged architecture guards passed. These are local policy/portable receipts, not GitHub native qualification or release publication.
 
 | Run | Event | Created UTC | Started UTC | Last job UTC | Critical path s | Native wait s |
 | --- | --- | --- | --- | --- | ---: | ---: |
@@ -58,6 +58,22 @@ Final local reviewed source digest `f46e8aef961a9e3c290e5e5119ce92d9e27bd65f0359
 | [36081251771](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081251771) | pull_request | 2026-09-25T01:15:54Z | 2026-09-25T01:15:54Z | 2026-09-25T01:20:48Z | 294 | 135 |
 | [36081237189](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081237189) | push | 2026-09-25T01:15:42Z | 2026-09-25T01:15:42Z | 2026-09-25T01:18:18Z | 156 | 4 |
 | [36077141780](https://github.com/openstack-afterglow/palimpsest/actions/runs/36077141780) | push | 2026-09-25T00:21:13Z | 2026-09-25T00:21:13Z | 2026-09-25T00:23:51Z | 158 | 5 |
+
+### Source-policy remote acceptance
+
+PR [15](https://github.com/openstack-afterglow/palimpsest/pull/15) merged normally into dev at `59b3285ded7dbfb4b2875a320620ca824f662734` after all six required hosted checks passed. Effective dev ruleset24071416 retained strict=true and the full six-check list; legacy branch-protection endpoints return404 because this protection is a ruleset, not a legacy branch rule. No protection or environment setting was mutated.
+
+| Run | Event | Source SHA | Created/start UTC | Last job UTC | Critical path s | Whole Test result |
+| --- | --- | --- | --- | --- | ---: | --- |
+| [37615773705](https://github.com/openstack-afterglow/palimpsest/actions/runs/37615773705) | pull_request | 449466e4fd71d956b9cdf32682663073ee579a3f | 2026-10-07T11:41:22Z | 2026-10-07T11:44:33Z | 191 | success |
+| [37623539561](https://github.com/openstack-afterglow/palimpsest/actions/runs/37623539561) | push/dev | 59b3285ded7dbfb4b2875a320620ca824f662734 | 2026-10-07T12:47:18Z | 2026-10-07T12:51:16Z | 238 | unrelated fixture failure |
+
+Each attempt1 receipt has19 jobs. PR n1 and push n1 are an insufficient after population; no speedup or after p90 is claimed. Native execution and wait are **not requested**, not fake zero-duration proof. The dev native job112799473202 was skipped with no steps at12:47:19Z. Policy job112799471301 ran12:47:21–12:47:26Z and its actual log showed `PALIMPSEST_KVM_ENABLED: false`, `PALIMPSEST_KVM_RESULT: skipped`, and `Native KVM qualification is explicitly disabled; no native proof ran.` Pending deployment API returned `[]`.
+
+The first dev whole-Test failure is retained separately: macOS job112799471233, `test_real_subprocess_error_kills_spawned_descendant[size]`, raised `FileNotFoundError` for `child.pid` after correctly rejecting the oversized archive. Its fixture wrote that archive **before** spawning/recording the descendant, so the monitor could terminate setup prematurely. Order the existing fixture as spawn → write PID → expose oversized archive → sleep. Keep production code, timeout, size limit and descendant-kill assertion unchanged. Corrected registry plus workflow contract modules passed153 tests in7.82s; this fixes fixture causality rather than weakening a required check.
+
+Post-fixture local portable proof: `uv run python scripts/test_lanes.py run portable` selected6583 nodes and finished6366 passed/217 skipped/7 existing fork deprecation warnings in212.87s. This includes the real subprocess cleanup regression, not a source-text assertion or mocked kill. No retry, quarantine, check suppression, runtime change or additional native attempt was used. The completed change is archived at [2026-10-07-disable-native-kvm-ci](../openspec/changes/archive/2026-10-07-disable-native-kvm-ci/) with its requirements already synchronized to the main spec. This dated local checkpoint precedes the strict fixture integration; final remote receipts belong to its dev integration PR.
+
 
 
 
