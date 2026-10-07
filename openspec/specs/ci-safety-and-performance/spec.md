@@ -7,7 +7,7 @@ This specification carries the 2026-09-27 Nova cutover and the detailed CI oblig
 ## Requirements
 
 ### Requirement: Preserve measured CI and protected execution boundaries
-CI changes MUST retain the active rules below: comparable measured critical paths, hosted-only untrusted PR jobs, fail-closed native evidence, verified shard execution, and publication gates. Dated timings describe their original population, not proof of a new run. Separate owner approval MUST precede changes to native runner exposure, release bypasses, or remote resource mutation.
+CI changes MUST retain comparable measured critical paths, hosted-only untrusted PR jobs, verified shard execution and successful publication verification. Native qualification SHALL be explicitly opt-in using canonical lowercase `PALIMPSEST_KVM_ENABLED=true` or `false`: enabled requires successful native proof; disabled permits an intentionally skipped native job without claiming qualification. Missing/non-boolean flags, native failures/cancellation/missing outcomes, unsuccessful release verification, cancelled workflows and untrusted publication contexts MUST NOT authorize publication. Test's actual Bash verdict SHALL compare literal flags; Release job conditions retain GitHub's case-insensitive comparison semantics and MUST NOT be claimed to reject uppercase boolean aliases. Separate owner approval MUST precede native runner exposure, native opt-out, release bypasses or remote resource mutation; the 2026-10-07 owner request authorizes this explicit native opt-out only.
 
 #### Scenario: Untrusted PR requests native proof
 - **WHEN** a fork or other untrusted PR reaches the test workflow
@@ -15,7 +15,25 @@ CI changes MUST retain the active rules below: comparable measured critical path
 
 #### Scenario: CI improvement is proposed
 - **WHEN** a workflow change claims a shorter critical path
-- **THEN** before/after comparable runs are measured and the actual median, p90 and sample size are recorded rather than a projection claimed as a result
+- **THEN** before/after comparable runs are measured and actual median, p90 and sample size are recorded rather than a projection claimed as a result
+
+#### Scenario: Owner explicitly disables native qualification
+- **WHEN** a trusted dev/main push has literal flag `false` and native job result `skipped`
+- **THEN** the native policy verdict succeeds while reporting that no native KVM proof ran
+- **AND** all ordinary validation remains required and the native protected environment is not requested
+
+#### Scenario: Disabled native dependency precedes a release
+- **WHEN** a non-cancelled trusted repository v-tag push has `verify=success`, flag `false` and native result `skipped`
+- **THEN** root publication is allowed despite that intentionally skipped dependency
+- **AND** its notice states that the release has no native KVM proof
+
+#### Scenario: Enabled or invalid qualification cannot pass without proof
+- **WHEN** flag is `true` without native `success`, flag is missing/non-boolean, disabled native result is not `skipped`, or release verification is not `success`
+- **THEN** the policy rejects the result and release publication cannot run
+
+#### Scenario: Cancelled or untrusted publication
+- **WHEN** the workflow is cancelled, the repository is not the trusted repository, the event is not push, or the ref is not a v-tag
+- **THEN** root publication cannot run regardless of native or verification outcomes
 
 ## Reference
 
@@ -39,12 +57,12 @@ CI changes MUST retain the active rules below: comparable measured critical path
 2. **목표 지표를 먼저 정한다.**
    - 이 저장소는 public이고 GitHub-hosted runner 시간이 무료이므로 목표는 wall-clock이다.
    - org `openstack-afterglow`의 Free plan 동시성 한도(hosted 20 job, macOS 5 job)는 lumen·openstack-afterglow·drover·waygate·afterglow-crypto와 공유한다. macOS runner를 쓰는 저장소는 이곳뿐이다.
-   - 2026-09-24 정의 기준 hosted 시작 job15개·전체18개는 self-hosted native job을 제외한 역사적 수다. 승인된 2026-09-27 cutover는 native orchestration도 `ubuntu-24.04`로 옮긴다. PR은 native job/aggregator를 실행하지 않고, trusted `main`·`dev` push는 hosted native job1개를 더 요구한다. Environment 승인 대기와 repo-wide native concurrency 대기도 wall-clock에 포함한다.
-   - `main`·`dev` push는 `hub-docker.yml`의 `test`와 `development-package.yml`의 `verify`, PR은 Hub `test`를 별도로 시작한다. Workflow 정의상 trusted push는 시작 hosted job18개(macOS4개), PR은16개(macOS4개)다. 실제 scheduling/승인 대기 실측과 구분한다.
+   - 2026-09-24 정의 기준 hosted 시작 job15개·전체18개는 self-hosted native job을 제외한 역사적 수다. 2026-09-27 cutover는 native orchestration도 `ubuntu-24.04`로 옮겼다. PR은 native job/aggregator를 실행하지 않고, trusted `main`·`dev` push는 flag=true일 때만 native job1개를 더 요청한다. Environment 승인 대기와 repo-wide native concurrency 대기도 wall-clock에 포함한다.
+   - `main`·`dev` push는 `hub-docker.yml`의 `test`와 `development-package.yml`의 `verify`, PR은 Hub `test`를 별도로 시작한다. Workflow 정의상 trusted push는 native enabled일 때 시작 hosted job18개, disabled일 때17개(macOS4개), PR은16개(macOS4개)다. 실제 scheduling/승인 대기 실측과 구분한다.
    - 겹치는 dev/main 실행은 hosted20개·macOS5개 한도를 넘을 수 있다. 단독 실행과 겹친 실행을 나누어 측정한다.
 3. **게이트 job을 테스트 job 앞에 두지 않는다.**
    - `Lint, manifests, and package`(`checks`)는 portable shard의 `needs:`로 걸지 않고 병렬로 실행한다. 그 결과는 `Pure contracts (Python 3.12)` aggregator에서만 합친다.
-   - 의존 job verdict는 `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Required native KVM proof` 세 aggregator가 담당한다. 앞의 둘은 `if: always()`, native aggregator는 `always()`와 아래 trusted repository/push/ref allowlist를 함께 적용한다. PR에서 native skip을 success로 바꾸지 않는다.
+   - 의존 job verdict는 `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Native KVM qualification policy` 세 aggregator가 담당한다. 앞의 둘은 `if: always()`, native policy aggregator는 `always()`와 아래 trusted repository/push/ref allowlist를 함께 적용한다. PR에서 native skip을 success로 바꾸지 않는다. Trusted push의 명시적 false/skipped 정책 통과도 native qualification으로 표시하지 않는다.
    - image·package **발행(push)과 배포**는 `Test` workflow 전체 결과로 게이팅한다. 아무것도 발행하지 않는 PR 검증 build는 테스트와 병렬로 돌려도 된다. `hub-docker.yml`의 `pull_request` 실행은 이 규칙을 지킨다. `build-and-push`가 두 image를 `push: false`로 build만 하기 때문이다.
    - 다음 세 발행 경로는 `Test` 전체 결과를 기다리지 않는다. 정본 규칙 3의 기존 예외다. 모두 테스트 크리티컬 패스 밖에 있고, 바꾸면 발행 의미가 달라진다. 그래서 소유자 결정 없이 바꾸지 않는다. 결정 항목은 [인계 문서](../../../docs/development-handoff.md) `CI critical-path checkpoint (2026-09-24)` 절의 승인 대기 목록에 있다.
      - `hub-docker.yml` `build-and-push`: `main`·`dev` push, `v*` tag push, `workflow_dispatch`에서 GHCR에 image를 push한다. 자체 `Hub Unit Tests` job(`hub/tests/`)에만 `needs:`를 건다.
@@ -92,13 +110,13 @@ CI changes MUST retain the active rules below: comparable measured critical path
    - fork PR과 dependabot PR은 항상 테스트한다.
    - 2026-09 실측에서 가장 큰 중복은 같은 SHA를 dev와 main에 3–6초 간격으로 push한 경우였다. 현재 형태의 push 실행 14건 중 7건이 그랬고, 매번 KVM 대기가 142–144초 생겼다. 이를 줄이는 방법(예: dev가 green이 된 뒤 main을 fast-forward)은 소유자가 결정한다.
 10. **보안: PR은 hosted-only, native는 보호된 trusted ref의 일회성 Nova VM에서 실행한다.**
-    - 2026-09-27 승인된 정책은 기존 self-hosted cutover 충돌을 해소한다. `Test.kvm`은 repository `openstack-afterglow/palimpsest`, event `push`, ref `refs/heads/dev` 또는 `refs/heads/main`, `PALIMPSEST_KVM_ENABLED == 'true'`를 모두 만족해야 한다. `kvm-required`는 같은 repository/event/ref와 `always()`를 요구하며 enabled=true와 native result=success만 받는다.
+    - `Test.kvm`은 repository `openstack-afterglow/palimpsest`, event `push`, ref `refs/heads/dev` 또는 `refs/heads/main`, `PALIMPSEST_KVM_ENABLED == 'true'`를 모두 만족해야 한다. `kvm-required`는 같은 repository/event/ref와 `always()`를 요구하며 `true/success` 또는 소유자가 허용한 명시적 `false/skipped`만 받는다. 누락·잘못된 flag와 failure/cancel/빈 결과, enabled skip 및 disabled success는 거부한다. 후자의 정책 통과는 proof 미실행을 알리며 native qualification이 아니다.
     - PR required checks는 `Pure contracts (Python 3.12)`, `Unit tests (macOS 15)`, `Hub tests, lint, and build`, `OCI filesystem proof (privileged Linux)`, `Local OCI image product build`, `Guest stage-1 binary (Linux x86_64)` 여섯 개이며 strict=true다. Native aggregator를 PR required 목록에 넣거나 PR에 native success를 만들지 않는다. 기존 main deletion/non-fast-forward 보호를 보존한다.
     - `Test.kvm`과 tag-only `release.kvm-proof`는 `ubuntu-24.04`와 보호 environment `palimpsest-native-kvm`을 사용한다. Environment는 branch `dev`, branch `main`, tag `v*`만 허용하고 required reviewer `jung-geun`, admin bypass=false를 유지한다. 서버 설정으로 보호를 확인하기 전 secret을 넣거나 native를 활성화하지 않는다.
     - GitHub-hosted orchestration이 전용 member-only application credential로 새 CI project에 run당 최대1대 Nova VM(2vCPU/8GiB/boot20GiB)을 만든다. CI project quota는 instances1/cores2/ram8192/volumes1/gigabytes20/floatingip0이다. Admin credential, 후보 Hub host/state, 기존 domain을 사용하지 않는다. VM을 GitHub self-hosted runner로 등록하지 않으며 cloud/GitHub credential을 VM에 전달하지 않는다.
     - Helper `scripts/run_native_kvm_openstack.py`는 source/kernel/config pins, project와 owner metadata, console host-key, KVM API12, mounted filesystem gate, 정본 stage-1 proof와 증거 회수를 검증한다. Manifest의 exact-owned server/volume/port/SG/keypair만 회수하고 부재를 확인한다. Deadline, signal, cleanup 실패는 gate 실패이며 ownership 불일치는 삭제 거부다. SSH ingress는 job egress IPv4/32만 허용한다.
     - 두 native job의 repo-wide concurrency group은 `palimpsest-native-kvm`, cancel-in-progress=false다. GitHub가 pending job을 대체 취소하면 cancelled gate이지 성공이 아니다. 강제 runner 상실 뒤 수동 manifest 회수 필요성을 숨기지 않는다.
-    - Release 기본 permissions는 contents:read다. PyPI publish만 id-token:write, GitHub release만 contents:write를 갖는다. Native 실패/cancel/skip/증거 누락은 PyPI와 정식 GitHub release를 차단한다. `hub-docker.yml`과 development-package 발행 예외는 규칙3의 별도 승인 대기로 남는다.
+    - Release 기본 permissions는 contents:read다. PyPI publish만 id-token:write, GitHub release만 contents:write를 갖는다. Publication은 `!cancelled()`·trusted repository·push·v* tag·verify=success와 위 두 상태를 명시적으로 요구한다. Native 실패/cancel/빈 결과, enabled skip과 잘못된 flag는 발행을 차단한다. 소유자가 선택한 false/skipped 발행에는 native proof가 없다고 알린다. `hub-docker.yml`과 development-package 발행 예외는 규칙3 그대로다.
     - 기존 repository runner21은 승인된 stop 이후 offline으로 보존하며 재시작·재등록하지 않는다. YAML 수정만으로 PR-editable workflow의 self-hosted 노출을 제거했다고 주장하지 않는다. 이 cutover의 source/수동 proof와 원격 GitHub 적용·실행은 별개이며 commit/push/tag/발행은 여전히 별도 승인이다. 역사적 노출·조치는 인계의 날짜별 기록을 참고한다.
 11. **CI 형태는 계약 테스트로 고정한다.**
     - `tests/unit/test_test_lanes.py`는 다음을 검사한다.
@@ -109,8 +127,8 @@ CI changes MUST retain the active rules below: comparable measured critical path
         - `fail-fast: false`여야 하고, `max-parallel`은 없거나 N 이상이어야 한다.
         - step 목록 전체를 정확히 고정한다. 여기에는 action 버전과 `with`, shard 명령 문자열과 `--shard …/N` 분모가 포함된다. 따라서 step `if`·`shell`·`env`, checkout `ref`, `$GITHUB_ENV`에 쓰는 추가 step이 들어갈 수 없다.
         - workflow-level `env`가 없어야 한다.
-      - aggregator 세 개의 이름·정확한 `needs`; portable 두 개는 `always()`, native verdict는 규칙10의 trusted repository/event/ref와 `always()`를 함께 요구한다.
-      - aggregator verdict의 dependency env와 실패 우회 금지. Native verdict는 실제 shell을 실행해 enabled=true/result=success만 통과하고 failure/cancelled/skipped/빈 결과는 거부하는지 검사한다.
+      - aggregator 세 개의 key·정확한 `needs`와 portable 두 개의 외부 required check 이름; portable은 `always()`, native verdict는 규칙10의 trusted repository/event/ref와 `always()`를 함께 요구한다. Native 표시 이름의 문구만 고정하는 검사는 두지 않는다.
+      - aggregator verdict의 dependency env와 실패 우회 금지. Native verdict는 실제 shell을 실행해 `true/success`·`false/skipped`만 통과하고 실패/cancel/빈 결과, 잘못된 flag 및 나머지 조합을 거부하는지 검사한다.
       - `test.yml`의 모든 job(11개)의 정확한 key 집합. 어느 job에도 job-level `env`·`permissions`·`continue-on-error`가 없고, `if`는 aggregator와 `kvm`만 가진다. Native job만 보호 environment·직렬 concurrency·timeout을 추가로 가진다. `defaults`는 `hub`의 `{run: {working-directory: hub}}`만 허용한다.
       - `test.yml`의 top-level key는 `name`·`on`·`permissions`·`jobs`뿐이고, `permissions`는 정확히 `{contents: read}`이다. 그래서 workflow `env`·`defaults`·`concurrency`와 write token이 들어갈 수 없다. 규칙 10의 노출 분석은 `kvm`이 읽기 전용 token을 받는다고 전제한다.
       - `test.yml`의 모든 step에 `shell`·`continue-on-error`가 없고, step `if`는 `always()`뿐이어야 한다. `always()`는 step을 건너뛰지 않으며 upload·cleanup step이 쓴다. `kvm` proof step도 이 규칙에 들어간다.
@@ -128,7 +146,7 @@ CI changes MUST retain the active rules below: comparable measured critical path
       - trigger가 `workflow_dispatch`와 허용 branch 세 개의 push인지, workflow `permissions`가 `{contents: read}`인지, ref 단위 `concurrency`와 job id 집합(`verify`·`publish`)
       - `verify`: job-level `permissions`가 없는지, job `if`에 허용 branch마다 ref 비교가 들어 있는지, step `run` 문자열을 이은 text에 필수 문자열 여섯 개가 들어 있는지. 모두 포함 여부만 본다. 그래서 `if`에 `|| true`를 더하거나 명령을 `echo`로 감싸도 통과한다. `qualification` lane과 `ruff` step은 필수 문자열에 없다.
       - `publish`: `needs: verify`, `permissions == {contents: write}`, 정확한 `uses` 목록, `sha256sum --check SHA256SUMS`를 담은 `run`이 helper `run`보다 앞에 있는지(순서만 본다), helper `run`의 `--repository`·`--sha`·`--dist-dir` 인자, 금지 문자열(`gh api`, `gh release create`, `--clobber` 등)
-      - 같은 파일은 `release.yml`의 tag-only trigger, publication 최소권한, native environment·concurrency·credential 범위, 실제 shell의 HTTPS kernel 입력 및 evidence/cleanup 누락 거부를 검사한다. Publication 조건은 native 실패/cancel/skip에서 차단되는지 평가한다.
+      - 같은 파일은 `release.yml`의 tag-only trigger, publication 최소권한, native environment·concurrency·credential 범위, 실제 shell의 HTTPS kernel 입력 및 evidence/cleanup 누락 거부를 검사한다. 실제 publication 조건은 enabled/disabled/invalid flag와 verify/native outcomes, trusted repository/event/ref 및 cancellation 조합으로 평가한다.
     - 따라서 development-package의 두 job 모두 job key 집합, step `if`·`shell`·`continue-on-error`·`env`, 추가 step을 고정하지 않는다. job-level `if`도 `verify`의 포함 검사 외에는 보지 않는다. `verify`의 테스트 step을 건너뛰거나 그 실패를 무시하게 바꿔도 계약은 통과한다. 그러면 `publish`가 `contents: write`로 검증되지 않은 SHA별 prerelease를 만들 수 있다. 이 workflow를 바꿀 때는 이 공백을 리뷰에서 직접 확인한다. 2026-09-24 최종 검토의 임시 복사본 변형 9가지(`verify` step `continue-on-error`·`if: false`·`shell: 'true {0}'`, `verify` job `continue-on-error`, checksum step `continue-on-error`·`if: false`, `publish` job `if: always()`, 명령 `echo` 감싸기, `verify` `if`의 `|| true`)가 모두 이 계약을 통과했다.
     - `tests/unit/test_native_kvm_openstack.py`는 private manifest와 가짜 cloud state로 다른 project/owner·ID 충돌 삭제 거부, 생성 응답 유실, timeout/signal 이후 회수, Cinder copy-state 대기, SDK 예외 redaction, 실제 child-process secret 차단, canonical kernel/config evidence 불일치를 검사한다. 이는 실제 Nova/KVM proof의 대체물이 아니다.
     - 새 CI 불변식은 새 파일을 만들기보다 이 파일들을 확장한다. 새 test 파일은 `scripts/test_lanes.py`에 분류해야 하기 때문이다.

@@ -113,10 +113,13 @@ negative console and the raw QEMU duplicate-name rejection output. All
 evidence files are
 exclusively created owner-readable (`0400`).
 
-The PR workflow also has an always-running `Required native KVM proof`
-aggregator. It fails if the self-hosted job is disabled, skipped or
-unsuccessful; setting the repository variable to false cannot turn this proof
-into a green merge check.
+GitHub native proof is opt-in for trusted dev/main pushes and v* release tags,
+not PRs. `Native KVM qualification policy` accepts only enabled/success or
+explicitly disabled/skipped. The owner's default-off policy avoids automatic
+approval waits but provides **no native KVM qualification**. Enabled proof still
+requires the protected environment, pinned inputs, real receipts and successful
+cleanup; failure/cancellation/missing inputs cannot become proof success. See
+[current CI policy](../../docs/testing.md#opt-in-stage-1-github-kvm-qualification).
 
 The stage-1 plan/protocol is v15, OCI-root domain plan/core are v14/v8, and the
 init contract is v17. Initramfs manifest/ABI are v19, supervisor is v10,

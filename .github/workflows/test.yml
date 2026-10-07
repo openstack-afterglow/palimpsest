@@ -284,15 +284,25 @@ jobs:
           if-no-files-found: error
 
   kvm-required:
-    name: Required native KVM proof
+    name: Native KVM qualification policy
     if: always() && github.repository == 'openstack-afterglow/palimpsest' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [kvm]
     runs-on: ubuntu-24.04
     steps:
-      - name: Refuse skipped or failed KVM qualification
+      - name: Require enabled proof or explicit native opt-out
         env:
           PALIMPSEST_KVM_ENABLED: ${{ vars.PALIMPSEST_KVM_ENABLED }}
           PALIMPSEST_KVM_RESULT: ${{ needs.kvm.result }}
         run: |
-          test "$PALIMPSEST_KVM_ENABLED" = "true"
-          test "$PALIMPSEST_KVM_RESULT" = "success"
+          case "$PALIMPSEST_KVM_ENABLED:$PALIMPSEST_KVM_RESULT" in
+            true:success)
+              echo 'Native KVM proof succeeded.'
+              ;;
+            false:skipped)
+              echo '::notice::Native KVM qualification is explicitly disabled; no native proof ran.'
+              ;;
+            *)
+              echo 'Native KVM policy requires enabled/success or explicitly disabled/skipped.' >&2
+              exit 1
+              ;;
+          esac
