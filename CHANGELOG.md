@@ -4,7 +4,8 @@ All notable changes to Palimpsest Local are documented here.
 
 ## Unreleased
 
-- Disable automatic native KVM CI attempts under the owner's 2026-10-07 decision. Test and Release accept only enabled/success or explicitly disabled/skipped, and label the latter as no native proof rather than qualification. Preserve ordinary validation, trusted contexts, strict hosted checks, environment protection, pinned inputs, receipts and cleanup. Release publication explicitly rejects cancellation and failed verification while handling the intentionally skipped native dependency. Existing main/tag sources require the workflow cutover; no release or native VM is created by this policy change.
+- Disable automatic native KVM CI attempts under the owner's 2026-10-07 decision. Test and Release accept enabled/success or explicitly disabled/skipped, and label the latter as no native proof rather than qualification. Preserve ordinary validation, trusted contexts, strict hosted checks, environment protection, pinned inputs, receipts and cleanup. Release publication explicitly rejects cancellation and failed verification while handling the intentionally skipped native dependency. Existing main/tag sources require the workflow cutover; no formal release tag or native VM is requested by this change, and ordinary dev publishing retains its existing gates.
+- Make the existing real subprocess descendant-cleanup regression reliable on macOS: record the spawned descendant PID before exposing an oversized archive to the bounded-copy monitor. Retain production behavior, timeout/size limits, both failure cases and the descendant-kill assertion; the observed PID-file race is fixed rather than hidden by retries or weaker CI checks.
 
 ## [0.3.1] - 2026-10-05 (candidate, unpublished)
 
