@@ -2,6 +2,10 @@
 
 All notable changes to Palimpsest Local are documented here.
 
+## Unreleased
+
+- Disable automatic native KVM CI attempts under the owner's 2026-10-07 decision. Test and Release accept only enabled/success or explicitly disabled/skipped, and label the latter as no native proof rather than qualification. Preserve ordinary validation, trusted contexts, strict hosted checks, environment protection, pinned inputs, receipts and cleanup. Release publication explicitly rejects cancellation and failed verification while handling the intentionally skipped native dependency. Existing main/tag sources require the workflow cutover; no release or native VM is created by this policy change.
+
 ## [0.3.1] - 2026-10-05 (candidate, unpublished)
 
 - Prepare root `palimpsest-client`, independent `palimpsest-hub`, their module versions/lockfile entries and packaged Kolla image-tag default at 0.3.1. Preserve unrelated dependency resolution, native stage-1 binary/protocol, runtime and Afterglow tracking baseline. This patch preparation supersedes the 0.3.0 candidate metadata below; it does not claim a formal 0.3.0 release.

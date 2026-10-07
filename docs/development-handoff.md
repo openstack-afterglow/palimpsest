@@ -24,6 +24,43 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Native CI opt-out — 2026-10-07
+
+Owner explicitly requested standing automatic approval or turning off native KVM attempts because CI/CD repeatedly waits. Current read-only inspection also found both pinned HTTPS URL variables absent, so the selected change is explicit `PALIMPSEST_KVM_ENABLED=false`, not automatically approving a doomed proof. Test and Release accept only enabled/success or literal disabled/skipped; disabled notices explicitly deny native qualification. Failed verification, native failure/cancellation/missing result, invalid flag and untrusted/cancelled release contexts stay blocked. Native environment reviewer/branch policy, secrets, cleanup/pins and all six strict hosted checks remain unchanged.
+
+Implement in isolated latest-dev clone; the shared checkout's unrelated uncommitted work is not included. Apply through the strict PR path to dev. Main promotion remains owner-managed, and older main/tag workflow source retains its old verdict; a variable write alone cannot update that source. No release tag, native VM or production action is part of this change.
+
+Before-policy measurements: latest20 completed non-cancelled Test runs (10 push/10 PR, same observed job-name shape, historical mixed native boundaries). Created-to-last-job critical path uses latest startedAt for reruns: median177s/p90 nearest-rank60072s; push n10=163/84054s, PR n10=187.5/295s. Run36169450623 uses its 17:55:34Z rerun start (167s), not the original createdAt (579s). Native execution n14=139/140s; valid native wait n13=72/84036s; its inconsistent negative native wait is retained below but excluded only from wait statistics. Run37502849641 native wait was60052s. Raw job/step timestamps remain in machine-local `/tmp/palimpsest-native-ci-metrics-20261007/before-measurements.json`; the normalized run receipts below are durable. After runs must retain exact SHA/event/sample size; no speedup claim without a comparable sufficient population.
+
+Repository variable mutation: API readback confirms canonical false at 2026-10-07T11:36:20Z. Native protected-environment/secret/resource settings were not changed.
+
+Final local reviewed source digest `f46e8aef961a9e3c290e5e5119ce92d9e27bd65f0359d0f055027abbb5b43272` (445 files): final workflow contract modules126 passed in4.04s; complete portable lane6366 passed/217 skipped/7 retained fork deprecation warnings in219.20s (6583 selected nodes). Actual Test verdict and Release notice shell paths exercised disabled/skipped, enabled/success and denied bad outcomes; Release notices bind actual native outcome, not flag spelling. Actionlint, changed-file Ruff lint/format, manifest, current CLI reference, strict OpenSpec and staged architecture guards passed. These are local policy/portable receipts, not GitHub native qualification or release publication.
+
+| Run | Event | Created UTC | Started UTC | Last job UTC | Critical path s | Native wait s |
+| --- | --- | --- | --- | --- | ---: | ---: |
+| [37502849641](https://github.com/openstack-afterglow/palimpsest/actions/runs/37502849641) | push | 2026-10-06T17:20:58Z | 2026-10-06T17:20:58Z | 2026-10-07T10:02:10Z | 60072 | 60052 |
+| [37495871557](https://github.com/openstack-afterglow/palimpsest/actions/runs/37495871557) | pull_request | 2026-10-06T16:27:39Z | 2026-10-06T16:27:39Z | 2026-10-06T16:30:55Z | 196 | not run |
+| [37493792765](https://github.com/openstack-afterglow/palimpsest/actions/runs/37493792765) | pull_request | 2026-10-06T16:12:00Z | 2026-10-06T16:12:00Z | 2026-10-06T16:14:59Z | 179 | not run |
+| [37318672004](https://github.com/openstack-afterglow/palimpsest/actions/runs/37318672004) | push | 2026-10-05T13:40:48Z | 2026-10-05T13:40:48Z | 2026-10-07T09:56:18Z | 159330 | 159313 |
+| [37317958855](https://github.com/openstack-afterglow/palimpsest/actions/runs/37317958855) | pull_request | 2026-10-05T13:35:14Z | 2026-10-05T13:35:14Z | 2026-10-05T13:37:59Z | 165 | not run |
+| [37185453150](https://github.com/openstack-afterglow/palimpsest/actions/runs/37185453150) | push | 2026-10-04T07:19:55Z | 2026-10-04T07:19:55Z | 2026-10-05T06:40:49Z | 84054 | 84036 |
+| [37154355462](https://github.com/openstack-afterglow/palimpsest/actions/runs/37154355462) | pull_request | 2026-10-03T21:13:36Z | 2026-10-03T21:13:36Z | 2026-10-03T21:18:42Z | 306 | not run |
+| [37154038899](https://github.com/openstack-afterglow/palimpsest/actions/runs/37154038899) | pull_request | 2026-10-03T21:08:17Z | 2026-10-03T21:08:17Z | 2026-10-03T21:11:12Z | 175 | not run |
+| [37138269501](https://github.com/openstack-afterglow/palimpsest/actions/runs/37138269501) | pull_request | 2026-10-03T16:49:30Z | 2026-10-03T16:49:30Z | 2026-10-03T16:52:21Z | 171 | not run |
+| [36170485131](https://github.com/openstack-afterglow/palimpsest/actions/runs/36170485131) | push | 2026-09-25T17:58:40Z | 2026-09-25T17:58:40Z | 2026-09-25T18:01:18Z | 158 | 4 |
+| [36169450623](https://github.com/openstack-afterglow/palimpsest/actions/runs/36169450623) | pull_request | 2026-09-25T17:48:42Z | 2026-09-25T17:55:34Z | 2026-09-25T17:58:21Z | 167 | -204 |
+| [36169445442](https://github.com/openstack-afterglow/palimpsest/actions/runs/36169445442) | push | 2026-09-25T17:48:39Z | 2026-09-25T17:48:39Z | 2026-09-25T17:52:13Z | 214 | 72 |
+| [36169076923](https://github.com/openstack-afterglow/palimpsest/actions/runs/36169076923) | pull_request | 2026-09-25T17:45:07Z | 2026-09-25T17:45:07Z | 2026-09-25T17:50:02Z | 295 | 143 |
+| [36169071658](https://github.com/openstack-afterglow/palimpsest/actions/runs/36169071658) | push | 2026-09-25T17:45:05Z | 2026-09-25T17:45:05Z | 2026-09-25T17:47:34Z | 149 | 4 |
+| [36114765058](https://github.com/openstack-afterglow/palimpsest/actions/runs/36114765058) | pull_request | 2026-09-25T08:46:38Z | 2026-09-25T08:46:38Z | 2026-09-25T08:51:33Z | 295 | 131 |
+| [36114742675](https://github.com/openstack-afterglow/palimpsest/actions/runs/36114742675) | push | 2026-09-25T08:46:23Z | 2026-09-25T08:46:23Z | 2026-09-25T08:49:11Z | 168 | 4 |
+| [36081623601](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081623601) | push | 2026-09-25T01:21:05Z | 2026-09-25T01:21:05Z | 2026-09-25T01:23:33Z | 148 | 3 |
+| [36081251771](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081251771) | pull_request | 2026-09-25T01:15:54Z | 2026-09-25T01:15:54Z | 2026-09-25T01:20:48Z | 294 | 135 |
+| [36081237189](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081237189) | push | 2026-09-25T01:15:42Z | 2026-09-25T01:15:42Z | 2026-09-25T01:18:18Z | 156 | 4 |
+| [36077141780](https://github.com/openstack-afterglow/palimpsest/actions/runs/36077141780) | push | 2026-09-25T00:21:13Z | 2026-09-25T00:21:13Z | 2026-09-25T00:23:51Z | 158 | 5 |
+
+
+
 **Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image-tag candidate is also `0.3.0` and its source default is the reviewed immutable candidate SHA. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
 
 **2026-10-06 local Hub endpoint wiring:** The `dev` working tree now derives the

@@ -414,14 +414,34 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/usr/lib/python3/dist-packages:src \
   .venv/bin/python scripts/test_lanes.py run native-live
 ```
 
-### Required stage-1 GitHub KVM gate
+### Opt-in stage-1 GitHub KVM qualification
 
-`Test.kvm` runs on `ubuntu-24.04` only for repository
-`openstack-afterglow/palimpsest`, event `push`, ref `refs/heads/dev` or
-`refs/heads/main`, and `PALIMPSEST_KVM_ENABLED=true`. Its aggregate rejects
-disabled, failed, cancelled, skipped, and missing native outcomes. Release
-uses the same isolated proof for `v*` tags; PyPI and formal GitHub release
-publication require native success. Portable/TCG results are not substitutes.
+The 2026-10-07 owner decision disables automatic native attempts with explicit
+repository variable `PALIMPSEST_KVM_ENABLED=false`. `Test.kvm` still runs on
+`ubuntu-24.04` only for repository `openstack-afterglow/palimpsest`, event `push`,
+ref `refs/heads/dev` or `refs/heads/main`, and literal flag `true`. Its
+`Native KVM qualification policy` verdict accepts exactly `true/success` or
+`false/skipped`. Disabled policy success reports that **no native proof ran**;
+missing/malformed flags, failed/cancelled native attempts and enabled skip fail.
+PRs run neither the native proof nor its verdict, retaining six strict hosted
+required checks.
+
+Release uses the same opt-in proof for `v*` tags. PyPI/formal GitHub publication
+requires a non-cancelled trusted repository push/tag, `verify=success`, and the
+same two-state native policy. Its explicit `!cancelled()` condition handles an
+intentionally skipped dependency without bypassing verification. A disabled
+release notice says it has **no native KVM proof**; portable/TCG results are not
+native qualification. No release tag or publication is needed to test this policy.
+
+Both pinned HTTPS URL inputs remain absent; disabling does not repair or replace
+them. Re-enabling requires exact verified inputs and existing protected approval.
+An older main/tag workflow retains its old gate until its source includes this
+change; main promotion remains the owner's `dev → main` merge.
+
+Configure lowercase `true`/`false`: the actual Test Bash verdict compares exact
+strings, while GitHub's job expressions (including Release) compare strings
+case-insensitively. Uppercase aliases are not a release-condition rejection
+claim. Missing/non-boolean values still cannot satisfy the publication policy.
 
 Both jobs use protected environment `palimpsest-native-kvm`, reviewer
 `jung-geun`, no admin bypass, and deployment policies for dev/main branches
@@ -584,13 +604,15 @@ Before publication:
   `Local OCI image product build`, and `Guest stage-1 binary (Linux x86_64)`.
   Branch-protection API returned 404, but that does not remove ruleset checks;
   do not bypass them. Keep portable/native skip receipts distinct.
-- A future release tag triggers its **own** protected `palimpsest-native-kvm`
-  job. It needs separate owner approval for that exact release workflow/ref;
-  a branch-run approval is not standing release approval. Never approve using
-  the logged-in reviewer account on the owner's behalf. Keep runner21 stopped.
-- `release.yml` publishes only the root wheel/sdist: rebuild/verify and native
-  proof must both succeed before PyPI (`pypi` trusted publisher), then formal
-  GitHub release. The independently versioned Hub wheel is not published there.
+- With the current owner-selected `false` policy, a future release tag skips
+  the protected native job and does not request native environment approval.
+  Re-enabling `true` restores that exact-ref protected proof and its pinned
+  prerequisites; never approve on the owner's behalf. Keep runner21 stopped.
+- `release.yml` publishes only the root wheel/sdist: rebuild/verify must succeed
+  before PyPI (`pypi` trusted publisher), followed by formal GitHub release.
+  Native policy must be exactly enabled/success or disabled/skipped; the latter
+  has no current native qualification. The separately versioned Hub wheel is
+  not published there.
 - `hub-docker.yml` builds separate API and worker targets. A stable `v0.3.1`
   tag selects `0.3.1`, `v0.3.1`, `sha-…` **and `latest`** for both images:
   metadata-action's [default `latest=auto` semver flavor](https://github.com/docker/metadata-action/tree/v5#latest-tag)

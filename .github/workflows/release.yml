@@ -150,12 +150,26 @@ jobs:
     needs: [verify, kvm-proof]
     permissions:
       id-token: write
-    if: needs.kvm-proof.result == 'success'
+    if: >-
+      !cancelled() && github.repository == 'openstack-afterglow/palimpsest' &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      needs.verify.result == 'success' &&
+      ((vars.PALIMPSEST_KVM_ENABLED == 'true' && needs.kvm-proof.result == 'success') ||
+      (vars.PALIMPSEST_KVM_ENABLED == 'false' && needs.kvm-proof.result == 'skipped'))
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/palimpsest-client
     steps:
+      - name: Report native qualification policy
+        env:
+          PALIMPSEST_KVM_RESULT: ${{ needs.kvm-proof.result }}
+        run: |
+          if [ "$PALIMPSEST_KVM_RESULT" = 'skipped' ]; then
+            echo '::notice::Native KVM qualification is disabled; this release has no native KVM proof.'
+          else
+            echo 'Native KVM proof succeeded.'
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: distributions

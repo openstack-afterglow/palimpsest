@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import subprocess
+from itertools import product
 from pathlib import Path
 
 import yaml
+from test_test_lanes import _github_condition
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "development-package.yml"
@@ -89,9 +91,49 @@ def test_formal_release_permissions_and_publication_gate() -> None:
     assert effective_permissions(jobs["publish"]) == {"id-token": "write"}
     assert effective_permissions(jobs["github-release"]) == {"contents": "write"}
     assert jobs["publish"]["needs"] == ["verify", "kvm-proof"]
-    assert jobs["publish"]["if"] == "needs.kvm-proof.result == 'success'"
     assert jobs["github-release"]["needs"] == "publish"
     assert any(step.get("uses") == "pypa/gh-action-pypi-publish@release/v1" for step in jobs["publish"]["steps"])
+
+    trusted_context = ("openstack-afterglow/palimpsest", "push", "refs/tags/v1.2.3")
+    contexts = [
+        trusted_context,
+        ("some-fork/palimpsest", "push", "refs/tags/v1.2.3"),
+        ("", "push", "refs/tags/v1.2.3"),
+        ("openstack-afterglow/palimpsest", "pull_request", "refs/tags/v1.2.3"),
+        ("openstack-afterglow/palimpsest", "workflow_call", "refs/tags/v1.2.3"),
+        ("openstack-afterglow/palimpsest", "workflow_dispatch", "refs/tags/v1.2.3"),
+        ("openstack-afterglow/palimpsest", "", "refs/tags/v1.2.3"),
+        ("openstack-afterglow/palimpsest", "push", "refs/heads/main"),
+        ("openstack-afterglow/palimpsest", "push", "refs/heads/dev"),
+        ("openstack-afterglow/palimpsest", "push", "refs/tags/release-1.2.3"),
+        ("openstack-afterglow/palimpsest", "push", ""),
+    ]
+    results = ["success", "failure", "cancelled", "skipped", ""]
+    # Evaluate the actual condition, including status functions: a disabled native
+    # lane may publish only when it was skipped, never after a failed attempt or
+    # as a substitute for successful verification.
+    for context, enabled, verify_result, native_result, cancelled in product(
+        contexts, ["true", "false", "", "1", "invalid"], results, results, [False, True]
+    ):
+        repository, event, ref = context
+        values = {
+            "github.repository": repository,
+            "github.event_name": event,
+            "github.ref": ref,
+            "vars.PALIMPSEST_KVM_ENABLED": enabled,
+            "needs.verify.result": verify_result,
+            "needs.kvm-proof.result": native_result,
+        }
+        expected = (
+            context == trusted_context
+            and not cancelled
+            and verify_result == "success"
+            and (enabled, native_result) in {("true", "success"), ("false", "skipped")}
+        )
+        assert _github_condition(jobs["publish"]["if"], values, cancelled=cancelled) is expected, (
+            values,
+            cancelled,
+        )
 
 
 def test_native_proofs_keep_secrets_on_prove_and_cleanup_only() -> None:

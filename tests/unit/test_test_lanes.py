@@ -387,7 +387,6 @@ def test_ci_portable_matrix_runs_every_shard_in_one_wave(job_id, count, runner, 
 _AGGREGATORS = {
     "pure": "Pure contracts (Python 3.12)",
     "unit-macos": "Unit tests (macOS 15)",
-    "kvm-required": "Required native KVM proof",
 }
 
 # Verdict scripts execute under bash -e; test their exit status across outcomes.
@@ -418,12 +417,14 @@ _AGGREGATOR_VERDICTS = {
 
 def test_ci_test_jobs_start_without_a_gate_job_in_front():
     jobs = _test_workflow_jobs()
-    assert {job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in _AGGREGATORS} == {}
+    assert {
+        job_id: job["needs"] for job_id, job in jobs.items() if "needs" in job and job_id not in _AGGREGATOR_VERDICTS
+    } == {}
     assert {job_id: jobs[job_id]["name"] for job_id in _AGGREGATORS} == _AGGREGATORS
     assert jobs["pure"]["if"] == jobs["unit-macos"]["if"] == "always()"
-    assert {job_id for job_id, job_config in jobs.items() if "if" in job_config and job_id not in _AGGREGATORS} == {
-        "kvm"
-    }
+    assert {
+        job_id for job_id, job_config in jobs.items() if "if" in job_config and job_id not in _AGGREGATOR_VERDICTS
+    } == {"kvm"}
 
 
 # Exact job keys keep portable jobs unconditionally runnable and native credentials scoped.
@@ -474,26 +475,48 @@ def test_ci_aggregator_verdict_accepts_only_every_dependency_succeeding(job_id):
         assert set(workflow["jobs"][dependency]) == _TEST_JOB_KEYS[dependency], dependency
 
 
-def _github_condition(expression: str, values: dict[str, str]) -> bool:
+def _github_condition(expression: str, values: dict[str, str], *, cancelled: bool = False) -> bool:
     """Evaluate the restricted GitHub boolean expression shape used by native jobs."""
     substituted = re.sub(
         r"\b(?:github|vars|needs)\.[\w.-]+", lambda match: repr(values.get(match.group(), "")), expression
     )
-    tree = ast.parse(substituted.replace("&&", " and ").replace("||", " or "), mode="eval")
+    substituted = re.sub(r"!(?!=)", " not ", substituted)
+    tree = ast.parse(substituted.replace("&&", " and ").replace("||", " or ").strip(), mode="eval")
+    # Without an explicit status function, GitHub implicitly requires success().
+    has_status_function = any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"always", "cancelled"}
+        for node in ast.walk(tree)
+    )
+    if not has_status_function and (
+        cancelled
+        or any(
+            result != "success"
+            for reference, result in values.items()
+            if reference.startswith("needs.") and reference.endswith(".result")
+        )
+    ):
+        return False
 
     def evaluate(node):
         if isinstance(node, ast.Constant):
             return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not evaluate(node.operand)
         if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
             results = [bool(evaluate(value)) for value in node.values]
             return all(results) if isinstance(node.op, ast.And) else any(results)
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
-            return evaluate(node.left) == evaluate(node.comparators[0])
+            left, right = evaluate(node.left), evaluate(node.comparators[0])
+            if isinstance(left, str) and isinstance(right, str):
+                return left.casefold() == right.casefold()
+            return left == right
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
             if node.func.id == "always" and not node.args:
                 return True
+            if node.func.id == "cancelled" and not node.args:
+                return cancelled
             if node.func.id == "startsWith" and len(node.args) == 2:
-                return evaluate(node.args[0]).startswith(evaluate(node.args[1]))
+                return evaluate(node.args[0]).casefold().startswith(evaluate(node.args[1]).casefold())
         raise AssertionError(f"unsupported GitHub expression: {ast.dump(node)}")
 
     return bool(evaluate(tree.body))
@@ -530,9 +553,9 @@ def test_native_jobs_use_positive_repository_event_ref_allowlist(
     assert _github_condition(release_jobs["kvm-proof"]["if"], values) is release_proof
 
 
-@pytest.mark.parametrize("enabled", ["true", "false", "", "TRUE"])
+@pytest.mark.parametrize("enabled", ["true", "false", "", "TRUE", "FALSE", "invalid", "1"])
 @pytest.mark.parametrize("result", ["success", "failure", "cancelled", "skipped", ""])
-def test_native_verdict_runs_actual_shell_and_accepts_only_enabled_success(enabled, result):
+def test_native_verdict_runs_actual_shell_and_accepts_only_enabled_success_or_disabled_skipped(enabled, result):
     job = _test_workflow_jobs()["kvm-required"]
     (step,) = job["steps"]
     values = {"vars.PALIMPSEST_KVM_ENABLED": enabled, "needs.kvm.result": result}
@@ -544,7 +567,7 @@ def test_native_verdict_runs_actual_shell_and_accepts_only_enabled_success(enabl
     completed = subprocess.run(
         ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], env=environment, check=False
     )
-    assert (completed.returncode == 0) is (enabled == "true" and result == "success")
+    assert (completed.returncode == 0) is ((enabled, result) in {("true", "success"), ("false", "skipped")})
 
 
 def test_ci_test_steps_cannot_be_skipped_or_neutered():
