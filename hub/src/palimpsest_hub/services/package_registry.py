@@ -29,7 +29,7 @@ from palimpsest_hub.api.hub import (
     _run_blocking,
     _wait_without_releasing,
 )
-from palimpsest_hub.auth import validate_package_owner
+from palimpsest_hub.auth import package_actions, package_capabilities, validate_package_owner
 from palimpsest_hub.config import default_project_namespace, get_settings, validate_keystone_id
 from palimpsest_hub.database import get_session_factory
 from palimpsest_hub.models import (
@@ -121,7 +121,11 @@ def require_policy(member=None):
     if member is not None:
         if validate_keystone_id(member["project_id"]) in projects or validate_keystone_id(member["user_id"]) in users:
             raise RegistryError(403, "ADMIN_CREDENTIAL_FORBIDDEN", "protected principals cannot use package authority")
-        if member.get("is_system_admin") or {str(r).lower() for r in member.get("roles", [])} & {"admin", "service"}:
+        if member.get("is_system_admin") or {str(r).lower() for r in member.get("roles", [])} & {
+            "admin",
+            "manager",
+            "service",
+        }:
             raise RegistryError(403, "ADMIN_CREDENTIAL_FORBIDDEN", "administrator or service authority forbidden")
     return settings
 
@@ -133,9 +137,9 @@ class Actor:
     namespace: str
     key_id: str | None = None
     scope: dict = field(default_factory=lambda: {"all_packages": True})
-    actions: tuple[str, ...] = ("packages:read",)
+    actions: tuple[str, ...] = ()
     credential: str | None = field(default=None, repr=False)
-    can_write: bool = False
+    capabilities: frozenset[str] = frozenset()
 
 
 async def namespace_row(session, namespace):
@@ -168,6 +172,7 @@ def package_authority():
 
 async def project_context(member):
     require_policy(member)
+    actions = package_actions(member["package_capabilities"])
     project = validate_keystone_id(member["project_id"])
     async with factory()() as session:
         row = await session.get(PackageNamespace, project)
@@ -176,7 +181,13 @@ async def project_context(member):
         "project_name": member["project_name"],
         "namespace": row.namespace if row else None,
         "package_authority": package_authority(),
-        "capabilities": {"packages_read": True, "packages_write": bool(member["can_write"]), "keys_issue": True},
+        "capabilities": {
+            "packages_read": "packages:inventory" in actions,
+            "packages_download": "packages:read" in actions,
+            "packages_write": "packages:write" in actions,
+            "keys_issue": "palimpsest-keys_editor" in member["package_capabilities"],
+            "keys_revoke": "palimpsest-keys_admin" in member["package_capabilities"],
+        },
     }
 
 
@@ -185,8 +196,7 @@ async def register_namespace(project_id, member):
     project = validate_keystone_id(member["project_id"])
     if project_id != project:
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "project does not match original token")
-    if not member["can_write"]:
-        raise RegistryError(403, "ACTION_DENIED", "namespace registration requires member write authority")
+    require_capability(member["package_capabilities"], "palimpsest-publish_editor")
     # A readable namespace is only a trusted configuration binding, never a display-name guess.
     try:
         bindings = settings.palimpsest_hub_package_namespace_bindings
@@ -233,7 +243,14 @@ async def member_actor(namespace, member):
         row = await namespace_row(session, namespace)
     if row.project_id != validate_keystone_id(member["project_id"]):
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "namespace does not match current project")
-    return Actor(row.project_id, validate_keystone_id(member["user_id"]), namespace)
+    capabilities = member["package_capabilities"]
+    return Actor(
+        row.project_id,
+        validate_keystone_id(member["user_id"]),
+        namespace,
+        actions=tuple(sorted(package_actions(capabilities))),
+        capabilities=capabilities,
+    )
 
 
 def key_metadata(row, namespace):
@@ -251,10 +268,16 @@ def key_metadata(row, namespace):
     }
 
 
+def require_capability(capabilities, capability):
+    if capability not in capabilities:
+        raise RegistryError(403, "ACTION_DENIED", "required Palimpsest capability is unavailable")
+
+
 async def issue_key(namespace, member, request: KeyCreate):
     actor = await member_actor(namespace, member)
-    if any(action.endswith(":write") for action in request.actions) and not member["can_write"]:
-        raise RegistryError(403, "ACTION_DENIED", "reader cannot delegate write authority")
+    require_capability(actor.capabilities, "palimpsest-keys_editor")
+    if not set(request.actions) <= set(actor.actions):
+        raise RegistryError(403, "ACTION_DENIED", "key actions exceed current owner authority")
     scope = request.scope.model_dump(exclude_none=True)
     for package in scope.get("packages", []):
         check_package(namespace, package)
@@ -280,6 +303,8 @@ async def issue_key(namespace, member, request: KeyCreate):
 
 async def list_keys(namespace, member):
     actor = await member_actor(namespace, member)
+    if not actor.capabilities & {"palimpsest-keys_editor", "palimpsest-keys_admin"}:
+        raise RegistryError(403, "ACTION_DENIED", "key metadata requires key editor or admin authority")
     async with factory()() as session:
         rows = (
             await session.scalars(
@@ -293,6 +318,7 @@ async def list_keys(namespace, member):
 
 async def revoke_key(namespace, key_id, member):
     actor = await member_actor(namespace, member)
+    require_capability(actor.capabilities, "palimpsest-keys_admin")
     key_id = canonical_uuid(key_id)
     async with factory()() as session:
         row = await session.scalar(select(PackageKey).where(PackageKey.id == key_id).with_for_update())
@@ -348,22 +374,28 @@ async def authenticate_key(credential, *, session=None, lock=False):
     namespace = await session.get(PackageNamespace, row.project_id)
     if namespace is None:
         raise RegistryError(404, "NOT_FOUND", "namespace not registered")
+    capabilities = package_capabilities(member["roles"])
+    delegated = set(row.actions)
+    # Download delegation includes metadata, independently attenuated by current owner roles.
+    if "packages:read" in delegated:
+        delegated.add("packages:inventory")
+    actions = delegated & package_actions(capabilities)
     return Actor(
         row.project_id,
         row.owner_user_id,
         namespace.namespace,
         row.id,
         row.scope,
-        tuple(row.actions),
+        tuple(sorted(actions)),
         credential,
-        bool(member["can_write"]),
+        capabilities,
     )
 
 
 async def auth_me(actor):
     async with factory()() as session:
         row = await session.get(PackageKey, actor.key_id)
-        return {**key_metadata(row, actor.namespace), "actor_type": "package-key"}
+        return {**key_metadata(row, actor.namespace), "actions": list(actor.actions), "actor_type": "package-key"}
 
 
 def check_package(namespace, package):
@@ -383,8 +415,6 @@ def authorize(actor, namespace, package, action):
         raise RegistryError(403, "ACTION_DENIED", "required action not delegated")
     if not actor.scope.get("all_packages") and package not in actor.scope.get("packages", []):
         raise RegistryError(403, "PACKAGE_SCOPE_DENIED", "package outside exact key scope")
-    if action.endswith(":write") and not actor.can_write:
-        raise RegistryError(403, "ACTION_DENIED", "owner no longer has delegated write authority")
 
 
 async def fresh_actor(actor, namespace, package, action, *, session=None, lock=False):
@@ -1036,8 +1066,8 @@ def make_cursor(binding, after):
 async def inventory(actor, namespace, limit, cursor, package_type):
     if actor.namespace != namespace:
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "namespace does not match actor")
-    if "packages:read" not in actor.actions:
-        raise RegistryError(403, "ACTION_DENIED", "package read not delegated")
+    if "packages:inventory" not in actor.actions:
+        raise RegistryError(403, "ACTION_DENIED", "package inventory not delegated")
     binding = cursor_binding(actor, "packages", package_type)
     after = read_cursor(cursor, binding)
     if after is not None and not isinstance(after, str):
@@ -1061,7 +1091,7 @@ async def inventory(actor, namespace, limit, cursor, package_type):
 
 
 async def package_detail(actor, namespace, package):
-    authorize(actor, namespace, package, "packages:read")
+    authorize(actor, namespace, package, "packages:inventory")
     async with factory()() as session:
         return await summary(session, await package_row(session, actor, package), namespace)
 
@@ -1091,7 +1121,7 @@ def version_view(row, actor, package):
 
 
 async def versions(actor, namespace, package, limit, cursor):
-    authorize(actor, namespace, package, "packages:read")
+    authorize(actor, namespace, package, "packages:inventory")
     binding = cursor_binding(actor, "versions", package)
     after = read_cursor(cursor, binding)
     async with factory()() as session:
@@ -1126,7 +1156,7 @@ async def versions(actor, namespace, package, limit, cursor):
 
 
 async def version(actor, namespace, package, *, digest=None, tag=None):
-    authorize(actor, namespace, package, "packages:read")
+    authorize(actor, namespace, package, "packages:inventory")
     async with factory()() as session:
         row = await package_row(session, actor, package)
         if tag is not None:

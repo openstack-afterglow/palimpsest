@@ -93,7 +93,7 @@ Profiles do not rewrite Dockerfile `FROM` lines. Remote Dockerfile inputs must r
 
 ### Operator binding and secret-once key issuance
 
-Before using `cloud.dmslab.re.kr/openstack-afterglow/test:v1`, the operator must configure the trusted public origin and bind `openstack-afterglow` to the **actual immutable Keystone project UUID**, then register that namespace with an ordinary member's original project-scoped token. A display name, client `X-Project-Id` header or familiar hostname is not a binding. This example is conditional, not evidence that this authority is deployed or that a binding exists. See [Hub service settings](install.md#hub-service-settings) for protected identities, validator policy and federated membership prerequisites.
+Before using `cloud.dmslab.re.kr/openstack-afterglow/test:v1`, the operator must configure the trusted public origin and bind `openstack-afterglow` to the **actual immutable Keystone project UUID**, then register that namespace with a member's original project-scoped token carrying current Palimpsest publish authority. Key issuance additionally requires keys-editor authority and every requested action; own-key revocation requires keys-admin authority. A display name, client `X-Project-Id` header or familiar hostname is not a binding. This example is conditional, not evidence that this authority is deployed or that a binding exists. See the [capability matrix](project-package-registry.md#3-identity-and-authorization) and [Hub service settings](install.md#hub-service-settings).
 
 Control calls use the original member token (`X-Auth-Token`), never a package key:
 
@@ -110,7 +110,7 @@ Control calls use the original member token (`X-Auth-Token`), never a package ke
 }
 ```
 
-The response contains public metadata under `key` and the complete credential under `secret` **once**. Write actions require their matching read actions; expiry is 1–90 days. Keep the secret in approved secret handling, not argv, shell history, TOML, receipts or logs. List/revoke calls never recover it. Keys bind owner, project, exact packages and actions; every use rechecks current owner membership and protected-principal policy. A package-only key cannot authorize an online build's mandatory cache.
+The response contains public metadata under `key` and the complete credential under `secret` **once**; expiry is 1–90 days. Write actions do not require or grant matching read actions. CLI publication needs `packages:inventory` plus `packages:write`, while pull needs effective inventory plus `packages:read`. The example permits both transfer directions and mandatory online cache transfer; a publish-only key can instead request just inventory plus write. Keep the secret in approved secret handling, not argv, shell history, TOML, receipts or logs. List/revoke calls never recover it. Keys bind owner, project, exact packages and actions; every use intersects delegated actions with current owner capabilities and protected-principal policy. A package-only key cannot authorize an online build's mandatory cache.
 
 ### Credential-helper configuration and login
 

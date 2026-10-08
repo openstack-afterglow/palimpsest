@@ -1220,7 +1220,9 @@ def _dispatch_native_registry(
     if op == "push" and (resolved.tag is None or resolved.digest is not None):
         raise PalimpsestError("native push requires a tag reference")
     client = NativePackageClient(profile, namespace=namespace)
-    client.authorize(package, ("packages:read", "packages:write") if op == "push" else ("packages:read",))
+    client.authorize(
+        package, ("packages:inventory", "packages:write") if op == "push" else ("packages:inventory", "packages:read")
+    )
     init_resolved_roots(roots)
     if op == "pull":
         output = args.output or (
@@ -2378,7 +2380,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         raise PalimpsestError("native builds reject Docker --load and external cache exporters")
                     package_client = NativePackageClient(selected_registry, namespace=native_namespace)
                     if args.push:
-                        package_client.authorize(native_package, ("packages:read", "packages:write"))
+                        package_client.authorize(native_package, ("packages:inventory", "packages:write"))
                 elif args.cache_registry is None or args.cache_package is None:
                     raise PalimpsestError(
                         "online OCI build requires --cache-registry and --cache-package namespace/package"

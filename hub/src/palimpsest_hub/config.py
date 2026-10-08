@@ -9,6 +9,9 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Never delegated through an export Trust, whatever the operator configures.
+FORBIDDEN_DELEGATED_ROLES = frozenset({"admin", "manager", "service"})
+
 
 def validate_keystone_id(value: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value) is None:
@@ -49,8 +52,15 @@ class Settings(DatabaseSettings):
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
     palimpsest_hub_package_namespace_bindings: dict[str, str] = Field(default_factory=dict)
     palimpsest_hub_package_public_origin: str = ""
+    # Deferred Glance exports run only through a requester-created Keystone Trust
+    # with these least global roles and this finite lifetime. Glance's default
+    # `download_image` policy requires `member` even for project-owned images.
+    palimpsest_hub_export_delegated_roles: tuple[str, ...] = ("member",)
+    palimpsest_hub_export_delegation_ttl_seconds: int = Field(default=21600, ge=900, le=86400)
 
     os_auth_url: str
+    # Export Trust trustee. It authenticates only to its own service project; it is
+    # never scoped to a tenant project and holds no tenant role assignments.
     os_username: str
     os_password: SecretStr
     os_project_name: str
@@ -68,6 +78,18 @@ class Settings(DatabaseSettings):
     @classmethod
     def canonical_protected_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(dict.fromkeys(validate_keystone_id(item) for item in value))
+
+    @field_validator("palimpsest_hub_export_delegated_roles")
+    @classmethod
+    def least_delegated_roles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        roles = tuple(dict.fromkeys(value))
+        if (
+            not roles
+            or any(not isinstance(role, str) or not role or role != role.strip() or len(role) > 255 for role in roles)
+            or {role.casefold() for role in roles} & FORBIDDEN_DELEGATED_ROLES
+        ):
+            raise ValueError("delegated export roles must be non-administrative Keystone role names")
+        return roles
 
     @field_validator("palimpsest_hub_package_namespace_bindings")
     @classmethod

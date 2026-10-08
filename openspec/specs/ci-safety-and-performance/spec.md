@@ -49,6 +49,13 @@ CI changes MUST retain comparable measured critical paths, hosted-only untrusted
 
 2026-09-24 `ci-perf` 변경은 두 matrix의 `max-parallel`을 제거했다. dev/PR 크리티컬 패스 약 155–170초라는 기대치는 KVM job 약 140초를 하한으로 한 추정이며, push 뒤 재측정 전까지 효과로 주장하지 않는다. CI를 바꾸는 모든 변경은 아래 규칙을 따른다.
 
+Rules 1–12 below remain mandatory for CI changes, including their stated
+coverage gaps and pending owner decisions. Historical measurements are dated
+baselines, not proof of a new run. The explicit native policy in Requirements
+above is authoritative: enabled requires proof; deliberate disabled/skipped
+permits policy success with no qualification. Hosted-only PR execution and
+fail-closed enabled-native verdicts cannot be traded for shorter wall-clock time.
+
 1. **측정 먼저, 추정 금지.**
    - CI를 바꾸기 전과 후에 최근 20회 이상 `Test` 실행의 job·step 시간을 `gh run list --workflow test.yml`와 `gh api repos/openstack-afterglow/palimpsest/actions/runs/<id>/jobs`로 수집한다.
    - 크리티컬 패스 중앙값과 p90을 commit 본문, [인계 문서](../../../docs/development-handoff.md), [`ARCHITECTURE.md`](../../../ARCHITECTURE.md) Maintenance summary에 남긴다. 이 spec은 2026-09-25의 OpenSpec 부재 기록 이후의 문서 이전이며 과거 실행 결과를 갱신하지 않는다.
@@ -157,3 +164,27 @@ CI changes MUST retain comparable measured critical paths, hosted-only untrusted
       - portable node 수가 크게 늘어난다. 기준은 `60fa42f`의 CI run `35826465548` "Lane shard" 줄의 선택 node 합계 6,081이다(Linux 6 shard와 macOS 4 shard 합계가 같다; pass 수가 아니다). 그 뒤 CI 형태 계약이 node를 더했다. 로컬 기준으로 `2e37538`은 6,084, review 1차 반영 뒤는 6,088, review 2차 반영 뒤는 6,089, review 3차 반영 뒤는 6,091(`--collect-only`)이다.
       - 새 테스트 계층이나 job을 추가한다.
     - `.github/**`와 `AGENTS.md`는 architecture digest 범위에 들어간다. 이 파일을 바꾸면 Maintenance summary를 갱신하고 `--stamp`와 `--staged` 검사를 거친다.
+
+#### Scenario: Fork PR attempts native proof
+
+- **GIVEN** a PR or fork-origin event that does not meet the trusted repository/push/ref allowlist
+- **WHEN** the `Test` workflow evaluates native execution and its aggregator
+- **THEN** neither runs or reports native success for that PR, while the six strict hosted PR required checks remain required.
+
+#### Scenario: Trusted native run has incomplete ownership evidence
+
+- **GIVEN** a reviewed `dev` or `main` push with enabled native proof, protected-environment approval and a dedicated quota-limited Nova VM
+- **WHEN** evidence is missing, resource ownership differs, the job is cancelled, or exact-owned cleanup cannot be confirmed
+- **THEN** the native verdict fails, unknown resources are not deleted, release publication is blocked, and manual manifest recovery remains explicit when required.
+
+#### Scenario: CI performance improvement claim
+
+- **GIVEN** a workflow change that removes a scheduling bottleneck
+- **WHEN** its effect is documented
+- **THEN** before/after completed `Test` job and step measurements cover at least 20 runs each, report median and p90 including environment/concurrency waits, and distinguish observed values from estimates without triggering extra runs merely to fill the sample.
+
+#### Scenario: Development package workflow change
+
+- **GIVEN** a workflow edit to the SHA-specific prerelease verification or publication jobs
+- **WHEN** existing contract tests pass
+- **THEN** review must still inspect unpinned step/job `if`, `continue-on-error`, `shell`, `env`, and additional-step bypasses; passing inclusion-based contracts alone is not publication authorization.

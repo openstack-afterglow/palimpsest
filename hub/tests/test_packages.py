@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.api import hub as legacy
 from palimpsest_hub.api import packages
-from palimpsest_hub.auth import get_package_member_info
+from palimpsest_hub.auth import get_package_member_info, package_capabilities
 from palimpsest_hub.models import (
     Base,
     PackageCache,
@@ -37,6 +37,15 @@ from palimpsest_hub.services.hub_store import LocalPathBlobStore
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 CONFIG = "application/vnd.oci.image.config.v1+json"
 LAYER = "application/vnd.oci.image.layer.v1.tar"
+
+SERVICE_ADMIN_ROLES = [
+    "member",
+    "palimpsest-inventory_reader",
+    "palimpsest-download_user",
+    "palimpsest-publish_editor",
+    "palimpsest-keys_editor",
+    "palimpsest-keys_admin",
+]
 
 
 def digest(payload):
@@ -153,36 +162,31 @@ async def hub(tmp_path, monkeypatch):
             "user_id": "f" * 64,
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": ["member"],
-            "can_write": True,
+            "roles": SERVICE_ADMIN_ROLES.copy(),
         },
         "two": {
             "user_id": "OtherMember",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": ["member"],
-            "can_write": True,
+            "roles": SERVICE_ADMIN_ROLES.copy(),
         },
         "foreign": {
             "user_id": "ForeignMember",
             "project_id": "Project-B",
             "project_name": "Renamable project",
-            "roles": ["member"],
-            "can_write": True,
+            "roles": SERVICE_ADMIN_ROLES.copy(),
         },
         "admin": {
             "user_id": "AdminRole",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": ["admin", "member"],
-            "can_write": True,
+            "roles": ["admin", *SERVICE_ADMIN_ROLES],
         },
         "protected": {
             "user_id": "ProtectedUser",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": ["member"],
-            "can_write": True,
+            "roles": SERVICE_ADMIN_ROLES.copy(),
         },
     }
 
@@ -198,7 +202,7 @@ async def hub(tmp_path, monkeypatch):
 
     async def original_member(token_info):
         registry.require_policy(token_info)
-        return token_info
+        return {**token_info, "package_capabilities": package_capabilities(token_info["roles"])}
 
     async def member_dependency(request: Request):
         return await original_member(await original_token(request))
@@ -373,8 +377,7 @@ async def test_authority_removed_during_transfer_prevents_publication(hub, chang
     elif change == "membership":
         hub.disabled.add(hub.people["one"]["user_id"])
     elif change == "role":
-        hub.people["one"]["can_write"] = False
-        hub.people["one"]["roles"] = ["reader"]
+        hub.people["one"]["roles"] = ["reader", "palimpsest-inventory_reader"]
         assert (await hub.client.get("/v1/auth/me", headers=credential)).status_code == 200
     else:
         async with hub.factory() as session:
@@ -558,6 +561,77 @@ async def test_package_only_key_cannot_cache_and_valid_cache_has_no_inventory_si
 
 
 @pytest.mark.asyncio
+async def test_cache_only_keys_preserve_independent_leaves_scope_and_current_owner(hub):
+    """ASGI/SQL/CAS proof, not a live identity or CLI transport qualification."""
+    namespace, _, writer = await key(hub, actions=["cache:write"])
+    _, _, other_writer = await key(hub, person="two", actions=["cache:write"])
+    _, _, reader = await key(hub, person="two", actions=["cache:read"])
+    hub.people["one"]["roles"] = ["member", "palimpsest-publish_editor"]
+    binding = {
+        "project_id": "Project-A",
+        "namespace": namespace,
+        "package": "test",
+        "build_key": digest(b"write-only cache"),
+        "cache_scope": "default",
+        "platform": "linux/amd64",
+        "builder_fingerprint": digest(b"builder"),
+    }
+    archive = cache_archive(binding)
+    partition = {name: binding[name] for name in ("build_key", "cache_scope", "platform", "builder_fingerprint")}
+    body = {**partition, "archive_digest": digest(archive), "archive_size_bytes": len(archive)}
+    base = f"/v1/projects/{namespace}/cache"
+    params = {"package": "test"}
+    path, _ = await staged(hub, namespace, writer, archive, body, resource="cache")
+    assert (await hub.client.get(path, params=params, headers=other_writer)).status_code == 404
+    assert (await hub.client.put(path, params=params, headers=other_writer, json={})).status_code == 404
+    assert (await hub.client.put(path, params=params, headers=writer, json={})).status_code == 201
+    archive_path = base + "/archives/" + digest(archive)
+    assert (await hub.client.get(base + "/resolve", params={**params, **partition}, headers=writer)).status_code == 403
+    assert (await hub.client.get(archive_path, params=params, headers=writer)).status_code == 403
+    assert (await hub.client.post(base + "/uploads", params=params, headers=reader, json=body)).status_code == 403
+    # Cache read is independent of package inventory and download delegation.
+    hub.people["two"]["roles"] = ["member", "palimpsest-download_user"]
+    resolved = await hub.client.get(base + "/resolve", params={**params, **partition}, headers=reader)
+    assert resolved.status_code == 200 and resolved.json()["resolution"] == "exact"
+    downloaded = await hub.client.get(archive_path, params=params, headers=reader)
+    assert downloaded.status_code == 200 and downloaded.content == archive
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert (await hub.client.get(f"/v1/projects/{namespace}/packages", headers=reader)).status_code == 403
+    assert (await hub.client.get(archive_path, params={"package": "test/child"}, headers=reader)).status_code == 403
+    assert (
+        await hub.client.get("/v1/projects/beta/cache/resolve", params={**params, **partition}, headers=reader)
+    ).status_code == 403
+    # Fully received bytes cannot become a cache record after the owner loses publish.
+    next_binding = {**binding, "build_key": digest(b"pending cache")}
+    pending_archive = cache_archive(next_binding)
+    pending_body = {
+        **body,
+        "build_key": next_binding["build_key"],
+        "archive_digest": digest(pending_archive),
+        "archive_size_bytes": len(pending_archive),
+    }
+    pending, _ = await staged(hub, namespace, writer, pending_archive, pending_body, resource="cache")
+    hub.people["one"]["roles"] = ["member", "palimpsest-download_user"]
+    assert (await hub.client.put(pending, params=params, headers=writer, json={})).status_code == 403
+    assert (
+        await hub.client.patch(
+            pending,
+            params=params,
+            headers={**writer, "Upload-Offset": str(len(pending_archive)), "Content-Type": "application/octet-stream"},
+            content=b"",
+        )
+    ).status_code == 403
+    assert not hub.store.exists(digest(pending_archive))
+    hub.people["two"]["roles"] = ["reader", "palimpsest-inventory_reader"]
+    assert (await hub.client.get(archive_path, params=params, headers=reader)).status_code == 403
+    inventory = await hub.client.get(f"/v1/projects/{namespace}/packages", headers={"X-Auth-Token": "two"})
+    assert inventory.status_code == 200 and inventory.json()["items"] == []
+    async with hub.factory() as session:
+        assert await session.scalar(select(func.count()).select_from(PackageCache)) == 1
+        assert await session.scalar(select(func.count()).select_from(RegistryPackage)) == 0
+
+
+@pytest.mark.asyncio
 async def test_protected_and_admin_member_tokens_and_empty_policy_fail_closed(hub):
     for person in ("admin", "protected"):
         context = await hub.client.get("/v1/projects/current", headers={"X-Auth-Token": person})
@@ -593,7 +667,7 @@ async def test_key_inventory_scope_and_explicit_whole_project_are_distinct(hub):
         {"scope": {"all_packages": 1}},
         {"scope": {"all_packages": True, "packages": ["test"]}},
         {"scope": {"packages": ["test", "test"]}},
-        {"actions": ["packages:write"]},
+        {"actions": ["vm:launch"]},
         {"expires_in_days": 91},
     ]
     for override in malformed:
@@ -712,3 +786,43 @@ async def test_package_expanded_byte_limit_returns_413_without_inventory_or_cas_
     assert not hub.store.upload_path(upload["upload_id"].replace("-", "")).exists()
     for blob_digest in {*graph, body["archive_digest"]}:
         assert not hub.store.exists(blob_digest)
+
+
+@pytest.mark.asyncio
+async def test_service_admin_key_control_stays_owner_only(hub):
+    namespace, issued, credential = await key(hub)
+    key_path = f"/v1/projects/{namespace}/keys"
+    # Same-project service admin still cannot revoke another owner's key.
+    assert (
+        await hub.client.delete(key_path + "/" + issued["key"]["key_id"], headers={"X-Auth-Token": "two"})
+    ).status_code == 404
+    assert (await hub.client.get(key_path, headers={"X-Auth-Token": "two"})).json()["items"] == []
+    assert (await hub.client.get(key_path, headers=credential)).status_code == 401
+    hub.people["one"]["roles"] = ["reader", "palimpsest-inventory_reader"]
+    assert (await hub.client.get(key_path, headers={"X-Auth-Token": "one"})).status_code == 403
+    assert (
+        await hub.client.delete(key_path + "/" + issued["key"]["key_id"], headers={"X-Auth-Token": "one"})
+    ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_inventory_only_key_cannot_download_or_delegate(hub):
+    namespace, _, writer = await key(hub)
+    archive, body, graph = image_archive()
+    assert (await publish(hub, namespace, writer, archive, body))[0].status_code == 201
+    _, _, reader = await key(hub, actions=["packages:inventory"])
+    path = f"/v1/projects/{namespace}/versions/{body['root_digest']}"
+    assert (await hub.client.get(path, params={"package": "test"}, headers=reader)).status_code == 200
+    for suffix in ("/download", "/blobs/" + next(iter(graph))):
+        assert (await hub.client.get(path + suffix, params={"package": "test"}, headers=reader)).status_code == 403
+    assert (
+        await hub.client.post(
+            f"/v1/projects/{namespace}/keys",
+            headers=reader,
+            json={
+                "name": "no delegation",
+                "scope": {"packages": ["test"]},
+                "actions": ["packages:inventory"],
+            },
+        )
+    ).status_code == 401

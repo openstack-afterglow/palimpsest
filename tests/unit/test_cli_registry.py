@@ -482,6 +482,54 @@ def test_native_all_tags_never_falls_back_to_docker_or_requests_credentials(
     assert cli.main([operation, "test", "--registry", "cloud", "--all-tags"]) == 1
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["push", "test:v1", "--registry", "cloud"], ("packages:inventory", "packages:write")),
+        (["pull", "test:v1", "--registry", "cloud"], ("packages:inventory", "packages:read")),
+        (
+            ["build", "{context}", "--registry", "cloud", "-t", "test:v1", "--push", "--output", "{output}"],
+            ("packages:inventory", "packages:write"),
+        ),
+        (
+            ["build", "{context}", "--registry", "cloud", "-t", "test:v1", "--output", "{output}"],
+            ("cache:read", "cache:write"),
+        ),
+    ],
+)
+def test_native_commands_preflight_exact_capability_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expected: tuple[str, ...],
+) -> None:
+    from palimpsest_local.packages import PackageError
+
+    roots = cli.init_roots()
+    profile = _native_profile()
+    registry.save_registry_config(roots, registry.add_profile(registry.default_registry_config(), profile))
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    class DeniedClient:
+        def __init__(self, selected: RegistryProfile, *, namespace: str) -> None:
+            assert (selected.alias, selected.protocol) == (profile.alias, "palimpsest")
+            self.namespace = namespace
+
+        def authorize(self, package: str, actions: tuple[str, ...]) -> None:
+            calls.append((self.namespace, package, tuple(actions)))
+            raise PackageError("native key does not authorize the requested actions")
+
+    monkeypatch.setattr(cli, "NativePackageClient", DeniedClient)
+    monkeypatch.setattr(cli, "build_with_buildkit", lambda *_args, **_kwargs: pytest.fail("builder started"))
+    monkeypatch.setattr(cli, "run_docker_passthrough", lambda *_args, **_kwargs: pytest.fail("Docker invoked"))
+    output = tmp_path / "output.oci.tar"
+    command = [value.format(context=tmp_path, output=output) for value in argv]
+    assert cli.main(command) == 1
+    assert calls == [(profile.namespace, "test", expected)]
+    assert not output.exists()
+    assert not tuple(roots.state.glob("package-artifacts/*"))
+
+
 def test_native_reference_roundtrip_rejects_identity_changes_and_shared_files(tmp_path: Path) -> None:
     from dataclasses import replace
 

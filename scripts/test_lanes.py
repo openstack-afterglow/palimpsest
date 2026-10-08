@@ -111,6 +111,7 @@ SPECIAL_FILES = {
             "database_pool",
             "hub_api",
             "image_exports",
+            "export_delegation",
             "migrate",
             "upload_limits",
             "packages",

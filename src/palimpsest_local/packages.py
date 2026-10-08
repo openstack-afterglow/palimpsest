@@ -55,7 +55,7 @@ _ERROR_CODE = re.compile(r"[A-Z0-9_]{1,80}\Z", re.ASCII)
 _CACHE_SCOPE = re.compile(r"[a-z0-9][a-z0-9.-]{0,47}\Z", re.ASCII)
 _CACHE_PLATFORM = re.compile(r"[a-z0-9]+/[a-z0-9_]+(?:/[a-zA-Z0-9_.-]+)?\Z", re.ASCII)
 _BUILDER_FINGERPRINT = re.compile(r"[A-Za-z0-9_.:+/-]{1,128}\Z", re.ASCII)
-_ACTIONS = frozenset({"packages:read", "packages:write", "cache:read", "cache:write"})
+_ACTIONS = frozenset({"packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"})
 _PACKAGE_TYPES = frozenset({"oci-image", "runtime-bundle"})
 _CACHE_SCHEMA = "palimpsest-buildkit-cache-archive-v1"
 _CACHE_BINDING = ("project_id", "namespace", "package", "build_key", "cache_scope", "platform", "builder_fingerprint")
@@ -293,9 +293,6 @@ class NativePackageClient:
             or len(set(actions)) != len(actions)
         ):
             raise PackageError("native key has invalid actions")
-        for resource in ("packages", "cache"):
-            if f"{resource}:write" in actions and f"{resource}:read" not in actions:
-                raise PackageError("native key write action lacks its read action")
         if actor.get("revoked_at") is not None:
             raise PackageError("native key is revoked")
         if _future(actor.get("expires_at")) <= datetime.now(UTC):
@@ -405,7 +402,7 @@ class NativePackageClient:
     def resolve(self, package: str, tag: str) -> dict[str, Any] | None:
         """Return the authoritative tag target, or ``None`` only on envelope 404."""
         package = self._package(package)
-        self.authorize(package, ("packages:read",))
+        self.authorize(package, ("packages:inventory",))
         return self._resolve(package, _tag(tag))
 
     def push(
@@ -429,7 +426,7 @@ class NativePackageClient:
             ):
                 raise PackageError("native provenance permits only bounded source_revision/build_id strings")
             body["provenance"] = dict(provenance)
-        self.authorize(package, ("packages:read", "packages:write"))
+        self.authorize(package, ("packages:inventory", "packages:write"))
         current = self._resolve(package, tag)
         body["expected_tag_digest"] = None if current is None else current["digest"]
         result = self._upload(package, snapshot.archive, body, cache=False)
@@ -458,7 +455,8 @@ class NativePackageClient:
         package = self._package(package)
         if (tag is None) == (digest is None):
             raise PackageError("native pull requires exactly one tag or digest")
-        self.authorize(package, ("packages:read",))
+        # Hub resolves tags and reads version metadata under inventory, then streams content under read.
+        self.authorize(package, ("packages:inventory", "packages:read"))
         if tag is not None:
             resolved = self._resolve(package, _tag(tag))
             if resolved is None:
@@ -605,7 +603,7 @@ class NativePackageClient:
         )
         if descriptor.get("oci_manifest_digest") is not None:  # optional image provenance, not the cache root
             _digest(descriptor["oci_manifest_digest"], "cache OCI manifest digest")
-        self.authorize(package, ("cache:read", "cache:write"))
+        self.authorize(package, ("cache:write",))
         expected = {"project_id": self.project_id, "namespace": self.namespace, "package": package, **partition}
         if any(descriptor.get(field) != expected[field] for field in _CACHE_BINDING):
             raise PackageError("native cache descriptor is bound to another project, namespace or package")

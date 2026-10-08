@@ -173,6 +173,7 @@ async def download(
     package: str = Query(...),
     actor: registry.Actor = Depends(read_actor),
 ):
+    registry.authorize(actor, namespace, package, "packages:read")
     value = await registry.version(actor, namespace, package, digest=digest)
     return private_blob(
         request, value["archive_digest"], value["archive_size_bytes"], "application/x-tar", "package.oci.tar"
@@ -188,6 +189,7 @@ async def version_blob(
     package: str = Query(...),
     actor: registry.Actor = Depends(read_actor),
 ):
+    registry.authorize(actor, namespace, package, "packages:read")
     value = await registry.version(actor, namespace, package, digest=digest)
     blob_digest = registry.checked_digest(blob_digest)
     descriptor = value["graph"].get(blob_digest)
@@ -252,7 +254,7 @@ async def resolve_cache(
     cache_scope: str = Query(...),
     platform: str = Query(...),
     builder_fingerprint: str = Query(...),
-    actor: registry.Actor = Depends(key_actor),
+    actor: registry.Actor = Depends(read_actor),
 ):
     try:
         partition = CachePartition(
@@ -265,7 +267,11 @@ async def resolve_cache(
 
 @router.get("/projects/{namespace}/cache/archives/{digest}")
 async def cache_archive(
-    namespace: str, digest: str, request: Request, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str,
+    digest: str,
+    request: Request,
+    package: str = Query(...),
+    actor: registry.Actor = Depends(read_actor),
 ):
     size = await registry.cache_archive(actor, namespace, package, digest)
     return private_blob(request, digest, size, "application/x-tar", "buildkit-cache.tar")

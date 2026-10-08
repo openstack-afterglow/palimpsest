@@ -22,6 +22,112 @@ published by these commands. The Hub 0.3.1 package registry and retained closed-
 separate source; update both reviewed Kolla API and worker image digests to
 deploy it, rather than assuming a root wheel upgrade updates running services.
 
+The 2026-10-08 isolated full-source candidate retains origin/dev
+`63f6f665e7f7f7469f384edd49619fa5d6683284` plus the original package-capability,
+requester-Trust delegation and CLI work. Root/Hub/locks/modules/Kolla image tag
+are synchronized at **0.3.1**, not published or deployed. Public registry
+manifest inspection found neither `0.3.1` nor `v0.3.1` for either Hub image;
+GitHub's package-versions API was unavailable without `read:packages` scope.
+The canonical Hub workflow currently declares no multi-platform matrix or
+`platforms` override: its hosted Ubuntu builder publishes its default platform,
+not an asserted amd64/arm64 manifest list. The Dockerfile targets support the
+previously exercised Linux amd64 and arm64 source builds, but deployment must
+inspect the actual candidate image manifest/revision/digest for its host.
+
+Before candidate Kolla rollout, the operator must:
+
+1. Preserve the previous **actual** API/worker digest pins, existing private
+   Kolla secret/config inputs, mounts and service identities. Both images must
+   come from the exact reviewed candidate ref. Source mode still defaults to
+   `c4887f7806608e98f215abbd377d2eafe159ff76`, not this candidate; override it
+   only with the eventual reviewed committed SHA. The source-build task rejects
+   a dirty existing checkout or a different existing HEAD; prepare a separate
+   clean checkout path rather than resetting an operator's checkout.
+2. Stop new ingress and quiesce **all** API/export/build/upload/GC writers, then
+   capture SQL and CAS from the same no-writers interval. Keep backup/restore
+   evidence and verify an isolated restore before production cutover. Do not
+   delete volumes, retained jobs, unknown guest state or Keystone Trusts.
+3. Use the candidate API image's `palimpsest-hub-bootstrap` to create missing
+   tables. It is additive `create_all`, not an ALTER migration. For a separate
+   database, bootstrap an empty destination, run
+   `palimpsest-hub-migrate-data --source-url "$SOURCE_DATABASE_URL" \
+   --destination-url "$DESTINATION_DATABASE_URL" --dry-run`, then the same
+   command without `--dry-run`, with credentials supplied privately and output
+   restricted. Migration rejects a nonempty destination and incomplete native
+   package schema; it copies all package tables, exports/delegations, builds,
+   layers/grants/uploads, skipping optional legacy tables only when absent.
+   Review private URI handling because this legacy CLI accepts URLs on argv;
+   do not put a real password in shell history or diagnostic logs.
+4. API, export worker and native build worker must use the same SQL and exact
+   absolute store path with a coherent shared filesystem/locking view. Default
+   Docker named volumes are host-local: multi-host API/export placements do
+   **not** become shared CAS merely because their SQL/volume names match.
+   Supply reviewed shared storage or select one storage-owning placement before
+   routing traffic. Preserve numeric owners/modes; bootstrap changes only each
+   volume root, not recursive blobs. Plan capacity for temporary double-sized
+   finalization, bundle expansion and private worker scratch.
+5. Supply trustee service-project credentials, the separate system-reader-only
+   validator, nonempty exact protected user/project ID sets, current role graph,
+   immutable namespace bindings and the trusted package HTTPS origin. Confirm
+   actual Keystone Trust create/authenticate/impersonating-delete policy and
+   finite least-role delegation (default member, 21600 seconds) with a real
+   requester. Never add tenant grants or fall back to service tenant scoping.
+   Pre-cutover undelegated queued exports fail `delegation_required`; requesters
+   resubmit them. Existing manual tenant grants require a separate owner decision.
+6. Align the separately owned Afterglow Kolla overlay and package-key gateway,
+   then use its normal precheck/reconfigure path. Keep API/export worker versions
+   together; the Kolla role does not deploy the native build worker. Verify real
+   SQL/Redis/auth/CLI bytes, worker cleanup, restart persistence and restored
+   reads/writes before reopening ingress. Health 200 proves only liveness.
+
+### Service-role provisioning prerequisite before reopening ingress
+
+The candidate gates every legacy artifact write and
+`POST /v1/image-exports` on current `palimpsest-publish_editor`; the export
+worker rechecks it before Glance I/O. Plain existing `member`/`reader` grants
+are not service authority. Without an approved role-graph/assignment cutover,
+existing export consumers (including Afterglow requesters) return 403. The
+Palimpsest Kolla role registers the trustee and system reader only: it does
+**not** create these service roles, inference rules or requester grants.
+
+Before reopening ingress, the IAM/operator owner must explicitly approve and
+provision unique **global** roles with these exact names, then verify their
+immutable IDs and actual acyclic Keystone inference graph:
+
+- Leaves: `palimpsest-inventory_reader`, `palimpsest-download_user`,
+  `palimpsest-publish_editor`, `palimpsest-keys_editor`,
+  `palimpsest-keys_admin`.
+- Documented parent grades: `palimpsest_reader`, `palimpsest_user`,
+  `palimpsest_editor`, `palimpsest_admin`.
+- Preset grade edges: `palimpsest_admin` → `palimpsest_editor` →
+  `palimpsest_user` → `palimpsest_reader`.
+- Preset grade-to-leaf edges: reader → inventory_reader; user → download_user;
+  editor → publish_editor and keys_editor; admin → keys_admin, using the full
+  exact names above.
+- Each non-reader leaf also implies `palimpsest_reader` through an actual
+  Keystone inference rule, supplying inventory without inventing download or
+  key-management authority. Role inference must not grant base membership.
+
+Assign only the owner-approved grade or independent leaves to the intended
+requesting users/groups in each exact project, retaining separate baseline
+`member` (or inventory-only `reader`) authority. Existing export requesters need
+current publish capability and the delegated member role; artifact downloads
+separately need download capability. Do not grant every leaf to every tenant,
+assign the trustee to tenant projects, weaken the Hub gate or silently remove
+existing grants. If operators choose granular leaves or a different graph, it
+must still provide exactly the approved effective capabilities; the Hub never
+hardcodes parent expansion. Obtain a renewed original subject token after any
+assignment upgrade not represented in that token.
+
+The system reader must be allowed to read the complete current roles,
+role-ID inference rules and effective assignments, including domain-role
+records referenced by the inference listing. Confirm current original-token
+and key-owner intersections, a real authorized export and denied plain-member
+write before reopening ingress. Record exact role/edge/assignment receipts and
+live Trust delete proof privately. This is an approval-requiring operator step,
+not an IAM mutation performed by source preparation.
+
+
 ## Package catalog
 
 | Distribution | Install selector | Entrypoints | Purpose |
@@ -220,8 +326,10 @@ socket or run the build worker in the unprivileged Hub API container. Host
 permissions, external services, and an actual guest boot remain separate
 deployment prerequisites; package installation does not establish them.
 
-The API/export worker still need the Hub Redis and Keystone settings. The build
-worker only reads `DATABASE_URL`, the database pool settings,
+The API/export worker still need the Hub Redis and Keystone settings. The export
+worker also needs the `OS_READER_*` validator and both protected-ID arrays: it
+revalidates the requester's current authority before every delegated export.
+The build worker only reads `DATABASE_URL`, the database pool settings,
 `PALIMPSEST_HUB_LOCAL_PATH`, `PALIMPSEST_HUB_MAX_BLOB_BYTES`,
 `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS`, and
 `PALIMPSEST_HUB_BUILDER_PYTHON`; it does not require Redis or `OS_*` credentials.
@@ -351,7 +459,7 @@ per-VM network contract. This is separate from Compose project publication.
 - An installed Docker CLI for OCI-profile `login`, `pull`, `push`, `tag` and Docker inventory/history/save/load/remove/passthrough. Native package push/pull do not use Docker's image store.
 - An installed Docker credential helper and exact API-base/namespace `credHelpers` entry (or `credsStore`) for native login. Host-only Docker credentials, `auths` and plaintext fallback are not accepted. The native client also supports an ephemeral `PALIMPSEST_PACKAGE_KEY`, not a legacy Keystone token.
 - A separately managed Buildx builder with an OCI exporter for Dockerfile builds. The default `docker` driver does not provide the required exporter.
-- Every online build requires a project-scoped key with both `cache:read` and `cache:write`; OCI output must pass `--cache-registry NATIVE_ALIAS --cache-package NAMESPACE/PACKAGE`, while native output defaults to its own profile/package. Package publication additionally requires `packages:read` and `packages:write`.
+- Every online build requires a project-scoped key with both `cache:read` and `cache:write`; OCI output must pass `--cache-registry NATIVE_ALIAS --cache-package NAMESPACE/PACKAGE`, while native output defaults to its own profile/package. CLI package publication additionally requires `packages:inventory` and `packages:write`, not content-download authority. Pull requires effective inventory plus `packages:read`.
 - Strict offline Dockerfile builds require preloaded pinned inputs and a
   separately bootstrapped single-node `docker-container` builder using
   `--driver-opt network=none`.
@@ -432,9 +540,9 @@ The required settings are:
 | `REDIS_URL` | Redis connection URL |
 | `PALIMPSEST_HUB_LOCAL_PATH` | Hub-owned local blob/cache directory |
 | `OS_AUTH_URL` | Keystone authentication endpoint |
-| `OS_USERNAME` / `OS_PASSWORD` | Service identity credentials |
-| `OS_PROJECT_NAME` | Service project |
-| `OS_READER_USERNAME` / `OS_READER_PASSWORD` | Separate read-only Keystone validation identity. It must authenticate system-scoped (`all`) with the `reader` role and neither `admin` nor `service`. Token validation returns 503 if it is absent, unavailable or holds other roles. |
+| `OS_USERNAME` / `OS_PASSWORD` | Export Trust trustee identity. It authenticates only to its own service project (to resolve its user ID) and through requester-created Trusts; it needs no tenant role assignment and is never scoped to a tenant project |
+| `OS_PROJECT_NAME` | The trustee's own service project |
+| `OS_READER_USERNAME` / `OS_READER_PASSWORD` | Separate read-only Keystone validation identity. It must authenticate system-scoped (`all`) with `reader` and no `admin`, `manager` or `service` role. Missing/unavailable or elevated validator authority fails token validation with 503. |
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. If empty, every package endpoint returns 503. |
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. If empty, every package endpoint returns 503. |
 
@@ -454,6 +562,8 @@ Optional settings and defaults:
 | `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; guest teardown is attempted on timeout. |
 | `PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS` | `{}`; JSON object mapping canonical namespace aliases to exact immutable Keystone project IDs, for example `'{"openstack-afterglow":"<project-uuid>"}'`. One configured alias per project; an existing SQL namespace is never rebound. |
 | `PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN` | Empty. Trusted HTTPS origin in canonical lower-case host/port form, with no credentials, path, query or fragment; other forms are rejected at startup. It is never inferred from the request Host. If empty, no package authority is advertised, and every native push fails closed with `503 HUB_UNAVAILABLE` before its tag is published. |
+| `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES` | `'["member"]'`; JSON array of the least global roles a deferred Glance export Trust delegates. Glance's default `download_image` policy requires `member`, even for images the project owns. The requester must currently hold each listed role in the target project. `admin`, `manager` and `service` are rejected at startup. |
+| `PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS` | `21600`, valid 900–86400; finite Trust lifetime. A queued export not started within it fails `delegation_expired`. |
 | `OS_READER_USER_DOMAIN_NAME` | `Default`; domain of the separate validation identity |
 | `OS_USER_DOMAIN_NAME` / `OS_PROJECT_DOMAIN_NAME` | `Default` |
 | `OS_REGION_NAME` | `RegionOne` |
@@ -483,7 +593,28 @@ These are operator prerequisites for a separately approved rollout, not a claim 
 
 The canonical Kolla role maps these inputs explicitly: `palimpsest_reader_user`, secret `palimpsest_reader_password` and `palimpsest_reader_user_domain_name` become `OS_READER_*`; `palimpsest_package_forbidden_project_ids` / `palimpsest_package_forbidden_user_ids` become the required protected JSON arrays; `palimpsest_package_namespace_bindings` becomes the alias map; and `palimpsest_package_public_origin` becomes the trusted HTTPS origin. The role precheck requires a separate reader username/password and both nonempty exact-ID protected sets. Secrets belong in approved private Kolla secret inputs, never globals/examples/logs. Rendering these settings is not evidence of Keystone policy or membership readiness.
 
-Reader provisioning uses `openstack.cloud.role_assignment` with `system: all`. The [reviewed 2.6.0 module schema](https://docs.ansible.com/projects/ansible/latest/collections/openstack/cloud/role_assignment_module.html) supports that argument; verify the operator-installed collection supports it before rollout. Provision a dedicated reader identity and inspect its actual effective grants: `state: present` does not remove pre-existing elevated assignments, and the Hub rejects a validator token holding administrator/service roles. No collection installation or cloud role mutation is implied.
+Reader provisioning uses `openstack.cloud.role_assignment` with `system: all`. The [reviewed 2.6.0 module schema](https://docs.ansible.com/projects/ansible/latest/collections/openstack/cloud/role_assignment_module.html) supports that argument; verify the operator-installed collection supports it before rollout. Provision a dedicated reader identity and inspect its actual effective grants: `state: present` does not remove pre-existing elevated assignments, and the Hub rejects validator tokens holding `admin`, `manager` or `service`. No collection installation or cloud role mutation is implied.
+
+### Deferred Glance export delegation
+
+`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current `palimpsest-publish_editor` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
+
+Before Glance I/O, the export worker re-reads the requester's current enabled user/project, publish authority and delegated role through the validator. It then authenticates `v3.Password(user_id=<trustee>, password, trust_id=...)` without project selectors. It verifies the trust token's ID, trustor, trustee, impersonated user, project, roles (no wider than current implications of the delegated roles) and expiry. Revoked, expired, swapped or legacy (pre-cutover, undelegated) exports fail terminally with `authorization_revoked`, `authorization_unavailable`, `delegation_revoked`, `delegation_expired`, `delegation_scope_mismatch` or `delegation_required`. There is no fallback to the service password scoped to the tenant. A new export always uses the current requester's own Trust. An earlier creator's delegation is retired, never reused.
+
+Each Trust has a durable cleanup state. A terminal job, soft deletion, exhausted attempts or an abandoned admission queues its Trust for deletion. The worker deletes it through its own impersonating trust token, retries with backoff and records `deleted`. Admission deletes an unbound Trust immediately with the requester token when it can. Cleanup failure never reruns an export. A Trust that currently cannot issue tokens (trustor disabled or delegated role removed) cannot be deleted by the Hub. Keystone keeps that Trust, and restoring the role or user before `expires_at` makes it usable again. The finite expiry is therefore the real bound. After expiry the Hub records the Trust as `expired`; it stays in Keystone until the operator runs `keystone-manage trust_flush`. Keystone policy must allow trustors to create and delete their own trusts (`identity:create_trust`, `identity:delete_trust` defaults) and must allow trust-scoped authentication. These are operator prerequisites. No deployed Trust flow has been verified.
+
+Cleanup completion is fenced by the claim's `cleanup_attempts` generation as
+well as Trust ID/state: a stale worker returning after its five-minute lease
+cannot overwrite the newer claimant's cleanup/backoff state. Only an update
+that still owns the claim counts as finished. Export soft-delete compares
+stored database DATETIME leases after UTC normalization; an unexpired claim
+still returns busy rather than being deleted. New tests define these boundaries
+and actual Base-model migration of all five delegation states, exact opaque
+trustor IDs, roles JSON and expiry/retry metadata. No final regression or live
+policy verification was run during source preparation.
+
+
+The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `["member"]`) and `palimpsest_export_delegation_ttl_seconds` (default `21600`) into the API environment. Its precheck rejects empty or administrative role lists and lifetimes outside 900–86400 seconds. The export worker container receives the same `OS_READER_*` and protected-ID inputs as the API. The service user's Kolla registration remains limited to its own `palimpsest_service_project_name`, where it still holds the existing `admin` grant. Do not add it to tenant projects. Existing manual tenant grants are no longer used by the Hub; removing them, or reducing the service-project grant, is a separate operator-approved change.
 
 After provisioning dependencies and injecting secrets, initialize the schema
 with `palimpsest-hub-bootstrap`, then run `palimpsest-hub` and
@@ -492,9 +623,12 @@ server-side builds, run `palimpsest-hub-build-worker` on the KVM host with the
 same `DATABASE_URL` and the same **absolute** `PALIMPSEST_HUB_LOCAL_PATH`
 filesystem view as the API. The worker takes one filesystem singleton lock and
 polls queued jobs; a second worker for the same store is rejected. Bootstrap
-creates `palimpsest_hub_builds`; data migration additionally copies build rows
-and project layer grants when present in the source. Migration remains separate
-from schema bootstrap.
+creates `palimpsest_hub_builds` and `palimpsest_image_export_delegations`
+(additive tables only); data migration additionally copies build rows, export
+delegation references and project layer grants when present in the source.
+Migration remains separate from schema bootstrap. Exports queued before the
+delegation cutover have no delegation and fail `delegation_required` instead of
+running with service credentials; requesters resubmit them.
 
 The `/app` web console uses the existing project-scoped `/v1/layers` and
 resumable `/v1/uploads` endpoints, plus `POST /v1/builds`, `GET /v1/builds`,
