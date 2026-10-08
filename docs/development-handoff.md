@@ -3352,3 +3352,49 @@ Afterglow) otherwise receive 403 under the new publish leaf/worker recheck.
 Source preparation made no IAM grants, graph changes or token exchanges; parent
 must obtain the approved role/edge/assignment and real authorized-export receipts.
 
+## Published 0.3.1 and held production cutover — 2026-10-08
+
+- Immutable source: `v0.3.1`, `1458db42a1449a25b664584d144d0a97086f8f6f`.
+  The preceding preparation snapshot and unexecuted statements are historical;
+  parent final root/Hub gates passed 6,435/298 tests, with 261 root opt-in skips.
+  Exact Test [37725533476](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725533476),
+  Hub images [37725879345](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879345)
+  and root publication [37725879373](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879373)
+  succeeded. Native KVM remained explicitly disabled; no new native proof exists.
+- Root wheel/sdist are public on PyPI and [GitHub Release v0.3.1](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1).
+  The exact run's distributions match PyPI and GitHub asset SHA-256 values:
+  wheel `827d6ffabb960402bc8c4dee7b8d9c4fe71903ba4a27141232ad2b9b7b5a69b0`,
+  sdist `18d62f9272591a425a648e54050a24ecab36512663c81f8beff258010bc7b423`.
+  GitHub Release creation was manually repaired after the final job's implicit
+  success gate propagated the native skip. No tag movement, asset overwrite or
+  PyPI republish occurred. Future tags use the explicit non-cancelled successful-
+  publisher condition; evaluator smoke passed 24 cases and focused policy tests
+  passed 127. No future tagged hosted execution of this correction is claimed.
+- Separate Hub API/worker images match the immutable revision, with aliases
+  `0.3.1`, `v0.3.1`, `sha-1458db4`, `latest`; both are **amd64 only**.
+  Exact digests and deployment prerequisites are in [install](install.md).
+  A literal `stable` alias, arm64 manifest or released Hub wheel is not claimed.
+  `uvx --from palimpsest-client==0.3.1 palimpsest --version` returned `0.3.1`.
+- Actual unmodified published digests exercised canonical MariaDB bootstrap/API
+  lifespan, Redis and conversion worker with synthetic HTTP Keystone/Glance:
+  184 package/persistence, 26 delegation and 27 independent cache checks,
+  including setup/repeated checks. Execution was amd64-under-arm64 emulation;
+  all four exact-owned fixture sets were cleaned. Retain the first fixture
+  failures/corrections in the evidence receipt. No real cloud policy, native
+  KVM, BuildKit execution or installed native TLS/helper transfer is established.
+- Parent approved preset-only IAM preparation created missing global roles and
+  implication edges, **not user/project grades**. Inventory found 106 ordinary
+  memberships across 43 users/41 projects without service-grade assignments
+  (104 enabled). This is risk inventory, not denied-request execution. Current
+  production remained on the prior Hub revision; no operator packages/pins,
+  writers, schema, assignments or storage were changed for this release.
+- Next requires reviewed project/user service grades and every auth/shared-CAS/
+  backup-and-restore prerequisite in [install](install.md), including real
+  requester Trust/Glance policy. Preserve active `isolate-service-execution-credentials`
+  task2.5; synthetic publication smoke cannot archive its live acceptance.
+  Native/GPU/VM mutations and main promotion are outside this release receipt.
+- Evidence root: `/tmp/afterglow-ecosystem-release-20261007.FDut9J/evidence/`:
+  `palimpsest-publication-runtime.json`, `palimpsest-formal-release-repair.json`,
+  `palimpsest-release-condition-before.json`, `palimpsest-release-condition-after.json`,
+  `keystone-presets-apply.json`, `keystone-assignment-inventory.json`.
+

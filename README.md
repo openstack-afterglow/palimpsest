@@ -1,6 +1,6 @@
 # Palimpsest Local
 
-`palimpsest-client` 0.3.1 is the prepared, unpublished root Python 3.11+
+`palimpsest-client` 0.3.1 is the published root Python 3.11+
 distribution for managing Palimpsest boot images, SquashFS layers, OCI-layout
 bundles, and local layered virtual machines. The Python module remains
 `palimpsest_local` and the CLI remains `palimpsest`. Local artifacts, tags,
@@ -13,20 +13,20 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published root release:** [`palimpsest-client` 0.2.3 on PyPI](https://pypi.org/project/palimpsest-client/0.2.3/) and [GitHub Release `v0.2.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.2.3). The 0.3.1 client/package-registry candidate is not yet published; the independently versioned Hub source and Kolla image-tag candidate both prepare 0.3.1. SHA-specific 0.3.0 development packages are not a formal release. Verify release image publication before deployment. A root wheel update never deploys the Hub.
+- **Published release:** [`palimpsest-client` 0.3.1 on PyPI](https://pypi.org/project/palimpsest-client/0.3.1/) and [GitHub Release `v0.3.1`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1), from immutable `1458db42a1449a25b664584d144d0a97086f8f6f`. Separate Hub API/worker images are published for Linux amd64 with matching revision; the Hub wheel is not a root-release artifact. Native KVM qualification was explicitly disabled, and production rollout remains held for reviewed service-role assignments, authentication, shared storage and recovery prerequisites. A root wheel update never deploys the Hub.
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer:
 
 ```sh
-python3.12 -m pip install "palimpsest-client==0.2.3"
+python3.12 -m pip install "palimpsest-client==0.3.1"
 palimpsest --version
 ```
 
-For an isolated one-off invocation, `uvx --from palimpsest-client==0.2.3 palimpsest --version` also reports `0.2.3`.
+For an isolated one-off invocation, `uvx --from palimpsest-client==0.3.1 palimpsest --version` was exercised against PyPI and reports `0.3.1`.
 
-The published commands above install 0.2.3, not the untagged 0.3.1 checkout.
+The published commands above install the 0.3.1 client.
 The Hub 0.3.1 package registry and retained closed-transport pool fix are separate source and must
 be deployed as reviewed API and worker images; updating the root wheel alone
 does not update running Kolla containers.
@@ -126,7 +126,7 @@ the end-user installation path.
 The root wheel also ships the `palimpsest` Kolla-Ansible role at
 `share/kolla-ansible/ansible/roles/palimpsest`. It does not declare or install
 Kolla-Ansible, Ansible, Hub, or other server dependencies; deployments must pin
-Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.1`,
+Kolla-Ansible independently. The released role defaults to Hub image tag `0.3.1`,
 while source builds use the configured reviewed immutable checkout SHA. Verify
 both Hub images are published before deployment; the root package version does not automatically
 set the independent Hub Python distribution version.
@@ -151,6 +151,14 @@ passed artifact verification and native stage-1 KVM proof, published through the
 separate [Hub image workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/36081630008)
 published API and worker images for that tag. A release does not by itself
 establish that an operator has deployed those images.
+
+For 0.3.1, [root Release run 37725879373](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879373)
+verified and published the root distributions to PyPI with native `false/skipped`.
+Its final GitHub job was incorrectly skipped; an authorized repair attached the
+same hash-matched tag-run artifacts without moving the tag or republishing PyPI.
+[Hub image run 37725879345](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879345)
+published separate API/worker images. See [publication and runtime evidence](docs/testing.md#published-031-verification)
+and [exact deployment pins and prerequisites](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
@@ -596,13 +604,13 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 ## Development
 
-The isolated 2026-10-08 full-source release candidate is **0.3.1**, based on
-origin/dev `63f6f665e7f7f7469f384edd49619fa5d6683284` plus preserved package,
-requester-Trust delegation and CLI work. It is not a new publication or rollout.
-See [final verification requirements](docs/testing.md#frozen-full-source-candidate--2026-10-08-verification-not-run)
-and the [Kolla/storage/credential prerequisites](docs/install.md). Native CI
-remains explicitly disabled; a successful `false/skipped` policy verdict is
-**not native qualification**. No verification was run during this preparation.
+The isolated full-source tree was published as **0.3.1** at immutable
+`1458db42a1449a25b664584d144d0a97086f8f6f`. Root/Hub gates, exact-commit CI,
+published-image HTTP/SQL/Redis/worker smoke and package hashes are recorded in
+[publication and runtime evidence](docs/testing.md#published-031-verification).
+Production rollout remains held under the [Kolla/storage/credential prerequisites](docs/install.md)
+and separately reviewed requester-project service grades. Native CI remains
+explicitly disabled: `false/skipped` is **not native qualification**.
 
 
 ### Resume ongoing development

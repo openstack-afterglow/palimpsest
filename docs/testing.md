@@ -561,6 +561,48 @@ to implicitly enable either special lane in portable selection.
 
 ### Release preparation and publication gates
 
+#### Published 0.3.1 verification
+
+On 2026-10-08, immutable `v0.3.1` resolves to
+`1458db42a1449a25b664584d144d0a97086f8f6f`. Final local root gates passed
+6,435 tests with 261 opt-in skips, and Hub passed 298. Exact-commit
+[Test 37725533476](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725533476),
+[Hub images 37725879345](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879345)
+and [root Release 37725879373](https://github.com/openstack-afterglow/palimpsest/actions/runs/37725879373)
+succeeded. Native KVM was deliberately skipped (`false/skipped`), not qualified.
+
+The tag-run wheel SHA-256 is `827d6ffabb960402bc8c4dee7b8d9c4fe71903ba4a27141232ad2b9b7b5a69b0`;
+sdist is `18d62f9272591a425a648e54050a24ecab36512663c81f8beff258010bc7b423`.
+Both match PyPI and the uploaded [GitHub Release](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1)
+assets. The final GitHub job was originally skipped despite successful PyPI
+publication; authorized manual repair reused these exact distributions without
+moving the tag or republishing PyPI. The future-tag job now uses
+`!cancelled() && needs.publish.result == 'success'`: existing evaluator smoke
+reproduced old ineligibility and passed all 24 fixed acceptance/denial contexts;
+focused workflow policy modules passed 127 tests. This evaluator is not hosted
+GitHub execution of a new tag. No Test scheduling or performance claim is made.
+The repaired source's full portable root gate subsequently passed 6,436 tests
+with 261 opt-in skips and seven existing fork warnings (226.29 s). The extra
+case covers final-job eligibility, not native qualification or a future-tag
+hosted publication run.
+
+Unmodified published API/worker digests in [install](install.md) were executed
+as Linux amd64 under arm64 Docker Desktop cross-architecture execution. Canonical
+MariaDB bootstrap and API lifespan, real Redis, API and conversion worker passed
+184 package/persistence, 26 delegation and 27 independent cache checks, including
+setup/repeated checks. Keystone/Glance were synthetic HTTP fixtures called by the
+real client libraries; the bounded cache archive was a fixture, not BuildKit output.
+All four exact-owned fixture sets were cleaned. Earlier fixture failures and their
+corrections remain in the parent receipt, not hidden by a final success claim.
+
+Receipts: `/tmp/afterglow-ecosystem-release-20261007.FDut9J/evidence/palimpsest-publication-runtime.json`
+and `palimpsest-formal-release-repair.json`. `uvx --from palimpsest-client==0.3.1
+palimpsest --version` reported `0.3.1`. No native amd64/KVM, live Keystone Trust/
+Glance policy, installed native TLS/credential-helper transfer or production
+cutover is claimed. Published Hub images are amd64 only; no separate Hub wheel
+is a root-release artifact. Production IAM/auth/shared-store/recovery prerequisites
+remain held. The following preparation snapshot is historical, not current status.
+
 #### Frozen full-source candidate — 2026-10-08 (verification not run)
 
 The isolated local `dev` candidate starts at GitHub origin/dev
@@ -679,8 +721,8 @@ Before publication:
   native proof or root release.
 - Kolla's source-build default remains the separately reviewed immutable
   `c4887f7806608e98f215abbd377d2eafe159ff76` (Hub 0.3.0 source), not this
-  uncommitted 0.3.1 candidate. To deploy the candidate from source, pin its
-  separately reviewed committed SHA; do not invent a circular self-pin.
+  released 0.3.1 ref. To deploy this release from source, pin its
+  separately reviewed `1458db42a1449a25b664584d144d0a97086f8f6f`; do not invent a circular self-pin.
   Root package installation alone does not replace running API/worker images.
 
 #### Pending-change source review — 2026-10-06

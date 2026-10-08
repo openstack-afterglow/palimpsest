@@ -136,6 +136,23 @@ def test_formal_release_permissions_and_publication_gate() -> None:
         )
 
 
+def test_github_release_requires_successful_publication_without_native_skip_propagation() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
+    expression = workflow["jobs"]["github-release"].get("if", "True")
+    for native_result, publish_result, cancelled in product(
+        ["success", "skipped"], ["success", "failure", "cancelled", "skipped", "", None], [False, True]
+    ):
+        values = {
+            "needs.verify.result": "success",
+            "needs.kvm-proof.result": native_result,
+        }
+        if publish_result is not None:
+            values["needs.publish.result"] = publish_result
+        assert _github_condition(expression, values, cancelled=cancelled) is (
+            publish_result == "success" and not cancelled
+        ), (values, cancelled)
+
+
 def test_native_proofs_keep_secrets_on_prove_and_cleanup_only() -> None:
     for name, job_id in (("test.yml", "kvm"), ("release.yml", "kvm-proof")):
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8"))
