@@ -44,23 +44,150 @@ There are two explicit authentication modes, never fallback alternatives:
 1. **Member control/read identity:** original project-scoped Keystone token in `X-Auth-Token`, validated without exchanging/re-scoping it. Used to register the project's namespace, issue/list/revoke the caller's own keys, and browse that project's package inventory. The browser BFF validates its JWT separately and sends the original Keystone token, not the JWT, upstream.
 2. **Package data identity:** Hub-issued opaque key in `Authorization: Bearer`. Used for CLI upload, package/tag publication, pull and explicitly authorized build-cache transfer. Raw Keystone tokens, Afterglow JWTs and service credentials do not authorize native package writes.
 
-An original token carrying `admin` or `service`, system/domain scope, a configured administrative/service principal, or an infrastructure/admin project is denied key issuance and package publication. Protected principals/projects use exact immutable IDs from trusted platform policy, not a client's role/name claim. A known admin/service account remains forbidden with a member-only token in an ordinary project. The same checks apply to a key's owner at use time. Ordinary project `member` permits read/write delegation; `reader` permits read-only delegation. System-admin is not a substitute for project membership.
+An original token carrying `admin`, `manager` or `service`, system/domain scope, a configured administrative/service principal, or an infrastructure/admin project is denied key issuance and package publication. Protected principals/projects use exact immutable IDs from trusted platform policy. A known admin/service account remains forbidden even with a reduced token in an ordinary project. System-admin is not a package-authority bypass. Native `member`/`reader` and project management roles alone grant no service entitlement.
+
+Authorization resolves a fresh global Keystone role directory and actual role-ID implication graph with current effective assignments. Only unique global role IDs can bind service capabilities; domain aliases, duplicate global bindings, missing roles/graphs, cycles and directory outages fail closed. Presets initially link `palimpsest_admin` → editor → user → reader and each grade to its leaves, but these are not hardcoded runtime expansions: deleting an implication revokes that feature even while the parent assignment/token remains. Baseline effective `member` is required for non-reader leaves; effective `member` or `reader` permits the inventory leaf. Leaves do not imply base membership.
+
+Initial presets also link each non-reader leaf to `palimpsest_reader`, providing inventory through an actual editable Keystone dependency. The Hub does not synthesize that dependency: removing it removes inventory unless another current path still grants it. A reader-only baseline paired with non-reader service authority fails closed rather than silently granting user/editor actions.
+
+| Exact effective leaf | Allowed authority |
+| --- | --- |
+| `palimpsest-inventory_reader` | Authorized package metadata/manifests and legacy artifact inventory; no content or credential download |
+| `palimpsest-download_user` | Authorized package/blob/layer/cache downloads and supporting metadata; no writes |
+| `palimpsest-publish_editor` | Namespace registration, package/tag/cache publication, native legacy artifact writes; no implicit download or key management |
+| `palimpsest-keys_editor` | Own-key metadata and issuance, only for actions currently held by the original token and owner |
+| `palimpsest-keys_admin` | Own-key metadata and revocation, never another user's key |
+
+Original-token service authority is intersected with current assignments, retaining the original user/project/token/auth reference. A role upgrade absent from the original subject requires a renewed token; downgrades and removed graph edges are enforced immediately on the next authorization. Package-key actions are intersected with current owner actions at every request and again at publication commit. Legacy verified global builder/GC and its artifact read path remain separate; `palimpsest_admin` never authorizes VM launch or global operations.
 
 Keystone token validation MUST use `GET /v3/auth/tokens` with the presented token as `X-Subject-Token`, authenticated by the Hub's read-only validator identity, and obtain that original subject's project/user/roles/expiry. Never use `v3.Token(...).get_access()` token-method authentication for validation. A supplied `X-Project-Id` is only a consistency assertion: mismatch with the validated original project is denied. No default-project inference, user re-login, replacement subject token or configured admin password fallback is allowed. Existing Hub read/export consumers retain that original subject/token when they require an OpenStack connection; a package key grants no Nova/Cinder/Manila/Glance authority.
 
-A dedicated system-scoped `reader` identity requires the Keystone policy targets `identity:validate_token`, `identity:list_role_assignments`, `identity:get_user` and `identity:get_project` for original-token validation and effective enabled user/project membership checks. Reader credentials are separate from Glance export credentials. The identity is never the upload actor or a package-key owner. Fail closed if credentials/read policy are unavailable or its token carries admin/service authority. Rollout replaces the current admin-role validator identity; it must not retain `_get_admin_ks_client` as a fallback.
+A dedicated system-scoped `reader` validator needs Keystone `identity:validate_token`, `identity:list_role_assignments`, `identity:get_user`, `identity:get_project`, `identity:list_roles`, `identity:get_role` and `identity:list_role_inference_rules` read policy. Original-subject validation and role-directory/graph reads never exchange or re-scope the caller's token. A global-only role listing may omit domain roles referenced by the inference listing: retrieve their trusted ID records to distinguish domain edges, ignore those edges for builtin global service authority, and deny unknown/missing global references. Explicit `truncated=true` and next-page links fail closed. Validator credentials remain separate from Glance export credentials and never own package keys. No live policy is mutated. The [Keystone policy mapping](https://docs.openstack.org/keystone/2026.2/getting-started/policy_mapping.html) names the `/v3/role_inferences` target `identity:list_role_inference_rules` (not `identity:list_role_inferences`).
 
 ### 3.2 Package keys
 
 A key binds `key_id`, `owner_user_id`, `project_id`, `namespace`, exact package names or explicit whole-project scope, actions, expiry and revocation. It is not a Keystone application credential: possession cannot invoke other OpenStack services.
 
-- Permissions: `packages:read`, `packages:write`, `cache:read`, `cache:write`. `packages:write` requires `packages:read`; `cache:write` requires `cache:read`. Package publication does not implicitly grant cache write or globally public visibility.
+- Permissions: `packages:inventory` (metadata/manifests), `packages:read` (download plus metadata), `packages:write`, `cache:read`, `cache:write`. Write actions do not imply read and may be issued without read to a publish-only principal. Each requested action must be a subset of current caller capabilities. Package publication does not imply cache read or globally public visibility.
+- Native client login accepts the effective inventory action. `resolve` requires inventory, and CLI/client push requires inventory plus publish for tag compare-and-set rather than content download. A deliberately write-only key is valid for direct upload calls but cannot resolve a tag; normal publish presets can delegate inventory plus publish without download.
 - Scope request is either `{ "packages": ["test"] }` or `{ "all_packages": true }`, never both. Exact package lists contain 1–32 unique canonical names. No wildcard, prefix match or child-package inheritance. Whole-project scope is an explicit UI/issuer choice, not a default.
 - Default lifetime is 30 days; issuer may choose 1–90 days. CI automation uses a non-admin project member/robot owner and the same bounds. No never-expiring or self-renewing keys.
 - Generate 32 random secret bytes. The wire credential is `ppk_v1_<key UUID as 32 lower-case hex>.<43-character unpadded base64url secret>`; creation's `secret` field returns that complete credential exactly once. Send it as `Authorization: Bearer <credential>`. Lookup by the embedded public key ID; persist only SHA-256 of the decoded random bytes and compare in constant time. Validate format/secret before disclosing expiry/revocation status. No credential in SQL plaintext, URLs, logs, events, receipts or list/detail responses. Issuance uses `Cache-Control: no-store`.
-- Issuance/list/revocation is owner-only in the authenticated current project. A key cannot issue another key. Rotation is create a new key and explicitly revoke the old key; there is no grace/fallback credential.
-- Each data/control authorization checks key active/expiry/revocation and the owner's enabled account, active project, membership and permitted role. Re-check on finalization/tag commit, not only upload initiation. Keystone unavailability is 503, not cached approval or admin fallback. Revocation/removal during a transfer prevents publication.
+- Issuance/list/revocation remains original-token-only and owner-only in the authenticated current project. Issuance requires keys editor, list requires keys editor or keys admin, revocation requires keys admin. A key cannot issue another key. Rotation is issue then explicit revoke, with no grace/fallback credential.
+- Each authorization checks key active/expiry/revocation and fresh enabled owner/project plus effective role-ID graph authority. `/auth/me` returns effective, not obsolete delegated, actions. Re-check on finalization/tag commit, not only initiation; removal/downgrade during transfer prevents publication. Keystone failure is 503, never cached approval. Legacy export download tickets also revalidate their bound owner's download capability at redemption.
 - A session is bound to the initiating key ID **and** owner/project/package. Another member's key cannot append/finalize/abort it. After revocation a new key starts a new session; it does not inherit the old one.
+
+### Isolated HTTP smoke (defined, not executed during integration)
+
+From `hub/`, after integration, run:
+
+```sh
+uv run pytest -q tests/test_auth.py -k native_http
+uv run pytest -q tests/test_auth.py tests/test_packages.py tests/test_hub_api.py tests/test_builds.py
+```
+
+`test_auth.py::native_http` starts a real Uvicorn Hub on an ephemeral loopback socket and uses the existing loopback synthetic Keystone HTTP server through the real Keystone SDK. Each case has a temporary SQLite database and CAS; production app lifespan, cloud credentials, Redis, workers, containers and live Hub endpoints are not used. Cases publish real bounded OCI archives, exercise leaf/parent metadata/download/write/key control, current graph-edge removal, owner downgrade, original subject/project assertions and builder/GC denial. The synthetic directory owns mutable actual implication edges; parent-only claims are not assumed capabilities. Existing package cases retain own-key, exact package/namespace, CAS and immutable version/tag coverage. These commands have not been run for this change and are not production qualification.
+
+### Docker-backed registered HTTP acceptance
+
+The 2026-10-07 scoped verification built the canonical `docker/hub/Dockerfile`
+API and export-worker targets for `linux/arm64` and `linux/amd64`, then exercised
+the unmodified registered `palimpsest_hub.main:app` routes, middleware and error
+handlers in local containers. Each architecture passed **182 checks** (364
+total); the root client/credential/CLI/BuildKit selection passed **309 tests**.
+This is isolated acceptance, not a production rollout or real cloud/KVM build.
+
+Exact commands, from the repository root:
+
+```sh
+docker buildx build --platform linux/arm64 --file docker/hub/Dockerfile --target palimpsest-hub-api --load --tag palimpsest-scope-api:20261007-arm64 .
+docker buildx build --platform linux/arm64 --file docker/hub/Dockerfile --target palimpsest-hub-worker --load --tag palimpsest-scope-worker:20261007-arm64 .
+docker buildx build --platform linux/amd64 --file docker/hub/Dockerfile --target palimpsest-hub-api --load --tag palimpsest-scope-api:20261007-amd64 .
+docker buildx build --platform linux/amd64 --file docker/hub/Dockerfile --target palimpsest-hub-worker --load --tag palimpsest-scope-worker:20261007-amd64 .
+python3 scripts/smoke_package_capabilities.py run --api-image palimpsest-scope-api:20261007-arm64 --worker-image palimpsest-scope-worker:20261007-arm64 --platform linux/arm64 --evidence-dir build/scoped-package-capabilities-smoke/20261007-arm64
+python3 scripts/smoke_package_capabilities.py run --api-image palimpsest-scope-api:20261007-amd64 --worker-image palimpsest-scope-worker:20261007-amd64 --platform linux/amd64 --evidence-dir build/scoped-package-capabilities-smoke/20261007-amd64
+uv run --frozen --extra dev python -m pytest -q tests/unit/test_packages.py tests/unit/test_package_credentials.py tests/unit/test_cli_registry.py tests/unit/test_buildkit.py
+```
+
+Reruns require a new or empty evidence directory; omitting `--evidence-dir`
+creates a unique directory. The runner requires Docker and the built images,
+downloads the hash-pinned `aiosqlite` wheel from `hub/uv.lock` (or accepts the
+same verified wheel through `--aiosqlite-wheel`), and uses real Redis on a
+unique private network. It retains its SQL/blob volumes and sanitizes reports
+and logs; only its disposable containers/network/smoke-derived image are
+removed. It does not contact production endpoints or use caller cloud secrets.
+
+**Storage/lifespan distinction:** canonical images deliberately omit the
+development-only SQLite driver. A smoke-only image derived from each built API
+installs exactly `aiosqlite==0.22.1` from the lockfile. The harness creates the
+SQLite engine/schema/session factory and installs it in `palimpsest_hub.database`,
+then serves the production app with Uvicorn `lifespan=off`. Authentication,
+registered routes, SQL services and blob storage are not mocked or replaced.
+Both actual canonical bootstrap probes exited 1 with
+`TypeError: 'connect_timeout' is an invalid keyword argument for Connection()`:
+`init_db` uses MySQL connection arguments. This finding is retained, not fixed
+or hidden by substituting MariaDB. Therefore the smoke proves persistent
+SQLite/CAS route behavior, **not** the canonical production database/lifespan,
+MariaDB, Redis credentials, TLS transport or deployment health.
+
+Observed route proof includes:
+
+- Real offset-owned uploads, stale-offset 409 and another key's session 404;
+  immutable publication 201 and idempotent finalize 200. Original archive,
+  layer, legacy artifact and seeded export bytes match; two owned Range 206
+  responses reproduce the original bytes, including after restart/recreation.
+- Inventory metadata 200 with content download 403; exact inventory+write
+  keys publish 201 without read/download authority. Undelegated actions/scopes,
+  wrong project assertions, protected identities and foreign resources deny.
+- Own-key revocation 204 followed by 401; current owner downgrade revokes
+  download, publication and previously issued Redis export tickets while
+  preserving inventory. Removing the current graph's publish edge revokes
+  write authority without suppressing unrelated download. Ambiguous/dangling
+  role metadata fails closed 503, including a provider metadata 404.
+- Native inventory/download/export-ticket lookups preserve actual SQL resource
+  visibility. The completed export row alone is seeded with real CAS bytes;
+  no Glance download, conversion or OpenStack execution occurred.
+- Tenant service-admin/Keystone admin and package keys cannot build or GC.
+  Verified system-admin passes the build boundary (503 because no builder is
+  configured) and deletes only this run's proof-owned GC layer; retained bytes
+  remain readable. No KVM builder or cloud executor is exercised.
+- The real Keystone SDK performs fresh reads against a synthetic unique-global
+  role-ID directory and mutable assignments/edges. Each run records 92 subject
+  validations and zero token exchanges/rescopes or caller-token actor calls.
+- SQL and 11 digest-verified CAS files reread identically after both a container
+  restart and full recreation using the same named SQLite/blob volumes.
+
+Local receipts are `build/scoped-package-capabilities-smoke/20261007-{arm64,amd64}/report.json`
+and sanitized logs. Canonical API/worker probes imported Hub **0.3.1** on
+`aarch64`/`x86_64`; each API exposed 58 registered routes. Worker probes also
+validated `qemu-img 10.0.13` formats without a cloud conversion. The root test
+receipt is `root-tests.txt` (309 passed in 1.54s), alongside `image-versions.txt`.
+The parent-selected Hub162 run remains separate; it was not rerun to confirm.
+
+Retained evidence volumes (the identifiers use the host's UTC run timestamp):
+
+| Architecture | SQLite volume | Blob volume |
+| --- | --- | --- |
+| arm64 | `palimpsest-scope-smoke-20261006t200227z-f9e281-sql` | `palimpsest-scope-smoke-20261006t200227z-f9e281-blobs` |
+| amd64 | `palimpsest-scope-smoke-20261006t200314z-bd2434-sql` | `palimpsest-scope-smoke-20261006t200314z-bd2434-blobs` |
+
+
+The 2026-10-08 full-source integration preserves independent cache leaves:
+standalone `NativePackageClient.upload_cache` requires `cache:write` only;
+online BuildKit still preflights both `cache:read` and `cache:write`. New
+client/CLI/Hub regressions define write-only upload, read-only resolve/download,
+exact package/platform/builder scope and current-owner attenuation, but were
+not executed during preparation. Final root and Hub regression is required.
+
+The existing Docker runner contains no cache-transfer scenario and executes no
+native CLI. Its plain-HTTP synthetic endpoint cannot prove native HTTPS trust
+or credential-helper behavior. Final acceptance must separately exercise real
+cache HTTP upload/resolve/download/downgrade and reread cache metadata/bytes
+after restart/recreation; installed CLI login/push/pull/logout through a trusted
+HTTPS profile and exact namespace helper; and opt-in real BuildKit cache reuse
+with pinned inputs. Canonical database/lifespan, credentialed Redis, live
+Keystone and the deployed Afterglow gateway remain separately qualified, never
+inferred from the current synthetic registered-app script.
 
 ### 3.3 Client credential storage
 
@@ -144,7 +271,7 @@ Key-create JSON:
 
 Key metadata fields: `key_id` UUID, `name`, `owner_user_id`, `project_id`, `namespace`, `scope`, `actions`, `created_at`, `expires_at`, `revoked_at` (nullable). Creation returns `{ "key": KeyMetadata, "secret": string }`. Only creation includes `secret`; UI copy/show-once state is discarded on navigation/project switch. `GET /auth/me` adds `actor_type: "package-key"`; token validation and the response never disclose service credentials.
 
-The example deliberately permits online build-cache transfer as well as publication for `test`. A push/pull-only key requests only `packages:read`/`packages:write`; a reader requests only read actions. The issuer never adds undeclared cache/write authority.
+The example deliberately permits online build-cache transfer and both package transfer directions for `test`. A push/pull key requests `packages:read`/`packages:write` (with inventory available from download delegation and current owner authority); a publish-without-download key requests `packages:inventory`/`packages:write`; an inventory-only key requests just `packages:inventory`. Effective inventory plus `packages:read` is required for pull. The issuer never adds undeclared cache/write authority.
 
 ### 6.2 Inventory and resolution APIs
 

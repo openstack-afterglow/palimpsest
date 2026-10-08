@@ -3156,3 +3156,199 @@ The detailed root `AGENTS.md` obligations were moved without changing their appr
   (445 files). No source stamp was changed; no new application tests were run
   for this unchanged-release operational redeployment.
 
+
+## Scoped Palimpsest package capabilities — 2026-10-07 integration
+
+Repo-local OpenSpec: `openspec/changes/archive/2026-10-06-scoped-package-capabilities`. Implemented native exact leaf capabilities, current unique-global role-ID directory/implication-graph resolution, baseline member/reader checks, original-token/current-owner intersection and use-time key attenuation. Package metadata is separate from content download; key issue is keys-editor plus subset, own-key revocation is keys-admin. Preserved key-only package publication, immutable package/tag/CAS boundaries and verified legacy builder/GC authority. No service-admin VM authority or new package-delete/public policy APIs.
+
+`hub/tests/test_auth.py::native_http` provides real loopback Hub and synthetic Keystone HTTP setup, temporary SQL/CAS and no production application lifespan. Run the exact commands in [package authorization smoke](project-package-registry.md#isolated-http-smoke-defined-not-executed-during-integration) only after integration. Existing package and native artifact regression fixtures are migrated to explicit capabilities. No checks/builds/lint/formatters/smoke were executed for these edits; no commit/index/deploy/cloud mutation or gbrain indexing occurred. Architecture marker is intentionally unstamped under the no-check instruction. Astra/Sol pairing and independent review were not performed in this delegated implementation; no independent review is claimed.
+
+## Scoped native container acceptance — 2026-10-07 verification
+
+The integrating parent supplied a passing selected Hub162 run including the
+current native SDK HTTP grade matrix, real range-resume/download downgrade and
+metadata404→503 correction. It was not rerun merely to confirm that result.
+This follow-on scope built both canonical Hub targets and exercised the actual
+registered native routes in local arm64/amd64 containers: **182 checks each,
+364 total**, then frozen root package/credentials/CLI/BuildKit **309 passed**.
+Canonical image imports report Hub0.3.1 and `aarch64`/`x86_64`; API routes58,
+worker `qemu-img10.0.13` formats validate without any export conversion.
+
+Added reusable `scripts/smoke_package_capabilities.py`; root pull preflight now
+requires inventory+download to match its metadata and content calls. Root
+regressions cover closed actions, normal inventory+write publish without read,
+inventory-only pull denial, preflight failure before transport and exact CLI
+capability requests. Credential helper source/tests remain intentionally
+unchanged: current namespace-qualified storage/isolation already suffices.
+Existing docs, changelog, architecture narrative and repo-local OpenSpec
+checklist record completed local acceptance, not production readiness.
+
+Real boundaries: registered `main:app`, actual Hub logic/datastore/filesystem
+CAS, real Redis ticket storage, current-authority lookups through the real
+Keystone SDK. Synthetic boundaries: a mutable HTTP Keystone directory, role
+assignments/subjects and one seeded completed export row with real CAS bytes.
+Original uploaded archive, layer, legacy and export bytes match, and Range206
+resume reconstructs them. SQL and11 verified CAS files remain identical after
+both container restart and recreation using retained named SQLite/blob volumes.
+Inventory/content split, exact-scope subset, own revocation, role/edge downgrade,
+protected system identities and system-only global builder/GC gates passed.
+The global builder stays unconfigured (authorized system admin receives503);
+no real KVM/OpenStack/Glance build or cloud mutation was attempted.
+
+Canonical SQLite bootstrap is **not** a pass: both probes exited1 with
+`TypeError: 'connect_timeout' is an invalid keyword argument for Connection()`.
+The isolated smoke-only derived image adds lock-pinned aiosqlite0.22.1 and its
+harness installs a dedicated SQLite factory with production lifespan off,
+without replacing routes/auth/blob logic. Production database code, dependency
+metadata and Dockerfile were not changed. Do not promote these receipts into
+canonical MySQL/MariaDB, production lifespan, Redis credentials, TLS transport
+or deployment qualification.
+
+Exact commands, reports and retained volume names are in
+[Docker-backed registered HTTP acceptance](project-package-registry.md#docker-backed-registered-http-acceptance).
+Local receipts: `build/scoped-package-capabilities-smoke/20261007-arm64/report.json`,
+`20261007-amd64/report.json`, sanitized runtime logs, `root-tests.txt` and
+`image-versions.txt`. Only this run's disposable resources were removed; the
+four SQL/blob volumes remain. No usable issued key response was retained after
+teardown; the parent browser fixture was not fabricated from native secrets or
+qualified as live native rendering. No Afterglow edit, production deployment,
+live Keystone role write, commit/push or shared index mutation occurred. Broad
+final gates and Afterglow/browser integration remain the parent's scope.
+
+## Deferred export credential isolation — 2026-10-07 (local, uncommitted)
+
+Repo-local OpenSpec: `openspec/changes/isolate-service-execution-credentials`,
+scoped to the Palimpsest slice of the parent's four-service cutover approval.
+Deferred Glance image exports no longer use a service password scoped to the
+tenant project. `get_admin_connection_for_project` is removed. Admission keeps
+the original-token Glance check and current publish authority, then creates a
+requester Trust with impersonation, the configured least roles (default
+`member`, required by Glance's default `download_image` policy), the token's project and a finite expiry. The trustee is resolved by
+authenticating only to the service's own project. The Hub stores only the Trust
+reference/scope in the additive table `palimpsest_image_export_delegations`.
+The worker revalidates current authority, verifies the trust token, then
+performs Glance I/O. The worker records durable Trust cleanup for terminal,
+deleted, exhausted and abandoned work; cleanup failure only reschedules
+deletion. Native package planes, local KVM/build and CAS domains are unchanged.
+
+Evidence status: source-reviewed and test-passed against a synthetic Keystone
+only, not live. Local commands run on 2026-10-07 against the uncommitted dirty `dev` tree:
+`cd hub && uv run pytest -v tests/test_export_delegation.py` passed 28 cases.
+These used real keystoneauth/keystoneclient/openstacksdk objects over loopback
+HTTP. Glance bytes and qemu-img were stubbed. The full Hub lane `cd hub &&
+uv run pytest` passed 285. Root `tests/test_kolla_role_contracts.py
+tests/test_kolla_assets.py` passed 45. `scripts/test_lanes.py list --check`
+passed, and `tests/unit/test_test_lanes.py` passed 106. `openspec validate
+isolate-service-execution-credentials` passed. In Hub ruff, the only remaining
+check error and format drift are in pre-existing user-dirty files: an I001 in
+`tests/test_auth.py`, plus formatting in `auth.py`, the package routes and their tests.
+The files changed here are clean. `scripts/check_architecture.py` reports a stale snapshot because the
+marker was intentionally not stamped. No live Keystone Trust, Glance, deployment,
+role mutation, commit or index change occurred. Pending: the parent's scoped
+architecture stamp, Afterglow/Kolla overlay alignment, a live Keystone trust
+policy smoke, and an operator decision on existing manual tenant grants. Exports
+queued before rollout fail `delegation_required` and must be resubmitted.
+
+## Isolated ecosystem full-source release candidate — 2026-10-08 (not shipped)
+
+- Ownership: integration-owner edits stayed inside
+  `/tmp/afterglow-ecosystem-release-20261007.FDut9J/palimpsest`, but a delegated
+  relative-path error edited four original user-dirty files. Its exact delta was
+  recovered into the isolated candidate, with original restoration owned by
+  Main; `.git/original-ownership-incident.json` records paths/hashes and the exact
+  reverse-patch prerequisite. No original reset/checkout/reverse or index edit
+  was performed by this preparer. Canonical clone starts `dev` tracking origin/dev at
+  `63f6f665e7f7f7469f384edd49619fa5d6683284`; no new commit/push/tag or remote
+  operator action occurred. PR15 `449466e4fd71d956b9cdf32682663073ee579a3f`
+  and PR16 `41be56f075e64f4530608ec2dbcfe7db38577017` remain in ancestry and
+  their native workflow/real descendant fixture source is preserved.
+- Imported original baseline `aa397a0fd976e35302974a347748a9773e3084bf`:
+  all 32 tracked working deltas and all 13 source files in four untracked
+  groups (delegation tests, OpenSpec changes/archive, synced package spec and
+  the registered-app capability smoke script). Three-way integration preserved
+  latest dev; architecture marker and changelog conflicts were reconciled,
+  retaining both native opt-out/fixture and package/delegation intent.
+- Related `/Users/pieroot/code/palimpsest-dev` HEAD
+  `dc8a164fd7ad4243f0e01bf7e48e613608674ccb` is already in origin/dev ancestry;
+  there were no new committed changes to merge. Its working `AGENTS.md` equals
+  the current original source. The still-missing contributor/CI scenarios were
+  merged, with overlapping obligations deduplicated and current explicit
+  native opt-out semantics retained. Stale/prunable historical worktrees were
+  not imported or modified.
+- Version: reuse prepared **0.3.1** for root/Hub metadata, modules, both locks
+  and packaged Kolla image tag. Current origin stable tags and releases contain
+  no 0.3.1; latest stable tag is `v0.2.3`. PyPI 0.3.1 returned HTTP404, and
+  public GHCR inspection found neither `0.3.1` nor `v0.3.1` for either image.
+  GitHub package-list inspection was denied without `read:packages` scope.
+  Development `package-<SHA>` prereleases do not publish stable 0.3.1.
+- Read-only GitHub evidence: repository `PALIMPSEST_KVM_ENABLED=false`; actual
+  [Test37632335023](https://github.com/openstack-afterglow/palimpsest/actions/runs/37632335023)
+  on origin/dev has 18 successful jobs and one skipped native proof. This is
+  baseline CI, not a check of imported source and not native qualification.
+- Verification boundary: no tests/builds/lint/formatters or HTTP smokes ran for
+  this integration. Source review is not a pass. Historical inherited results
+  retain their original snapshot/environment boundaries. The integrating
+  parent must run the root, Hub, contract/package/image and registered HTTP
+  gates in [testing](testing.md#frozen-full-source-candidate--2026-10-08-verification-not-run)
+  after the source is frozen. Known inherited lint/format failures are not
+  rerun to confirm; final parent lint/format remains required.
+- OpenSpec: `scoped-package-capabilities` and `disable-native-kvm-ci` remain
+  archived/completed with their recorded historical evidence; the former's
+  synced spec is included. `isolate-service-execution-credentials` stays active:
+  source/test-defined and historical synthetic HTTP tasks are checked, but
+  task2.5 (live Keystone trust policy/impersonating delete, Afterglow Kolla
+  overlay alignment and separately approved manual-grant decision) is open.
+  It must not be archived or marked live-qualified by this source preparation.
+- Rollout prerequisites and exact migration/storage/credentials are in
+  [install](install.md). Additive bootstrap creates delegation/package tables;
+  undelegated queued exports fail closed and require requester resubmission.
+  Every API/export/build writer must share SQL and the same absolute CAS with
+  coherent locks; default host-local named volumes are not multi-host storage.
+  Preserve private keys/secrets/mounts/previous image digests and take a
+  consistent quiesced SQL+CAS backup with isolated restore proof first. Kolla
+  source default remains reviewed `c4887f7806608e98f215abbd377d2eafe159ff76`,
+  not a self-pin; use the eventual separately reviewed committed candidate SHA.
+- Detailed nonsecret provenance, final source tree/archive identifiers and
+  operator/final-gate report are retained under this isolated clone's `.git/`,
+  not in the original checkout or release payload. Source preparation is not
+  publication, Kolla rollout, live Trust/Glance proof or native qualification.
+
+
+Source-review integration repairs (no checks run): export soft-delete now
+normalizes database-naive UTC leases before expiry/busy comparison; cleanup
+completion is fenced by the claimed `cleanup_attempts` generation and counts
+only an owned affected row. The separate system-reader validator rejects
+manager alongside admin/service. New regressions define actual Base-model
+migration of every delegation state/64-character trustor/JSON roles/timestamps,
+attempt exhaustion, requester replacement in reset branches and stale cleanup
+lease completion. The reported test-auth import ordering was manually split,
+without claiming a lint pass. Final parent gates and live policy task2.5 remain.
+
+
+The standalone cache upload preflight now requires only `cache:write`; online
+BuildKit's mandatory read+write preflight remains. Added client/CLI/Hub tests
+define exact scope and current-owner attenuation but were not run. Existing
+Docker smoke does not execute cache transfer or installed native CLI/TLS/helper
+flows; those final real HTTP requirements are recorded separately.
+
+
+Main's ownership recovery receipt: anchored reversals restored only the four
+misplaced child edits; Main reported `cmp` exit0 against each saved
+`.git/original-pre-child/<path>`. Original files are byte-identical to the
+pre-child source snapshot, with original index/HEAD and unrelated files untouched
+by that recovery. The incident remains in provenance; do not claim it never
+occurred. Candidate retains the child fixes. Frozen architecture source metadata
+is `e9af7ac5bf1928b5459625e966a299ae8630730d1c3b5252ea87e573ef6b327a`
+(447 included source files); no guard or test was run to verify it.
+
+
+Final documentation repair: the CI spec has one authoritative Requirements
+block; the redundant older heading was removed without changing numbered rules.
+The install checklist now explicitly requires approved provisioning of all five
+exact global `palimpsest-*` leaves, four `palimpsest_*` parent grades, their real
+inference edges and requester-project assignments before ingress reopens.
+Kolla does not provision them. Existing plain-member export callers (including
+Afterglow) otherwise receive 403 under the new publish leaf/worker recheck.
+Source preparation made no IAM grants, graph changes or token exchanges; parent
+must obtain the approved role/edge/assignment and real authorized-export receipts.
+

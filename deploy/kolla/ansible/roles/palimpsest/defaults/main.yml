@@ -45,6 +45,11 @@ palimpsest_package_forbidden_project_ids: []
 palimpsest_package_forbidden_user_ids: []
 palimpsest_package_namespace_bindings: {}
 palimpsest_package_public_origin: ""
+# Deferred Glance exports run only through a requester-created Keystone Trust
+# delegating these least global roles; never admin, manager or service. Glance's
+# default download_image policy requires member.
+palimpsest_export_delegated_roles: ["member"]
+palimpsest_export_delegation_ttl_seconds: 21600
 palimpsest_keystone_region_name: "{{ openstack_region_name }}"
 palimpsest_keystone_interface: "{{ openstack_interface | default('internal') }}"
 palimpsest_service_project_name: "palimpsest-service"
@@ -92,6 +97,8 @@ palimpsest_services:
       PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
       PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS: "{{ palimpsest_package_namespace_bindings | to_json }}"
       PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN: "{{ palimpsest_package_public_origin }}"
+      PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES: "{{ palimpsest_export_delegated_roles | to_json }}"
+      PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS: "{{ palimpsest_export_delegation_ttl_seconds | string }}"
       PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
       PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
       PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
@@ -139,6 +146,12 @@ palimpsest_services:
       DATABASE_URL: "{{ palimpsest_database_url }}"
       REDIS_URL: "{{ palimpsest_redis_url }}"
       OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+      # The worker revalidates the requester's current authority before each delegated export.
+      OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
+      OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
+      OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
+      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
+      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
       PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
       PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
       OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"

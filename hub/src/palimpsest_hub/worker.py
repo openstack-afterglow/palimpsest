@@ -15,6 +15,7 @@ from palimpsest_hub.database import close_db, init_db
 from palimpsest_hub.logging import configure_logging
 from palimpsest_hub.services.image_exports import (
     process_one_image_export,
+    run_delegation_cleanup,
     run_export_maintenance,
     validate_qemu_img_support,
 )
@@ -58,6 +59,8 @@ async def main() -> None:
 
     last_maint = 0.0
     maint_interval = 3600.0  # Run maintenance once per hour
+    last_delegation_cleanup = 0.0
+    delegation_cleanup_interval = 60.0  # Retired requester Trusts are deleted promptly and retried durably
 
     try:
         while not stop_event.is_set():
@@ -68,6 +71,13 @@ async def main() -> None:
                 logger.error("Image export worker iteration failed")
 
             now = loop.time()
+            if now - last_delegation_cleanup > delegation_cleanup_interval:
+                try:
+                    await run_delegation_cleanup()
+                except Exception:
+                    logger.warning("Export delegation cleanup failed")
+                last_delegation_cleanup = now
+
             if now - last_maint > maint_interval:
                 try:
                     await run_export_maintenance()

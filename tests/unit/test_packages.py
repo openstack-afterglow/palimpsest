@@ -104,7 +104,7 @@ def _actor(**changes):
         "owner_user_id": _OWNER,
         "namespace": "team",
         "scope": {"packages": ["app"]},
-        "actions": ["packages:read", "packages:write", "cache:read", "cache:write"],
+        "actions": ["packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"],
         "created_at": "2026-01-01T00:00:00Z",
         "expires_at": "2099-01-01T00:00:00Z",
         "revoked_at": None,
@@ -444,6 +444,53 @@ def test_federated_owner_and_opaque_project_are_preserved_exactly():
     assert (client.project_id, client.owner_user_id) == (_PROJECT, _OWNER)
 
 
+def test_inventory_and_publish_key_does_not_require_content_download():
+    hub = _Hub(_actor(actions=["packages:inventory", "packages:write"]))
+    client = _client(hub)
+    client.authorize("app", ("packages:inventory", "packages:write"))
+    assert client.resolve("app", "v1") is None
+    with pytest.raises(PackageError, match="requested actions"):
+        client.authorize("app", ("packages:read",))
+
+
+def test_write_only_key_is_valid_but_cannot_resolve_metadata():
+    hub = _Hub(_actor(actions=["packages:write"]))
+    client = _client(hub)
+    client.authorize("app", ("packages:write",))
+    with pytest.raises(PackageError, match="requested actions"):
+        client.resolve("app", "v1")
+    assert hub.requests == [("GET", "/auth/me"), ("GET", "/auth/me")]
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["packages:delete"],
+        ["packages:*"],
+        ["packages:admin"],
+        ["cache:inventory"],
+        ["PACKAGES:INVENTORY"],
+        ["packages:read "],
+        ["packages:inventory", "packages:inventory"],
+        ["packages:inventory", "packages:write", "keys:issue"],
+        [],
+    ],
+)
+def test_key_action_vocabulary_is_closed(actions):
+    hub = _Hub(_actor(actions=actions))
+    with pytest.raises(PackageError, match="invalid actions"):
+        _client(hub).authenticate()
+    assert hub.requests == [("GET", "/auth/me")]
+
+
+@pytest.mark.parametrize("requested", [(), ("packages:delete",), ("packages:inventory", "keys:issue")])
+def test_unknown_requested_action_is_rejected_before_any_request(requested):
+    hub = _Hub()
+    with pytest.raises(PackageError, match="invalid requested native actions"):
+        _client(hub).authorize("app", requested)
+    assert hub.requests == []
+
+
 def test_redirect_is_not_followed_and_key_reaches_only_configured_authority(monkeypatch):
     opened = []
 
@@ -486,7 +533,7 @@ def test_only_enveloped_404_is_an_authoritative_miss(status, body):
 # Push/pull -------------------------------------------------------------------
 
 
-def _upload_routes(hub, publish, *, ack=None):
+def _upload_routes(hub, publish, *, ack=None, suffix="/uploads"):
     hub.starts = []
 
     def start(request):
@@ -500,8 +547,8 @@ def _upload_routes(hub, publish, *, ack=None):
             hub.uploaded += chunk
         return _Response(b"", request.full_url, 204, {"Upload-Offset": str(len(hub.uploaded)) if ack is None else ack})
 
-    session = "/projects/team/uploads/" + "3" * 32
-    hub.routes[("POST", "/projects/team/uploads")] = start
+    session = "/projects/team" + suffix + "/" + "3" * 32
+    hub.routes[("POST", "/projects/team" + suffix)] = start
     hub.routes[("PATCH", session)] = patch
     hub.routes[("PUT", session)] = publish
     hub.routes[("DELETE", session)] = lambda request: _Response(b"", request.full_url, 204)
@@ -563,8 +610,65 @@ def test_push_wrong_offset_ack_aborts_session_without_finalizing(tmp_path):
     assert ("PUT", "/projects/team/uploads/" + "3" * 32) not in hub.requests
 
 
-def _pull_hub(snapshot, payload):
-    hub = _Hub()
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["packages:read", "packages:write"],
+        ["packages:inventory", "packages:read"],
+        ["packages:write", "cache:read", "cache:write"],
+        ["packages:inventory", "cache:write"],
+    ],
+)
+def test_push_requires_inventory_and_write_before_any_package_request(tmp_path, actions):
+    layout = tmp_path / "layout"
+    _layout(layout)
+    hub = _Hub(_actor(actions=actions))
+    _upload_routes(hub, lambda request: pytest.fail("must not finalize"))
+    with snapshot_package(layout) as snapshot:
+        with pytest.raises(PackageError, match="requested actions"):
+            _client(hub).push("app", "v1", snapshot)
+    assert hub.requests == [("GET", "/auth/me")]
+    assert hub.starts == [] and hub.uploaded == b""
+
+
+def test_inventory_and_write_push_publishes_without_content_download(tmp_path):
+    layout = tmp_path / "layout"
+    _layout(layout)
+    hub = _Hub(_actor(actions=["packages:inventory", "packages:write"]))
+    with snapshot_package(layout) as snapshot:
+        publish = {
+            "project_id": _PROJECT,
+            "namespace": "team",
+            "package": "app",
+            "tag": "v1",
+            "digest": snapshot.root_digest,
+            "package_type": "oci-image",
+            "visibility": "project",
+            "platforms": [{"os": "linux", "architecture": "amd64"}],
+            "already_published": False,
+            "pushed_by": _OWNER,
+            "pushed_key_id": str(uuid.UUID(_KEY_ID)),
+            "archive_digest": snapshot.archive_digest,
+            "archive_size_bytes": snapshot.archive_size_bytes,
+            "web_url": "https://example.test/p",
+        }
+        _upload_routes(hub, lambda request: publish)
+        receipt = _client(hub).push("app", "v1", snapshot)
+        frozen = snapshot.archive.read_bytes()
+    assert receipt["digest"] == snapshot.root_digest
+    assert hub.uploaded == frozen
+    assert hub.starts[0]["expected_tag_digest"] is None
+    session = "/projects/team/uploads/" + "3" * 32
+    assert [request for request in hub.requests if request[1] != session] == [
+        ("GET", "/auth/me"),
+        ("GET", "/projects/team/resolve"),
+        ("POST", "/projects/team/uploads"),
+    ]
+    assert not any("/versions/" in path or path.endswith("/download") for _method, path in hub.requests)
+
+
+def _pull_hub(snapshot, payload, actor=None):
+    hub = _Hub(actor)
     version = f"/projects/team/versions/{snapshot.root_digest}"
     hub.routes[("GET", version)] = lambda request: _version(snapshot)
     hub.routes[("GET", version + "/download")] = lambda request: _Response(payload, request.full_url)
@@ -592,6 +696,55 @@ def test_pull_verifies_graph_before_replacing_destination(tmp_path):
     assert destination.read_bytes() == payload
     assert (receipt["digest"], receipt["archive_digest"]) == (snapshot.root_digest, _digest(payload))
     assert sorted(path.name for path in destination.parent.iterdir()) == ["image.tar"]
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        ["packages:inventory"],
+        ["packages:read"],
+        ["packages:inventory", "packages:write"],
+        ["packages:inventory", "cache:read"],
+    ],
+)
+@pytest.mark.parametrize("selector", ["tag", "digest"])
+def test_pull_requires_inventory_and_download_before_any_package_request(tmp_path, actions, selector):
+    layout = tmp_path / "layout"
+    _layout(layout)
+    destination = tmp_path / "out" / "image.tar"
+    with snapshot_package(layout) as snapshot:
+        hub = _pull_hub(snapshot, snapshot.archive.read_bytes(), _actor(actions=actions))
+        reference = {"tag": "v1"} if selector == "tag" else {"digest": snapshot.root_digest}
+        with pytest.raises(PackageError, match="requested actions"):
+            _client(hub).pull("app", destination=destination, **reference)
+    assert hub.requests == [("GET", "/auth/me")]
+    assert not destination.parent.exists()
+
+
+def test_inventory_and_download_key_pulls_tag_with_exact_requests(tmp_path):
+    layout = tmp_path / "layout"
+    _layout(layout)
+    archive = tmp_path / "source.tar"
+    _archive(layout, archive)
+    destination = tmp_path / "image.tar"
+    with snapshot_package(archive) as snapshot:
+        payload = snapshot.archive.read_bytes()
+        hub = _pull_hub(snapshot, payload, _actor(actions=["packages:inventory", "packages:read"]))
+        hub.routes[("GET", "/projects/team/resolve")] = lambda request: {
+            **_version(snapshot),
+            "digest": snapshot.root_digest,
+            "tag": "v1",
+        }
+        receipt = _client(hub).pull("app", tag="v1", destination=destination)
+    version = f"/projects/team/versions/{snapshot.root_digest}"
+    assert hub.requests == [
+        ("GET", "/auth/me"),
+        ("GET", "/projects/team/resolve"),
+        ("GET", version),
+        ("GET", version + "/download"),
+    ]
+    assert destination.read_bytes() == payload
+    assert (receipt["digest"], receipt["tag"]) == (snapshot.root_digest, "v1")
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "identity"])
@@ -676,6 +829,78 @@ def test_cache_scope_hit_pulls_only_the_resolved_bounded_archive(tmp_path):
     target = client.pull_cache("app", receipt, tmp_path / "cache.part")
     assert target.read_bytes() == payload
     assert not (tmp_path / "forged.part").exists()
+
+
+def _cache_descriptor():
+    return {
+        "schema": "palimpsest-buildkit-cache-archive-v1",
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "package": "app",
+        "build_key": "sha256:" + "5" * 64,
+        "cache_scope": "main",
+        "platform": "linux/amd64",
+        "builder_fingerprint": "bk",
+        "oci_manifest_digest": None,
+    }
+
+
+def test_write_only_cache_key_uploads_without_read_or_package_actions(tmp_path):
+    """Standalone upload needs only write; online build preflight still needs both."""
+    payload = b"frozen cache archive"
+    archive = tmp_path / "cache.tar"
+    archive.write_bytes(payload)
+    hub = _Hub(_actor(actions=["cache:write"]))
+    receipt = _cache_receipt(payload)
+    receipt.pop("resolution")
+    _upload_routes(hub, lambda request: receipt, suffix="/cache/uploads")
+    client = _client(hub)
+    assert client.push_cache("app", archive, _cache_descriptor()) == receipt
+    assert hub.uploaded == payload
+    assert hub.starts == [
+        {
+            "build_key": "sha256:" + "5" * 64,
+            "cache_scope": "main",
+            "platform": "linux/amd64",
+            "builder_fingerprint": "bk",
+            "archive_digest": _digest(payload),
+            "archive_size_bytes": len(payload),
+        }
+    ]
+    assert hub.requests == [
+        ("GET", "/auth/me"),
+        ("POST", "/projects/team/cache/uploads"),
+        ("PATCH", "/projects/team/cache/uploads/" + "3" * 32),
+        ("PUT", "/projects/team/cache/uploads/" + "3" * 32),
+    ]
+    with pytest.raises(PackageError, match="requested actions"):
+        client.resolve_cache(
+            "app", build_key=receipt["build_key"], cache_scope="main", platform="linux/amd64", builder_fingerprint="bk"
+        )
+    client._cache_receipts[receipt["archive_digest"]] = receipt
+    destination = tmp_path / "download.tar"
+    with pytest.raises(PackageError, match="requested actions"):
+        client.pull_cache("app", receipt, destination)
+    assert not destination.exists()
+    assert hub.requests[-2:] == [("GET", "/auth/me"), ("GET", "/auth/me")]
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"actions": ["cache:read"]}, "requested actions"),
+        ({"scope": {"packages": ["app/child"]}}, "exact package"),
+    ],
+)
+def test_cache_upload_rechecks_actions_and_scope_before_source_access(tmp_path, changes, message):
+    hub = _Hub(_actor(actions=["cache:write"]))
+    client = _client(hub)
+    client.authorize("app", ("cache:write",))
+    hub.actor.update(changes)
+    with pytest.raises(PackageError, match=message):
+        client.push_cache("app", tmp_path / "missing.tar", _cache_descriptor())
+    assert hub.requests == [("GET", "/auth/me"), ("GET", "/auth/me")]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_push_cache_rejects_descriptor_bound_to_another_project_before_upload(tmp_path):

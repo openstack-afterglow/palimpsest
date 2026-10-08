@@ -43,6 +43,18 @@
   tags: precheck
   when: enable_palimpsest | bool
 
+- name: Precheck | Validate least-privilege export delegation
+  ansible.builtin.assert:
+    that:
+      - palimpsest_export_delegated_roles | length > 0
+      - palimpsest_export_delegated_roles | map('lower') | intersect(['admin', 'manager', 'service']) | length == 0
+      - palimpsest_export_delegation_ttl_seconds | int >= 900
+      - palimpsest_export_delegation_ttl_seconds | int <= 86400
+    fail_msg: "Export Trusts must delegate only non-administrative roles with a finite 900-86400 second lifetime"
+  run_once: true
+  tags: precheck
+  when: enable_palimpsest | bool
+
 - name: Precheck | Validate Palimpsest public route hostname
   ansible.builtin.assert:
     that:

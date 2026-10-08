@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 _COMPONENT = re.compile(r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*", re.ASCII)
 _TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
-_ACTIONS = {"packages:read", "packages:write", "cache:read", "cache:write"}
+_ACTIONS = {"packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"}
 
 
 def canonical_package(value: str) -> str:
@@ -64,7 +64,7 @@ class KeyScope(StrictDTO):
 class KeyCreate(StrictDTO):
     name: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
     scope: KeyScope
-    actions: list[str] = Field(min_length=1, max_length=4)
+    actions: list[str] = Field(min_length=1, max_length=5)
     expires_in_days: int = Field(default=30, ge=1, le=90)
 
     @field_validator("actions")
@@ -72,9 +72,6 @@ class KeyCreate(StrictDTO):
     def permissions(cls, value):
         if len(set(value)) != len(value) or not set(value) <= _ACTIONS:
             raise ValueError("invalid or duplicate key actions")
-        for resource in ("packages", "cache"):
-            if f"{resource}:write" in value and f"{resource}:read" not in value:
-                raise ValueError("write requires read")
         return value
 
 

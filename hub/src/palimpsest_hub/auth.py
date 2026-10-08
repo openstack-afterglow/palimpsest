@@ -1,4 +1,4 @@
-"""Keystone token validation and service-scoped OpenStack connections for Palimpsest Hub."""
+"""Keystone token validation, current-authority checks and caller-token OpenStack connections for Palimpsest Hub."""
 
 from __future__ import annotations
 
@@ -22,6 +22,130 @@ from pydantic import SecretStr
 from palimpsest_hub.config import get_settings, validate_keystone_id
 
 _logger = logging.getLogger(__name__)
+
+# This is an exact leaf allowlist, not a preset hierarchy. Keystone owns all edges.
+_PACKAGE_LEAVES = frozenset(
+    {
+        "palimpsest-inventory_reader",
+        "palimpsest-download_user",
+        "palimpsest-publish_editor",
+        "palimpsest-keys_editor",
+        "palimpsest-keys_admin",
+    }
+)
+
+
+def package_capabilities(roles) -> frozenset[str]:
+    roles = set(roles)
+    if roles & {"admin", "manager", "service"} or not roles & {"member", "reader"}:
+        return frozenset()
+    capabilities = roles & _PACKAGE_LEAVES
+    if "member" not in roles and capabilities - {"palimpsest-inventory_reader"}:
+        return frozenset()
+    return frozenset(capabilities)
+
+
+def _role_metadata(client, path):
+    try:
+        return client.get(path)[1]
+    except ks_exceptions.NotFound:
+        raise HTTPException(status_code=503, detail="Keystone role metadata is unavailable") from None
+
+
+def _role_directory(client):
+    """Read one fresh, complete role-ID graph. Missing/ambiguous data never grants authority."""
+    directory = _role_metadata(client, "/roles")
+    inferences = _role_metadata(client, "/role_inferences")
+    if (
+        directory.get("links", {}).get("next")
+        or inferences.get("links", {}).get("next")
+        or directory.get("truncated") is True
+        or inferences.get("truncated") is True
+    ):
+        raise ValueError("Incomplete Keystone role directory")
+    by_id, global_names = {}, {}
+    for role in directory["roles"]:
+        role_id, name = role["id"], role["name"]
+        if not isinstance(role_id, str) or not role_id or not isinstance(name, str) or not name or role_id in by_id:
+            raise ValueError("Invalid Keystone role directory")
+        by_id[role_id] = role
+        if role.get("domain_id") is None:
+            global_names.setdefault(name, []).append(role_id)
+
+    def referenced_role(role_id):
+        if role_id not in by_id:
+            # /roles normally lists globals only, while inferences can mention domain roles.
+            validate_keystone_id(role_id)
+            response = _role_metadata(client, f"/roles/{role_id}")
+            role = response["role"]
+            if role.get("id") != role_id or not isinstance(role.get("name"), str) or not role["name"]:
+                raise ValueError("Invalid referenced role")
+            if role.get("domain_id") is None:
+                raise ValueError("Global role missing from complete directory")
+            by_id[role_id] = role
+        return by_id[role_id]
+
+    edges = {role_id: set() for role_id in by_id}
+    for inference in inferences["role_inferences"]:
+        prior = inference["prior_role"]["id"]
+        prior_role = referenced_role(prior)
+        for implied in inference["implies"]:
+            implied_role = referenced_role(implied["id"])
+            # Domain/custom aliases never assert global builtin capabilities through inference.
+            if prior_role.get("domain_id") is None and implied_role.get("domain_id") is None:
+                edges[prior].add(implied["id"])
+    return by_id, global_names, edges
+
+
+def _effective_role_names(role_ids, directory):
+    by_id, global_names, edges = directory
+    names, visited, visiting = set(), set(), set()
+
+    def visit(role_id):
+        if role_id in visiting or role_id not in by_id:
+            raise ValueError("Invalid Keystone role graph")
+        if role_id in visited:
+            return
+        role = by_id[role_id]
+        name = role["name"]
+        if role.get("domain_id") is not None:
+            return
+        if global_names.get(name) != [role_id]:
+            raise ValueError("Role is not a unique global binding")
+        visiting.add(role_id)
+        names.add(name)
+        for implied in edges[role_id]:
+            visit(implied)
+        visiting.remove(role_id)
+        visited.add(role_id)
+
+    for role_id in role_ids:
+        visit(role_id)
+    return names
+
+
+def role_name_closure(role_names, directory) -> frozenset[str]:
+    """Exact unique global role names plus their current Keystone implications; ambiguity grants nothing."""
+    _, global_names, _ = directory
+    role_ids = []
+    for name in role_names:
+        bound = global_names.get(name)
+        if not bound or len(bound) != 1:
+            raise ValueError("Delegated role is not a unique global Keystone role")
+        role_ids.append(bound[0])
+    return frozenset(_effective_role_names(role_ids, directory))
+
+
+def package_actions(capabilities) -> frozenset[str]:
+    actions = set()
+    if "palimpsest-inventory_reader" in capabilities:
+        actions.add("packages:inventory")
+    if "palimpsest-download_user" in capabilities:
+        actions.update(("packages:read", "cache:read"))
+    if "palimpsest-publish_editor" in capabilities:
+        actions.update(("packages:write", "cache:write"))
+    return frozenset(actions)
+
 
 keystone_token_header = APIKeyHeader(
     name="X-Auth-Token",
@@ -60,7 +184,7 @@ def _get_reader_ks_client():
         )
         access = client.session.auth.get_access(client.session)
         roles = {role.casefold() for role in access.role_names}
-        if not access.system_scoped or "reader" not in roles or roles & {"admin", "service"}:
+        if not access.system_scoped or "reader" not in roles or roles & {"admin", "manager", "service"}:
             raise HTTPException(status_code=503, detail="A read-only Keystone validator identity is required")
         client._palimpsest_reader_user_id = validate_keystone_id(access.user_id)
         return client
@@ -152,6 +276,7 @@ def validate_token(token: str, project_id: str = "") -> dict[str, Any]:
             "username": access.username or "",
             "expires_at": access.expires.isoformat(),
             "roles": list(access.role_names or []),
+            "role_ids": [role["id"] for role in access.get("roles", [])],
             "system_scope": bool(access.get("system")),
             "domain_scope": bool(access.get("domain")),
             "is_system_admin": _is_system_admin(original_user),
@@ -224,11 +349,15 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
         if _value(user, "enabled") is not True or _value(project, "enabled") is not True:
             raise HTTPException(status_code=403, detail="Package owner or project is disabled")
         roles: set[str] = set()
+        directory = _role_directory(client)
         for assignment in client.role_assignments.list(user=user_id, effective=True, include_names=True):
             if _assignment_user(assignment) != user_id:
                 continue
-            role = _assignment_role(assignment)
-            if role in {"admin", "service"}:
+            assigned = _value(assignment, "role")
+            effective = _effective_role_names([assigned["id"]], directory)
+            if assigned.get("name") != directory[0][assigned["id"]]["name"]:
+                raise ValueError("Assignment role does not match directory")
+            if effective & {"admin", "manager", "service"}:
                 raise HTTPException(
                     status_code=403,
                     detail={
@@ -239,9 +368,10 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
             scope = _value(assignment, "scope")
             target = scope.get("project", {}).get("id") if isinstance(scope, dict) else None
             if target == project_id:
-                roles.add(role)
-        if not roles & {"member", "reader"}:
-            raise HTTPException(status_code=403, detail="Current project membership is required")
+                roles.update(effective)
+        capabilities = package_capabilities(roles)
+        if not capabilities:
+            raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
         return {
             "user_id": user_id,
             "username": _value(user, "name") or "",
@@ -249,7 +379,9 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
             "project_name": _value(project, "name") or "",
             "project_domain_id": _value(project, "domain_id") or "",
             "roles": sorted(roles),
-            "can_write": "member" in roles,
+            "package_capabilities": capabilities,
+            "can_write": "palimpsest-publish_editor" in capabilities,
+            "role_directory": directory,
         }
     except HTTPException:
         raise
@@ -262,7 +394,7 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
 async def get_package_member_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
     roles = {str(role).casefold() for role in token_info.get("roles", [])}
     if (
-        roles & {"admin", "service"}
+        roles & {"admin", "manager", "service"}
         or token_info.get("is_system_admin")
         or token_info.get("system_scope")
         or token_info.get("domain_scope")
@@ -274,11 +406,25 @@ async def get_package_member_info(token_info: dict[str, Any] = Depends(require_t
                 "message": "Administrative or service tokens cannot authorize package access",
             },
         )
-    if not roles & {"member", "reader"}:
-        raise HTTPException(status_code=403, detail="A project member or reader token is required")
     owner = await asyncio.to_thread(validate_package_owner, token_info["user_id"], token_info["project_id"])
-    owner["can_write"] = owner["can_write"] and "member" in roles
-    return {**token_info, **owner}
+    try:
+        token_roles = _effective_role_names(token_info["role_ids"], owner["role_directory"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Current Keystone role bindings are unavailable") from None
+    token_capabilities = package_capabilities(token_roles)
+    if not token_capabilities:
+        raise HTTPException(status_code=403, detail="A Palimpsest service role token is required")
+    if owner["user_id"] != token_info["user_id"] or owner["project_id"] != token_info["project_id"]:
+        raise HTTPException(status_code=403, detail="Package owner does not match original token identity")
+    capabilities = token_capabilities & package_capabilities(owner["roles"])
+    if not capabilities:
+        raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
+    return {
+        **token_info,
+        "current_roles": owner["roles"],
+        "package_capabilities": capabilities,
+        "can_write": "palimpsest-publish_editor" in capabilities,
+    }
 
 
 def require_admin(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:

@@ -130,6 +130,35 @@ class PalimpsestImageExport(Base):
     )
 
 
+class PalimpsestImageExportDelegation(Base):
+    """Requester-created Keystone Trust reference for deferred export I/O; never a credential.
+
+    `pending` is recorded before admission binds it, `active` belongs to one queued
+    export, `cleanup` awaits Keystone deletion, and `deleted`/`expired` are final.
+    """
+
+    __tablename__ = "palimpsest_image_export_delegations"
+
+    trust_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    export_id: Mapped[str | None] = mapped_column(CHAR(36), nullable=True)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    trustor_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    trustee_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    role_names: Mapped[list] = mapped_column(JSON, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    state: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+    cleanup_attempts: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
+    cleanup_next_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now, onupdate=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+
+    __table_args__ = (
+        Index("idx_palimpsest_export_delegations_export", "export_id", "state"),
+        Index("idx_palimpsest_export_delegations_cleanup", "state", "cleanup_next_at"),
+    )
+
+
 class PalimpsestHubBuild(Base):
     __tablename__ = "palimpsest_hub_builds"
 

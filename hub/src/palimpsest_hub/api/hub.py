@@ -30,7 +30,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 
-from palimpsest_hub.auth import get_os_conn, get_package_member_info, get_token_info, require_admin
+from palimpsest_hub.auth import (
+    _is_system_admin,
+    get_os_conn,
+    get_package_member_info,
+    get_token_info,
+    require_admin,
+    validate_package_owner,
+)
 from palimpsest_hub.cache import get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import get_session_factory
@@ -398,9 +405,28 @@ class HubBundleImportResponse(BaseModel):
 
 async def _legacy_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
     """Separate legacy artifact authority; never accept a key or admin/service principal."""
-    if not token_info.get("can_write"):
-        raise HTTPException(status_code=403, detail="ordinary project member write authority required")
+    if "palimpsest-publish_editor" not in token_info.get("package_capabilities", ()):
+        raise HTTPException(status_code=403, detail="Palimpsest publish authority required")
     return token_info
+
+
+async def _legacy_inventory(token_info: dict = Depends(get_token_info)) -> dict:
+    # Verified global builder/GC operators retain their pre-existing legacy artifact read path.
+    if token_info.get("is_system_admin"):
+        return token_info
+    member = await get_package_member_info(token_info=token_info)
+    if "palimpsest-inventory_reader" not in member["package_capabilities"]:
+        raise HTTPException(status_code=403, detail="Palimpsest inventory authority required")
+    return member
+
+
+async def _legacy_download(token_info: dict = Depends(get_token_info)) -> dict:
+    if token_info.get("is_system_admin"):
+        return token_info
+    member = await get_package_member_info(token_info=token_info)
+    if "palimpsest-download_user" not in member["package_capabilities"]:
+        raise HTTPException(status_code=403, detail="Palimpsest download authority required")
+    return member
 
 
 def _factory_or_503():
@@ -670,7 +696,7 @@ async def search_hub_layers(
     kind: str | None = Query(None),
     parent_digest: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_inventory),
 ) -> list[dict[str, Any]]:
     stmt = _visible_filter(select(PalimpsestHubLayer), token_info)
 
@@ -720,7 +746,7 @@ async def list_hub_images(
     os_variant: str | None = Query(None),
     disk_format: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_inventory),
 ) -> list[dict[str, Any]]:
     if arch is not None and arch not in {"x86_64", "aarch64"}:
         raise HTTPException(status_code=422, detail="arch 는 x86_64 또는 aarch64 여야 합니다")
@@ -770,7 +796,7 @@ async def list_image_exports(
     source_image_id: UUID | None = Query(None),
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_inventory),
 ) -> list[dict[str, Any]]:
     if status is not None and status not in EXPORT_STATUSES:
         raise HTTPException(status_code=422, detail="지원하지 않는 내보내기 상태입니다")
@@ -789,7 +815,7 @@ async def list_image_exports(
 @router.get("/image-exports/{export_id}", response_model=HubImageExportResponse, operation_id="get_image_export")
 async def get_image_export(
     export_id: UUID,
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_inventory),
 ) -> dict[str, Any]:
     try:
         row = await get_project_export(_required_project_id(token_info), str(export_id))
@@ -802,7 +828,7 @@ async def get_image_export(
 async def download_image_export_blob(
     export_id: UUID,
     request: Request,
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_download),
 ) -> StreamingResponse:
     try:
         row = await get_project_export(_required_project_id(token_info), str(export_id))
@@ -828,7 +854,7 @@ async def download_image_export_blob(
 async def create_image_export_download_token(
     export_id: UUID,
     response: Response,
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_download),
 ) -> dict[str, Any]:
     project_id = _required_project_id(token_info)
     try:
@@ -839,7 +865,14 @@ async def create_image_export_download_token(
     token = secrets.token_urlsafe(32)
     expires_at = int(datetime.now(UTC).timestamp()) + _EXPORT_TOKEN_TTL_SECONDS
     payload = json.dumps(
-        {"export_id": row.id, "project_id": project_id, "digest": digest, "expires_at": expires_at},
+        {
+            "export_id": row.id,
+            "project_id": project_id,
+            "digest": digest,
+            "expires_at": expires_at,
+            "user_id": token_info["user_id"],
+            "is_system_admin": bool(token_info.get("is_system_admin")),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -876,6 +909,7 @@ async def download_image_export_with_token(
         payload = json.loads(raw_payload)
         project_id = payload["project_id"]
         bound_export_id = payload["export_id"]
+        user_id = payload["user_id"]
         bound_digest = normalize_digest(payload["digest"])
         expires_at = payload["expires_at"]
         if (
@@ -888,6 +922,11 @@ async def download_image_export_with_token(
             raise ValueError("invalid ticket binding")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=404, detail="다운로드 토큰이 유효하지 않습니다") from exc
+    # A download ticket is not independent authority after its issuer is downgraded.
+    if not (payload.get("is_system_admin") is True and await asyncio.to_thread(_is_system_admin, user_id)):
+        owner = await asyncio.to_thread(validate_package_owner, user_id, project_id)
+        if "palimpsest-download_user" not in owner["package_capabilities"]:
+            raise HTTPException(status_code=403, detail="Current Palimpsest download authority required")
 
     try:
         row = await get_project_export(project_id, str(export_id))
@@ -911,7 +950,7 @@ async def download_image_export_with_token(
 @router.delete("/image-exports/{export_id}", status_code=204, operation_id="delete_image_export")
 async def delete_image_export(
     export_id: UUID,
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(_legacy_writer),
 ) -> None:
     try:
         await soft_delete_project_export(_required_project_id(token_info), str(export_id))
@@ -920,7 +959,7 @@ async def delete_image_export(
 
 
 @router.get("/layers/{digest}", response_model=HubLayerDetailResponse, operation_id="get_hub_layer")
-async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info)) -> dict[str, Any]:
+async def get_hub_layer(digest: str, token_info: dict = Depends(_legacy_inventory)) -> dict[str, Any]:
     normalized = normalize_digest(digest)
     if normalized is None:
         raise HTTPException(status_code=422, detail="digest 는 sha256:<64hex> 형식이어야 합니다")
@@ -936,7 +975,7 @@ async def get_hub_layer(digest: str, token_info: dict = Depends(get_token_info))
 
 
 @router.get("/layers/{digest}/ancestors", response_model=list[HubLayerResponse], operation_id="get_hub_layer_ancestors")
-async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_token_info)) -> list[dict[str, Any]]:
+async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(_legacy_inventory)) -> list[dict[str, Any]]:
     """루트 → 자기 자신 순서. 누락된 조상은 상세 조회의 chain_complete 로 판별한다."""
     normalized = normalize_digest(digest)
     if normalized is None:
@@ -949,7 +988,7 @@ async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(get_to
 
 @router.get("/layers/{digest}/blob", operation_id="download_hub_blob")
 async def download_hub_blob(
-    digest: str, request: Request, token_info: dict = Depends(get_token_info)
+    digest: str, request: Request, token_info: dict = Depends(_legacy_download)
 ) -> StreamingResponse:
     normalized = normalize_digest(digest)
     if normalized is None:
@@ -1397,7 +1436,7 @@ async def abort_upload(session_id: str, token_info: dict = Depends(_legacy_write
 
 
 @router.post("/bundles", operation_id="export_bundle")
-async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(get_token_info)) -> StreamingResponse:
+async def export_bundle(req: BundleExportRequest, token_info: dict = Depends(_legacy_download)) -> StreamingResponse:
     """요청한 leaf 들의 **부모 체인 전체**를 OCI image-layout tar 로 흘린다."""
     factory = _factory_or_503()
     store = _store_or_503()

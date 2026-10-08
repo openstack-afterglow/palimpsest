@@ -60,6 +60,15 @@ the pooled connection and that an unrelated runtime error still propagates. The
 `hub` lane includes this file; the fixture is isolated SQLite and does not
 claim live MariaDB failover or in-flight transaction recovery.
 
+`hub/tests/test_export_delegation.py` drives the export route and worker
+against a loopback synthetic Keystone. The Hub's real keystoneauth/keystoneclient
+and openstacksdk objects perform token validation, the current role graph,
+OS-TRUST create/delete and trust-scoped authentication over HTTP. Glance byte
+I/O and qemu-img are stubbed at the Hub's own boundary. The file defines
+revocation, scope substitution, expiry, abandonment and cleanup-retry
+regressions. It does not prove the deployed Keystone trust policy or a real
+Glance download.
+
 The Hub's server-build path has a focused project-scoped HTTP contract lane:
 
 ```sh
@@ -312,7 +321,8 @@ wave.
     `always()`, while native also requires the trusted repository/event/ref;
   - verdict dependency environments and failure-bypass prevention. Native
     verdicts run as actual shell commands over enabled/result combinations;
-    only enabled=`true` and result=`success` pass;
+    exactly `true/success` and explicitly opted-out `false/skipped` pass. The
+    latter is policy success with no native proof or qualification;
   - the exact job keys of every `test.yml` job, and the exact set of job
     ids, so a new job needs its own table entry. No job sets job-level
     `env`, `permissions` or `continue-on-error`; only the aggregates and
@@ -550,6 +560,50 @@ the explicit non-claims. This is executed product-gate evidence, not permission
 to implicitly enable either special lane in portable selection.
 
 ### Release preparation and publication gates
+
+#### Frozen full-source candidate — 2026-10-08 (verification not run)
+
+The isolated local `dev` candidate starts at GitHub origin/dev
+`63f6f665e7f7f7469f384edd49619fa5d6683284`, preserving PR15 native opt-out and
+PR16's real descendant PID-before-archive fixture fix. It integrates all 32
+original tracked changes, all 13 files in four untracked groups, and the
+remaining related worktree contributor/CI scenarios. Root, Hub, both locks,
+module versions and Kolla's image-tag candidate remain **0.3.1**. Read-only
+origin tags/releases and PyPI inspection found no stable 0.3.1 publication;
+SHA development prereleases are not stable releases. No checks, builds, lint,
+formatters or runtime smokes were run for this integrated source. Historical
+results below must not be reused as its final receipts.
+
+The integrating parent must run final root and separate Hub gates once after
+the source is frozen, retaining their complete outputs:
+
+```sh
+uv sync --frozen --extra dev
+python3 scripts/check_architecture.py
+python3 scripts/check_architecture.py --staged
+uv run python tests/fixtures/oci-root/generate_fixtures.py --check
+uv run python scripts/generate_cli_reference.py --check
+uv run python scripts/test_lanes.py list --check
+uv run ruff check .
+uv run ruff format --check .
+uv run python scripts/test_lanes.py run full
+uv run python scripts/build_package.py --out-dir "$RUNNER_TEMP/palimpsest-dist"
+uv run --python 3.11 --no-dev palimpsest --version
+(cd hub && uv sync --frozen --extra dev && uv run ruff check . && \
+ uv run ruff format --check . && uv run pytest -v && uv build)
+```
+
+An empty changed-file plan, architecture fingerprint or source archive is not
+a test pass. On the exact eventual submitted ref, retain all six strict hosted
+required checks and the actual native-disabled receipt (`false/skipped`, no
+proof). Do not flip KVM on to finish ordinary source preparation. Opt-in real
+filesystem, guest-binary and network-none BuildKit proofs retain the canonical
+commands/prerequisites in `.github/workflows/test.yml`; full portable/root/Hub
+checks do not replace them. The registered-app Docker smoke below must also run
+on both supported image architectures and retain its synthetic-Keystone/SQLite
+boundary. Installed CLI native push/pull/login/logout and canonical
+MySQL/MariaDB bootstrap/lifespan, real Keystone Trust/Glance and restoration
+require their own separately recorded HTTP/runtime receipts.
 
 The 2026-10-05 patch candidate is root/Hub/Kolla image-tag **0.3.1**;
 `v0.3.1` was absent from origin at preparation. No push, tag, native approval,

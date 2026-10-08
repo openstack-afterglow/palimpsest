@@ -39,6 +39,18 @@ Contributors SHALL preserve the resume and authorization boundaries above.
 - **THEN** read the entry documents and latest dated checkpoints, compare Git/source state and separate staged/unstaged ownership before choosing local work
 - **AND** do not publish, transfer the helper, run native proofs or mutate GPUs/VMs without specific current approval.
 
+#### Scenario: Unpublished candidate and staged user work
+
+- **GIVEN** a `dev` worktree with staged user changes and the 2026-09-27 unpublished 0.2.4 candidate
+- **WHEN** a contributor resumes from an older handoff entry
+- **THEN** they inspect staged and unstaged state, preserve the existing index, read the newer checkpoint and do not claim publication or new permission.
+
+#### Scenario: Portable evidence without remote approval
+
+- **GIVEN** portable tests or a manual native proof succeeded at a recorded source snapshot
+- **WHEN** a contributor prepares a remote helper transfer, GPU reassignment or publication
+- **THEN** they retain the separate approval gate and do not reinterpret the prior result as authority or live proof for a new checkout.
+
 ### Requirement: Maintain architecture and evidence honestly
 Contributors SHALL apply the architecture procedure and retain evidence scope.
 
@@ -46,3 +58,9 @@ Contributors SHALL apply the architecture procedure and retain evidence scope.
 - **WHEN** source changes but only local checks were run
 - **THEN** update affected architecture contracts and the maintenance summary, stamp only after actual review, and record only executed checks
 - **AND** retain historical failures and do not promote plans, portable success or CPU-only proof into live GPU or deployment verification.
+
+#### Scenario: Documentation-only migration under an explicit no-stamp instruction
+
+- **GIVEN** contributor guidance moves into these specifications without changing source or workflows
+- **WHEN** a migration note is appended to architecture and handoff
+- **THEN** the dated source evidence and JSON review marker remain unchanged, and the note does not claim a new test, stamp or remote validation.

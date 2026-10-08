@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from palimpsest_hub.models import Base, PalimpsestImageExport
+from palimpsest_hub.models import Base, PalimpsestImageExport, PalimpsestImageExportDelegation
 from palimpsest_hub.services import image_exports
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.image_exports import (
@@ -180,6 +180,7 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
     job = PalimpsestImageExport(
         id="export-secret-id",
         project_id="project-secret-id",
+        created_by="requester-secret-id",
         source_image_id="image-secret-id",
         source_name=secret,
         source_disk_format="raw",
@@ -193,8 +194,18 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
         status="queued",
         progress_pct=0,
     )
+    delegation = PalimpsestImageExportDelegation(
+        trust_id="trust-secret-id",
+        export_id=job.id,
+        project_id=job.project_id,
+        trustor_user_id=job.created_by,
+        trustee_user_id="trustee-secret-id",
+        role_names=["reader"],
+        expires_at=_now() + timedelta(hours=1),
+        state=image_exports.DELEGATION_ACTIVE,
+    )
     async with factory() as session:
-        session.add(job)
+        session.add_all([job, delegation])
         await session.commit()
 
     class Response:
@@ -215,14 +226,23 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
         os_hash_value=checksum,
         updated_at=None,
     )
-    admin_conn = SimpleNamespace(
-        image=SimpleNamespace(download_image=lambda *args, **kwargs: Response()), close=lambda: None
-    )
+    export_conn = SimpleNamespace(close=lambda: None)
+    opened = []
+
+    def authorized(project_id, verified):
+        opened.append((project_id, verified.trust_id, verified.trustor_user_id))
+        return export_conn
+
+    deleted = []
     monkeypatch.setattr(image_exports, "get_session_factory", lambda: factory)
     monkeypatch.setattr(image_exports, "get_blob_store", lambda: store)
     monkeypatch.setattr(image_exports, "get_settings", lambda: SimpleNamespace(palimpsest_hub_max_blob_bytes=1024))
-    monkeypatch.setattr(image_exports, "get_admin_connection_for_project", lambda _project: admin_conn)
+    monkeypatch.setattr(image_exports, "_authorized_export_connection", authorized)
     monkeypatch.setattr(image_exports, "get_image", lambda *_args: openstack_image)
+    monkeypatch.setattr(image_exports, "download_image", lambda conn, _image: Response())
+    monkeypatch.setattr(
+        image_exports, "delete_export_trust", lambda verified: deleted.append(verified.trust_id) or True
+    )
 
     async def subprocess_result(argv, **kwargs):
         if outcome == "error":
@@ -239,14 +259,21 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
             assert await image_exports.process_one_image_export(owner="worker-secret-id") is True
         async with factory() as session:
             stored = await session.get(PalimpsestImageExport, job.id)
+            retained = await session.get(PalimpsestImageExportDelegation, delegation.trust_id)
             expected = "downloading" if outcome == "lease_lost" else outcome
             assert stored.status == expected
+            assert opened == [(job.project_id, delegation.trust_id, job.created_by)]
             if outcome == "complete":
                 assert stored.result_size_bytes == len(source)
             elif outcome == "error":
                 assert stored.error_code == "export_failed"
             else:
                 assert stored.lease_owner == "worker-secret-id"
+            # Terminal outcomes delete the Trust; a lost lease leaves it to the new owner.
+            if outcome == "lease_lost":
+                assert (retained.state, deleted) == (image_exports.DELEGATION_ACTIVE, [])
+            else:
+                assert (retained.state, deleted) == (image_exports.DELEGATION_DELETED, [delegation.trust_id])
         records = [r for r in caplog.records if r.name == image_exports.__name__]
         info = [r.getMessage() for r in records if r.levelno == logging.INFO]
         assert info == ["Export task started status=downloading", f"Export task ended status={outcome}"]

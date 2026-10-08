@@ -2,7 +2,9 @@
 
 Provides durable Glance-to-hub image export enqueueing, status query,
 soft deletion, worker claim/execution with lease fencing, qemu conversion,
-and deferred blob store garbage collection.
+deferred blob store garbage collection, and the lifecycle of the
+requester-created Keystone Trust that is the only authority for deferred
+Glance I/O.
 """
 
 from __future__ import annotations
@@ -28,10 +30,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 if TYPE_CHECKING:
     import openstack
 
+from fastapi import HTTPException
+
+from palimpsest_hub.auth import role_name_closure, validate_package_owner
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import get_session_factory
-from palimpsest_hub.models import PalimpsestHubLayer, PalimpsestImageExport, exact_identity
-from palimpsest_hub.openstack import get_admin_connection_for_project, get_image
+from palimpsest_hub.models import (
+    PalimpsestHubLayer,
+    PalimpsestImageExport,
+    PalimpsestImageExportDelegation,
+    exact_identity,
+)
+from palimpsest_hub.openstack import (
+    DelegationError,
+    ExportDelegation,
+    create_export_trust,
+    delete_export_trust,
+    delete_trust_as_trustor,
+    download_image,
+    get_image,
+    list_image_members,
+    open_trust_connection,
+)
 from palimpsest_hub.services.blob_references import package_blob_referenced
 from palimpsest_hub.services.hub_store import (
     IMAGE_FORMAT_SPECS,
@@ -66,6 +86,19 @@ CONVERTER_CONTRACT = "palimpsest-qemu-convert-v1"
 SUPPORTED_FORMATS = ("raw", "qcow2", "vmdk", "vdi", "vhd", "vhdx")
 QEMU_MEASURE_DRIVERS = frozenset({"raw", "qcow2"})
 
+# Requester delegation lifecycle (see PalimpsestImageExportDelegation).
+DELEGATION_PENDING = "pending"
+DELEGATION_ACTIVE = "active"
+DELEGATION_CLEANUP = "cleanup"
+DELEGATION_DELETED = "deleted"
+DELEGATION_EXPIRED = "expired"
+# An admission binds its pending Trust within one request; older pending rows were abandoned.
+_ADMISSION_GRACE = timedelta(minutes=15)
+_CLEANUP_LEASE = timedelta(minutes=5)
+_CLEANUP_MAX_BACKOFF_SECONDS = 3600
+# Publishing an export is the Hub action that admits deferred export I/O.
+EXPORT_CAPABILITY = "palimpsest-publish_editor"
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -90,6 +123,132 @@ class ImageExportNotFound(ImageExportError):
 
     def __init__(self, detail: str = "Image export job not found"):
         super().__init__(status_code=404, detail=detail, code="export_not_found")
+
+
+class _DelegationRequired(Exception):
+    """Admission must queue Glance work and therefore needs a requester delegation."""
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _delegation_from_row(row: PalimpsestImageExportDelegation) -> ExportDelegation:
+    return ExportDelegation(
+        trust_id=row.trust_id,
+        project_id=row.project_id,
+        trustor_user_id=row.trustor_user_id,
+        trustee_user_id=row.trustee_user_id,
+        role_names=tuple(row.role_names),
+        expires_at=_aware(row.expires_at),
+    )
+
+
+async def _retire_export_delegations(session: AsyncSession, export_id: str, now: datetime) -> None:
+    """Queue every active delegation of a terminal/reset/deleted export for Keystone cleanup."""
+    await session.execute(
+        update(PalimpsestImageExportDelegation)
+        .where(
+            PalimpsestImageExportDelegation.export_id == export_id,
+            PalimpsestImageExportDelegation.state == DELEGATION_ACTIVE,
+        )
+        .values(state=DELEGATION_CLEANUP, cleanup_next_at=now, updated_at=now)
+    )
+
+
+async def _bind_delegation(session: AsyncSession, export_id: str, trust_id: str, now: datetime) -> None:
+    """Bind the current admission's own Trust; an earlier creator's delegation is never reused."""
+    await _retire_export_delegations(session, export_id, now)
+    result = await session.execute(
+        update(PalimpsestImageExportDelegation)
+        .where(
+            PalimpsestImageExportDelegation.trust_id == trust_id,
+            PalimpsestImageExportDelegation.state == DELEGATION_PENDING,
+            PalimpsestImageExportDelegation.export_id.is_(None),
+        )
+        .values(state=DELEGATION_ACTIVE, export_id=export_id, updated_at=now)
+    )
+    if result.rowcount != 1:
+        raise ImageExportError(503, "Export delegation is unavailable", code="delegation_unavailable")
+
+
+async def _create_admission_delegation(
+    factory, token_info: dict[str, Any], project_id: str, user_id: str
+) -> ExportDelegation:
+    """Create the requester's bounded Trust and durably record it before binding."""
+    settings = get_settings()
+    role_names = tuple(settings.palimpsest_hub_export_delegated_roles)
+    if not set(role_names) <= set(token_info.get("current_roles") or ()):
+        raise ImageExportError(
+            403,
+            "The requester does not currently hold the project role delegated for exports",
+            code="delegation_role_missing",
+        )
+    auth_ref = token_info.get("auth_ref")
+    if (
+        auth_ref is None
+        or auth_ref.auth_token != token_info.get("token")
+        or auth_ref.project_id != project_id
+        or auth_ref.user_id != user_id
+    ):
+        raise ImageExportError(401, "Validated original Keystone token is required", code="original_token_required")
+    try:
+        delegation = await asyncio.to_thread(
+            create_export_trust,
+            auth_ref,
+            project_id=project_id,
+            trustor_user_id=user_id,
+            role_names=role_names,
+            ttl_seconds=settings.palimpsest_hub_export_delegation_ttl_seconds,
+        )
+    except DelegationError as exc:
+        raise ImageExportError(exc.status_code, exc.detail, code=exc.code) from None
+    now = _now()
+    try:
+        async with factory() as session, session.begin():
+            session.add(
+                PalimpsestImageExportDelegation(
+                    trust_id=delegation.trust_id,
+                    project_id=delegation.project_id,
+                    trustor_user_id=delegation.trustor_user_id,
+                    trustee_user_id=delegation.trustee_user_id,
+                    role_names=list(delegation.role_names),
+                    expires_at=delegation.expires_at,
+                    state=DELEGATION_PENDING,
+                    cleanup_attempts=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+    except Exception:
+        if not await asyncio.to_thread(delete_trust_as_trustor, auth_ref, delegation.trust_id):
+            _logger.warning("Unrecorded export delegation remains bounded by its expiry")
+        raise ImageExportError(503, "Export delegation could not be recorded", code="delegation_unavailable") from None
+    return delegation
+
+
+async def _abandon_admission_delegation(factory, auth_ref, delegation: ExportDelegation) -> None:
+    """Delete an unbound admission Trust now, or leave a durable cleanup record."""
+    deleted = await asyncio.to_thread(delete_trust_as_trustor, auth_ref, delegation.trust_id)
+    now = _now()
+    try:
+        async with factory() as session, session.begin():
+            await session.execute(
+                update(PalimpsestImageExportDelegation)
+                .where(
+                    PalimpsestImageExportDelegation.trust_id == delegation.trust_id,
+                    PalimpsestImageExportDelegation.state.in_([DELEGATION_PENDING, DELEGATION_CLEANUP]),
+                )
+                .values(
+                    state=DELEGATION_DELETED if deleted else DELEGATION_CLEANUP,
+                    cleanup_next_at=None if deleted else now,
+                    finished_at=now if deleted else None,
+                    updated_at=now,
+                )
+            )
+    except Exception:
+        # The pending row is promoted to cleanup by the worker after the admission grace.
+        _logger.warning("Export delegation admission cleanup was deferred")
 
 
 def _is_retryable_transaction_error(exc: OperationalError) -> bool:
@@ -228,6 +387,8 @@ async def enqueue_image_export(
     if not isinstance(project_id, str) or not project_id:
         raise ImageExportError(status_code=401, detail="Project scope is required", code="project_scope_required")
     user_id = token_info.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        raise ImageExportError(status_code=401, detail="A validated requester is required", code="requester_required")
 
     source_fingerprint = compute_source_fingerprint(
         image_id=img.id,
@@ -286,7 +447,34 @@ async def enqueue_image_export(
     if valid_global_digest and global_blob_present:
         global_result_size = blob_store.size(valid_global_digest)
 
-    async def _write_transaction() -> PalimpsestImageExport:
+    def _reset_queued(row: PalimpsestImageExport, now: datetime) -> None:
+        # The current requester becomes the creator; earlier creators' authority is never reused.
+        row.status = STATUS_QUEUED
+        row.progress_pct = PROGRESS_QUEUED
+        row.error_code = None
+        row.error_message = None
+        row.attempts = 0
+        row.next_at = now
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.started_at = None
+        row.completed_at = None
+        row.result_blob_digest = None
+        row.result_size_bytes = None
+        row.deleted_at = None
+        row.created_by = user_id
+        row.source_image_id = img.id
+        row.source_name = img.name
+        row.source_disk_format = img.disk_format
+        row.source_size_bytes = img.size
+        row.source_virtual_size_bytes = getattr(img, "virtual_size", None)
+        row.source_checksum = getattr(img, "checksum", None)
+        row.source_hash_algo = getattr(img, "os_hash_algo", None)
+        row.source_hash_value = getattr(img, "os_hash_value", None)
+        row.source_updated_at = getattr(img, "updated_at", None)
+        row.updated_at = now
+
+    async def _write_transaction(trust_id: str | None) -> tuple[PalimpsestImageExport, bool]:
         async with factory() as session, session.begin():
             # Lock the project's indexed key range so concurrent requests for
             # different artifacts cannot both create nonterminal work.
@@ -322,35 +510,15 @@ async def enqueue_image_export(
                     and same_row.result_blob_digest == valid_same_digest
                     and same_blob_present
                 ):
-                    return same_row
+                    return same_row, False
 
-                # Reset soft-deleted, error, or missing-blob row to queued
+                # Reset soft-deleted, error, or missing-blob row to queued Glance work.
+                if trust_id is None:
+                    raise _DelegationRequired
                 now = _now()
-                same_row.status = STATUS_QUEUED
-                same_row.progress_pct = PROGRESS_QUEUED
-                same_row.error_code = None
-                same_row.error_message = None
-                same_row.attempts = 0
-                same_row.next_at = now
-                same_row.lease_owner = None
-                same_row.lease_expires_at = None
-                same_row.started_at = None
-                same_row.completed_at = None
-                same_row.result_blob_digest = None
-                same_row.result_size_bytes = None
-                same_row.deleted_at = None
-                same_row.created_by = user_id
-                same_row.source_image_id = img.id
-                same_row.source_name = img.name
-                same_row.source_disk_format = img.disk_format
-                same_row.source_size_bytes = img.size
-                same_row.source_virtual_size_bytes = getattr(img, "virtual_size", None)
-                same_row.source_checksum = getattr(img, "checksum", None)
-                same_row.source_hash_algo = getattr(img, "os_hash_algo", None)
-                same_row.source_hash_value = getattr(img, "os_hash_value", None)
-                same_row.source_updated_at = getattr(img, "updated_at", None)
-                same_row.updated_at = now
-                return same_row
+                _reset_queued(same_row, now)
+                await _bind_delegation(session, same_row.id, trust_id, now)
+                return same_row, True
 
             # 3. Check for global completed artifact with present blob
             if valid_global_digest and global_blob_present:
@@ -383,9 +551,11 @@ async def enqueue_image_export(
                     completed_at=now,
                 )
                 session.add(new_row)
-                return new_row
+                return new_row, False
 
-            # 4. Insert new queued job
+            # 4. Insert new queued job bound to the current requester's delegation
+            if trust_id is None:
+                raise _DelegationRequired
             now = _now()
             new_row = PalimpsestImageExport(
                 id=str(uuid.uuid4()),
@@ -411,30 +581,10 @@ async def enqueue_image_export(
                 updated_at=now,
             )
             session.add(new_row)
-            return new_row
+            await _bind_delegation(session, new_row.id, trust_id, now)
+            return new_row, True
 
-    reuse_digest = valid_same_digest or valid_global_digest
-    reuse_lock_fd: int | None = None
-    try:
-        if reuse_digest:
-            reuse_lock_fd = await acquire_lock_by_polling(
-                lambda: blob_store.acquire_blob_lock(reuse_digest, blocking=False)
-            )
-            if valid_same_digest:
-                same_blob_present = blob_store.exists(valid_same_digest)
-            if valid_global_digest:
-                global_blob_present = blob_store.exists(valid_global_digest)
-                if global_blob_present:
-                    global_result_size = blob_store.size(valid_global_digest)
-        for attempt in range(3):
-            try:
-                return await _write_transaction()
-            except OperationalError as exc:
-                if not _is_retryable_transaction_error(exc) or attempt == 2:
-                    raise
-                await asyncio.sleep(0.05 * (attempt + 1))
-        raise RuntimeError("Unreachable transaction retry state")
-    except IntegrityError:
+    async def _recover_duplicate(trust_id: str | None) -> tuple[PalimpsestImageExport, bool]:
         # Explicit race recovery preflight outside transaction
         async with factory() as session:
             stmt_same = select(PalimpsestImageExport).where(
@@ -459,41 +609,61 @@ async def enqueue_image_export(
                 and target.result_blob_digest == race_digest
                 and race_present
             ):
-                return target
+                return target, False
             if target.status not in (STATUS_COMPLETE, STATUS_ERROR) and target.deleted_at is None:
-                # The winner may already be claimed. Preserve its lease and
-                # attempts instead of resetting live work after a duplicate insert.
-                return target
+                # The winner may already be claimed. Preserve its lease, attempts
+                # and its own delegation instead of resetting live work.
+                return target, False
 
+            if trust_id is None:
+                raise _DelegationRequired
             now = _now()
-            target.status = STATUS_QUEUED
-            target.progress_pct = PROGRESS_QUEUED
-            target.error_code = None
-            target.error_message = None
-            target.attempts = 0
-            target.next_at = now
-            target.lease_owner = None
-            target.lease_expires_at = None
-            target.started_at = None
-            target.completed_at = None
-            target.result_blob_digest = None
-            target.result_size_bytes = None
-            target.deleted_at = None
-            target.created_by = user_id
-            target.source_image_id = img.id
-            target.source_name = img.name
-            target.source_disk_format = img.disk_format
-            target.source_size_bytes = img.size
-            target.source_virtual_size_bytes = getattr(img, "virtual_size", None)
-            target.source_checksum = getattr(img, "checksum", None)
-            target.source_hash_algo = getattr(img, "os_hash_algo", None)
-            target.source_hash_value = getattr(img, "os_hash_value", None)
-            target.source_updated_at = getattr(img, "updated_at", None)
-            target.updated_at = now
-            return target
+            _reset_queued(target, now)
+            await _bind_delegation(session, target.id, trust_id, now)
+            return target, True
+
+    async def _admit(trust_id: str | None) -> tuple[PalimpsestImageExport, bool]:
+        try:
+            for attempt in range(3):
+                try:
+                    return await _write_transaction(trust_id)
+                except OperationalError as exc:
+                    if not _is_retryable_transaction_error(exc) or attempt == 2:
+                        raise
+                    await asyncio.sleep(0.05 * (attempt + 1))
+            raise RuntimeError("Unreachable transaction retry state")
+        except IntegrityError:
+            return await _recover_duplicate(trust_id)
+
+    reuse_digest = valid_same_digest or valid_global_digest
+    reuse_lock_fd: int | None = None
+    delegation: ExportDelegation | None = None
+    bound = False
+    try:
+        if reuse_digest:
+            reuse_lock_fd = await acquire_lock_by_polling(
+                lambda: blob_store.acquire_blob_lock(reuse_digest, blocking=False)
+            )
+            if valid_same_digest:
+                same_blob_present = blob_store.exists(valid_same_digest)
+            if valid_global_digest:
+                global_blob_present = blob_store.exists(valid_global_digest)
+                if global_blob_present:
+                    global_result_size = blob_store.size(valid_global_digest)
+        while True:
+            try:
+                row, bound = await _admit(delegation.trust_id if delegation is not None else None)
+                return row
+            except _DelegationRequired:
+                if delegation is not None:
+                    raise RuntimeError("Admission requested a second export delegation") from None
+                # Only queued Glance work needs delegated authority; byte reuse never creates a Trust.
+                delegation = await _create_admission_delegation(factory, token_info, project_id, user_id)
     finally:
         if reuse_lock_fd is not None:
             blob_store.release_blob_lock(reuse_lock_fd)
+        if delegation is not None and not bound:
+            await _abandon_admission_delegation(factory, token_info["auth_ref"], delegation)
 
 
 async def list_project_exports(
@@ -559,7 +729,7 @@ async def soft_delete_project_export(project_id: str, export_id: str) -> Palimps
         now = _now()
         terminal = row.status in (STATUS_COMPLETE, STATUS_ERROR)
         unclaimed = row.status == STATUS_QUEUED and row.lease_owner is None
-        expired = row.lease_expires_at is not None and row.lease_expires_at <= now
+        expired = row.lease_expires_at is not None and _aware(row.lease_expires_at) <= now
         if not (terminal or unclaimed or expired):
             raise ImageExportError(
                 status_code=409,
@@ -568,6 +738,8 @@ async def soft_delete_project_export(project_id: str, export_id: str) -> Palimps
             )
         row.deleted_at = now
         row.updated_at = now
+        # Deletion is DB-only; the creator's Trust is retired for worker cleanup, never reused.
+        await _retire_export_delegations(session, row.id, now)
         return row
 
 
@@ -680,6 +852,7 @@ async def claim_next_image_export(*, owner: str) -> PalimpsestImageExport | None
                 candidate.lease_expires_at = None
                 candidate.completed_at = now
                 candidate.updated_at = now
+                await _retire_export_delegations(session, candidate.id, now)
                 return None
 
             candidate.attempts += 1
@@ -804,6 +977,149 @@ def _scratch_dir_for(exports_dir: Path, job: PalimpsestImageExport, owner: str) 
     return exports_dir / f"{job.id}-{job.attempts}-{owner_key}"
 
 
+async def _load_job_delegation(factory, job: PalimpsestImageExport) -> ExportDelegation:
+    """Return the export's own admitted delegation; legacy or swapped rows never run."""
+    if factory is None:
+        raise ImageExportError(503, "Database connection unavailable", code="db_unavailable")
+    async with factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(PalimpsestImageExportDelegation).where(
+                        PalimpsestImageExportDelegation.export_id == job.id,
+                        PalimpsestImageExportDelegation.state == DELEGATION_ACTIVE,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if len(rows) != 1:
+        raise ImageExportError(403, "Export has no current requester delegation", code="delegation_required")
+    row = rows[0]
+    # Exact bytes: legacy CI collations must not equate a different project or creator.
+    if row.project_id != job.project_id or row.trustor_user_id != job.created_by:
+        raise ImageExportError(
+            403, "Export delegation scope does not match the queued export", code="delegation_scope_mismatch"
+        )
+    delegation = _delegation_from_row(row)
+    if delegation.expires_at <= _now():
+        raise ImageExportError(403, "Export delegation has expired", code="delegation_expired")
+    return delegation
+
+
+def _authorized_export_connection(project_id: str, delegation: ExportDelegation) -> openstack.connection.Connection:
+    """Revalidate the requester's current authority, then open only the verified trust connection."""
+    try:
+        owner = validate_package_owner(delegation.trustor_user_id, project_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise DelegationError(
+                "authorization_revoked", "Requester no longer holds current export authority", 403
+            ) from None
+        raise DelegationError("authorization_unavailable", "Current export authority cannot be verified", 503) from None
+    if (
+        owner["user_id"] != delegation.trustor_user_id
+        or owner["project_id"] != project_id
+        or EXPORT_CAPABILITY not in owner["package_capabilities"]
+        or not set(delegation.role_names) <= set(owner["roles"])
+    ):
+        raise DelegationError("authorization_revoked", "Requester no longer holds current export authority", 403)
+    try:
+        allowed = role_name_closure(delegation.role_names, owner["role_directory"])
+    except (KeyError, TypeError, ValueError):
+        raise DelegationError(
+            "authorization_unavailable", "Current delegated role bindings are unavailable", 503
+        ) from None
+    return open_trust_connection(delegation, allowed_role_names=allowed)
+
+
+async def run_delegation_cleanup(*, limit: int = 20, export_id: str | None = None) -> int:
+    """Delete retired requester Trusts; failure reschedules cleanup only, never export work."""
+    factory = get_session_factory()
+    if factory is None:
+        return 0
+    delegations = PalimpsestImageExportDelegation
+    now = _now()
+    async with factory() as session, session.begin():
+        # Abandoned admissions and delegations of finished/deleted exports become cleanup work.
+        await session.execute(
+            update(delegations)
+            .where(delegations.state == DELEGATION_PENDING, delegations.created_at <= now - _ADMISSION_GRACE)
+            .values(state=DELEGATION_CLEANUP, cleanup_next_at=now, updated_at=now)
+        )
+        finished_exports = select(PalimpsestImageExport.id).where(
+            or_(
+                PalimpsestImageExport.status.in_([STATUS_COMPLETE, STATUS_ERROR]),
+                PalimpsestImageExport.deleted_at.isnot(None),
+            )
+        )
+        await session.execute(
+            update(delegations)
+            .where(delegations.state == DELEGATION_ACTIVE, delegations.export_id.in_(finished_exports))
+            .values(state=DELEGATION_CLEANUP, cleanup_next_at=now, updated_at=now)
+        )
+        stmt = select(delegations).where(
+            delegations.state == DELEGATION_CLEANUP,
+            or_(delegations.cleanup_next_at.is_(None), delegations.cleanup_next_at <= now),
+        )
+        if export_id is not None:
+            stmt = stmt.where(delegations.export_id == export_id)
+        rows = list(
+            (
+                await session.execute(
+                    stmt.order_by(delegations.cleanup_next_at.asc()).limit(limit).with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        claimed = []
+        for row in rows:
+            # Lease the row so another worker does not race the same Keystone delete.
+            row.cleanup_attempts += 1
+            row.cleanup_next_at = now + _CLEANUP_LEASE
+            row.updated_at = now
+            claimed.append((row.cleanup_attempts, _delegation_from_row(row)))
+
+    finished = 0
+    for attempts, delegation in claimed:
+        state: str | None = None
+        if delegation.expires_at <= _now():
+            # An expired Trust cannot issue tokens; Keystone's trust_flush owns the inert record.
+            state = DELEGATION_EXPIRED
+        else:
+            try:
+                if await asyncio.to_thread(delete_export_trust, delegation):
+                    state = DELEGATION_DELETED
+            except Exception:
+                _logger.warning("Export delegation cleanup is temporarily unavailable")
+        done = _now()
+        values: dict[str, Any] = {"updated_at": done}
+        if state is not None:
+            values.update(state=state, finished_at=done, cleanup_next_at=None)
+        else:
+            delay = timedelta(seconds=min(_CLEANUP_MAX_BACKOFF_SECONDS, 60 * 2 ** min(attempts, 6)))
+            values["cleanup_next_at"] = min(done + delay, delegation.expires_at)
+        try:
+            async with factory() as session, session.begin():
+                result = await session.execute(
+                    update(delegations)
+                    .where(
+                        delegations.trust_id == delegation.trust_id,
+                        delegations.state == DELEGATION_CLEANUP,
+                        delegations.cleanup_attempts == attempts,
+                    )
+                    .values(**values)
+                )
+                # A slow delete must not overwrite a newer worker's cleanup lease or result.
+                if state is not None and result.rowcount == 1:
+                    finished += 1
+        except Exception:
+            _logger.warning("Export delegation cleanup state was not recorded")
+    return finished
+
+
 async def process_one_image_export(*, owner: str) -> bool:
     """Claim and execute one pending image export job. Returns True if a job was processed."""
     job = await claim_next_image_export(owner=owner)
@@ -845,22 +1161,23 @@ async def process_one_image_export(*, owner: str) -> bool:
 
     heartbeat_task = asyncio.create_task(_heartbeat())
 
-    admin_conn: openstack.connection.Connection | None = None
+    export_conn: openstack.connection.Connection | None = None
     err_code = "export_failed"
     err_msg = "An unexpected error occurred during image export"
 
     try:
         await asyncio.to_thread(_prepare_scratch_dir, scratch_dir, blob_store.exports_dir)
-        # 1. Obtain project-scoped OpenStack connection & recheck Glance image authorization/revision
+        # 1. Revalidate the requester and open only its admitted Trust; no service-credential fallback.
+        delegation = await _load_job_delegation(factory, job)
         try:
-            admin_conn = await asyncio.to_thread(get_admin_connection_for_project, job.project_id)
-        except Exception as exc:
-            err_code = "access_denied"
-            err_msg = "Unable to establish project-scoped OpenStack access"
-            raise ImageExportError(403, err_msg, code=err_code) from exc
+            export_conn = await asyncio.to_thread(_authorized_export_connection, job.project_id, delegation)
+        except DelegationError as exc:
+            raise ImageExportError(exc.status_code, exc.detail, code=exc.code) from None
+        if lease_lost.is_set():
+            raise ImageExportLeaseLost
 
         try:
-            img = await asyncio.to_thread(get_image, admin_conn, job.source_image_id)
+            img = await asyncio.to_thread(get_image, export_conn, job.source_image_id)
         except Exception as exc:
             err_code = "image_unavailable"
             err_msg = f"Source Glance image {job.source_image_id!r} is unavailable"
@@ -880,7 +1197,7 @@ async def process_one_image_export(*, owner: str) -> bool:
             authorized = True
         elif img_visibility == "shared":
             try:
-                members = await asyncio.to_thread(lambda: list(admin_conn.image.members(img.id)))
+                members = await asyncio.to_thread(list_image_members, export_conn, img.id)
                 for m in members:
                     m_id = getattr(m, "member_id", None) or getattr(m, "id", None)
                     m_status = getattr(m, "status", None)
@@ -930,7 +1247,7 @@ async def process_one_image_export(*, owner: str) -> bool:
         def _do_download():
             nonlocal total_downloaded
             with os.fdopen(fd, "wb") as out_f:
-                resp = admin_conn.image.download_image(job.source_image_id, stream=True)
+                resp = download_image(export_conn, job.source_image_id)
                 try:
                     for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                         if not chunk:
@@ -1193,6 +1510,9 @@ async def process_one_image_export(*, owner: str) -> bool:
                     if not ok:
                         _logger.warning("Export completion lost lease")
                         outcome = "lease_lost"
+                    else:
+                        # Same transaction as completion: the Trust can never outlive a finished export unnoticed.
+                        await _retire_export_delegations(session, job.id, _now())
         if outcome != "lease_lost":
             outcome = "complete"
         return True
@@ -1220,6 +1540,8 @@ async def process_one_image_export(*, owner: str) -> bool:
                         clear_lease=True,
                     ):
                         outcome = "lease_lost"
+                    else:
+                        await _retire_export_delegations(session, job.id, _now())
             except Exception:
                 _logger.error("Export error status update failed")
 
@@ -1230,11 +1552,17 @@ async def process_one_image_export(*, owner: str) -> bool:
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
-        if admin_conn is not None:
+        if export_conn is not None:
             try:
-                await asyncio.to_thread(admin_conn.close)
+                await asyncio.to_thread(export_conn.close)
             except Exception:
                 _logger.debug("Export connection close failed")
+        if outcome in ("complete", "error") and factory is not None:
+            # Cleanup failure only reschedules Trust deletion; the export result is already final.
+            try:
+                await run_delegation_cleanup(export_id=job.id)
+            except Exception:
+                _logger.warning("Export delegation cleanup was deferred")
         try:
             await asyncio.to_thread(_remove_scratch_dir, scratch_dir)
         finally:

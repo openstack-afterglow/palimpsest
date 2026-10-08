@@ -218,11 +218,11 @@ palimpsest registry add hub packages.example.invalid \
   --namespace project-apps
 ```
 
-Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. An ordinary member uses the original project-scoped token to register the operator-bound namespace and issue a secret-once key scoped to exact packages/actions. Native login checks `/auth/me` before saving that key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, with no host-only/plaintext fallback). `--username` must match the key's public UUID; secrets enter through `--password-stdin` or a prompt. An ephemeral `PALIMPSEST_PACKAGE_KEY` can instead serve the native client, never the legacy runtime client.
+Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. A project member with current Palimpsest publish and keys-editor capabilities uses the original project-scoped token to register the operator-bound namespace and issue a secret-once key scoped to exact packages/actions. Plain member/reader roles do not grant service authority; see the [capability matrix and isolated HTTP smoke](docs/project-package-registry.md#3-identity-and-authorization). Native login checks `/auth/me` before saving that key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, with no host-only/plaintext fallback). `--username` must match the key's public UUID; secrets enter through `--password-stdin` or a prompt. An ephemeral `PALIMPSEST_PACKAGE_KEY` can instead serve the native client, never the legacy runtime client.
 
 Native `build --output ARCHIVE` produces a verified OCI export and typed, immutable-byte-bound local reference, not a Docker image. Deferred `push` reads that reference; `push --input LAYOUT_OR_ARCHIVE --manifest sha256:...` can supply another source (manifest required for multiple roots). Native `pull --output ARCHIVE` downloads and verifies original bytes without `docker load`. Receipts are owner-only under `state/package-references/`; frozen exports are under `state/package-artifacts/`, separate from SquashFS runtime tags. Native transfers reject `--all-tags`/`--platform`; native builds reject `--load`/external Docker caches and native `tag` is not supported.
 
-See [registry profiles](docs/registries.md) for the complete secret-once login → build → push → pull flow. Its `cloud.dmslab.re.kr/openstack-afterglow/test:v1` example is conditional. It needs an operator binding to the actual immutable Keystone project UUID and the separate Afterglow key gateway, which has not been deployed. The source changes have not been exercised or deployed, and the tests written for them have not been run to a pass.
+See [registry profiles](docs/registries.md) for the complete secret-once login → build → push → pull flow. Its `cloud.dmslab.re.kr/openstack-afterglow/test:v1` example remains conditional on operator binding and deployment of the separate Afterglow key gateway. The [isolated container acceptance](docs/project-package-registry.md#docker-backed-registered-http-acceptance) exercised the scoped native routes on arm64 and amd64 with persistent SQLite/blob bytes and synthetic current Keystone; it is not production deployment, canonical database/lifespan, cloud or KVM qualification.
 See also the source-based [Docker Hub intake analysis](docs/docker-hub-intake-analysis.md)
 for the current local-archive boundary and unqualified gaps.
 
@@ -595,6 +595,15 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 - `palimpsest run --backend <Tab><Tab>` → suggests backend choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
 
 ## Development
+
+The isolated 2026-10-08 full-source release candidate is **0.3.1**, based on
+origin/dev `63f6f665e7f7f7469f384edd49619fa5d6683284` plus preserved package,
+requester-Trust delegation and CLI work. It is not a new publication or rollout.
+See [final verification requirements](docs/testing.md#frozen-full-source-candidate--2026-10-08-verification-not-run)
+and the [Kolla/storage/credential prerequisites](docs/install.md). Native CI
+remains explicitly disabled; a successful `false/skipped` policy verdict is
+**not native qualification**. No verification was run during this preparation.
+
 
 ### Resume ongoing development
 

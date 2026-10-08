@@ -1398,50 +1398,44 @@ async def test_unscoped_upload_session_is_not_claimable_by_project():
 
 
 @pytest.mark.asyncio
-async def test_export_download_ticket_supports_range_resume(monkeypatch: pytest.MonkeyPatch):
+async def test_export_download_ticket_resumes_real_bytes_and_rechecks_download_authority(store, monkeypatch):
     export_id = UUID("11111111-1111-1111-1111-111111111111")
-    digest = "sha256:" + "b" * 64
+    payload_bytes = bytes(range(256)) * 16
+    digest = _put_blob(store, payload_bytes)
     token = "t" * 32
-    token_key = f"afterglow:export-dl-token:{token}"
+    ticket = {
+        "export_id": str(export_id),
+        "project_id": "project-1",
+        "user_id": "user-1",
+        "digest": digest,
+        "expires_at": int(time.time()) + 60,
+    }
 
     class FakeRedis:
-        async def get(self, key: str):
-            assert key == token_key
-            return json.dumps(
-                {
-                    "export_id": str(export_id),
-                    "project_id": "project-1",
-                    "digest": digest,
-                    "expires_at": int(time.time()) + 60,
-                }
-            )
-
-    redis = FakeRedis()
+        async def get(self, key):
+            return json.dumps(ticket)
 
     async def fake_get_redis():
-        return redis
+        return FakeRedis()
 
-    async def fake_get_project_export(project_id: str, requested_export_id: str):
-        assert project_id == "project-1"
-        assert requested_export_id == str(export_id)
+    async def fake_get_project_export(project_id, requested_export_id):
         return object()
 
-    captured: dict = {}
+    capabilities = {"palimpsest-download_user"}
 
-    def fake_blob_response(**kwargs):
-        captured.update(kwargs)
-        return object()
+    def current_owner(user_id, project_id):
+        assert (user_id, project_id) == ("user-1", "project-1")
+        return {"package_capabilities": frozenset(capabilities)}
 
     monkeypatch.setattr(hub_api, "get_redis", fake_get_redis)
     monkeypatch.setattr(hub_api, "get_project_export", fake_get_project_export)
+    monkeypatch.setattr(hub_api, "validate_package_owner", current_owner)
     monkeypatch.setattr(
         hub_api,
         "_complete_export_blob",
-        lambda row, store: (digest, 4096, "export.qcow2", "application/octet-stream"),
+        lambda row, blob_store: (digest, len(payload_bytes), "export.qcow2", "application/octet-stream"),
     )
-    monkeypatch.setattr(hub_api, "_store_or_503", lambda: object())
-    monkeypatch.setattr(hub_api, "_blob_response", fake_blob_response)
-
+    monkeypatch.setattr(hub_api, "_store_or_503", lambda: store)
     request = Request(
         {
             "type": "http",
@@ -1451,10 +1445,14 @@ async def test_export_download_ticket_supports_range_resume(monkeypatch: pytest.
         }
     )
     result = await hub_api.download_image_export_with_token(export_id, request, token)
-
-    assert result is not None
-    assert captured["range_header"] == "bytes=1024-2047"
-    assert captured["cache_control"] == "no-store"
+    assert result.status_code == 206
+    assert result.headers["content-range"] == "bytes 1024-2047/4096"
+    assert result.headers["cache-control"] == "no-store"
+    assert b"".join([chunk async for chunk in result.body_iterator]) == payload_bytes[1024:2048]
+    capabilities.clear()
+    with pytest.raises(HTTPException) as denied:
+        await hub_api.download_image_export_with_token(export_id, request, token)
+    assert denied.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -1526,7 +1524,9 @@ async def test_export_ticket_records_original_absolute_deadline(monkeypatch: pyt
     )
     before = int(time.time())
     issued = Response()
-    result = await hub_api.create_image_export_download_token(export_id, issued, {"project_id": "project-1"})
+    result = await hub_api.create_image_export_download_token(
+        export_id, issued, {"project_id": "project-1", "user_id": "owner"}
+    )
     assert result["expires_in"] == 60
     assert issued.headers["cache-control"] == "no-store"
     assert captured["ttl"] == 60
@@ -1597,7 +1597,8 @@ async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_s
     async def identity(request: Request):
         return {"project_id": request.headers["x-project-id"], "user_id": "member"}
 
-    app.dependency_overrides[hub_api.get_token_info] = identity
+    app.dependency_overrides[hub_api._legacy_inventory] = identity
+    app.dependency_overrides[hub_api._legacy_download] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             for project in ("Project-A", "Granted-A"):
