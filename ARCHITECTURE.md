@@ -2,7 +2,7 @@
 
 ## Overview
 
-Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. 기본 checkout의 현재 source는 root `palimpsest-client 0.3.1`과 별도 `palimpsest-hub 0.3.1` native project-package registry 후보를 준비한다. 두 package metadata/lock/module version 및 Kolla image-tag 후보는 0.3.1로 일치하지만 게시·배포 증거는 아니다. Kolla source-build 기본 ref는 기존 검토·검증된 Hub 0.3.0 commit `c4887f7806608e98f215abbd377d2eafe159ff76`이며 이 미커밋 후보의 self-pin이 아니다. 후보 source 배포는 별도 검토한 committed SHA를 pin해야 하며 운영자는 게시된 API/worker image와 검토된 digest를 별도로 확인·pin해야 한다.
+Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. Immutable `v0.3.1` source `1458db42a1449a25b664584d144d0a97086f8f6f`의 root wheel/sdist는 PyPI와 GitHub Release에 게시됐고 별도 Hub API/worker image도 같은 revision의 Linux amd64 digest로 게시됐다. Hub Python wheel은 root release 산출물이 아니다. Root/Hub metadata/locks/module/Kolla image tag는 0.3.1로 일치하지만 운영 배포나 native KVM qualification을 뜻하지 않는다. Kolla source-build 기본 ref는 기존 검토된 Hub 0.3.0 commit `c4887f7806608e98f215abbd377d2eafe159ff76`이므로 source-mode에는 별도 검토한 release SHA를, image-mode에는 [`docs/install.md`](docs/install.md)의 정확한 API/worker digest를 pin해야 한다. 운영 cutover는 승인된 requester-project service-grade 할당·auth/storage/recovery 검토 전까지 보류됐다.
 
 Multi-host Kolla deployments prepare each host's local Hub volume with its reviewed API image before starting API/worker containers; only the database bootstrap is delegated to the first host.
 
@@ -1151,6 +1151,10 @@ Source-reviewed delegation integration fixes (not test-passed): soft-delete norm
 
 The standalone native client's `upload_cache` preflight requires only `cache:write`, matching the Hub's independent cache leaves; online BuildKit retains its mandatory `cache:read` plus `cache:write` preflight. Added client/CLI/Hub regressions define write-only upload, read-only resolution/download, exact package/platform/builder scope and current-owner attenuation. They were not run. The existing registered-app Docker smoke does not exercise cache transfer or an actual native CLI/TLS/credential helper; final real HTTP/cache/installed CLI acceptance remains a separate requirement, not evidence supplied by its current script.
 
+Published 0.3.1 review — 2026-10-08: the preceding preparation-only/unexecuted statements retain their historical boundary. Final root gates passed 6,435 tests with 261 opt-in skips; Hub passed 298. Exact release Test 37725533476, Hub images 37725879345 and root publisher 37725879373 succeeded. Actual published amd64 images, unmodified under arm64 cross-architecture execution, exercised canonical MariaDB bootstrap/lifespan, Redis, API and conversion worker with synthetic HTTP Keystone/Glance: 184 package/persistence, 26 delegation and 27 independent cache checks, including setup and repeated checks. All four exact-owned fixture sets were cleaned. No native amd64/KVM, real cloud policy, BuildKit execution or installed client TLS/helper transfer proof is claimed.
+
+Release completion repair — 2026-10-08: root publisher succeeded with intentional native skip, but the final GitHub job's implicit success gate suppressed completion (run 37725879373). Its actual YAML now requires `!cancelled() && needs.publish.result == 'success'`; upstream trusted-tag/verify/native/environment policy and contents-write scope are unchanged. Existing evaluator reproduced the old refusal and exercised 24 acceptance/denial states after the fix; focused policy modules passed 127 tests. Authorized manual GitHub Release creation attached only the exact tag-run wheel/sdist with hashes matching PyPI and GitHub's uploaded asset digests. Tag/source and PyPI bytes were not changed. The old immutable tag retains its old workflow; future-tag hosted execution of the corrected condition is not claimed. No runtime structure or Test scheduling/performance change; no before/after performance improvement claim. Production operator/Kolla pins, writers, data, service-role assignments and volume contents remain unchanged. See current publication/handoff records for the IAM hold and separate live prerequisites.
+
 
 
 
@@ -1158,9 +1162,9 @@ The standalone native client's `upload_cache` preflight requires only `cache:wri
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2824866b37a85ce94ce5742fcf8e091b63bd09de9840377017ccc65656e19f0b",
-  "reviewed_at": "2026-10-08T03:58:02Z",
-  "summary": "Palimpsest 0.3.1 release tree: requester-Trust Hub image export worker with additive delegation table, exact current-graph service leaves with key attenuation, standalone cache:write scope, native KVM CI opt-out handling, host-share lifecycle and SYSTEM operator tooling, fail-closed public HAProxy hostname derivation, Hub framework advisory pins; client/Hub/Kolla versions 0.3.1 and 2026-10-08 portable/Hub qualification recorded."
+  "source_sha256": "a80fee2489137486c9478383d0aca2768f7336e0d7d8f4b0feb0668384f75a34",
+  "reviewed_at": "2026-10-08T07:08:51Z",
+  "summary": "Review final GitHub Release eligibility after successful permitted publication; preserve trusted/native/cancellation gates. Published 0.3.1 artifacts and held cutover documented; full portable 6436 passed, 261 opt-in skips."
 }
 ```
 <!-- architecture-review:end -->

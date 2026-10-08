@@ -6,48 +6,51 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 It does not use a repository checkout as the user installation mechanism.
 
 Palimpsest Local requires Python 3.11 or newer. The root distribution
-[`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
+[`palimpsest-client 0.3.1`](https://pypi.org/project/palimpsest-client/0.3.1/)
 is published on PyPI. The independently versioned Hub distribution is
 `palimpsest-hub 0.3.1` in this tree; this source version is not a PyPI release.
 Git and outbound HTTPS access to GitHub
 are required only for the direct VCS installation examples below.
 
-Install the published CLI with `python3.12 -m pip install "palimpsest-client==0.2.3"`,
+Install the published CLI with `python3.12 -m pip install "palimpsest-client==0.3.1"`,
 then run `palimpsest --version`. The isolated invocation
-`uvx --from palimpsest-client==0.2.3 palimpsest --version` was verified against
-the published wheel and reports `0.2.3`.
+`uvx --from palimpsest-client==0.3.1 palimpsest --version` was exercised against
+PyPI and reports `0.3.1`. The formal [GitHub Release](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1)
+contains the same hash-matched wheel and sdist as the exact tag run and PyPI.
 
-The current checkout prepares root `palimpsest-client 0.3.1`, which is not
-published by these commands. The Hub 0.3.1 package registry and retained closed-transport pool recovery are
-separate source; update both reviewed Kolla API and worker image digests to
-deploy it, rather than assuming a root wheel upgrade updates running services.
+The Hub 0.3.1 package registry and retained closed-transport pool recovery are
+separate service code; update both reviewed Kolla API and worker image digests
+to deploy it. A root wheel upgrade does not update running services.
 
-The 2026-10-08 isolated full-source candidate retains origin/dev
-`63f6f665e7f7f7469f384edd49619fa5d6683284` plus the original package-capability,
-requester-Trust delegation and CLI work. Root/Hub/locks/modules/Kolla image tag
-are synchronized at **0.3.1**, not published or deployed. Public registry
-manifest inspection found neither `0.3.1` nor `v0.3.1` for either Hub image;
-GitHub's package-versions API was unavailable without `read:packages` scope.
-The canonical Hub workflow currently declares no multi-platform matrix or
-`platforms` override: its hosted Ubuntu builder publishes its default platform,
-not an asserted amd64/arm64 manifest list. The Dockerfile targets support the
-previously exercised Linux amd64 and arm64 source builds, but deployment must
-inspect the actual candidate image manifest/revision/digest for its host.
+The immutable release source is `1458db42a1449a25b664584d144d0a97086f8f6f`.
+Root/Hub/locks/modules/Kolla image tag are synchronized at **0.3.1**. Published
+API/worker revisions match this source, and `0.3.1`, `v0.3.1`, `sha-1458db4`
+and `latest` resolve to the same respective indexes:
 
-Before candidate Kolla rollout, the operator must:
+- API: `ghcr.io/openstack-afterglow/palimpsest-hub-api@sha256:4ee1a42d14f4b0193877d1cd7d4f55187a987628097ec424eda2b0b7812d929a`
+- Worker: `ghcr.io/openstack-afterglow/palimpsest-hub-worker@sha256:4564a89553132366f38fd23be2ee101262a4f99a9962afdae37a0975511814a6`
+
+Both published images are **Linux amd64 only**. No arm64 publication or literal
+`stable` alias exists in the observed release; `latest` is not a deployment pin.
+The Dockerfile supports prior amd64/arm64 source builds, which do not establish
+an arm64 release manifest. Runtime smoke executed the published amd64 digests
+under cross-architecture Docker Desktop on arm64, not on a native amd64/KVM host.
+See [qualification boundaries](testing.md#published-031-verification).
+
+**Production rollout is held**, not completed. Before Kolla cutover, the operator must:
 
 1. Preserve the previous **actual** API/worker digest pins, existing private
    Kolla secret/config inputs, mounts and service identities. Both images must
-   come from the exact reviewed candidate ref. Source mode still defaults to
-   `c4887f7806608e98f215abbd377d2eafe159ff76`, not this candidate; override it
-   only with the eventual reviewed committed SHA. The source-build task rejects
+   come from the exact reviewed release ref. Source mode still defaults to
+   `c4887f7806608e98f215abbd377d2eafe159ff76`, not this release; override it
+   only with the separately reviewed `1458db42a1449a25b664584d144d0a97086f8f6f`. The source-build task rejects
    a dirty existing checkout or a different existing HEAD; prepare a separate
    clean checkout path rather than resetting an operator's checkout.
 2. Stop new ingress and quiesce **all** API/export/build/upload/GC writers, then
    capture SQL and CAS from the same no-writers interval. Keep backup/restore
    evidence and verify an isolated restore before production cutover. Do not
    delete volumes, retained jobs, unknown guest state or Keystone Trusts.
-3. Use the candidate API image's `palimpsest-hub-bootstrap` to create missing
+3. Use the reviewed release API image's `palimpsest-hub-bootstrap` to create missing
    tables. It is additive `create_all`, not an ALTER migration. For a separate
    database, bootstrap an empty destination, run
    `palimpsest-hub-migrate-data --source-url "$SOURCE_DATABASE_URL" \
@@ -82,13 +85,21 @@ Before candidate Kolla rollout, the operator must:
 
 ### Service-role provisioning prerequisite before reopening ingress
 
-The candidate gates every legacy artifact write and
+The 0.3.1 release gates every legacy artifact write and
 `POST /v1/image-exports` on current `palimpsest-publish_editor`; the export
 worker rechecks it before Glance I/O. Plain existing `member`/`reader` grants
 are not service authority. Without an approved role-graph/assignment cutover,
 existing export consumers (including Afterglow requesters) return 403. The
 Palimpsest Kolla role registers the trustee and system reader only: it does
 **not** create these service roles, inference rules or requester grants.
+
+During this release's approved preset-only preparation, global roles and their
+implication edges were created and verified, but no user/project assignments
+were made. Read-only inventory found 106 ordinary user/project memberships
+without service-grade assignments across 43 users/41 projects (104 enabled).
+These rows describe cutover risk, not 106 exercised denied requests. Review
+the intended service grade for each requester before reopening ingress; never
+promote every `member` or grant tenant admin automatically.
 
 Before reopening ingress, the IAM/operator owner must explicitly approve and
 provision unique **global** roles with these exact names, then verify their
@@ -147,12 +158,12 @@ Use the same reviewed Git ref for Local and Hub to prevent source skew.
 The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
 under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
 Kolla-Ansible, Ansible, Hub, or their runtime dependencies; deployments pin
-Kolla-Ansible independently. This candidate role defaults to Hub image tag `0.3.1`,
-while source builds bind to the configured reviewed checkout commit SHA. Verify both
-`0.3.1` Hub images are published before deploying this default; source metadata
-alone does not establish image availability.
+Kolla-Ansible independently. The released role defaults to Hub image tag `0.3.1`,
+while source builds bind to the configured reviewed checkout commit SHA. Both
+published image digests above must be inspected and pinned for the deployment
+host; source metadata alone does not establish runtime readiness.
 
-The role's release candidate matches the Hub 0.3.1 source. Operators deploying
+The role's release matches the Hub 0.3.1 source. Operators deploying
 the package registry or closed-connection fix must verify reviewed API/worker
 image digests in Kolla globals; a Python update does not change running containers.
 
