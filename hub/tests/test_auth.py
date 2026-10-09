@@ -153,6 +153,7 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
         "token_roles": ["member", "palimpsest_admin"],
         "project_roles": ["member", "palimpsest_admin"],
         "other_roles": [],
+        "system_assignments": [],
         "unavailable": False,
         "requests": [],
     }
@@ -311,6 +312,8 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
                         }
                         for name in state["other_roles"]
                     )
+                elif not query.get("effective"):
+                    assignments.extend(state["system_assignments"])
                 self.send_json(200, {"role_assignments": assignments})
             else:
                 self.send_json(404, {"error": {"message": "Unknown identity resource"}})
@@ -327,6 +330,26 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_direct_system_admin_recognition_and_revocation(keystone_http):
+    keystone_http["token_roles"] = ["admin"]
+    keystone_http["system_assignments"] = [
+        {
+            "user": {"id": FEDERATED_OWNER},
+            "scope": {"system": {"all": True}},
+            "role": {"id": "role-admin", "name": "admin"},
+        }
+    ]
+    info = validate_token(ORIGINAL_SUBJECT, PROJECT_A)
+    assert info["is_system_admin"] is True
+
+    keystone_http["system_assignments"] = []
+    info = validate_token(ORIGINAL_SUBJECT, PROJECT_A)
+    assert info["is_system_admin"] is False
+    with pytest.raises(HTTPException) as exc_info:
+        require_admin(token_info=info)
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.parametrize("project_header", ["", PROJECT_A])

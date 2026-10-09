@@ -24,6 +24,14 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Native Hub authority repair — 2026-10-09
+
+Isolated latest-dev baseline `75593f31b23cbceb76b2a38dc57f63bc4260271b`; shared work is untouched. Production query inspection found that effective expansion omits a direct system-all administrator, which the direct reader-compatible query returns. The one-keyword repair, native HTTP regression and synchronized root/Hub 0.3.2 metadata are tracked in [fix-native-hub-system-admin](../openspec/changes/fix-native-hub-system-admin/).
+
+Owner explicitly approved verification, commit/protected-dev integration, immutable 0.3.2 wheel/image publication and controller1 Hub deployment through the deployment server's canonical Kolla lifecycle, including its managed separate reader secret and existing reader system assignment. Ordinary grants, multi-node local CAS and native/KVM activation are excluded. Sol develops; independent configured-parent-model reviewers inspect auth consumers and release/Kolla boundaries. No Astra planning participation is claimed.
+
+Installed-SDK HTTP regression failed before and passed after; full Hub 299 passed. Real registered-app loopback HTTP, synthetic dedicated-reader Keystone and fresh SQLite proved original-project-only reads 200, revocation 403 despite project-admin token and missing token401, without an auth dependency override. Root release gates, exact-SHA CI, image publication and native deployment-reader acceptance are still separate checkpoints. Historical publication/Trust/native boundaries below remain dated and do not imply new proof.
+
 ## Native CI opt-out — 2026-10-07
 
 Owner explicitly requested standing automatic approval or turning off native KVM attempts because CI/CD repeatedly waits. Current read-only inspection also found both pinned HTTPS URL variables absent, so the selected change is explicit `PALIMPSEST_KVM_ENABLED=false`, not automatically approving a doomed proof. Test and Release accept only enabled/success or literal disabled/skipped; disabled notices explicitly deny native qualification. Failed verification, native failure/cancellation/missing result, invalid flag and untrusted/cancelled release contexts stay blocked. Native environment reviewer/branch policy, secrets, cleanup/pins and all six strict hosted checks remain unchanged.
