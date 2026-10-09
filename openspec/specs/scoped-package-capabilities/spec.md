@@ -2,9 +2,7 @@
 
 ## Purpose
 Separate authorized package metadata, content download, publishing and owned key administration while attenuating tokens and delegated keys to current Keystone owner authority.
-
 ## Requirements
-
 ### Requirement: Exact Palimpsest service capability matrix
 Hub SHALL accept exact effective `palimpsest-inventory_reader`, `palimpsest-download_user`, `palimpsest-publish_editor`, `palimpsest-keys_editor`, `palimpsest-keys_admin` leaves. Parent assignments (`palimpsest_reader`, `palimpsest_user`, `palimpsest_editor`, `palimpsest_admin`) SHALL resolve through Keystone's current role-ID implication DAG, not hardcoded bundles. Presets initially link lower grades and their leaves, but operators can remove edges. Role bindings SHALL use a fresh complete directory of unique global IDs. Baseline effective member SHALL be required for non-reader leaves; inventory SHALL additionally accept baseline reader. Project/native roles alone grant no service entitlement, and domain aliases, ambiguous bindings or unavailable directory/graph SHALL grant no authority.
 
@@ -34,11 +32,23 @@ Hub SHALL revalidate current effective named Keystone assignments and enabled ow
 - **THEN** existing scope/ownership checks deny the request even for a service admin.
 
 ### Requirement: Preserve global and credential boundaries
-Hub SHALL preserve verified-system-admin global builder/GC gates and key-only native package writes, without granting service admin global authority or allowing package keys to authorize OpenStack/VM launch.
+
+Hub SHALL preserve verified-system-admin global builder/GC gates and key-only native package writes, without granting service admin global authority or allowing package keys to authorize OpenStack/VM launch. System administrator recognition SHALL use a fresh direct user/system-all assignment query through the separate reader, not project-oriented effective expansion, and SHALL still require an exact subject user, system-all scope and named admin role.
 
 #### Scenario: Service admin and package key cannot launch
+
 - **WHEN** service admin tokens or package keys call global builder/GC or VM operations
 - **THEN** no new authority is granted.
+
+#### Scenario: Direct system administrator survives project-oriented expansion
+
+- **WHEN** a project-scoped subject user has a direct admin assignment on system-all while effective expansion omits that assignment
+- **THEN** Hub recognizes the administrator through the direct reader lookup without exchanging or re-scoping the original subject token.
+
+#### Scenario: Revocation removes global authority despite project admin
+
+- **WHEN** the direct system-all admin assignment is removed while the original token retains a project admin role
+- **THEN** the next validation no longer recognizes a system administrator and privileged requests are denied with 403.
 
 ### Requirement: Isolated HTTP regression setup
 Regression cases SHALL exercise actual native FastAPI HTTP routes and a synthetic HTTP Keystone boundary with temporary SQL/CAS, without production Hub mutation.
@@ -54,3 +64,4 @@ Regression cases SHALL exercise actual native FastAPI HTTP routes and a syntheti
 - **AND** original upload/download bytes and owned range-resume bytes remain equal after container restart and recreation; inventory is not content-download authority, and inventory plus write publishes without read
 - **AND** current-owner downgrade revokes issued keys and export tickets while retained inventory remains available; verified-system-only builder/GC gates remain separate
 - **AND** the report distinguishes the smoke-only SQLite factory/lifespan-off setup from canonical MySQL bootstrap/deployment and records the observed SQLite connect_timeout incompatibility without claiming real cloud/KVM execution.
+
