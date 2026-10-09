@@ -221,9 +221,7 @@ def _is_system_admin(user_id: str) -> bool:
         return False
     try:
         user_id = validate_keystone_id(user_id)
-        assignments = _get_reader_ks_client().role_assignments.list(
-            user=user_id, system="all", effective=True, include_names=True
-        )
+        assignments = _get_reader_ks_client().role_assignments.list(user=user_id, system="all", include_names=True)
         for assignment in assignments:
             scope = _value(assignment, "scope")
             if (

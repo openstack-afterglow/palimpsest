@@ -4,6 +4,11 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-09
+
+- Recognize directly assigned Keystone system administrators through a fresh separate reader lookup without project-oriented effective expansion. Preserve exact subject/system-all/admin checks, original token scope, fail-closed failures and independent ordinary service authority. Regress recognition and immediate revocation through the installed SDK and real HTTP; synchronize root/Hub metadata, locks, modules and packaged Kolla image tag without dependency or schema changes.
+- Registered production-app loopback smoke with synthetic Keystone and fresh SQLite verified original-project-only administrator reads (200), immediate revocation despite project-admin token (403), and missing-token denial (401). This is not real cloud/KVM or production-reader policy proof.
+
 - Complete GitHub Release creation after successful permitted root publication when native qualification was explicitly disabled. Keep cancellation and failed/skipped/missing publication fail-closed; preserve upstream verification and native-policy gates. The immutable v0.3.1 tag remains unchanged, and the missing release was repaired using its original hash-matched distributions.
 
 ## [0.3.1] - 2026-10-08
