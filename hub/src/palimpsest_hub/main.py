@@ -160,6 +160,8 @@ async def log_request(request: Request, call_next):
             if _package_path(request)
             else PlainTextResponse("Internal Server Error", status_code=500)
         )
+    if request.scope.get("path") == "/v1/me":
+        response.headers["Cache-Control"] = "no-store"
     if _package_path(request):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Request-Id"] = request.state.request_id
@@ -194,7 +196,7 @@ async def hub_console() -> FileResponse:
 
 @app.get("/app/{asset}", include_in_schema=False)
 async def hub_console_asset(asset: str) -> FileResponse:
-    if asset not in {"hub.css", "hub.js"}:
+    if asset not in {"hub.css", "hub.js", "hub-packages.js"}:
         raise HTTPException(status_code=404)
     return FileResponse(_APP_FILES / asset, headers=_APP_HEADERS)
 

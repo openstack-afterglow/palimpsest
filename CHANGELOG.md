@@ -4,6 +4,12 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-11
+
+- Extend the authenticated Hub console with original-token capability context (`GET /v1/me`), bounded image/layer pagination and metadata filters, managed image/layer upload/download/delete and build submission, and separate memory-only native package-key browsing/publication. Legacy Keystone tokens and native package keys never share an authentication domain.
+- Keep repeat uploads consumable by publish-only CLI/console callers: take the existing-digest descriptor shortcut only with inventory authority; otherwise verify the ordinary upload's bytes and metadata without descriptor disclosure. Reject native keys before a legacy identity request and release missing upload sessions without assuming unacknowledged finalization failed or automatically retrying publication. Preserve the fresh direct system-admin lookup, manager exclusion, Trust cleanup generation fencing and UTC lease handling from 0.3.2.
+- Synchronize root/Hub metadata, module versions, locks and packaged Kolla image default at 0.3.3 without changing dependencies, schemas, local runtime code, native binaries or CI policy. Formal publication and Kolla deployment remain separate approval/verification gates; this candidate is not the earlier dirty 0.3.1 management image.
+
 ## [0.3.2] - 2026-10-09
 
 - Recognize directly assigned Keystone system administrators through a fresh separate reader lookup without project-oriented effective expansion. Preserve exact subject/system-all/admin checks, original token scope, fail-closed failures and independent ordinary service authority. Regress recognition and immediate revocation through the installed SDK and real HTTP; synchronize root/Hub metadata, locks, modules and packaged Kolla image tag without dependency or schema changes.

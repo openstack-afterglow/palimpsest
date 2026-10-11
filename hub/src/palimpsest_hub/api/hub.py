@@ -36,6 +36,7 @@ from palimpsest_hub.auth import (
     get_package_member_info,
     get_token_info,
     require_admin,
+    require_token,
     validate_package_owner,
 )
 from palimpsest_hub.cache import get_redis
@@ -429,6 +430,35 @@ async def _legacy_download(token_info: dict = Depends(get_token_info)) -> dict:
     return member
 
 
+@router.get("/me", operation_id="get_hub_identity")
+async def get_hub_identity(token_info: dict = Depends(require_token)) -> dict[str, Any]:
+    """Describe the original token scope and freshly checked legacy artifact authority."""
+    is_system_admin = bool(token_info.get("is_system_admin"))
+    capabilities = frozenset()
+    if not is_system_admin:
+        try:
+            member = await get_package_member_info(token_info=token_info)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+        else:
+            capabilities = member["package_capabilities"]
+    return {
+        "user_id": token_info["user_id"],
+        "project_id": token_info["project_id"],
+        "project_name": token_info.get("project_name", ""),
+        "roles": token_info.get("roles", []),
+        "is_system_admin": is_system_admin,
+        "capabilities": {
+            "inventory": is_system_admin or "palimpsest-inventory_reader" in capabilities,
+            "download": is_system_admin or "palimpsest-download_user" in capabilities,
+            "upload": "palimpsest-publish_editor" in capabilities,
+            "delete": is_system_admin,
+            "build": is_system_admin,
+        },
+    }
+
+
 def _factory_or_503():
     factory = get_session_factory()
     if factory is None:
@@ -695,7 +725,12 @@ async def search_hub_layers(
     name: str | None = Query(None),
     kind: str | None = Query(None),
     parent_digest: str | None = Query(None),
+    arch: str | None = Query(None),
+    os_variant: str | None = Query(None),
+    disk_format: str | None = Query(None),
+    ubuntu_base: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     token_info: dict = Depends(_legacy_inventory),
 ) -> list[dict[str, Any]]:
     stmt = _visible_filter(select(PalimpsestHubLayer), token_info)
@@ -733,9 +768,30 @@ async def search_hub_layers(
             raise HTTPException(status_code=422, detail="kind 형식이 유효하지 않습니다")
         stmt = stmt.where(PalimpsestHubLayer.kind == kind)
 
+    if arch is not None and arch not in {"x86_64", "aarch64"}:
+        raise HTTPException(status_code=422, detail="arch 는 x86_64 또는 aarch64 여야 합니다")
+    if disk_format is not None and disk_format not in DISK_FORMAT_MEDIA_TYPES:
+        raise HTTPException(status_code=422, detail=f"지원 disk_format: {', '.join(IMAGE_FORMAT_SPECS)}")
+    if ubuntu_base is not None and not _UBUNTU_BASE_RE.match(ubuntu_base):
+        raise HTTPException(status_code=422, detail="ubuntu_base 형식이 유효하지 않습니다")
+    if os_variant is not None and not _OS_VARIANT_RE.match(os_variant):
+        raise HTTPException(status_code=422, detail="os_variant 형식이 유효하지 않습니다")
+    for value, column in (
+        (ubuntu_base, PalimpsestHubLayer.ubuntu_base),
+        (arch, PalimpsestHubLayer.arch),
+        (os_variant, PalimpsestHubLayer.os_variant),
+        (disk_format, PalimpsestHubLayer.disk_format),
+    ):
+        if value is not None:
+            stmt = stmt.where(column == value)
+
     factory = _factory_or_503()
     async with factory() as session:
-        rows = (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).limit(limit))).scalars().all()
+        rows = (
+            (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).offset(offset).limit(limit)))
+            .scalars()
+            .all()
+        )
         return [_layer_dict(row, token_info) for row in rows]
 
 
@@ -746,6 +802,7 @@ async def list_hub_images(
     os_variant: str | None = Query(None),
     disk_format: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     token_info: dict = Depends(_legacy_inventory),
 ) -> list[dict[str, Any]]:
     if arch is not None and arch not in {"x86_64", "aarch64"}:
@@ -769,7 +826,11 @@ async def list_hub_images(
 
     factory = _factory_or_503()
     async with factory() as session:
-        rows = (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).limit(limit))).scalars().all()
+        rows = (
+            (await session.execute(stmt.order_by(PalimpsestHubLayer.id.desc()).offset(offset).limit(limit)))
+            .scalars()
+            .all()
+        )
         return [_layer_dict(row, token_info) for row in rows]
 
 
@@ -1065,14 +1126,15 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(_l
         if existing is not None:
             if existing.kind == KIND_BUILDKIT_CACHE:
                 raise HTTPException(status_code=422, detail="legacy cache registration is retired")
-            return {
-                "session_id": None,
-                "completed": True,
-                "blob_digest": req.digest,
-                "already_present": True,
-                "registered": True,
-                "registration": _layer_dict(existing, token_info),
-            }
+            if "palimpsest-inventory_reader" in token_info.get("package_capabilities", ()):
+                return {
+                    "session_id": None,
+                    "completed": True,
+                    "blob_digest": req.digest,
+                    "already_present": True,
+                    "registered": True,
+                    "registration": _layer_dict(existing, token_info),
+                }
 
     session_id = uuid.uuid4().hex
     async with _locked_file(store, lambda: store.acquire_project_upload_lock(project_id, blocking=False)):
