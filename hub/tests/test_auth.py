@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from palimpsest_hub.auth import (
+    _is_system_admin,
     _reader_client_for,
     get_os_conn,
     get_package_member_info,
@@ -350,6 +351,72 @@ def test_direct_system_admin_recognition_and_revocation(keystone_http):
     with pytest.raises(HTTPException) as exc_info:
         require_admin(token_info=info)
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        None,
+        [],
+        {"project": {"id": PROJECT_A}},
+        {"system": "all"},
+        {"system": None},
+        {"system": []},
+        {"system": True},
+        {"system": {"all": False}},
+        {"system": {"all": 1}},
+    ],
+)
+def test_system_admin_requires_explicit_boolean_system_scope(scope):
+    assignment = {"user": {"id": FEDERATED_OWNER}, "scope": scope, "role": {"name": "admin"}}
+    with patch("palimpsest_hub.auth._get_reader_ks_client") as reader:
+        reader.return_value.role_assignments.list.return_value = [assignment]
+        assert _is_system_admin(FEDERATED_OWNER) is False
+        reader.return_value.role_assignments.list.assert_called_once_with(
+            user=FEDERATED_OWNER, system="all", include_names=True
+        )
+
+
+def test_system_admin_ignores_malformed_scope_without_hiding_valid_direct_assignment():
+    records = [
+        {"user": {"id": FEDERATED_OWNER}, "scope": {"system": "all"}, "role": {"name": "admin"}},
+        {"user": {"id": "a" * 32}, "scope": {"system": {"all": True}}, "role": {"name": "admin"}},
+        {"user": {"id": FEDERATED_OWNER}, "scope": {"system": {"all": True}}, "role": {"name": "reader"}},
+    ]
+    with patch("palimpsest_hub.auth._get_reader_ks_client") as reader:
+        reader.return_value.role_assignments.list.return_value = records
+        assert _is_system_admin(FEDERATED_OWNER) is False
+        records.append({"user": {"id": FEDERATED_OWNER}, "scope": {"system": {"all": True}}, "role": {"name": "admin"}})
+        assert _is_system_admin(FEDERATED_OWNER) is True
+
+
+def test_system_admin_query_failure_does_not_retry_with_broader_authority():
+    with patch("palimpsest_hub.auth._get_reader_ks_client") as reader:
+        reader.return_value.role_assignments.list.side_effect = RuntimeError("identity unavailable")
+        assert _is_system_admin(FEDERATED_OWNER) is False
+        reader.return_value.role_assignments.list.assert_called_once_with(
+            user=FEDERATED_OWNER, system="all", include_names=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_me_rechecks_membership_for_a_retained_token(keystone_http):
+    from palimpsest_hub.api.hub import get_hub_identity
+
+    original = validate_token(ORIGINAL_SUBJECT)
+    context = await get_hub_identity(original)
+    assert context["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": True,
+        "delete": False,
+        "build": False,
+    }
+    keystone_http["project_roles"] = []
+    revoked = await get_hub_identity(original)
+    assert not any(revoked["capabilities"].values())
+    assert revoked["roles"] == original["roles"]
+    assert revoked["project_id"] == PROJECT_A and revoked["user_id"] == FEDERATED_OWNER
 
 
 @pytest.mark.parametrize("project_header", ["", PROJECT_A])

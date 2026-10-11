@@ -4,7 +4,9 @@
 
 Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. Immutable `v0.3.1` source `1458db42a1449a25b664584d144d0a97086f8f6f`의 root wheel/sdist는 PyPI와 GitHub Release에 게시됐고 별도 Hub API/worker image도 같은 revision의 Linux amd64 digest로 게시됐다. Hub Python wheel은 root release 산출물이 아니다. Root/Hub metadata/locks/module/Kolla image tag는 0.3.1로 일치하지만 운영 배포나 native KVM qualification을 뜻하지 않는다. Kolla source-build 기본 ref는 기존 검토된 Hub 0.3.0 commit `c4887f7806608e98f215abbd377d2eafe159ff76`이므로 source-mode에는 별도 검토한 release SHA를, image-mode에는 [`docs/install.md`](docs/install.md)의 정확한 API/worker digest를 pin해야 한다. 운영 cutover는 승인된 requester-project service-grade 할당·auth/storage/recovery 검토 전까지 보류됐다.
 
-The paragraph above records the published 0.3.1 snapshot. Current root/Hub metadata, locks, modules and packaged Kolla image tag prepare the explicitly approved compatible 0.3.2 repair. It removes effective expansion only from the separate direct system-admin assignment lookup; endpoint/schema, ordinary owner membership and service capability graphs are unchanged. Publication and production-reader acceptance remain distinct gates.
+The paragraph above records the published 0.3.1 snapshot. The separately published 0.3.2 repair removed effective expansion only from the direct system-admin assignment lookup; endpoint/schema, ordinary owner membership and service capability graphs were unchanged. The current unpublished 0.3.3 preparation below preserves that repair. Publication and production-reader acceptance remain distinct gates.
+
+The isolated 0.3.3 management candidate is based on current dev `a428d3fdb7c4d6243833ab189fd187b03710ada3`, not the older shared working tree. `GET /v1/me` retains the presented token's user/project/roles and returns freshly checked legacy inventory/download/upload/build/delete capabilities with `Cache-Control: no-store`; system-admin authority never implies publication. Image/layer search applies visibility and validated metadata predicates before newest-ID ordering and bounded offset pagination. Only inventory-authorized publication can take an existing-digest descriptor shortcut; publish-only callers use a normal session with server byte/digest/metadata validation and no descriptor disclosure. The same-origin console keeps legacy Keystone tokens and native package keys in separate memory-only state, rejects a native key in the legacy token field before any identity request, and releases a missing upload session without retrying publication or assuming finalization did not commit. Native package authorization, export Trust UTC/generation fencing, database schemas, native binaries and CI policy remain the current-dev contracts. Formal publication and Kolla cutover require separate exact-ref/resource approvals.
 
 Multi-host Kolla deployments prepare each host's local Hub volume with its reviewed API image before starting API/worker containers; only the database bootstrap is delegated to the first host.
 
@@ -1168,9 +1170,9 @@ Release completion repair — 2026-10-08: root publisher succeeded with intentio
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "502d3479cffb924d8cf6d7f020b430c96ebb217f8481ee8d81c55b595710489c",
-  "reviewed_at": "2026-10-09T09:58:13Z",
-  "summary": "2026-10-09 native Hub system-admin authority repair: removed effective=True from _is_system_admin, added installed-SDK HTTP regression for recognition and immediate revocation, synchronized root and Hub 0.3.2 release metadata and Kolla defaults, and verified registered-app HTTP smoke."
+  "source_sha256": "a8d16f3f592b263ba620c161f68c3d5767eccd7ddd3de6f1030f59aafe6da107",
+  "reviewed_at": "2026-10-11T08:33:52Z",
+  "summary": "Reviewed isolated 0.3.3 management delta on a428d3f and distinct-publisher ownership regression; original-token capability projection, bounded visible inventory, separate credential domains, consumable publish-only repeats and terminal-session handling; preserved auth/Trust/native/CI boundaries; planned portable gates and byte-bound canonical runtime/browser proofs passed. Unpublished; no production cutover authorization."
 }
 ```
 <!-- architecture-review:end -->

@@ -1654,3 +1654,296 @@ async def test_legacy_upload_remains_private_to_its_original_member(tmp_path: Pa
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()
+
+
+def test_app_assets_http_allowlist_includes_package_console_without_arbitrary_files(tmp_path, monkeypatch):
+    from palimpsest_hub import main as hub_main
+
+    for asset in ("hub.js", "hub.css", "hub-packages.js", "private.js"):
+        (tmp_path / asset).write_text("fixture asset", encoding="utf-8")
+    monkeypatch.setattr(hub_main, "_APP_FILES", tmp_path)
+    client = TestClient(app)
+    for asset in ("hub.js", "hub.css", "hub-packages.js"):
+        response = client.get("/app/" + asset)
+        assert response.status_code == 200 and response.text == "fixture asset"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert "default-src 'none'" in response.headers["content-security-policy"]
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert client.get("/app/private.js").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
+    from palimpsest_hub import auth
+
+    identity = {
+        "user_id": "member",
+        "project_id": "alpha",
+        "project_name": "Alpha",
+        "roles": ["member"],
+        "is_system_admin": False,
+        "token": "identity-secret",
+        "auth_ref": "private-auth-reference",
+    }
+    monkeypatch.setattr(auth, "validate_token", lambda token, project: identity)
+    state = {"status": 200}
+
+    async def current_member(token_info):
+        if state["status"] != 200:
+            raise HTTPException(status_code=state["status"], detail="Current authority unavailable")
+        return {**token_info, "package_capabilities": frozenset({"palimpsest-inventory_reader"})}
+
+    monkeypatch.setattr(hub_api, "get_package_member_info", current_member)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+        missing = await client.get("/v1/me")
+        assert missing.status_code == 401 and missing.headers["cache-control"] == "no-store"
+        headers = {"X-Auth-Token": "identity-secret"}
+        success = await client.get("/v1/me", headers=headers)
+        assert success.status_code == 200 and success.headers["cache-control"] == "no-store"
+        assert "identity-secret" not in success.text and "private-auth-reference" not in success.text
+        assert success.json() == {
+            "user_id": "member",
+            "project_id": "alpha",
+            "project_name": "Alpha",
+            "roles": ["member"],
+            "is_system_admin": False,
+            "capabilities": {"inventory": True, "download": False, "upload": False, "delete": False, "build": False},
+        }
+        state["status"] = 403
+        denied = await client.get("/v1/me", headers=headers)
+        assert denied.status_code == 200 and denied.headers["cache-control"] == "no-store"
+        assert not any(denied.json()["capabilities"].values())
+        state["status"] = 503
+        unavailable = await client.get("/v1/me", headers=headers)
+        assert unavailable.status_code == 503 and unavailable.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("system_admin", "leaves", "expected"),
+    [
+        (
+            False,
+            {"palimpsest-publish_editor"},
+            {"inventory": False, "download": False, "upload": True, "delete": False, "build": False},
+        ),
+        (
+            False,
+            {"palimpsest-download_user"},
+            {"inventory": False, "download": True, "upload": False, "delete": False, "build": False},
+        ),
+        (False, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
+        (True, set(), {"inventory": True, "download": True, "upload": False, "delete": True, "build": True}),
+    ],
+)
+async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_admin, leaves, expected):
+    calls = []
+
+    async def current_member(token_info):
+        calls.append(token_info)
+        return {**token_info, "package_capabilities": frozenset(leaves)}
+
+    monkeypatch.setattr(hub_api, "get_package_member_info", current_member)
+    identity = {"user_id": "member", "project_id": "alpha", "roles": ["admin"], "is_system_admin": system_admin}
+    context = await hub_api.get_hub_identity(identity)
+    assert context["capabilities"] == expected
+    assert len(calls) == (0 if system_admin else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/images", "/v1/layers"])
+async def test_management_pagination_filters_before_offset_and_preserves_visibility(tmp_path, store, monkeypatch, path):
+    engine, factory = await _prepared_hub(tmp_path, "management.sqlite", store, monkeypatch)
+    descriptors = [
+        ("owner", {}),
+        ("granted", {"project_id": "beta"}),
+        ("public", {"project_id": "beta", "is_published": True}),
+        ("hidden", {"project_id": "beta"}),
+        ("other-arch", {"arch": "aarch64"}),
+        ("other-format", {"disk_format": "raw"}),
+        ("other-base", {"ubuntu_base": "ubuntu-22.04"}),
+        ("other-variant", {"os_variant": "server"}),
+        ("generic-layer", {"kind": "squashfs", "disk_format": None, "media_type": MEDIA_TYPE_LAYER_SQUASHFS}),
+    ]
+    async with factory() as session:
+        for index, (name, changes) in enumerate(descriptors, start=1):
+            values = {
+                "id": index,
+                "blob_digest": _sha256(name.encode()),
+                "size_bytes": 1,
+                "config_digest": _sha256(("config-" + name).encode()),
+                "config_json": {},
+                "name": name,
+                "kind": "cloud-image",
+                "media_type": MEDIA_TYPE_IMAGE_QCOW2,
+                "project_id": "alpha",
+                "created_by": "owner",
+                "is_published": False,
+                "arch": "x86_64",
+                "disk_format": "qcow2",
+                "ubuntu_base": "ubuntu-24.04",
+                "os_variant": "minimal",
+            }
+            session.add(PalimpsestHubLayer(**(values | changes)))
+        session.add(PalimpsestHubLayerAccess(blob_digest=_sha256(b"granted"), project_id="alpha"))
+        await session.commit()
+
+    async def identity():
+        return {"project_id": "alpha", "user_id": "owner", "is_system_admin": False}
+
+    app.dependency_overrides[hub_api._legacy_inventory] = identity
+    filters = {"arch": "x86_64", "disk_format": "qcow2", "ubuntu_base": "ubuntu-24.04", "os_variant": "minimal"}
+    expected = ["public", "granted", "owner"]
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+            unfiltered = await client.get(path)
+            assert unfiltered.status_code == 200, unfiltered.text
+            names = [row["name"] for row in unfiltered.json()]
+            assert "hidden" not in names
+            assert ("generic-layer" in names) == (path == "/v1/layers")
+            for key, excluded in (
+                ("arch", "other-arch"),
+                ("disk_format", "other-format"),
+                ("ubuntu_base", "other-base"),
+                ("os_variant", "other-variant"),
+            ):
+                filtered = await client.get(path, params={key: filters[key]})
+                assert filtered.status_code == 200, filtered.text
+                names = [row["name"] for row in filtered.json()]
+                assert excluded not in names and "hidden" not in names
+                assert set(expected) <= set(names)
+            all_rows = await client.get(path, params=filters | {"limit": 200, "offset": 0})
+            assert all_rows.status_code == 200, all_rows.text
+            assert [row["name"] for row in all_rows.json()] == expected
+            first = await client.get(path, params=filters | {"limit": 1})
+            assert [row["name"] for row in first.json()] == expected[:1]
+            second = await client.get(path, params=filters | {"limit": 2, "offset": 1})
+            assert [row["name"] for row in second.json()] == expected[1:3]
+            repeated = await client.get(path, params=filters | {"limit": 2, "offset": 1})
+            assert repeated.json() == second.json()
+            empty = await client.get(path, params=filters | {"offset": len(expected)})
+            assert empty.status_code == 200 and empty.json() == []
+            for row in all_rows.json():
+                if row["name"] in {"public", "granted"}:
+                    assert row["project_id"] is None and row["created_by"] is None
+            if path == "/v1/layers":
+                named = await client.get(path, params=filters | {"name": "owner", "kind": "cloud-image"})
+                assert [row["name"] for row in named.json()] == ["owner"]
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("path", ["/v1/images", "/v1/layers"])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"limit": 0},
+        {"limit": 201},
+        {"offset": -1},
+        {"offset": "1.5"},
+        {"arch": "armv7"},
+        {"disk_format": "unknown"},
+        {"ubuntu_base": "../ubuntu"},
+        {"os_variant": "../private"},
+    ],
+)
+def test_management_rejects_invalid_pagination_and_metadata_before_query(monkeypatch, path, params):
+    async def identity():
+        return {"project_id": "alpha", "user_id": "owner"}
+
+    def no_query():
+        pytest.fail("invalid management query reached the database")
+
+    monkeypatch.setattr(hub_api, "get_session_factory", no_query)
+    app.dependency_overrides[hub_api._legacy_inventory] = identity
+    try:
+        assert TestClient(app).get(path, params=params).status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inventory", [False, True])
+async def test_declared_digest_shortcut_requires_inventory_and_write_only_repeat_validates_descriptor(
+    tmp_path, store, monkeypatch, inventory
+):
+    engine, factory = await _prepared_hub(tmp_path, "declared-digest.sqlite", store, monkeypatch)
+    payload = b"registered upload bytes"
+    digest = _put_blob(store, payload)
+    async with factory() as session:
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=digest,
+                size_bytes=len(payload),
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                config_digest=_sha256(b"upload config"),
+                config_json={"name": "private-descriptor"},
+                name="private-descriptor",
+                kind="squashfs",
+                project_id="alpha",
+                created_by="owner",
+                is_published=False,
+            )
+        )
+        await session.commit()
+
+    async def writer():
+        capabilities = {"palimpsest-publish_editor"}
+        if inventory:
+            capabilities.add("palimpsest-inventory_reader")
+        return {"project_id": "alpha", "user_id": "publisher", "package_capabilities": frozenset(capabilities)}
+
+    app.dependency_overrides[hub_api._legacy_writer] = writer
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
+            response = await client.post("/v1/uploads", json={"digest": digest})
+            assert response.status_code == 200, response.text
+            result = response.json()
+            if inventory:
+                assert result["completed"] is True and result["registered"] is True
+                assert result["already_present"] is True and result["session_id"] is None
+                assert result["blob_digest"] == digest
+                assert result["registration"]["name"] == "private-descriptor"
+                assert result["registration"]["project_id"] == "alpha"
+            else:
+                assert result["completed"] is False
+                assert result.get("registration") is None
+                assert "private-descriptor" not in response.text
+                session_path = "/v1/uploads/" + result["session_id"]
+                appended = await client.patch(session_path, content=payload, headers={"Upload-Offset": "0"})
+                assert appended.status_code == 200, appended.text
+                completed = await client.put(
+                    session_path,
+                    json={"name": "private-descriptor", "kind": "squashfs"},
+                    headers={"Upload-Offset": str(len(payload))},
+                )
+                assert completed.status_code == 200, completed.text
+                assert completed.json()["blob_digest"] == digest
+                assert completed.json()["size_bytes"] == len(payload)
+                assert completed.json()["already_present"] is True
+                assert "private-descriptor" not in completed.text and completed.json().get("registration") is None
+                assert (await client.get(session_path)).status_code == 404
+
+                conflicting = await client.post("/v1/uploads", json={"digest": digest})
+                conflict_path = "/v1/uploads/" + conflicting.json()["session_id"]
+                assert (
+                    await client.patch(conflict_path, content=payload, headers={"Upload-Offset": "0"})
+                ).status_code == 200
+                refused = await client.put(
+                    conflict_path,
+                    json={"name": "different-descriptor", "kind": "squashfs"},
+                    headers={"Upload-Offset": str(len(payload))},
+                )
+                assert refused.status_code == 409
+                assert "private-descriptor" not in refused.text
+                assert (await client.delete(conflict_path)).status_code == 204
+        async with factory() as session:
+            row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
+            assert row.name == "private-descriptor" and row.project_id == "alpha" and row.created_by == "owner"
+            assert (await session.scalars(select(PalimpsestHubUpload))).all() == []
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()

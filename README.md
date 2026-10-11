@@ -162,7 +162,9 @@ and [exact deployment pins and prerequisites](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
-Palimpsest Hub runs as a standalone FastAPI service on port 8020 using OpenStack Keystone token authentication (`X-Auth-Token` and optional `X-Project-Id`). Open `/app` for its same-origin web console: use a project-scoped token to upload, search, and download artifacts; server-side Palimpsestfile builds additionally require a Keystone system administrator.
+Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using the original OpenStack project-scoped token (`X-Auth-Token` and optional `X-Project-Id` assertion, never re-scoping). Its same-origin `/app` console reads exact identity and fresh independent inventory/download/upload/build/delete permissions from `GET /v1/me`; credentials and transfer state remain in tab memory, not browser storage. Upload requires current publish authority, metadata browsing requires inventory authority, and downloading requires download authority. A verified system administrator can build/delete legacy artifacts but cannot use member upload or native package controls.
+
+The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Native package browsing/publication is a separate console credential domain: original member tokens handle member controls, while `ppk_v1_…` package keys handle native writes. Neither credential is substituted for the other; connection changes cancel tab-controlled work without automatic re-publication.
 
 Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, and now has separate project-scoped package and BuildKit-cache APIs. Native package keys authorize those package/cache operations; legacy artifact commands still use the original Keystone token. `POST /v1/builds` queues an isolated VM build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. A separate Linux KVM host worker consumes jobs and registers successful outputs as private layers. The API container does not execute recipes. Hub is not a Docker/OCI `/v2` registry: profiles explicitly select native `palimpsest` or Docker/OCI `oci` transport.
 
@@ -604,13 +606,16 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 ## Development
 
-The isolated full-source tree was published as **0.3.1** at immutable
-`1458db42a1449a25b664584d144d0a97086f8f6f`. Root/Hub gates, exact-commit CI,
-published-image HTTP/SQL/Redis/worker smoke and package hashes are recorded in
+The historical **0.3.1** publication and runtime receipts at immutable
+`1458db42a1449a25b664584d144d0a97086f8f6f` remain in
 [publication and runtime evidence](docs/testing.md#published-031-verification).
-Production rollout remains held under the [Kolla/storage/credential prerequisites](docs/install.md)
-and separately reviewed requester-project service grades. Native CI remains
-explicitly disabled: `false/skipped` is **not native qualification**.
+Published **0.3.2** is at `1f120392c1b15b182330ab6a2d740bfe218aa990`;
+the 2026-10-11 handoff records the inspected single-host running image pins.
+The **0.3.3 management candidate is unpublished** and starts from upstream dev
+`a428d3fdb7c4d6243833ab189fd187b03710ada3`, preserving later identity/Trust fixes.
+Publication, operator installation and controller1 Kolla rollout require exact
+scoped approval and [storage/credential prerequisites](docs/install.md).
+Native CI remains explicitly disabled: `false/skipped` is **not native qualification**.
 
 
 ### Resume ongoing development

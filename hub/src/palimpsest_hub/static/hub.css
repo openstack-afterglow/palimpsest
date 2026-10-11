@@ -154,3 +154,25 @@ footer {
   button { transition: background .15s ease; transform: translateZ(0); }
   button:active { transform: scale(.98); }
 }
+[hidden] { display: none !important; }
+.identity p, [role="status"] { overflow-wrap: anywhere; line-height: 1.6; font-size: 13px; }
+.auth form { min-width: 0; }
+.auth form > label { margin-bottom: 14px; }
+.actions, .row-actions { flex-wrap: wrap; }
+.row-actions { display: flex; gap: 8px; flex-shrink: 0; max-width: 260px; }
+button.danger { background: #fff; border-color: #dab6b4; color: #8f302e; }
+button.danger:hover { background: #fff1ef; }
+.descriptor { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.6; padding: 14px; background: #f5f7f4; border: 1px solid #e5eae3; }
+.check { flex-direction: row !important; align-items: center; gap: 10px; }
+.check input { width: auto; }
+.native-section { margin-top: 32px; border-top: 1px solid #eaeaea; padding-top: 24px; }
+.native-section h3 { margin: 0 0 18px; }
+.secret-once { white-space: pre-wrap; overflow-wrap: anywhere; background: #fbf3db; padding: 16px; border: 1px solid #e4d5a8; }
+:focus-visible { outline: 2px solid #56725b; outline-offset: 3px; }
+@media (max-width: 720px) {
+  .actions { align-items: flex-start; }
+  .row-actions { max-width: none; }
+  .toolbar label { min-width: 0; }
+}
+.toolbar { flex-wrap: wrap; }
+.toolbar label { flex: 1 1 180px; }

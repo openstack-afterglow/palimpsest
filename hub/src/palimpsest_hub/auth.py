@@ -224,10 +224,11 @@ def _is_system_admin(user_id: str) -> bool:
         assignments = _get_reader_ks_client().role_assignments.list(user=user_id, system="all", include_names=True)
         for assignment in assignments:
             scope = _value(assignment, "scope")
+            system_scope = scope.get("system") if isinstance(scope, dict) else None
             if (
                 _assignment_user(assignment) == user_id
-                and isinstance(scope, dict)
-                and scope.get("system", {}).get("all") is True
+                and isinstance(system_scope, dict)
+                and system_scope.get("all") is True
                 and _assignment_role(assignment) == "admin"
             ):
                 return True

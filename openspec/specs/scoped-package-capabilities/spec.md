@@ -65,3 +65,45 @@ Regression cases SHALL exercise actual native FastAPI HTTP routes and a syntheti
 - **AND** current-owner downgrade revokes issued keys and export tickets while retained inventory remains available; verified-system-only builder/GC gates remain separate
 - **AND** the report distinguishes the smoke-only SQLite factory/lifespan-off setup from canonical MySQL bootstrap/deployment and records the observed SQLite connect_timeout incompatibility without claiming real cloud/KVM execution.
 
+### Requirement: Original-token console capability projection
+
+Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity and roles, with no token/password/auth-reference fields and `Cache-Control: no-store` on success and errors. Its independent inventory/download/upload capabilities SHALL be computed from fresh current service leaves. Verified system administrators SHALL retain legacy inventory/download/build/delete authority without gaining upload or native member controls; membership denial SHALL expose no member capabilities, and identity outages SHALL remain failures.
+
+#### Scenario: Retained token loses membership
+
+- **WHEN** current member assignments are revoked while the original subject token remains valid
+- **THEN** the identity and original roles remain unchanged but member capability flags are false on the next `/v1/me` request.
+
+#### Scenario: Publish-only repeat upload
+
+- **WHEN** a publish-only caller starts an upload for an already registered visible digest
+- **THEN** the server creates a normal upload session, verifies the submitted bytes and metadata at finalization, and does not return an inventory descriptor; only an inventory-authorized caller can take the verified-descriptor completion shortcut.
+
+### Requirement: Same-origin console credential isolation
+
+The Hub console SHALL keep original Keystone tokens and native package keys in separate memory-only connection domains and SHALL use each only for its existing endpoint authority. Connection changes SHALL cancel tab-controlled transfers without automatically retrying publication or deleting server state. Download saving SHALL verify descriptor size and SHA-256 before committing bytes.
+
+#### Scenario: Native key is not legacy authority
+
+- **WHEN** a native package key is connected for native browsing or publication
+- **THEN** it is never sent to legacy image/layer or original-member control endpoints, and disconnect or reload discards tab-held credentials and issued secrets.
+
+#### Scenario: Native key pasted into the legacy connection
+
+- **WHEN** a `ppk_v1_` native key is submitted in the legacy Keystone token field
+- **THEN** the console clears the submitted secret and rejects it before assigning legacy credentials or sending an identity request.
+
+#### Scenario: Server upload session disappears
+
+- **WHEN** status, resume or abort returns HTTP 404 for the active legacy upload session
+- **THEN** the console releases the local file/metadata controls and reports that the session is unavailable and finalization may already have committed, without automatically retrying publication.
+
+### Requirement: Visible filtered management pages
+
+Layer/image inventory SHALL apply visibility and supported metadata predicates before nonnegative offset and limit 1–200, ordered by descending unique row ID. Layer inventory SHALL support architecture, OS variant, disk format and Ubuntu base predicates in addition to existing digest/name/type fields; image inventory SHALL remain cloud-image-only.
+
+#### Scenario: Filtered offset excludes unrelated private rows
+
+- **WHEN** a caller advances a filtered page past its first matching row
+- **THEN** unrelated metadata rows and unauthorized private rows do not consume offset, and visible rows retain their existing ownership redaction.
+
