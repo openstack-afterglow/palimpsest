@@ -24,28 +24,42 @@
   no_log: true
 
 - name: Keystone | Register dedicated read-only token validator
-  openstack.cloud.identity_user:
-    auth: "{{ openstack_auth }}"
-    name: "{{ palimpsest_reader_user }}"
-    password: "{{ palimpsest_reader_password }}"
-    domain: "{{ palimpsest_reader_user_domain_name }}"
-    enabled: true
-    update_password: always
-    state: present
-    interface: "{{ openstack_interface | default('internal') }}"
-    validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: openstack.cloud.identity_user
+    module_args:
+      auth: "{{ openstack_auth }}"
+      name: "{{ palimpsest_reader_user }}"
+      password: "{{ palimpsest_reader_password }}"
+      domain: "{{ palimpsest_reader_user_domain_name }}"
+      enabled: true
+      update_password: always
+      state: present
+      interface: "{{ openstack_interface | default('internal') }}"
+      region_name: "{{ openstack_region_name }}"
+      cacert: "{{ openstack_cacert | default(omit, true) }}"
+      validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  become: true
   register: palimpsest_reader_identity
   no_log: true
   run_once: true
+  delegate_to: "{{ groups['palimpsest'][0] }}"
 
 - name: Keystone | Assign validator system reader role only
-  openstack.cloud.role_assignment:
-    auth: "{{ openstack_auth }}"
-    user: "{{ palimpsest_reader_identity.user.id }}"
-    role: reader
-    system: all
-    state: present
-    interface: "{{ openstack_interface | default('internal') }}"
-    validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  kolla_toolbox:
+    container_engine: "{{ kolla_container_engine }}"
+    module_name: openstack.cloud.role_assignment
+    module_args:
+      auth: "{{ openstack_auth }}"
+      user: "{{ palimpsest_reader_identity.user.id }}"
+      role: reader
+      system: all
+      state: present
+      interface: "{{ openstack_interface | default('internal') }}"
+      region_name: "{{ openstack_region_name }}"
+      cacert: "{{ openstack_cacert | default(omit, true) }}"
+      validate_certs: "{{ not (openstack_insecure | default(false) | bool) }}"
+  become: true
   no_log: true
   run_once: true
+  delegate_to: "{{ groups['palimpsest'][0] }}"

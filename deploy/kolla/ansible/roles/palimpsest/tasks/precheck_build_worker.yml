@@ -1,0 +1,74 @@
+---
+- name: Precheck | Require remote build admission key
+  ansible.builtin.assert:
+    that:
+      - palimpsest_build_worker_key is string
+      - palimpsest_build_worker_key | length >= 32
+      - palimpsest_build_worker_key | trim == palimpsest_build_worker_key
+      - palimpsest_build_worker_key is not search('[\r\n]')
+    fail_msg: "Remote builds require a private shared worker key of at least 32 characters"
+    quiet: true
+  no_log: true
+
+- name: Precheck | Validate verified HTTPS worker origin
+  ansible.builtin.assert:
+    that:
+      - palimpsest_build_worker_hub_origin is string
+      - (palimpsest_build_worker_hub_origin | urlsplit('scheme')) == 'https'
+      - (palimpsest_build_worker_hub_origin | urlsplit('hostname') | default('', true)) | length > 0
+      - (palimpsest_build_worker_hub_origin | urlsplit('username')) is none
+      - (palimpsest_build_worker_hub_origin | urlsplit('password')) is none
+      - (palimpsest_build_worker_hub_origin | urlsplit('path')) in ['', '/']
+      - (palimpsest_build_worker_hub_origin | urlsplit('query')) == ''
+      - (palimpsest_build_worker_hub_origin | urlsplit('fragment')) == ''
+      - (palimpsest_build_worker_hub_origin | urlsplit('port')) is none or (1 <= (palimpsest_build_worker_hub_origin | urlsplit('port')) <= 65535)
+      - "'?' not in palimpsest_build_worker_hub_origin and '#' not in palimpsest_build_worker_hub_origin"
+      - palimpsest_build_worker_hub_origin is not search('[\\s\\\\]')
+    fail_msg: "Remote worker Hub URL must be a verified HTTPS origin without credentials, query, fragment or non-root path"
+    quiet: true
+
+- name: Precheck | Validate finite remote build resources and paths
+  ansible.builtin.assert:
+    that:
+      - palimpsest_build_worker_timeout_seconds | string is match('^[0-9]+$')
+      - 60 <= (palimpsest_build_worker_timeout_seconds | int) <= 3600
+      - palimpsest_build_worker_max_blob_bytes | string is match('^[0-9]+$')
+      - palimpsest_build_worker_max_blob_bytes | int > 0
+      - palimpsest_build_worker_cpus | string is match('^[0-9]+(?:\.[0-9]+)?$')
+      - 0 < (palimpsest_build_worker_cpus | float) <= 2
+      - palimpsest_build_worker_memory is match('^[1-6]g$')
+      - palimpsest_build_worker_pids_limit | string is match('^[0-9]+$')
+      - 1 <= (palimpsest_build_worker_pids_limit | int) <= 512
+      - palimpsest_build_worker_key_path is match('^/[^:\s]+$')
+      - palimpsest_build_worker_key_path is not search('(^|/)\.{1,2}(/|$)')
+      - (palimpsest_build_worker_key_path | dirname) == palimpsest_config_dir
+      - palimpsest_build_worker_container_key_path is match('^/[^:\s]+$')
+      - palimpsest_build_worker_scratch_path is match('^/[^:\s]+$')
+      - palimpsest_build_worker_scratch_path is not search('(^|/)\.{1,2}(/|$)')
+      - palimpsest_build_worker_container_key_path is not search('(^|/)\.{1,2}(/|$)')
+      - palimpsest_build_worker_container_key_path != palimpsest_build_worker_scratch_path
+      - not palimpsest_build_worker_container_key_path.startswith(palimpsest_build_worker_scratch_path.rstrip('/') ~ '/')
+      - palimpsest_build_worker_scratch_volume is match('^[A-Za-z0-9][A-Za-z0-9_.-]+$')
+      - palimpsest_build_worker_scratch_volume != palimpsest_hub_volume
+    fail_msg: "Remote worker needs private absolute paths, a dedicated scratch volume, timeout 60-3600s, positive byte limit and at most 2 CPUs/6GiB/512 PIDs"
+    quiet: true
+
+- name: Precheck | Validate worker hostname pins
+  ansible.builtin.assert:
+    that:
+      - palimpsest_build_worker_etc_hosts is mapping
+    fail_msg: "palimpsest_build_worker_etc_hosts must map hostnames to IP addresses"
+    quiet: true
+
+- name: Precheck | Validate each worker hostname pin
+  ansible.builtin.assert:
+    that:
+      - item.key is string
+      - item.key is match('^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$')
+      - item.value is string
+      - item.value is match('^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$') or (item.value is match('^[0-9a-f:]+$') and ':' in item.value)
+    fail_msg: "Worker hostname pins require lower-case DNS names and literal IPv4/IPv6 addresses"
+    quiet: true
+  loop: "{{ palimpsest_build_worker_etc_hosts | dict2items if palimpsest_build_worker_etc_hosts is mapping else [] }}"
+  loop_control:
+    label: "{{ item.key }}"

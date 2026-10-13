@@ -1,16 +1,17 @@
 ---
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
 - name: Include Palimpsest image precheck tasks
   ansible.builtin.include_tasks: image_precheck.yml
+  when: palimpsest_local_services | length > 0
 
-- name: Pull | Pull Palimpsest images
+- name: Pull | Pull enabled local Palimpsest images
   become: true
   community.docker.docker_image:
-    name: "{{ item.value.image }}"
+    name: "{{ lookup('vars', item.value.image_var) }}"
     source: pull
     force_source: true
   no_log: true
-  loop: "{{ palimpsest_services | dict2items }}"
-  when:
-    - inventory_hostname in groups['palimpsest']
-    - item.value.enabled | bool
-    - not (palimpsest_source_mode | default(false) | bool)
+  loop: "{{ palimpsest_local_services | dict2items }}"
+  when: not (palimpsest_source_mode | bool)

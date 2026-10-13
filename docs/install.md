@@ -6,32 +6,53 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 It does not use a repository checkout as the user installation mechanism.
 
 Palimpsest Local requires Python 3.11 or newer. The root distribution
-[`palimpsest-client 0.3.1`](https://pypi.org/project/palimpsest-client/0.3.1/)
-is published on PyPI. The independently versioned Hub distribution is
-`palimpsest-hub 0.3.1` in this tree; this source version is not a PyPI release.
-Git and outbound HTTPS access to GitHub
-are required only for the direct VCS installation examples below.
+[`palimpsest-client 0.3.3`](https://pypi.org/project/palimpsest-client/0.3.3/)
+is published on PyPI with [GitHub Release `v0.3.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.3).
+The independent Hub distribution and root/Hub metadata, modules, locks and
+Kolla image tag in this tree are the **unpublished 0.3.4 candidate**.
+Git and outbound HTTPS access to GitHub are required only for direct VCS
+installation. Install the published CLI with
+`python3.12 -m pip install "palimpsest-client==0.3.3"`; package installation
+alone does not update running Hub services or qualify native execution.
 
-Install the published CLI with `python3.12 -m pip install "palimpsest-client==0.3.1"`,
-then run `palimpsest --version`. The isolated invocation
-`uvx --from palimpsest-client==0.3.1 palimpsest --version` was exercised against
-PyPI and reports `0.3.1`. The formal [GitHub Release](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1)
-contains the same hash-matched wheel and sdist as the exact tag run and PyPI.
-
-**0.3.3 management candidate (not yet published):** prepare API and export-worker images from the same reviewed current-dev source, preserve the deployed immutable digest pins and the single storage-owning host, and deploy only the approved Hub scope through `/etc/kolla/multinode`. Do not publish or deploy the older uncommitted management image as a release. The authenticated `/app` console uses `GET /v1/me` for exact original-token identity and independent capabilities; native package keys remain separate and are rejected in the legacy token field before an identity request. Layer/image list requests support `offset >= 0` and `1 <= limit <= 200`, with visibility and metadata filters applied before pagination. Publish-only repeat uploads use normal byte/metadata-verified sessions without inventory descriptors; only inventory-authorized callers take the existing-digest descriptor shortcut. A missing upload session releases local controls without automatically retrying publication; unacknowledged finalization may already have committed.
+**0.3.4 source candidate (not committed, published or deployed):** based on published 0.3.3 at upstream dev `7186abf7844454eda7ed86a215192b33b9250ff8`. The 2026-10-14 owner-approved scoped iterative Hub build/upload/consume loop is branch push → protected dev PR → required checks → merge → immutable v0.3.x tag → PyPI/GitHub/GHCR → operator PyPI pin → Kolla deploy; main promotion and CI protection changes are excluded. Preserve immutable running pins and the single API/export storage-owning host. The controller serves the build API but never runs recipes; a dedicated CPU-only Nova service VM runs the remote worker. Native qualification is pending until the parent records it. The authenticated `/app` console retains original-token `/v1/me`, independent capabilities, bounded visible pagination and separate memory-only native keys. Publish-only repeat uploads still use byte/metadata-verified sessions without descriptor disclosure; missing sessions never trigger automatic re-publication or prove an unacknowledged finalization failed.
 
 The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Afterglow's effective Hub transport is already `https://palimpsest.dmslab.re.kr` and certificate-verified requests from its running backend returned HTTP 200. The dedicated Hub validator authenticated with only system `reader`. These checks concern the existing deployment, not acceptance of the candidate.
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
+
+**Observed operations, 2026-10-13/14 (not 0.3.4 acceptance):** canonical Kolla
+deployment put API/export-worker 0.3.3 on `dms-controller1`. The observed immutable live refs were:
+
+- API: `ghcr.io/openstack-afterglow/palimpsest-hub-api@sha256:cb5b32ef81f8db0380821146d50eed0f4eba9b26a4361a177fa0e1cef96ef979`
+- Export worker: `ghcr.io/openstack-afterglow/palimpsest-hub-worker@sha256:99d6193e889c92b4512dece8cf2ce1c20c4372f1d2d64db301f1931a5bdd0af3`
+
+Live token creation returned 201; `/v1/me` returned 200 with system-admin upload false under 0.3.3;
+`POST /v1/builds` returned 503 `isolated build worker is not configured`.
+Backups were empty-state logical SQL (14 tables, zero rows) and configuration
+only, not writer-fenced CAS capture or isolated restore. The approved worker VM
+`palimpsest-hub-build-worker-034` was created in `palimpsest-service` with
+`cpu.2c_8g`, Ubuntu 24.04, a 40 GiB boot volume, no floating IP and SSH limited
+to the operator. It has loop-control; verified-TLS Hub health returned 200
+through explicit reachable IPs and GHCR/PyPI egress was observed. Its service
+DNS lacks the Hub name. These are provisioning/connectivity observations, not
+a deployed worker, completed build or native qualification.
+
+### Historical 0.3.1 release and cutover record
+
+The following pins and held-rollout record describe 0.3.1, not the current
+running 0.3.3 or unpublished 0.3.4. Their backup, authority and recovery
+prerequisites remain applicable with the remote-build exceptions below.
+
 
 The Hub 0.3.1 package registry and retained closed-transport pool recovery are
 separate service code; update both reviewed Kolla API and worker image digests
 to deploy it. A root wheel upgrade does not update running services.
 
 The immutable release source is `1458db42a1449a25b664584d144d0a97086f8f6f`.
-Root/Hub/locks/modules/Kolla image tag are synchronized at **0.3.1**. Published
-API/worker revisions match this source, and `0.3.1`, `v0.3.1`, `sha-1458db4`
-and `latest` resolve to the same respective indexes:
+At that release, root/Hub/locks/modules/Kolla image tag were synchronized at
+**0.3.1**. Published API/worker revisions matched that source; the observed
+`0.3.1`, `v0.3.1`, `sha-1458db4` and `latest` tags resolved to these indexes:
 
 - API: `ghcr.io/openstack-afterglow/palimpsest-hub-api@sha256:4ee1a42d14f4b0193877d1cd7d4f55187a987628097ec424eda2b0b7812d929a`
 - Worker: `ghcr.io/openstack-afterglow/palimpsest-hub-worker@sha256:4564a89553132366f38fd23be2ee101262a4f99a9962afdae37a0975511814a6`
@@ -43,7 +64,7 @@ an arm64 release manifest. Runtime smoke executed the published amd64 digests
 under cross-architecture Docker Desktop on arm64, not on a native amd64/KVM host.
 See [qualification boundaries](testing.md#published-031-verification).
 
-**Production rollout is held**, not completed. Before Kolla cutover, the operator must:
+**The 0.3.1 rollout was held** in this record. For any new Kolla cutover, the operator must:
 
 1. Preserve the previous **actual** API/worker digest pins, existing private
    Kolla secret/config inputs, mounts and service identities. Both images must
@@ -67,14 +88,14 @@ See [qualification boundaries](testing.md#published-031-verification).
    layers/grants/uploads, skipping optional legacy tables only when absent.
    Review private URI handling because this legacy CLI accepts URLs on argv;
    do not put a real password in shell history or diagnostic logs.
-4. API, export worker and native build worker must use the same SQL and exact
-   absolute store path with a coherent shared filesystem/locking view. Default
-   Docker named volumes are host-local: multi-host API/export placements do
-   **not** become shared CAS merely because their SQL/volume names match.
-   Supply reviewed shared storage or select one storage-owning placement before
-   routing traffic. Preserve numeric owners/modes; bootstrap changes only each
-   volume root, not recursive blobs. Plan capacity for temporary double-sized
-   finalization, bundle expansion and private worker scratch.
+4. API and export worker must use the same SQL and exact absolute store path
+   with a coherent filesystem/locking view. Default Docker named volumes are
+   host-local: multi-host API/export placements do **not** become shared CAS
+   merely because their SQL/volume names match. Supply reviewed shared storage
+   or select one storage-owning placement. The 0.3.4 remote build worker instead
+   uses HTTPS and private local scratch, never shared SQL/CAS/NFS. Preserve
+   numeric owners/modes and allow for temporary double-sized finalization,
+   bundle expansion and bounded worker scratch.
 5. Supply trustee service-project credentials, the separate system-reader-only
    validator, nonempty exact protected user/project ID sets, current role graph,
    immutable namespace bindings and the trusted package HTTPS origin. Confirm
@@ -84,10 +105,11 @@ See [qualification boundaries](testing.md#published-031-verification).
    Pre-cutover undelegated queued exports fail `delegation_required`; requesters
    resubmit them. Existing manual tenant grants require a separate owner decision.
 6. Align the separately owned Afterglow Kolla overlay and package-key gateway,
-   then use its normal precheck/reconfigure path. Keep API/export worker versions
-   together; the Kolla role does not deploy the native build worker. Verify real
-   SQL/Redis/auth/CLI bytes, worker cleanup, restart persistence and restored
-   reads/writes before reopening ingress. Health 200 proves only liveness.
+   then use its normal precheck/reconfigure path for API/export. The 0.3.4
+   remote worker uses the separate Palimpsest-owned playbook below; the deployed
+   Afterglow aggregate does not target its inventory group. Verify real
+   SQL/Redis/auth/CLI bytes, cleanup, restart persistence and restored reads/
+   writes before reopening ingress. Health 200 proves only liveness.
 
 ### Service-role provisioning prerequisite before reopening ingress
 
@@ -99,13 +121,14 @@ existing export consumers (including Afterglow requesters) return 403. The
 Palimpsest Kolla role registers the trustee and system reader only: it does
 **not** create these service roles, inference rules or requester grants.
 
-During this release's approved preset-only preparation, global roles and their
-implication edges were created and verified, but no user/project assignments
-were made. Read-only inventory found 106 ordinary user/project memberships
-without service-grade assignments across 43 users/41 projects (104 enabled).
-These rows describe cutover risk, not 106 exercised denied requests. Review
-the intended service grade for each requester before reopening ingress; never
-promote every `member` or grant tenant admin automatically.
+The 0.3.1 preset-only preparation created global roles and inference edges
+without requester assignments; its read-only inventory found 106 ordinary
+memberships without service grades across 43 users/41 projects (104 enabled).
+This is historical cutover risk, not 106 exercised denied requests. On
+2026-10-13/14 an approved grant of three Palimpsest leaves to `test` in project
+`test` returned 204 for each; the owner later added Palimpsest roles to
+`pieroot`/`test` themselves. These observations do not authorize blanket grants
+or prove the 0.3.4 upload policy live. Review each requester's intended grade.
 
 Before reopening ingress, the IAM/operator owner must explicitly approve and
 provision unique **global** roles with these exact names, then verify their
@@ -332,24 +355,158 @@ python3.12 -m venv "$HOME/.venvs/palimpsest-hub"
 Do not start `palimpsest-hub` merely as an installation check: it starts the
 service and requires its database, Redis, blob path, and OpenStack settings.
 
-For server-side builds only, provision a **separate Linux KVM host**. Install
-`palimpsest-client[kvm]` at the same reviewed ref in its own administrator-owned
-interpreter; install `palimpsest-hub` on the worker host as well. Point
-`PALIMPSEST_HUB_BUILDER_PYTHON` at that absolute Local interpreter, not at the
-Hub API container. The worker also needs readable/writable `/dev/kvm`,
-`qemu:///system` access, QEMU, firmware, `cloud-localds`, SquashFS tools, and
-the normal conventional cloud-image build dependencies. Do not expose a Docker
-socket or run the build worker in the unprivileged Hub API container. Host
-permissions, external services, and an actual guest boot remain separate
-deployment prerequisites; package installation does not establish them.
+For server-side builds, use the dedicated CPU-only service VM described below,
+not a controller, API container or nested KVM host. The canonical worker image
+installs the exact same-source root wheel in the Hub venv with `qemu-utils`,
+`bubblewrap`, `squashfs-tools`, `util-linux`, `mount` and `e2fsprogs`; it needs no
+Local `[kvm]` extra or libvirt. API/export still need SQL/Redis/Keystone, and
+export needs the reader/protected-ID settings. None of those credentials or
+the Hub CAS path is passed to the build VM. There is no schema migration.
 
-The API/export worker still need the Hub Redis and Keystone settings. The export
-worker also needs the `OS_READER_*` validator and both protected-ID arrays: it
-revalidates the requester's current authority before every delegated export.
-The build worker only reads `DATABASE_URL`, the database pool settings,
-`PALIMPSEST_HUB_LOCAL_PATH`, `PALIMPSEST_HUB_MAX_BLOB_BYTES`,
-`PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS`, and
-`PALIMPSEST_HUB_BUILDER_PYTHON`; it does not require Redis or `OS_*` credentials.
+### Remote build worker deployment (0.3.4 source candidate)
+
+Provision a dedicated Linux x86_64 CPU-only Nova VM in `palimpsest-service`.
+The API admits x86_64 bases only and the executor requires the VM machine to
+match the input architecture. Do not place it on a controller or an active CI
+runner. Enable `enable_palimpsest_hub_build_worker: "yes"` only with a nonempty
+`palimpsest-build-worker` inventory group disjoint from `control`, `controller`,
+`controllers`, `compute` and `palimpsest`. API/export/bootstrap remain on
+`palimpsest` hosts; metadata-first `palimpsest_service_catalog` and host-local
+`palimpsest_local_services` prevent worker-only hosts from templating SQL,
+Redis, Keystone, reader values or `palimpsest.conf`.
+
+Set these nonsecret operator inputs in the approved Kolla configuration;
+keep `palimpsest_build_worker_key` in private `passwords.yml`/Vault, not this
+example. Use 32–4096 printable non-space ASCII characters, matching the API's
+`SecretStr` constraint. Kolla supplies it to API
+`PALIMPSEST_HUB_BUILD_WORKER_KEY` and creates the worker's root-owned 0600
+regular file `{{ palimpsest_config_dir }}/build-worker.key`, mounted read-only
+at `/run/palimpsest/build-worker.key`. The worker reads the key only from that
+file, never an environment value, and disables dumpability before reading it.
+
+```yaml
+enable_palimpsest_hub_build_worker: "yes"
+palimpsest_build_worker_hub_origin: "https://palimpsest.dmslab.re.kr"
+palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
+palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+palimpsest_build_worker_timeout_seconds: 3600
+palimpsest_build_worker_max_blob_bytes: 107374182400
+palimpsest_build_worker_cpus: 2
+palimpsest_build_worker_memory: 6g
+palimpsest_build_worker_pids_limit: 512
+palimpsest_build_worker_etc_hosts: {}
+```
+
+`palimpsest_build_worker_etc_hosts` optionally maps the exact origin hostname
+to an operator-verified reachable IP **inside the worker container only** when
+service DNS lacks it. TLS still verifies the configured origin name through
+the system CA; do not replace the origin with an IP or disable verification.
+Transport uses stdlib `http.client`, a fresh connection per request and no
+proxy, redirect or retry. The watchdog bounds header/body stalls, **not DNS or
+connection establishment**; hostname pinning addresses missing DNS but does
+not turn establishment into a hard wall-clock deadline.
+
+The service `palimpsest-hub-build-worker` runs container
+`palimpsest_hub_build_worker` as root, privileged, with bridge networking and
+`init: true` (worker is not PID 1). Its only mounts are the read-only key and
+private scratch; there is no `/dev/kvm`, Docker socket, libvirt or Hub CAS
+mount. Defaults bound it to 2 CPUs, 6g memory with equal `memory_swap`, and
+512 PIDs. Size local disk separately: the 100 GiB blob ceiling is not a disk
+quota and cannot fit on the observed 40 GiB VM boot disk. The privileged
+**service VM is the kernel isolation boundary**. Bubblewrap isolates recipe
+namespaces, not a hostile kernel; recipes remain system-admin-only.
+
+The root wheel installs the Palimpsest-owned lifecycle playbook alongside
+Kolla's `site.yml`. After operator pinning and API configuration, invoke the
+canonical worker path (replace `<venv>` with the operator Kolla environment):
+
+```sh
+kolla-ansible deploy -i /etc/kolla/multinode \
+  --playbook <venv>/share/kolla-ansible/ansible/palimpsest-build-worker.yml
+```
+
+The same playbook supports `pull`, `reconfigure`, `upgrade`, `stop` and
+`destroy`; choose only the approved lifecycle action and preserve retained
+scratch until recovery is settled. The deployed Afterglow aggregate at
+`/etc/kolla/plugins/openstack-afterglow-v1.30.12/deploy/kolla/site.yml` only
+targets `palimpsest`. It does **not yet target the worker group/image**;
+aggregate integration is a separate Afterglow follow-up, not implemented here.
+
+For durable operator pins, use the Palimpsest-owned final override
+`/etc/kolla/globals.d/99-palimpsest.yml` (0640) for reviewed Hub image refs and
+origin. The aggregate-owned regular file `90-openstack-afterglow-globals.yml`
+was rewritten by a concurrent Afterglow/Drover rollout and reverted refs to
+0.3.2. Canonical argument assembly was observed to load `99-palimpsest.yml`
+last; that check did not execute a playbook. Preserve these precedence rules
+when pinning a subsequently published candidate, not a mutable `latest` tag.
+
+#### Claim, execution and operational recovery
+
+The worker authenticates `/v1/build-worker/*` with
+`X-Palimpsest-Build-Worker-Key` (constant-time comparison); claimed-job routes
+also require `X-Palimpsest-Build-Lease`, a UUID nonce in existing `lease_owner`.
+`POST /v1/build-worker/claim` returns 202 with job ID/name/lease, UTC deadline,
+timeout, recipe/digest, base and parent-first layer descriptors with sizes,
+and max output bytes, or 204 when idle.
+An API-local flock plus SQL `FOR UPDATE` enforces one globally active build.
+The fixed deadline is `started_at + API timeout`; expired attempts become
+`error/worker_interrupted` and are never requeued/replayed. Claim revalidates
+visibility, chain/base identity, positive sizes and total input bytes within
+the max-blob ceiling. Serialized timestamps use UTC ISO offsets.
+
+Exact claimed inputs are fetched through
+`GET /v1/build-worker/builds/{id}/inputs/{digest}` with fresh visibility,
+CAS rehash and deadline bounds. The direct executor
+`python -I -m palimpsest_local.hub_builder <manifest> <worker_pid>` verifies
+recipe/chain/digests before mounts. It rejects qcow2 external backing/data
+files, converts qcow2 to raw, journals explicit read-only loop ownership and
+requires exactly one ext4 root with `etc` and `usr/bin` (`ro,noload`). Private
+sysfs-derived partition nodes stay under the job tree; no shared `/dev` writes
+or udev. Read-only parent SquashFS lowers are child-first; writable upper/work
+use bounded tmpfs; the upper root inherits the effective lower root's numeric
+uid/gid, mode, timestamps and xattrs. RUN uses private mount/PID/IPC/UTS/network
+namespaces without user remapping, only CHOWN/DAC_OVERRIDE/FOWNER/FSETID/
+SETUID/SETGID capabilities, `no_new_privs`, clean PATH/HOME/LANG/LC_ALL,
+closed FDs and umask 022. WORKDIR is created inside the sandbox; host root,
+sockets and credentials are absent and output is discarded. No-follow
+`CLEAN_TARGETS_V1` transient cleanup precedes zstd SquashFS creation bounded
+by `RLIMIT_FSIZE = max_output_bytes`; deadline exit is 124.
+
+Before output transfer, executor cleanup must succeed. `PUT
+/v1/build-worker/builds/{id}/output` requires exact Content-Length and canonical
+`X-Content-Digest`, private 0600 staging, SquashFS magic and SHA-256. Digest
+locking lasts through SQL commit; the private layer belongs only to the
+original project/creator. A matching repeat after completion returns the same
+receipt within a finite transfer deadline; conflicts return 409. `POST
+/v1/build-worker/builds/{id}/fail` accepts only `build_failed`, `build_timeout`
+or `cleanup_failed` and never downgrades complete. Recipe text is limited to
+1 MiB UTF-8 and JSON envelopes to 6 MiB + 64 KiB.
+
+Keep scratch private and persistent across restarts. Its `worker.lock` flock
+and `worker.json` journal are recovery authority; do not remove either merely
+to unblock polling. Operator disposition depends on the recorded phase:
+
+- `claim_pending`: a lost claim response means the API may have assigned a
+  lease the worker never learned. The worker halts permanently for operator
+  disposition; inspect server state/deadline and retained journal without
+  replaying the claim or deleting uncertainty. Expiry is terminal, not requeue.
+- `claimed` / `executing`: restart never re-executes a recorded job. Preserve
+  the tree while the cleanup helper verifies exact process groups and loops;
+  a parent-death fence and `builder.pid` / `helper-UUID.pid` records bind
+  PID/start ticks/boot ID. Stale records matching the current helper PID are
+  previous lifetimes, not authority to kill that helper.
+- `output_pending` / `fail_pending`: a lost mutation response is settled by
+  **status only**, `GET /v1/build-worker/builds/{id}` for the exact lease
+  (including terminal status), not automatic output/failure replay.
+- `terminal`: cleanup still must be established before deleting the job or
+  claiming another. `preflight <worker_pid> <scratch_root>` and
+  `cleanup <job_dir> <worker_pid>` are executor modes, not a license for broad
+  host cleanup. Unverifiable cleanup halts and retains scratch. Preserve the
+  journal and inspect exact owned processes/mounts/loops; never detach unknown
+  loops, kill PID-only matches or erase the tree to manufacture recovery.
+
+These are implemented/source-reviewed recovery contracts, not live recovery
+or native build qualification. The parent records executed acceptance.
 
 ### Hub API and worker logs
 
@@ -371,16 +528,11 @@ Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connectio
 before the request's SQL operation. It does not retry transactions that lose
 their connection after checkout; reconcile those requests before retrying.
 
-The build worker executes `python -I -m palimpsest_local.hub_builder preflight`
-using that exact Local interpreter **before** opening SQL or claiming a job.
-Preflight requires an x86_64 Linux KVM host, an accessible system libvirt URI,
-and root-owned non-writable QEMU, cloud-localds, SSH and SCP binaries. A
-successful preflight does not prove that a guest can boot or be cleaned up.
-For offline Linux deployment, prepare and hash a complete target-ABI wheelhouse
-including Hub transitive dependencies and the `libvirt-python` dependency of
-`palimpsest-client[kvm]`; two application wheels alone are not runnable. Do not
-reuse an active CI runner's KVM/libvirt host as an isolated worker without an
-explicit operator-owned runner drain/fence and resource assessment.
+### Historical KVM build-worker observations — 2026-09-24
+
+The following dated probes used the superseded KVM executor, not the 0.3.4
+remote worker. Their preflight, shared storage, guest sizing and libvirt
+requirements are historical only and do not qualify the new direct executor.
 
 2026-09-24 live proof on a dedicated Linux KVM host found two deployment
 prerequisites that are not enforced by preflight and cause a `build_failed`
@@ -575,8 +727,8 @@ Optional settings and defaults:
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
 | `PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES` | `107374182400` bytes (100 GiB), minimum 1; total expansion allowed for one imported bundle |
 | `PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` | `2`, valid 1–16; process-wide concurrent hash/copy/parse workers |
-| `PALIMPSEST_HUB_BUILDER_PYTHON` | Empty: build requests return 503. For build service, absolute path to the **separate** `palimpsest-client[kvm]` interpreter on the KVM worker; set the same path string on API and worker. |
-| `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; guest teardown is attempted on timeout. |
+| `PALIMPSEST_HUB_BUILD_WORKER_KEY` | Empty: build admission returns 503 `isolated build worker is not configured`. For remote builds, `SecretStr` of 32–4096 printable non-space ASCII characters; provision privately and match the worker keyfile. |
+| `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; fixes the claim deadline at `started_at + timeout`; expiry is terminal `worker_interrupted`, never replay. |
 | `PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS` | `{}`; JSON object mapping canonical namespace aliases to exact immutable Keystone project IDs, for example `'{"openstack-afterglow":"<project-uuid>"}'`. One configured alias per project; an existing SQL namespace is never rebound. |
 | `PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN` | Empty. Trusted HTTPS origin in canonical lower-case host/port form, with no credentials, path, query or fragment; other forms are rejected at startup. It is never inferred from the request Host. If empty, no package authority is advertised, and every native push fails closed with `503 HUB_UNAVAILABLE` before its tag is published. |
 | `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES` | `'["member"]'`; JSON array of the least global roles a deferred Glance export Trust delegates. Glance's default `download_image` policy requires `member`, even for images the project owns. The requester must currently hold each listed role in the target project. `admin`, `manager` and `service` are rejected at startup. |
@@ -587,13 +739,37 @@ Optional settings and defaults:
 | `OS_INTERFACE` | `internal` |
 | `SSL_VERIFY` | `true` |
 
+### Remote build worker settings
+
+`BuildWorkerSettings` is a separate environment contract; it does not consume
+`DATABASE_URL`, `REDIS_URL`, `PALIMPSEST_HUB_LOCAL_PATH` or `OS_*` secrets.
+
+| Environment setting | Default / constraint |
+| --- | --- |
+| `PALIMPSEST_HUB_URL` | Required verified HTTPS origin; no credentials, non-root path, query or fragment |
+| `PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE` | Required absolute owner-only 0600 regular file; the key is never read from an environment value |
+| `PALIMPSEST_HUB_BUILD_WORK_PATH` | Required absolute private local scratch; persist journals and cleanup state across restart |
+| `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600 |
+| `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` (100 GiB), minimum 1; align with API limits and actual scratch capacity |
+
 ### Original token and package-owner prerequisites
 
 The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
 
-Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including the system-role check that keeps privileged server builds administrator-only. On every package-key use the implementation checks that the user and project are currently enabled, and lists `role_assignments.list(user=OWNER, effective=True, include_names=True)`. It does not rely on the token or a cached membership. The owner needs a `member` or `reader` assignment on the target project, and an `admin` or `service` assignment on any scope makes the owner forbidden. Protected user/project IDs and the validator identity itself are also refused. Read-only members cannot delegate write actions. Configure both protected sets with every relevant administrative/service project and principal; empty sets are not an allow-all default. Do not grant package upload authority to an administrator to work around a missing prerequisite.
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including fresh direct system grants as well as effective project assignments. On every native package-key use, enabled user/project, current membership and current service authority are checked, not cached token membership. Native owners need current `member` or `reader` in the original project and remain forbidden by `admin`, `manager` or `service` assignments, protected IDs or validator identity. Direct system-grant lookup also attenuates existing native keys immediately when the owner is promoted. Read-only members cannot delegate writes; empty protected sets fail closed, and admin authority is not a native upload workaround. Deferred Glance exports retain this native owner policy.
 
 The separate system-administrator gate uses `role_assignments.list(user=SUBJECT, system="all", include_names=True)` without effective expansion. Qualify that exact direct query with the dedicated reader and confirm immediate revocation; a project-oriented effective listing can omit a valid direct system-all admin assignment. Project-token admin/service grades are not substitutes for this system check. This does not change the fresh effective membership query used for ordinary package owners, and does not grant package keys builder/GC authority.
+
+For **legacy image/layer upload**, the 2026-10-14 owner-approved source policy
+treats a system administrator as an ordinary current-project user: both
+current original-project membership and current `palimpsest-publish_editor`
+are required. Publish authority derives only from ordinary direct/group/
+inherited assignment roots, excluding builtin `admin`/`manager` roots and
+Keystone implied copies tagged `links.prior_role`. Admin privilege alone never
+grants publication. Service identities, protected users/projects and validator
+identity remain denied. `/v1/me` projects this upload check for admins;
+delete/build remain system-admin. This does not relax native keys/owner policy
+or claim that live 0.3.3 has the candidate policy.
 
 Keystone user/project IDs are exact bounded ASCII identifiers (up to 64 characters), including federated 64-hex user IDs. Do not parse them as UUIDs, case-fold or strip them. UUID formatting applies only to Hub-generated key/upload IDs. Protected sets and namespace binding values must preserve exact identity bytes. For a conventional project UUID, the conditional operator configuration is:
 
@@ -612,7 +788,7 @@ These are operator prerequisites for a separately approved rollout, not a claim 
 
 The canonical Kolla role maps these inputs explicitly: `palimpsest_reader_user`, secret `palimpsest_reader_password` and `palimpsest_reader_user_domain_name` become `OS_READER_*`; `palimpsest_package_forbidden_project_ids` / `palimpsest_package_forbidden_user_ids` become the required protected JSON arrays; `palimpsest_package_namespace_bindings` becomes the alias map; and `palimpsest_package_public_origin` becomes the trusted HTTPS origin. The role precheck requires a separate reader username/password and both nonempty exact-ID protected sets. Secrets belong in approved private Kolla secret inputs, never globals/examples/logs. Rendering these settings is not evidence of Keystone policy or membership readiness.
 
-Reader provisioning uses `openstack.cloud.role_assignment` with `system: all`. The [reviewed 2.6.0 module schema](https://docs.ansible.com/projects/ansible/latest/collections/openstack/cloud/role_assignment_module.html) supports that argument; verify the operator-installed collection supports it before rollout. Provision a dedicated reader identity and inspect its actual effective grants: `state: present` does not remove pre-existing elevated assignments, and the Hub rejects validator tokens holding `admin`, `manager` or `service`. No collection installation or cloud role mutation is implied.
+Reader provisioning in the 0.3.4 source uses `openstack.cloud.identity_user` and `openstack.cloud.role_assignment` (`system: all`) **through `kolla_toolbox`**, following stock Kolla rather than requiring the operator host's collection. Inspect actual grants: `state: present` does not remove elevated assignments, and the validator rejects `admin`, `manager` or `service`. `update_password: always` resets the reader password whenever preconditions run. Observed 0.3.3 deployment failed to resolve `openstack.cloud.identity_user` on the operator host; its live cutover used the explicit bypass `-e palimpsest_run_preconditions=false`. That is a historical workaround, not the candidate provisioning contract or proof of current cloud policy.
 
 ### Deferred Glance export delegation
 
@@ -635,19 +811,15 @@ policy verification was run during source preparation.
 
 The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `["member"]`) and `palimpsest_export_delegation_ttl_seconds` (default `21600`) into the API environment. Its precheck rejects empty or administrative role lists and lifetimes outside 900–86400 seconds. The export worker container receives the same `OS_READER_*` and protected-ID inputs as the API. The service user's Kolla registration remains limited to its own `palimpsest_service_project_name`, where it still holds the existing `admin` grant. Do not add it to tenant projects. Existing manual tenant grants are no longer used by the Hub; removing them, or reducing the service-project grant, is a separate operator-approved change.
 
-After provisioning dependencies and injecting secrets, initialize the schema
-with `palimpsest-hub-bootstrap`, then run `palimpsest-hub` and
-`palimpsest-hub-worker` as separately supervised processes. To enable
-server-side builds, run `palimpsest-hub-build-worker` on the KVM host with the
-same `DATABASE_URL` and the same **absolute** `PALIMPSEST_HUB_LOCAL_PATH`
-filesystem view as the API. The worker takes one filesystem singleton lock and
-polls queued jobs; a second worker for the same store is rejected. Bootstrap
-creates `palimpsest_hub_builds` and `palimpsest_image_export_delegations`
-(additive tables only); data migration additionally copies build rows, export
-delegation references and project layer grants when present in the source.
-Migration remains separate from schema bootstrap. Exports queued before the
-delegation cutover have no delegation and fail `delegation_required` instead of
-running with service credentials; requesters resubmit them.
+After injecting dependencies/secrets, initialize the schema with
+`palimpsest-hub-bootstrap`, then supervise API and export worker separately.
+Enable the HTTPS build worker through the dedicated VM/playbook above, never
+shared SQL/CAS. Global claim serialization belongs to API flock plus SQL;
+worker-local flock protects its own journal/scratch. Bootstrap creates build
+and export-delegation tables additively; migration copies rows/references and
+project grants into an empty destination, separately from bootstrap. The
+0.3.4 build protocol requires no schema migration. Pre-cutover exports without
+delegation fail `delegation_required`; requesters resubmit them.
 
 The `/app` web console uses the existing project-scoped `/v1/layers` and
 resumable `/v1/uploads` endpoints, plus `POST /v1/builds`, `GET /v1/builds`,
@@ -657,18 +829,13 @@ and `GET /v1/builds/{id}`. A build request supplies `name`, full
 digests. Only a Keystone **system administrator** with a project-scoped token
 can queue or inspect builds. Input visibility is checked on enqueue and again
 when claimed; successful output appears as a private SquashFS layer under
-`GET /v1/layers/{digest}/blob`. Raw recipes, user identities, and worker paths
-are not returned by the build API. Builds run with VM networking disabled;
-queue capacity is four active jobs per project and creation is rate-limited to
-six requests per hour. A failed/interrupted build is not automatically retried.
-Guest cleanup failures stop the worker and retain private state for operator
-inspection, rather than claiming the VM was removed.
-
-Before running guest code, the Linux child records its boot ID/PID/start ticks
-in the private job tree and sets a parent-death signal. On worker restart,
-recovery verifies and stops that exact process group before VM cleanup. An
-unverifiable process or failed cleanup leaves the job tree and halts the build
-worker for operator inspection; do not delete the tree blindly.
+`GET /v1/layers/{digest}/blob`. Raw recipes, user identities and worker paths
+are not returned by the public build API. Recipes execute directly inside the
+dedicated VM with private network namespaces, not per-build guest VMs. Queue
+capacity remains four active jobs per project and six creations per hour. No
+failed/interrupted attempt is automatically retried. Cleanup failures halt
+the worker with private state retained; the journal phases and exact process/
+loop recovery procedure above supersede the old guest-cleanup contract.
 
 Uploads cap at four active sessions per project. Before creating a session,
 24-hour-idle sessions for that project are removed under per-session locks;
@@ -676,9 +843,9 @@ interrupted PATCH bytes beyond the last acknowledged offset are discarded on
 resume. The browser keeps the token in tab memory only; use HTTPS except on
 localhost. Chromium streams large downloads directly to a chosen file; other
 browsers support downloads up to 64 MiB in this console and can use the Hub
-API/client for larger artifacts. Server-side KVM execution has **not** been
-established by merely installing either package or by passing the portable
-HTTP contract tests.
+API/client for larger artifacts. Package installation or portable HTTP
+contracts alone do not qualify the 0.3.4 direct executor; native qualification
+is pending until the parent records it.
 
 Lock waits never occupy a worker thread: each attempt is one non-blocking
 `flock`, and a failed attempt sleeps on the event loop before retrying. Waiters
@@ -751,8 +918,10 @@ sudo -H -u palimpsest env -u PALIMPSEST_STATE_HOME -u PALIMPSEST_LOG_HOME \
 
 ## Isolated Hub candidate access and data safety
 
-This is an operator handoff for the **candidate**, not a production installation
-recipe or a claim that `0.2.4` is published. The private local workdir is
+This is the **historical 2026-09-27 0.2.4 candidate** operator handoff, not the
+current 0.3.4 deployment recipe or a claim that 0.2.4 was published. Its old
+KVM/shared-store configuration does not apply to the remote build plane.
+The private local workdir for that historical candidate is
 `/Users/pieroot/.local/share/palimpsest-candidate-024/`; consult its nonsecret
 `candidate-resources.json`, `artifact-receipt.json`, `reboot-receipt.json` and
 the [dated evidence](development-handoff.md#격리-hub-후보-운영-인계--2026-09-27-production-미승격).

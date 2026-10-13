@@ -1,9 +1,29 @@
 ---
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
+- name: Include precheck tasks
+  ansible.builtin.include_tasks: precheck.yml
+  when: palimpsest_local_services | length > 0
+
+- name: Include source build tasks
+  ansible.builtin.include_tasks: source_build.yml
+  when:
+    - palimpsest_local_services | length > 0
+    - palimpsest_source_mode | bool
+
 - name: Include pull tasks
   ansible.builtin.include_tasks: pull.yml
+  when: palimpsest_local_services | length > 0
 
+- name: Include config tasks
+  ansible.builtin.include_tasks: config.yml
+  when: palimpsest_local_services | length > 0
 - name: Include bootstrap service tasks
   ansible.builtin.include_tasks: bootstrap_service.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
+
 
 - name: Include start tasks
   ansible.builtin.include_tasks: start.yml
+  when: palimpsest_local_services | length > 0

@@ -1,31 +1,89 @@
 ---
-- name: Start | Stat Palimpsest config file
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
+
+- name: Start | Stat controller config file
   become: true
   ansible.builtin.stat:
     path: "{{ palimpsest_config_dir }}/palimpsest.conf"
   register: palimpsest_config_stat
-  when: inventory_hostname in groups['palimpsest']
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
 
-- name: Start | Start Palimpsest containers
+- name: Start | Stat build worker admission key
+  become: true
+  ansible.builtin.stat:
+    path: "{{ palimpsest_build_worker_key_path }}"
+    checksum_algorithm: sha256
+  register: palimpsest_build_worker_key_stat
+  no_log: true
+  when: '"palimpsest-hub-build-worker" in palimpsest_local_services'
+
+- name: Start | Require a private root-owned worker key file
+  ansible.builtin.assert:
+    that:
+      - palimpsest_build_worker_key_stat.stat.exists
+      - palimpsest_build_worker_key_stat.stat.isreg | default(false)
+      - not (palimpsest_build_worker_key_stat.stat.islnk | default(false))
+      - palimpsest_build_worker_key_stat.stat.uid | default(-1) == 0
+      - palimpsest_build_worker_key_stat.stat.mode | default('') == '0600'
+    fail_msg: "Build worker key must be an existing root-owned regular file with mode 0600"
+    quiet: true
+  no_log: true
+  when: '"palimpsest-hub-build-worker" in palimpsest_local_services'
+
+- name: Start | Initialize private build worker scratch volume
   become: true
   community.docker.docker_container:
-    name: "{{ item.value.container_name }}"
-    image: "{{ item.value.image }}"
-    pull: "{{ 'never' if (palimpsest_source_mode | default(false) | bool) else 'always' }}"
+    name: palimpsest_build_worker_scratch_init
+    image: "{{ palimpsest_build_worker_image_ref }}"
+    pull: "{{ 'never' if (palimpsest_source_mode | bool) else 'always' }}"
+    command: ["chmod", "0700", "{{ palimpsest_build_worker_scratch_path }}"]
+    user: "0:0"
+    privileged: false
     state: started
-    restart_policy: "{{ item.value.restart_policy | default('unless-stopped') }}"
-    volumes: "{{ item.value.volumes | default([]) }}"
-    env: "{{ item.value.environment | default({}) }}"
-    command: "{{ item.value.command | default(omit) }}"
-    healthcheck: "{{ item.value.healthcheck | default(omit) }}"
-    ports: "{{ item.value.ports | default([]) }}"
-    network_mode: "{{ item.value.network_mode | default(omit) }}"
+    detach: false
+    cleanup: true
+    network_mode: none
+    memory: "{{ palimpsest_build_worker_memory }}"
+    memory_swap: "{{ palimpsest_build_worker_memory }}"
+    cpus: "{{ palimpsest_build_worker_cpus }}"
+    pids_limit: "{{ palimpsest_build_worker_pids_limit }}"
+    volumes:
+      - "{{ palimpsest_build_worker_scratch_volume }}:{{ palimpsest_build_worker_scratch_path }}"
+  when: '"palimpsest-hub-build-worker" in palimpsest_local_services'
+  register: palimpsest_build_worker_scratch_init
+  failed_when: palimpsest_build_worker_scratch_init.status | default(-1) | int != 0
+
+- name: Start | Start enabled local Palimpsest containers
+  become: true
+  community.docker.docker_container:
+    name: "{{ palimpsest_service.container_name }}"
+    image: "{{ palimpsest_service.image }}"
+    pull: "{{ 'never' if (palimpsest_source_mode | bool) else 'always' }}"
+    state: started
+    restart_policy: "{{ palimpsest_service.restart_policy | default('unless-stopped') }}"
+    init: "{{ palimpsest_service.init | default(omit) }}"
+    etc_hosts: "{{ palimpsest_service.etc_hosts | default(omit) }}"
+    volumes: "{{ palimpsest_service.volumes | default([]) }}"
+    env: "{{ palimpsest_service.environment | default({}) }}"
+    command: "{{ palimpsest_service.command | default(omit) }}"
+    healthcheck: "{{ palimpsest_service.healthcheck | default(omit) }}"
+    ports: "{{ palimpsest_service.ports | default([]) }}"
+    network_mode: "{{ palimpsest_service.network_mode | default(omit) }}"
+    user: "{{ palimpsest_service.user | default(omit) }}"
+    privileged: "{{ palimpsest_service.privileged | default(false) }}"
+    memory: "{{ palimpsest_service.memory | default(omit) }}"
+    memory_swap: "{{ palimpsest_service.memory_swap | default(omit) }}"
+    cpus: "{{ palimpsest_service.cpus | default(omit) }}"
+    pids_limit: "{{ palimpsest_service.pids_limit | default(omit) }}"
     labels:
       kolla_version: "2025.2"
       service: palimpsest
-      config_hash: "{{ palimpsest_config_stat.stat.checksum | default('') }}"
+      config_hash: "{{ palimpsest_build_worker_key_stat.stat.checksum | default('') if item.key == 'palimpsest-hub-build-worker' else palimpsest_config_stat.stat.checksum | default('') }}"
+  vars:
+    palimpsest_service: "{{ lookup('vars', item.value.definition) }}"
   no_log: true
-  loop: "{{ palimpsest_services | dict2items }}"
-  when:
-    - inventory_hostname in groups['palimpsest']
-    - item.value.enabled | bool
+  loop: "{{ palimpsest_local_services | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"

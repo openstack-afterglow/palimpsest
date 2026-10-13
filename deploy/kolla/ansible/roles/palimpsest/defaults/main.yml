@@ -1,10 +1,11 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.3"
+palimpsest_image_tag: "0.3.4"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
+palimpsest_build_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-build-worker"
 
 palimpsest_source_mode: "{{ enable_palimpsest_source_build | default(enable_source_build | default(palimpsest_dev_mode | default(false))) | bool }}"
 palimpsest_source_repo: "https://github.com/openstack-afterglow/palimpsest.git"
@@ -12,11 +13,31 @@ palimpsest_source_version: "c4887f7806608e98f215abbd377d2eafe159ff76"
 palimpsest_source_dir: "{{ palimpsest_source_checkout_path | default('/opt/afterglow/src/palimpsest') }}"
 palimpsest_api_image_ref: "{{ 'afterglow-local/palimpsest-hub-api:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_api_image ~ ':' ~ palimpsest_image_tag) }}"
 palimpsest_worker_image_ref: "{{ 'afterglow-local/palimpsest-hub-worker:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_worker_image ~ ':' ~ palimpsest_image_tag) }}"
+palimpsest_build_worker_image_ref: "{{ 'afterglow-local/palimpsest-hub-build-worker:' ~ (palimpsest_source_version | truncate(12, True, '')) if (palimpsest_source_mode | bool) else (palimpsest_build_worker_image ~ ':' ~ palimpsest_image_tag) }}"
 
 enable_palimpsest: "no"
 enable_palimpsest_hub_api: "{{ enable_palimpsest }}"
 enable_palimpsest_hub_worker: "{{ enable_palimpsest }}"
+enable_palimpsest_hub_build_worker: "no"
 palimpsest_run_preconditions: true
+
+# The remote build protocol is opt-in; secrets belong in passwords.yml/Vault.
+palimpsest_build_worker_key: ""
+palimpsest_build_worker_hub_origin: ""
+palimpsest_build_worker_key_path: "{{ palimpsest_config_dir }}/build-worker.key"
+palimpsest_build_worker_container_key_path: /run/palimpsest/build-worker.key
+palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
+palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+palimpsest_build_worker_memory: 6g
+palimpsest_build_worker_cpus: 2
+palimpsest_build_worker_pids_limit: 512
+palimpsest_build_worker_timeout_seconds: 3600
+palimpsest_build_worker_max_blob_bytes: 107374182400
+# Optional exact hostname -> IP pins for the worker container only, e.g. when
+# the service network's DNS lacks the public Hub name. TLS still verifies the
+# certificate for the configured origin hostname.
+palimpsest_build_worker_etc_hosts: {}
+
 
 palimpsest_api_port: 8020
 palimpsest_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
@@ -73,95 +94,142 @@ palimpsest_public_haproxy_fqdn: >-
      if palimpsest_public_endpoint_url is match('^https://[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]/?\Z')
      else '' }}
 
-palimpsest_services:
+# Keep the catalog free of service payloads. Ansible may eagerly template every
+# value of a dictionary before a filter or loop can discard unrelated services.
+palimpsest_service_catalog:
   palimpsest-hub-api:
-    container_name: palimpsest_hub_api
     group: palimpsest
     enabled: "{{ enable_palimpsest_hub_api | bool }}"
-    image: "{{ palimpsest_api_image_ref }}"
-    network_mode: host
-    command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
-    restart_policy: unless-stopped
-    volumes:
-      - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-      - "kolla_logs:/var/log/kolla/"
-    environment:
-      DATABASE_URL: "{{ palimpsest_database_url }}"
-      REDIS_URL: "{{ palimpsest_redis_url }}"
-      OS_PASSWORD: "{{ palimpsest_keystone_password }}"
-      OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
-      OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
-      OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
-      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
-      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
-      PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS: "{{ palimpsest_package_namespace_bindings | to_json }}"
-      PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN: "{{ palimpsest_package_public_origin }}"
-      PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES: "{{ palimpsest_export_delegated_roles | to_json }}"
-      PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS: "{{ palimpsest_export_delegation_ttl_seconds | string }}"
-      PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
-      PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
-      PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
-      PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
-      OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
-      OS_USERNAME: "{{ palimpsest_keystone_user }}"
-      OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
-      OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
-      OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
-      OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
-      OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
-      SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
-    healthcheck:
-      test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    haproxy:
-      palimpsest-hub-api:
-        enabled: "{{ enable_palimpsest_hub_api | bool }}"
-        external: false
-        port: "{{ palimpsest_api_port }}"
-        listen_port: "{{ palimpsest_api_listen_port }}"
-        host_group: palimpsest
-        frontend_http_extra:
-          - "option forwardfor"
-        backend_http_extra:
-          - "option httpchk GET /v1/health"
-          - "http-check expect status 200"
-
+    definition: palimpsest_hub_api_service
+    image_var: palimpsest_api_image_ref
+    container_name: palimpsest_hub_api
+    build_dockerfile: docker/hub/Dockerfile
+    build_target: palimpsest-hub-api
   palimpsest-hub-worker:
-    container_name: palimpsest_hub_worker
     group: palimpsest
     enabled: "{{ enable_palimpsest_hub_worker | bool }}"
-    image: "{{ palimpsest_worker_image_ref }}"
-    command: ["palimpsest-hub-worker"]
-    network_mode: host
-    restart_policy: unless-stopped
-    volumes:
-      - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-      - "kolla_logs:/var/log/kolla/"
-    environment:
-      DATABASE_URL: "{{ palimpsest_database_url }}"
-      REDIS_URL: "{{ palimpsest_redis_url }}"
-      OS_PASSWORD: "{{ palimpsest_keystone_password }}"
-      # The worker revalidates the requester's current authority before each delegated export.
-      OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
-      OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
-      OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
-      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
-      PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
-      PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
-      PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
-      OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
-      OS_USERNAME: "{{ palimpsest_keystone_user }}"
-      OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
-      OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
-      OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
-      OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
-      OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
-      SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
+    definition: palimpsest_hub_worker_service
+    image_var: palimpsest_worker_image_ref
+    container_name: palimpsest_hub_worker
+    build_dockerfile: docker/hub/Dockerfile
+    build_target: palimpsest-hub-worker
+  palimpsest-hub-build-worker:
+    group: palimpsest-build-worker
+    enabled: "{{ enable_palimpsest_hub_build_worker | bool }}"
+    definition: palimpsest_hub_build_worker_service
+    image_var: palimpsest_build_worker_image_ref
+    container_name: palimpsest_hub_build_worker
+    build_dockerfile: docker/hub/Dockerfile
+    build_target: palimpsest-hub-build-worker
+
+palimpsest_hub_api_service:
+  container_name: palimpsest_hub_api
+  group: palimpsest
+  enabled: "{{ enable_palimpsest_hub_api | bool }}"
+  image: "{{ palimpsest_api_image_ref }}"
+  build_dockerfile: docker/hub/Dockerfile
+  build_target: palimpsest-hub-api
+  network_mode: host
+  command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
+  restart_policy: unless-stopped
+  volumes:
+    - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+    - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+    - "kolla_logs:/var/log/kolla/"
+  environment:
+    PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
+    DATABASE_URL: "{{ palimpsest_database_url }}"
+    REDIS_URL: "{{ palimpsest_redis_url }}"
+    OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+    OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
+    OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
+    OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
+    PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
+    PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
+    PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS: "{{ palimpsest_package_namespace_bindings | to_json }}"
+    PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN: "{{ palimpsest_package_public_origin }}"
+    PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES: "{{ palimpsest_export_delegated_roles | to_json }}"
+    PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS: "{{ palimpsest_export_delegation_ttl_seconds | string }}"
+    PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+    PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
+    PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
+    PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
+    OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
+    OS_USERNAME: "{{ palimpsest_keystone_user }}"
+    OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
+    OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
+    OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
+    OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
+    OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
+    SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
+  healthcheck:
+    test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+palimpsest_hub_build_worker_service:
+  container_name: palimpsest_hub_build_worker
+  group: palimpsest-build-worker
+  enabled: "{{ enable_palimpsest_hub_build_worker | bool }}"
+  image: "{{ palimpsest_build_worker_image_ref }}"
+  command: ["python", "-m", "palimpsest_hub.build_worker"]
+  network_mode: bridge
+  restart_policy: unless-stopped
+  init: true
+  etc_hosts: "{{ palimpsest_build_worker_etc_hosts }}"
+  user: "0:0"
+  # Privileges are confined to the dedicated service VM, never a controller.
+  privileged: true
+  memory: "{{ palimpsest_build_worker_memory }}"
+  memory_swap: "{{ palimpsest_build_worker_memory }}"
+  cpus: "{{ palimpsest_build_worker_cpus }}"
+  pids_limit: "{{ palimpsest_build_worker_pids_limit }}"
+  volumes:
+    - "{{ palimpsest_build_worker_key_path }}:{{ palimpsest_build_worker_container_key_path }}:ro"
+    - "{{ palimpsest_build_worker_scratch_volume }}:{{ palimpsest_build_worker_scratch_path }}"
+  environment:
+    PALIMPSEST_HUB_URL: "{{ palimpsest_build_worker_hub_origin }}"
+    PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE: "{{ palimpsest_build_worker_container_key_path }}"
+    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_scratch_path }}"
+    PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS: "{{ palimpsest_build_worker_timeout_seconds | string }}"
+    PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_build_worker_max_blob_bytes | string }}"
+
+palimpsest_hub_worker_service:
+  container_name: palimpsest_hub_worker
+  group: palimpsest
+  enabled: "{{ enable_palimpsest_hub_worker | bool }}"
+  image: "{{ palimpsest_worker_image_ref }}"
+  build_dockerfile: docker/hub/Dockerfile
+  build_target: palimpsest-hub-worker
+  command: ["palimpsest-hub-worker"]
+  network_mode: host
+  restart_policy: unless-stopped
+  volumes:
+    - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+    - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+    - "kolla_logs:/var/log/kolla/"
+  environment:
+    DATABASE_URL: "{{ palimpsest_database_url }}"
+    REDIS_URL: "{{ palimpsest_redis_url }}"
+    OS_PASSWORD: "{{ palimpsest_keystone_password }}"
+    # Revalidate the requester's current authority before each delegated export.
+    OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
+    OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
+    OS_READER_USER_DOMAIN_NAME: "{{ palimpsest_reader_user_domain_name }}"
+    PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS: "{{ palimpsest_package_forbidden_project_ids | to_json }}"
+    PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
+    PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
+    PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
+    OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
+    OS_USERNAME: "{{ palimpsest_keystone_user }}"
+    OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
+    OS_PROJECT_DOMAIN_NAME: "{{ palimpsest_keystone_project_domain_name }}"
+    OS_USER_DOMAIN_NAME: "{{ palimpsest_keystone_user_domain_name }}"
+    OS_REGION_NAME: "{{ palimpsest_keystone_region_name }}"
+    OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
+    SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
 
 palimpsest_public_haproxy_services:
   palimpsest-public:
@@ -184,4 +252,21 @@ palimpsest_public_haproxy_services:
           - "option httpchk GET /v1/health"
           - "http-check expect status 200"
 
-palimpsest_haproxy_services: "{{ palimpsest_services | combine(palimpsest_public_haproxy_services, recursive=True) }}"
+# HAProxy consumes routing metadata only, never a DB-bearing service payload.
+palimpsest_haproxy_services:
+  palimpsest-hub-api:
+    group: palimpsest
+    enabled: "{{ enable_palimpsest_hub_api | bool }}"
+    haproxy:
+      palimpsest-hub-api:
+        enabled: "{{ enable_palimpsest_hub_api | bool }}"
+        external: false
+        port: "{{ palimpsest_api_port }}"
+        listen_port: "{{ palimpsest_api_listen_port }}"
+        host_group: palimpsest
+        frontend_http_extra:
+          - "option forwardfor"
+        backend_http_extra:
+          - "option httpchk GET /v1/health"
+          - "http-check expect status 200"
+  palimpsest-public: "{{ palimpsest_public_haproxy_services['palimpsest-public'] }}"

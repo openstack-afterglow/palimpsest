@@ -1,72 +1,11 @@
 ---
-- name: Precheck | Verify enable_palimpsest is set
-  ansible.builtin.assert:
-    that:
-      - enable_palimpsest is defined
-    fail_msg: "enable_palimpsest must be set in globals.yml"
-  run_once: true
-  tags: precheck
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
 
-- name: Precheck | Verify stock Kolla Valkey dependency
-  ansible.builtin.assert:
-    that:
-      - enable_valkey | default(false) | bool
-      - groups.get('valkey', []) | length > 0
-      - valkey_master_password is defined and valkey_master_password | length > 0
-    fail_msg: "Deploy stock Kolla Valkey before enabling palimpsest; no plugin Redis fallback exists"
-  run_once: true
-  tags: precheck
-  when: enable_palimpsest | default(false) | bool
+- name: Include controller-only precheck tasks
+  ansible.builtin.include_tasks: precheck_controller.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
 
-- name: Precheck | Check required Palimpsest secrets
-  ansible.builtin.assert:
-    that:
-      - palimpsest_database_password is defined and palimpsest_database_password | length > 0
-      - palimpsest_keystone_password is defined and palimpsest_keystone_password | length > 0
-      - palimpsest_reader_password is defined and palimpsest_reader_password | length > 0
-      - palimpsest_reader_user != palimpsest_keystone_user
-      - palimpsest_package_forbidden_project_ids | length > 0
-      - palimpsest_package_forbidden_user_ids | length > 0
-      - palimpsest_redis_db_index == 9
-    fail_msg: "Separate DB/export/reader secrets and immutable protected project/user IDs are required; Redis index must equal 9"
-  tags: precheck
-  when: enable_palimpsest | bool
-
-- name: Precheck | Validate exact package protection IDs
-  ansible.builtin.assert:
-    that:
-      - item is string
-      - item is match('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
-    fail_msg: "Package protection IDs must be exact immutable Keystone identifiers, not display names"
-  loop: "{{ palimpsest_package_forbidden_project_ids + palimpsest_package_forbidden_user_ids }}"
-  run_once: true
-  tags: precheck
-  when: enable_palimpsest | bool
-
-- name: Precheck | Validate least-privilege export delegation
-  ansible.builtin.assert:
-    that:
-      - palimpsest_export_delegated_roles | length > 0
-      - palimpsest_export_delegated_roles | map('lower') | intersect(['admin', 'manager', 'service']) | length == 0
-      - palimpsest_export_delegation_ttl_seconds | int >= 900
-      - palimpsest_export_delegation_ttl_seconds | int <= 86400
-    fail_msg: "Export Trusts must delegate only non-administrative roles with a finite 900-86400 second lifetime"
-  run_once: true
-  tags: precheck
-  when: enable_palimpsest | bool
-
-- name: Precheck | Validate Palimpsest public route hostname
-  ansible.builtin.assert:
-    that:
-      - palimpsest_public_haproxy_fqdn is match('^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$')
-      - palimpsest_public_endpoint_url is match('^https://[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]/?\\Z')
-      - (palimpsest_public_endpoint_url | regex_replace('/$', '')) == ('https://' ~ palimpsest_public_haproxy_fqdn)
-    fail_msg: "palimpsest_public_endpoint_url must be the HTTPS origin for palimpsest_public_haproxy_fqdn"
-  run_once: true
-  tags: precheck
-  when:
-    - enable_palimpsest | bool
-    - palimpsest_public_haproxy_enabled | bool
 
 - name: Include Palimpsest image precheck tasks
   ansible.builtin.include_tasks: image_precheck.yml

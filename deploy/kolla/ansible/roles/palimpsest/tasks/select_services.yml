@@ -1,0 +1,35 @@
+---
+# This file is also included by standalone lifecycle entrypoints. Never resolve
+# service definitions here: even pull/build/destroy must work without DB secrets.
+- name: Select | Require an explicit remote build worker group
+  ansible.builtin.assert:
+    that:
+      - groups.get('palimpsest-build-worker', []) | length > 0
+      - groups.get('palimpsest-build-worker', []) | intersect(groups.get('control', []) + groups.get('controller', []) + groups.get('controllers', []) + groups.get('compute', []) + groups.get('palimpsest', [])) | length == 0
+    fail_msg: "Build workers require a separate nonempty palimpsest-build-worker group disjoint from controllers, computes and API/export hosts"
+  when: enable_palimpsest_hub_build_worker | bool
+
+- name: Select | Require placement for enabled controller services
+  ansible.builtin.assert:
+    that:
+      - groups.get('palimpsest', []) | length > 0
+    fail_msg: "Enabled API/export services require the palimpsest inventory group"
+  when: enable_palimpsest_hub_api | bool or enable_palimpsest_hub_worker | bool
+
+- name: Select | Reset host-local service catalog
+  ansible.builtin.set_fact:
+    palimpsest_local_services: {}
+
+- name: Select | Select enabled services by their own host group
+  ansible.builtin.set_fact:
+    palimpsest_local_services: "{{ palimpsest_local_services | combine({item.key: item.value}) }}"
+  loop: "{{ palimpsest_service_catalog | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when:
+    - inventory_hostname in groups.get(item.value.group, [])
+    - item.value.enabled | bool
+
+- name: Select | Validate enabled remote build settings
+  ansible.builtin.include_tasks: precheck_build_worker.yml
+  when: '"palimpsest-hub-build-worker" in palimpsest_local_services or ("palimpsest-hub-api" in palimpsest_local_services and enable_palimpsest_hub_build_worker | bool)'

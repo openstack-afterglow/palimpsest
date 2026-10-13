@@ -1,0 +1,12 @@
+---
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
+- name: Stop | Stop enabled local Palimpsest containers
+  become: true
+  community.docker.docker_container:
+    name: "{{ item.value.container_name }}"
+    state: stopped
+  loop: "{{ palimpsest_local_services | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"

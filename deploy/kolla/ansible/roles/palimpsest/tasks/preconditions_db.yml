@@ -1,4 +1,7 @@
 ---
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
 - name: DB | Create Palimpsest database
   kolla_toolbox:
     container_engine: "{{ kolla_container_engine }}"
@@ -9,8 +12,10 @@
       login_user: "{{ palimpsest_database_admin_user }}"
       login_password: "{{ palimpsest_database_admin_password }}"
       name: "{{ palimpsest_database_name }}"
-  run_once: true
-  delegate_to: "{{ groups['palimpsest'][0] }}"
+  no_log: true
+  when:
+    - '"palimpsest-hub-api" in palimpsest_local_services'
+    - inventory_hostname == (groups.get('palimpsest', []) | first)
 
 - name: DB | Create Palimpsest database user
   kolla_toolbox:
@@ -26,6 +31,7 @@
       host: "%"
       priv: "{{ palimpsest_database_name }}.*:ALL"
       state: present
-  run_once: true
-  delegate_to: "{{ groups['palimpsest'][0] }}"
   no_log: true
+  when:
+    - '"palimpsest-hub-api" in palimpsest_local_services'
+    - inventory_hostname == (groups.get('palimpsest', []) | first)

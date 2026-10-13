@@ -40,6 +40,7 @@ PORTABLE_FILES = {
         "tests/test_kolla_assets.py",
         "tests/test_kolla_palimpsest_image_ref.py",
         "tests/test_kolla_role_contracts.py",
+        "tests/test_kolla_remote_build.py",
     ),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima pci_preflight
@@ -108,6 +109,7 @@ SPECIAL_FILES = {
         for name in (
             "auth",
             "builds",
+            "build_worker",
             "database_pool",
             "hub_api",
             "image_exports",

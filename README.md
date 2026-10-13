@@ -13,7 +13,7 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published release:** [`palimpsest-client` 0.3.1 on PyPI](https://pypi.org/project/palimpsest-client/0.3.1/) and [GitHub Release `v0.3.1`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.1), from immutable `1458db42a1449a25b664584d144d0a97086f8f6f`. Separate Hub API/worker images are published for Linux amd64 with matching revision; the Hub wheel is not a root-release artifact. Native KVM qualification was explicitly disabled, and production rollout remains held for reviewed service-role assignments, authentication, shared storage and recovery prerequisites. A root wheel update never deploys the Hub.
+- **Published release:** [`palimpsest-client` 0.3.3 on PyPI](https://pypi.org/project/palimpsest-client/0.3.3/) and [GitHub Release `v0.3.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.3). API/export-worker 0.3.3 images are running on the existing Kolla controller placement; the 0.3.4 remote-build candidate is unpublished and undeployed. Publication and health checks do not establish native qualification; see [deployment boundaries](docs/install.md) and [development status](#development).
 
 ## Install from PyPI
 
@@ -162,17 +162,17 @@ and [exact deployment pins and prerequisites](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
-Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using the original OpenStack project-scoped token (`X-Auth-Token` and optional `X-Project-Id` assertion, never re-scoping). Its same-origin `/app` console reads exact identity and fresh independent inventory/download/upload/build/delete permissions from `GET /v1/me`; credentials and transfer state remain in tab memory, not browser storage. Upload requires current publish authority, metadata browsing requires inventory authority, and downloading requires download authority. A verified system administrator can build/delete legacy artifacts but cannot use member upload or native package controls.
+Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using the original OpenStack project-scoped token (`X-Auth-Token` and optional `X-Project-Id` assertion, never re-scoping). Its same-origin `/app` console reads exact identity and fresh independent inventory/download/upload/build/delete permissions from `GET /v1/me`; credentials and transfer state remain in tab memory, not browser storage. Upload requires current publish authority, metadata browsing requires inventory authority, and downloading requires download authority. A verified system administrator can build/delete legacy artifacts; legacy image/layer upload additionally requires ordinary current-project membership and publish authority, never admin privilege alone. Native package controls retain their separate elevated-owner exclusion.
 
 The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Native package browsing/publication is a separate console credential domain: original member tokens handle member controls, while `ppk_v1_…` package keys handle native writes. Neither credential is substituted for the other; connection changes cancel tab-controlled work without automatic re-publication.
 
-Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, and now has separate project-scoped package and BuildKit-cache APIs. Native package keys authorize those package/cache operations; legacy artifact commands still use the original Keystone token. `POST /v1/builds` queues an isolated VM build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. A separate Linux KVM host worker consumes jobs and registers successful outputs as private layers. The API container does not execute recipes. Hub is not a Docker/OCI `/v2` registry: profiles explicitly select native `palimpsest` or Docker/OCI `oci` transport.
+Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, and has separate project-scoped package and BuildKit-cache APIs. Native package keys authorize those package/cache operations; legacy artifact commands still use the original Keystone token. `POST /v1/builds` queues a system-admin/project-scoped build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. In the 0.3.4 source candidate, a dedicated CPU-only Nova service VM claims jobs over verified HTTPS and runs recipes directly, registering successful outputs through the API as private project layers. No nested/per-build KVM or libvirt is needed. The API container never executes recipes. Hub is not a Docker/OCI `/v2` registry: profiles explicitly select native `palimpsest` or Docker/OCI `oci` transport.
 
 ### Entrypoints & Docker Targets
 
 - **Hub API:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`; `/app` serves the web console).
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`).
-- **Isolated Build Worker:** `palimpsest-hub-build-worker` on a separately provisioned Linux `/dev/kvm` host, with `PALIMPSEST_HUB_BUILDER_PYTHON` set to an absolute interpreter containing `palimpsest-client[kvm]` at the same reviewed source ref. Share its SQL database and Hub blob path with the API; do not place the worker or a Docker socket inside the API container.
+- **Isolated Build Worker (0.3.4 candidate):** `palimpsest-hub-build-worker` (Docker target `palimpsest-hub-build-worker`) runs as root in a dedicated CPU-only Linux service VM in the `palimpsest-service` project. It receives only a verified Hub HTTPS origin, owner-only keyfile and local scratch/limits, never SQL, CAS/NFS, Redis or Keystone credentials. Configure `PALIMPSEST_HUB_BUILD_WORKER_KEY` on the API; without it, build admission returns 503 `isolated build worker is not configured`. The privileged VM is the kernel boundary; no Docker socket or controller recipe execution. See [remote worker deployment and recovery](docs/install.md#remote-build-worker-deployment-034-source-candidate).
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
 - **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies source tables into an empty initialized destination; it is not bootstrap.
 
@@ -181,6 +181,7 @@ The canonical Hub container build uses the repository root as context and `docke
 ```sh
 docker build --file docker/hub/Dockerfile --target palimpsest-hub-api .
 docker build --file docker/hub/Dockerfile --target palimpsest-hub-worker .
+docker build --file docker/hub/Dockerfile --target palimpsest-hub-build-worker .
 ```
 
 ### Client Hub Configuration
@@ -606,16 +607,18 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 ## Development
 
-The historical **0.3.1** publication and runtime receipts at immutable
-`1458db42a1449a25b664584d144d0a97086f8f6f` remain in
-[publication and runtime evidence](docs/testing.md#published-031-verification).
-Published **0.3.2** is at `1f120392c1b15b182330ab6a2d740bfe218aa990`;
-the 2026-10-11 handoff records the inspected single-host running image pins.
-The **0.3.3 management candidate is unpublished** and starts from upstream dev
-`a428d3fdb7c4d6243833ab189fd187b03710ada3`, preserving later identity/Trust fixes.
-Publication, operator installation and controller1 Kolla rollout require exact
-scoped approval and [storage/credential prerequisites](docs/install.md).
-Native CI remains explicitly disabled: `false/skipped` is **not native qualification**.
+Published **0.3.3** is the base for the isolated **0.3.4 candidate** on upstream
+dev `7186abf7844454eda7ed86a215192b33b9250ff8`. Candidate metadata, modules,
+locks and Kolla image tag are 0.3.4; it is not committed, published or deployed.
+The owner approved the 2026-10-14 scoped iterative Hub build/upload/consume loop:
+branch push → protected dev PR → required checks → merge → immutable v0.3.x tag
+→ PyPI/GitHub/GHCR → operator PyPI pin → Kolla deploy. This excludes main
+promotion and CI protection changes and preserves the
+[storage/credential prerequisites](docs/install.md). Native qualification is
+pending until the parent records it; an explicit native `false/skipped` is not
+qualification. Historical 0.3.1 receipts remain in
+[publication and runtime evidence](docs/testing.md#published-031-verification);
+the handoff owns current verification and live-operation evidence.
 
 
 ### Resume ongoing development

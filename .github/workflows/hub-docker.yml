@@ -61,6 +61,16 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern=v{{version}}
             type=sha,prefix=sha-
+      - uses: docker/metadata-action@v5
+        id: build-worker
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/palimpsest-hub-build-worker
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=sha,prefix=sha-
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -77,3 +87,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.worker.outputs.tags }}
           labels: ${{ steps.worker.outputs.labels }}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/hub/Dockerfile
+          target: palimpsest-hub-build-worker
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.build-worker.outputs.tags }}
+          labels: ${{ steps.build-worker.outputs.labels }}
