@@ -1,6 +1,6 @@
 [project]
 name = "palimpsest-client"
-version = "0.3.3"
+version = "0.3.4"
 description = "Verified local OCI artifacts, KVM lifecycle, and Kolla-Ansible role data for Afterglow Palimpsest"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,7 @@ packages = ["src/palimpsest_local"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "deploy/kolla/ansible/roles/palimpsest" = "share/kolla-ansible/ansible/roles/palimpsest"
+"deploy/kolla/ansible/palimpsest-build-worker.yml" = "share/kolla-ansible/ansible/palimpsest-build-worker.yml"
 
 [tool.pytest.ini_options]
 markers = [

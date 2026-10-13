@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -377,6 +378,18 @@ def test_serial_builder_seed_is_credential_free_and_transport_handles_short_writ
     writer = ShortWriter()
     namespace["_write_all"](writer, b"serial-output")  # type: ignore[operator]
     assert bytes(writer.data) == b"serial-output"
+
+
+def test_serial_builder_layer_root_uses_base_root_not_private_capture_mode(tmp_path):
+    namespace: dict[str, object] = {"__name__": "serial_builder_test"}
+    exec(compile(cloudinit._BUILD_WORKER_SOURCE, "<serial-builder>", "exec"), namespace)
+    base_root, upper = tmp_path / "base-root", tmp_path / "upper"
+    base_root.mkdir()
+    base_root.chmod(0o755)
+    upper.mkdir(mode=0o700)
+    namespace["_seed_upper_root"](str(upper), str(base_root))  # type: ignore[operator]
+    assert stat.S_IMODE(upper.stat().st_mode) == 0o755
+    assert (upper.stat().st_uid, upper.stat().st_gid) == (base_root.stat().st_uid, base_root.stat().st_gid)
 
 
 def test_exec_payload_encoding_roundtrip():

@@ -1,0 +1,16 @@
+---
+# Palimpsest-owned Kolla lifecycle entrypoint for remote build-worker hosts.
+# Installed beside Kolla's site.yml so stock group_vars, filters and roles apply:
+#   kolla-ansible <deploy|pull|reconfigure|upgrade|stop|destroy> -i /etc/kolla/multinode \
+#     --playbook <kolla share>/ansible/palimpsest-build-worker.yml
+# Controller API/export services keep using the aggregate site play.
+- name: Apply Palimpsest remote build worker
+  gather_facts: false
+  hosts: palimpsest-build-worker
+  become: true
+  serial: "{{ kolla_serial | default('0') }}"
+  tasks:
+    - name: Apply role palimpsest
+      ansible.builtin.include_role:
+        name: palimpsest
+      when: enable_palimpsest_hub_build_worker | default(false) | bool

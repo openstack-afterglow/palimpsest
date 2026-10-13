@@ -32,6 +32,7 @@ from sqlalchemy import func, select
 
 from palimpsest_hub.auth import (
     _is_system_admin,
+    get_legacy_member_info,
     get_os_conn,
     get_package_member_info,
     get_token_info,
@@ -404,11 +405,16 @@ class HubBundleImportResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _legacy_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
-    """Separate legacy artifact authority; never accept a key or admin/service principal."""
+async def _legacy_writer(token_info: dict = Depends(get_legacy_member_info)) -> dict:
+    """Publication uses ordinary project service authority, never administrative power."""
     if "palimpsest-publish_editor" not in token_info.get("package_capabilities", ()):
         raise HTTPException(status_code=403, detail="Palimpsest publish authority required")
     return token_info
+
+
+async def _export_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
+    """Deferred Trust exports retain their separately qualified non-admin owner policy."""
+    return await _legacy_writer(token_info)
 
 
 async def _legacy_inventory(token_info: dict = Depends(get_token_info)) -> dict:
@@ -435,14 +441,13 @@ async def get_hub_identity(token_info: dict = Depends(require_token)) -> dict[st
     """Describe the original token scope and freshly checked legacy artifact authority."""
     is_system_admin = bool(token_info.get("is_system_admin"))
     capabilities = frozenset()
-    if not is_system_admin:
-        try:
-            member = await get_package_member_info(token_info=token_info)
-        except HTTPException as exc:
-            if exc.status_code != 403:
-                raise
-        else:
-            capabilities = member["package_capabilities"]
+    try:
+        member = await get_legacy_member_info(token_info=token_info)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+    else:
+        capabilities = member["package_capabilities"]
     return {
         "user_id": token_info["user_id"],
         "project_id": token_info["project_id"],
@@ -842,7 +847,7 @@ async def create_image_export(
     request: Request,
     req: HubImageExportRequest,
     conn: Any = Depends(get_os_conn),
-    token_info: dict = Depends(_legacy_writer),
+    token_info: dict = Depends(_export_writer),
 ) -> dict[str, Any]:
     _store_or_503()
     try:
@@ -1011,7 +1016,7 @@ async def download_image_export_with_token(
 @router.delete("/image-exports/{export_id}", status_code=204, operation_id="delete_image_export")
 async def delete_image_export(
     export_id: UUID,
-    token_info: dict = Depends(_legacy_writer),
+    token_info: dict = Depends(_export_writer),
 ) -> None:
     try:
         await soft_delete_project_export(_required_project_id(token_info), str(export_id))

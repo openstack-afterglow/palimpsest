@@ -154,6 +154,14 @@ def _local_capture_check():
         raise RuntimeError("capture upper and work directories differ")
 
 
+def _seed_upper_root(upper, root="/"):
+    # The captured root inode masks lower roots in the merged layer view. Never
+    # publish the private 0700 capture directory as the layer's root metadata.
+    info = os.stat(root)
+    os.chown(upper, info.st_uid, info.st_gid)
+    os.chmod(upper, info.st_mode & 0o7777)
+
+
 def _build():
     global _RUN_LINE, _STAGE
     with open(JOB_PATH, encoding="utf-8") as fp:
@@ -165,6 +173,7 @@ def _build():
     try:
         for path in ("upper", "work", "merged"):
             os.makedirs(os.path.join(CAPTURE, path), mode=0o700, exist_ok=True)
+        _seed_upper_root(CAPTURE + "/upper")
         mounted = False
         try:
             _STAGE = "mount"

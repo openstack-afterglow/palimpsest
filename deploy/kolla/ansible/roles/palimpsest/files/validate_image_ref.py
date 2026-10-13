@@ -14,7 +14,7 @@ _REMOTE_TAG_REF = re.compile(
     r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?/"
     r"[a-z0-9]+(?:[._/-][a-z0-9]+)*:([a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127})$"
 )
-_LOCAL_SOURCE_REF = re.compile(r"^afterglow-local/palimpsest-hub-(?:api|worker):[0-9a-f]{12}$")
+_LOCAL_SOURCE_REF = re.compile(r"^afterglow-local/palimpsest-hub-(?:api|worker|build-worker):[0-9a-f]{12}$")
 
 
 def validate_image_ref(reference: str, *, source_mode: bool) -> None:
@@ -22,7 +22,7 @@ def validate_image_ref(reference: str, *, source_mode: bool) -> None:
         if not _LOCAL_SOURCE_REF.fullmatch(reference):
             raise ValueError(
                 "invalid Palimpsest image reference; "
-                "expected afterglow-local/palimpsest-hub-{api|worker}:<12-hex-commit>"
+                "expected afterglow-local/palimpsest-hub-{api|worker|build-worker}:<12-hex-commit>"
             )
         return
 

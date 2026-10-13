@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import re
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -44,9 +45,8 @@ class Settings(DatabaseSettings):
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
     palimpsest_hub_max_bundle_expanded_bytes: int = Field(default=107374182400, ge=1)
     palimpsest_hub_max_blocking_operations: int = Field(default=2, ge=1, le=16)
-    # A separate KVM-capable worker installs palimpsest-local in this interpreter.
-    # Unset keeps remote builds disabled; the API container never runs builds.
-    palimpsest_hub_builder_python: str = ""
+    # The control plane admits remote builds only when a worker secret is configured.
+    palimpsest_hub_build_worker_key: SecretStr = SecretStr("")
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
     palimpsest_hub_package_forbidden_project_ids: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
@@ -73,6 +73,14 @@ class Settings(DatabaseSettings):
     os_reader_username: str = ""
     os_reader_password: SecretStr = SecretStr("")
     os_reader_user_domain_name: str = "Default"
+
+    @field_validator("palimpsest_hub_build_worker_key")
+    @classmethod
+    def bounded_worker_key(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value()
+        if secret and (not 32 <= len(secret) <= 4096 or any(not 33 <= ord(char) <= 126 for char in secret)):
+            raise ValueError("worker key must be 32..4096 printable non-whitespace ASCII characters")
+        return value
 
     @field_validator("palimpsest_hub_package_forbidden_project_ids", "palimpsest_hub_package_forbidden_user_ids")
     @classmethod
@@ -146,13 +154,45 @@ class Settings(DatabaseSettings):
         return canonical
 
 
-class BuildWorkerSettings(DatabaseSettings):
-    """The KVM host needs SQL and blob access, never Keystone or Redis secrets."""
+class BuildWorkerSettings(BaseSettings):
+    """A remote executor has HTTPS access and local scratch, never control-plane credentials."""
 
-    palimpsest_hub_local_path: str
-    palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
-    palimpsest_hub_builder_python: str
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
+
+    palimpsest_hub_url: str
+    palimpsest_hub_build_worker_key_file: str
+    palimpsest_hub_build_work_path: str
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
+    palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
+
+    @field_validator("palimpsest_hub_url")
+    @classmethod
+    def https_origin(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("worker Hub URL must be an HTTPS origin") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in value)
+            or (port is not None and port < 1)
+        ):
+            raise ValueError("worker Hub URL must be an HTTPS origin")
+        return value.rstrip("/")
+
+    @field_validator("palimpsest_hub_build_worker_key_file", "palimpsest_hub_build_work_path")
+    @classmethod
+    def absolute_local_path(cls, value: str) -> str:
+        if not Path(value).is_absolute() or "\x00" in value:
+            raise ValueError("worker paths must be absolute local paths")
+        return value
 
 
 @lru_cache

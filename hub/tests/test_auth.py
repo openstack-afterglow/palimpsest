@@ -15,6 +15,7 @@ from starlette.requests import Request
 from palimpsest_hub.auth import (
     _is_system_admin,
     _reader_client_for,
+    get_legacy_member_info,
     get_os_conn,
     get_package_member_info,
     require_admin,
@@ -155,6 +156,7 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
         "project_roles": ["member", "palimpsest_admin"],
         "other_roles": [],
         "system_assignments": [],
+        "expanded_assignments": [],
         "unavailable": False,
         "requests": [],
     }
@@ -313,8 +315,28 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
                         }
                         for name in state["other_roles"]
                     )
+                    if query.get("effective"):
+                        assignments.extend(state["expanded_assignments"])
                 elif not query.get("effective"):
                     assignments.extend(state["system_assignments"])
+                for assignment in assignments:
+                    role_id = assignment.get("role", {}).get("id")
+                    if not role_id:
+                        continue
+                    scope = assignment.get("scope", {})
+                    target = "/system" if scope.get("system") else "/projects/" + scope.get("project", {}).get("id", "")
+                    assignment.setdefault(
+                        "links",
+                        {
+                            "assignment": state["url"]
+                            + "/v3"
+                            + target
+                            + "/users/"
+                            + state["user_id"]
+                            + "/roles/"
+                            + role_id
+                        },
+                    )
                 self.send_json(200, {"role_assignments": assignments})
             else:
                 self.send_json(404, {"error": {"message": "Unknown identity resource"}})
@@ -864,3 +886,114 @@ def test_mixed_case_unrelated_assignment_uses_exact_directory_name(keystone_http
     )
     keystone_http["project_roles"].append("UnrelatedMixedCase")
     assert validate_package_owner(FEDERATED_OWNER, PROJECT_A)["can_write"] is True
+
+
+@pytest.mark.asyncio
+async def test_system_admin_publishes_only_as_current_project_user(keystone_http):
+    keystone_http["token_roles"] = ["admin", "manager", "member", "palimpsest-publish_editor"]
+    keystone_http["project_roles"] = list(keystone_http["token_roles"])
+    keystone_http["system_assignments"] = [
+        {
+            "user": {"id": FEDERATED_OWNER},
+            "scope": {"system": {"all": True}},
+            "role": {"id": "role-admin", "name": "admin"},
+        }
+    ]
+    original = validate_token(ORIGINAL_SUBJECT)
+    assert original["is_system_admin"] is True
+    member = await get_legacy_member_info(original)
+    assert member["can_write"] is True
+    assert (member["user_id"], member["project_id"], member["token"]) == (FEDERATED_OWNER, PROJECT_A, ORIGINAL_SUBJECT)
+    with pytest.raises(HTTPException) as native:
+        await get_package_member_info(original)
+    assert native.value.status_code == 403
+    keystone_http["project_roles"] = ["admin", "manager", "member", "palimpsest_reader"]
+    revoked = await get_legacy_member_info(original)
+    assert revoked["can_write"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["admin-only", "other-project", "old-token", "service", "removed-member"])
+async def test_legacy_upload_never_uses_admin_or_foreign_authority(keystone_http, case):
+    keystone_http["token_roles"] = ["admin", "member", "palimpsest-publish_editor"]
+    keystone_http["project_roles"] = list(keystone_http["token_roles"])
+    if case == "admin-only":
+        keystone_http["edges"]["admin"] = ["member", "palimpsest-publish_editor"]
+        keystone_http["token_roles"] = ["admin"]
+        keystone_http["project_roles"] = ["admin"]
+    elif case == "other-project":
+        keystone_http["project_roles"] = ["admin", "member"]
+        keystone_http["other_roles"] = ["palimpsest-publish_editor"]
+    elif case == "old-token":
+        keystone_http["token_roles"] = ["admin", "member"]
+    elif case == "service":
+        keystone_http["other_roles"] = ["service"]
+    else:
+        keystone_http["project_roles"] = ["admin", "palimpsest-publish_editor"]
+    with pytest.raises(HTTPException) as denied:
+        await get_legacy_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,identity", [("USER", FEDERATED_OWNER), ("PROJECT", PROJECT_A)])
+async def test_legacy_admin_upload_preserves_protected_identity_denial(keystone_http, monkeypatch, field, identity):
+    keystone_http["token_roles"] = ["admin", "member", "palimpsest-publish_editor"]
+    keystone_http["project_roles"] = list(keystone_http["token_roles"])
+    monkeypatch.setenv(f"PALIMPSEST_HUB_PACKAGE_FORBIDDEN_{field}_IDS", json.dumps([identity]))
+    get_settings.cache_clear()
+    with pytest.raises(HTTPException) as denied:
+        await get_legacy_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["direct", "group", "inherited-group"])
+async def test_legacy_ordinary_grant_survives_admin_inference_but_not_revocation(keystone_http, source):
+    keystone_http["token_roles"] = ["admin", "member", "palimpsest_admin", "palimpsest-publish_editor"]
+    keystone_http["project_roles"] = ["admin", "member"]
+    keystone_http["edges"]["admin"] = ["palimpsest-publish_editor"]
+    root = keystone_http["url"] + "/v3"
+    inferred = {
+        "user": {"id": FEDERATED_OWNER},
+        "scope": {"project": {"id": PROJECT_A}},
+        "role": {"id": "role-palimpsest-publish_editor", "name": "palimpsest-publish_editor"},
+        "links": {
+            "assignment": root + f"/projects/{PROJECT_A}/users/{FEDERATED_OWNER}/roles/role-admin",
+            "prior_role": root + "/prior_role/role-palimpsest-publish_editor/implies/role-admin",
+        },
+    }
+    if source == "direct":
+        grant = f"/projects/{PROJECT_A}/users/{FEDERATED_OWNER}/roles/role-palimpsest_admin"
+    elif source == "group":
+        grant = f"/projects/{PROJECT_A}/groups/group-1/roles/role-palimpsest_admin"
+    else:
+        grant = "/OS-INHERIT/domains/default/groups/group-1/roles/role-palimpsest_admin/inherited_to_projects"
+    ordinary = {
+        "user": {"id": FEDERATED_OWNER},
+        "scope": {"project": {"id": PROJECT_A}},
+        "role": {"id": "role-palimpsest_admin", "name": "palimpsest_admin"},
+        "links": {"assignment": root + grant},
+    }
+    keystone_http["expanded_assignments"] = [inferred, ordinary]
+    original = validate_token(ORIGINAL_SUBJECT)
+    assert (await get_legacy_member_info(original))["can_write"] is True
+    keystone_http["expanded_assignments"] = [inferred]
+    with pytest.raises(HTTPException) as revoked:
+        await get_legacy_member_info(original)
+    assert revoked.value.status_code == 403
+
+
+@pytest.mark.parametrize("elevated", ["admin", "manager", "service"])
+def test_existing_native_owner_loses_authority_on_direct_system_grant(keystone_http, elevated):
+    assert validate_package_owner(FEDERATED_OWNER, PROJECT_A)["can_write"] is True
+    keystone_http["system_assignments"] = [
+        {
+            "user": {"id": FEDERATED_OWNER},
+            "scope": {"system": {"all": True}},
+            "role": {"id": "role-" + elevated, "name": elevated},
+        }
+    ]
+    with pytest.raises(HTTPException) as revoked:
+        validate_package_owner(FEDERATED_OWNER, PROJECT_A)
+    assert revoked.value.status_code == 403

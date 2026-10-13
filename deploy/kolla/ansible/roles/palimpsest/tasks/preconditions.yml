@@ -1,6 +1,11 @@
 ---
+- name: Select host-local Palimpsest services
+  ansible.builtin.include_tasks: select_services.yml
+
 - name: Include database precondition tasks
-  ansible.builtin.import_tasks: preconditions_db.yml
+  ansible.builtin.include_tasks: preconditions_db.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services'
 
 - name: Include Keystone precondition tasks
-  ansible.builtin.import_tasks: preconditions_keystone.yml
+  ansible.builtin.include_tasks: preconditions_keystone.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services'

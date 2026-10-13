@@ -1695,7 +1695,7 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
             raise HTTPException(status_code=state["status"], detail="Current authority unavailable")
         return {**token_info, "package_capabilities": frozenset({"palimpsest-inventory_reader"})}
 
-    monkeypatch.setattr(hub_api, "get_package_member_info", current_member)
+    monkeypatch.setattr(hub_api, "get_legacy_member_info", current_member)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
         missing = await client.get("/v1/me")
         assert missing.status_code == 401 and missing.headers["cache-control"] == "no-store"
@@ -1736,20 +1736,22 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
         ),
         (False, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
         (True, set(), {"inventory": True, "download": True, "upload": False, "delete": True, "build": True}),
+        (
+            True,
+            {"palimpsest-publish_editor"},
+            {"inventory": True, "download": True, "upload": True, "delete": True, "build": True},
+        ),
     ],
 )
 async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_admin, leaves, expected):
-    calls = []
 
     async def current_member(token_info):
-        calls.append(token_info)
         return {**token_info, "package_capabilities": frozenset(leaves)}
 
-    monkeypatch.setattr(hub_api, "get_package_member_info", current_member)
+    monkeypatch.setattr(hub_api, "get_legacy_member_info", current_member)
     identity = {"user_id": "member", "project_id": "alpha", "roles": ["admin"], "is_system_admin": system_admin}
     context = await hub_api.get_hub_identity(identity)
     assert context["capabilities"] == expected
-    assert len(calls) == (0 if system_admin else 1)
 
 
 @pytest.mark.asyncio

@@ -74,3 +74,28 @@ def test_accepts_source_build_commit_tag() -> None:
         "afterglow-local/palimpsest-hub-api:e83ce559e3e3",
         source_mode=True,
     )
+
+
+@pytest.mark.parametrize(
+    "source_mode,reference",
+    [
+        (True, "afterglow-local/palimpsest-hub-build-worker:e83ce559e3e3"),
+        (False, "ghcr.io/openstack-afterglow/palimpsest-hub-build-worker:0.3.1"),
+        (False, "ghcr.io/openstack-afterglow/palimpsest-hub-build-worker@sha256:" + "a" * 64),
+    ],
+)
+def test_accepts_canonical_direct_worker_reference(source_mode, reference):
+    _VALIDATOR.validate_image_ref(reference, source_mode=source_mode)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "afterglow-local/palimpsest-hub-build-worker:latest",
+        "afterglow-local/palimpsest-hub-build-worker:e83ce559e3e",
+        "afterglow-local/palimpsest-hub-build-worker:e83ce559e3e3extra",
+    ],
+)
+def test_direct_worker_source_reference_requires_exact_commit_tag(reference):
+    with pytest.raises(ValueError):
+        _VALIDATOR.validate_image_ref(reference, source_mode=True)

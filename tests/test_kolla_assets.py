@@ -66,7 +66,9 @@ def test_root_metadata_owns_kolla_shared_data_without_runtime_dependencies():
     )
     assert "palimpsest-hub" not in project["dependencies"]
     assert root_pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["shared-data"] == {
-        "deploy/kolla/ansible/roles/palimpsest": "share/kolla-ansible/ansible/roles/palimpsest"
+        "deploy/kolla/ansible/roles/palimpsest": "share/kolla-ansible/ansible/roles/palimpsest",
+        # Installed beside Kolla's site.yml so stock group_vars/filters/roles resolve.
+        "deploy/kolla/ansible/palimpsest-build-worker.yml": "share/kolla-ansible/ansible/palimpsest-build-worker.yml",
     }
 
 
