@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, Header, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
@@ -122,6 +123,13 @@ def _effective_role_names(role_ids, directory):
     for role_id in role_ids:
         visit(role_id)
     return names
+
+
+def _legacy_role_names(role_ids, directory):
+    """General user roles only: builtin administrative grants never imply upload."""
+    by_id = directory[0]
+    ordinary_ids = [role_id for role_id in role_ids if by_id[role_id]["name"].casefold() not in {"admin", "manager"}]
+    return _effective_role_names(ordinary_ids, directory)
 
 
 def role_name_closure(role_names, directory) -> frozenset[str]:
@@ -311,8 +319,8 @@ def get_token_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[
     return token_info
 
 
-def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
-    """Recheck current owner authority; neither a token nor cached membership is minted."""
+def _validate_project_user(user_id: str, project_id: str, *, legacy: bool = False) -> dict[str, Any]:
+    """Recheck current authority without minting or exchanging the user's token."""
     settings = get_settings()
     if (
         not settings.palimpsest_hub_package_forbidden_project_ids
@@ -349,14 +357,18 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=403, detail="Package owner or project is disabled")
         roles: set[str] = set()
         directory = _role_directory(client)
-        for assignment in client.role_assignments.list(user=user_id, effective=True, include_names=True):
+        assignments = list(client.role_assignments.list(user=user_id, effective=True, include_names=True))
+        # Keystone's effective project expansion omits direct system grants.
+        # Recheck them separately so existing native keys cannot outlive promotion.
+        assignments.extend(client.role_assignments.list(user=user_id, system="all", include_names=True))
+        for assignment in assignments:
             if _assignment_user(assignment) != user_id:
                 continue
             assigned = _value(assignment, "role")
             effective = _effective_role_names([assigned["id"]], directory)
             if assigned.get("name") != directory[0][assigned["id"]]["name"]:
                 raise ValueError("Assignment role does not match directory")
-            if effective & {"admin", "manager", "service"}:
+            if effective & ({"service"} if legacy else {"admin", "manager", "service"}):
                 raise HTTPException(
                     status_code=403,
                     detail={
@@ -364,6 +376,19 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
                         "message": "Administrative or service identities cannot authorize package access",
                     },
                 )
+            if legacy:
+                links = _value(assignment, "links")
+                if not isinstance(links, dict) or not isinstance(links.get("assignment"), str):
+                    raise ValueError("Assignment provenance is unavailable")
+                # Keystone keeps each original direct/group/inherited root and
+                # tags the separate implied-role copies with prior_role links.
+                # Expand ordinary roots ourselves, never admin-derived copies.
+                if "prior_role" in links:
+                    continue
+                source_role = urlsplit(links["assignment"]).path.rsplit("/roles/", 1)[-1]
+                if source_role.removesuffix("/inherited_to_projects") != assigned["id"]:
+                    raise ValueError("Assignment root does not match its role")
+                effective = _legacy_role_names([assigned["id"]], directory)
             scope = _value(assignment, "scope")
             target = scope.get("project", {}).get("id") if isinstance(scope, dict) else None
             if target == project_id:
@@ -390,11 +415,16 @@ def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Keystone membership validation is unavailable") from None
 
 
-async def get_package_member_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+def validate_package_owner(user_id: str, project_id: str) -> dict[str, Any]:
+    """Native package keys retain the non-administrative owner policy."""
+    return _validate_project_user(user_id, project_id)
+
+
+async def _member_info(token_info: dict[str, Any], *, legacy: bool) -> dict[str, Any]:
     roles = {str(role).casefold() for role in token_info.get("roles", [])}
     if (
-        roles & {"admin", "manager", "service"}
-        or token_info.get("is_system_admin")
+        roles & ({"service"} if legacy else {"admin", "manager", "service"})
+        or (not legacy and token_info.get("is_system_admin"))
         or token_info.get("system_scope")
         or token_info.get("domain_scope")
     ):
@@ -402,12 +432,18 @@ async def get_package_member_info(token_info: dict[str, Any] = Depends(require_t
             status_code=403,
             detail={
                 "code": "ADMIN_CREDENTIAL_FORBIDDEN",
-                "message": "Administrative or service tokens cannot authorize package access",
+                "message": "This token cannot authorize project-user publication",
             },
         )
-    owner = await asyncio.to_thread(validate_package_owner, token_info["user_id"], token_info["project_id"])
+    if legacy:
+        owner = await asyncio.to_thread(
+            _validate_project_user, token_info["user_id"], token_info["project_id"], legacy=True
+        )
+    else:
+        owner = await asyncio.to_thread(validate_package_owner, token_info["user_id"], token_info["project_id"])
     try:
-        token_roles = _effective_role_names(token_info["role_ids"], owner["role_directory"])
+        role_names = _legacy_role_names if legacy else _effective_role_names
+        token_roles = role_names(token_info["role_ids"], owner["role_directory"])
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=503, detail="Current Keystone role bindings are unavailable") from None
     token_capabilities = package_capabilities(token_roles)
@@ -424,6 +460,15 @@ async def get_package_member_info(token_info: dict[str, Any] = Depends(require_t
         "package_capabilities": capabilities,
         "can_write": "palimpsest-publish_editor" in capabilities,
     }
+
+
+async def get_package_member_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+    return await _member_info(token_info, legacy=False)
+
+
+async def get_legacy_member_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:
+    """Admins publish as original project users with current ordinary service leaves."""
+    return await _member_info(token_info, legacy=True)
 
 
 def require_admin(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:

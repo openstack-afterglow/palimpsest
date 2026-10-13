@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.api import hub as legacy
 from palimpsest_hub.api import packages
-from palimpsest_hub.auth import get_package_member_info, package_capabilities
+from palimpsest_hub.auth import get_legacy_member_info, get_package_member_info, package_capabilities
 from palimpsest_hub.models import (
     Base,
     PackageCache,
@@ -232,6 +232,7 @@ async def hub(tmp_path, monkeypatch):
     app.include_router(packages.router, prefix="/v1")
     app.include_router(legacy.router, prefix="/v1")
     app.dependency_overrides[get_package_member_info] = member_dependency
+    app.dependency_overrides[get_legacy_member_info] = member_dependency
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
         yield SimpleNamespace(
             client=client, store=blob_store, factory=factory, settings=settings, people=people, disabled=disabled
@@ -636,7 +637,7 @@ async def test_protected_and_admin_member_tokens_and_empty_policy_fail_closed(hu
     for person in ("admin", "protected"):
         context = await hub.client.get("/v1/projects/current", headers={"X-Auth-Token": person})
         assert context.status_code == 403
-        assert (await hub.client.post("/v1/uploads", headers={"X-Auth-Token": person}, json={})).status_code == 403
+    assert (await hub.client.post("/v1/uploads", headers={"X-Auth-Token": "protected"}, json={})).status_code == 403
     hub.settings.palimpsest_hub_package_forbidden_user_ids = ()
     assert (await hub.client.get("/v1/projects/current", headers={"X-Auth-Token": "one"})).status_code == 503
     assert not hub.store.uploads_dir.exists()
