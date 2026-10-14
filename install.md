@@ -1,33 +1,33 @@
 # Install Palimpsest
 
-Palimpsest requires Python 3.11 or newer. Latest dev's release baseline is
-[`palimpsest-client 0.3.4`](https://pypi.org/project/palimpsest-client/0.3.4/);
-this integration prepares unpublished 0.3.5. Install released bytes in isolation:
+Palimpsest requires Python 3.11 or newer. The current release is
+[`palimpsest-client 0.3.5`](https://pypi.org/project/palimpsest-client/0.3.5/),
+released on 2026-10-14. Install released bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.4"
+uv tool install --python 3.11 "palimpsest-client==0.3.5"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.4"
+.venv/bin/python -m pip install "palimpsest-client==0.3.5"
 .venv/bin/palimpsest --version
 ```
 
-This checkout declares 0.3.5 and includes preserved **unreleased** local web,
-runtime, cache, user-default/help/completion work. To use its bytes, run `uv tool install
---force --python 3.11 .` from this trusted checkout, or `python -m pip install .`
-inside a virtual environment. A remote branch/PyPI install does not include
+Released 0.3.5 includes the integrated local web, runtime, cache and
+user-default/help/completion work. To use a trusted checkout's exact bytes,
+run `uv tool install --force --python 3.11 .`, or `python -m pip install .`
+inside a virtual environment. Remote branch/PyPI installation does not include
 uncommitted edits. Do not infer source identity from the version alone.
 If uv's bin directory is not on `PATH`, explicitly run `uv tool update-shell`
 and open a new terminal. Hub is a separate distribution/deployment; a client
 upgrade does not publish or roll out Hub images.
 
-Release `v0.3.3` is the separately reviewed Hub-management source at
-`7186abf7844454eda7ed86a215192b33b9250ff8`, not this shared checkout's local
-dashboard refresh or unreleased runtime changes. Its PyPI client ran on
-Python 3.11.15; canonical Hub images are amd64-only and production rollout
-still requires separate approval. See the [publication handoff](docs/development-handoff.md#approved-hub-033-publication-progression--2026-10-11-separate-clean-source).
+Release `v0.3.5` follows protected-dev PR #24 and merge
+`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. PyPI/GHCR publication and
+production Hub on `dms-controller1` plus the dedicated build-worker VM rollout
+are recorded in [release receipts](docs/testing.md#full-source-035-integration--local-verification).
+Native KVM proof was NOT performed: repository-policy skip, exactly as for 0.3.4.
 
 ## 1. Install the Local CLI
 
@@ -113,11 +113,12 @@ Uvicorn dependencies. Its service entrypoints require database, Redis, local
 storage, and OpenStack settings before startup.
 
 Repository tags also drive GHCR image tags for
-`ghcr.io/openstack-afterglow/palimpsest-hub-api` and
-`ghcr.io/openstack-afterglow/palimpsest-hub-worker`; image tags follow the
-repository tag, not the independently versioned Hub wheel. The Kolla role in
-this candidate source tree defaults to Hub image tag `0.3.5`; verify exact reviewed
-API/export/build-worker images and platform manifests before deployment.
+`ghcr.io/openstack-afterglow/palimpsest-hub-api`,
+`ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
+`ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
+repository tag, not the independently versioned Hub wheel. The released Kolla
+role defaults to Hub image tag `0.3.5`; verify exact reviewed API/export/build-worker
+digests and platform manifests before any future deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly
 disabled/skipped; disabled publication is **not native qualification**.

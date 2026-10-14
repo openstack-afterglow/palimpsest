@@ -3,25 +3,25 @@
 This guide covers end-user installation from PyPI or a GitHub VCS URL,
 package selection, supported host/runtime combinations, external dependencies,
 initial configuration, upgrades, and administrator-owned Linux deployment.
-Released installations use pinned published bytes; trusted local installation below is only for unreleased working-source behavior.
+Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` is the 0.3.4 release
-baseline. This isolated full-source tree prepares **unpublished 0.3.5** for
-root/Hub metadata, modules, native-generated locks and Kolla image defaults.
-Install released client bytes with `uv tool install --python 3.11
-palimpsest-client==0.3.4`, or install the actual trusted local checkout with
-`uv tool install --force --python 3.11 .`. A remote package/branch cannot contain
-uncommitted WIP; a root wheel upgrade neither deploys Hub nor qualifies native
-execution. Git/outbound GitHub HTTPS is needed only for VCS installation.
+Palimpsest 0.3.5 was released on 2026-10-14 from protected dev merge
+`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Root/Hub metadata, modules,
+native-generated locks and Kolla image defaults are 0.3.5. Install released
+client bytes with `uv tool install --python 3.11 palimpsest-client==0.3.5`, or
+install the actual trusted local checkout with
+`uv tool install --force --python 3.11 .`. A root wheel upgrade neither
+deploys Hub nor qualifies native execution. Git/outbound GitHub HTTPS is
+needed only for VCS installation.
 
-**0.3.5 full-source integration (not committed, published or deployed):** retains the latest HTTPS-only private build plane and authorization while integrating distributed export ownership and local/client WIP. This assignment performs no tests/builds/lint/format/runtime proofs or operator mutation. Historical approval, deployment, publication and authentication receipts below retain their dated ref/resource boundary and are not current candidate acceptance. The API never runs recipes; the CPU-only service VM receives verified HTTPS, a private keyfile and local scratch only. Follow the offline drain/schema/paired-storage restore checklist before any separately authorized rollout.
+**0.3.5 release and production:** retains the latest HTTPS-only private build plane and authorization while integrating distributed export ownership and local/client work. PyPI/GHCR publication and the controller1 Hub plus dedicated build-worker VM rollout completed on 2026-10-14; see [CI, publication and production receipts](testing.md#full-source-035-integration--local-verification), including evidence-based `claim_pending` recovery. Native KVM proof was NOT performed (repository-policy skip, as for 0.3.4); idle polling does not prove live recipe execution. Historical approval, deployment, publication and authentication receipts below retain their dated ref/resource boundary. The API never runs recipes; the CPU-only service VM receives verified HTTPS, a private keyfile and local scratch only. Follow the offline drain/schema/paired-storage restore checklist before any separately authorized rollout.
 
-The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Afterglow's effective Hub transport is already `https://palimpsest.dmslab.re.kr` and certificate-verified requests from its running backend returned HTTP 200. The dedicated Hub validator authenticated with only system `reader`. These checks concern the existing deployment, not acceptance of the candidate.
+The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Historical transport/validator checks observed Afterglow's Hub transport as `https://palimpsest.dmslab.re.kr`, certificate-verified backend requests returning HTTP 200, and a dedicated Hub validator authenticated with only system `reader`; these do not qualify current requester reads/writes. The 0.3.5 rollout separately observed Hub health 200 direct/public and unauthenticated `/v1/me` 401.
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
 
-**Observed operations, 2026-10-13/14 (not 0.3.4 acceptance):** canonical Kolla
+**Historical operations, 2026-10-13/14 (0.3.3, not current production):** canonical Kolla
 deployment put API/export-worker 0.3.3 on `dms-controller1`. The observed immutable live refs were:
 
 - API: `ghcr.io/openstack-afterglow/palimpsest-hub-api@sha256:cb5b32ef81f8db0380821146d50eed0f4eba9b26a4361a177fa0e1cef96ef979`
@@ -41,7 +41,7 @@ a deployed worker, completed build or native qualification.
 ### Historical 0.3.1 release and cutover record
 
 The following pins and held-rollout record describe historical 0.3.1, not
-current production or the unpublished 0.3.5 integration. Their backup,
+current production or the released 0.3.5 integration. Their backup,
 authority and recovery prerequisites remain applicable with the exceptions below.
 
 
@@ -387,8 +387,8 @@ the Hub CAS path is passed to the build VM. Integrated ownership bootstrap is de
 
 This heading preserves the original 0.3.4 introduction/link target; the same
 private HTTPS execution boundary is retained by 0.3.5, with API SQL ownership
-and offline additive schema rollout described above/below. It is not current
-candidate publication or native acceptance evidence.
+and offline additive schema rollout described above/below. The original
+introduction is not current publication or native acceptance evidence.
 
 Provision a dedicated Linux x86_64 CPU-only Nova VM in `palimpsest-service`.
 The API admits x86_64 bases only and the executor requires the VM machine to
@@ -507,6 +507,9 @@ receipt within a finite transfer deadline; conflicts return 409. `POST
 or `cleanup_failed` and never downgrades complete. Recipe text is limited to
 1 MiB UTF-8 and JSON envelopes to 6 MiB + 64 KiB.
 
+During planned Hub maintenance, stop/drain the remote build worker before
+stopping the Hub API to avoid an uncertain claim.
+
 Keep scratch private and persistent across restarts. Its `worker.lock` flock
 and `worker.json` journal are recovery authority; do not remove either merely
 to unblock polling. Operator disposition depends on the recorded phase:
@@ -530,8 +533,9 @@ to unblock polling. Operator disposition depends on the recorded phase:
   journal and inspect exact owned processes/mounts/loops; never detach unknown
   loops, kill PID-only matches or erase the tree to manufacture recovery.
 
-These are implemented/source-reviewed recovery contracts, not live recovery
-or native build qualification. The parent records executed acceptance.
+These recovery contracts are source-reviewed; the 0.3.5 production receipt
+records `claim_pending` disposition and resumed idle polling, not native build
+or recipe execution/restart/cleanup qualification.
 
 ### Hub API and worker logs
 
