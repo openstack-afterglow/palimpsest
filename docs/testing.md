@@ -2,12 +2,12 @@
 
 ## Full-source 0.3.5 integration — local verification
 
-Baseline is latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` (0.3.4).
-The isolated, unpublished 0.3.5 clone received the following parent-run local
-qualification on 2026-10-14. These are local/disposable receipts, not CI,
-publication or production evidence. Historical counts below still apply only
-to their recorded source/environment; the earlier SQL/KVM ownership receipt
-does not qualify this HTTPS build cutover.
+Integration began on the 0.3.4 base `ad1674e842c6cefaf4e2d38705b109a579f56040`.
+The isolated 0.3.5 clone received the following parent-run local qualification
+on 2026-10-14 before release. These local/disposable receipts are distinct from
+the hosted CI, publication and production receipts recorded after them below.
+Historical counts still apply only to their recorded source/environment; the
+earlier SQL/KVM ownership receipt does not qualify this HTTPS build cutover.
 
 - **Parent fixes before the passing gates:** `ruff check --fix` corrected nine
   import-order/unused-import issues; `ruff format` formatted 38 root and ten Hub
@@ -58,17 +58,56 @@ does not qualify this HTTPS build cutover.
   **20/20** local runs passed and `tests/unit/test_completion.py` reported
   85 passed, 2 skipped.
 
-Still pending: a PR to protected `dev` with all six strict required hosted
-checks on the submitted ref, an immutable `v0.3.5` tag, PyPI/GHCR publication,
-separately authorized native KVM/BuildKit/cloud proofs, and production rollout
-of the controller1 Hub plus dedicated build-worker VM. No production mutation
-is claimed. The read-only baseline still runs Hub 0.3.4 (`ad1674e`); Hub has no
-migration ledger. Bootstrap `create_all` and an empty-database smoke are **not
-existing-schema compatibility proof**. Rollout requires all-writer drain,
-reviewed offline schema upgrade, paired SQL/CAS backup and isolated restore,
-current requester authority, and actual dedicated-VM build/restart/cleanup
-acceptance. Skipped opt-in lanes and literal native `false/skipped` remain
-explicit absence of qualification.
+**Hosted CI and publication — 2026-10-14:** [PR #24](https://github.com/openstack-afterglow/palimpsest/pull/24)
+passed all six strict required hosted checks on `1ff87efe` and merged into
+protected `dev` as `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Dev CI on
+`04d51ad6` succeeded for Test, Hub images and Development package. The two
+pre-merge fixes were `84e38103` (loopback dashboard bind without reverse DNS)
+and `1ff87efe` (completion-test deflake described above). Annotated `v0.3.5`
+completed the Release workflow (verify, PyPI publish, GitHub release) and the
+Hub image workflow. PyPI `palimpsest-client` 0.3.5 SHA-256 digest prefixes:
+wheel `ad0ee712cecef648`, sdist `f53642bbe1a2d2bb`.
+
+Published GHCR Hub images have amd64 platform, OCI revision `04d51ad6` and
+version label `0.3.5`. Each executed under amd64 with `--network none` and
+successful entry-module import:
+
+| Image (`ghcr.io/openstack-afterglow/`) | Digest |
+| --- | --- |
+| `palimpsest-hub-api` | `sha256:1f61fd0e150f871a5dd5d11dab4f5b18cd41f1c1f076ae6fdd7113bd32bdbc01` |
+| `palimpsest-hub-worker` | `sha256:deca07af481a963c4ac70a4294af92f8451e56b4badeaadba9065357e0fb93fa` |
+| `palimpsest-hub-build-worker` | `sha256:b5cd64562234d57ca9c694ed596978d6dda813219d0bb85f60d8f9ae1e14efb7` |
+
+**Production receipt — 2026-10-14:** canonical Kolla used `--skip-tags haproxy`
+on every action. Hub API and export worker on `dms-controller1` exited 0 after
+a terminal gate (3 builds complete, 1 error). Cold SQL restore matched all
+15 tables and 10 rows exactly; the encrypted cold Hub blob-volume tar was
+884,766,720 bytes. `genconfig` changed nothing; Hub reconfigure was limited
+to `dms-controller1`. `/v1/health` returned 200 direct and public;
+`/v1/me` returned 401 without authentication. Operator `palimpsest-client`
+was promoted to 0.3.5; all 27 installed Kolla role files matched the tag.
+
+The dedicated build-worker VM was upgraded using `palimpsest-build-worker.yml`
+(pull + deploy). Startup halted because the old 0.3.4 worker journaled
+`{"phase": "claim_pending"}` at 10:47:06Z, five seconds after Hub quiesce began
+stopping the API; the claim response was lost. Disposition followed the
+[operational recovery guidance](install.md#claim-execution-and-operational-recovery):
+server state proved no lease could exist—4 builds, all terminal, every
+`lease_expires_at` NULL, last change 2026-10-13 21:19:30Z, and nothing claimable.
+The journal was preserved in the operator backup and VM `/root` before
+`worker.json` was cleared; `worker.lock` was retained. The worker then ran with
+0 restarts, and the Hub logged 16 `/v1/build-worker/claim` responses of 204 in
+two minutes. **Maintenance lesson: stop/drain the remote build worker before
+stopping the Hub API to avoid an uncertain claim.**
+
+**Native KVM proof was NOT performed:** skipped by repository policy exactly
+as for 0.3.4, not qualified. BuildKit/cloud opt-in proofs also remain
+unqualified. Idle polling and this evidence-based uncertain-claim disposition
+do not prove recipe execution, live-build restart/cleanup, requester authority
+or cloud/GPU operation. Hub has no migration ledger; bootstrap `create_all`
+and empty-database smoke are not existing-schema compatibility proof. Future
+cutovers still require all-writer drain, reviewed offline schema upgrade,
+paired SQL/CAS backups and isolated restore, and current requester authority.
 
 Current authoritative root entrypoints (reproduction/selection commands below
 are not additional receipts):

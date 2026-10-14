@@ -13,38 +13,37 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Release baseline:** latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` carries 0.3.4. This full-source integration prepares unpublished 0.3.5, including preserved local/client and distributed export work. Historical live pins and receipts belong to their dated snapshots, not this candidate; see [deployment boundaries](docs/install.md) and [development status](#development).
+- **Release baseline:** 0.3.5 was released on 2026-10-14 from protected dev merge `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`, including preserved local/client and distributed export work. PyPI/GHCR publication and production Hub/build-worker rollout are recorded in [release receipts](docs/testing.md#full-source-035-integration--local-verification); native KVM proof was skipped by repository policy, not performed. Historical live pins and receipts remain bound to their dated snapshots; see [deployment boundaries](docs/install.md) and [development status](#development).
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.4"
+uv tool install --python 3.11 "palimpsest-client==0.3.5"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.4"
+.venv/bin/python -m pip install "palimpsest-client==0.3.5"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.4 palimpsest --version`.
+palimpsest-client==0.3.5 palimpsest --version`.
 
-The published package does not include this working tree's new behavior.
-The Hub 0.3.1 package registry and retained closed-transport pool fix are separate source and must
-be deployed as reviewed API and worker images; updating the root wheel alone
-does not update running Kolla containers.
+The published 0.3.5 package includes the integrated local/client behavior.
+Hub services are separate and must be deployed as reviewed API and worker
+images; updating the root wheel alone does not update running Kolla containers.
 
-The commands above target the 0.3.4 release baseline, not the unpublished 0.3.5
-working source. Client installation does not update running Hub images. The
-dated 0.3.3 operator installation and image receipts remain in the
+The commands above target released 0.3.5. Current publication and production
+receipts are in [testing](docs/testing.md#full-source-035-integration--local-verification).
+The dated 0.3.3 operator installation and image receipts remain in the
 [handoff](docs/development-handoff.md#pypi-operator-transition-and-read-only-cloud-prerequisites);
-they do not establish current production state or qualify this candidate.
+they are historical, not current production state.
 
-### Use the unreleased working source
+### Use a trusted source checkout
 
 From this trusted checkout, install the current bytes rather than a remote branch:
 
@@ -691,8 +690,8 @@ Docker, start a daemon, or turn Docker containers into Palimpsest VMs.
 
 ## Development
 
-Latest dev **0.3.4**, `ad1674e842c6cefaf4e2d38705b109a579f56040`, is the base
-for the isolated **0.3.5 full-source candidate**. Root/Hub metadata, modules,
+Released **0.3.5** integrates the 0.3.4 base
+`ad1674e842c6cefaf4e2d38705b109a579f56040`. Root/Hub metadata, modules,
 native-generated locks and Kolla image tag are 0.3.5. Parent-run local root
 full lane passed **7,064 tests (264 skipped)**; Hub passed **559 (2 skipped)**.
 Ruff lint/format, root lane/OCI-fixture/CLI-reference checks, root package
@@ -702,18 +701,22 @@ all three canonical Hub images built/executed as emulated `linux/amd64` with
 entry-module imports and matching 0.3.5 versions. Parent lint/format and
 test-only context-Dockerfile/output-location fixes preceded these gates;
 production validation is unchanged. See [local receipts and limits](docs/testing.md#full-source-035-integration--local-verification).
-The candidate retains HTTPS-only private build execution and latest native
+The release retains HTTPS-only private build execution and latest native
 authority, integrates distributed SQL export maintenance and preserved local
 web/CLI WIP, and excludes private `test-openrc.sh` from release bytes.
-Still pending: protected-`dev` PR with six required checks, immutable tag,
-PyPI/GHCR publication, native KVM/BuildKit/cloud proofs (opt-in lanes skipped),
-and production controller1 Hub plus dedicated build-worker VM rollout.
-Before rollout, stop/drain every old writer, review the offline schema upgrade
-and prove paired SQL/CAS restore, current requester authority and exact-owned
-recovery. Hub has no migration ledger; bootstrap `create_all` is not an
-existing-schema compatibility proof. Local/emulated/synthetic results and
-native `false/skipped` are not native or production qualification. Historical
-checks and live pins remain dated evidence; see the [handoff](docs/development-handoff.md)
+PR #24 passed all six strict required hosted checks on `1ff87efe` and merged
+into protected dev as `04d51ad6`; dev CI, annotated `v0.3.5` release and
+PyPI/GHCR publication succeeded. Production Hub on `dms-controller1` and the
+dedicated build-worker VM were upgraded after the terminal gate and cold
+backup/restore receipt. The worker resumed idle polling after evidence-based
+`claim_pending` disposition; stop/drain it before stopping the Hub API during
+future maintenance. Native KVM proof was NOT performed (policy-skipped, as
+for 0.3.4); BuildKit/cloud proofs and live recipe execution remain unqualified.
+Hub has no migration ledger; bootstrap `create_all` is not existing-schema
+compatibility proof. Future rollouts retain all-writer drain, offline schema,
+paired SQL/CAS restore, current requester authority and exact-owned recovery
+prerequisites. Local/emulated/synthetic results are not native qualification.
+Historical checks and live pins remain dated evidence; see the [handoff](docs/development-handoff.md)
 and [storage/credential prerequisites](docs/install.md).
 
 
