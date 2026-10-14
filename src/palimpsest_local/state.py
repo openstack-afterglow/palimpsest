@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import pwd
 import re
 import stat as stat_module
 import sys
@@ -467,6 +468,24 @@ def _dump_simple_toml(data: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def uses_system_defaults() -> bool:
+    """Use Linux system paths only for root or the effective service account."""
+    if not sys.platform.startswith("linux"):
+        return False
+    uid = os.geteuid()
+    if uid == 0:
+        return True
+    try:
+        account = pwd.getpwuid(uid)
+    except (KeyError, OSError) as exc:
+        raise StateError("cannot determine effective account for Linux defaults") from exc
+    if account.pw_name != "palimpsest":
+        return False
+    if account.pw_dir != "/var/lib/palimpsest":
+        raise StateError("effective palimpsest account has conflicting system home")
+    return True
+
+
 def state_root_source(environment: dict[str, str] | None = None) -> str:
     env = environment if environment is not None else os.environ
     if env.get("PALIMPSEST_STATE_HOME"):
@@ -519,7 +538,7 @@ def resolve_roots(environment: dict[str, str] | None = None) -> StatePaths:
             state = cfg_state_root
         elif "XDG_STATE_HOME" in env and env["XDG_STATE_HOME"]:
             state = Path(env["XDG_STATE_HOME"]) / "palimpsest"
-        elif sys.platform.startswith("linux"):
+        elif uses_system_defaults():
             legacy_state = Path.home() / ".local" / "state" / "palimpsest"
             try:
                 os.lstat(legacy_state)
@@ -3143,20 +3162,116 @@ def tag_path(roots: StatePaths, tag: str) -> Path:
 
 
 def write_tag_record(roots: StatePaths, record: TagRecord) -> None:
-    target = tag_path(roots, record.tag)
-    lock_path = roots.locks / f"tag-{validate_tag(record.tag)}.lock"
-    with artifact_reference_guard(roots), file_lock(lock_path):
-        if target.exists() and read_tag_record(roots, record.tag).digest != record.digest:
-            raise StateError("tag already maps to a different digest")
-        normalized = normalize_digest(record.digest)
-        blob = roots.store / "blobs" / "sha256" / normalized.split(":", 1)[1]
+    with artifact_reference_guard(roots), pinned_owner_directory(roots.tags) as tags_fd:
+        assert tags_fd is not None
+        _write_tag_record_locked(roots, record, tags_fd=tags_fd)
+
+
+def _write_tag_record_locked(
+    roots: StatePaths,
+    record: TagRecord,
+    *,
+    tags_fd: int,
+    blob_snapshot: os.stat_result | None = None,
+    metadata_snapshot: tuple[int, int, int, int, int] | None = None,
+) -> TagRecord:
+    """Publish relative to pinned tags; caller retains the reference/digest guards."""
+    tag = validate_tag(record.tag)
+    filename = f"{tag}.json"
+    normalized = normalize_digest(record.digest)
+    blob = roots.store / "blobs" / "sha256" / normalized.split(":", 1)[1]
+    pinned_tags = os.fstat(tags_fd)
+
+    def verify_authority() -> None:
+        try:
+            visible = os.stat(roots.tags, follow_symlinks=False)
+        except OSError:
+            raise StateError("tag directory changed during publication") from None
+        if not stat_module.S_ISDIR(visible.st_mode) or (visible.st_dev, visible.st_ino) != (
+            pinned_tags.st_dev,
+            pinned_tags.st_ino,
+        ):
+            raise StateError("tag directory changed during publication")
         try:
             entry = blob.stat(follow_symlinks=False)
         except OSError:
             raise StateError("tag references a missing artifact") from None
         if not stat_module.S_ISREG(entry.st_mode):
             raise StateError("tag references an unsafe artifact")
-        atomic_write_json(target, asdict(record))
+        if blob_snapshot is not None and (
+            entry.st_dev,
+            entry.st_ino,
+            entry.st_mode,
+            entry.st_uid,
+            entry.st_gid,
+            entry.st_nlink,
+            entry.st_size,
+            entry.st_mtime_ns,
+            entry.st_ctime_ns,
+        ) != (
+            blob_snapshot.st_dev,
+            blob_snapshot.st_ino,
+            blob_snapshot.st_mode,
+            blob_snapshot.st_uid,
+            blob_snapshot.st_gid,
+            blob_snapshot.st_nlink,
+            blob_snapshot.st_size,
+            blob_snapshot.st_mtime_ns,
+            blob_snapshot.st_ctime_ns,
+        ):
+            raise StateError("verified artifact changed during tag publication")
+        if metadata_snapshot is not None:
+            with pinned_owner_directory(roots.store / "metadata") as metadata_fd:
+                assert metadata_fd is not None
+                current = _read_pinned_json_object_snapshot(metadata_fd, f"{normalized.split(':', 1)[1]}.json")[1]
+            if current != metadata_snapshot:
+                raise StateError("artifact metadata changed during tag publication")
+
+    def existing_binding() -> TagRecord | None:
+        try:
+            os.stat(filename, dir_fd=tags_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        existing = read_tag_record_snapshot_at(tags_fd, tag)[0]
+        if existing.digest != normalized:
+            raise StateError("tag already maps to a different digest")
+        return existing
+
+    temporary = f".tag-tmp-{uuid.uuid4().hex}"
+    with file_lock(roots.locks / f"tag-{tag}.lock"):
+        existing = existing_binding()
+        verify_authority()
+        if existing is not None:
+            return existing
+        payload = asdict(record)
+        _reject_secrets(payload)
+        content = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+            fd = os.open(temporary, flags, 0o600, dir_fd=tags_fd)
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, content)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            verify_authority()
+            existing = existing_binding()
+            if existing is not None:
+                return existing
+            os.replace(temporary, filename, src_dir_fd=tags_fd, dst_dir_fd=tags_fd)
+            temporary = ""
+            os.fsync(tags_fd)
+            verify_authority()
+            return record
+        except OSError:
+            raise StateError("cannot durably publish local tag") from None
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=tags_fd)
+                except FileNotFoundError:
+                    pass
 
 
 def read_tag_record(roots: StatePaths, tag: str) -> TagRecord:

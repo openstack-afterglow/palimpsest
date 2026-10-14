@@ -1,7 +1,7 @@
 # Palimpsest Local
 
-`palimpsest-client` 0.3.1 is the published root Python 3.11+
-distribution for managing Palimpsest boot images, SquashFS layers, OCI-layout
+`palimpsest-client` is a Python 3.11+ distribution for managing
+Palimpsest boot images, SquashFS layers, OCI-layout
 bundles, and local layered virtual machines. The Python module remains
 `palimpsest_local` and the CLI remains `palimpsest`. Local artifacts, tags,
 run state, and build records live
@@ -13,23 +13,53 @@ dependencies; Linux KVM support is an opt-in extra.
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Published release:** [`palimpsest-client` 0.3.3 on PyPI](https://pypi.org/project/palimpsest-client/0.3.3/) and [GitHub Release `v0.3.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.3). API/export-worker 0.3.3 images are running on the existing Kolla controller placement; the 0.3.4 remote-build candidate is unpublished and undeployed. Publication and health checks do not establish native qualification; see [deployment boundaries](docs/install.md) and [development status](#development).
+- **Release baseline:** latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` carries 0.3.4. This full-source integration prepares unpublished 0.3.5, including preserved local/client and distributed export work. Historical live pins and receipts belong to their dated snapshots, not this candidate; see [deployment boundaries](docs/install.md) and [development status](#development).
 
 ## Install from PyPI
 
-Requires Python 3.11 or newer:
+Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-python3.12 -m pip install "palimpsest-client==0.3.1"
+uv tool install --python 3.11 "palimpsest-client==0.3.4"
 palimpsest --version
+
+# Alternative: pip, without modifying the system Python.
+python3.11 -m venv .venv
+.venv/bin/python -m pip install "palimpsest-client==0.3.4"
+.venv/bin/palimpsest --version
 ```
 
-For an isolated one-off invocation, `uvx --from palimpsest-client==0.3.1 palimpsest --version` was exercised against PyPI and reports `0.3.1`.
+If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
+and open a new terminal. One-off use: `uvx --python 3.11 --from
+palimpsest-client==0.3.4 palimpsest --version`.
 
-The published commands above install the 0.3.1 client.
+The published package does not include this working tree's new behavior.
 The Hub 0.3.1 package registry and retained closed-transport pool fix are separate source and must
 be deployed as reviewed API and worker images; updating the root wheel alone
 does not update running Kolla containers.
+
+The commands above target the 0.3.4 release baseline, not the unpublished 0.3.5
+working source. Client installation does not update running Hub images. The
+dated 0.3.3 operator installation and image receipts remain in the
+[handoff](docs/development-handoff.md#pypi-operator-transition-and-read-only-cloud-prerequisites);
+they do not establish current production state or qualify this candidate.
+
+### Use the unreleased working source
+
+From this trusted checkout, install the current bytes rather than a remote branch:
+
+```sh
+uv tool install --force --python 3.11 .
+# Or, inside a Python 3.11+ virtual environment:
+python -m pip install .
+
+palimpsest
+palimpsest store ls --kind image
+palimpsest completion zsh --install  # select bash or fish instead if appropriate
+```
+
+Installation does not edit shell profiles; the final command explicitly opts in.
+No commit, push, package publication, or server setup is implied.
 
 ## Install directly from GitHub
 
@@ -112,10 +142,12 @@ Skopeo, or other host executables. `palimpsest-hub` is a separate server
 distribution with FastAPI, OpenStack, Redis, and SQL dependencies. Use the same
 commit ref for Local and Hub to avoid source skew.
 
-On Linux, select a private `XDG_STATE_HOME` for user-owned artifact workflows or
-use the explicit administrator-managed account and storage provisioner. Package
-installation never creates accounts, changes privileged groups, writes sudoers
-policy, or initializes mutable state.
+In this working source, ordinary Linux users use their existing private home
+state and automatically provision its private command journal; no state/log
+environment variables are required. Root and the dedicated `palimpsest` service
+account retain administrator-managed system paths. Package installation itself
+never creates accounts, changes privileged groups, writes sudoers policy, or
+initializes mutable state.
 
 See the [short install guide](install.md), [detailed package/platform/configuration
 guide](docs/install.md), [command workflows](docs/cli/workflows.md), and
@@ -166,13 +198,13 @@ Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using t
 
 The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Native package browsing/publication is a separate console credential domain: original member tokens handle member controls, while `ppk_v1_…` package keys handle native writes. Neither credential is substituted for the other; connection changes cancel tab-controlled work without automatic re-publication.
 
-Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, and has separate project-scoped package and BuildKit-cache APIs. Native package keys authorize those package/cache operations; legacy artifact commands still use the original Keystone token. `POST /v1/builds` queues a system-admin/project-scoped build; `GET /v1/builds` and `GET /v1/builds/{id}` report its project-scoped state. In the 0.3.4 source candidate, a dedicated CPU-only Nova service VM claims jobs over verified HTTPS and runs recipes directly, registering successful outputs through the API as private project layers. No nested/per-build KVM or libvirt is needed. The API container never executes recipes. Hub is not a Docker/OCI `/v2` registry: profiles explicitly select native `palimpsest` or Docker/OCI `oci` transport.
+Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, with separate project-scoped package/BuildKit-cache APIs. Native package keys authorize only package/cache operations; legacy commands retain the original Keystone token. `POST /v1/builds` queues system-admin/project-scoped work and GET routes report project state. The retained 0.3.4 HTTPS-only dedicated CPU service-VM executor is also the 0.3.5 contract: direct recipe execution and API-registered private project outputs, no nested/per-build KVM/libvirt or API-container recipe execution. Hub is not a Docker/OCI `/v2` registry; profiles explicitly select `palimpsest` or `oci` transport.
 
 ### Entrypoints & Docker Targets
 
 - **Hub API:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`; `/app` serves the web console).
 - **Async Export Worker:** `python -m palimpsest_hub.worker` (Docker target `palimpsest-hub-worker`).
-- **Isolated Build Worker (0.3.4 candidate):** `palimpsest-hub-build-worker` (Docker target `palimpsest-hub-build-worker`) runs as root in a dedicated CPU-only Linux service VM in the `palimpsest-service` project. It receives only a verified Hub HTTPS origin, owner-only keyfile and local scratch/limits, never SQL, CAS/NFS, Redis or Keystone credentials. Configure `PALIMPSEST_HUB_BUILD_WORKER_KEY` on the API; without it, build admission returns 503 `isolated build worker is not configured`. The privileged VM is the kernel boundary; no Docker socket or controller recipe execution. See [remote worker deployment and recovery](docs/install.md#remote-build-worker-deployment-034-source-candidate).
+- **Isolated Build Worker:** `palimpsest-hub-build-worker` (Docker target `palimpsest-hub-build-worker`) runs as root in a dedicated CPU-only Linux service VM in `palimpsest-service`. It receives only verified Hub HTTPS, an owner-only keyfile and local scratch/limits, never SQL, CAS/NFS, Redis or Keystone credentials. Configure `PALIMPSEST_HUB_BUILD_WORKER_KEY` on the API; absent configuration denies build admission with 503. SQL fencing belongs to the API; worker-local flock protects its private journal. See [remote worker deployment and recovery](docs/install.md#remote-build-worker-deployment-034-source-candidate).
 - **Database Bootstrap:** `python -m palimpsest_hub.bootstrap` creates the destination schema.
 - **Data Migration:** `python -m palimpsest_hub.migrate --source-url "$SOURCE_DATABASE_URL" --destination-url "$DESTINATION_DATABASE_URL"` copies source tables into an empty initialized destination; it is not bootstrap.
 
@@ -257,10 +289,11 @@ palimpsest bundle pull sha256:<leaf-layer-digest> --include-base --output ./bund
 palimpsest bundle verify ./bundle
 ```
 
-Local artifacts live below the selected state root. The unconfigured Linux
-default is `/var/lib/palimpsest`; an explicit `XDG_STATE_HOME` selects
-`${XDG_STATE_HOME}/palimpsest`, and other platforms default to
-`~/.local/state/palimpsest`:
+Local artifacts live below the selected state root. Ordinary Linux users and
+macOS default to `~/.local/state/palimpsest`; Linux root and the dedicated
+`palimpsest` system account default to `/var/lib/palimpsest`. Explicit
+`PALIMPSEST_STATE_HOME`, config, and `XDG_STATE_HOME` overrides retain precedence;
+existing data is not relocated:
 
 ```text
 store/       content-addressed blobs and metadata
@@ -291,10 +324,10 @@ This requires the qualified SquashFS packer (`/usr/bin/mksquashfs` by default)
 and currently supports `linux/amd64`. It produces verified layer artifacts,
 not a running VM by itself. Public local OCI-root `run/-d` and the protected-root
 Gate 2 have separate qualified proofs on Linux/x86_64 KVM; see the
-[public-runtime roadmap](docs/oci-public-runtime-roadmap.md). Docker Hub
-references are not accepted directly by OCI-root `run`; `oci pull` first
-terminates acquisition at the verified local archive boundary, while the Docker
-`pull` wrapper does not bridge into that runtime. See the
+[public-runtime roadmap](docs/oci-public-runtime-roadmap.md). `run IMAGE` now
+resolves local sources first and acquires missing OCI references through
+configured profiles; only verified local archives cross into the runtime.
+The explicit anonymous `oci pull` command remains available. See the
 [anonymous registry intake contract](docs/registry-intake.md) and
 [Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
 digest-preserving local-archive workflow and its real-image verification scope.
@@ -354,7 +387,7 @@ palimpsest build . \
   --runtime-push
 ```
 
-Online builds require digest-pinned remote bases/frontends and mandatory native cache authorization for `cache:read` **and** `cache:write` on an exact package before builder preflight. Native output defaults cache selection to its profile and namespace/package. OCI output, as above, requires both `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE`, even when `PALIMPSEST_TOKEN` is set. The cache is Hub-first, digest-verified and fail-closed; every online build refreshes it. Local generations and remote fallback are partitioned by project/package, cache scope, platform and builder fingerprint. OCI external cache definitions are additive only. `--push` uses Buildx for OCI profiles and the native package API for native profiles; `--runtime-push` uses the separate original-token legacy Hub path for SquashFS. No unqualified cache writes are allowed.
+The default `--cache-mode native` requires digest-pinned remote bases/frontends and native cache authorization for `cache:read` **and** `cache:write` on an exact package before builder preflight. Native output defaults cache selection to its profile and namespace/package. OCI output in this mode requires both `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE`, even when `PALIMPSEST_TOKEN` is set. The cache is Hub-first, digest-verified and fail-closed; every online native-cache build refreshes it. Local generations and remote fallback are partitioned by project/package, cache scope, platform and builder fingerprint. OCI external cache definitions are additive only in native cache mode. `--cache-mode local --registry docker` instead uses managed host cache without Hub authorization; it rejects native/external cache selection and permits `--no-cache`. It is not strict offline mode. `--push` uses Buildx for OCI profiles and the native package API for native profiles; `--runtime-push` uses the separate original-token legacy Hub path for SquashFS. No unqualified native cache writes are allowed.
 
 Strict `--offline` uses only verified local OCI layouts and local cache with `--network none`. It never loads `registries.toml` or resolves profiles, never authenticates and never constructs a Hub or registry client, so it writes no typed native package references. It rejects `--registry` ("--offline cannot select an external registry"), `--cache-registry`, `--cache-package`, `--pull`, both push flags and external caches. To publish an offline result, run a native `push --input ARCHIVE --manifest sha256:...` afterwards. Docker may still read `DOCKER_CONFIG` to locate the existing local builder. Profiles do not rewrite Dockerfile `FROM` lines. See [BuildKit cache and block runtime workflow](docs/buildkit-block-workflow.md) for cache bindings, runtime upload and remaining acceptance gates.
 
@@ -551,7 +584,7 @@ palimpsest run
 palimpsest start
 palimpsest compose config|up|down|ps|logs|exec|stop|port
 palimpsest ps|inspect|logs|shell|exec|stop|rm|commit
-palimpsest ui                                # read-only local monitoring dashboard (--allow-control for changes)
+palimpsest web                               # foreground local dashboard; no Hub required
 palimpsest store show|ls|rm|move|set         # storage state & artifact management
 palimpsest completion zsh|bash|fish          # shell completion generator
 ```
@@ -561,9 +594,50 @@ Use `palimpsest <command> --help` for exact arguments. The checked generated
 [command workflow catalog](docs/cli/workflows.md) documents the per-command
 order, configuration, and platform limits with Archify workflow diagrams.
 
+## Local web dashboard
+
+```sh
+palimpsest web                    # read-only dashboard; opens a browser
+palimpsest web --no-browser       # print the URL without opening a browser
+palimpsest web --allow-control    # enable build/run, consoles and resource controls
+```
+
+The loopback server runs only while this foreground command runs. Ctrl-C stops
+it; installation and other CLI commands do not start a background web service.
+Hub configuration is unnecessary: local images, retained acquired sources,
+BuildKit exports, build logs, VM observations, volumes, networks and storage are
+available independently. With `--allow-control`, build images using inline
+Dockerfile editing and local host cache, run local or automatically acquired OCI
+references, and open capability-aware VM consoles. Build/run operations expose
+bounded asynchronous output. Conventional shells use a PTY; OCI-root consoles
+use non-TTY guest exec. Console disconnect does not stop the VM.
+Five-second refresh can be paused. Image availability is a file observation,
+not digest verification or proof that OCI-root execution works. Automatic OCI
+run remains Linux amd64 KVM-only; local cache mode does not itself prohibit
+remote Dockerfile inputs.
+
+The desktop-style VM list provides explicit Console/Details actions and
+Logs, Terminal, Resources and Details tabs. Open detail collects real bounded
+Linux guest journal, CPU/memory/filesystem, interface and per-device disk counters;
+first samples and unavailable/stale measurements are labelled, not guessed.
+Marked external Lima VMs can expose authenticated guest access without adoption;
+start/stop/remove still require an exact selected-owned run. Drawer/tab/chart
+motion respects reduced-motion settings. Normal dashboard shutdown retains the
+original OCI result owners through bounded drain/ACK, never command retry or VM stop.
+`ps`, `volumes`, `networks` and `compose ps` align complete cell widths without
+truncating names or changing JSON. For macOS HVF from a source checkout, retain
+the optional binding with `uv run --frozen --extra kvm palimpsest web --allow-control`.
+Backend availability first checks host compatibility: macOS does not probe the
+Linux KVM/system libvirt connection, while libvirt/HVF observes the session daemon.
+Reload-cancelled response writes close that request without an extra error response;
+internal application errors still return HTTP 500 and log their traceback.
+Use [`web` usage](docs/cli/usage.md#local-store-and-ui) for editing safeguards
+and remote SSH forwarding. The former `ui` command is replaced by `web`.
+
+
 ## Shell completion
 
-Palimpsest provides dynamic shell completion for `zsh`, `bash`, and `fish`. Completion follows the live CLI `argparse` tree dynamically and suppresses unrelated filesystem suggestions. The `palimpsest` executable (or active virtual environment) must be active and on your `PATH`. Installing the package does not silently modify shell configuration files.
+Palimpsest provides dynamic completion for `zsh`, `bash`, and `fish`. Palimpsest candidates come from the live `argparse` tree; `palimpsest docker ...` delegates to the installed Docker CLI's native `__complete` protocol, including Buildx/plugin commands and option values. Zsh/Fish show command and option descriptions; Bash inserts literal values. Docker calls have a two-second deadline and a 1 MiB output cap. Docker-directed file/directory completion is supported; unrelated Palimpsest positionals do not fall back to filesystem suggestions. Keep the installed executable on `PATH`. Installing the Python package never edits shell configuration.
 
 ### Current shell activation
 
@@ -581,44 +655,66 @@ palimpsest completion fish | source
 
 ### Persistent setup
 
-To make completion persistent across terminal sessions, add the matching lines to your shell configuration:
-The Zsh and Bash startup forms require `palimpsest` on `PATH` when the shell starts. With a project-local virtual environment, use the current-shell activation after `source .venv/bin/activate`.
+Opt in once for the shell you use, then open a new interactive shell:
 
 ```sh
-# Zsh: add both lines to ~/.zshrc
-autoload -Uz compinit && compinit
-eval "$(palimpsest completion zsh)"
-
-# Bash: add this guarded line to ~/.bashrc
-if command -v palimpsest >/dev/null 2>&1; then source <(palimpsest completion bash); fi
-
-# Fish:
-mkdir -p ~/.config/fish/completions
-palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
+palimpsest completion zsh --install
+# Alternatives:
+palimpsest completion bash --install
+palimpsest completion fish --install
 ```
+
+Targets: `$ZDOTDIR/.zshrc` (otherwise `~/.zshrc`), `~/.bashrc`, or
+`${XDG_CONFIG_HOME:-~/.config}/fish/completions/palimpsest.fish`.
+Bash login profiles must already source `.bashrc`; they are not modified.
+Exact reinstalls leave the file unchanged. Edited/outdated managed blocks,
+existing different Fish files, symlinks, hardlinks, foreign/shared-writable
+targets and observed concurrent edits are refused rather than overwritten.
+Review/remove the managed block or file before replacing it after an upgrade.
+Use physical absolute environment paths; atomic replacement preserves mode and
+unrelated bytes, not ACLs/xattrs, and is not a filesystem compare-and-swap.
 
 ### Completion expectations
 
 Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matching the live CLI tree:
 
-- `palimpsest <Tab><Tab>` → suggests top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `ui`, `store`, etc.)
+- `palimpsest <Tab><Tab>` → suggests top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `web`, `store`, etc.)
 - `palimpsest image <Tab><Tab>` → suggests subcommands (`inspect`, `history`, `rm`, `save`, `load`, `ls`, `pull`, `verify`, `import`, `push`)
 - `palimpsest run --backend <Tab><Tab>` → suggests backend choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
+- `palimpsest docker <Tab><Tab>` → native Docker commands and descriptions
+- `palimpsest docker run --<Tab><Tab>` → native run options and descriptions
+- `palimpsest docker buildx build --p<Tab>` → installed Buildx options
+
+Use `palimpsest docker run --help` for the installed Docker version's full help.
+Docker completion requires a CLI supporting `__complete`; it does not install
+Docker, start a daemon, or turn Docker containers into Palimpsest VMs.
 
 ## Development
 
-Published **0.3.3** is the base for the isolated **0.3.4 candidate** on upstream
-dev `7186abf7844454eda7ed86a215192b33b9250ff8`. Candidate metadata, modules,
-locks and Kolla image tag are 0.3.4; it is not committed, published or deployed.
-The owner approved the 2026-10-14 scoped iterative Hub build/upload/consume loop:
-branch push → protected dev PR → required checks → merge → immutable v0.3.x tag
-→ PyPI/GitHub/GHCR → operator PyPI pin → Kolla deploy. This excludes main
-promotion and CI protection changes and preserves the
-[storage/credential prerequisites](docs/install.md). Native qualification is
-pending until the parent records it; an explicit native `false/skipped` is not
-qualification. Historical 0.3.1 receipts remain in
-[publication and runtime evidence](docs/testing.md#published-031-verification);
-the handoff owns current verification and live-operation evidence.
+Latest dev **0.3.4**, `ad1674e842c6cefaf4e2d38705b109a579f56040`, is the base
+for the isolated **0.3.5 full-source candidate**. Root/Hub metadata, modules,
+native-generated locks and Kolla image tag are 0.3.5. Parent-run local root
+full lane passed **7,064 tests (264 skipped)**; Hub passed **559 (2 skipped)**.
+Ruff lint/format, root lane/OCI-fixture/CLI-reference checks, root package
+build/install smoke, Hub wheel/sdist build and Python 3.11 CLI version smoke
+passed. Separate disposable MariaDB SQL/process ownership passed **2** cases;
+all three canonical Hub images built/executed as emulated `linux/amd64` with
+entry-module imports and matching 0.3.5 versions. Parent lint/format and
+test-only context-Dockerfile/output-location fixes preceded these gates;
+production validation is unchanged. See [local receipts and limits](docs/testing.md#full-source-035-integration--local-verification).
+The candidate retains HTTPS-only private build execution and latest native
+authority, integrates distributed SQL export maintenance and preserved local
+web/CLI WIP, and excludes private `test-openrc.sh` from release bytes.
+Still pending: protected-`dev` PR with six required checks, immutable tag,
+PyPI/GHCR publication, native KVM/BuildKit/cloud proofs (opt-in lanes skipped),
+and production controller1 Hub plus dedicated build-worker VM rollout.
+Before rollout, stop/drain every old writer, review the offline schema upgrade
+and prove paired SQL/CAS restore, current requester authority and exact-owned
+recovery. Hub has no migration ledger; bootstrap `create_all` is not an
+existing-schema compatibility proof. Local/emulated/synthetic results and
+native `false/skipped` are not native or production qualification. Historical
+checks and live pins remain dated evidence; see the [handoff](docs/development-handoff.md)
+and [storage/credential prerequisites](docs/install.md).
 
 
 ### Resume ongoing development

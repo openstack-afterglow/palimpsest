@@ -37,11 +37,11 @@ Three similarly named image surfaces are intentionally separate:
 | --- | --- | --- | --- |
 | Palimpsest Hub artifacts | `image ls/pull/verify/import/push`, `layer *`, `bundle *` | Native Hub `/v1` | `PALIMPSEST_TOKEN` |
 | Docker image operations | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `image inspect/history/rm/save/load`, `docker` | Installed Docker CLI and OCI registries | Docker credential store |
-| Local OCI root | `oci pull`, `oci materialize`, `run ... --runtime-kind oci-root`, OCI evidence commands | Skopeo intake, private source CAS, Linux KVM runtime | Anonymous HTTPS intake plus local host/runtime permissions |
+| OCI root | `oci pull`, `oci materialize`, `run IMAGE`, OCI evidence commands | local-first resolution, Skopeo intake, private source CAS, Linux KVM runtime | Docker registry credentials for automatic acquisition; anonymous HTTPS for `oci pull`; local host/runtime permissions |
 
-Do not pass a Hub `/v1` endpoint to Docker commands. Do not pass a registry
-reference directly to `run`; `oci pull` must first publish a verified local OCI
-archive.
+Do not pass a Hub `/v1` endpoint to Docker commands. `run IMAGE` resolves local
+sources before automatic OCI acquisition; the runtime consumes only verified
+local bytes, never a remote registry or Docker's mutable image store directly.
 
 ### Setting precedence
 
@@ -284,7 +284,8 @@ Key invariants:
 
 - Offline mode requires `--network none`; it rejects pull/push, registry, and
   external cache endpoints.
-- `--no-cache` is offline-only. Online builds reuse Hub cache.
+- `--no-cache` requires offline or local cache mode. Online native-cache builds reuse Hub cache.
+- `--cache-mode local` requires OCI output and rejects native/external cache authorities; it does not forbid remote inputs by itself.
 - `--runtime-tag` and `--runtime-base` appear together; `--runtime-push`
   requires both.
 - `--local-image` pins an absolute OCI layout and manifest digest.
@@ -464,17 +465,33 @@ leased objects; `--force` does not bypass those safety checks.
 ### Start the local dashboard
 
 ```sh
-palimpsest ui --port 8080 --no-browser
+palimpsest web --port 8080 --no-browser
 ```
 
 The default `--port 0` chooses an available loopback port; explicit ports are
 1024–65535. Open the printed `http://127.0.0.1:PORT/?token=...` URL; the
-process stays in the foreground until interrupted. The dashboard reads through
-the same Local inventory layer as CLI commands and shows overview, VM, volume,
+process stays in the foreground until Ctrl-C/SIGINT or SIGTERM. Without
+`--no-browser`, it also opens a browser. Installation and other CLI commands
+never start a web service. No Hub connection is needed: the dashboard reads
+the same local inventory as CLI commands and shows overview, VM, volume,
 layer/image, network, build, and storage views with five-second refresh.
 
-It is read-only unless started with `--allow-control`, which enables the
-existing VM lifecycle, image import, artifact removal, and state-root controls.
+It is read-only unless started with `--allow-control`, which enables image
+build/run, consoles, VM lifecycle, image import, local CAS tag editing/removal,
+and state-root controls. Build forms can edit an inline Dockerfile and select
+local host cache without a Hub connection. Local cache mode is not an offline
+guarantee; select offline mode to forbid remote inputs. Build and run requests
+return an operation ID immediately and expose bounded completion/output through
+the operations view. Run shares CLI local-first resolution and platform checks.
+Shutting down the dashboard cancels owned pre-launch preparation, not an already
+launched VM. Stop/Remove remain explicit lifecycle actions.
+
+Conventional VM shell consoles provide PTY input and resize. OCI-root consoles
+provide non-TTY guest exec with an explicit command, capability-aware controls
+and typed exit/signal results; they do not attach to PID 1. Disconnect and tab
+unload close only the owned console transport. Successful BuildKit OCI exports
+and retained acquired sources appear as local images without runtime packing;
+missing archives retain their provenance and availability label.
 Volume and network rows are stored metadata or committed configuration, not
 live attachment or listener proof; see the
 [usage guide](usage.md#local-store-and-ui) for each view's source.

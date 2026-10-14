@@ -8,10 +8,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
 
+from palimpsest_hub.api import hub as hub_api
 from palimpsest_hub.auth import (
     _is_system_admin,
     _reader_client_for,
@@ -997,3 +999,235 @@ def test_existing_native_owner_loses_authority_on_direct_system_grant(keystone_h
     with pytest.raises(HTTPException) as revoked:
         validate_package_owner(FEDERATED_OWNER, PROJECT_A)
     assert revoked.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elevated", ["admin", "manager", "service"])
+async def test_native_key_and_finalize_recheck_direct_system_promotion(native_http, elevated):
+    from test_packages import image_archive, staged
+
+    h = native_http
+    # Issue and stage as the original ordinary owner before its system promotion.
+    namespace = default_project_namespace(PROJECT_A)
+    token = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    base = f"/v1/projects/{namespace}"
+    registered = await h.client.put(f"/v1/projects/{PROJECT_A}/namespace", headers=token, json={})
+    assert registered.status_code == 201
+    issued = await h.client.post(
+        base + "/keys",
+        headers=token,
+        json={
+            "name": "before promotion",
+            "scope": {"packages": ["test"]},
+            "actions": ["packages:inventory", "packages:read", "packages:write"],
+        },
+    )
+    assert issued.status_code == 201
+    credential = {"Authorization": "Bearer " + issued.json()["secret"]}
+    archive, body, _ = image_archive()
+    path, _ = await staged(h, namespace, credential, archive, body)
+    h.identity["system_assignments"] = [
+        {
+            "user": {"id": FEDERATED_OWNER},
+            "scope": {"system": {"all": True}},
+            "role": {"id": "role-" + elevated, "name": elevated},
+        }
+    ]
+    assert (await h.client.get("/v1/auth/me", headers=credential)).status_code == 403
+    assert (await h.client.get("/v1/projects/current", headers=token)).status_code == 403
+    assert (await h.client.put(path, params={"package": "test"}, headers=credential, json={})).status_code == 403
+    h.identity["system_assignments"] = []
+    assert (await h.client.put(path, params={"package": "test"}, headers=credential, json={})).status_code == 201
+
+
+@pytest.fixture
+async def identity_http(keystone_http):
+    application = FastAPI()
+    application.include_router(hub_api.router, prefix="/v1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://fixture") as client:
+        yield client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers,status",
+    [
+        ({}, 401),
+        ({"Authorization": "Bearer " + ORIGINAL_SUBJECT}, 401),
+        ({"X-Auth-Token": "invalid-subject"}, 401),
+        ({"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_B}, 403),
+        ({"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A.upper()}, 403),
+    ],
+)
+async def test_me_http_requires_original_project_credentials(identity_http, keystone_http, headers, status):
+    response = await identity_http.get("/v1/me", headers=headers)
+    assert response.status_code == status
+    assert not any(event.get("methods") == ["token"] for event in keystone_http["requests"])
+
+
+@pytest.mark.asyncio
+async def test_me_http_exposes_only_immutable_scope_and_fresh_capabilities(identity_http, keystone_http):
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    response = await identity_http.get("/v1/me", headers=headers)
+    assert response.status_code == 200
+    expected = {
+        "user_id": FEDERATED_OWNER,
+        "project_id": PROJECT_A,
+        "project_name": "selected-project",
+        "roles": ["member", "palimpsest_admin"],
+        "is_system_admin": False,
+        "capabilities": {"inventory": True, "download": True, "upload": True, "delete": False, "build": False},
+    }
+    assert response.json() == expected
+    assert all(
+        secret not in response.text
+        for secret in (
+            ORIGINAL_SUBJECT,
+            "validator-subject",
+            "synthetic-read-secret",
+            "auth_ref",
+            "catalog",
+            "role_directory",
+        )
+    )
+    # The original token remains valid and unchanged after current authority is reduced.
+    keystone_http["project_roles"] = ["reader", "palimpsest_reader"]
+    reduced = await identity_http.get("/v1/me", headers=headers)
+    expected["capabilities"].update(download=False, upload=False)
+    assert reduced.status_code == 200 and reduced.json() == expected
+    keystone_http["project_roles"] = []
+    removed = await identity_http.get("/v1/me", headers=headers)
+    expected["capabilities"]["inventory"] = False
+    assert removed.status_code == 200 and removed.json() == expected
+    assert not any(event.get("methods") == ["token"] for event in keystone_http["requests"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "roles,expected",
+    [
+        (["member", "palimpsest-inventory_reader"], (True, False, False)),
+        (["member", "palimpsest-download_user"], (True, True, False)),
+        (["member", "palimpsest-publish_editor"], (True, False, True)),
+        (["reader", "palimpsest-inventory_reader"], (True, False, False)),
+        (["reader", "palimpsest-download_user"], (False, False, False)),
+        (["member"], (False, False, False)),
+        (["admin", "member", "palimpsest_admin"], (True, True, True)),
+    ],
+)
+async def test_me_http_matches_exact_legacy_leaf_policies(identity_http, keystone_http, roles, expected):
+    keystone_http["token_roles"] = roles
+    keystone_http["project_roles"] = roles
+    response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 200
+    assert response.json()["roles"] == roles
+    assert response.json()["capabilities"] == dict(
+        zip(("inventory", "download", "upload", "delete", "build"), (*expected, False, False), strict=True)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["user_enabled", "project_enabled"])
+async def test_me_http_disabled_authority_has_no_capabilities(identity_http, keystone_http, field):
+    keystone_http[field] = False
+    response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 200
+    assert not any(response.json()["capabilities"].values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["directory_unavailable", "directory_truncated"])
+async def test_me_http_does_not_mask_current_authority_freshness_failures(identity_http, keystone_http, field):
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    assert (await identity_http.get("/v1/me", headers=headers)).status_code == 200
+    keystone_http[field] = True
+    assert (await identity_http.get("/v1/me", headers=headers)).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_me_http_system_admin_needs_independent_publication_authority(native_http, keystone_http):
+    identity_http = native_http.client
+    keystone_http["system_assignments"] = [
+        {
+            "user": {"id": FEDERATED_OWNER},
+            "scope": {"system": {"all": True}},
+            "role": {"id": "role-admin", "name": "admin"},
+        }
+    ]
+    keystone_http["token_roles"] = keystone_http["project_roles"] = ["admin", "member"]
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    response = await identity_http.get("/v1/me", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["is_system_admin"] is True
+    assert response.json()["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": False,
+        "delete": True,
+        "build": True,
+    }
+    assert (await identity_http.post("/v1/uploads", headers=headers, json={})).status_code == 403
+    keystone_http["token_roles"] = keystone_http["project_roles"] = [
+        "admin",
+        "member",
+        "palimpsest-publish_editor",
+    ]
+    permitted = await identity_http.get("/v1/me", headers=headers)
+    assert permitted.status_code == 200
+    assert permitted.json()["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": True,
+        "delete": True,
+        "build": True,
+    }
+    assert (await identity_http.post("/v1/uploads", headers=headers, json={})).status_code == 200
+    assert (await identity_http.get("/v1/projects/current", headers=headers)).status_code == 403
+    assert (
+        await identity_http.post(
+            "/v1/image-exports",
+            headers=headers,
+            json={
+                "image_id": "d" * 32,
+                "target_disk_format": "qcow2",
+            },
+        )
+    ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_me_http_rejects_unscoped_subject(identity_http, keystone_http):
+    keystone_http["project_id"] = ""
+    assert (await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_me_http_protected_identity_has_no_capabilities(identity_http, monkeypatch):
+    monkeypatch.setenv("PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS", json.dumps([FEDERATED_OWNER]))
+    get_settings.cache_clear()
+    response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 200 and response.json()["user_id"] == FEDERATED_OWNER
+    assert not any(response.json()["capabilities"].values())
+
+
+@pytest.mark.asyncio
+async def test_me_http_missing_protection_policy_is_unavailable_not_denied(identity_http, monkeypatch):
+    monkeypatch.setenv("PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS", "[]")
+    get_settings.cache_clear()
+    assert (await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_me_http_administrative_assignment_elsewhere_does_not_supply_or_erase_ordinary_grants(
+    identity_http, keystone_http
+):
+    keystone_http["other_roles"] = ["admin"]
+    response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 200 and response.json()["is_system_admin"] is False
+    assert response.json()["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": True,
+        "delete": False,
+        "build": False,
+    }

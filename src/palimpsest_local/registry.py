@@ -951,6 +951,7 @@ def run_docker_command(
     *,
     stdin_text: str | None = None,
     timeout_seconds: float | None = 600,
+    check: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> subprocess.CompletedProcess[str]:
     """Run validated Docker argv directly, never through a shell."""
@@ -977,7 +978,7 @@ def run_docker_command(
         result = runner(command, **kwargs)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
         raise RegistryError(f"Docker command failed to start or timed out: {command[3]}") from exc
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()[-4000:]
         detail = f": {stderr}" if stderr else ""
         raise RegistryError(f"Docker {command[3]} failed with exit code {result.returncode}{detail}")

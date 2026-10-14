@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.api import hub as legacy
 from palimpsest_hub.api import packages
-from palimpsest_hub.auth import get_legacy_member_info, get_package_member_info, package_capabilities
+from palimpsest_hub.auth import get_legacy_member_info, get_package_member_info, package_capabilities, require_token
 from palimpsest_hub.models import (
     Base,
     PackageCache,
@@ -188,6 +188,13 @@ async def hub(tmp_path, monkeypatch):
             "project_name": "Renamable project",
             "roles": SERVICE_ADMIN_ROLES.copy(),
         },
+        "operator": {
+            "user_id": "SystemOperator",
+            "project_id": "Project-A",
+            "project_name": "Renamable project",
+            "roles": ["admin"],
+            "is_system_admin": True,
+        },
     }
 
     async def original_token(request, x_auth_token=None, x_project_id=None):
@@ -203,6 +210,9 @@ async def hub(tmp_path, monkeypatch):
     async def original_member(token_info):
         registry.require_policy(token_info)
         return {**token_info, "package_capabilities": package_capabilities(token_info["roles"])}
+
+    async def token_dependency(request: Request):
+        return await original_token(request)
 
     async def member_dependency(request: Request):
         return await original_member(await original_token(request))
@@ -226,6 +236,8 @@ async def hub(tmp_path, monkeypatch):
     monkeypatch.setattr(legacy, "get_session_factory", lambda: factory)
     monkeypatch.setattr(legacy, "get_blob_store", lambda: blob_store)
     monkeypatch.setattr(legacy, "get_settings", lambda: settings)
+    monkeypatch.setattr(legacy, "get_package_member_info", original_member)
+    monkeypatch.setattr(legacy, "get_legacy_member_info", original_member)
     monkeypatch.setattr(image_exports, "get_session_factory", lambda: factory)
     monkeypatch.setattr(image_exports, "get_blob_store", lambda: blob_store)
     app = FastAPI()
@@ -233,6 +245,7 @@ async def hub(tmp_path, monkeypatch):
     app.include_router(legacy.router, prefix="/v1")
     app.dependency_overrides[get_package_member_info] = member_dependency
     app.dependency_overrides[get_legacy_member_info] = member_dependency
+    app.dependency_overrides[require_token] = token_dependency
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
         yield SimpleNamespace(
             client=client, store=blob_store, factory=factory, settings=settings, people=people, disabled=disabled
@@ -827,3 +840,268 @@ async def test_inventory_only_key_cannot_download_or_delegate(hub):
             },
         )
     ).status_code == 401
+
+
+async def legacy_staged(hub, payload, *, person="one", declared_digest=None):
+    headers = {"X-Auth-Token": person}
+    started = await hub.client.post("/v1/uploads", headers=headers, json={"digest": declared_digest})
+    assert started.status_code == 200 and started.json()["completed"] is False
+    path = "/v1/uploads/" + started.json()["session_id"]
+    appended = await hub.client.patch(
+        path,
+        headers={**headers, "Upload-Offset": "0", "Content-Type": "application/octet-stream"},
+        content=payload,
+    )
+    assert appended.status_code == 200
+    assert appended.headers["upload-offset"] == str(len(payload))
+    return path, {**headers, "Upload-Offset": str(len(payload))}
+
+
+async def legacy_publish(hub, payload, metadata, *, person="one"):
+    path, headers = await legacy_staged(hub, payload, person=person)
+    response = await hub.client.put(path, headers=headers, json=metadata)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"name": "base", "kind": "cloud-image", "arch": "x86_64"},
+        {"name": "base", "kind": "cloud-image", "disk_format": "qcow2"},
+        {"name": "base", "kind": "cloud-image", "disk_format": "qcow2", "arch": "amd64"},
+        {"name": "base", "kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64", "media_type": LAYER},
+        {"name": "runtime", "kind": "squashfs", "disk_format": "raw"},
+        {"name": "runtime", "kind": "squashfs", "media_type": LAYER},
+        {"name": "cache", "kind": "buildkit-cache"},
+        {"name": "../escape", "kind": "squashfs"},
+    ],
+)
+async def test_legacy_http_metadata_rejection_keeps_upload_retryable(hub, metadata):
+    payload = b"metadata validation bytes"
+    path, headers = await legacy_staged(hub, payload)
+    assert (await hub.client.put(path, headers=headers, json=metadata)).status_code == 422
+    status = await hub.client.get(path, headers=headers)
+    assert status.status_code == 200 and status.json()["received_bytes"] == len(payload)
+    assert (await hub.client.get("/v1/layers", headers=headers)).json() == []
+    accepted = await hub.client.put(path, headers=headers, json={"name": "runtime", "kind": "squashfs"})
+    assert accepted.status_code == 200 and accepted.json()["blob_digest"] == digest(payload)
+
+
+@pytest.mark.asyncio
+async def test_legacy_http_non_admin_cannot_publish_public_artifacts(hub):
+    path, headers = await legacy_staged(hub, b"private only")
+    metadata = {"name": "runtime", "kind": "squashfs", "is_published": True}
+    assert (await hub.client.put(path, headers=headers, json=metadata)).status_code == 403
+    assert (await hub.client.get("/v1/layers", headers=headers)).json() == []
+    metadata["is_published"] = False
+    assert (await hub.client.put(path, headers=headers, json=metadata)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_legacy_http_digest_mismatch_discards_unregistered_upload(hub):
+    payload = b"bytes must match the declared digest"
+    declared = digest(b"different bytes")
+    path, headers = await legacy_staged(hub, payload, declared_digest=declared)
+    response = await hub.client.put(path, headers=headers, json={"name": "runtime", "kind": "squashfs"})
+    assert response.status_code == 422
+    assert (await hub.client.get(path, headers=headers)).status_code == 404
+    assert (await hub.client.get("/v1/layers", headers=headers)).json() == []
+    assert not hub.store.exists(digest(payload)) and not hub.store.exists(declared)
+
+
+@pytest.mark.asyncio
+async def test_legacy_http_idempotent_registration_preserves_descriptor_and_project_grants(hub):
+    payload = b"immutable shared legacy bytes"
+    metadata = {"name": "runtime", "kind": "squashfs", "arch": "x86_64", "ubuntu_base": "ubuntu-24.04"}
+    original = await legacy_publish(hub, payload, metadata)
+    assert original["already_present"] is False
+    token = {"X-Auth-Token": "one"}
+    detail_path = "/v1/layers/" + digest(payload)
+    before = (await hub.client.get(detail_path, headers=token)).json()
+    shortcut = await hub.client.post("/v1/uploads", headers=token, json={"digest": digest(payload)})
+    assert shortcut.status_code == 200
+    assert shortcut.json()["completed"] is True and shortcut.json()["registered"] is True
+    assert shortcut.json()["session_id"] is None
+    assert shortcut.json()["registration"]["name"] == "runtime"
+    duplicate = await legacy_publish(hub, payload, metadata, person="two")
+    assert duplicate["already_present"] is True
+    assert (await hub.client.get(detail_path, headers=token)).json() == before
+    foreign = {"X-Auth-Token": "foreign"}
+    assert (await hub.client.get(detail_path, headers=foreign)).status_code == 404
+    path, headers = await legacy_staged(hub, payload, person="foreign", declared_digest=digest(payload))
+    conflict = await hub.client.put(path, headers=headers, json={**metadata, "arch": "aarch64"})
+    assert conflict.status_code == 409
+    assert (await hub.client.get(detail_path, headers=foreign)).status_code == 404
+    assert (await hub.client.get(detail_path, headers=token)).json() == before
+    accepted = await hub.client.put(path, headers=headers, json=metadata)
+    assert accepted.status_code == 200 and accepted.json()["already_present"] is True
+    assert (await hub.client.get(detail_path, headers=foreign)).status_code == 200
+    assert (await hub.client.get(detail_path, headers=token)).json() == before
+
+
+@pytest.mark.asyncio
+async def test_legacy_http_admin_delete_is_child_protected(hub):
+    parent = await legacy_publish(hub, b"parent layer", {"name": "parent", "kind": "squashfs"})
+    child = await legacy_publish(
+        hub,
+        b"child layer",
+        {
+            "name": "child",
+            "kind": "squashfs",
+            "parent_digest": parent["blob_digest"],
+        },
+    )
+    parent_path = "/v1/layers/" + parent["blob_digest"]
+    for person in ("one", "admin"):
+        assert (await hub.client.delete(parent_path, headers={"X-Auth-Token": person})).status_code == 403
+    operator = {"X-Auth-Token": "operator"}
+    assert (await hub.client.delete(parent_path, headers=operator)).status_code == 409
+    assert (await hub.client.get(parent_path, headers=operator)).status_code == 200
+    assert (await hub.client.delete("/v1/layers/" + child["blob_digest"], headers=operator)).status_code == 204
+    assert (await hub.client.delete(parent_path, headers=operator)).status_code == 204
+    assert (await hub.client.get(parent_path, headers=operator)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_layers_http_metadata_filters_apply_before_limit_across_visible_artifacts(hub):
+    cloud = {
+        "name": "base",
+        "kind": "cloud-image",
+        "disk_format": "qcow2",
+        "arch": "x86_64",
+        "os_variant": "ubuntu",
+        "ubuntu_base": "ubuntu-24.04",
+    }
+    base = await legacy_publish(hub, b"matching base", cloud)
+    layer = await legacy_publish(
+        hub,
+        b"matching layer",
+        {
+            "name": "runtime",
+            "kind": "squashfs",
+            "arch": "x86_64",
+            "os_variant": "ubuntu",
+            "ubuntu_base": "ubuntu-24.04",
+        },
+    )
+    await legacy_publish(
+        hub,
+        b"newer other architecture",
+        {
+            **cloud,
+            "name": "other",
+            "arch": "aarch64",
+            "os_variant": "debian",
+            "ubuntu_base": "ubuntu-22.04",
+            "disk_format": "raw",
+        },
+    )
+    await legacy_publish(hub, b"foreign matching base", cloud, person="foreign")
+    token = {"X-Auth-Token": "one"}
+    for filters, expected in (
+        ({"arch": "x86_64"}, [layer["blob_digest"], base["blob_digest"]]),
+        ({"os_variant": "ubuntu"}, [layer["blob_digest"], base["blob_digest"]]),
+        ({"ubuntu_base": "ubuntu-24.04"}, [layer["blob_digest"], base["blob_digest"]]),
+        ({"disk_format": "qcow2"}, [base["blob_digest"]]),
+        ({"arch": "x86_64", "os_variant": "ubuntu", "ubuntu_base": "ubuntu-24.04", "limit": 1}, [layer["blob_digest"]]),
+        ({"kind": "cloud-image", "arch": "x86_64", "disk_format": "qcow2", "limit": 1}, [base["blob_digest"]]),
+        ({"arch": "x86_64", "os_variant": "debian"}, []),
+    ):
+        response = await hub.client.get("/v1/layers", headers=token, params=filters)
+        assert response.status_code == 200
+        assert [row["blob_digest"] for row in response.json()] == expected
+    images = await hub.client.get("/v1/images", headers=token, params={"arch": "x86_64"})
+    assert images.status_code == 200 and [row["blob_digest"] for row in images.json()] == [base["blob_digest"]]
+    page = await hub.client.get("/v1/layers", headers=token, params={"arch": "x86_64", "limit": 1, "offset": 1})
+    assert page.status_code == 200 and [row["blob_digest"] for row in page.json()] == [base["blob_digest"]]
+    assert (await hub.client.get("/v1/layers", headers=token, params={"arch": "x86_64", "offset": 2})).json() == []
+    assert (await hub.client.get("/v1/images", headers=token, params={"arch": "x86_64", "offset": 1})).json() == []
+    for endpoint in ("/v1/layers", "/v1/images"):
+        assert (await hub.client.get(endpoint, headers=token, params={"offset": -1})).status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"arch": "amd64"},
+        {"arch": ""},
+        {"disk_format": "unsupported"},
+        {"disk_format": ""},
+        {"os_variant": "../ubuntu"},
+        {"os_variant": ""},
+        {"ubuntu_base": "Ubuntu 24.04"},
+        {"ubuntu_base": ""},
+    ],
+)
+async def test_layers_http_metadata_filters_reject_invalid_values(hub, filters):
+    token = {"X-Auth-Token": "one"}
+    assert (await hub.client.get("/v1/layers", headers=token, params=filters)).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_native_keys_are_not_legacy_or_member_credentials(hub):
+    namespace, issued, credential = await key(hub)
+    assert (await hub.client.get("/v1/auth/me", headers=credential)).status_code == 200
+    assert (await hub.client.get("/v1/me", headers={"X-Auth-Token": "one"})).status_code == 200
+    for headers in (credential, {"X-Auth-Token": issued["secret"]}):
+        assert (await hub.client.get("/v1/me", headers=headers)).status_code == 401
+        assert (await hub.client.get("/v1/layers", headers=headers)).status_code == 401
+        assert (await hub.client.post("/v1/uploads", headers=headers, json={})).status_code == 401
+    assert (await hub.client.get("/v1/auth/me", headers={"X-Auth-Token": "one"})).status_code == 401
+    _, body, _ = image_archive()
+    path = f"/v1/projects/{namespace}/uploads"
+    assert (
+        await hub.client.post(path, params={"package": "test"}, headers={"X-Auth-Token": "one"}, json=body)
+    ).status_code == 401
+    mixed = {**credential, "X-Auth-Token": "one"}
+    assert (await hub.client.post(path, params={"package": "test"}, headers=mixed, json=body)).status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["root_digest", "archive_digest", "archive_size_bytes", "expected_tag_digest"])
+async def test_browser_native_upload_requires_explicit_archive_fields(hub, field):
+    namespace, _, credential = await key(hub)
+    _, body, _ = image_archive()
+    del body[field]
+    response = await hub.client.post(
+        f"/v1/projects/{namespace}/uploads",
+        params={"package": "test"},
+        headers=credential,
+        json=body,
+    )
+    assert response.status_code == 422
+    assert (await hub.client.get(f"/v1/projects/{namespace}/packages", headers=credential)).json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_browser_native_archive_fields_round_trip_to_private_download(hub):
+    namespace, issued, credential = await key(hub, package="browser/image")
+    archive, body, _ = image_archive(b"browser file bytes")
+    body["provenance"] = {"source_revision": "browser-revision", "build_id": "browser-build"}
+    result, _, _ = await publish(hub, namespace, credential, archive, body, package="browser/image")
+    assert result.status_code == 201
+    member = {"X-Auth-Token": "one"}
+    params = {"package": "browser/image"}
+    resolved = await hub.client.get(
+        f"/v1/projects/{namespace}/resolve",
+        params={**params, "tag": "v1"},
+        headers=member,
+    )
+    assert resolved.status_code == 200
+    assert resolved.headers["etag"] == '"' + body["root_digest"] + '"'
+    for field in ("root_digest", "archive_digest", "archive_size_bytes", "provenance"):
+        assert resolved.json()[field] == body[field]
+    assert resolved.json()["pushed_key_id"] == issued["key"]["key_id"]
+    downloaded = await hub.client.get(
+        f"/v1/projects/{namespace}/versions/{body['root_digest']}/download",
+        params=params,
+        headers=member,
+    )
+    assert downloaded.status_code == 200 and downloaded.content == archive
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["content-type"] == "application/x-tar"
+    assert issued["secret"] not in resolved.text
+    assert (await hub.client.get("/v1/layers", headers=member)).json() == []

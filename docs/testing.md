@@ -1,5 +1,159 @@
 # Fast feedback without dropping coverage
 
+## Full-source 0.3.5 integration — local verification
+
+Baseline is latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` (0.3.4).
+The isolated, unpublished 0.3.5 clone received the following parent-run local
+qualification on 2026-10-14. These are local/disposable receipts, not CI,
+publication or production evidence. Historical counts below still apply only
+to their recorded source/environment; the earlier SQL/KVM ownership receipt
+does not qualify this HTTPS build cutover.
+
+- **Parent fixes before the passing gates:** `ruff check --fix` corrected nine
+  import-order/unused-import issues; `ruff format` formatted 38 root and ten Hub
+  files, all within integrated or version-metadata paths. The test-only repair
+  to `tests/unit/test_cli_registry.py::test_oci_local_cache_build_uses_no_native_or_legacy_authority`
+  supplies a context Dockerfile and keeps output outside the build context;
+  production validation is unchanged.
+- **Root:** `uv sync --python 3.12 --frozen --extra dev`;
+  `scripts/test_lanes.py list --check` passed; `scripts/test_lanes.py run full`
+  reported **7,064 passed, 264 skipped**. Opt-in native/KVM/BuildKit proofs were
+  skipped, not qualified. Root `ruff check .` and `ruff format --check .`, OCI
+  fixture generation `--check` and CLI reference generation `--check` passed.
+  `scripts/build_package.py --out-dir <owned output directory>` built and
+  smoke-installed the `palimpsest_client-0.3.5` wheel and sdist.
+  `uv run --python 3.11 --no-dev palimpsest --version` returned `0.3.5`;
+  this is a minimum-interpreter CLI smoke, not a full Python 3.11 suite.
+- **Hub:** frozen dev sync; `pytest tests -q` reported **559 passed, 2 skipped**;
+  Ruff check/format passed; `uv build` built `palimpsest_hub-0.3.5` wheel and sdist.
+- **Disposable MariaDB ownership:** the separate
+  `test_shared_sql_process_ownership_smoke` run reported **2 passed**, using an
+  empty loopback MariaDB 11.4 `palimpsest_ownership_*` database selected by private
+  `PALIMPSEST_OWNERSHIP_SQL_URL`. Two and three real SQL/process workers used
+  independent flocks. Remote execution and provider effects remained synthetic;
+  this is not a live-build or production compatibility proof.
+- **Hub images:** canonical `docker/hub/Dockerfile` targets
+  `palimpsest-hub-api`, `palimpsest-hub-worker` and `palimpsest-hub-build-worker`
+  built for the declared `linux/amd64` platform and executed under local
+  emulation. Each imported its entry module and reported `palimpsest-hub 0.3.5`
+  on `x86_64`; the build-worker also contained `palimpsest-client 0.3.5` and
+  `bwrap`, `mksquashfs`, `mkfs.ext4`. This is image execution evidence, not
+  native KVM, BuildKit, cloud or production proof.
+- **Public diff scan:** redacted gitleaks found one false positive in vendored
+  MIT minified `xterm.js` (`FourKeyMap`).
+- **Hosted macOS 15 finding:** the first PR run passed Linux, Hub, OCI and
+  guest jobs but failed six `test_web_process_browser_choice_and_shutdown`
+  cases on the macOS 15 runners only (local macOS and the same portable shard
+  passed). A throwaway diagnostic run's faulthandler stack showed the `web`
+  child blocked in `socket.getfqdn()` inside `HTTPServer.server_bind`. The
+  dashboard now uses a loopback server that skips that reverse lookup;
+  `test_dashboard_bind_does_not_reverse_resolve_loopback` fails against the
+  stdlib default bind and passes with the fix, and `tests/unit/test_ui.py`
+  passed **87** locally.
+- **Hosted Linux flake:** the rerun then failed WIP-added
+  `test_interactive_bash_readline_tab_completion` once on Linux (`--backend=a`
+  captured before readline inserted `auto`); it also failed 1/12 locally. The
+  test now waits for the expected completion text, or two idle seconds for its
+  negative case, within a 15-second bound instead of a fixed 0.4-second sleep:
+  **20/20** local runs passed and `tests/unit/test_completion.py` reported
+  85 passed, 2 skipped.
+
+Still pending: a PR to protected `dev` with all six strict required hosted
+checks on the submitted ref, an immutable `v0.3.5` tag, PyPI/GHCR publication,
+separately authorized native KVM/BuildKit/cloud proofs, and production rollout
+of the controller1 Hub plus dedicated build-worker VM. No production mutation
+is claimed. The read-only baseline still runs Hub 0.3.4 (`ad1674e`); Hub has no
+migration ledger. Bootstrap `create_all` and an empty-database smoke are **not
+existing-schema compatibility proof**. Rollout requires all-writer drain,
+reviewed offline schema upgrade, paired SQL/CAS backup and isolated restore,
+current requester authority, and actual dedicated-VM build/restart/cleanup
+acceptance. Skipped opt-in lanes and literal native `false/skipped` remain
+explicit absence of qualification.
+
+Current authoritative root entrypoints (reproduction/selection commands below
+are not additional receipts):
+
+```sh
+uv sync --frozen --extra dev
+python3 scripts/check_architecture.py
+uv run python tests/fixtures/oci-root/generate_fixtures.py --check
+uv run python scripts/generate_cli_reference.py --check
+uv run ruff check .
+uv run ruff format --check .
+uv run python scripts/test_lanes.py list --check
+uv run python scripts/test_lanes.py plan --changed HEAD
+uv run python scripts/test_lanes.py run core-cli build-registry
+uv run python scripts/test_lanes.py run portable
+uv run python scripts/test_lanes.py run full
+uv run python scripts/build_package.py --out-dir /tmp/palimpsest-dist
+uv run --python 3.11 --no-dev palimpsest --version
+```
+
+`portable` is all portable lanes; `full` is the root legacy suite with opt-in
+skips and excludes Hub. CI uses Python 3.12, Linux portable shards `1/6`–`6/6`
+and macOS15 shards `1/4`–`4/4`, each `run portable --shard N/M`.
+Root supports Python3.11+; conventional Linux KVM supports x86_64/aarch64,
+macOS Apple Silicon defaults to Lima/VZ and HVF is experimental. OCI-root KVM
+remains Linux amd64 only; neither macOS portable nor emulated image success
+is native proof.
+
+Hub has its own Python3.12+ environment; root gates do not cover it:
+
+```sh
+cd hub
+uv sync --frozen --extra dev
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q tests/test_auth.py tests/test_hub_api.py tests/test_packages.py \
+  tests/test_build_worker.py tests/test_builds.py tests/test_build_ownership.py \
+  tests/test_image_exports.py tests/test_export_delegation.py \
+  tests/test_database_pool.py tests/test_migrate.py
+uv run pytest -v
+uv build
+```
+
+The optional process ownership node is
+`uv run pytest -q -s tests/test_database_pool.py::test_shared_sql_process_ownership_smoke`
+in Hub, with private `PALIMPSEST_OWNERSHIP_SQL_URL` selecting **empty disposable
+loopback MariaDB** named `palimpsest_ownership_*`. It checks real SQL/process
+ownership, not guest/provider execution or production readiness. Never point
+it at production or substitute a SQLite pass for MariaDB exclusion evidence.
+
+Canonical image builds use root context, `docker/hub/Dockerfile` and targets
+`palimpsest-hub-api`, `palimpsest-hub-worker`, `palimpsest-hub-build-worker`:
+`docker build --file docker/hub/Dockerfile --target TARGET .`.
+For separately scoped local multi-arch evidence use Buildx with
+`--platform linux/amd64,linux/arm64 --output type=oci,dest=OWNED_ARCHIVE` and the
+same context/Dockerfile/target; no push. Current Hub CI builds host-default
+platforms and does not define a multi-arch publication matrix.
+
+Privileged filesystem, stage-1 binary, real BuildKit, native KVM, direct-executor,
+SYSTEM/cloud and GPU paths require distinct tools/resources/authorization.
+CI filesystem proof needs Linux root, squashfs/erofs tools and
+`PALIMPSEST_REQUIRE_OCI_FS=1`; stage-1 uses the pinned amd64 GCC image;
+BuildKit integration uses `PALIMPSEST_BUILDKIT_E2E=1` and an owned
+`docker-container` builder bootstrapped with `network=none`. Native CI remains
+trusted-ref/protected-environment only, using the reviewed source/kernel/config
+pins and exact-owned Nova quota/cleanup receipts. Literal native `false/skipped`
+means **no native qualification**. No native/cloud/GPU command was executed here.
+
+Exact opt-in lane entrypoints (only after separate resource/authority approval):
+
+| Lane command | Required platform/input boundary |
+| --- | --- |
+| `uv run python scripts/test_lanes.py run filesystem` | privileged Linux, `PALIMPSEST_REQUIRE_OCI_FS=1`, squashfs/erofs tools and owned evidence directories |
+| `uv run python scripts/test_lanes.py run guest-binary` | pinned Docker compiler image and guest ELF reproducibility prerequisites; not a VM boot |
+| `uv run python scripts/test_lanes.py run gate1` | real Docker/Buildx, owned network-none OCI exporter, `PALIMPSEST_BUILDKIT_E2E=1` |
+| `uv run python scripts/test_lanes.py run guest-kvm` | Linux x86_64 `/dev/kvm`, exact pinned kernel/config/proof fixtures, `PALIMPSEST_REQUIRE_STAGE1_KVM=1` |
+| `uv run python scripts/test_lanes.py run native-live` | qualified Linux amd64 libvirt runtime, `PALIMPSEST_REQUIRE_OCI_ROOT_LIBVIRT=1` plus each selected proof's own image/flag; no implied GPU authorization |
+| `uv run python scripts/test_lanes.py run gate2` | qualified Linux amd64 runtime and transferred verified artifacts; `PALIMPSEST_OCI_ROOT_E2E=1` and `PALIMPSEST_OCI_ROOT_E2E_ARTIFACT_DIR` |
+
+The direct Hub executor is a different CPU-only service-VM boundary, not a
+native-live/KVM lane. Its current HTTPS/journal/direct-root integration requires
+separately approved same-ref dedicated-VM build, restart and exact-owned process/
+loop cleanup acceptance. No canonical new live receipt is fabricated here.
+
+
 The last complete baseline, commit `6cf198f`, passed 4,325 local tests and
 4,360 server tests; the server run took 879.97 seconds. Repeating that entire
 suite after every small change is no longer the default development loop.
@@ -28,6 +182,38 @@ uv run python scripts/test_lanes.py run oci-monitor
 uv run python scripts/test_lanes.py run oci-access
 uv run python scripts/test_lanes.py run qualification
 ```
+
+### Local host resource discovery
+
+`tests/unit/test_host_inventory.py` exercises read-only Lima/libvirt snapshots
+with isolated backend fixtures. `test_inventory.py` covers selected-state joins,
+same-name replacements, independent access capabilities, bounded Linux source
+reads and explicit partial measurements, running journal failures, pinned stopped
+console tails, disk-capacity separation and network identities. `test_console.py`
+uses real isolated PTY/process consumers to verify guest identity fencing and
+that replacement guests receive no user command, disconnect reaping and safe
+errors. `test_oci_exec_session.py` exercises original-token drain/ACK after
+dashboard timeout/disconnect, shutdown admission closure (including a pending
+submission factory), bounded owner admission and unresolved ACK reporting,
+without changing core close semantics. Actual foreground `ui.serve` SIGINT and
+SIGTERM smoke holds both a console owner and a detached timed-out probe until
+their original completion/ACK using isolated `MonitorExecControl`; this proves
+process lifetime, not a native OCI VM. `test_ui.py`
+covers stable external identifiers and parameter bounds without lifecycle
+authority. Inventory unit consumers stub host discovery; they never enumerate
+the developer's real VMs.
+
+For actual UI proof, run the foreground web command against an APFS clone of
+selected state (`cp -cRp`), because selected-run reconciliation can update its
+ledger even in read-only mode. List refresh must not probe every guest. Open
+detail explicitly for running journal and real counter samples; exercise enabled
+external Lima and selected-owned consoles, disconnect without VM stop, pause and
+resume, first-sample/rate reset, stale/error labels, identical-list failure/recovery,
+keyboard focus and reduced motion. Test replacement/capability-loss projections
+with isolated browser response fixtures, never by replacing unrelated VMs. Do
+not stop/delete unrelated VMs. Host discovery, portable tests and macOS HVF
+cloud-image proof are not Linux KVM/OCI-root, cloud, passthrough or GPU qualification.
+The latest handoff distinguishes test-defined, test-passed and live-verified evidence.
 
 Linux state-root default and override changes can first be checked without
 creating system directories:
@@ -69,6 +255,107 @@ revocation, scope substitution, expiry, abandonment and cleanup-retry
 regressions. It does not prove the deployed Keystone trust policy or a real
 Glance download.
 
+### Native Hub worker ownership
+
+**Historical SQL/KVM worker snapshot, not 0.3.5 verification.** The following
+receipt and former rollout description are preserved for their original dirty
+`aa397a0fd976e35302974a347748a9773e3084bf` source, before integration onto
+the latest HTTPS-only build plane. The current schema/drain/private-worker
+contract is in [installation](install.md); current commands are at the top of
+this document. Older renewable distributed build launches and execution-node
+guest recovery APIs are superseded, not reintroduced by retained test evidence.
+
+The implementation slice ran no checks. Subsequent parent verification ran on
+a frozen public clone synced byte-for-byte from that earlier working tree,
+including concurrent WIP (544 files; snapshot manifest SHA-256
+`fb720648c50a6d2f4140988b4f10ced074c4647dd721ed86f828e86bdd9d35d5`).
+Logs, JUnit XML and per-lane execution JSON are under
+`/Users/pieroot/.local/share/afterglow-proofs/afterglow-process-ownership-n7xrnua4/`.
+These results are **test-passed locally, not live-verified**:
+
+- Focused Hub selection below: **93 passed, 2 skipped**.
+- MariaDB multiprocess hook below: **2 passed** against fresh empty owned
+  database `palimpsest_ownership_n7xrnua4c`, with `PALIMPSEST_OWNERSHIP_SQL_URL`.
+  An earlier pre-lint source run also passed **2** against
+  `palimpsest_ownership_n7xrnua4`. SQL and OS-process ownership assertions are
+  real; guest execution/provider deletion are synthetic and expiry is controlled.
+- Full Hub suite, `pytest -p no:cacheprovider tests`: **378 passed, 2 skipped**.
+
+The initial parent focused run exposed 16 export timestamp failures; the
+SQLAlchemy ORM's Python predicate evaluator compared naive SQL DATETIME values
+against aware UTC lease times after loading the fenced row. Those failures were
+fixed: timestamp-predicate updates now synchronize through SQL
+(`synchronize_session="fetch"`), retaining owner/expiry predicates and locks;
+Python soft-delete lease checks normalize UTC. Five added regressions exercise
+reloaded-naive renewal/complete/error synchronization and live/expired soft
+deletion. The earlier authorized remediation command `uv run pytest -q
+tests/test_image_exports.py tests/test_export_delegation.py` passed **54 tests**,
+with 74 existing auth-client deprecation warnings, in 18.17 seconds; the later
+focused/full Hub passes above include the fix. Full focused selection:
+
+```sh
+cd hub
+uv run pytest -q tests/test_builds.py tests/test_image_exports.py \
+  tests/test_export_delegation.py tests/test_database_pool.py tests/test_migrate.py
+```
+
+Portable SQLite consumers cover live startup preservation, expired recovery,
+late-owner fencing, local cleanup authority, role tokens and scratch/delegation
+lifetime. SQLite does not implement MariaDB's `FOR UPDATE SKIP LOCKED`; a
+portable pass alone is not distributed SQL exclusion evidence.
+
+The opt-in local-process hook requires an **empty disposable MariaDB database**
+whose name starts with `palimpsest_ownership_`, an asyncmy URL, and no production
+credentials or services. Supply the URL through approved private environment
+handling (do not put passwords into shell history):
+
+```sh
+cd hub
+# PALIMPSEST_OWNERSHIP_SQL_URL is supplied privately, not DATABASE_URL.
+uv run pytest -q -s tests/test_database_pool.py::test_shared_sql_process_ownership_smoke
+```
+
+Hub `ruff check .` retains only `tests/test_auth.py` I001, credential-isolation
+WIP outside this change. SIM117/SIM102 in `services/image_exports.py` were fixed.
+The eight lease-change files were formatted: `services/builds.py`,
+`services/image_exports.py`, `services/worker_leases.py`, `tests/test_builds.py`,
+`tests/test_database_pool.py`, `tests/test_export_delegation.py`,
+`tests/test_image_exports.py`, and `tests/test_migrate.py`. Hub CI's
+`ruff format --check .` gate still fails on seven unformatted credential-isolation
+files outside this change: `api/hub.py`, `api/packages.py`, `auth.py`,
+`services/package_registry.py`, `tests/test_auth.py`, `tests/test_hub_api.py`, and
+`tests/test_packages.py`. These remaining findings are not lease-change failures
+or a claim that the whole Hub lint/format gates passed.
+
+The hook refuses a nonempty schema or a non-loopback SQL endpoint. It creates
+and removes only the schema objects it owns in that disposable database. Real
+spawned OS processes hold independent local flock paths while sharing SQL and
+artifact storage. Assertions distinguish per-job SQL claims, live-build
+startup preservation, successful publication, expired/crashed-owner recovery
+without recipe replay, and maintenance role exclusion/takeover. Guest execution
+and provider boundaries are synthetic: no `/dev/kvm`, libvirt, Keystone Trust
+policy, Glance transfer, provider create, production readiness, shared-network
+filesystem crash durability or guest-build proof is established. A SQL/process
+failure is a failed ownership hook, not a reason to substitute SQLite success.
+
+Verification used disposable owned Docker MariaDB 11.4 (tmpfs, loopback
+`127.0.0.1:56498`) and Redis 7 (`127.0.0.1:56497`) fixtures; providers were
+synthetic loopback HTTP or in-process fakes. No private configuration or live
+credentials, live OpenStack/Keystone/K3s/Nova/Octavia/Glance/KVM, paid inference,
+deployment, image publication, commit, stage or push was involved. KVM guest
+builds, live Glance/provider deletion, production and mixed-version rollout
+remain **not exercised**. These checks also do not qualify production
+Redis/Sentinel failover, async-replication lease/journal loss or promoted-node
+TIME skew. Architecture guard stamping is recorded separately by the parent in
+isolated clones; the existing shared review marker/digest/UTC block is unchanged.
+
+Rollout is offline: stop **all old API/build/export workers**, run
+`palimpsest-hub-bootstrap`, then start only the new version. Nullable build
+ownership columns do not authorize adoption of unknown legacy guests. A remote
+expired-build reconciler retains another node's private tree; that node must
+return for verified cleanup or require an explicitly authorized local operator.
+The shared artifact filesystem must still provide coherent cross-node digest
+locks; independent worker flocks are only local process guards.
 The Hub's server-build path has a focused project-scoped HTTP contract lane:
 
 ```sh
@@ -919,6 +1206,51 @@ inventory checks. Guest C/ELF are unchanged by the host-only user override;
 this does not itself require the whole guest boot matrix or qualify Gate 2.
 
 ### Other focused paths
+
+Local web/inventory changes start with the portable, temporary-state selection:
+
+```sh
+umask 022
+uv run --frozen pytest -q tests/unit/test_inventory.py tests/unit/test_ui.py tests/unit/test_cli_contract.py tests/unit/test_state.py tests/unit/test_run_source.py tests/unit/test_registry_intake.py tests/unit/test_web_operations.py tests/unit/test_web_job_client.py tests/unit/test_console.py
+```
+
+The web subprocess cases exercise browser/no-browser selection, a blocking
+browser command, HTTP responsiveness, SIGINT/SIGTERM exit and listener closure.
+Inventory cases cover OCI export provenance/availability, FIFO observation
+without opening the output, local CAS tag conflicts and commit-time authority
+changes. A metadata-restore fixture must replace its JSON directly rather than
+re-entering the cooperating writer while its digest lock is held. Shared tag
+writer changes also select `test_build.py`, `test_buildkit.py` and
+`test_cloud_runtime.py`.
+
+For real-browser smoke, use a temporary clone with `PALIMPSEST_STATE_HOME` and
+isolated config, then run `palimpsest web --no-browser`, followed separately by
+`--allow-control`. Read-only VM GETs can reconcile and write run ledgers, so do
+not point QA at protected proof state. Verify local data with Hub unavailable,
+read-only and authentication/origin refusal, tag save/conflict, polling input
+stability, pause/resume, build logs and stopped-server guidance. Exercise an
+actual local-cache BuildKit job via the authenticated build form, including
+inline Dockerfile output, and observe its operation and image receipt. For
+console changes, exercise PTY input/resize, typed exit/signal completion,
+capability-disabled non-TTY controls, and disconnect immediately followed by
+reload/unload; verify the owned transport is reaped. A local subprocess fixture
+proves HTTP/browser/transport behavior only, not VM launch or guest exec.
+Stop the owned server/browser afterward; this is not native VM/control or Hub
+qualification.
+
+Acquisition changes additionally need real Docker inspect/save and Skopeo smoke
+against disposable owned state. Cover qualified-only local Docker hits,
+conflicting image IDs, hard daemon failures, Docker `credsStore` and per-host
+`credHelpers` with their original sanitized environment, custom CA success and
+untrusted TLS rejection, and a digest-pinned index whose root remains distinct
+from its selected amd64 child. Loopback registry fixtures must not use production
+credentials. On unsupported hosts, a bypassed capability preflight is diagnostic
+acquisition evidence only; it cannot qualify public OCI-root `run` or Gate 2.
+Preparation ownership changes select worker-protocol/run-adapter/project-volume
+coverage as well. Run the lane planner and canonical isolated package build;
+inspect the wheel/sdist's vendored terminal assets and license, then exercise
+the installed wheel's authenticated asset surface.
+
 
 Runtime-parent diagnostic-only edits use
 `tests/unit/test_oci_host.py tests/unit/test_oci_run_adapter.py`

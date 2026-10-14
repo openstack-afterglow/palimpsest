@@ -10,7 +10,7 @@ import os
 import signal
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
 from . import platforms
@@ -44,6 +44,7 @@ from .oci_shared_traversal import join_oci_shared_traversal
 from .oci_stage1_access import grant_oci_stage1_access
 from .oci_store import OCIStore
 from .state import init_resolved_roots, locked_existing_run, reserve_new_run
+from .web_job_client import cancellable_run_preparation, defer_web_cancellation
 
 _MONITOR_SPAWN_TIMEOUT_SECONDS = 30
 _MONITOR_COORDINATOR_TIMEOUT_SECONDS = 60
@@ -91,50 +92,56 @@ def _startup_signals():
 
 
 def _launch_local_oci(roots, request, host_config, interrupted):
-    if type(request) is not LocalOCIRunRequest:
-        raise StateError("OCI launch requires a typed local request")
-    request.__post_init__()
-    config = OCIHostConfig.from_environment() if host_config is None else host_config
-    # All readonly host checks and toolchain identity precede state mutation.
-    preflight_oci_host(config, roots, request.name)
-    toolchain = discover_squashfs_toolchain(
-        config.packer, expected_packer_sha256=digest_hex(digest_file(config.packer))
-    )
-    profile = platforms.resolve_domain_profile("kvm", "x86_64")
-    if profile.uri != "qemu:///system":
-        raise StateError("OCI public launch requires the qualified system libvirt profile")
-    init_resolved_roots(roots)
-    selected = materialize_local_oci_run(request, roots=roots, packer_path=config.packer, toolchain=toolchain)
-    store = OCIStore(roots)
-    conn = connect_oci_root_libvirt(profile.uri)
-    startup_events = None
-    startup_events_stopped = False
-    try:
-        startup_events = OCIStartupEventService(conn)
-        startup_events.start()
-        with first_party_boot(config, roots) as source_boot:
-            with reserve_new_run(roots, request.name, request.dispatch_key) as reservation:
-                command_authority = (
-                    {
-                        "command_override": request.command_override,
-                        "source_cas": selected.source_cas,
-                        "config_snapshot": selected.config_snapshot,
-                    }
-                    if request.command_override is not None
-                    else {}
-                )
-                prepared = prepare_oci_root_run(
-                    reservation,
-                    selected.receipt,
-                    store,
-                    root_volume_size_bytes=request.root_size_bytes,
-                    retained_volume_id=request.root_volume_id,
-                    retention_policy=request.root_retention,
-                    user_override=request.user_override,
-                    **command_authority,
-                )
-            startup_events.check()
-            publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
+    with ExitStack() as preparation:
+        preparation.enter_context(cancellable_run_preparation())
+        if type(request) is not LocalOCIRunRequest:
+            raise StateError("OCI launch requires a typed local request")
+        request.__post_init__()
+        config = OCIHostConfig.from_environment() if host_config is None else host_config
+        # All readonly host checks and toolchain identity precede state mutation.
+        preflight_oci_host(config, roots, request.name)
+        toolchain = discover_squashfs_toolchain(
+            config.packer, expected_packer_sha256=digest_hex(digest_file(config.packer))
+        )
+        profile = platforms.resolve_domain_profile("kvm", "x86_64")
+        if profile.uri != "qemu:///system":
+            raise StateError("OCI public launch requires the qualified system libvirt profile")
+        init_resolved_roots(roots)
+        selected = materialize_local_oci_run(request, roots=roots, packer_path=config.packer, toolchain=toolchain)
+        store = OCIStore(roots)
+        conn = None
+        startup_events = None
+        startup_events_stopped = False
+        try:
+            with defer_web_cancellation():
+                conn = connect_oci_root_libvirt(profile.uri)
+            startup_events = OCIStartupEventService(conn)
+            startup_events.start()
+            with first_party_boot(config, roots) as source_boot:
+                with reserve_new_run(roots, request.name, request.dispatch_key) as reservation:
+                    command_authority = (
+                        {
+                            "command_override": request.command_override,
+                            "source_cas": selected.source_cas,
+                            "config_snapshot": selected.config_snapshot,
+                        }
+                        if request.command_override is not None
+                        else {}
+                    )
+                    prepared = prepare_oci_root_run(
+                        reservation,
+                        selected.receipt,
+                        store,
+                        root_volume_size_bytes=request.root_size_bytes,
+                        retained_volume_id=request.root_volume_id,
+                        retention_policy=request.root_retention,
+                        user_override=request.user_override,
+                        **command_authority,
+                    )
+                startup_events.check()
+                publish_oci_boot_exports(roots, prepared, source_boot, conn=conn)
+            # Subsequent launch authority uses only the managed BOOT copies.
+            # Release the source scratch while cooperative cancellation is live.
             startup_events.check()
             boot = load_oci_boot_exports(roots, request.name)
             publish_oci_lower_exports(roots, prepared, store, conn=conn)
@@ -197,20 +204,24 @@ def _launch_local_oci(roots, request, host_config, interrupted):
                 timeout_seconds=60,
                 terminal_timeout_seconds=None,
             ) as authority:
+                # The coordinator can activate the domain independently as soon
+                # as it is spawned. From here SIGUSR1 is process-only: it must
+                # not unwind a helper owner that can signal VM-owned processes.
+                preparation.close()
                 endpoint = spawn_monitor_coordinator(
                     MonitorExecIdentity(binding, str(uuid.uuid4())),
                     authority,
                     timeout=_MONITOR_SPAWN_TIMEOUT_SECONDS,
                     coordinator_timeout=_MONITOR_COORDINATOR_TIMEOUT_SECONDS,
                 )
-    finally:
-        try:
-            if startup_events is not None and not startup_events_stopped:
-                startup_events.stop()
-                startup_events_stopped = True
         finally:
-            if startup_events is None or startup_events_stopped:
-                close_oci_root_libvirt(conn)
+            try:
+                if startup_events is not None and not startup_events_stopped:
+                    startup_events.stop()
+                    startup_events_stopped = True
+            finally:
+                if conn is not None and (startup_events is None or startup_events_stopped):
+                    close_oci_root_libvirt(conn)
     with MonitorClient(roots, binding, endpoint, timeout=_MONITOR_CLIENT_STARTUP_TIMEOUT_SECONDS) as client:
         try:
             observation = client.wait_ready(timeout=75)

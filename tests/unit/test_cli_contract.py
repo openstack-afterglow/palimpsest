@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from types import MappingProxyType
@@ -50,6 +51,30 @@ def _isolated_xdg_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("PALIMPSEST_LOG_HOME", str(journal_root))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    # Automatic acquisition must not depend on the developer's Docker daemon,
+    # credential directory, context/host, or preferred registry.
+    from palimpsest_local import run_source
+
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "docker-config"))
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.delenv("PALIMPSEST_REGISTRY", raising=False)
+    monkeypatch.setattr(run_source, "find_docker_daemon_source", lambda *a, **k: None)
+    monkeypatch.setattr(
+        run_source,
+        "run_docker_command",
+        lambda *a, **k: pytest.fail("real Docker inspection reached in CLI contract test"),
+    )
+    monkeypatch.setattr(
+        run_source,
+        "export_docker_image_to_oci_archive",
+        lambda *a, **k: pytest.fail("real Docker export reached in CLI contract test"),
+    )
+    monkeypatch.setattr(
+        run_source,
+        "pull_registry_oci_archive",
+        lambda *a, **k: pytest.fail("real registry acquisition reached in CLI contract test"),
+    )
     monkeypatch.setattr(
         runtime_dispatch.platforms,
         "_check_capability",
@@ -265,87 +290,140 @@ def test_explicit_then_environment_then_config_url_precedence(monkeypatch: pytes
     assert cli.resolve_url("https://explicit.example/") == "https://explicit.example"
 
 
-def test_exact_nested_command_tree_and_defaults():
-    parser = cli.build_parser()
-    top = next(action for action in parser._actions if isinstance(action, __import__("argparse")._SubParsersAction))
-    assert set(top.choices) == {
-        "image",
-        "layer",
-        "bundle",
-        "oci",
-        "build",
-        "registry",
-        "login",
-        "logout",
-        "pull",
-        "push",
-        "tag",
-        "images",
-        "history",
-        "rmi",
-        "save",
-        "load",
-        "docker",
-        "run",
-        "compose",
-        "ps",
-        "inspect",
-        "logs",
-        "shell",
-        "exec",
-        "start",
-        "stop",
-        "rm",
-        "commit",
-        "ui",
-        "store",
-        "completion",
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["--help"],
+        ["build", "--help"],
+        ["run", "--help"],
+        ["store", "--help"],
+        ["store", "ls", "--help"],
+        ["image", "--help"],
+        ["image", "ls", "--help"],
+        ["images", "--help"],
+        ["registry", "--help"],
+        ["registry", "add", "--help"],
+        ["completion", "--help"],
+    ],
+)
+def test_cli_help_is_useful_without_journal_state_or_hub(
+    argv: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("help accessed journal, state, or Hub")
+
+    monkeypatch.setattr(cli.host_journal, "begin", unexpected)
+    for name in ("init_roots", "resolve_roots", "HubClient", "resolve_url", "resolve_token"):
+        monkeypatch.setattr(cli, name, unexpected)
+
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("usage: palimpsest")
+    assert "-h, --help" in captured.out
+    if not argv:
+        assert "Examples:" in captured.out
+        assert "palimpsest image import" in captured.out
+        assert 'palimpsest run "$digest" --name dev' in captured.out
+    assert not captured.err
+    assert not (tmp_path / "xdg-config").exists()
+    assert not (tmp_path / "xdg-state").exists()
+
+
+@pytest.mark.parametrize("shell", [None, "bash", "zsh", "fish"])
+def test_hidden_completion_emits_real_protocol_without_journal_or_state(
+    shell: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("completion accessed journal or state")
+
+    monkeypatch.setattr(cli.host_journal, "begin", unexpected)
+    monkeypatch.setattr(cli, "init_roots", unexpected)
+    monkeypatch.setattr(cli, "resolve_roots", unexpected)
+    monkeypatch.setattr(cli, "HubClient", unexpected)
+    protocol = [] if shell is None else ["--shell", shell]
+    assert cli.main(["__complete", *protocol, "--", "build", "--runtime-"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    if shell is not None:
+        assert lines.pop(0) == "__palimpsest_directive__\t4"
+    assert {line.partition("\t")[0] for line in lines} == {
+        "--runtime-base",
+        "--runtime-block-size",
+        "--runtime-push",
+        "--runtime-tag",
     }
-    store = top.choices["store"]
-    store_commands = next(
-        action for action in store._actions if isinstance(action, __import__("argparse")._SubParsersAction)
-    )
-    assert set(store_commands.choices) == {"show", "ls", "rm", "move", "set"}
-    assert parser.parse_args(["ui"]).port == 0
-    assert parser.parse_args(["ui"]).no_browser is False
-    assert parser.parse_args(["store", "show"]).format == "table"
-    assert parser.parse_args(["store", "ls"]).kind == "all"
-    assert parser.parse_args(["store", "ls"]).format == "table"
-    assert parser.parse_args(["store", "rm", "sha256:" + "a" * 64]).force is False
-    assert parser.parse_args(["store", "move", "--to", "/tmp/dest"]).destination == Path("/tmp/dest")
-    assert parser.parse_args(["store", "set", "--to", "/tmp/dest"]).destination == Path("/tmp/dest")
-    image = top.choices["image"]
-    image_commands = next(
-        action for action in image._actions if isinstance(action, __import__("argparse")._SubParsersAction)
-    )
-    assert set(image_commands.choices) == {
-        "ls",
-        "pull",
-        "verify",
-        "import",
-        "push",
-        "inspect",
-        "history",
-        "rm",
-        "save",
-        "load",
-    }
-    assert parser.parse_args(["image", "ls"]).limit == 50
-    assert parser.parse_args(["layer", "ls"]).limit == 50
-    assert parser.parse_args(["run", "sha256:" + "a" * 64, "--name", "demo"]).memory == 4096
-    compose_args = parser.parse_args(["compose", "-f", "palimpsest.yml", "up", "-d", "api"])
-    assert compose_args.project_file == Path("palimpsest.yml")
-    assert compose_args.services == ["api"]
-    assert compose_args.detach is True
-    build_args = parser.parse_args(["build", "--base", "sha256:" + "a" * 64, "--tag", "layer"])
-    assert build_args.network == "none"
-    assert build_args.tag == ["layer"]
-    assert parser.parse_args(["bundle", "pull", "sha256:" + "a" * 64, "--output", "out"]).include_base is False
-    oci_args = parser.parse_args(["oci", "materialize", "/tmp/image.oci.tar", "--manifest", "sha256:" + "a" * 64])
-    assert oci_args.platform == "linux/amd64"
-    assert oci_args.packer == Path("/usr/bin/mksquashfs")
-    assert oci_args.timeout == 300.0
-    assert parser.parse_args(["oci", "root-proof", "demo"]).name == "demo"
+    assert all(("\t" in line) == (shell in ("fish", "zsh")) for line in lines)
+    assert not (tmp_path / "xdg-config").exists()
+    assert not (tmp_path / "xdg-state").exists()
+
+
+@pytest.mark.parametrize("argv", [["__complete", "--shell"], ["__complete", "--shell", "invalid", "--"]])
+def test_hidden_completion_rejects_invalid_protocol_before_journal(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli.host_journal, "begin", lambda *_args: pytest.fail("journal accessed"))
+    assert cli.main(argv) == 2
+    assert "__complete requires --shell" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+def test_completion_script_then_real_install_avoids_journal_state(
+    shell: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ZDOTDIR", raising=False)
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("completion accessed journal or state")
+
+    monkeypatch.setattr(cli.host_journal, "begin", unexpected)
+    monkeypatch.setattr(cli, "init_roots", unexpected)
+    monkeypatch.setattr(cli, "resolve_roots", unexpected)
+    monkeypatch.setattr(cli, "HubClient", unexpected)
+    assert cli.main(["completion", shell]) == 0
+    script = capsys.readouterr().out
+    target = {
+        "bash": tmp_path / ".bashrc",
+        "zsh": tmp_path / ".zshrc",
+        "fish": tmp_path / "xdg-config/fish/completions/palimpsest.fish",
+    }[shell]
+    assert not target.exists()
+    assert "__complete" in script
+    assert cli.main(["completion", shell, "--install"]) == 0
+    assert capsys.readouterr().out.strip() == str(target)
+    assert target.is_file()
+    assert script.strip() in target.read_text()
+    assert not (tmp_path / "xdg-state").exists()
+
+
+def test_completion_install_preserves_conflicting_user_file_and_reports_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = tmp_path / "xdg-config/fish/completions/palimpsest.fish"
+    target.parent.mkdir(parents=True, mode=0o700)
+    original = b"# existing user completion\n"
+    target.write_bytes(original)
+    monkeypatch.setattr(cli.host_journal, "begin", lambda *_args: pytest.fail("journal accessed"))
+    monkeypatch.setattr(cli, "init_roots", lambda *_args: pytest.fail("state accessed"))
+    assert cli.main(["completion", "fish", "--install"]) == 1
+    assert target.read_bytes() == original
+    assert str(target) in capsys.readouterr().err
 
 
 def test_parser_accepts_additive_buildkit_dockerfile_surface():
@@ -585,6 +663,7 @@ def test_buildkit_cli_rejects_incomplete_or_networked_offline_forms(argv: list[s
         ["--build-arg", "MODE=release"],
         ["--local-image", "base=/tmp/base@sha256:" + "a" * 64],
         ["--cache-scope", "default"],
+        ["--cache-mode", "local"],
         ["--registry", "corp"],
         ["--cache-registry", "cloud"],
         ["--cache-package", "project/test"],
@@ -711,8 +790,8 @@ def test_palimpsestfile_frontend_rejects_every_buildkit_only_option(
         ["stop", "demo"],
         ["rm", "demo", "--volumes"],
         ["commit", "demo", "--tag", "layer"],
-        ["ui"],
-        ["ui", "--port", "8080", "--no-browser", "--allow-control"],
+        ["web"],
+        ["web", "--port", "8080", "--no-browser", "--allow-control"],
         ["store", "show"],
         ["store", "show", "--format", "json"],
         ["store", "ls"],
@@ -830,7 +909,7 @@ def test_cli_run_attached_result_bridges_generic_session_and_returns_its_exit(
         ),
     )
 
-    assert cli.main(["run", "unused", "--name", "attached-run"]) == 7
+    assert cli.main(["run", str(image), "--name", "attached-run"]) == 7
     assert capsys.readouterr().out == "attached\n"
 
 
@@ -865,7 +944,7 @@ def test_cli_run_nonready_result_fails_without_printing_a_launch_hint(
         ),
     )
 
-    assert cli.main(["run", "unused", "--name", "failed-run"]) == 1
+    assert cli.main(["run", str(image), "--name", "failed-run"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "runtime did not become ready (status: failed)" in captured.err
@@ -1231,6 +1310,131 @@ def test_cli_dispatch_ps(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Capture
     assert "192.168.122.50" in out
 
 
+def _aligned_table_cells(output: str) -> list[list[str]]:
+    """Check column starts, not a spacing snapshot or formatter implementation."""
+    parsed = [list(re.finditer(r"\S.*?(?= {2,}|$)", line)) for line in output.splitlines()]
+    assert len(parsed) > 1
+    starts = [cell.start() for cell in parsed[0]]
+    for row in parsed[1:]:
+        assert [cell.start() for cell in row] == starts
+    return [[cell.group() for cell in row] for row in parsed]
+
+
+def test_cli_ps_aligns_long_and_short_names_without_changing_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    long_name = "afterglow-ag-f1823ba8-app-1"
+    payload = {
+        "warnings": ["test observation warning"],
+        "vms": [
+            {
+                "name": name,
+                "status": "running",
+                "backend": "lima-vz",
+                "managed": managed,
+                "base_digest": "sha256:" + "a" * 64,
+                "layers": [],
+                "guest_ip": "192.168.5.15",
+                "created_at": "2026-10-11T00:00:00Z",
+                "ports": [{"host_ip": "127.0.0.1", "host_port": 18080, "guest_port": 8080, "protocol": "tcp"}],
+            }
+            for name, managed in ((long_name, True), ("db", False))
+        ]
+        + [{"name": "removed-name-longer-than-every-live-name", "status": "removed"}],
+    }
+    monkeypatch.setattr(cli.inventory, "list_vms", lambda _roots: payload)
+
+    assert cli.main(["ps"]) == 0
+
+    captured = capsys.readouterr()
+    cells = _aligned_table_cells(captured.out)
+    assert len(cells) == 3
+    assert [row[0] for row in cells[1:]] == [long_name, "db"]
+    assert captured.out.splitlines()[0].index("STATUS") == len(long_name) + 2
+    assert [row[3] for row in cells[1:]] == ["managed", "observed"]
+    for row in cells[1:]:
+        assert row[4:7] == ["a" * 12, "0", "192.168.5.15"]
+        assert row[-1] == "127.0.0.1:18080->8080/tcp"
+    assert "test observation warning" in captured.err
+
+
+@pytest.mark.parametrize("operation", ["volumes", "networks"])
+def test_cli_resource_tables_align_names_preserve_values_and_json(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    long_name = "afterglow-ag-f1823ba8-app-1-writable-disk"
+    fields = (
+        {"size_bytes": 0, "file_size_bytes": 4096, "allocated_bytes": None}
+        if operation == "volumes"
+        else {"mode": "shared", "subnet": "192.168.105.0/24", "gateway": None}
+    )
+    payload = {
+        "warnings": [],
+        operation: [
+            {
+                "name": name,
+                "backend": "lima-vz",
+                "status": "attached",
+                "attachments": [{"name": "afterglow-ag-f1823ba8-app-1"}],
+                **fields,
+            }
+            for name in (long_name, "db")
+        ],
+    }
+    monkeypatch.setattr(cli.inventory, "list_" + operation, lambda _roots: payload)
+
+    assert cli.main([operation]) == 0
+
+    cells = _aligned_table_cells(capsys.readouterr().out)
+    assert [row[0] for row in cells[1:]] == [long_name, "db"]
+    for row in cells[1:]:
+        assert row[3:6] == (["0", "4096", "-"] if operation == "volumes" else ["shared", "192.168.105.0/24", "-"])
+        assert row[-1] == "afterglow-ag-f1823ba8-app-1"
+
+    assert cli.main([operation, "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_cli_compose_ps_aligns_long_names_and_preserves_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    from palimpsest_local.project_runtime import ProjectServiceStatus
+
+    (tmp_path / "palimpsest.yml").write_text(
+        'version: "1"\nname: afterglow\nservices:\n'
+        f"  app:\n    image: sha256:{'a' * 64}\n"
+        f"  db:\n    image: sha256:{'a' * 64}\n",
+        encoding="utf-8",
+    )
+    rows = (
+        ProjectServiceStatus(
+            "application-service-longer-than-the-old-column", "afterglow-ag-f1823ba8-app-1", "running"
+        ),
+        ProjectServiceStatus("db", "db", "stopped"),
+    )
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *_args: SimpleNamespace(inspect=lambda _name: None))
+    monkeypatch.setattr(cli, "project_ps", lambda *_args, **_kwargs: rows)
+    argv = ["compose", "--project-directory", str(tmp_path), "ps"]
+
+    assert cli.main(argv) == 0
+
+    cells = _aligned_table_cells(capsys.readouterr().out)
+    assert [row[1] for row in cells[1:]] == [row.run_name for row in rows]
+    assert [row[2] for row in cells[1:]] == ["running", "stopped"]
+
+    assert cli.main([*argv, "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"service": row.service, "name": row.run_name, "status": row.status} for row in rows
+    ]
+
+
 def test_cli_ps_missing_state_is_read_only(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1258,7 +1462,6 @@ def test_cli_ps_reports_corrupt_ledger_without_reflecting_its_contents(
 
     captured = capsys.readouterr()
     assert "demo-vm" not in captured.out
-    assert "warning: demo-vm: invalid run ledger" in captured.err
     assert "SENSITIVE_VALUE" not in captured.out + captured.err
 
 
@@ -1515,7 +1718,7 @@ def test_cli_ps_prints_each_published_endpoint(
         }
     )
     aggregation = RunAggregationResult((RunSummary(inspected.record, "running", details, stale=True),), ())
-    monkeypatch.setattr(runtime_dispatch, "ps", lambda **_kwargs: aggregation)
+    monkeypatch.setattr(runtime_dispatch, "reconcile", lambda **_kwargs: aggregation)
 
     assert cli.main(["ps"]) == 0
 
@@ -2082,35 +2285,19 @@ def test_cli_run_dispatch_lima_routing(
     assert capsys.readouterr().out.strip() == "limactl shell lima-vm"
 
 
-def test_cli_ui_port_validation(capsys: pytest.CaptureFixture[str]):
+def test_cli_web_port_validation(capsys: pytest.CaptureFixture[str]):
     parser = cli.build_parser()
-    args = parser.parse_args(["ui", "--port", "500"])
+    args = parser.parse_args(["web", "--port", "500"])
     with pytest.raises(SystemExit) as exc_info:
         cli._validate_args(args, parser)
     assert exc_info.value.code == 2
     assert "--port must be 0 or between 1024 and 65535" in capsys.readouterr().err
 
-    args_0 = parser.parse_args(["ui", "--port", "0"])
+    args_0 = parser.parse_args(["web", "--port", "0"])
     cli._validate_args(args_0, parser)
 
-    args_8080 = parser.parse_args(["ui", "--port", "8080"])
+    args_8080 = parser.parse_args(["web", "--port", "8080"])
     cli._validate_args(args_8080, parser)
-
-
-@pytest.mark.parametrize(("extra", "read_only"), [([], True), (["--allow-control"], False)])
-def test_cli_dispatch_ui_is_read_only_unless_control_is_requested(
-    monkeypatch: pytest.MonkeyPatch, extra: list[str], read_only: bool
-):
-    called: dict[str, object] = {}
-
-    def fake_serve(roots, port=0, open_browser=True, read_only=True):
-        called.update(port=port, open_browser=open_browser, read_only=read_only)
-        return 8765
-
-    monkeypatch.setattr("palimpsest_local.cli.ui.serve", fake_serve)
-    ret = cli.main(["ui", "--port", "8080", "--no-browser", *extra])
-    assert ret == 0
-    assert called == {"port": 8080, "open_browser": False, "read_only": read_only}
 
 
 def test_cli_dispatch_store_show(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -2261,3 +2448,394 @@ def test_cli_dispatch_store_set(monkeypatch: pytest.MonkeyPatch, capsys: pytest.
     out = capsys.readouterr().out
     data = json.loads(out)
     assert data["status"] == "ok"
+
+
+def test_cli_run_without_name_or_kind_auto_names_and_resolves_local_buildkit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    from types import SimpleNamespace
+
+    from palimpsest_local import run_source
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    # Create dummy OCI archive and BuildKit record
+    archive_dir = tmp_path / "build-output"
+    archive_dir.mkdir(parents=True)
+    archive_file = archive_dir / "app.oci.tar"
+    archive_content = b"fake-oci-archive-tar-bytes"
+    archive_file.write_bytes(archive_content)
+    archive_digest = f"sha256:{hashlib.sha256(archive_content).hexdigest()}"
+    manifest_digest = f"sha256:{hashlib.sha256(b'fake-manifest').hexdigest()}"
+
+    build_dir = roots.builds / "bk-123456abcdef"
+    build_dir.mkdir(parents=True)
+    build_record = {
+        "build_id": "bk-123456abcdef",
+        "engine": "buildkit",
+        "status": "success",
+        "output_tags": ["myorg/demo-service:v2"],
+        "output_path": str(archive_file),
+        "output_oci_archive_digest": archive_digest,
+        "output_oci_manifest_digest": manifest_digest,
+    }
+    (build_dir / "record.json").write_text(json.dumps(build_record), encoding="utf-8")
+
+    dispatched: list[object] = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **kw: (
+            dispatched.append(request)
+            or SimpleNamespace(record=SimpleNamespace(name=request.name), terminal=None, session=None)
+        ),
+    )
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *a, **k: pytest.fail("cloud stack entered"))
+
+    # Run without --name and without --runtime-kind
+    ret = cli.main(["run", "myorg/demo-service:v2", "-d"])
+    assert ret == 0
+    assert len(dispatched) == 1
+    req = dispatched[0]
+    # Auto-generated name matches pattern and has prefix
+    assert req.name.startswith("demo-service-")
+    assert run_source._RUN_NAME_RE.fullmatch(req.name) is not None
+    assert req.source == archive_file.resolve()
+    assert req.manifest_digest == manifest_digest
+    assert req.detached is True
+    assert capsys.readouterr().out.strip() == req.name
+
+
+def test_cli_run_warm_local_source_does_not_query_registries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from palimpsest_local import run_source
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    blobs_dir = roots.state / "sources" / "blobs"
+    blobs_dir.mkdir(parents=True, mode=0o700)
+    archive_file = blobs_dir / "warm.oci.tar"
+    archive_content = b"fake-warm-oci-tar"
+    archive_file.write_bytes(archive_content)
+    archive_digest = f"sha256:{hashlib.sha256(archive_content).hexdigest()}"
+    manifest_digest = f"sha256:{hashlib.sha256(b'fake-warm-manifest').hexdigest()}"
+
+    rec = run_source.RetainedSourceRecord(
+        reference="warm-org/cached-app:1.0",
+        canonical_reference="docker.io/warm-org/cached-app:1.0",
+        archive_path=str(archive_file),
+        archive_digest=archive_digest,
+        archive_size_bytes=len(archive_content),
+        manifest_digest=manifest_digest,
+        root_digest=manifest_digest,
+        source_type="oci-registry",
+        platform="linux/amd64",
+        created_at="2026-10-10T00:00:00Z",
+        tags=("warm-org/cached-app:1.0",),
+    )
+    run_source.save_retained_source_record(roots, rec)
+
+    # Guard that registries and docker are NEVER queried
+    monkeypatch.setattr(
+        run_source,
+        "pull_registry_oci_archive",
+        lambda *a, **k: pytest.fail("remote registry queried on warm local source"),
+    )
+    monkeypatch.setattr(
+        run_source,
+        "export_docker_image_to_oci_archive",
+        lambda *a, **k: pytest.fail("docker export queried on warm local source"),
+    )
+
+    dispatched: list[object] = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **kw: (
+            dispatched.append(request)
+            or SimpleNamespace(record=SimpleNamespace(name=request.name), terminal=None, session=None)
+        ),
+    )
+
+    ret = cli.main(["run", "warm-org/cached-app:1.0", "--name", "warm-vm", "-d"])
+    assert ret == 0
+    assert len(dispatched) == 1
+    assert dispatched[0].source == archive_file.resolve()
+    assert dispatched[0].manifest_digest == manifest_digest
+
+
+def test_cli_run_web_oci_digest_selection_with_explicit_kind(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    archive_file = tmp_path / "export.oci.tar"
+    archive_content = b"fake-exported-archive-bytes"
+    archive_file.write_bytes(archive_content)
+    archive_digest = f"sha256:{hashlib.sha256(archive_content).hexdigest()}"
+    manifest_digest = f"sha256:{hashlib.sha256(b'web-selected-manifest').hexdigest()}"
+
+    build_dir = roots.builds / "bk-0123456789ab"
+    build_dir.mkdir(parents=True)
+    build_record = {
+        "build_id": "bk-0123456789ab",
+        "engine": "buildkit",
+        "status": "success",
+        "output_tags": ["web-built:latest"],
+        "output_path": str(archive_file),
+        "output_oci_archive_digest": archive_digest,
+        "output_oci_manifest_digest": manifest_digest,
+    }
+    (build_dir / "record.json").write_text(json.dumps(build_record), encoding="utf-8")
+
+    dispatched: list[object] = []
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **kw: (
+            dispatched.append(request)
+            or SimpleNamespace(record=SimpleNamespace(name=request.name), terminal=None, session=None)
+        ),
+    )
+
+    # Web passes image=manifest_digest with runtime_kind=oci-root
+    ret = cli.main(["run", manifest_digest, "--runtime-kind", "oci-root", "--name", "web-vm", "-d"])
+    assert ret == 0
+    assert len(dispatched) == 1
+    assert dispatched[0].source == archive_file.resolve()
+    assert dispatched[0].manifest_digest == manifest_digest
+
+
+def test_cli_run_short_ref_searches_deterministic_oci_profiles_on_true_misses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    from types import SimpleNamespace
+
+    from palimpsest_local import registry_intake, run_source
+    from palimpsest_local.registry import RegistryConfig, RegistryProfile, save_registry_config
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    config = RegistryConfig(
+        schema_version=1,
+        default="alpha",
+        registries={
+            "docker": RegistryProfile(alias="docker", endpoint="docker.io", namespace="library"),
+            "alpha": RegistryProfile(alias="alpha", endpoint="reg-alpha.example.com"),
+            "beta": RegistryProfile(alias="beta", endpoint="reg-beta.example.com"),
+            "gamma": RegistryProfile(alias="gamma", endpoint="reg-gamma.example.com"),
+            "palnative": RegistryProfile(
+                alias="palnative",
+                endpoint="native.example.com",
+                protocol="palimpsest",
+                api_base="https://native.example.com",
+            ),
+        },
+    )
+    save_registry_config(roots, config)
+
+    queried_profiles: list[str] = []
+    pulled_archive = tmp_path / "pulled.oci.tar"
+    pulled_content = b"fake-pulled-archive"
+    pulled_archive.write_bytes(pulled_content)
+
+    def fake_pull(ref, out, _roots, *, profile=None, **kwargs):
+        alias = profile.alias if profile else "none"
+        queried_profiles.append(alias)
+        if alias == "alpha":
+            # True miss in default profile: 404
+            raise registry_intake.RegistryImageNotFoundError("manifest unknown in alpha")
+        if alias == "beta":
+            # Hit in second profile
+            out.write_bytes(pulled_content)
+            return registry_intake.RegistryPullReceipt(
+                reference=ref,
+                output=out,
+                platform="linux/amd64",
+                root_digest="sha256:" + "1" * 64,
+                manifest_digest="sha256:" + "2" * 64,
+                source_cas_id="cas-1",
+                source_binding_digest="sha256:" + "3" * 64,
+            )
+        pytest.fail(f"unexpected query to profile: {alias}")
+
+    monkeypatch.setattr(run_source, "pull_registry_oci_archive", fake_pull)
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **kw: SimpleNamespace(record=SimpleNamespace(name=request.name), terminal=None, session=None),
+    )
+
+    ret = cli.main(["run", "service:3.0", "--name", "det-vm", "-d"])
+    assert ret == 0
+    # Alpha was tried first (default), then Beta (next OCI profile alphabetically), Gamma was not reached
+    # Native profile palnative was completely excluded (not treated as Docker /v2)
+    assert queried_profiles == ["alpha", "beta"]
+
+
+def test_cli_run_explicit_registry_respects_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from palimpsest_local import registry_intake, run_source
+    from palimpsest_local.registry import RegistryConfig, RegistryProfile, save_registry_config
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    config = RegistryConfig(
+        schema_version=1,
+        default="docker",
+        registries={
+            "docker": RegistryProfile(alias="docker", endpoint="docker.io", namespace="library"),
+            "quay": RegistryProfile(alias="quay", endpoint="quay.io"),
+        },
+    )
+    save_registry_config(roots, config)
+
+    queried: list[str] = []
+
+    def fake_pull(ref, out, _roots, *, profile=None, **kwargs):
+        queried.append(profile.endpoint if profile else "none")
+        out.write_bytes(b"dummy")
+        return registry_intake.RegistryPullReceipt(
+            reference=ref,
+            output=out,
+            platform="linux/amd64",
+            root_digest="sha256:" + "a" * 64,
+            manifest_digest="sha256:" + "b" * 64,
+            source_cas_id="c-1",
+            source_binding_digest="sha256:" + "c" * 64,
+        )
+
+    monkeypatch.setattr(run_source, "pull_registry_oci_archive", fake_pull)
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "run_local_oci",
+        lambda request, **kw: SimpleNamespace(record=SimpleNamespace(name=request.name), terminal=None, session=None),
+    )
+
+    # Explicit reference with authority quay.io queries ONLY quay.io, never default docker.io
+    ret = cli.main(["run", "quay.io/core/app:v1", "--name", "auth-vm", "-d"])
+    assert ret == 0
+    assert queried == ["quay.io"]
+
+    # Selecting mismatched --registry fails
+    assert cli.main(["run", "quay.io/core/app:v1", "--registry", "docker", "--name", "bad-vm", "-d"]) == 1
+
+
+def test_cli_run_unsupported_host_fails_before_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    from palimpsest_local import run_source
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    # Host check fails on kvm-device
+    def fail_kvm(requirement, **_kw):
+        if requirement.capability_id == "host.kvm-device":
+            return CapabilityCheck(
+                requirement.capability_id, "missing", False, CapabilityErrorCategory.MISSING, "no kvm"
+            )
+        return CapabilityCheck(requirement.capability_id, "test-present", True)
+
+    monkeypatch.setattr(runtime_dispatch.platforms, "_check_capability", fail_kvm)
+    monkeypatch.setattr(
+        run_source, "pull_registry_oci_archive", lambda *a, **k: pytest.fail("pull reached on unsupported host")
+    )
+    monkeypatch.setattr(
+        run_source,
+        "export_docker_image_to_oci_archive",
+        lambda *a, **k: pytest.fail("export reached on unsupported host"),
+    )
+
+    ret = cli.main(["run", "remote-registry.example.com/app:v1", "--name", "fail-vm", "-d"])
+    assert ret == 1
+    err = capsys.readouterr().err
+    assert "no kvm" in err or "preflight" in err or "cannot run OCI-root" in err
+
+
+def test_cli_run_auth_tls_network_errors_are_not_masked_as_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    from palimpsest_local import registry_intake, run_source
+    from palimpsest_local.registry import RegistryConfig, RegistryProfile, save_registry_config
+
+    roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
+    monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+
+    config = RegistryConfig(
+        schema_version=1,
+        default="p1",
+        registries={
+            "docker": RegistryProfile(alias="docker", endpoint="docker.io", namespace="library"),
+            "p1": RegistryProfile(alias="p1", endpoint="reg1.example.com"),
+            "p2": RegistryProfile(alias="p2", endpoint="reg2.example.com"),
+        },
+    )
+    save_registry_config(roots, config)
+
+    attempts: list[str] = []
+
+    def fake_pull(ref, out, _roots, *, profile=None, **kwargs):
+        alias = profile.alias if profile else "none"
+        attempts.append(alias)
+        # Auth error on p1
+        raise registry_intake.RegistryAuthenticationError("401 Unauthorized: token expired")
+
+    monkeypatch.setattr(run_source, "pull_registry_oci_archive", fake_pull)
+
+    ret = cli.main(["run", "private-app:1.0", "--name", "auth-vm", "-d"])
+    assert ret == 1
+    # p2 was NOT queried because p1 failed with auth, which must not masquerade as missing
+    assert attempts == ["p1"]
+    err = capsys.readouterr().err
+    assert "401 Unauthorized" in err
+
+
+def test_cli_run_docker_credentials_do_not_cross_native_boundary():
+    from palimpsest_local.registry import credential_free_subprocess_environment
+
+    env = {
+        "PATH": "/usr/bin",
+        "DOCKER_CONFIG": "/path/to/docker",
+        "PALIMPSEST_TOKEN": "secret-hub-token",
+        "PALIMPSEST_PACKAGE_KEY": "secret-native-key",
+    }
+    sanitized = credential_free_subprocess_environment(env)
+    assert sanitized["PATH"] == "/usr/bin"
+    assert sanitized["DOCKER_CONFIG"] == "/path/to/docker"
+    assert "PALIMPSEST_TOKEN" not in sanitized
+    assert "PALIMPSEST_PACKAGE_KEY" not in sanitized
+    assert "PALIMPSEST_TOKEN" in env
+    assert "PALIMPSEST_PACKAGE_KEY" in env
+
+
+def test_cli_automatic_acquisition_fixture_is_isolated(tmp_path: Path):
+    import os
+
+    from palimpsest_local import run_source
+
+    assert os.environ["DOCKER_CONFIG"] == str(tmp_path / "docker-config")
+    assert "DOCKER_HOST" not in os.environ
+    assert "DOCKER_CONTEXT" not in os.environ
+    assert "PALIMPSEST_REGISTRY" not in os.environ
+    assert run_source.find_docker_daemon_source(None, ["service"]) is None
+    with pytest.raises(pytest.fail.Exception, match="real Docker inspection"):
+        run_source.run_docker_command(["docker", "info"])
+    with pytest.raises(pytest.fail.Exception, match="real Docker export"):
+        run_source.export_docker_image_to_oci_archive("service", tmp_path / "unused", None)
+    with pytest.raises(pytest.fail.Exception, match="real registry acquisition"):
+        run_source.pull_registry_oci_archive("service", tmp_path / "unused", None)

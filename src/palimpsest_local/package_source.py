@@ -121,6 +121,8 @@ class PackageSnapshot:
     package_type: str
     platforms: tuple[dict[str, str], ...]
     graph: dict[str, dict[str, Any]] = field(repr=False)
+    runtime_configs: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    runtime_bases: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
 
 
 def _hash_file(path: Path) -> tuple[str, int]:
@@ -496,6 +498,7 @@ class _Graph:
         self.package_types: set[str] = set()
         self.runtime_configs: dict[str, dict[str, Any]] = {}
         self.runtime_parents: dict[str, str | None] = {}
+        self.runtime_bases: dict[str, set[str]] = {}
         self.roots: list[dict[str, Any]] = []
         self.edges = 0
         self.expanded = 0
@@ -894,6 +897,8 @@ class _Graph:
                 ) != base_config.get("arch"):
                     raise ArtifactValidationError("runtime layer and cloud base architectures differ")
                 cloud_base = base
+            if cloud_base is not None:
+                self.runtime_bases.setdefault(digest, set()).add(cloud_base)
             previous, previous_chain = digest, chain
         if constraint is not None:
             arch = leaf.get("arch")
@@ -960,4 +965,6 @@ def snapshot_package(
             package_type=next(iter(graph.package_types)),
             platforms=tuple(graph.platforms),
             graph=dict(graph.verified),
+            runtime_configs={digest: dict(config) for digest, config in graph.runtime_configs.items()},
+            runtime_bases={digest: tuple(sorted(bases)) for digest, bases in graph.runtime_bases.items()},
         )

@@ -221,6 +221,7 @@ async def test_streamed_claim_download_publication_and_lost_response_settlement(
     async with h.factory() as session:
         row = await session.get(PalimpsestHubBuild, job["id"])
         row.started_at = datetime.now(UTC) - timedelta(hours=2)
+        row.lease_expires_at = row.started_at + timedelta(seconds=60)
         await session.commit()
     repeated = await output(h, job, payload)
     assert repeated.status_code == 200 and repeated.json()["status"] == "complete"
@@ -287,6 +288,7 @@ async def test_global_claim_deadline_nonce_and_terminal_failure_boundaries(remot
         row = await session.get(PalimpsestHubBuild, old["id"])
         assert row.started_at is not None
         row.started_at = datetime.now(UTC) - timedelta(seconds=61)
+        row.lease_expires_at = row.started_at + timedelta(seconds=60)
         await session.commit()
     new = await claim(h)
     assert new["id"] == second.json()["id"] and new["lease"] != old["lease"]

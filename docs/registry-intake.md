@@ -1,9 +1,10 @@
 # Anonymous TLS OCI registry intake
 
 `palimpsest oci pull` turns one fully qualified anonymously accessible registry reference into
-a verified local OCI archive. It does not make a registry or Docker's mutable
-image store a runtime authority: `palimpsest run` continues to accept the
-result only through its existing local OCI archive boundary.
+a verified local OCI archive. The separate [automatic `run` resolver](registries.md#automatic-run-acquisition)
+can use configured Docker authentication and custom CAs, but still passes only
+verified local archive bytes into the runtime. Neither a registry nor Docker's
+mutable image store becomes runtime authority.
 
 ```sh
 palimpsest oci pull ghcr.io/nginx/nginx-unprivileged:stable-alpine \
@@ -12,9 +13,11 @@ palimpsest oci pull quay.io/prometheus/busybox:latest \
   --output ./busybox.oci.tar
 ```
 
-The command requires Skopeo 1.13 or newer on `PATH`. It selects exactly
-`linux/amd64`, requests digest-preserving OCI archive output, snapshots the
-selected graph through Palimpsest's descriptor-verifying private source CAS,
+The command requires Skopeo 1.13 or newer on `PATH`. It selects
+`linux/amd64` and requests digest-preserving OCI archive output. Tag-based copies
+contain the selected platform; digest-pinned references preserve the complete
+index (`--multi-arch=all`) so the original root pin remains verifiable before
+selecting the amd64 image. It snapshots the graph through the private source CAS
 and publishes the archive at mode `0600` only after verification. The JSON
 result distinguishes the copied archive's root descriptor from the selected
 platform manifest digest.
@@ -41,8 +44,8 @@ platform manifest digest.
   Descriptor-verified source-CAS copies require additional local storage.
   The deadline covers the external copy, not subsequent archive/CAS
   verification and publication.
-  Standard output and error from the external client are discarded rather than
-  accumulated without a bound. The client runs in a dedicated process group,
+  Standard output is discarded; stderr is file-backed and only a bounded diagnostic
+  prefix is read on failure. The client runs in a dedicated process group,
   which is terminated on success or failure; as with any local process,
   kernel uninterruptible sleep can delay actual task and resource reclamation.
 - The output parent must already exist, be owned by the caller, be free of

@@ -4,24 +4,43 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import hashlib
 import ipaddress
+import math
 import os
 import re
 import shutil
 import stat as stat_module
-from collections.abc import Mapping
+import uuid
+from collections.abc import Iterator, Mapping
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from . import oci_network_status, oci_root_volume_inventory, project_runtime, runtime_dispatch, state
+from . import (
+    host_inventory,
+    oci_network_status,
+    oci_root_volume_inventory,
+    project_runtime,
+    runtime_dispatch,
+    state,
+    vm_access,
+)
 from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import digest_file, require_digest
-from .errors import ArtifactValidationError, StateError
+from .errors import ArtifactValidationError, InvalidDigestError, StateError
 from .hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
-from .oci_layout import ContentStore
+from .oci_layout import DISK_FORMAT_MEDIA_TYPES, ContentStore
 from .oci_store import OCIStore, OCIStoreError
-from .runtime_types import RuntimeKind
+from .remote_artifacts import RemoteArtifacts
+from .run_source import list_retained_oci_sources
+from .runtime_types import (
+    ExpectedRunIdentity,
+    LifecycleResult,
+    ProcessCapabilityError,
+    RuntimeCapabilityError,
+    RuntimeKind,
+)
 from .state import (
     StatePaths,
     artifact_reference_guard,
@@ -34,11 +53,171 @@ from .state import (
     state_root_source,
     write_state_root,
 )
+from .web_operations import OperationManager
 
 BUILD_ID_RE = re.compile(r"^(?:b|bk)-[0-9a-f]{12}$")
 # Each build engine writes its console to one fixed file in the build directory.
 _BUILD_LOG_FILENAMES = {"buildkit": "buildkit.log", "palimpsestfile": "console.log"}
 _MAX_BUILD_LOG_TAIL_BYTES = 4 * 1024 * 1024
+
+
+def _web_string(body: dict[str, Any], key: str, *, required: bool = False) -> str | None:
+    value = body.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip() or any(char in value for char in "\0\r\n"):
+        raise StateError(f"missing or invalid field '{key}'")
+    return value
+
+
+def _web_strings(body: dict[str, Any], key: str) -> list[str]:
+    values = body.get(key, [])
+    if (
+        not isinstance(values, list)
+        or len(values) > 128
+        or any(not isinstance(value, str) or "\0" in value for value in values)
+    ):
+        raise StateError(f"invalid field '{key}'")
+    return values
+
+
+def build_image(roots: StatePaths, operations: OperationManager, body: dict[str, Any]) -> dict[str, Any]:
+    """Start the canonical local-cache Dockerfile pipeline, never a publication."""
+    if set(body) - {"context", "dockerfile", "dockerfile_text", "tag", "platform", "target", "build_args", "offline"}:
+        raise StateError("unsupported build field")
+    context = Path(_web_string(body, "context", required=True)).expanduser()
+    if not context.is_absolute() or not context.is_dir():
+        raise StateError("context must be an existing absolute host directory")
+    tag = _web_string(body, "tag", required=True)
+    platform = body.get("platform", "linux/amd64")
+    if not isinstance(platform, str) or platform not in {"linux/amd64", "linux/arm64"}:
+        raise StateError("platform must be linux/amd64 or linux/arm64")
+    offline = body.get("offline", False)
+    if type(offline) is not bool:
+        raise StateError("offline must be a boolean")
+    recipe = _web_string(body, "dockerfile")
+    inline = body.get("dockerfile_text")
+    if inline is not None and (not isinstance(inline, str) or not inline.strip() or "\0" in inline):
+        raise StateError("dockerfile_text must be nonempty Dockerfile text")
+    if recipe is not None and inline is not None:
+        raise StateError("choose dockerfile or dockerfile_text, not both")
+    args = [
+        "build",
+        str(context.resolve()),
+        "--frontend=dockerfile",
+        "--cache-mode=local",
+        f"--tag={tag}",
+        f"--platform={platform}",
+        f"--network={'none' if offline else 'default'}",
+    ]
+    if offline:
+        args.append("--offline")
+    else:
+        args.append("--registry=docker")
+    if recipe is not None:
+        recipe_path = Path(recipe).expanduser()
+        if not recipe_path.is_absolute() or not recipe_path.is_file():
+            raise StateError("dockerfile must be an existing absolute host file")
+        args.append(f"--file={recipe_path.resolve()}")
+    elif inline is None and not (context / "Dockerfile").is_file():
+        raise StateError("context has no Dockerfile; provide a host file or inline recipe")
+    target = _web_string(body, "target")
+    if target is not None:
+        args.append(f"--target={target}")
+    args.extend(f"--build-arg={value}" for value in _web_strings(body, "build_args"))
+    return operations.start(roots, "build", args, dockerfile_text=inline)
+
+
+def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, Any]) -> dict[str, Any]:
+    """Start the same detached image resolution/runtime path used by run IMAGE."""
+    if set(body) - {
+        "image",
+        "name",
+        "runtime_kind",
+        "manifest",
+        "memory",
+        "vcpus",
+        "network",
+        "publish",
+        "command",
+        "registry",
+        "layers",
+    }:
+        raise StateError("unsupported run field")
+    image = _web_string(body, "image", required=True)
+    if image.startswith("-"):
+        raise StateError("image cannot begin with an option prefix")
+    name = _web_string(body, "name") or f"web-{uuid.uuid4().hex[:12]}"
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None:
+        raise StateError("invalid run name")
+    args = ["run", f"--name={name}", "--detach"]
+    for key, option in (
+        ("runtime_kind", "runtime-kind"),
+        ("manifest", "manifest"),
+        ("network", "network"),
+        ("registry", "registry"),
+    ):
+        value = _web_string(body, key)
+        if key == "runtime_kind" and value is not None and value not in {"cloud-image", "oci-root"}:
+            raise StateError("runtime_kind must be cloud-image or oci-root")
+        if value is not None:
+            args.append(f"--{option}={value}")
+    for key, low, high in (("memory", 256, 1048576), ("vcpus", 1, 256)):
+        value = body.get(key)
+        if value is not None:
+            if type(value) is not int or not low <= value <= high:
+                raise StateError(f"{key} must be an integer between {low} and {high}")
+            args.append(f"--{key}={value}")
+    args.extend(f"--publish={value}" for value in _web_strings(body, "publish"))
+    for layer in _web_strings(body, "layers"):
+        args.append(f"--layer={require_digest(layer)}")
+    args.append(image)
+    command = _web_strings(body, "command")
+    if command:
+        args.extend(["--", *command])
+    return operations.start(roots, "run", args, resource_name=name)
+
+
+def remote_connections(roots: StatePaths) -> dict[str, Any]:
+    """Describe configured protocols without invoking credential helpers."""
+    return {"connections": RemoteArtifacts(roots).connections()}
+
+
+def browse_remote_artifacts(
+    roots: StatePaths,
+    *,
+    connection_id: str,
+    kind: str = "all",
+    query: str = "",
+    repository: str = "",
+    limit: int = 30,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    return RemoteArtifacts(roots).browse(
+        connection_id,
+        kind=kind,
+        query=query,
+        repository=repository,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+def transfer_artifact(roots: StatePaths, operations: OperationManager, body: dict[str, Any]) -> dict[str, Any]:
+    action = _web_string(body, "action", required=True)
+    connection = _web_string(body, "connection_id", required=True)
+    backend = RemoteArtifacts(roots)
+    if action == "download":
+        if set(body) - {"action", "connection_id", "reference"}:
+            raise StateError("unsupported download field")
+        return backend.start_download(operations, connection, _web_string(body, "reference", required=True))
+    if action == "upload":
+        if set(body) - {"action", "connection_id", "source", "target"}:
+            raise StateError("unsupported upload field")
+        return backend.start_upload(
+            operations, connection, body.get("source"), _web_string(body, "target", required=True)
+        )
+    raise StateError("transfer action must be download or upload")
 
 
 def _fsync_index_directory(directory_fd: int) -> None:
@@ -162,7 +341,7 @@ def _json_projection(value: Any) -> Any:
 
 
 def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
-    """Project managed runs; ``live=False`` reads durable ledgers without backend calls."""
+    """Project selected runs and live host resources; ``live=False`` is ledger-only."""
     proj_index = _build_project_index(roots)
     aggregation = runtime_dispatch.reconcile(roots=roots) if live else runtime_dispatch.ps(roots=roots)
     warnings = [
@@ -182,6 +361,9 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
 
         vms.append(
             {
+                "id": name,
+                "managed": not live or not summary.stale,
+                "source": "run-ledger",
                 "name": name,
                 "run_id": summary.run_id,
                 "runtime_kind": summary.runtime_kind.value,
@@ -205,7 +387,39 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
             }
         )
 
-    vms.sort(key=lambda x: x["name"])
+    if live:
+        observed = host_inventory.observe()
+        warnings.extend(observed["warnings"])
+        selected = {(vm["backend"], vm["name"], vm["run_id"]): vm for vm in vms}
+        for host_vm in observed["vms"]:
+            identity = (host_vm["backend"], host_vm["name"], host_vm.get("run_id"))
+            owned = selected.get(identity) if identity[2] else None
+            if owned is not None and owned["status"] != "removed":
+                # Libvirt domain enumeration cannot recover Palimpsest's published endpoints.
+                fields = ("status", "memory_mib", "vcpus")
+                if host_vm["backend"] == "lima-vz":
+                    fields += ("ssh", "guest_ip", "ports")
+                for field in fields:
+                    if host_vm.get(field) is not None:
+                        owned[field] = host_vm[field]
+                owned["source"] = "run-ledger+host-backend"
+            else:
+                for vm in vms:
+                    if vm["backend"] == host_vm["backend"] and vm["name"] == host_vm["name"]:
+                        vm["managed"] = False
+                        vm["stale"] = True
+                vms.append(host_vm)
+
+    vms.sort(key=lambda x: (x["name"], x["backend"], x["id"]))
+    for vm in vms:
+        collision = any(
+            other is not vm and other["backend"] == vm["backend"] and other["name"] == vm["name"] for other in vms
+        )
+        vm["access"] = vm_access.capabilities(vm, live=live, collision=collision)
+        identity_collision = collision or any(
+            other is not vm and (other["id"] == vm["id"] or other["name"] == vm["id"]) for other in vms
+        )
+        vm["lifecycle"] = _vm_lifecycle_capabilities(vm, live=live, collision=identity_collision)
 
     unique_warnings: list[str] = []
     seen = set()
@@ -219,10 +433,186 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
 
 def get_vm(roots: StatePaths, name: str) -> dict[str, Any]:
     res = list_vms(roots)
-    for vm in res["vms"]:
-        if vm["name"] == name:
-            return vm
+    matches = [vm for vm in res["vms"] if vm["id"] == name or vm["name"] == name]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise StateError(f"VM '{name}' is ambiguous across backend ownership identities")
     raise StateError(f"VM '{name}' not found")
+
+
+def _vm_lifecycle_capabilities(row: dict[str, Any], *, live: bool = True, collision: bool = False) -> dict[str, bool]:
+    """Eligibility only: observation never grants lifecycle ownership.
+
+    OCI-root currently has a separate removal/stop receipt and retention policy;
+    it cannot honor this surface's retained-run-files lifecycle contract.
+    """
+    eligible = (
+        live
+        and row.get("managed") is True
+        and not row.get("stale")
+        and not collision
+        and row.get("id") == row.get("name")
+        and bool(row.get("run_id"))
+        and row.get("runtime_kind") == "cloud-image"
+        and row.get("status") != "removed"
+    )
+    return {
+        "start": eligible and row.get("status") == "stopped",
+        "stop": eligible and row.get("status") == "running",
+        "remove": eligible,
+        "remove_volumes": eligible,
+    }
+
+
+def _selected_vm_identity(
+    roots: StatePaths, identifier: str, *, expected_run_id: str, action: str
+) -> ExpectedRunIdentity:
+    if not isinstance(identifier, str) or not identifier:
+        raise StateError("invalid VM inventory identifier")
+    if not isinstance(expected_run_id, str) or not expected_run_id:
+        raise StateError("expected_run_id must be the selected VM UUID")
+    row = get_vm(roots, identifier)
+    if identifier != row["id"] or row.get("managed") is not True:
+        raise StateError("VM lifecycle is forbidden for unmanaged inventory identities")
+    if row.get("run_id") != expected_run_id:
+        raise StateError("selected VM identity changed")
+    if not row["lifecycle"][action]:
+        raise StateError("VM lifecycle action is unavailable for this selected identity")
+    snapshot = state.read_run_ledger_snapshot(roots, row["name"])
+    record = snapshot.record
+    if (
+        record.name != identifier
+        or record.run_id != expected_run_id
+        or record.dispatch_key.backend.value != row["backend"]
+        or record.dispatch_key.runtime_kind.value != row["runtime_kind"]
+        or snapshot.state.get("status") == "removed"
+    ):
+        raise StateError("selected VM identity changed")
+    # Carry the original selection into dispatch; never resolve a fresh identity
+    # at mutation time or wrap the adapter's own lock in an inventory lock.
+    return ExpectedRunIdentity(record.name, expected_run_id, record.dispatch_key)
+
+
+def _vm_lifecycle_projection(result: LifecycleResult) -> dict[str, Any]:
+    """Return only public receipt fields, never a fresh same-name VM lookup."""
+    if not isinstance(result, LifecycleResult):
+        raise StateError("runtime returned an invalid VM lifecycle receipt")
+    return {
+        "name": result.record.name,
+        "run_id": result.record.run_id,
+        "runtime_kind": result.record.dispatch_key.runtime_kind.value,
+        "backend": result.record.dispatch_key.backend.value,
+        "operation": result.operation.value,
+        "previous_status": result.previous_status,
+        "status": result.current_status,
+        "lifecycle_revision": result.cursor.revision,
+        "warning_category": None if result.warning_category is None else result.warning_category.value,
+        "fallback_used": result.fallback_used,
+    }
+
+
+def vm_lifecycle(roots: StatePaths, identifier: str, action: str, *, expected_run_id: str) -> dict[str, Any]:
+    """Start/stop an exact managed selection with backend-lock UUID fencing."""
+    if not isinstance(action, str) or action not in {"start", "stop"}:
+        raise StateError("VM lifecycle action must be start or stop")
+    identity = _selected_vm_identity(roots, identifier, expected_run_id=expected_run_id, action=action)
+    operation = runtime_dispatch.start if action == "start" else runtime_dispatch.stop
+    return _vm_lifecycle_projection(operation(identity.name, roots=roots, expected_identity=identity))
+
+
+def remove_vm(
+    roots: StatePaths, identifier: str, *, expected_run_id: str, confirmation: str, volumes: bool = False
+) -> dict[str, Any]:
+    """Remove an exact selection after typed-name confirmation.
+
+    Run files are retained by default. ``volumes=True`` removes only the
+    canonical owned run tree via dispatch, not project volumes or host paths.
+    """
+    if type(volumes) is not bool:
+        raise StateError("volumes must be a boolean")
+    identity = _selected_vm_identity(
+        roots, identifier, expected_run_id=expected_run_id, action="remove_volumes" if volumes else "remove"
+    )
+    if not isinstance(confirmation, str) or confirmation != identity.name:
+        raise StateError("confirmation must exactly match the selected VM name")
+    return _vm_lifecycle_projection(
+        runtime_dispatch.rm(
+            identity.name,
+            roots=roots,
+            expected_identity=identity,
+            volumes=volumes,
+        )
+    )
+
+
+def vm_metrics(
+    roots: StatePaths, identifier: str, *, expected_run_id: str | None = None, exec_owners=None
+) -> dict[str, Any]:
+    """Collect one bounded Linux sample, only for this detail request."""
+    try:
+        access = vm_access.Access.resolve(roots, identifier, expected_run_id=expected_run_id)
+        access.exec_owners = exec_owners
+        return vm_access.metrics(access)
+    except vm_access.VMAccessError as exc:
+        reason, message = exc.category, str(exc)
+    except (RuntimeCapabilityError, ProcessCapabilityError):
+        reason, message = "capability", "Guest measurement transport is unsupported by this runtime"
+    except Exception:
+        reason, message = "transport", "Guest measurements are unavailable"
+    return {
+        "id": identifier,
+        "status": "unavailable",
+        "source": "linux-guest",
+        "reason": reason,
+        "message": message,
+        "measured_at": None,
+        "run_id": expected_run_id,
+        "cpu": None,
+        "load": None,
+        "memory": None,
+        "uptime_seconds": None,
+        "boot_id": None,
+        "filesystems": None,
+        "interfaces": None,
+        "block_devices": None,
+        "unavailable": [
+            "stat",
+            "loadavg",
+            "meminfo",
+            "uptime",
+            "df",
+            "net/dev",
+            "diskstats",
+            "sys/kernel/random/boot_id",
+        ],
+    }
+
+
+def vm_logs(
+    roots: StatePaths, identifier: str, *, tail: int = 200, expected_run_id: str | None = None, exec_owners=None
+) -> dict[str, Any]:
+    """Read bounded guest journal or identity-bound native Lima serial console."""
+    if type(tail) is not int or not 1 <= tail <= 5000:
+        raise StateError("VM log tail must be between 1 and 5000 lines")
+    try:
+        access = vm_access.Access.resolve(roots, identifier, expected_run_id=expected_run_id)
+        access.exec_owners = exec_owners
+        return {"status": "available", **access.logs(tail)}
+    except vm_access.VMAccessError as exc:
+        reason, message = exc.category, str(exc)
+    except (RuntimeCapabilityError, ProcessCapabilityError):
+        reason, message = "capability", "Guest log transport is unsupported by this runtime"
+    except Exception:
+        reason, message = "transport", "Guest journal or native console is unavailable"
+    return {
+        "status": "unavailable",
+        "log": "",
+        "source": None,
+        "truncated": False,
+        "reason": reason,
+        "message": message,
+    }
 
 
 def list_artifacts(roots: StatePaths) -> dict[str, Any]:
@@ -295,6 +685,14 @@ def list_artifacts(roots: StatePaths) -> dict[str, Any]:
                 "kind": kind or "unknown",
                 "size_bytes": size_bytes,
                 "tags": tags,
+                "source": "content-store",
+                "availability": "available" if store.exists(digest) else "missing",
+                "editable": store.exists(digest)
+                and (
+                    kind == KIND_CLOUD_IMAGE
+                    or kind == "squashfs"
+                    or meta.get("media_type") == MEDIA_TYPE_LAYER_SQUASHFS
+                ),
                 "referenced_by": ref_dict,
             }
 
@@ -307,12 +705,233 @@ def list_artifacts(roots: StatePaths) -> dict[str, Any]:
             else:
                 unknown.append(art_record)
 
+    # BuildKit's OCI export is not a runtime block and need not be in the CAS.
+    # Output tags are build provenance, not proof of a durable local CAS binding.
+    artifacts_by_digest = {artifact["digest"]: artifact for artifact in artifacts}
+    oci_images: dict[tuple[str, str], dict[str, Any]] = {}
+    export_observations: dict[tuple[str | None, int | None], tuple[str, int | None]] = {}
+    for build_dir, rec in _build_records(roots):
+        build = _normalize_build_record(build_dir, rec)
+        if build["engine"] != "buildkit" or build["status"] != "success":
+            continue
+        runtime_digest = build["runtime_block_digest"]
+        runtime_artifact = artifacts_by_digest.get(runtime_digest)
+        if runtime_artifact is not None and (
+            runtime_artifact.get("kind") == "squashfs"
+            or runtime_artifact.get("media_type") == MEDIA_TYPE_LAYER_SQUASHFS
+        ):
+            runtime_artifact.setdefault("builds", []).append(build)
+            runtime_artifact["runtime_block_digest"] = runtime_digest
+        archive_digest = build["output_oci_archive_digest"]
+        manifest_digest = build["output_oci_manifest_digest"]
+        if archive_digest is None and manifest_digest is None:
+            continue
+        output_path = rec.get("output_path")
+        output_path = output_path if isinstance(output_path, str) else None
+        recorded_bytes = rec.get("bytes")
+        recorded_size = recorded_bytes.get("oci_archive") if isinstance(recorded_bytes, dict) else None
+        recorded_size = recorded_size if type(recorded_size) is int and recorded_size >= 0 else None
+        export_key = (output_path, recorded_size)
+        if export_key not in export_observations:
+            export_observations[export_key] = _local_export_observation(output_path, recorded_size)
+        availability, observed_size = export_observations[export_key]
+        size = recorded_size if recorded_size is not None else observed_size
+        digest_type = "oci-manifest" if manifest_digest else "oci-archive"
+        digest = manifest_digest or archive_digest
+        key = (digest_type, digest)
+        if key not in oci_images:
+            art_record = {
+                "digest": digest,
+                "digest_type": digest_type,
+                "kind": "oci-image",
+                "source": "build-record",
+                "editable": False,
+                "availability": availability,
+                "name": ", ".join(build["output_tags"]) or build["build_id"],
+                "output_tags": list(build["output_tags"]),
+                "build_ids": [],
+                "arch": build["platform"].split("/")[1] if build["platform"] and "/" in build["platform"] else None,
+                "created_at": build["finished_at"] or build["started_at"],
+                "size_bytes": size,
+                "output_oci_archive_size_bytes": size,
+                "platform": build["platform"],
+                "output_oci_manifest_digest": manifest_digest,
+                "output_oci_archive_digest": archive_digest,
+                "tags": [],
+                "referenced_by": {"runs": [], "projects": []},
+                "builds": [],
+            }
+            oci_images[key] = art_record
+            artifacts.append(art_record)
+            images.append(art_record)
+        oci_images[key]["builds"].append(build)
+        image = oci_images[key]
+        image["build_ids"].append(build["build_id"])
+        image["output_tags"] = sorted(set(image["output_tags"] + build["output_tags"]))
+        image["name"] = ", ".join(image["output_tags"]) or image["build_ids"][0]
+        if availability == "available" and image["availability"] != "available":
+            image["availability"] = availability
+            image["size_bytes"] = image["output_oci_archive_size_bytes"] = size
+            image["output_oci_archive_digest"] = archive_digest
+        elif availability == "unavailable" and image["availability"] == "missing":
+            image["availability"] = availability
+    for retained in list_retained_oci_sources(roots):
+        key = (retained["digest_type"], retained["digest"])
+        if key in oci_images:
+            continue
+        oci_images[key] = retained
+        artifacts.append(retained)
+        images.append(retained)
+    for retained in _retained_remote_artifacts(roots):
+        key = (retained["digest_type"], retained["digest"])
+        if key in oci_images:
+            oci_images[key].setdefault("upload_source", retained["upload_source"])
+            continue
+        oci_images[key] = retained
+        artifacts.append(retained)
+        images.append(retained)
     return {
         "artifacts": artifacts,
         "images": images,
         "layers": layers,
         "unknown": unknown,
     }
+
+
+def _retained_remote_artifacts(roots: StatePaths) -> Iterator[dict[str, Any]]:
+    """Project owner-bound receipts; observe files without rehashing archives."""
+    try:
+        with pinned_owner_directory(roots.state.resolve() / "remote-references", missing_ok=True) as directory_fd:
+            if directory_fd is None:
+                return
+            for filename in sorted(os.listdir(directory_fd)):
+                if re.fullmatch(r"[0-9a-f]{64}\.json", filename) is None:
+                    continue
+                try:
+                    info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                    if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+                        continue
+                    record = state._read_pinned_json_object(directory_fd, filename)
+                    if record.get("schema") != "palimpsest-remote-reference-v1" or record.get("kind") not in {
+                        "oci-image",
+                        "runtime-bundle",
+                    }:
+                        continue
+                    connection, reference = record.get("connection_id"), record.get("requested_reference")
+                    if not isinstance(connection, str) or not isinstance(reference, str):
+                        continue
+                    if hashlib.sha256((connection + "\0" + reference).encode()).hexdigest() + ".json" != filename:
+                        continue
+                    archive_digest = require_digest(record.get("archive_digest"))
+                    root_digest = require_digest(record.get("package_manifest"))
+                    archive = record.get("archive")
+                    if not isinstance(archive, str) or not Path(archive).is_absolute():
+                        continue
+                    archive_path = Path(archive).parent.resolve() / Path(archive).name
+                    if archive_path.parent not in {
+                        roots.state.resolve() / "registry-artifacts",
+                        roots.state.resolve() / "package-artifacts",
+                    }:
+                        continue
+                    availability, size = _local_export_observation(archive, None)
+                    yield {
+                        "digest": root_digest,
+                        "digest_type": "oci-manifest",
+                        "kind": record["kind"],
+                        "source": "remote-transfer",
+                        "name": reference,
+                        "editable": False,
+                        "availability": availability,
+                        "size_bytes": size,
+                        "output_oci_archive_digest": archive_digest,
+                        "output_oci_manifest_digest": record.get("manifest"),
+                        "image": record.get("image"),
+                        "manifest": record.get("manifest"),
+                        "runtime_kind": record.get("runtime_kind"),
+                        "layers": record.get("layers", []),
+                        "run_supported": record.get("run_supported") is True,
+                        "run_limitation": record.get("run_limitation"),
+                        "architectures": record.get("architectures", []),
+                        "tags": [],
+                        "referenced_by": {"runs": [], "projects": []},
+                        "upload_source": {"kind": "remote", "connection_id": connection, "reference": reference},
+                    }
+                except (OSError, ValueError, TypeError, StateError, ArtifactValidationError):
+                    continue
+    except (OSError, StateError):
+        return
+
+
+def _optional_digest(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return require_digest(value)
+    except InvalidDigestError:
+        return None
+
+
+def _local_export_observation(value: str | None, recorded_size: int | None) -> tuple[str, int | None]:
+    """Observe a regular archive's presence/size, not its digest or runnability."""
+    if not value or not Path(value).is_absolute():
+        return "unavailable", None
+    path = Path(value)
+    try:
+        # Allow parent aliases such as macOS /tmp, but never follow the leaf.
+        path = path.parent.resolve(strict=True) / path.name
+        entry = path.stat(follow_symlinks=False)
+        if not stat_module.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            return "unavailable", None
+        size = entry.st_size
+        if size <= 0 or recorded_size is not None and size != recorded_size:
+            return "unavailable", size
+        return "available", size
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, ValueError, ArtifactValidationError):
+        return "unavailable", None
+
+
+def _read_build_record(builds_fd: int, name: str) -> dict[str, Any]:
+    before = os.stat(name, dir_fd=builds_fd, follow_symlinks=False)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    build_fd = os.open(name, flags, dir_fd=builds_fd)
+    try:
+        opened = os.fstat(build_fd)
+        if (
+            not stat_module.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat_module.S_IMODE(opened.st_mode) & 0o022
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise StateError("invalid build directory")
+        rec = state._read_pinned_json_object(build_fd, "record.json")
+        current = os.stat(name, dir_fd=builds_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise StateError("build directory changed during read")
+        if rec.get("build_id", name) != name:
+            raise StateError("build record does not match its directory")
+        return rec
+    finally:
+        os.close(build_fd)
+
+
+def _build_records(roots: StatePaths) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Read editable ledgers only through owner-bound directories and files."""
+    try:
+        with pinned_owner_directory(roots.state.resolve() / "builds", missing_ok=True) as builds_fd:
+            if builds_fd is None:
+                return
+            for name in sorted(os.listdir(builds_fd)):
+                if BUILD_ID_RE.fullmatch(name) is None:
+                    continue
+                build_dir = roots.state.resolve() / "builds" / name
+                try:
+                    yield build_dir, _read_build_record(builds_fd, name)
+                except (OSError, StateError, ArtifactValidationError):
+                    continue
+    except (OSError, StateError):
+        return
 
 
 def _build_engine(rec: dict[str, Any]) -> str:
@@ -325,10 +944,10 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
     engine = _build_engine(rec)
 
     build_id = rec.get("build_id") or build_dir.name
-    status = rec.get("status", "unknown")
-    finished_at = rec.get("finished_at")
-    created_at = rec.get("created_at")
-    started_at = rec.get("started_at")
+    status = rec.get("status") if isinstance(rec.get("status"), str) else "unknown"
+    finished_at = rec.get("finished_at") if isinstance(rec.get("finished_at"), str) else None
+    created_at = rec.get("created_at") if isinstance(rec.get("created_at"), str) else None
+    started_at = rec.get("started_at") if isinstance(rec.get("started_at"), str) else None
 
     duration_ms = None
     timings_ms = rec.get("timings_ms") if isinstance(rec.get("timings_ms"), dict) else {}
@@ -344,8 +963,9 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
             except Exception:
                 pass
     else:
-        if "total" in timings_ms and isinstance(timings_ms["total"], (int, float)):
-            duration_ms = int(timings_ms["total"])
+        total = timings_ms.get("total")
+        if type(total) in (int, float) and math.isfinite(total):
+            duration_ms = int(total)
         elif finished_at and started_at:
             try:
                 dt_fin = datetime.datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
@@ -365,13 +985,24 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
     output_tags = rec.get("output_tags")
     if output_tags is None:
         out_tag = rec.get("output_tag")
-        output_tags = [out_tag] if out_tag else []
+        output_tags = [out_tag] if isinstance(out_tag, str) and out_tag else []
+    if not isinstance(output_tags, list):
+        output_tags = []
+    output_tags = [tag for tag in output_tags if isinstance(tag, str) and tag]
 
-    output_digest = rec.get("output_digest") or rec.get("runtime_block_digest") or rec.get("output_oci_archive_digest")
-    base_digest = rec.get("base_digest") or rec.get("runtime_base_digest")
+    manifest_digest = _optional_digest(rec.get("output_oci_manifest_digest"))
+    archive_digest = _optional_digest(rec.get("output_oci_archive_digest"))
+    runtime_digest = _optional_digest(rec.get("runtime_block_digest"))
+    output_digest = _optional_digest(rec.get("output_digest")) or runtime_digest or manifest_digest or archive_digest
+    base_digest = _optional_digest(rec.get("base_digest")) or _optional_digest(rec.get("runtime_base_digest"))
     parent_digests = rec.get("parent_digests", [])
-    platform = rec.get("platform")
-    cache_source = rec.get("cache_source")
+    parent_digests = (
+        [digest for value in parent_digests if (digest := _optional_digest(value)) is not None]
+        if isinstance(parent_digests, list)
+        else []
+    )
+    platform = rec.get("platform") if isinstance(rec.get("platform"), str) else None
+    cache_source = rec.get("cache_source") if isinstance(rec.get("cache_source"), str) else None
     log_available = (build_dir / _BUILD_LOG_FILENAMES[engine]).is_file()
 
     return {
@@ -383,6 +1014,9 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
         "duration_ms": duration_ms,
         "output_tags": output_tags,
         "output_digest": output_digest,
+        "output_oci_manifest_digest": manifest_digest,
+        "output_oci_archive_digest": archive_digest,
+        "runtime_block_digest": runtime_digest,
         "base_digest": base_digest,
         "parent_digests": parent_digests,
         "platform": platform,
@@ -394,22 +1028,8 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
 
 def list_builds(roots: StatePaths, *, limit: int = 100) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    if not roots.builds.exists():
-        return items
-
-    for build_dir in roots.builds.iterdir():
-        if not build_dir.is_dir():
-            continue
-        if BUILD_ID_RE.fullmatch(build_dir.name) is None:
-            continue
-        rec_file = build_dir / "record.json"
-        if not rec_file.is_file():
-            continue
-        try:
-            rec = read_json(rec_file)
-            items.append(_normalize_build_record(build_dir, rec))
-        except Exception:
-            pass
+    for build_dir, rec in _build_records(roots):
+        items.append(_normalize_build_record(build_dir, rec))
 
     items.sort(key=lambda b: b.get("started_at") or b.get("finished_at") or "", reverse=True)
     return items[:limit]
@@ -418,13 +1038,13 @@ def list_builds(roots: StatePaths, *, limit: int = 100) -> list[dict[str, Any]]:
 def get_build(roots: StatePaths, build_id: str) -> dict[str, Any]:
     if not isinstance(build_id, str) or BUILD_ID_RE.fullmatch(build_id) is None:
         raise StateError(f"invalid build id: {build_id!r}")
-    build_dir = (roots.builds / build_id).resolve()
-    if not build_dir.is_relative_to(roots.builds.resolve()):
-        raise StateError(f"invalid build id: {build_id!r}")
-    rec_file = build_dir / "record.json"
-    if not rec_file.is_file():
-        raise StateError(f"build '{build_id}' not found")
-    rec = read_json(rec_file)
+    build_dir = roots.state.resolve() / "builds" / build_id
+    try:
+        with pinned_owner_directory(build_dir.parent) as builds_fd:
+            assert builds_fd is not None
+            rec = _read_build_record(builds_fd, build_id)
+    except OSError:
+        raise StateError(f"build '{build_id}' not found or unsafe") from None
     return _normalize_build_record(build_dir, rec)
 
 
@@ -450,6 +1070,64 @@ def build_log(roots: StatePaths, build_id: str, *, tail: int = 400) -> str:
         data = data[data.find(b"\n") + 1 :]
     lines = data.decode("utf-8", errors="replace").splitlines()
     return "".join(line + "\n" for line in lines[-tail:])
+
+
+def tag_artifact(roots: StatePaths, digest: str, tag: str) -> dict[str, Any]:
+    """Verify and bind one supported CAS artifact in a single guarded transaction."""
+    roots = StatePaths(config=roots.config.resolve(), state=roots.state.resolve())
+    digest = require_digest(digest)
+    tag = state.validate_tag(tag)
+    with artifact_reference_guard(roots):
+        physical = ArtifactStore(roots.store)
+        with (
+            physical.digest_guard(digest),
+            pinned_owner_directory(roots.store / "metadata") as metadata_fd,
+            pinned_owner_directory(roots.tags) as tags_fd,
+        ):
+            assert metadata_fd is not None and tags_fd is not None
+            blob = roots.store / "blobs" / "sha256" / digest.split(":", 1)[1]
+            try:
+                blob_snapshot = blob.stat(follow_symlinks=False)
+                verified = physical.verify_blob(digest)
+            except (OSError, ArtifactStoreError):
+                raise StateError("tag references a missing or unsafe CAS artifact") from None
+            meta, metadata_snapshot = state._read_pinned_json_object_snapshot(
+                metadata_fd, f"{digest.split(':', 1)[1]}.json"
+            )
+            if meta.get("digest") != digest:
+                raise StateError("artifact metadata digest mismatch")
+            if meta.get("kind") == KIND_CLOUD_IMAGE:
+                disk_format = meta.get("disk_format")
+                media_type = DISK_FORMAT_MEDIA_TYPES.get(disk_format) if isinstance(disk_format, str) else None
+                if media_type is None:
+                    raise StateError("unsupported cloud image disk format")
+            elif meta.get("kind") == "squashfs" or meta.get("media_type") == MEDIA_TYPE_LAYER_SQUASHFS:
+                media_type = MEDIA_TYPE_LAYER_SQUASHFS
+            else:
+                raise StateError("unsupported artifact type for local tagging")
+            for field in ("parent_digest", "base_image_digest"):
+                value = meta.get(field)
+                if value is not None and _optional_digest(value) is None:
+                    raise StateError("artifact metadata has an invalid digest reference")
+            record = state.TagRecord(
+                schema_version=1,
+                tag=tag,
+                digest=digest,
+                media_type=media_type,
+                size_bytes=verified.size,
+                parent_digest=meta.get("parent_digest"),
+                base_image_digest=meta.get("base_image_digest"),
+                source="inventory",
+                created_at=state.utc_now_iso(),
+            )
+            committed = state._write_tag_record_locked(
+                roots,
+                record,
+                tags_fd=tags_fd,
+                blob_snapshot=blob_snapshot,
+                metadata_snapshot=metadata_snapshot,
+            )
+            return dataclasses.asdict(committed)
 
 
 def remove_artifact(roots: StatePaths, digest: str, *, force: bool = False) -> dict[str, Any]:
@@ -890,7 +1568,7 @@ def _overlay_size(roots: StatePaths, vm: dict[str, Any]) -> int:
 
 
 def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[str, Any]:
-    """Enumerate ledger volumes, including preserved volumes without any VM."""
+    """Enumerate retained ledger volumes and read-only host disks, including unattached disks."""
     warnings: set[str] = set()
     projects = _projects(roots, warnings)
     owners = _owners(projects, warnings)
@@ -997,6 +1675,30 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
                 row["status"] = "unavailable"
                 warnings.add(_DISK_WARNING)
         volumes[key] = row
+    observed = host_inventory.observe()
+    warnings.update(observed["warnings"])
+    for host_volume in observed["volumes"]:
+        target = None
+        if host_volume["kind"] == "vm-disk":
+            identities = {
+                (item["name"], item.get("run_id")) for item in host_volume["attachments"] if item.get("run_id")
+            }
+            target = next(
+                (
+                    row
+                    for row in volumes.values()
+                    if row["kind"] == "vm-disk"
+                    and row["backend"] == host_volume["backend"]
+                    and any((item["name"], item.get("run_id")) in identities for item in row["attachments"])
+                ),
+                None,
+            )
+        if target is None:
+            volumes[host_volume["id"]] = host_volume
+        else:
+            for field in ("size_bytes", "file_size_bytes", "allocated_bytes", "status", "source"):
+                if field in host_volume:
+                    target[field] = host_volume[field]
     for row in volumes.values():
         row["attachments"].sort(
             key=lambda item: (item["name"], item["run_id"] or "", item["mount_path"] or "", item["read_only"])
@@ -1060,7 +1762,7 @@ def _network(
 
 
 def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[str, Any]:
-    """Configured networks, never evidence of a running listener or bridge."""
+    """Configured and host-observed networks; configuration alone is not listener proof."""
     warnings: set[str] = set()
     vms = _vms(roots, vms_result, warnings)
     # ps may omit any VM whose public fields or committed plan are malformed.
@@ -1172,6 +1874,30 @@ def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[
             networks[key] = _network(
                 key, vm["name"], "unknown", backend, mode=None, status="unavailable", source="run-ledger"
             )
+    observed = host_inventory.observe()
+    warnings.update(observed["warnings"])
+    for host_network in observed["networks"]:
+        target = next(
+            (
+                row
+                for row in networks.values()
+                if row["backend"] == host_network["backend"]
+                and (row["name"].removeprefix("lima:") if row["backend"] == "lima-vz" else row["name"])
+                == host_network["name"]
+                and row["kind"] in {"lima", "libvirt"}
+                and row["status"] != "isolated"
+            ),
+            None,
+        )
+        if target is None:
+            networks[host_network["id"]] = host_network
+        else:
+            attached = {(item["name"], item.get("run_id")): item for item in target["attachments"]}
+            attached.update({(item["name"], item.get("run_id")): item for item in host_network["attachments"]})
+            target["attachments"] = list(attached.values())
+            for field in ("mode", "subnet", "gateway", "status", "source"):
+                if host_network.get(field) is not None:
+                    target[field] = host_network[field]
     for row in networks.values():
         row["attachments"].sort(key=lambda item: (item["name"], item["run_id"] or ""))
     return {

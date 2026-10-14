@@ -3,19 +3,19 @@
 This guide covers end-user installation from PyPI or a GitHub VCS URL,
 package selection, supported host/runtime combinations, external dependencies,
 initial configuration, upgrades, and administrator-owned Linux deployment.
-It does not use a repository checkout as the user installation mechanism.
+Released installations use pinned published bytes; trusted local installation below is only for unreleased working-source behavior.
 
-Palimpsest Local requires Python 3.11 or newer. The root distribution
-[`palimpsest-client 0.3.3`](https://pypi.org/project/palimpsest-client/0.3.3/)
-is published on PyPI with [GitHub Release `v0.3.3`](https://github.com/openstack-afterglow/palimpsest/releases/tag/v0.3.3).
-The independent Hub distribution and root/Hub metadata, modules, locks and
-Kolla image tag in this tree are the **unpublished 0.3.4 candidate**.
-Git and outbound HTTPS access to GitHub are required only for direct VCS
-installation. Install the published CLI with
-`python3.12 -m pip install "palimpsest-client==0.3.3"`; package installation
-alone does not update running Hub services or qualify native execution.
+Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
+Latest dev `ad1674e842c6cefaf4e2d38705b109a579f56040` is the 0.3.4 release
+baseline. This isolated full-source tree prepares **unpublished 0.3.5** for
+root/Hub metadata, modules, native-generated locks and Kolla image defaults.
+Install released client bytes with `uv tool install --python 3.11
+palimpsest-client==0.3.4`, or install the actual trusted local checkout with
+`uv tool install --force --python 3.11 .`. A remote package/branch cannot contain
+uncommitted WIP; a root wheel upgrade neither deploys Hub nor qualifies native
+execution. Git/outbound GitHub HTTPS is needed only for VCS installation.
 
-**0.3.4 source candidate (not committed, published or deployed):** based on published 0.3.3 at upstream dev `7186abf7844454eda7ed86a215192b33b9250ff8`. The 2026-10-14 owner-approved scoped iterative Hub build/upload/consume loop is branch push → protected dev PR → required checks → merge → immutable v0.3.x tag → PyPI/GitHub/GHCR → operator PyPI pin → Kolla deploy; main promotion and CI protection changes are excluded. Preserve immutable running pins and the single API/export storage-owning host. The controller serves the build API but never runs recipes; a dedicated CPU-only Nova service VM runs the remote worker. Native qualification is pending until the parent records it. The authenticated `/app` console retains original-token `/v1/me`, independent capabilities, bounded visible pagination and separate memory-only native keys. Publish-only repeat uploads still use byte/metadata-verified sessions without descriptor disclosure; missing sessions never trigger automatic re-publication or prove an unacknowledged finalization failed.
+**0.3.5 full-source integration (not committed, published or deployed):** retains the latest HTTPS-only private build plane and authorization while integrating distributed export ownership and local/client WIP. This assignment performs no tests/builds/lint/format/runtime proofs or operator mutation. Historical approval, deployment, publication and authentication receipts below retain their dated ref/resource boundary and are not current candidate acceptance. The API never runs recipes; the CPU-only service VM receives verified HTTPS, a private keyfile and local scratch only. Follow the offline drain/schema/paired-storage restore checklist before any separately authorized rollout.
 
 The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Afterglow's effective Hub transport is already `https://palimpsest.dmslab.re.kr` and certificate-verified requests from its running backend returned HTTP 200. The dedicated Hub validator authenticated with only system `reader`. These checks concern the existing deployment, not acceptance of the candidate.
 
@@ -40,9 +40,9 @@ a deployed worker, completed build or native qualification.
 
 ### Historical 0.3.1 release and cutover record
 
-The following pins and held-rollout record describe 0.3.1, not the current
-running 0.3.3 or unpublished 0.3.4. Their backup, authority and recovery
-prerequisites remain applicable with the remote-build exceptions below.
+The following pins and held-rollout record describe historical 0.3.1, not
+current production or the unpublished 0.3.5 integration. Their backup,
+authority and recovery prerequisites remain applicable with the exceptions below.
 
 
 The Hub 0.3.1 package registry and retained closed-transport pool recovery are
@@ -167,7 +167,6 @@ write before reopening ingress. Record exact role/edge/assignment receipts and
 live Trust delete proof privately. This is an approval-requiring operator step,
 not an IAM mutation performed by source preparation.
 
-
 ## Package catalog
 
 | Distribution | Install selector | Entrypoints | Purpose |
@@ -195,6 +194,27 @@ host; source metadata alone does not establish runtime readiness.
 The role's release matches the Hub 0.3.1 source. Operators deploying
 the package registry or closed-connection fix must verify reviewed API/worker
 image digests in Kolla globals; a Python update does not change running containers.
+
+### Install the Kolla role from PyPI
+
+In the existing operator project's dependency array, pin
+`palimpsest-client==0.3.3` and remove only the `palimpsest-client` Git entry from
+`[tool.uv.sources]`. Keep Kolla and the other packages' existing pins unchanged.
+Normal release installation does not require GitHub access to Palimpsest and
+does not enable a source-image build.
+
+```sh
+uv --directory /etc/kolla lock
+uv --directory /etc/kolla sync --locked --inexact --no-install-project \
+  --reinstall-package palimpsest-client
+/etc/kolla/.venv/bin/palimpsest --version
+```
+
+Explicit package-only reinstall is necessary when replacing a Git installation
+with the same PyPI version: a plain sync can only audit the old installation.
+Verify the lock's PyPI wheel hash, installed role bytes and unchanged unrelated
+package versions. This installs role data; it does not pull or restart the Hub.
+
 
 On deploy and upgrade, each Palimpsest host pulls the API image and sets the
 root of its own named Hub volume to the image's runtime user before containers
@@ -361,9 +381,14 @@ installs the exact same-source root wheel in the Hub venv with `qemu-utils`,
 `bubblewrap`, `squashfs-tools`, `util-linux`, `mount` and `e2fsprogs`; it needs no
 Local `[kvm]` extra or libvirt. API/export still need SQL/Redis/Keystone, and
 export needs the reader/protected-ID settings. None of those credentials or
-the Hub CAS path is passed to the build VM. There is no schema migration.
+the Hub CAS path is passed to the build VM. Integrated ownership bootstrap is described below.
 
 ### Remote build worker deployment (0.3.4 source candidate)
+
+This heading preserves the original 0.3.4 introduction/link target; the same
+private HTTPS execution boundary is retained by 0.3.5, with API SQL ownership
+and offline additive schema rollout described above/below. It is not current
+candidate publication or native acceptance evidence.
 
 Provision a dedicated Linux x86_64 CPU-only Nova VM in `palimpsest-service`.
 The API admits x86_64 bases only and the executor requires the VM machine to
@@ -592,13 +617,25 @@ Python package installation deliberately does not install or mutate host tools.
 
 The experimental libvirt/HVF backend additionally needs QEMU, libvirt,
 `qemu:///session`, `hdiutil`, and the Local `[kvm]` extra. With Homebrew,
-`brew install qemu pkgconf` supplies the separate QEMU tools and the
-`pkg-config` executable needed to build `libvirt-python` against the already
-installed host libvirt. In a source checkout, install the optional binding with
-`uv sync --frozen --extra dev --extra kvm`; verify session access with
-`virsh -c qemu:///session list --all` before explicitly selecting
-`--backend libvirt-hvf`. Package installation or successful preflight alone
-does not prove a guest can boot; Lima/VZ remains the macOS default.
+`brew install qemu libvirt pkgconf` supplies the host tools and the
+`pkg-config` executable needed to build `libvirt-python`. Start the local
+session daemon with `brew services start libvirt` if it is not already running.
+In a source checkout, install and retain the optional binding when running uv:
+
+```sh
+uv sync --frozen --extra dev --extra kvm
+virsh -c qemu:///session list --all
+uv run --frozen --extra kvm palimpsest web --allow-control
+```
+
+Plain `uv run` can synchronize away an extra that was previously installed;
+include `--extra kvm` for libvirt-backed commands, or use the prepared
+`.venv/bin/palimpsest` directly. Verify the Python binding and session connection
+in the same environment as the CLI, not just a separately installed `virsh`.
+Select `--backend libvirt-hvf` explicitly for a conventional ARM64 cloud image.
+Package installation or successful preflight alone does not prove a guest can
+boot; Lima/VZ remains the macOS default. The latest handoff records separately
+scoped live boot, SSH, console and measurement evidence.
 
 ### Linux conventional cloud-image runtime
 
@@ -628,7 +665,7 @@ per-VM network contract. This is separate from Compose project publication.
 - An installed Docker CLI for OCI-profile `login`, `pull`, `push`, `tag` and Docker inventory/history/save/load/remove/passthrough. Native package push/pull do not use Docker's image store.
 - An installed Docker credential helper and exact API-base/namespace `credHelpers` entry (or `credsStore`) for native login. Host-only Docker credentials, `auths` and plaintext fallback are not accepted. The native client also supports an ephemeral `PALIMPSEST_PACKAGE_KEY`, not a legacy Keystone token.
 - A separately managed Buildx builder with an OCI exporter for Dockerfile builds. The default `docker` driver does not provide the required exporter.
-- Every online build requires a project-scoped key with both `cache:read` and `cache:write`; OCI output must pass `--cache-registry NATIVE_ALIAS --cache-package NAMESPACE/PACKAGE`, while native output defaults to its own profile/package. CLI package publication additionally requires `packages:inventory` and `packages:write`, not content-download authority. Pull requires effective inventory plus `packages:read`.
+- Every online build in default native cache mode requires a project-scoped key with both `cache:read` and `cache:write`; OCI output in that mode must pass `--cache-registry NATIVE_ALIAS --cache-package NAMESPACE/PACKAGE`, while native output defaults to its own profile/package. OCI output can instead use `--cache-mode local` with managed host cache and no Hub connection; this rejects native/external cache authorities and is not strict offline mode. CLI package publication additionally requires `packages:inventory` and `packages:write`, not content-download authority. Pull requires effective inventory plus `packages:read`.
 - Strict offline Dockerfile builds require preloaded pinned inputs and a
   separately bootstrapped single-node `docker-container` builder using
   `--driver-opt network=none`.
@@ -646,27 +683,27 @@ The Local state root is resolved in this order:
 2. `[storage].state_root` in
    `${XDG_CONFIG_HOME:-~/.config}/palimpsest/config.toml`.
 3. An explicitly set `XDG_STATE_HOME`, with `/palimpsest` appended.
-4. Linux default `/var/lib/palimpsest`; other platforms default to
-   `~/.local/state/palimpsest`.
+4. `~/.local/state/palimpsest` for ordinary Linux users and macOS; Linux root
+   or the effective `palimpsest` account with home `/var/lib/palimpsest` uses
+   `/var/lib/palimpsest`.
 
-For a user-owned first run on Linux:
+In this working source, `palimpsest store show` and `palimpsest store ls --kind
+image` work for a normal user without state/log environment variables or Hub
+credentials. Existing user state stays in place; explicit namespaces remain
+authoritative and unsafe/corrupt state never triggers a fallback or migration.
+`store show` reports the chosen state root and storage usage, not host readiness.
 
-```sh
-export XDG_STATE_HOME="$HOME/.local/state"
-"$HOME/.venvs/palimpsest/bin/palimpsest" store show
-```
+Linux normal-user journals use `logs/commands.jsonl` beneath the selected state
+root and securely create only missing user-owned directories. Root/service
+journals stay at `/var/log/palimpsest/commands.jsonl`, preprovisioned separately.
+`PALIMPSEST_LOG_HOME` selects a pre-created absolute private directory on either
+platform; Darwin otherwise keeps journaling disabled. Existing ownership/modes,
+no-follow paths and corrupt records are never silently repaired. See the full
+[storage/logging contract](linux-storage-logging.md).
 
-`store show` is the authoritative first check because it prints the selected
-state, configuration, and journal boundaries before other stateful work.
-
-Linux command journaling defaults to `/var/log/palimpsest/commands.jsonl`.
-`PALIMPSEST_LOG_HOME` can select another pre-created absolute owner-private
-directory. Outside Linux, journaling is disabled unless that override is set.
-
-```sh
-install -d -m 0700 "$HOME/.local/state/palimpsest-log"
-export PALIMPSEST_LOG_HOME="$HOME/.local/state/palimpsest-log"
-```
+Shell registration is also explicit: `palimpsest completion zsh --install`
+(or `bash`/`fish`), then open a new interactive shell. See
+[completion setup and preservation limits](../README.md#shell-completion).
 
 ### Hub client settings
 
@@ -811,15 +848,30 @@ policy verification was run during source preparation.
 
 The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `["member"]`) and `palimpsest_export_delegation_ttl_seconds` (default `21600`) into the API environment. Its precheck rejects empty or administrative role lists and lifetimes outside 900–86400 seconds. The export worker container receives the same `OS_READER_*` and protected-ID inputs as the API. The service user's Kolla registration remains limited to its own `palimpsest_service_project_name`, where it still holds the existing `admin` grant. Do not add it to tenant projects. Existing manual tenant grants are no longer used by the Hub; removing them, or reducing the service-project grant, is a separate operator-approved change.
 
-After injecting dependencies/secrets, initialize the schema with
-`palimpsest-hub-bootstrap`, then supervise API and export worker separately.
-Enable the HTTPS build worker through the dedicated VM/playbook above, never
-shared SQL/CAS. Global claim serialization belongs to API flock plus SQL;
-worker-local flock protects its own journal/scratch. Bootstrap creates build
-and export-delegation tables additively; migration copies rows/references and
-project grants into an empty destination, separately from bootstrap. The
-0.3.4 build protocol requires no schema migration. Pre-cutover exports without
-delegation fail `delegation_required`; requesters resubmit them.
+### Deferred Glance export delegation
+
+`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current `palimpsest-publish_editor` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
+
+Before Glance I/O, the export worker re-reads the requester's current enabled user/project, publish authority and delegated role through the validator. It then authenticates `v3.Password(user_id=<trustee>, password, trust_id=...)` without project selectors. It verifies the trust token's ID, trustor, trustee, impersonated user, project, roles (no wider than current implications of the delegated roles) and expiry. Revoked, expired, swapped or legacy (pre-cutover, undelegated) exports fail terminally with `authorization_revoked`, `authorization_unavailable`, `delegation_revoked`, `delegation_expired`, `delegation_scope_mismatch` or `delegation_required`. There is no fallback to the service password scoped to the tenant. A new export always uses the current requester's own Trust. An earlier creator's delegation is retired, never reused.
+
+Each Trust has a durable cleanup state. A terminal job, soft deletion, exhausted attempts or an abandoned admission queues its Trust for deletion. The worker deletes it through its own impersonating trust token, retries with backoff and records `deleted`. Admission deletes an unbound Trust immediately with the requester token when it can. Cleanup failure never reruns an export. A Trust that currently cannot issue tokens (trustor disabled or delegated role removed) cannot be deleted by the Hub. Keystone keeps that Trust, and restoring the role or user before `expires_at` makes it usable again. The finite expiry is therefore the real bound. After expiry the Hub records the Trust as `expired`; it stays in Keystone until the operator runs `keystone-manage trust_flush`. Keystone policy must allow trustors to create and delete their own trusts (`identity:create_trust`, `identity:delete_trust` defaults) and must allow trust-scoped authentication. These are operator prerequisites. No deployed Trust flow has been verified.
+
+The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `["member"]`) and `palimpsest_export_delegation_ttl_seconds` (default `21600`) into the API environment. Its precheck rejects empty or administrative role lists and lifetimes outside 900–86400 seconds. The export worker container receives the same `OS_READER_*` and protected-ID inputs as the API. The service user's Kolla registration remains limited to its own `palimpsest_service_project_name`, where it still holds the existing `admin` grant. Do not add it to tenant projects. Existing manual tenant grants are no longer used by the Hub; removing them, or reducing the service-project grant, is a separate operator-approved change.
+
+After injecting dependencies/secrets, stop new ingress and drain **every** old
+API/export/build/upload/GC writer and its already-started blocking effects.
+Capture SQL and CAS from the same no-writers interval and prove isolated restore.
+Run reviewed `palimpsest-hub-bootstrap` offline: additive tables include
+`palimpsest_worker_leases`; existing build tables gain nullable
+`lease_expires_at`. No automatic owner backfill or legacy guest adoption occurs.
+The build worker remains HTTPS-only in its dedicated VM, never on shared SQL/CAS.
+Start only the new version; old recovery must not coexist with new live claims.
+Data migration into an empty initialized destination copies durable rows and
+references, not transient maintenance leases; blob copying remains separate.
+Undelegated queued exports fail `delegation_required` and require requester
+resubmission. Unknown/ambiguous build scratch is retained, never replayed.
+Rollback requires all writers stopped, exact previous image/config pins and
+paired SQL/CAS restore; do not roll older workers over new live ownership state.
 
 The `/app` web console uses the existing project-scoped `/v1/layers` and
 resumable `/v1/uploads` endpoints, plus `POST /v1/builds`, `GET /v1/builds`,

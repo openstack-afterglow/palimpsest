@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from palimpsest_local import cli, runtime_dispatch, state, ui
+from palimpsest_local import cli, runtime_dispatch, state
 from palimpsest_local.errors import StateError
 from palimpsest_local.runtime_types import (
     DispatchKey,
@@ -326,13 +326,6 @@ def test_cli_writes_exact_log_bytes(
     monkeypatch.setattr(cli.sys, "stdout", output)
     assert cli.main(["logs", "demo"]) == 0
     assert output.buffer.getvalue() == b"\x00\xff\x1b[31m\r\n"
-
-
-def test_ui_tail_is_bounded_and_decodes_only_at_rendering_boundary(tmp_path: Path) -> None:
-    roots = _roots(tmp_path)
-    _run(roots, content=b"old\nmid\xff\nlast-\xe2\x82\xac")
-    stream = runtime_dispatch.logs("demo", roots=roots)
-    assert ui._bounded_log_tail(stream, 2) == "mid�\nlast-€"
 
 
 def test_compose_frames_lf_across_byte_and_multibyte_chunk_boundaries() -> None:

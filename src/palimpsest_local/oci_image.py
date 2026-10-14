@@ -370,6 +370,9 @@ def _exact_phase1_platform(platform: _WirePlatform | None) -> bool:
 
 
 def _require_document_media_type(document: Mapping[str, Any], descriptor: Descriptor, field_name: str) -> None:
+    # OCI indexes may omit this optional field; the pinned descriptor retains the type.
+    if descriptor.media_type == OCI_IMAGE_INDEX_MEDIA_TYPE and "mediaType" not in document:
+        return
     if document.get("mediaType") != descriptor.media_type:
         raise ArtifactValidationError(f"{field_name} mediaType does not match its descriptor")
 

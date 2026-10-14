@@ -188,7 +188,6 @@ HTTPS profile and exact namespace helper; and opt-in real BuildKit cache reuse
 with pinned inputs. Canonical database/lifespan, credentialed Redis, live
 Keystone and the deployed Afterglow gateway remain separately qualified, never
 inferred from the current synthetic registered-app script.
-
 ### 3.3 Client credential storage
 
 Reuse the existing Docker credential-helper protocol and `DOCKER_CONFIG` selection; do not invent a plaintext `palimpsest-tokens.json`. For native Hub keys, the helper lookup key is the HTTPS native API base plus namespace, distinct from the Docker registry host credential. Profile TOML stores only protocol/authority/API base/namespace, never the key.
@@ -380,7 +379,7 @@ palimpsest pull cloud.dmslab.re.kr/openstack-afterglow/test:v1 --output ./pulled
 
 - Native `login` parses the wire credential, requires `--username` to match its public key UUID, calls `/auth/me`, validates authority/project/namespace/action binding, then stores the key in the namespace-qualified credential-helper entry. There is no Docker login or Keystone token minting on this branch.
 - Native `build` stores a typed local reference/receipt to its validated archive/root, so `palimpsest push REFERENCE` can resolve the build output without `docker load`. `--input` selects an explicit verified layout/tar; `--manifest` selects an explicit root. Local artifact references and identifier-only SquashFS runtime tags remain distinct.
-- Online builds have mandatory Hub cache transfer today. Native profile builds must obtain explicit `cache:read/write` grants and project/package binding before any cache lookup/write; package-only keys cannot authorize those writes. The example build key needs both cache actions in addition to package actions, or build with the existing strict offline/local-input contract and push later. Do not silently downgrade cache authorization to `PALIMPSEST_TOKEN`.
+- Online native-profile builds retain mandatory Hub cache transfer. Native profile builds must obtain explicit `cache:read/write` grants and project/package binding before any cache lookup/write; package-only keys cannot authorize those writes. The example build key needs both cache actions in addition to package actions, or build with the existing strict offline/local-input contract and push later. OCI output alone can select `--cache-mode local` without Hub access; native output rejects that mode. Do not silently downgrade native cache authorization to `PALIMPSEST_TOKEN`.
 - For native `build --push`, BuildKit first exports locally; the client runs the same package publication pipeline afterward. Do not send a native Hub URL into Buildx `type=registry`. On failure, preserve the valid local archive/receipt and return nonzero; a cache upload is not push success.
 - For `runtime-bundle`, a standalone SquashFS blob is not a complete package. Assemble/verify the required base/config/ordered layer graph through the existing bundle machinery before push; an OCI image's automatic command/user semantics must not be claimed for a cloud-image overlay.
 - Fully qualified references containing another namespace are denied when the key lacks that exact project/package binding, regardless of profile defaults or supplied project headers.

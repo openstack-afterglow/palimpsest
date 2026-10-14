@@ -58,6 +58,7 @@ from palimpsest_hub.services.hub_store import (
     acquire_lock_by_polling,
     get_blob_store,
 )
+from palimpsest_hub.services.worker_leases import LeaseLost, role_lease, run_blocking
 
 _logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ DELEGATION_EXPIRED = "expired"
 # An admission binds its pending Trust within one request; older pending rows were abandoned.
 _ADMISSION_GRACE = timedelta(minutes=15)
 _CLEANUP_LEASE = timedelta(minutes=5)
+_ROLE_LEASE_SECONDS = 120
 _CLEANUP_MAX_BACKOFF_SECONDS = 3600
 # Publishing an export is the Hub action that admits deferred export I/O.
 EXPORT_CAPABILITY = "palimpsest-publish_editor"
@@ -130,7 +132,7 @@ class _DelegationRequired(Exception):
 
 
 def _aware(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _delegation_from_row(row: PalimpsestImageExportDelegation) -> ExportDelegation:
@@ -770,7 +772,23 @@ async def _update_job_cas(
     clear_lease: bool = False,
     extend_lease_seconds: int = 120,
 ) -> bool:
-    """Perform a Compare-And-Swap database update conditioned on job ID + lease_owner."""
+    """Update only the still-live attempt token; an expired owner cannot revive itself."""
+    held = (
+        await session.execute(
+            select(PalimpsestImageExport)
+            .where(PalimpsestImageExport.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        held is None
+        or held.lease_owner != owner
+        or held.deleted_at is not None
+        or held.lease_expires_at is None
+        or _aware(held.lease_expires_at) <= _now()
+    ):
+        return False
     now = _now()
     values: dict[str, Any] = {"updated_at": now}
     if status is not None:
@@ -800,9 +818,13 @@ async def _update_job_cas(
         .where(
             PalimpsestImageExport.id == job_id,
             PalimpsestImageExport.lease_owner == owner,
+            PalimpsestImageExport.lease_expires_at > now,
             PalimpsestImageExport.deleted_at.is_(None),
         )
         .values(**values)
+        # SQL owns the timestamp predicate. SQLite/MySQL load DATETIME values
+        # without tzinfo; Python ORM evaluation against UTC `now` is invalid.
+        .execution_options(synchronize_session="fetch")
     )
     result = await session.execute(stmt)
     return result.rowcount > 0
@@ -842,6 +864,7 @@ async def claim_next_image_export(*, owner: str) -> PalimpsestImageExport | None
             candidate = (await session.execute(stmt)).scalar_one_or_none()
             if candidate is None:
                 return None
+            now = _now()
 
             # Attempt limit check: 4th claim triggers terminal error
             if candidate.attempts >= 3:
@@ -856,7 +879,7 @@ async def claim_next_image_export(*, owner: str) -> PalimpsestImageExport | None
                 return None
 
             candidate.attempts += 1
-            candidate.lease_owner = owner
+            candidate.lease_owner = f"{owner[:80]}:{uuid.uuid4().hex}"
             candidate.lease_expires_at = now + lease_ttl
             candidate.next_at = now + lease_ttl
             candidate.updated_at = now
@@ -1035,18 +1058,26 @@ def _authorized_export_connection(project_id: str, delegation: ExportDelegation)
 
 
 async def run_delegation_cleanup(*, limit: int = 20, export_id: str | None = None) -> int:
-    """Delete retired requester Trusts; failure reschedules cleanup only, never export work."""
+    """Exclusively sweep retired Trusts without serializing distributed export jobs."""
     factory = get_session_factory()
     if factory is None:
         return 0
+    async with role_lease(factory, "export-delegation-cleanup", ttl_seconds=_ROLE_LEASE_SECONDS) as lease:
+        if lease is None:
+            return 0
+        return await _run_delegation_cleanup(lease, limit=limit, export_id=export_id)
+
+
+async def _run_delegation_cleanup(lease, *, limit: int, export_id: str | None) -> int:
     delegations = PalimpsestImageExportDelegation
-    now = _now()
-    async with factory() as session, session.begin():
+    async with lease.fence() as session:
+        now = _now()
         # Abandoned admissions and delegations of finished/deleted exports become cleanup work.
         await session.execute(
             update(delegations)
             .where(delegations.state == DELEGATION_PENDING, delegations.created_at <= now - _ADMISSION_GRACE)
             .values(state=DELEGATION_CLEANUP, cleanup_next_at=now, updated_at=now)
+            .execution_options(synchronize_session="fetch")
         )
         finished_exports = select(PalimpsestImageExport.id).where(
             or_(
@@ -1080,43 +1111,60 @@ async def run_delegation_cleanup(*, limit: int = 20, export_id: str | None = Non
             row.cleanup_attempts += 1
             row.cleanup_next_at = now + _CLEANUP_LEASE
             row.updated_at = now
-            claimed.append((row.cleanup_attempts, _delegation_from_row(row)))
+            claimed.append((row.cleanup_attempts, row.cleanup_next_at, _delegation_from_row(row)))
 
     finished = 0
-    for attempts, delegation in claimed:
-        state: str | None = None
-        if delegation.expires_at <= _now():
-            # An expired Trust cannot issue tokens; Keystone's trust_flush owns the inert record.
-            state = DELEGATION_EXPIRED
-        else:
-            try:
-                if await asyncio.to_thread(delete_export_trust, delegation):
-                    state = DELEGATION_DELETED
-            except Exception:
-                _logger.warning("Export delegation cleanup is temporarily unavailable")
-        done = _now()
-        values: dict[str, Any] = {"updated_at": done}
-        if state is not None:
-            values.update(state=state, finished_at=done, cleanup_next_at=None)
-        else:
-            delay = timedelta(seconds=min(_CLEANUP_MAX_BACKOFF_SECONDS, 60 * 2 ** min(attempts, 6)))
-            values["cleanup_next_at"] = min(done + delay, delegation.expires_at)
-        try:
-            async with factory() as session, session.begin():
-                result = await session.execute(
-                    update(delegations)
+    for attempts, deadline, delegation in claimed:
+        # Keep both the role and attempt row locked until Keystone's blocking
+        # delete has drained. Wall-clock expiry cannot admit a competing effect.
+        async with lease.fence() as session:
+            row = (
+                await session.execute(
+                    select(delegations)
                     .where(
                         delegations.trust_id == delegation.trust_id,
-                        delegations.state == DELEGATION_CLEANUP,
-                        delegations.cleanup_attempts == attempts,
                     )
-                    .values(**values)
+                    .with_for_update()
                 )
-                # A slow delete must not overwrite a newer worker's cleanup lease or result.
-                if state is not None and result.rowcount == 1:
-                    finished += 1
-        except Exception:
-            _logger.warning("Export delegation cleanup state was not recorded")
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.state != DELEGATION_CLEANUP
+                or row.cleanup_attempts != attempts
+                or row.cleanup_next_at is None
+                or _aware(row.cleanup_next_at) != _aware(deadline)
+                or _aware(row.cleanup_next_at) <= _now()
+            ):
+                continue
+            state: str | None = None
+            if delegation.expires_at <= _now():
+                state = DELEGATION_EXPIRED
+            else:
+                try:
+                    if await run_blocking(delete_export_trust, delegation):
+                        state = DELEGATION_DELETED
+                except Exception:
+                    _logger.warning("Export delegation cleanup is temporarily unavailable")
+            done = _now()
+            values: dict[str, Any] = {"updated_at": done}
+            if state is not None:
+                values.update(state=state, finished_at=done, cleanup_next_at=None)
+            else:
+                delay = timedelta(seconds=min(_CLEANUP_MAX_BACKOFF_SECONDS, 60 * 2 ** min(attempts, 6)))
+                values["cleanup_next_at"] = min(done + delay, delegation.expires_at)
+            result = await session.execute(
+                update(delegations)
+                .where(
+                    delegations.trust_id == delegation.trust_id,
+                    delegations.state == DELEGATION_CLEANUP,
+                    delegations.cleanup_attempts == attempts,
+                    delegations.cleanup_next_at == deadline,
+                )
+                .values(**values)
+                .execution_options(synchronize_session="fetch")
+            )
+            if result.rowcount == 1 and state is not None:
+                finished += 1
     return finished
 
 
@@ -1125,6 +1173,7 @@ async def process_one_image_export(*, owner: str) -> bool:
     job = await claim_next_image_export(owner=owner)
     if job is None:
         return False
+    owner = job.lease_owner
     started = time.monotonic()
     _logger.info("Export task started status=downloading")
     outcome = "error"
@@ -1166,7 +1215,7 @@ async def process_one_image_export(*, owner: str) -> bool:
     err_msg = "An unexpected error occurred during image export"
 
     try:
-        await asyncio.to_thread(_prepare_scratch_dir, scratch_dir, blob_store.exports_dir)
+        await run_blocking(_prepare_scratch_dir, scratch_dir, blob_store.exports_dir)
         # 1. Revalidate the requester and open only its admitted Trust; no service-credential fallback.
         delegation = await _load_job_delegation(factory, job)
         try:
@@ -1268,7 +1317,7 @@ async def process_one_image_export(*, owner: str) -> bool:
                         with suppress(Exception):
                             resp.close()
 
-        await asyncio.to_thread(_do_download)
+        await run_blocking(_do_download)
         if lease_lost.is_set():
             raise ImageExportLeaseLost
 
@@ -1472,47 +1521,46 @@ async def process_one_image_export(*, owner: str) -> bool:
         # 8. Promotion & Final Completion
         if lease_lost.is_set():
             raise ImageExportLeaseLost
-        if factory:
-            async with factory() as session:
-                now = _now()
-                stmt = select(PalimpsestImageExport).where(
-                    PalimpsestImageExport.id == job.id,
-                    PalimpsestImageExport.lease_owner == owner,
-                    PalimpsestImageExport.lease_expires_at > now,
-                    PalimpsestImageExport.deleted_at.is_(None),
-                )
-                held = (await session.execute(stmt)).scalar_one_or_none()
-                if held is None:
-                    lease_lost.set()
-                    raise ImageExportLeaseLost
-
         # Import lazily: legacy API imports this service before defining its locks.
-        from palimpsest_hub.api.hub import _locked_blob, _run_blocking
+        from palimpsest_hub.api.hub import _locked_blob
 
-        finalized = await _run_blocking(
+        finalized = await run_blocking(
             blob_store.inspect_file, target_file, max_bytes=settings.palimpsest_hub_max_blob_bytes
         )
-        async with _locked_blob(blob_store, finalized.blob_digest):
-            await _run_blocking(blob_store.publish_verified, target_file, finalized)
-            if factory:
-                async with factory() as session, session.begin():
-                    ok = await _update_job_cas(
-                        session,
-                        job.id,
-                        owner,
-                        status=STATUS_COMPLETE,
-                        progress_pct=PROGRESS_COMPLETE,
-                        result_blob_digest=finalized.blob_digest,
-                        result_size_bytes=finalized.size_bytes,
-                        completed_at=_now(),
-                        clear_lease=True,
-                    )
-                    if not ok:
-                        _logger.warning("Export completion lost lease")
-                        outcome = "lease_lost"
-                    else:
-                        # Same transaction as completion: the Trust can never outlive a finished export unnoticed.
-                        await _retire_export_delegations(session, job.id, _now())
+        async with _locked_blob(blob_store, finalized.blob_digest), factory() as session, session.begin():
+            held = (
+                await session.execute(
+                    select(PalimpsestImageExport).where(PalimpsestImageExport.id == job.id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                held is None
+                or held.lease_owner != owner
+                or held.deleted_at is not None
+                or held.lease_expires_at is None
+                or _aware(held.lease_expires_at) <= _now()
+            ):
+                lease_lost.set()
+                raise ImageExportLeaseLost
+            # A row lock fences takeover until publication has drained and
+            # completion commits; shared artifact locking is still retained.
+            await run_blocking(blob_store.publish_verified, target_file, finalized)
+            held.lease_expires_at = _now() + timedelta(seconds=120)
+            await session.flush()
+            ok = await _update_job_cas(
+                session,
+                job.id,
+                owner,
+                status=STATUS_COMPLETE,
+                progress_pct=PROGRESS_COMPLETE,
+                result_blob_digest=finalized.blob_digest,
+                result_size_bytes=finalized.size_bytes,
+                completed_at=_now(),
+                clear_lease=True,
+            )
+            if not ok:
+                raise ImageExportLeaseLost
+            await _retire_export_delegations(session, job.id, _now())
         if outcome != "lease_lost":
             outcome = "complete"
         return True
@@ -1564,7 +1612,7 @@ async def process_one_image_export(*, owner: str) -> bool:
             except Exception:
                 _logger.warning("Export delegation cleanup was deferred")
         try:
-            await asyncio.to_thread(_remove_scratch_dir, scratch_dir)
+            await run_blocking(_remove_scratch_dir, scratch_dir)
         finally:
             _logger.info("Export task ended status=%s", outcome)
             _logger.debug(
@@ -1605,27 +1653,66 @@ async def run_image_export_worker(*, owner: str | None = None) -> bool:
 
 
 async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
-    """Clean stale scratch and delete only locked, freshly rechecked unreferenced blobs."""
+    """Exclusively clean SQL-proven stale scratch and shared-lock-protected blobs."""
+    factory = get_session_factory()
+    if factory is None:
+        return
+    async with role_lease(factory, "export-maintenance", ttl_seconds=_ROLE_LEASE_SECONDS) as lease:
+        if lease is not None:
+            await _run_export_maintenance(lease, max_age_seconds)
+
+
+async def _remove_stale_scratch(lease, entry: Path, max_age_seconds: int) -> None:
+    # Unknown/legacy paths are deliberately not guessed from age alone.
+    try:
+        job_id, attempt_text, owner_key = entry.name.rsplit("-", 2)
+        if str(uuid.UUID(job_id)) != job_id or len(owner_key) != 12:
+            return
+        int(owner_key, 16)
+        attempt = int(attempt_text)
+        if attempt <= 0:
+            return
+    except ValueError:
+        return
+    async with lease.fence() as session:
+        job = (
+            await session.execute(
+                select(PalimpsestImageExport).where(PalimpsestImageExport.id == job_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if job is None or attempt > job.attempts:
+            return
+        if attempt == job.attempts:
+            if job.lease_owner is not None:
+                expected = hashlib.sha256(job.lease_owner.encode("utf-8")).hexdigest()[:12]
+                if owner_key != expected:
+                    return
+            if (
+                job.status not in (STATUS_COMPLETE, STATUS_ERROR)
+                and job.deleted_at is None
+                and (job.lease_expires_at is None or _aware(job.lease_expires_at) > _now())
+            ):
+                return
+        if entry.is_dir() and not entry.is_symlink() and time.time() - entry.stat().st_mtime > max_age_seconds:
+            await run_blocking(_remove_scratch_dir, entry)
+
+
+async def _run_export_maintenance(lease, max_age_seconds: int) -> None:
     try:
         blob_store = get_blob_store()
     except Exception:
         return
-
-    now_epoch = time.time()
-
     if blob_store.exports_dir.is_dir():
         for entry in blob_store.exports_dir.iterdir():
-            if entry.is_dir() and not entry.is_symlink():
-                try:
-                    if now_epoch - entry.stat().st_mtime > max_age_seconds:
-                        shutil.rmtree(entry, ignore_errors=True)
-                except Exception:
-                    pass
-
-    factory = get_session_factory()
-    if factory is None or not blob_store.blobs_dir.is_dir():
+            try:
+                await _remove_stale_scratch(lease, entry, max_age_seconds)
+            except LeaseLost:
+                raise
+            except OSError:
+                _logger.warning("Export scratch GC failed")
+    if not blob_store.blobs_dir.is_dir():
         return
-
+    now_epoch = time.time()
     deleted_after = _now() - timedelta(seconds=max_age_seconds)
     for entry in blob_store.blobs_dir.iterdir():
         if not entry.is_file() or entry.is_symlink() or len(entry.name) != 64:
@@ -1649,7 +1736,7 @@ async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
             if now_epoch - entry.stat().st_mtime <= max_age_seconds:
                 continue
 
-            async with factory() as session:
+            async with lease.fence() as session:
                 export_ref = (
                     await session.execute(
                         select(PalimpsestImageExport.id)
@@ -1675,8 +1762,9 @@ async def run_export_maintenance(max_age_seconds: int = 86400) -> None:
                     continue
                 if await package_blob_referenced(session, digest):
                     continue
-
-            entry.unlink(missing_ok=True)
+                entry.unlink(missing_ok=True)
+        except LeaseLost:
+            raise
         except Exception:
             _logger.warning("Export blob GC failed")
         finally:

@@ -1256,3 +1256,146 @@ def test_parent_worker_boundary_rejects_success_with_a_live_descendant(tmp_path:
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, signal.SIGCONT)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group signals require POSIX")
+@pytest.mark.parametrize("boundary", ["scratch", "spawn", "thread-constructor", "thread-start"])
+def test_web_cancellation_reaps_worker_before_removing_scratch_at_handoff(tmp_path, monkeypatch, boundary):
+    from palimpsest_local.web_job_client import cancellable_run_preparation
+
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setenv("PALIMPSEST_WEB_JOB", "run")
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+    original_spawn = materializer.subprocess.Popen
+    original_mkdtemp = materializer.tempfile.mkdtemp
+    original_thread = materializer.threading.Thread
+    original_start = original_thread.start
+    processes = []
+    scratches = []
+    threads = []
+    cancelled = False
+
+    def cancel(selected):
+        nonlocal cancelled
+        if selected == boundary and not cancelled:
+            cancelled = True
+            os.kill(os.getpid(), signal.SIGUSR1)
+
+    def mkdtemp(*args, **kwargs):
+        scratch = original_mkdtemp(*args, **kwargs)
+        scratches.append(Path(scratch))
+        cancel("scratch")
+        return scratch
+
+    def spawn(_argv, **kwargs):
+        process = original_spawn([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        processes.append(process)
+        cancel("spawn")  # Before the caller has received the Popen result.
+        return process
+
+    def thread(*args, **kwargs):
+        cancel("thread-constructor")
+        result = original_thread(*args, **kwargs)
+        threads.append(result)
+        return result
+
+    def start(selected):
+        original_start(selected)
+        cancel("thread-start")  # Native thread exists, before start() returns.
+
+    monkeypatch.setattr(materializer.tempfile, "mkdtemp", mkdtemp)
+    monkeypatch.setattr(materializer.subprocess, "Popen", spawn)
+    monkeypatch.setattr(materializer.threading, "Thread", thread)
+    monkeypatch.setattr(original_thread, "start", start)
+    try:
+        with pytest.raises(SystemExit) as raised:
+            with cancellable_run_preparation():
+                materializer.materialize_layer_hard(
+                    fixture.image,
+                    0,
+                    source_cas_root=fixture.source_cas_root,
+                    roots=fixture.roots,
+                    store=fixture.store,
+                    packer_path=fixture.packer,
+                    toolchain=fixture.toolchain,
+                    terminate_grace_seconds=0.2,
+                )
+        assert raised.value.code == 128 + signal.SIGUSR1
+        assert cancelled and scratches and all(not scratch.exists() for scratch in scratches)
+        for process in processes:
+            assert process.returncode is not None
+            assert process.stdin.closed and process.stdout.closed
+            with pytest.raises(ChildProcessError):
+                os.waitpid(process.pid, os.WNOHANG)
+        assert all(not thread.is_alive() for thread in threads)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group signals require POSIX")
+def test_cancellation_during_failed_termination_handoff_retains_caller_worker_owner(tmp_path, monkeypatch):
+    from palimpsest_local.web_job_client import cancellable_run_preparation
+
+    fixture = _materialization_fixture(tmp_path)
+    monkeypatch.setenv("PALIMPSEST_WEB_JOB", "run")
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+    original_spawn = materializer.subprocess.Popen
+    original_terminate = materializer._terminate_worker
+    processes = []
+    reaped = []
+
+    def spawn(_argv, **kwargs):
+        process = original_spawn([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        processes.append(process)
+        return process
+
+    def fail_start(thread):
+        raise RuntimeError("can't start new thread")
+
+    def interrupted_failure_handoff(self, *args, **kwargs):
+        # Termination already reported failure; interrupt before the exception
+        # can deliver its process field to materialize_layer_hard's except arm.
+        assert kwargs["process"] is processes[0] and not kwargs["reaped"]
+        os.kill(os.getpid(), signal.SIGUSR1)
+        pytest.fail("failure construction continued after cancellation")
+
+    def reap(process, scratch, scratch_fd, parent):
+        # A synchronous test seam makes the retained-scratch ordering explicit;
+        # the production reaper uses this same owned worker and scratch pin.
+        assert process is processes[0] and process.poll() is None
+        assert scratch.exists(), "scratch removed while the registered worker was still live"
+        assert original_terminate(process, 0.2)
+        for stream in (process.stdin, process.stdout):
+            stream.close()
+        materializer._cleanup_scratch(scratch, scratch_fd, parent)
+        reaped.append(scratch)
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", spawn)
+    monkeypatch.setattr(materializer.threading.Thread, "start", fail_start)
+    monkeypatch.setattr(materializer, "_terminate_worker", lambda *args: False)
+    monkeypatch.setattr(materializer._WorkerBoundaryFailure, "__init__", interrupted_failure_handoff)
+    monkeypatch.setattr(materializer, "_background_reap", reap)
+    try:
+        with pytest.raises(SystemExit):
+            with cancellable_run_preparation():
+                materializer.materialize_layer_hard(
+                    fixture.image,
+                    0,
+                    source_cas_root=fixture.source_cas_root,
+                    roots=fixture.roots,
+                    store=fixture.store,
+                    packer_path=fixture.packer,
+                    toolchain=fixture.toolchain,
+                )
+        assert len(reaped) == 1 and not reaped[0].exists()
+        assert processes[0].returncode is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(processes[0].pid, os.WNOHANG)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()

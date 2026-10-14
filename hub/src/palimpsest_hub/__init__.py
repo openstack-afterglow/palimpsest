@@ -1,3 +1,3 @@
 """Palimpsest Hub API and durable export worker."""
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"

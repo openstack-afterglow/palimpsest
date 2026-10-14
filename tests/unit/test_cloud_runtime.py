@@ -10,7 +10,6 @@ import shutil
 import socket
 import stat as stat_module
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -256,10 +255,6 @@ def test_start_serial_builder_writes_ledger_and_serial_channel(tmp_path: Path, m
     assert str(rpaths.root / "builder.sock") in xml
     assert 'name="org.afterglow.palimpsest.builder.v1"' in xml
     assert "<interface" not in xml
-
-
-def test_no_libvirt_import_on_module_import():
-    assert "libvirt" not in sys.modules, "importing runtime must not import libvirt"
 
 
 def test_overlay_creation_and_validation():

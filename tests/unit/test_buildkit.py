@@ -1535,6 +1535,32 @@ def test_native_export_callback_retains_verified_reference_when_cache_finalize_f
         assert layer_archive.extractfile("app").read() == b"retained application bytes"
 
 
+def test_local_online_cache_is_warm_without_crossing_offline_or_platform_scopes(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    offline = _spec(tmp_path, offline=True, network="none")
+    build_with_buildkit(offline, roots, runner=_SuccessfulBuildxRunner(offline))
+    offline_pointer = (roots.build_cache / offline.cache_scope / "current.json").read_bytes()
+
+    local = _spec(tmp_path, "FROM ubuntu:24.04\n", cache_mode="local", output=tmp_path / "local.oci.tar")
+    first = build_with_buildkit(local, roots, runner=_SuccessfulBuildxRunner(local))
+    second_spec = replace(local, output=tmp_path / "warm.oci.tar")
+    second = build_with_buildkit(second_spec, roots, runner=_SuccessfulBuildxRunner(second_spec))
+    arm_spec = replace(local, platform="linux/arm64", output=tmp_path / "arm.oci.tar")
+    arm = build_with_buildkit(arm_spec, roots, runner=_SuccessfulBuildxRunner(arm_spec))
+
+    assert (first["cache_source"], second["cache_source"], arm["cache_source"]) == ("none", "local", "none")
+    assert first["cache_project_id"] is None and first["cache_package"] is None
+    assert (roots.build_cache / offline.cache_scope / "current.json").read_bytes() == offline_pointer
+    assert not (roots.build_cache / "_packages").exists()
+    assert not (roots.build_cache / "_local").is_symlink()
+
+    mixed_spec = replace(local, output=tmp_path / "mixed.oci.tar")
+    before = set(roots.builds.iterdir())
+    with pytest.raises(PalimpsestError):
+        build_with_buildkit(mixed_spec, roots, hub_client=_NativeCache(), cache_package=CACHE_PACKAGE)
+    assert set(roots.builds.iterdir()) == before and not mixed_spec.output.exists()
+
+
 def test_offline_build_never_calls_hub(tmp_path: Path):
     roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     spec = _spec(tmp_path, offline=True, network="none")

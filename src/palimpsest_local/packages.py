@@ -201,6 +201,13 @@ class NativePackageClient:
         url = self.api_base + path
         return url + "?" + urllib.parse.urlencode(query) if query else url
 
+    def _read_error_body(self, response, limit):
+        """Read bounded error bytes; connected transports may enforce a deadline.
+
+        Deadline failures propagate while ``_open`` still closes the response.
+        """
+        return response.read(limit)
+
     def _open(self, method, path, *, query=None, body=None, headers=None):
         url = self._url(path, query)
         request_headers = {"Authorization": "Bearer " + self._credential, "Accept": "application/json"}
@@ -214,7 +221,7 @@ class NativePackageClient:
         except urllib.error.HTTPError as exc:
             code = "REQUEST_FAILED"
             try:
-                payload = exc.read(_MAX_RESPONSE + 1)
+                payload = self._read_error_body(exc, _MAX_RESPONSE + 1)
                 error = (
                     strict_json_object(payload, "native error").get("error") if len(payload) <= _MAX_RESPONSE else None
                 )
@@ -382,6 +389,96 @@ class NativePackageClient:
             ) from None
 
     # Packages ------------------------------------------------------------
+
+    @staticmethod
+    def _page_options(limit: int, cursor: str | None) -> dict[str, str]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise PackageError("native inventory limit must be between 1 and 100")
+        query = {"limit": str(limit)}
+        if cursor is not None:
+            if (
+                not isinstance(cursor, str)
+                or not cursor
+                or len(cursor) > 2048
+                or re.fullmatch(r"[A-Za-z0-9_-]+", cursor) is None
+            ):
+                raise PackageError("invalid native inventory cursor")
+            query["cursor"] = cursor
+        return query
+
+    def _inventory_page(self, data: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+        if (
+            validate_keystone_id(data.get("project_id"), "project ID") != self.project_id
+            or data.get("namespace") != self.namespace
+        ):
+            raise PackageError("native inventory project/namespace binding mismatch")
+        items = data.get("items")
+        if not isinstance(items, list) or len(items) > limit or any(not isinstance(item, dict) for item in items):
+            raise PackageError("invalid or over-limit native inventory page")
+        self._page_options(limit, data.get("next_cursor"))
+        return items
+
+    def list_packages(
+        self, *, limit: int = 50, cursor: str | None = None, package_type: str | None = None
+    ) -> dict[str, Any]:
+        """List one bounded actor-scoped page, rejecting foreign project or package scope."""
+        query = self._page_options(limit, cursor)
+        if package_type is not None:
+            if package_type not in _PACKAGE_TYPES:
+                raise PackageError("invalid native inventory package type")
+            query["package_type"] = package_type
+        actor = self.authenticate()
+        if "packages:inventory" not in actor["actions"]:
+            raise PackageError("native key does not authorize inventory")
+        data = self._json("GET", self._path("/packages"), query=query)
+        seen = set()
+        for item in self._inventory_page(data, limit):
+            package = self._package(item.get("name"))
+            if package in seen or (
+                actor["scope"].get("all_packages") is not True and package not in actor["scope"]["packages"]
+            ):
+                raise PackageError("native inventory returned duplicate or unauthorized package")
+            seen.add(package)
+            self._bound({**item, "package": package}, package)
+            if item.get("package_type") not in _PACKAGE_TYPES:
+                raise PackageError("invalid native inventory package type")
+            tags = item.get("tags")
+            if not isinstance(tags, list):
+                raise PackageError("invalid native inventory tags")
+            for tag in tags:
+                if not isinstance(tag, dict):
+                    raise PackageError("invalid native inventory tag")
+                _tag(tag.get("tag"))
+                _digest(tag.get("digest"))
+        return data
+
+    def get_package(self, package: str) -> dict[str, Any]:
+        """Read an exact package summary under freshly validated actor scope."""
+        package = self._package(package)
+        self.authorize(package, ("packages:inventory",))
+        data = self._json("GET", self._path("/package"), query={"package": package})
+        self._bound({**data, "package": data.get("name")}, package)
+        if data.get("package_type") not in _PACKAGE_TYPES:
+            raise PackageError("invalid native inventory package type")
+        return data
+
+    def list_versions(self, package: str, *, limit: int = 50, cursor: str | None = None) -> dict[str, Any]:
+        """List one exact package's versions, freshly authenticating before the read."""
+        package = self._package(package)
+        query = {**self._page_options(limit, cursor), "package": package}
+        self.authorize(package, ("packages:inventory",))
+        data = self._json("GET", self._path("/versions"), query=query)
+        self._bound(data, package)
+        seen = set()
+        for item in self._inventory_page(data, limit):
+            self._bound(item, package)
+            digest = _digest(item.get("root_digest"))
+            if digest in seen:
+                raise PackageError("duplicate native inventory version")
+            seen.add(digest)
+            _digest(item.get("archive_digest"), "archive digest")
+            _size(item.get("archive_size_bytes"), self.limits.max_archive_bytes)
+        return data
 
     def _resolve(self, package: str, tag: str) -> dict[str, Any] | None:
         try:

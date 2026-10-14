@@ -107,9 +107,9 @@ DESCRIPTIONS = {
     "private_port": "Guest/private port number.",
     "protocol": "Published transport protocol.",
     "completion_record": "Persist the OCI exec completion record at this path.",
-    "port": "UI listen port; 0 selects an available port.",
-    "no_browser": "Do not open the UI in a browser.",
-    "allow_control": "Enable dashboard VM, artifact, and storage changes; the default is read-only.",
+    "port": "Local web listen port; 0 selects an available loopback port.",
+    "no_browser": "Print the dashboard URL without opening a browser.",
+    "allow_control": "Enable local CAS tag edits, VM and storage controls; default: read-only.",
     "destination": "New local store path.",
     "keep_source": "Keep source bytes after moving the store.",
     "shell": "Shell completion target.",
@@ -248,7 +248,7 @@ GUIDE_ANCHORS = {
     "oci": "runtime-lifecycle-and-observation",
     "compose": "compose-shaped-projects",
     "store": "local-store-and-ui",
-    "ui": "local-store-and-ui",
+    "web": "local-store-and-ui",
     "completion": "invocation-and-configuration",
 }
 

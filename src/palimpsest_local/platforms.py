@@ -719,13 +719,14 @@ def backend_capability_report(
     operation: RuntimeOperation = RuntimeOperation.RUN,
     host: HostPlatform | None = None,
 ) -> PreflightReport:
-    """Return a cloud-image backend report for UI/read-only discovery."""
+    """Report supported cloud-image backends; reject incompatible hosts before probes."""
 
     resolved_host = host or detect_host()
     try:
         runtime_backend = RuntimeBackend(backend)
     except ValueError:
         raise ArtifactValidationError(f"unknown backend: {backend}") from None
+    select_backend(resolved_host.machine, host=resolved_host, requested=backend)
     key = DispatchKey(RuntimeKind.CLOUD_IMAGE, runtime_backend)
     profile = capability_profile(key, operation)
     raw_subject = f"{profile.profile_id}:{resolved_host.system}:{resolved_host.machine}".encode()

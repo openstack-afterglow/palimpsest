@@ -32,6 +32,7 @@ from .oci_guest_filesystems import (
     verify_ext4_superblock,
 )
 from .state import StatePaths
+from .web_job_client import defer_web_cancellation, run_preparation_tool
 
 _LOGICAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _LIMA_BACKEND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -94,7 +95,7 @@ class LimaVolume:
 
 def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        return run_preparation_tool(
             argv,
             check=False,
             capture_output=True,
@@ -440,25 +441,28 @@ def _ensure_ext4_raw_file_locked(
         os.chmod(path.parent, 0o700)
     else:
         parent_validator()
-    if creation_temp_path is None:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{logical_name}-",
-            suffix=".raw.tmp",
-            dir=path.parent,
-        )
-        temporary = Path(temporary_name)
-    else:
-        temporary = creation_temp_path
-        try:
-            descriptor = os.open(
-                temporary,
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-            )
-        except OSError:
-            raise StateError(f"cannot create KVM volume temporary: {temporary}") from None
     published_identity: tuple[int, int] | None = None
+    descriptor = -1
+    temporary = None
     try:
+        with defer_web_cancellation():
+            if creation_temp_path is None:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{logical_name}-",
+                    suffix=".raw.tmp",
+                    dir=path.parent,
+                )
+                temporary = Path(temporary_name)
+            else:
+                try:
+                    descriptor = os.open(
+                        creation_temp_path,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    temporary = creation_temp_path
+                except OSError:
+                    raise StateError(f"cannot create KVM volume temporary: {creation_temp_path}") from None
         os.fchmod(descriptor, 0o600)
         os.ftruncate(descriptor, size_bytes)
         os.fsync(descriptor)
@@ -505,16 +509,17 @@ def _ensure_ext4_raw_file_locked(
         if parent_validator is not None:
             parent_validator()
 
-        try:
-            os.link(temporary, path, follow_symlinks=False)
-        except FileExistsError as exc:
-            raise StateError(f"KVM volume appeared concurrently and was not overwritten: {path}") from exc
-        published = path.stat()
-        published_identity = (published.st_dev, published.st_ino)
+        with defer_web_cancellation():
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise StateError(f"KVM volume appeared concurrently and was not overwritten: {path}") from exc
+            published = path.stat()
+            published_identity = (published.st_dev, published.st_ino)
         state.fsync_directory(path.parent)
         temporary.unlink()
         state.fsync_directory(path.parent)
-    except Exception:
+    except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
         if published_identity is not None:
@@ -524,7 +529,8 @@ def _ensure_ext4_raw_file_locked(
                     path.unlink()
             except FileNotFoundError:
                 pass
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         raise
     if parent_validator is not None:
         parent_validator()

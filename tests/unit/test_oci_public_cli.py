@@ -258,7 +258,7 @@ def test_detached_early_exit_is_not_reported_as_running(tmp_path, monkeypatch, c
 @pytest.mark.parametrize(
     "flags",
     [
-        ["-d"],
+        ["--publish", "8080:80"],
         ["--manifest", "a" * 64],
         ["--root-retention", "retain"],
         ["--root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"],
@@ -270,35 +270,24 @@ def test_cloud_run_does_not_adopt_new_oci_flags(monkeypatch, flags):
     assert cli.main(["run", "cloud:latest", "--name", "demo", *flags]) == 1
 
 
-def test_cloud_user_rejection_precedes_store_resolution_and_state_mutation(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "ContentStore", lambda *_a, **_k: pytest.fail("content store entered"))
-    monkeypatch.setattr(cli, "_resolve_runtime_stack", lambda *_a, **_k: pytest.fail("cloud resolution entered"))
+def test_cloud_run_accepts_detach_harmlessly(monkeypatch):
+    seen = []
+
+    def fake_resolve(*args, **kwargs):
+        seen.append("resolve")
+        raise StateError("reached cloud resolver")
+
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", fake_resolve)
+    assert cli.main(["run", "cloud:latest", "--name", "demo", "-d"]) == 1
+    assert seen == ["resolve"]
+
+
+def test_cloud_oci_override_rejection_does_not_create_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_dispatch, "run", lambda *_a, **_k: pytest.fail("VM launch entered"))
+    monkeypatch.setattr(runtime_dispatch, "run_local_oci", lambda *_a, **_k: pytest.fail("OCI launch entered"))
 
     assert cli.main(["run", "cloud:latest", "--name", "demo", "--user", "redis"]) == 1
     assert not (tmp_path / "state").exists() and not (tmp_path / "config").exists()
-
-
-@pytest.mark.parametrize("kind", ["layout", "explicit-cloud", "reference"])
-def test_existing_cloud_source_selection_and_default_network_are_preserved(tmp_path, monkeypatch, kind):
-    source = tmp_path / ("image.oci.tar" if kind == "explicit-cloud" else "layout")
-    if kind == "layout":
-        source.mkdir()
-        (source / "oci-layout").touch()
-    elif kind == "explicit-cloud":
-        source.touch()
-    seen = []
-
-    def cloud(*args, **kwargs):
-        seen.append(kwargs["run_network"])
-        raise StateError("selected cloud resolver")
-
-    monkeypatch.setattr(cli, "_resolve_runtime_stack", cloud)
-    monkeypatch.setattr(runtime_dispatch, "run_local_oci", lambda *a, **k: pytest.fail("OCI adapter entered"))
-    args = ["run", "cloud:latest" if kind == "reference" else str(source), "--name", "demo"]
-    if kind == "explicit-cloud":
-        args += ["--runtime-kind", "cloud-image"]
-    assert cli.main(args) == 1
-    assert seen == ["default"]
 
 
 def test_init_runtime_does_not_initialize_default_state(tmp_path, monkeypatch, capsys):

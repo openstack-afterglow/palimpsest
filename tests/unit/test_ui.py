@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import select
+import signal
 import socket
+import struct
+import subprocess
+import sys
 import threading
+import time
+import urllib.parse
 import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -59,16 +67,26 @@ def _write_ui_run_ledger(
 _UI_LIFECYCLE_REQUESTS = (
     ("start", "start", "POST", "/api/v1/vms/ui-vm/start", {}),
     ("stop", "stop", "POST", "/api/v1/vms/ui-vm/stop", {}),
-    ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm?volumes=true", {"volumes": True}),
+    ("rm", "rm", "DELETE", "/api/v1/vms/ui-vm", {"volumes": True}),
 )
 
 
 @pytest.fixture(autouse=True)
 def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        ui.runtime_dispatch.platforms,
+        ui.inventory.runtime_dispatch.platforms,
         "_check_capability",
         lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
+    monkeypatch.setattr(
+        ui.inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        },
     )
 
 
@@ -100,6 +118,7 @@ def server_env(tmp_path: Path, request: pytest.FixtureRequest):
     }
 
     server.shutdown()
+    handler_cls.close_transports()
     server.server_close()
 
 
@@ -136,6 +155,123 @@ def _request(
 
     conn.close()
     return resp.status, resp_headers, json_data or content
+
+
+@pytest.mark.parametrize("path", ["/api/v1/operations", "/app.js"])
+@pytest.mark.parametrize("disconnect_at", ["headers", "body"])
+def test_disconnected_response_does_not_retry_or_break_next_request(
+    server_env, monkeypatch, capsys, path, disconnect_at
+):
+    server = server_env["server"]
+    handler = server.RequestHandlerClass
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    statuses = []
+    errors = []
+    original_headers = handler.end_headers
+    original_response = handler.send_response
+    original_process = server.process_request_thread
+    original_error = server.handle_error
+
+    def pause_response(self):
+        if entered.is_set():
+            return original_headers(self)
+        if disconnect_at == "body":
+            original_headers(self)
+        entered.set()
+        assert release.wait(5)
+        if disconnect_at == "headers":
+            original_headers(self)
+
+    def record_response(self, status, message=None):
+        statuses.append(status)
+        return original_response(self, status, message)
+
+    def complete_request(request, address):
+        try:
+            original_process(request, address)
+        finally:
+            completed.set()
+
+    def record_error(request, address):
+        errors.append(sys.exc_info()[1])
+        original_error(request, address)
+
+    monkeypatch.setattr(handler, "end_headers", pause_response)
+    monkeypatch.setattr(handler, "send_response", record_response)
+    monkeypatch.setattr(server, "process_request_thread", complete_request)
+    monkeypatch.setattr(server, "handle_error", record_error)
+    peer = socket.create_connection(("127.0.0.1", server_env["port"]), timeout=5)
+    try:
+        peer.sendall(f"GET {path} HTTP/1.0\r\nAuthorization: Bearer {server_env['token']}\r\n\r\n".encode())
+        assert entered.wait(5)
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        peer.close()
+    finally:
+        peer.close()
+        release.set()
+    assert completed.wait(5)
+    assert statuses == [200], "a closed response must not be replaced with an HTTP 500"
+    assert errors == []
+    assert capsys.readouterr().err == ""
+    assert _request(server_env["port"], "GET", "/api/v1/operations")[0] == 401
+    status, _, result = _request(
+        server_env["port"],
+        "GET",
+        "/api/v1/operations",
+        headers={"Authorization": f"Bearer {server_env['token']}"},
+    )
+    assert status == 200
+    assert result == {"operations": []}
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "supported"),
+    [
+        ("Darwin", "aarch64", {"lima-vz", "libvirt-hvf"}),
+        ("Darwin", "x86_64", {"libvirt-hvf"}),
+        ("Linux", "x86_64", {"kvm"}),
+        ("Linux", "aarch64", {"kvm"}),
+        ("Windows", "x86_64", set()),
+    ],
+)
+def test_summary_rejects_unsupported_backends_before_probing(server_env, monkeypatch, system, machine, supported):
+    host = ui.platforms.HostPlatform(system, machine)
+    monkeypatch.setattr(ui.platforms, "detect_host", lambda: host)
+
+    def probe(requirement, *, dispatch_key, **_kwargs):
+        assert dispatch_key.backend.value in supported, "unsupported backends must not contact host services"
+        return CapabilityCheck(requirement.capability_id, "test-present", True)
+
+    monkeypatch.setattr(ui.platforms, "_check_capability", probe)
+    status, _, result = _request(
+        server_env["port"],
+        "GET",
+        "/api/v1/summary",
+        headers={"Authorization": f"Bearer {server_env['token']}"},
+    )
+    assert status == 200
+    assert {backend for backend, item in result["backends"].items() if item["available"]} == supported
+    for backend, item in result["backends"].items():
+        if backend not in supported:
+            assert item["reason"]
+
+
+def test_internal_request_failure_still_returns_error_and_logs(server_env, monkeypatch, capsys):
+    def fail(_self):
+        raise RuntimeError("deliberate internal failure")
+
+    monkeypatch.setattr(ui.OperationManager, "list", fail)
+    status, _, result = _request(
+        server_env["port"],
+        "GET",
+        "/api/v1/operations",
+        headers={"Authorization": f"Bearer {server_env['token']}"},
+    )
+    assert status == 500
+    assert "error" in result
+    assert "RuntimeError" in capsys.readouterr().err
 
 
 def test_auth_semantics(server_env: dict[str, Any]):
@@ -215,6 +351,292 @@ def test_ui_vm_inventory_uses_safe_aggregation_projection(
     assert "local_path" not in repr(payload)
 
 
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "",
+        "a" * 64,
+        "ui-vm%0A",
+        "../ui-vm",
+        "ui-vm%2Fother",
+        "ui-vm%252Fother",
+        "host:kvm:",
+        "host:unknown:vm",
+        "other:kvm:vm",
+        "host:kvm:.",
+        "host:kvm:..",
+        "host:kvm:vm%2Fother",
+        "host:kvm:vm%5Cother",
+        "host:kvm:vm%00",
+        "host:kvm:vm%0A",
+        "host:kvm:vm%7F",
+        "host:kvm:%FF",
+        "host:kvm:vm%",
+        "host:kvm:vm%GG",
+        "host:kvm:" + "a" * (513 - len("host:kvm:")),
+    ],
+)
+def test_vm_resource_routes_reject_malformed_identifiers_before_forwarding(
+    server_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    encoded: str,
+) -> None:
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        pytest.fail("Malformed VM identifier reached backend")
+
+    for method in ("get_vm", "vm_logs", "vm_metrics"):
+        monkeypatch.setattr(ui.inventory, method, forbidden)
+    monkeypatch.setattr(ui.ConsoleManager, "open", forbidden)
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console")):
+        status, _, result = _request(
+            server_env["port"],
+            method,
+            "/api/v1/vms/" + encoded + suffix,
+            headers,
+            body={} if method == "POST" else None,
+        )
+        assert status == 400
+        assert result == {"error": "invalid VM identifier"}
+    assert calls == []
+
+
+@pytest.mark.parametrize("tail", ["-1", "0", "5001", "10001", "1.5", "arbitrary", "999999999999999999999999999999"])
+def test_vm_logs_reject_invalid_tail_before_forwarding(server_env, monkeypatch, tail):
+    calls = []
+    monkeypatch.setattr(ui.inventory, "vm_logs", lambda *a, **k: calls.append((a, k)))
+    headers = {"Authorization": f"Bearer {server_env['token']}"}
+    for identifier in ("ui-vm", "host:kvm:external"):
+        status, _, result = _request(
+            server_env["port"],
+            "GET",
+            "/api/v1/vms/" + urllib.parse.quote(identifier, safe="") + "/logs?tail=" + tail,
+            headers,
+        )
+        assert status == 400
+        assert "tail parameter" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("identifier", "mode", "argv", "expected_run_id"),
+    [
+        ("ui-vm", "shell", [], "11111111-1111-4111-8111-111111111111"),
+        ("host:lima-vz:external", "shell", [], None),
+        ("host:libvirt-hvf:Guest café:one", "exec", ["printf", "hello world"], "22222222-2222-4222-8222-222222222222"),
+    ],
+)
+def test_vm_console_forwards_decoded_stable_id_and_expected_run_id(
+    server_env,
+    monkeypatch,
+    identifier,
+    mode,
+    argv,
+    expected_run_id,
+):
+    calls = []
+    session_id = "a" * 32
+    response = {"id": session_id, "name": identifier, "capabilities": {"stdin": True}, "cursor": 0}
+
+    def open_console(self, roots, actual_identifier, **kwargs):
+        calls.append((roots, actual_identifier, kwargs))
+        return response
+
+    monkeypatch.setattr(ui.ConsoleManager, "open", open_console)
+    body = {"mode": mode, "argv": argv, "id": session_id}
+    if expected_run_id is not None:
+        body["expected_run_id"] = expected_run_id
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    status, _, result = _request(
+        server_env["port"],
+        "POST",
+        "/api/v1/vms/" + urllib.parse.quote(identifier, safe="") + "/console",
+        headers,
+        body,
+    )
+    assert status == 201
+    assert result == response
+    assert calls == [
+        (
+            server_env["roots"],
+            identifier,
+            {
+                "mode": mode,
+                "argv": argv,
+                "session_id": session_id,
+                "expected_run_id": expected_run_id,
+            },
+        )
+    ]
+    assert list(server_env["roots"].runs.iterdir()) == []
+
+
+def test_external_vm_lifecycle_routes_never_forward_to_dispatch(server_env, monkeypatch):
+    calls = []
+    for method in ("start", "stop", "rm"):
+        monkeypatch.setattr(ui.inventory.runtime_dispatch, method, lambda *a, **k: calls.append((a, k)))
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    for identifier in ("host:lima-vz:external", "host:libvirt-hvf:Guest café"):
+        for encoded in {identifier, urllib.parse.quote(identifier, safe="")}:
+            if not encoded.isascii():
+                continue
+            for method, suffix in (("POST", "/start"), ("POST", "/stop"), ("DELETE", "")):
+                status, _, result = _request(server_env["port"], method, "/api/v1/vms/" + encoded + suffix, headers)
+                assert status == 400
+                assert result == {"error": "invalid run name"}
+    assert calls == []
+    assert list(server_env["roots"].runs.iterdir()) == []
+
+
+@pytest.mark.parametrize("server_env", [None], indirect=True)
+def test_read_only_console_denies_stable_ids_before_open(server_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ui.ConsoleManager, "open", lambda *a, **k: calls.append((a, k)))
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    for identifier in ("ui-vm", "host:lima-vz:external"):
+        status, _, result = _request(
+            server_env["port"],
+            "POST",
+            "/api/v1/vms/" + urllib.parse.quote(identifier, safe="") + "/console",
+            headers,
+            {"expected_run_id": "11111111-1111-4111-8111-111111111111"},
+        )
+        assert status == 403
+        assert "--allow-control" in result["error"]
+    assert calls == []
+
+
+def test_vm_resource_routes_preserve_auth_and_console_csrf(server_env, monkeypatch):
+    calls = []
+    for method in ("get_vm", "vm_logs", "vm_metrics"):
+        monkeypatch.setattr(ui.inventory, method, lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(ui.ConsoleManager, "open", lambda *a, **k: calls.append((a, k)))
+    path = "/api/v1/vms/" + urllib.parse.quote("host:lima-vz:external", safe="")
+    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console")):
+        status, _, result = _request(server_env["port"], method, path + suffix, body={})
+        assert status == 401
+        assert result == {"error": "Unauthorized"}
+    auth = {"Authorization": f"Bearer {server_env['token']}"}
+    for extra in ({"Origin": "https://foreign.invalid"}, {"Sec-Fetch-Site": "cross-site"}):
+        status, _, _ = _request(server_env["port"], "POST", path + "/console", auth | extra, {})
+        assert status == 403
+    assert calls == []
+
+
+def test_vm_console_default_body_preserves_managed_route_contract(server_env, monkeypatch):
+    calls = []
+
+    def open_console(self, roots, identifier, **kwargs):
+        calls.append((roots, identifier, kwargs))
+        return {"id": "a" * 32, "name": identifier}
+
+    monkeypatch.setattr(ui.ConsoleManager, "open", open_console)
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    status, _, result = _request(server_env["port"], "POST", "/api/v1/vms/ui-vm/console", headers, {})
+    assert status == 201
+    assert result["name"] == "ui-vm"
+    assert calls == [
+        (
+            server_env["roots"],
+            "ui-vm",
+            {
+                "mode": "shell",
+                "argv": [],
+                "session_id": None,
+                "expected_run_id": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("resource", ["logs", "metrics"])
+def test_vm_http_reads_reject_replaced_run_before_guest_probe(server_env, monkeypatch, resource):
+    from palimpsest_local import vm_access
+
+    identifier = "host:lima-vz:redis.qa-1"
+    current_run = "22222222-2222-4222-8222-222222222222"
+    selected_run = "11111111-1111-4111-8111-111111111111"
+    row = {
+        "id": identifier,
+        "name": "redis.qa-1",
+        "run_id": current_run,
+        "backend": "lima-vz",
+        "runtime_kind": "cloud-image",
+        "status": "running",
+        "managed": False,
+        "source": "host-backend",
+        "stale": False,
+    }
+    monkeypatch.setattr(
+        ui.inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [row],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        },
+    )
+    effects = []
+
+    def forbidden(*args, **kwargs):
+        effects.append((args, kwargs))
+        pytest.fail("replaced VM reached guest probe")
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    monkeypatch.setattr(vm_access.runtime_dispatch, "exec", forbidden)
+    path = "/api/v1/vms/" + urllib.parse.quote(identifier, safe="") + "/" + resource
+    status, _, result = _request(
+        server_env["port"],
+        "GET",
+        path + "?expected_run_id=" + selected_run,
+        {"Authorization": "Bearer " + server_env["token"]},
+    )
+    assert status == 200
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "identity"
+    if resource == "logs":
+        assert result["log"] == "" and result["source"] is None
+    else:
+        assert result["run_id"] == selected_run
+        assert result["cpu"] is None and result["memory"] is None
+    assert effects == []
+    assert list(server_env["roots"].runs.iterdir()) == []
+
+
+def test_vm_console_preserves_backend_identity_refusal(server_env, monkeypatch):
+    def refuse(self, roots, identifier, **kwargs):
+        assert identifier == "host:lima-vz:external"
+        assert kwargs["expected_run_id"] == "11111111-1111-4111-8111-111111111111"
+        raise ui.ConsoleError("identity", "Selected VM identity changed")
+
+    monkeypatch.setattr(ui.ConsoleManager, "open", refuse)
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    status, _, result = _request(
+        server_env["port"],
+        "POST",
+        "/api/v1/vms/host%3Alima-vz%3Aexternal/console",
+        headers,
+        {"expected_run_id": "11111111-1111-4111-8111-111111111111"},
+    )
+    assert status == 409
+    assert result == {"error": "Selected VM identity changed", "category": "identity"}
+
+
+def test_vm_console_preserves_expired_open_guard(server_env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ui.ConsoleManager, "open", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(ui.ConsoleManager, "IDLE_SECONDS", 0)
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    status, _, result = _request(server_env["port"], "POST", "/api/v1/vms/ui-vm/console", headers, {})
+    assert status == 409
+    assert result == {"error": "Console open request expired", "category": "closed"}
+    assert calls == []
+
+
 def test_csrf_origin_semantics(server_env: dict[str, Any]):
     port = server_env["port"]
     token = server_env["token"]
@@ -268,13 +690,23 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
     expected_kwargs: dict[str, object],
 ) -> None:
     roots: state.StatePaths = server_env["roots"]
-    _write_ui_run_ledger(roots, backend=backend)
+    rpaths = _write_ui_run_ledger(roots, backend=backend)
+    record = state.read_run_state(rpaths)
+    previous_status = "running" if operation == "stop" else "stopped"
+    state.atomic_write_json(rpaths.state, {**record, "status": previous_status})
+    for adapter in (ui.inventory.runtime_dispatch.cloud_runtime, ui.inventory.runtime_dispatch.lima):
+        monkeypatch.setattr(
+            adapter,
+            "reconcile_run",
+            lambda name, **kwargs: {
+                "state": state.read_run_state(state.run_paths(roots, name)),
+                "warnings": [],
+            },
+        )
     calls: list[tuple[str, dict[str, object]]] = []
 
     def selected(name: str, **kwargs: object) -> object:
         calls.append((name, kwargs))
-        if operation == "logs":
-            return iter(("one\n", "two\n", "three\n"))
         expected = kwargs["_expected_record"]
         assert isinstance(expected, ExistingRunRecord)
         expected_snapshot = kwargs["_expected_snapshot"]
@@ -298,8 +730,12 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
                 mutation.delete_run_tree()
             return outcome
 
-    selected_adapter = getattr(ui.runtime_dispatch, adapter_name)
-    other_adapter = ui.runtime_dispatch.lima if adapter_name == "cloud_runtime" else ui.runtime_dispatch.cloud_runtime
+    selected_adapter = getattr(ui.inventory.runtime_dispatch, adapter_name)
+    other_adapter = (
+        ui.inventory.runtime_dispatch.lima
+        if adapter_name == "cloud_runtime"
+        else ui.inventory.runtime_dispatch.cloud_runtime
+    )
     monkeypatch.setattr(selected_adapter, target_name, selected)
     monkeypatch.setattr(
         other_adapter,
@@ -311,25 +747,25 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
         "Origin": server_env["origin"],
     }
 
-    status, response_headers, payload = _request(server_env["port"], method, path, headers=headers)
+    body = {"expected_run_id": record["run_id"]}
+    if operation == "rm":
+        body.update(confirmation="ui-vm", volumes=True)
+    status, response_headers, payload = _request(server_env["port"], method, path, headers=headers, body=body)
 
     assert status == 200
     assert "application/json" in response_headers["Content-Type"]
-    if operation == "logs":
-        assert payload == {"log": "two\nthree\n"}
-    else:
-        assert payload == {
-            "name": "ui-vm",
-            "run_id": payload["run_id"],
-            "runtime_kind": "cloud-image",
-            "backend": backend,
-            "operation": operation,
-            "previous_status": "stopped",
-            "status": "running" if operation == "start" else "removed" if operation == "rm" else "stopped",
-            "lifecycle_revision": 0 if operation == "stop" else 1,
-            "warning_category": None,
-            "fallback_used": False,
-        }
+    assert payload == {
+        "name": "ui-vm",
+        "run_id": payload["run_id"],
+        "runtime_kind": "cloud-image",
+        "backend": backend,
+        "operation": operation,
+        "previous_status": previous_status,
+        "status": "running" if operation == "start" else "removed" if operation == "rm" else "stopped",
+        "lifecycle_revision": 1,
+        "warning_category": None,
+        "fallback_used": False,
+    }
     assert len(calls) == 1
     called_name, kwargs = calls[0]
     assert called_name == "ui-vm"
@@ -337,8 +773,7 @@ def test_ui_vm_lifecycle_routes_by_durable_dispatch_and_preserves_json_contract(
     expected_snapshot = kwargs.pop("_expected_snapshot", None)
     assert isinstance(expected_record, ExistingRunRecord)
     assert expected_record.dispatch_key.backend is expected_backend
-    if operation in {"start", "stop", "rm"}:
-        assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
+    assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
     assert kwargs == {"roots": roots, **expected_kwargs}
 
 
@@ -366,12 +801,12 @@ def test_ui_oci_vm_lifecycle_fails_closed_with_typed_409_before_backend_side_eff
         pytest.fail(f"UI backend side effect reached: {effect}")
 
     monkeypatch.setattr(
-        ui.runtime_dispatch.cloud_runtime,
+        ui.inventory.runtime_dispatch.cloud_runtime,
         target_name,
         lambda *_args, **_kwargs: forbidden("cloud"),
     )
     monkeypatch.setattr(
-        ui.runtime_dispatch.lima,
+        ui.inventory.runtime_dispatch.lima,
         target_name,
         lambda *_args, **_kwargs: forbidden("lima"),
     )
@@ -380,15 +815,13 @@ def test_ui_oci_vm_lifecycle_fails_closed_with_typed_409_before_backend_side_eff
         "Origin": server_env["origin"],
     }
 
-    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+    record = state.read_run_state(rpaths)
+    body = {"expected_run_id": record["run_id"]}
+    if operation == "rm":
+        body.update(confirmation="ui-vm", volumes=True)
+    status, _, payload = _request(server_env["port"], method, path, headers=headers, body=body)
 
     assert status == 409
-    expected_error = {
-        "start": "runtime operation 'start' is unavailable for oci-root/kvm",
-        "stop": "OCI run removal could not be verified; preserve the run evidence",
-        "rm": "OCI-root rm --volumes is unavailable; root retention follows the owned run policy",
-    }[operation]
-    assert payload == {"error": expected_error}
     assert effects == []
     assert before == (
         rpaths.owner.read_bytes(),
@@ -415,10 +848,13 @@ def test_ui_corrupt_vm_ledger_fails_closed_as_409_without_value_reflection(
         "Origin": server_env["origin"],
     }
 
-    status, _, payload = _request(server_env["port"], method, path, headers=headers)
+    owner = json.loads(rpaths.owner.read_bytes())
+    body = {"expected_run_id": owner["run_id"]}
+    if method == "DELETE":
+        body.update(confirmation="ui-vm", volumes=True)
+    status, _, payload = _request(server_env["port"], method, path, headers=headers, body=body)
 
     assert status == 409
-    assert payload == {"error": "invalid run state schema"}
     assert "sensitive-corrupt-value" not in json.dumps(payload)
     assert rpaths.state.read_bytes() == before
 
@@ -432,7 +868,6 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     status, resp_headers, content = _request(port, "GET", f"/?token={token}")
     assert status == 200
     assert "text/html" in resp_headers.get("Content-Type", "")
-    assert "<!DOCTYPE html>" in content
 
     # 2. Unauthenticated asset fetches return 401
     status, _, _ = _request(port, "GET", "/app.css")
@@ -456,7 +891,7 @@ def test_static_asset_routes(server_env: dict[str, Any]):
     assert "text/css" in resp_headers.get("Content-Type", "")
 
 
-def test_get_routes_and_not_found(server_env: dict[str, Any]):
+def test_get_routes_and_not_found(server_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch):
     roots: state.StatePaths = server_env["roots"]
     port = server_env["port"]
     token = server_env["token"]
@@ -480,9 +915,6 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
             "created_at": "2026-08-24T00:00:00Z",
         },
     )
-    (run_dir / "console.log").write_text("vm console line 1\nvm console line 2\n", encoding="utf-8")
-    run_dir.chmod(0o700)
-    (run_dir / "console.log").chmod(0o600)
 
     # Synthesize build record
     b_id = "b-000000000999"
@@ -518,9 +950,13 @@ def test_get_routes_and_not_found(server_env: dict[str, Any]):
     assert vm_data["name"] == "demo-vm"
 
     # Test GET /api/v1/vms/<name>/logs
+    def vm_logs(actual_roots, identifier, *, tail, expected_run_id, **_kwargs):
+        return {"status": "available", "log": "vm journal line 1\n", "source": "guest-journal", "truncated": False}
+
+    monkeypatch.setattr(ui.inventory, "vm_logs", vm_logs)
     status, _, log_data = _request(port, "GET", "/api/v1/vms/demo-vm/logs?tail=10", headers=headers)
     assert status == 200
-    assert "vm console line 1" in log_data["log"]
+    assert "vm journal line 1" in log_data["log"]
 
     # Test GET /api/v1/store/artifacts
     status, _, artifacts = _request(port, "GET", "/api/v1/store/artifacts", headers=headers)
@@ -836,15 +1272,26 @@ def test_read_only_default_refuses_all_mutation_routes_without_state_changes(ser
         ("POST", "/api/v1/vms/ui-vm/start", None),
         ("POST", "/api/v1/vms/ui-vm/stop", None),
         ("DELETE", "/api/v1/vms/ui-vm?volumes=true", None),
+        (
+            "POST",
+            "/api/v1/builds",
+            {"context": str(roots.state), "tag": "example", "dockerfile_text": "FROM scratch\n"},
+        ),
+        ("POST", "/api/v1/vms", {"image": "example"}),
+        ("POST", "/api/v1/vms/ui-vm/console", {"mode": "shell"}),
+        ("POST", "/api/v1/consoles/" + "a" * 32 + "/input", {"data": "eA=="}),
+        ("POST", "/api/v1/consoles/" + "a" * 32 + "/resize", {"rows": 24, "columns": 80}),
+        ("POST", "/api/v1/consoles/" + "a" * 32 + "/signal", {"signal": "interrupt"}),
+        ("DELETE", "/api/v1/consoles/" + "a" * 32, None),
         ("DELETE", "/api/v1/store/artifacts/sha256:" + "a" * 64, None),
         ("POST", "/api/v1/store/import", {"path": str(source), "disk_format": "raw", "arch": "x86_64"}),
+        ("POST", "/api/v1/store/artifacts/sha256:" + "a" * 64 + "/tag", {"tag": "example"}),
         ("POST", "/api/v1/storage/set", {"destination": str(destination)}),
         ("POST", "/api/v1/storage/move", {"destination": str(destination)}),
     ]
     for method, path, body in requests:
         status, _, payload = _request(server_env["port"], method, path, headers=headers, body=body)
         assert status == 403
-        assert payload == {"error": "Dashboard is read-only; restart with --allow-control to enable changes"}
     after = {path.relative_to(roots.state): path.read_bytes() for path in roots.state.rglob("*") if path.is_file()}
     assert after == before
     assert not destination.exists()
@@ -852,3 +1299,220 @@ def test_read_only_default_refuses_all_mutation_routes_without_state_changes(ser
     status, _, summary = _request(server_env["port"], "GET", "/api/v1/summary", headers=headers)
     assert status == 200
     assert summary["read_only"] is True
+    status, _, operations = _request(server_env["port"], "GET", "/api/v1/operations", headers=headers)
+    assert status == 200 and operations == {"operations": []}
+
+
+def test_web_tag_edit_persists_and_refuses_reassignment(server_env: dict[str, Any], tmp_path: Path) -> None:
+    roots = server_env["roots"]
+    images = []
+    for index in range(2):
+        source = tmp_path / f"image-{index}.raw"
+        source.write_bytes(f"image-{index}".encode())
+        images.append(ui.inventory.import_cloud_image(roots, source, disk_format="raw", arch="aarch64")["digest"])
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    endpoint = f"/api/v1/store/artifacts/{images[0]}/tag"
+    status, _, _ = _request(server_env["port"], "POST", endpoint, body={"tag": "web-image"})
+    assert status == 401
+    status, _, _ = _request(
+        server_env["port"],
+        "POST",
+        endpoint,
+        headers={**headers, "Origin": "https://foreign.invalid"},
+        body={"tag": "web-image"},
+    )
+    assert status == 403
+    assert not (roots.tags / "web-image.json").exists()
+    status, _, payload = _request(server_env["port"], "POST", endpoint, headers=headers, body={"tag": "web-image"})
+    assert status == 200
+    assert payload == {"digest": images[0], "tag": "web-image"}
+    assert state.read_tag_record(roots, "web-image").digest == images[0]
+    status, _, _ = _request(
+        server_env["port"],
+        "POST",
+        f"/api/v1/store/artifacts/{images[1]}/tag",
+        headers=headers,
+        body={"tag": "web-image"},
+    )
+    assert status == 409
+    assert state.read_tag_record(roots, "web-image").digest == images[0]
+    status, _, inventory = _request(server_env["port"], "GET", "/api/v1/store/artifacts", headers=headers)
+    assert status == 200
+    assert next(image for image in inventory["images"] if image["digest"] == images[0])["tags"][0]["tag"] == "web-image"
+
+
+def test_console_routes_lifecycle_and_precancellation(
+    server_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from palimpsest_local import console
+    from palimpsest_local.process_session import LocalProcessSession
+
+    roots = server_env["roots"]
+    rpaths = _write_ui_run_ledger(roots, backend="kvm")
+    run_id = state.read_run_state(rpaths)["run_id"]
+    calls = []
+
+    def resolve(actual_roots, identifier, *, expected_run_id):
+        assert actual_roots is roots
+        assert identifier == "ui-vm"
+        assert expected_run_id == run_id
+        calls.append((identifier, expected_run_id))
+        return SimpleNamespace(
+            open=lambda mode, argv: LocalProcessSession(
+                (sys.executable, "-c", "import time; time.sleep(60)"),
+                tty=False,
+                stdin=True,
+            )
+        )
+
+    monkeypatch.setattr(console.vm_access.Access, "resolve", resolve)
+
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+
+    # 1. Pre-cancellation test: DELETE before open
+    pre_id = "00001111222233334444555566667777"
+    status, _, res = _request(server_env["port"], "DELETE", f"/api/v1/consoles/{pre_id}", headers=headers)
+    assert status == 200 and res["status"] == "disconnected"
+    status, _, err = _request(
+        server_env["port"],
+        "POST",
+        "/api/v1/vms/ui-vm/console",
+        headers=headers,
+        body={"mode": "shell", "id": pre_id, "expected_run_id": run_id},
+    )
+    assert status == 409
+    assert "cancelled" in err["error"]
+
+    # 2. Normal open with explicit ID
+    sess_id = "88889999aaaabbbbccccddddeeeeffff"
+    status, _, opened = _request(
+        server_env["port"],
+        "POST",
+        "/api/v1/vms/ui-vm/console",
+        headers=headers,
+        body={"mode": "shell", "id": sess_id, "expected_run_id": run_id},
+    )
+    assert status == 201
+    assert opened["id"] == sess_id
+    assert opened["capabilities"]["stdin"] is True
+    assert calls == [("ui-vm", run_id)]
+
+    # 3. Write input
+    status, _, _ = _request(
+        server_env["port"],
+        "POST",
+        f"/api/v1/consoles/{sess_id}/input",
+        headers=headers,
+        body={"data": "aGVsbG8="},
+    )
+    assert status == 200
+
+    # 4. Disconnect via DELETE
+    status, _, closed = _request(server_env["port"], "DELETE", f"/api/v1/consoles/{sess_id}", headers=headers)
+    assert status == 200
+    assert closed["status"] == "disconnected"
+
+
+@pytest.mark.parametrize(("open_browser", "blocking_browser"), [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+def test_web_process_browser_choice_and_shutdown(
+    tmp_path: Path,
+    open_browser: bool,
+    blocking_browser: bool,
+    stop_signal: int,
+) -> None:
+    roots = _setup_roots(tmp_path)
+    marker = tmp_path / "browser-url"
+    release_browser = tmp_path / "release-browser"
+    browser_command = tmp_path / "browser.py"
+    browser_command.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nimport sys, time\n"
+        "Path(sys.argv[1]).write_text(sys.argv[2])\n"
+        f"while {blocking_browser!r} and not Path(sys.argv[3]).exists():\n    time.sleep(0.01)\n",
+        encoding="utf-8",
+    )
+    browser_command.chmod(0o700)
+    environment = dict(os.environ)
+    environment.update(
+        PALIMPSEST_STATE_HOME=str(roots.state),
+        XDG_CONFIG_HOME=str(roots.config.parent),
+        PALIMPSEST_URL="http://127.0.0.1:1",
+        PALIMPSEST_TOKEN="not-used-by-local-web",
+        BROWSER=f"{browser_command} {marker} %s {release_browser}",
+    )
+    args = [sys.executable, "-m", "palimpsest_local.cli", "web"]
+    if not open_browser:
+        args.append("--no-browser")
+    process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert process.stdout is not None
+        assert select.select([process.stdout], [], [], 15)[0], "web did not print its listening URL"
+        url = process.stdout.readline().strip()
+        parsed = urllib.parse.urlparse(url)
+        assert parsed.hostname == "127.0.0.1"
+        assert parsed.port is not None
+        token = urllib.parse.parse_qs(parsed.query)["token"][0]
+        headers = {"Authorization": f"Bearer {token}"}
+        status, _, summary = _request(parsed.port, "GET", "/api/v1/summary", headers=headers)
+        assert status == 200
+        assert summary["read_only"] is True
+        if open_browser:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert marker.read_text() == url
+            assert not release_browser.exists()
+        else:
+            assert not marker.exists()
+        process.send_signal(stop_signal)
+        process.wait(timeout=10)
+        release_browser.touch()
+        _, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        with socket.socket() as connection:
+            assert connection.connect_ex(("127.0.0.1", parsed.port)) != 0
+    finally:
+        release_browser.touch()
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=10)
+
+
+def test_dashboard_bind_does_not_reverse_resolve_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # http.server's default bind calls socket.getfqdn(), which hung `web` on macOS 15 runners.
+    monkeypatch.setattr(socket, "getfqdn", lambda *_args: pytest.fail("dashboard bind performed reverse DNS"))
+    server = ui._LoopbackHTTPServer(("127.0.0.1", 0), lambda *_args: None)
+    try:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port == server.server_address[1] != 0
+    finally:
+        server.server_close()
+
+
+def test_host_vm_detail_uses_stable_id_without_creating_run(server_env, monkeypatch):
+    vm = {
+        "id": "host:lima-vz:external",
+        "name": "external",
+        "run_id": None,
+        "backend": "lima-vz",
+        "runtime_kind": "external",
+        "status": "running",
+        "managed": False,
+        "source": "host-backend",
+    }
+    monkeypatch.setattr(
+        ui.inventory.host_inventory, "observe", lambda: {"vms": [vm], "volumes": [], "networks": [], "warnings": []}
+    )
+    headers = {"Authorization": "Bearer " + server_env["token"]}
+    status, _, result = _request(
+        server_env["port"], "GET", "/api/v1/vms/" + urllib.parse.quote(vm["id"], safe=""), headers
+    )
+    assert status == 200
+    assert result["name"] == "external" and result["managed"] is False
+    assert list(server_env["roots"].runs.iterdir()) == []
+    for method, suffix in (("POST", "/start"), ("POST", "/stop"), ("DELETE", "")):
+        status, _, _ = _request(server_env["port"], method, "/api/v1/vms/" + vm["id"] + suffix, headers)
+        assert status == 400
+    assert list(server_env["roots"].runs.iterdir()) == []

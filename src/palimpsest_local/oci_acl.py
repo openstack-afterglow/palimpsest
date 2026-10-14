@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import StateError
+from .web_job_client import run_preparation_tool
 
 _MAX_DAC_ID = 2**32 - 2
 _MAX_ACL_BYTES = 4096
@@ -174,7 +175,7 @@ class LinuxFdACLBackend:
     def __init__(self, *, runner: Callable[..., Any] | None = None) -> None:
         if runner is not None and not callable(runner):
             raise _invalid()
-        self._runner = subprocess.run if runner is None else runner
+        self._runner = run_preparation_tool if runner is None else runner
         self._native = runner is None
 
     def _command(self, fd: int, *, acl: ACLStructure | None = None) -> str:

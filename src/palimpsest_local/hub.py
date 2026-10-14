@@ -255,6 +255,9 @@ class HubClient:
         self,
         *,
         name: str | None = None,
+        digest: str | None = None,
+        digest_prefix: str | None = None,
+        offset: int = 0,
         kind: str | None = None,
         chain_id: str | None = None,
         parent_digest: str | None = None,
@@ -262,10 +265,19 @@ class HubClient:
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200:
             raise HubError("limit must be between 1 and 200")
+        if type(offset) is not int or offset < 0:
+            raise HubError("offset must be a nonnegative integer")
+        if digest_prefix is not None and (
+            not isinstance(digest_prefix, str) or re.fullmatch(r"(?:sha256:)?[0-9a-fA-F]{4,64}", digest_prefix) is None
+        ):
+            raise HubError("digest_prefix must contain 4–64 hexadecimal characters")
         normalized_chain = normalize_digest(chain_id) if chain_id is not None else None
         normalized_parent = normalize_digest(parent_digest) if parent_digest is not None else None
         query = {
             "name": name,
+            "digest": normalize_digest(digest) if digest is not None else None,
+            "digest_prefix": digest_prefix,
+            "offset": offset or None,
             "kind": kind,
             "chain_id": normalized_chain,
             "parent_digest": normalized_parent,

@@ -33,6 +33,7 @@ from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, PalimpsestHubLayer
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError
+from palimpsest_hub.services.worker_leases import sql_mutex
 
 
 def _now() -> datetime:
@@ -42,6 +43,9 @@ def _now() -> datetime:
 def _deadline(job: PalimpsestHubBuild) -> datetime:
     if job.started_at is None:
         return datetime.min.replace(tzinfo=UTC)
+    if job.lease_expires_at is not None:
+        expiry = job.lease_expires_at
+        return expiry.replace(tzinfo=UTC) if expiry.tzinfo is None else expiry.astimezone(UTC)
     started = job.started_at
     if started.tzinfo is None:
         started = started.replace(tzinfo=UTC)
@@ -60,10 +64,12 @@ def _expire(job: PalimpsestHubBuild) -> bool:
 
 @asynccontextmanager
 async def _global_lock(store):
-    # Shared API CAS volume: serialize the global count + claim even on SQLite
-    # and when no rows exist for SQL to lock. SQL row locks also fence publication.
-    async with _locked_file(store, lambda: store.acquire_package_lock("build-worker-global", blocking=False)):
-        yield
+    # CAS locks remain useful locally, but SQL owns the deployment-wide singleton.
+    async with (
+        _locked_file(store, lambda: store.acquire_package_lock("build-worker-global", blocking=False)),
+        sql_mutex(_factory_or_503(), "build-api:single-flight") as session,
+    ):
+        yield session
 
 
 async def _owned(session, build_id: str, lease: str) -> PalimpsestHubBuild:
@@ -125,8 +131,8 @@ async def _inputs(session, store, job: PalimpsestHubBuild) -> list[PalimpsestHub
 
 
 async def claim_build() -> dict | None:
-    store, factory = _store_or_503(), _factory_or_503()
-    async with _global_lock(store), factory() as session:
+    store = _store_or_503()
+    async with _global_lock(store) as session:
         active = (
             await session.scalars(
                 select(PalimpsestHubBuild).where(PalimpsestHubBuild.status == "building").with_for_update()
@@ -156,7 +162,8 @@ async def claim_build() -> dict | None:
             job.status = "building"
             job.started_at = _now()
             job.lease_owner = str(uuid4())
-            deadline = _deadline(job)
+            deadline = job.started_at + timedelta(seconds=get_settings().palimpsest_hub_build_timeout_seconds)
+            job.lease_expires_at = deadline
             result = {
                 "id": job.id,
                 "lease": job.lease_owner,
@@ -190,8 +197,8 @@ async def claim_build() -> dict | None:
 
 
 async def worker_status(build_id: str, lease: str) -> PalimpsestHubBuild:
-    store, factory = _store_or_503(), _factory_or_503()
-    async with _global_lock(store), factory() as session:
+    store = _store_or_503()
+    async with _global_lock(store) as session:
         job = await _owned(session, build_id, lease)
         _expire(job)
         await session.commit()
@@ -199,9 +206,9 @@ async def worker_status(build_id: str, lease: str) -> PalimpsestHubBuild:
 
 
 async def download_input(build_id: str, lease: str, digest: str) -> StreamingResponse:
-    store, factory = _store_or_503(), _factory_or_503()
+    store = _store_or_503()
     # No CAS lookup until both attempt authority and exact input membership pass.
-    async with _global_lock(store), factory() as session:
+    async with _global_lock(store) as session:
         job = await _live(session, build_id, lease)
         if digest not in (job.base_digest, *job.layer_digests):
             raise HTTPException(status_code=404, detail="build input not found")
@@ -216,7 +223,7 @@ async def download_input(build_id: str, lease: str, digest: str) -> StreamingRes
         if verified.blob_digest != digest or verified.size_bytes != size:
             raise HTTPException(status_code=409, detail="build input bytes changed")
         # Recheck after potentially lengthy verification, before returning any bytes.
-        async with _global_lock(store), factory() as session:
+        async with _global_lock(store) as session:
             job = await _live(session, build_id, lease)
             await _inputs(session, store, job)
         handle = store.open_read(digest)
@@ -247,8 +254,8 @@ async def download_input(build_id: str, lease: str, digest: str) -> StreamingRes
 
 
 async def fail_build(build_id: str, lease: str, error_code: str) -> PalimpsestHubBuild:
-    store, factory = _store_or_503(), _factory_or_503()
-    async with _global_lock(store), factory() as session:
+    store = _store_or_503()
+    async with _global_lock(store) as session:
         job = await _owned(session, build_id, lease)
         _expire(job)
         if job.status == "building":
@@ -266,10 +273,10 @@ def _squashfs_magic(path) -> bool:
 
 
 async def upload_output(build_id: str, lease: str, request: Request, expected: str, size: int) -> PalimpsestHubBuild:
-    store, factory = _store_or_503(), _factory_or_503()
+    store = _store_or_503()
     # One bounded staging file per attempt; duplicates wait rather than multiply disk use.
     async with _locked_file(store, lambda: store.acquire_package_lock("build-output-" + build_id, blocking=False)):
-        async with _global_lock(store), factory() as session:
+        async with _global_lock(store) as session:
             job = await _owned(session, build_id, lease)
             if job.status != "complete":
                 job = await _live(session, build_id, lease)
@@ -308,7 +315,7 @@ async def upload_output(build_id: str, lease: str, request: Request, expected: s
             if finalized.blob_digest != expected or not await _run_blocking(_squashfs_magic, staged):
                 raise HTTPException(status_code=422, detail="build output digest or SquashFS magic mismatch")
             # Digest lock spans durable CAS publication and the SQL reference commit.
-            async with _locked_blob(store, expected), _global_lock(store), factory() as session:
+            async with _locked_blob(store, expected), _global_lock(store) as session:
                 job = await _owned(session, build_id, lease)
                 if job.status == "complete":
                     if (job.output_digest, job.output_size_bytes) != (expected, size):

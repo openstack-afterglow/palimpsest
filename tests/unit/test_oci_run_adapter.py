@@ -353,6 +353,7 @@ def test_pipeline_prepares_exact_run_before_six_grants_and_waits_for_ready(case,
         "prepare",
         "events-check",
         "boot-publish",
+        "boot-exit",
         "events-check",
         "boot-load",
         "lower-publish",
@@ -372,7 +373,6 @@ def test_pipeline_prepares_exact_run_before_six_grants_and_waits_for_ready(case,
         "authority-enter",
         "spawn",
         "authority-exit",
-        "boot-exit",
         "close",
         "client",
         "ready",
@@ -695,3 +695,107 @@ def test_signal_queued_while_restoring_startup_handlers_still_stops_detached_run
         launch(case)
     assert fired == [True] and case.calls[-1] == "outer-stop" and "session" not in case.calls
     assert state.read_run_ledger_snapshot(case.roots, case.request.name).record == case.record
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private cancellation requires POSIX")
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "preflight_oci_host",
+        "discover_squashfs_toolchain",
+        "materialize_local_oci_run",
+        *_GRANTS,
+        "prepare_monitor_launch_authority",
+    ],
+)
+def test_web_cancellation_covers_all_preactivation_stages_without_stop(case, monkeypatch, stage):
+    monkeypatch.setenv("PALIMPSEST_WEB_JOB", "run")
+
+    def cancel(*args, **kwargs):
+        os.kill(os.getpid(), signal.SIGUSR1)
+        pytest.fail("preparation continued after cancellation")
+
+    monkeypatch.setattr(adapter, stage, cancel)
+    monkeypatch.setattr(adapter, "stop_oci_run", lambda *a, **k: pytest.fail("web cancellation issued STOP"))
+    with pytest.raises(SystemExit) as raised:
+        launch(case)
+    assert raised.value.code == 128 + signal.SIGUSR1
+    assert "spawn" not in case.calls and "stop-wait" not in case.calls
+    if "boot-enter" in case.calls:
+        assert "boot-exit" in case.calls
+    if "connect" in case.calls:
+        assert case.calls[-1] == "close"
+
+
+def test_web_preparation_handler_is_restored_before_activation_and_source_is_released(case, monkeypatch):
+    monkeypatch.setenv("PALIMPSEST_WEB_JOB", "run")
+    previous = signal.getsignal(signal.SIGUSR1)
+    original_spawn = adapter.spawn_monitor_coordinator
+
+    def spawn(*args, **kwargs):
+        assert signal.getsignal(signal.SIGUSR1) == previous
+        assert "boot-exit" in case.calls
+        assert case.calls.index("boot-exit") < case.calls.index("authority-enter")
+        return original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "spawn_monitor_coordinator", spawn)
+    launch(case)
+    assert "stop-wait" not in case.calls
+
+
+@pytest.mark.skipif(os.name != "posix", reason="owned formatter sessions require POSIX")
+def test_web_cancellation_during_formatting_reclaims_source_and_volume_scratch(case, monkeypatch):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from palimpsest_local import oci_host, project_volumes
+
+    monkeypatch.setenv("PALIMPSEST_WEB_JOB", "run")
+    monkeypatch.setattr(
+        oci_host, "build_bootstrap_initramfs", lambda: SimpleNamespace(payload=b"source", manifest=object())
+    )
+    monkeypatch.setattr(oci_host, "verify_first_party_bootstrap_initramfs", lambda *a: SimpleNamespace(digest="unused"))
+    monkeypatch.setattr(oci_host, "verify_host_boot_artifacts", lambda *a, **k: case.source_boot)
+    monkeypatch.setattr(adapter, "first_party_boot", oci_host.first_party_boot)
+    monkeypatch.setattr(project_volumes, "_preflight_kvm_tools", lambda runner: None)
+    original_spawn = subprocess.Popen
+    processes = []
+    scratch = []
+    raw = case.roots.state / "format-cancel.raw"
+
+    def prepare(*args, **kwargs):
+        project_volumes._ensure_ext4_raw_file_locked(
+            raw, 4096, "cancel-test", "cancel-test", project_volumes._default_runner
+        )
+        pytest.fail("cancelled formatter returned")
+
+    def spawn(argv, **kwargs):
+        assert argv[0] == "mkfs.ext4"
+        source = tuple(case.roots.state.glob("oci-boot-*"))
+        assert len(source) == 1 and (source[0] / "initramfs").read_bytes() == b"source"
+        scratch.extend((*source, Path(argv[-1])))
+        process = original_spawn([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        processes.append(process)
+        os.kill(os.getpid(), signal.SIGUSR1)  # Immediately at formatter handoff.
+        return process
+
+    monkeypatch.setattr(adapter, "prepare_oci_root_run", prepare)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(adapter, "stop_oci_run", lambda *a, **k: pytest.fail("web cancellation issued STOP"))
+    try:
+        with pytest.raises(SystemExit) as raised:
+            launch(case)
+        assert raised.value.code == 128 + signal.SIGUSR1
+        assert len(processes) == 1 and processes[0].returncode is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(processes[0].pid, os.WNOHANG)
+        assert processes[0].stdout.closed and processes[0].stderr.closed
+        assert scratch and all(not path.exists() for path in scratch)
+        assert not raw.exists() and "spawn" not in case.calls and "stop-wait" not in case.calls
+        assert case.calls[-1] == "close"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()

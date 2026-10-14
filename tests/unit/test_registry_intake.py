@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sys
 import time
@@ -67,6 +69,78 @@ def test_isolated_environment_routes_all_writable_client_state_under_staging(tmp
         assert directory.is_dir()
         assert directory.stat().st_mode & 0o777 == 0o700
     assert "REGISTRY_AUTH_FILE" not in environment
+
+
+def test_default_docker_store_preserves_helper_environment_and_excludes_native_credentials(tmp_path, monkeypatch):
+    config = tmp_path / "docker-config"
+    config.mkdir(mode=0o700)
+    (config / "config.json").write_text(json.dumps({"credsStore": "fixture"}))
+    home = tmp_path / "user-home"
+    home.mkdir()
+    secret = home / "registry-secret"
+    secret.write_text("selected-registry-secret")
+    helper = tmp_path / "docker-credential-fixture"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "assert sys.argv[1:] == ['get']\n"
+        "assert sys.stdin.read().strip() == 'https://index.docker.io/v1/'\n"
+        f"assert os.environ['DOCKER_CONFIG'] == {str(config)!r}\n"
+        f"assert os.environ['HOME'] == {str(home)!r}\n"
+        "assert 'PALIMPSEST_TOKEN' not in os.environ\n"
+        "assert 'PALIMPSEST_PACKAGE_KEY' not in os.environ\n"
+        "secret = pathlib.Path(os.environ['FIXTURE_REGISTRY_SECRET']).read_text()\n"
+        "print(json.dumps({'Username': 'registry-user', 'Secret': secret}))\n"
+    )
+    helper.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FIXTURE_REGISTRY_SECRET", str(secret))
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "native-token-must-not-reach-docker-helper")
+    monkeypatch.setenv("PALIMPSEST_PACKAGE_KEY", "native-key-must-not-reach-docker-helper")
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+
+    resolved = registry_intake._stage_docker_auth(config, "docker.io", staging, timeout_seconds=2)
+
+    auth_file = resolved / "config.json"
+    auth = json.loads(auth_file.read_text())["auths"]
+    assert set(auth) == {"docker.io"}
+    assert base64.b64decode(auth["docker.io"]["auth"]).decode() == "registry-user:selected-registry-secret"
+    assert auth_file.stat().st_mode & 0o777 == 0o600
+    assert resolved.stat().st_mode & 0o777 == 0o700
+
+
+def test_registry_specific_docker_helper_overrides_default_store_and_inline_auth(tmp_path, monkeypatch):
+    config = tmp_path / "docker-config"
+    config.mkdir(mode=0o700)
+    (config / "config.json").write_text(
+        json.dumps(
+            {
+                "credsStore": "unavailable-default-store",
+                "credHelpers": {"registry.example": "selected"},
+                "auths": {"registry.example": {"auth": "wrong-inline-auth"}},
+            }
+        )
+    )
+    helper = tmp_path / "docker-credential-selected"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        "assert sys.argv[1:] == ['get']\n"
+        "assert sys.stdin.read().strip() == 'registry.example'\n"
+        "print(json.dumps({'Username': '<token>', 'Secret': 'selected-identity-token'}))\n"
+    )
+    helper.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+
+    resolved = registry_intake._stage_docker_auth(config, "registry.example", staging, timeout_seconds=2)
+
+    assert json.loads((resolved / "config.json").read_text()) == {
+        "auths": {"registry.example": {"identitytoken": "selected-identity-token"}},
+    }
 
 
 def test_real_subprocess_timeout_is_bounded(tmp_path: Path):
@@ -404,3 +478,161 @@ def test_swapped_output_parent_does_not_publish_and_cleans_owned_staging(
         )
     assert list(output_parent.iterdir()) == []
     assert list(moved_parent.iterdir()) == []
+
+
+def test_skopeo_pull_argv_with_profile_and_authfile(tmp_path: Path):
+    from palimpsest_local.registry import RegistryProfile
+
+    docker_config = tmp_path / "docker"
+    docker_config.mkdir()
+    (docker_config / "config.json").write_text('{"auths":{}}', encoding="utf-8")
+    profile = RegistryProfile(
+        alias="custom",
+        endpoint="registry.secure.test",
+        tls_skip_verify=True,
+        ca=(str(tmp_path / "ca.crt"),),
+    )
+    argv = registry_intake.skopeo_pull_argv(
+        Path("/usr/bin/skopeo"),
+        "registry.secure.test/app:v1",
+        tmp_path / "app.oci.tar",
+        profile=profile,
+        docker_config_dir=docker_config,
+    )
+    assert "--src-tls-verify=false" in argv
+    assert "--src-cert-dir" in argv
+    assert str(tmp_path / "ca.crt") in argv
+    assert "--authfile" in argv
+    assert str(docker_config / "config.json") in argv
+    assert "--src-no-creds" not in argv
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "build401",
+        "build403",
+        "credentials",
+        "tls",
+        "x509",
+        "certificate",
+        "handshake",
+        "timeout",
+        "denied",
+        "unauthorized",
+    ],
+)
+def test_protocol_miss_is_not_overridden_by_reference_text(name: str):
+    error = registry_intake._classify_skopeo_error(
+        f"reading manifest {name} in registry.example/team/{name}: manifest unknown",
+        1,
+    )
+    assert isinstance(error, registry_intake.RegistryImageNotFoundError)
+
+
+@pytest.mark.parametrize(
+    "diagnostic, expected",
+    [
+        ("manifest unknown: authentication required", registry_intake.RegistryAuthenticationError),
+        ("manifest unknown: x509: certificate signed by unknown authority", registry_intake.RegistryTLSError),
+        ("manifest unknown: dial tcp 127.0.0.1:443: connection refused", registry_intake.RegistryNetworkError),
+    ],
+)
+def test_hard_registry_failure_precedes_protocol_miss(diagnostic: str, expected: type):
+    assert isinstance(registry_intake._classify_skopeo_error(diagnostic, 1), expected)
+
+
+def test_classify_skopeo_error_distinguishes_missing_auth_tls_network():
+    # Missing
+    err = registry_intake._classify_skopeo_error("Error: manifest unknown: requested image was not found", 1)
+    assert isinstance(err, registry_intake.RegistryImageNotFoundError)
+    assert "not found" in str(err)
+
+    # Auth
+    err = registry_intake._classify_skopeo_error("Error: 401 Unauthorized: authentication required", 1)
+    assert isinstance(err, registry_intake.RegistryAuthenticationError)
+    assert "authentication failed" in str(err)
+
+    # TLS
+    err = registry_intake._classify_skopeo_error("Error: x509: certificate signed by unknown authority", 1)
+    assert isinstance(err, registry_intake.RegistryTLSError)
+    assert "TLS verification failed" in str(err)
+
+    # Network
+    err = registry_intake._classify_skopeo_error("Error: dial tcp: connection refused", 1)
+    assert isinstance(err, registry_intake.RegistryNetworkError)
+    assert "network connection failed" in str(err)
+
+    # Generic fallback contains "could not copy"
+    err = registry_intake._classify_skopeo_error("some unclassified error", 7)
+    assert isinstance(err, registry_intake.RegistryIntakeError)
+    assert "could not copy" in str(err)
+
+
+def test_export_docker_image_missing_raises_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import subprocess
+
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    fake_skopeo = tmp_path / "skopeo"
+    fake_skopeo.write_bytes(b"tool")
+    fake_skopeo.chmod(0o700)
+
+    # Mock inspect to fail (image not found in daemon)
+    monkeypatch.setattr(
+        registry_intake,
+        "run_docker_command",
+        lambda argv, **_kw: subprocess.CompletedProcess(argv, returncode=1, stderr="No such image: myapp:v1"),
+    )
+    with pytest.raises(registry_intake.RegistryImageNotFoundError, match="not found in.*Docker daemon"):
+        registry_intake.export_docker_image_to_oci_archive(
+            "myapp:v1",
+            tmp_path / "out.oci.tar",
+            roots,
+            skopeo=fake_skopeo,
+        )
+
+
+def test_inspection_uses_selected_docker_credentials_and_bounded_private_output(tmp_path, monkeypatch):
+    from palimpsest_local.registry import default_registry_config
+
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    profile = default_registry_config().registries["docker"]
+    seen = []
+    monkeypatch.setattr(registry_intake.shutil, "which", lambda _name: "/usr/bin/skopeo")
+
+    def stage(config, endpoint, staging, *, timeout_seconds):
+        assert endpoint == "docker.io" and timeout_seconds == 10
+        private = staging / "docker-auth"
+        private.mkdir(mode=0o700)
+        (private / "config.json").write_text(json.dumps({"auths": {endpoint: {"auth": "synthetic-only"}}}))
+        return private
+
+    monkeypatch.setattr(registry_intake, "_stage_docker_auth", stage)
+
+    def run(argv, output, staging, *, timeout_seconds, maximum_bytes, stdout):
+        seen.append((argv, staging))
+        assert timeout_seconds == 10 and maximum_bytes == 4 * 1024 * 1024
+        assert "--tls-verify=true" in argv and "--authfile" in argv
+        assert not any("synthetic-only" in arg or "PALIMPSEST_TOKEN" in arg for arg in argv)
+        assert Path(argv[argv.index("--authfile") + 1]).is_file()
+        stdout.write(json.dumps({"Tags": ["latest"]}).encode())
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", run)
+    result = registry_intake.inspect_registry_reference(
+        "library/ubuntu:latest", roots, profile=profile, tags=True, timeout_seconds=10
+    )
+    assert result == {"Tags": ["latest"]}
+    assert seen[0][0][-1] == "docker://docker.io/library/ubuntu"
+    assert not seen[0][1].exists()
+
+
+@pytest.mark.parametrize("options", [{"plain_http": True}, {"tls_skip_verify": True}])
+def test_inspection_rejects_insecure_profile_before_acquisition(tmp_path, monkeypatch, options):
+    from palimpsest_local.registry import RegistryProfile
+
+    profile = RegistryProfile("private", "example.test", **options)
+    monkeypatch.setattr(registry_intake.shutil, "which", lambda _name: pytest.fail("tool selection occurred"))
+    with pytest.raises(RegistryIntakeError, match="verified OCI HTTPS"):
+        registry_intake.inspect_registry_reference(
+            "example.test/app:latest", StatePaths(tmp_path / "config", tmp_path / "state"), profile=profile
+        )

@@ -101,7 +101,6 @@ async function hashFile(file, check, progress) {
   check();
   return hash.digest();
 }
-
 async function downloadVerified(request, path, digest, size, filename, check, progress) {
   if (!digestPattern.test(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("Missing verified download descriptor.");
   filename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");

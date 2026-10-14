@@ -415,6 +415,13 @@ legacy `ArgsEscaped` field against the OCI/Moby contract before changing the
 existing fail-closed parser. Neither change is justified by silently editing
 the downloaded image or bypassing its validator.
 
+The direct-reference intake prerequisite below is historical. The 2026-10-10
+working tree implements [automatic local-first run acquisition](registries.md#automatic-run-acquisition)
+with Docker credential/profile isolation, deterministic genuine-miss fallback,
+private verified archive retention and complete index-pin preservation. Current
+local acquisition/browser proof is recorded in the development handoff, not as
+new Linux KVM or universal image compatibility evidence.
+
 Before enabling a registry reference directly in `run`, define an explicit
 OCI-reference grammar that cannot fall into the existing cloud-image path,
 tag-to-platform-digest resolution, acquisition/tool/authentication limits,

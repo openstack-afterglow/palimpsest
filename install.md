@@ -1,19 +1,33 @@
 # Install Palimpsest
 
-Palimpsest requires Python 3.11 or newer. The root
-[`palimpsest-client 0.2.3`](https://pypi.org/project/palimpsest-client/0.2.3/)
-is published on PyPI; install it with
-`python3.12 -m pip install "palimpsest-client==0.2.3"` and verify with
-`palimpsest --version`. Git and outbound HTTPS access to GitHub are required
-only for the VCS installation examples below. The independent Hub Python
-package (`palimpsest-hub`) prepares `0.3.1` in this source tree; the root release
-tag does not publish that wheel.
+Palimpsest requires Python 3.11 or newer. Latest dev's release baseline is
+[`palimpsest-client 0.3.4`](https://pypi.org/project/palimpsest-client/0.3.4/);
+this integration prepares unpublished 0.3.5. Install released bytes in isolation:
 
-The current checkout prepares root `palimpsest-client 0.3.1`; the published
-commands above still install 0.2.3. Hub 0.3.1 includes the project-package registry and retains
-closed-transport recovery. The candidate Kolla role defaults to Hub image
-tag 0.3.1; verify that both reviewed images have been published before deployment.
-Pin their image digests explicitly; a root package update does not roll out the Hub.
+```sh
+uv tool install --python 3.11 "palimpsest-client==0.3.4"
+palimpsest --version
+
+# Or use pip, without changing system Python:
+python3.11 -m venv .venv
+.venv/bin/python -m pip install "palimpsest-client==0.3.4"
+.venv/bin/palimpsest --version
+```
+
+This checkout declares 0.3.5 and includes preserved **unreleased** local web,
+runtime, cache, user-default/help/completion work. To use its bytes, run `uv tool install
+--force --python 3.11 .` from this trusted checkout, or `python -m pip install .`
+inside a virtual environment. A remote branch/PyPI install does not include
+uncommitted edits. Do not infer source identity from the version alone.
+If uv's bin directory is not on `PATH`, explicitly run `uv tool update-shell`
+and open a new terminal. Hub is a separate distribution/deployment; a client
+upgrade does not publish or roll out Hub images.
+
+Release `v0.3.3` is the separately reviewed Hub-management source at
+`7186abf7844454eda7ed86a215192b33b9250ff8`, not this shared checkout's local
+dashboard refresh or unreleased runtime changes. Its PyPI client ran on
+Python 3.11.15; canonical Hub images are amd64-only and production rollout
+still requires separate approval. See the [publication handoff](docs/development-handoff.md#approved-hub-033-publication-progression--2026-10-11-separate-clean-source).
 
 ## 1. Install the Local CLI
 
@@ -51,7 +65,7 @@ If an existing `pyproject.toml` says `requires-python = ">=3.10"`, raise it to
 `">=3.11"` before `uv add`, or keep the project range and use `uv tool install`
 instead. uv resolves dependencies for the entire declared range, not only the
 pinned interpreter. `--frozen` is not a compatibility fix. A successful
-metadata probe for an installed 0.2.3 root package must report `0.2.3`.
+metadata probe must match the selected distribution version.
 The unpinned Git URL follows the default branch and can resolve a different
 version. Output from a same-named local application does not verify that
 `palimpsest-client` was installed.
@@ -102,21 +116,21 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. The Kolla role in
-this candidate source tree defaults to Hub image tag `0.3.1`; verify both images are published before
-deployment. Root PyPI publishing requires tag-triggered artifact checks,
-a successful protected native stage-1 proof orchestrated on hosted Ubuntu
-with a disposable OpenStack Linux x86_64 KVM guest, and a GitHub trusted publisher
-registered for PyPI project `palimpsest-client` (workflow `release.yml`, environment `pypi`).
-The tag's native environment approval is separate from any prior branch run approval;
-the persistent runner stays stopped. See [release prerequisites](docs/testing.md#release-preparation-and-publication-gates).
+this candidate source tree defaults to Hub image tag `0.3.5`; verify exact reviewed
+API/export/build-worker images and platform manifests before deployment.
+Root publication requires trusted tag artifact checks and protected PyPI
+publisher gates. Native policy permits only enabled/success or explicitly
+disabled/skipped; disabled publication is **not native qualification**.
+Native environment approval is separate from prior branch approval; the old
+persistent runner stays offline. See [release prerequisites](docs/testing.md#release-preparation-and-publication-gates).
 
 The Hub serves `/app` for browser upload/search/download and system-admin-only
-server builds. The API package alone cannot run a build: install
-`palimpsest-client[kvm]` at the same reviewed ref on a **separate Linux x86_64
-KVM host**, configure the absolute `PALIMPSEST_HUB_BUILDER_PYTHON` interpreter
-path on API and worker, and run `palimpsest-hub-build-worker` with the same SQL
-database and Hub blob filesystem path. See [Hub service settings](docs/install.md#hub-service-settings)
-for prerequisites and failure boundaries.
+server builds. API packages never execute recipes. Configure its private worker
+key and run the same-source `palimpsest-hub-build-worker` in a dedicated CPU-only
+Linux x86_64 service VM with verified Hub HTTPS, owner-only keyfile and private
+scratch. Do not supply SQL/CAS/Redis/Keystone credentials or resurrect the old
+KVM/shared-store interpreter setting. See [worker deployment and recovery](docs/install.md#remote-build-worker-deployment-034-source-candidate)
+for tools, resource/disk bounds, fixed deadlines, journal/no-replay and exact-owned cleanup.
 
 ## 3. Match the supported platform
 
@@ -138,22 +152,73 @@ installing `[kvm]` or passing the stage-1 gate does not close the gap.
 Package installation never installs hypervisors, creates system accounts,
 changes privileged groups, writes sudoers policy, or initializes mutable state.
 
-## 4. Configure the first state root
+## 4. Start using the installed CLI
 
-An unconfigured Linux process selects `/var/lib/palimpsest`, which is normally
-administrator-owned. For a user-owned artifact workflow, select a private state
-parent before running stateful commands:
+The working source uses `~/.local/state/palimpsest` for ordinary Linux users
+and macOS; no state variables are needed. Existing user artifacts and VM ledgers
+stay there. Linux normal-user commands automatically create a private journal
+under the selected state's `logs/`. Root and the dedicated `palimpsest` account
+retain administrator-provisioned `/var/lib/palimpsest` and `/var/log/palimpsest`.
+See [storage/logging](docs/linux-storage-logging.md) for override/security policy.
 
 ```sh
-export XDG_STATE_HOME="$HOME/.local/state"
-"$HOME/.venvs/palimpsest/bin/palimpsest" store show
+palimpsest                           # help and examples, no required-operation error
+palimpsest store show
+palimpsest store ls --kind image     # local inventory; no Hub credentials
+palimpsest completion zsh --install # choose bash/fish if appropriate; reopen shell
+palimpsest docker run --help         # actual installed Docker help
 ```
+
+`image ls` queries Hub and still needs a Hub URL/token. `images` queries the
+Docker daemon. These are not aliases for the local Palimpsest store.
 
 `PALIMPSEST_STATE_HOME` is the highest-priority state override. Hub credentials,
 registry credentials, and host permissions are separate settings; do not place
 secrets in repository files.
 
-## 5. Upgrade or remove code
+## 5. Build and run locally or on Linux
+
+For ordinary Docker containers, the installed Docker CLI and running daemon are
+required. The passthrough preserves Docker's help, plugin commands and flags:
+
+```sh
+palimpsest docker build -t demo:local .
+palimpsest docker run --rm demo:local
+```
+
+This runs a Docker container, not a Palimpsest VM. `palimpsest build` is the
+separate artifact workflow: online Dockerfile builds require a native cache
+profile/key; strict offline builds require a preprovisioned network-none Buildx
+builder and pinned local OCI inputs. Follow the
+[BuildKit workflow](docs/buildkit-block-workflow.md), not an implicit Hub fallback.
+
+For a **Palimpsest VM**, first install Lima on macOS Apple Silicon, or the
+documented KVM/libvirt tools and `[kvm]` extra on Linux. Download and verify an
+architecture-matching Ubuntu cloud image using the
+[Hello VM guide](examples/hello-vm/README.md#step-1-download-an-ubuntu-cloud-image).
+Then use the installed CLI directly (no source `uv run` environment required):
+
+```sh
+ARCH=aarch64 # macOS Apple Silicon/Linux ARM64; Linux x86_64: ARCH=x86_64
+BASE=$(palimpsest image import ./ubuntu.qcow2 --disk-format qcow2 --arch "$ARCH")
+cat > Palimpsestfile <<EOF
+FROM $BASE
+RUN mkdir -p /srv/demo && printf 'hello from the built layer\n' > /srv/demo/message
+EOF
+LAYER=$(palimpsest build --frontend palimpsestfile --base "$BASE" \
+  --tag demo-layer --file ./Palimpsestfile --network none)
+palimpsest run "$BASE" --layer "$LAYER" --name demo-vm --memory 2048 --vcpus 2
+palimpsest exec demo-vm -- cat /opt/layers/merged/srv/demo/message
+palimpsest stop demo-vm
+palimpsest rm demo-vm --volumes
+```
+
+Use a new run name, not an existing VM's name. Layers mount under
+`/opt/layers/merged`; this conventional VM flow does not replace guest `/`.
+OCI-root application launch is a distinct Linux amd64 KVM lane, not enabled by
+Docker installation or a successful macOS build.
+
+## 6. Upgrade or remove code
 
 Upgrade by reinstalling a newly reviewed SHA into the same isolated environment:
 

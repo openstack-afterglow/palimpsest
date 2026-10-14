@@ -6,9 +6,16 @@ This document defines the target Dockerfile workflow for Palimpsest. It separate
 
 The two frontends have intentionally separate option contracts. Selecting `--frontend palimpsestfile` rejects every Dockerfile/BuildKit-only flag, including explicit default-valued flags such as `--platform linux/amd64`, instead of silently ignoring them.
 
+Cache mode is explicit. The native-cache sections below describe default
+`--cache-mode native`, including mandatory scoped Hub transfer. For OCI output,
+`--cache-mode local` uses managed host cache without Hub URL/key/authorization;
+it rejects native and external cache authorities and permits `--no-cache`.
+It retains the same builder/export and source-validation contracts. It is not
+offline mode: only `--offline` forbids remote Dockerfile inputs.
+
 ## Selected Buildx builder preflight
 
-Online Dockerfile builds first authorize `cache:read` and `cache:write` for the exact native cache package, then inspect the builder already selected by Buildx or `BUILDX_BUILDER`. The inspected name is pinned into `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. Inspection is read-only: Palimpsest does not create, select or bootstrap a builder. Unauthorized package-only keys fail before inspection or build-directory creation.
+Dockerfile builds in default native cache mode first authorize `cache:read` and `cache:write` for the exact native cache package, then inspect the builder already selected by Buildx or `BUILDX_BUILDER`. Local cache mode skips Hub authorization but still inspects that selected builder. The inspected name is pinned into `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. Inspection is read-only: Palimpsest does not create, select or bootstrap a builder. Unauthorized native package-only keys fail before inspection or build-directory creation.
 
 The OCI output required by this workflow is supported by the `docker-container`, `kubernetes`, and `remote` drivers. The default `docker` driver is rejected before Hub cache resolution or the Buildx solve because it cannot export `type=oci`. The successful build receipt records the inspected `buildx_driver`.
 
@@ -81,7 +88,7 @@ Native packages/cache, legacy Hub artifacts and Docker/OCI registries use distin
 | Legacy Palimpsest Hub | Native `/v1/images`, `/layers`, `/bundles` | Boot images, SquashFS runtime blocks and bundles | `PALIMPSEST_URL`; original `PALIMPSEST_TOKEN` |
 | Docker/OCI registry | Distribution `/v2` via Docker/Buildx | OCI images and optional external BuildKit registry caches | `protocol = "oci"` profile; Docker credentials |
 
-Hub is not a `/v2` registry. Every online solve uses explicit native package-key cache authority; the old `HubClient.push_blob` rejects BuildKit-cache writes, so a legacy token cannot supply an unqualified cache upload. Runtime SquashFS lookup/upload uses a separate original-token `runtime_hub_client`, never the native key. This does not grant native package keys privileged server-build authority; `/v1/builds` remains system-admin-only.
+Hub is not a `/v2` registry. Every online solve in native cache mode uses explicit native package-key cache authority; the old `HubClient.push_blob` rejects BuildKit-cache writes, so a legacy token cannot supply an unqualified cache upload. Local cache mode performs no Hub cache transfer. Runtime SquashFS lookup/upload uses a separate original-token `runtime_hub_client`, never the native key. This does not grant native package keys privileged server-build authority; `/v1/builds` remains system-admin-only.
 
 Profiles live in `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`. Unqualified selection is `--registry`, then `PALIMPSEST_REGISTRY`, then default. A fully qualified tag whose authority has no configured profile stays an ordinary OCI reference, as before. A configured authority must map to one protocol, and an explicit alias must match the authority. OCI builds canonicalize tags against the selected profile only with `--push` or `--registry`; native builds always do. Native HTTPS requires the same authority as `endpoint`, verifies system/profile CAs and refuses redirects. Its helper key is `api_base.rstrip('/') + '/projects/' + namespace`, not the host-only Docker credential entry. See [registry profiles](registries.md) for secret-once issuance, login and binding prerequisites.
 
@@ -103,7 +110,7 @@ Palimpsest uses distinct digests for distinct questions:
 
 A BuildKit cache key is not a layer blob hash. Palimpsest's canonical pre-build key locates a portable local-exporter archive; its SHA-256 verifies the transported bytes, and BuildKit remains the authority that validates and consumes the cache records inside it.
 
-The canonical BuildKit key includes the complete local context, Dockerfile, platform, target, network policy, build-argument digest, pinned local-image descriptors, builder fingerprint and `cache_scope`. It excludes output tags and downstream VM base/SquashFS policy so those do not invalidate reusable vertices. Online Dockerfiles must pin every fully qualified remote `FROM` and external `# syntax=` frontend as `@sha256:<64hex>`; mutable tags and ARG-expanded image sources are rejected before the solve and builder inspection. Cache-key and scope fallback remain bound to the authenticated project/package partition. Profiles never rewrite Dockerfile inputs.
+The canonical BuildKit key includes the complete local context, Dockerfile, platform, target, network policy, build-argument digest, pinned local-image descriptors, builder fingerprint and `cache_scope`. It excludes output tags and downstream VM base/SquashFS policy so those do not invalidate reusable vertices. Online Dockerfiles must pin every fully qualified remote `FROM` and external `# syntax=` frontend as `@sha256:<64hex>`; mutable tags and ARG-expanded image sources are rejected before the solve and builder inspection. In native cache mode, cache-key and scope fallback additionally bind the authenticated project/package partition. Profiles never rewrite Dockerfile inputs.
 
 The native cache descriptor remains `palimpsest-buildkit-cache-archive-v1` and requires seven binding fields: `project_id`, `namespace`, `package`, `build_key`, `cache_scope`, `platform`, `builder_fingerprint`. `oci_manifest_digest` is optional provenance, not cache authority. Download, upload receipt and wrapper validation compare all binding fields. Keystone project/user IDs are exact opaque bounded ASCII strings (up to 64 characters, including federated 64-hex identities), not UUID-normalized or case-folded values; UUID normalization is only for Hub-generated key/session IDs.
 
@@ -121,7 +128,7 @@ The implemented v2 runtime descriptor binds the source OCI manifest, the SHA-256
 
 When a runtime block is requested, the CLI resolves the immutable runtime base before BuildKit starts and requires its cloud-image architecture to match the build platform: `linux/amd64` maps to `x86_64`, and `linux/arm64[/variant]` maps to `aarch64`. The runtime artifact metadata records both spellings so a mismatched block/base pair fails at build time instead of at guest execution.
 
-## Online build: Hub-first, verified, and fail-closed
+## Online native cache: Hub-first, verified, and fail-closed
 
 The online default is Hub-first cache resolution. "Hub-first" means the Hub cache index is consulted before Palimpsest permits BuildKit to solve. An exact-key hit, or the latest same-scope archive used for partial reuse, is downloaded and SHA-256 verified even when an older local scope cache exists. Only an authoritative Hub miss permits fallback to the local scope cache or a cold solve.
 

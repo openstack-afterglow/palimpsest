@@ -240,9 +240,10 @@ def _is_system_admin(user_id: str) -> bool:
                 and _assignment_role(assignment) == "admin"
             ):
                 return True
+        return False
     except Exception:
         _logger.warning("Keystone system-admin check failed")
-    return False
+        return False
 
 
 def validate_token(token: str, project_id: str = "") -> dict[str, Any]:
