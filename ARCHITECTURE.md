@@ -1211,9 +1211,9 @@ Maintenance review — 2026-10-14, 0.3.5 local qualification documentation: revi
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "bc672cc87a6724f2e66d95eb5e928c9e2b4d81e3df1c49055a0de121f9e23ba8",
-  "reviewed_at": "2026-10-14T09:38:55Z",
-  "summary": "0.3.5 follow-up review: ui.serve now constructs a private loopback ThreadingHTTPServer subclass whose server_bind skips HTTPServer's socket.getfqdn reverse lookup, fixing the macOS 15 hosted-check startup hang of palimpsest web before the URL is printed. Loopback-only binding, token, read-only default, browser launch and shutdown are unchanged; no schema, Hub, Kolla or CLI contract change. Regression test asserts bind performs no reverse DNS; all prior 0.3.5 integration review conclusions stand."
+  "source_sha256": "855cda7bf7a8155834035086c074f769622a77b03a4d610b230e7379ea11cbd4",
+  "reviewed_at": "2026-10-14T09:47:03Z",
+  "summary": "0.3.5 follow-up review: test-only deflake of test_interactive_bash_readline_tab_completion, which now waits for the expected bash completion insertion (or idle output for the negative case) within a bound instead of a fixed sleep; plus the reviewed loopback dashboard bind without reverse DNS. No product, schema, Hub, Kolla or CLI contract change beyond the bind fix."
 }
 ```
 <!-- architecture-review:end -->

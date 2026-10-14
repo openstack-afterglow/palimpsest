@@ -234,6 +234,7 @@ def test_interactive_bash_readline_tab_completion():
         pytest.skip("interactive bash pty testing requires POSIX bash")
 
     import pty
+    import select
     import time
 
     repo_root = Path(__file__).parent.parent.parent
@@ -251,7 +252,7 @@ def test_interactive_bash_readline_tab_completion():
         script_file = tmp_path / "completion.bash"
         script_file.write_text(script)
 
-        def run_tab(setup_commands: str, typed_input: str) -> str:
+        def run_tab(setup_commands: str, typed_input: str, expect: str | None) -> str:
             master, slave = pty.openpty()
             child_pid = os.fork()
             if child_pid == 0:
@@ -273,17 +274,24 @@ def test_interactive_bash_readline_tab_completion():
             time.sleep(0.1)
             os.read(master, 2048)
             os.write(master, typed_input.encode() + b"\t")
-            time.sleep(0.4)
+            # Completion runs the CLI; wait for its expected insertion (or output idle for
+            # negative checks) instead of a fixed sleep that raced slow CI interpreters.
             output_bytes = b""
-            while True:
-                try:
-                    chunk = os.read(master, 1024)
+            deadline = time.monotonic() + 15
+            last_output = time.monotonic()
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        chunk = os.read(master, 1024)
+                    except OSError:
+                        break
                     if not chunk:
                         break
                     output_bytes += chunk
-                    if len(chunk) < 1024:
+                    last_output = time.monotonic()
+                    if expect is not None and expect.encode() in output_bytes:
                         break
-                except OSError:
+                elif expect is None and output_bytes and time.monotonic() - last_output >= 2.0:
                     break
             os.write(master, b"\nexit\n")
             time.sleep(0.05)
@@ -291,13 +299,13 @@ def test_interactive_bash_readline_tab_completion():
             os.close(master)
             return output_bytes.decode("utf-8", "replace")
 
-        out1 = run_tab(f". {script_file}", "palimpsest run --backend=a")
+        out1 = run_tab(f". {script_file}", "palimpsest run --backend=a", "palimpsest run --backend=auto ")
         assert "palimpsest run --backend=auto " in out1
 
-        out2 = run_tab(f". {script_file}", "palimpsest stor")
+        out2 = run_tab(f". {script_file}", "palimpsest stor", "palimpsest store ")
         assert "palimpsest store " in out2
 
-        out3 = run_tab(f". {script_file}", "palimpsest run --memory 1024 ")
+        out3 = run_tab(f". {script_file}", "palimpsest run --memory 1024 ", None)
         assert "README.md" not in out3 and "pyproject.toml" not in out3
 
         mock_output = "output=$'__palimpsest_directive__\t4\nmy special&file$var.txt'"
@@ -307,7 +315,7 @@ def test_interactive_bash_readline_tab_completion():
         )
         meta_file = tmp_path / "meta.bash"
         meta_file.write_text(meta_script)
-        out4 = run_tab(f". {meta_file}", "palimpsest my")
+        out4 = run_tab(f". {meta_file}", "palimpsest my", "\\&")
         assert "my\\ special\\&file\\$var.txt " in out4 or "\\&" in out4
 
 

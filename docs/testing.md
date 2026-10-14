@@ -50,6 +50,13 @@ does not qualify this HTTPS build cutover.
   `test_dashboard_bind_does_not_reverse_resolve_loopback` fails against the
   stdlib default bind and passes with the fix, and `tests/unit/test_ui.py`
   passed **87** locally.
+- **Hosted Linux flake:** the rerun then failed WIP-added
+  `test_interactive_bash_readline_tab_completion` once on Linux (`--backend=a`
+  captured before readline inserted `auto`); it also failed 1/12 locally. The
+  test now waits for the expected completion text, or two idle seconds for its
+  negative case, within a 15-second bound instead of a fixed 0.4-second sleep:
+  **20/20** local runs passed and `tests/unit/test_completion.py` reported
+  85 passed, 2 skipped.
 
 Still pending: a PR to protected `dev` with all six strict required hosted
 checks on the submitted ref, an immutable `v0.3.5` tag, PyPI/GHCR publication,
